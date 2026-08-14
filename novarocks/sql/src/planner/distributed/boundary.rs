@@ -62,11 +62,11 @@ use super::{
 /// Unlike [`ColumnId`] (logical provenance, shared across occurrences), an
 /// `ExecutionColumnId` is unique for every occurrence within one query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct ExecutionColumnId(u32);
+pub struct ExecutionColumnId(u32);
 
 impl ExecutionColumnId {
     /// The raw occurrence value. Occurrence ids are assigned densely from 1.
-    pub(crate) fn value(self) -> u32 {
+    pub fn value(self) -> u32 {
         self.0
     }
 }
@@ -113,7 +113,7 @@ impl Default for ExecutionColumnIdAllocator {
 /// One column at a boundary, carrying both its occurrence identity and its
 /// logical planner provenance.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct BoundaryColumn {
+pub struct BoundaryColumn {
     /// Query-scoped occurrence identity (NEW; unique per boundary member).
     pub execution_column_id: ExecutionColumnId,
     /// Logical planner provenance (shared across occurrences of the column).
@@ -128,7 +128,7 @@ pub(crate) struct BoundaryColumn {
 
 /// The kind of seam a [`BoundaryContract`] describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum BoundaryKind {
+pub enum BoundaryKind {
     /// The query result root output (root fragment with a result sink).
     ResultOutput,
     /// The sender side of an Exchange edge (stream, CTE multicast, or router).
@@ -166,7 +166,7 @@ impl fmt::Display for BoundaryKind {
 /// destination Exchange node id: the receiver is that node, and the sender's
 /// sink is addressed to it, so both sides share the id and can be paired.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct BoundaryContract {
+pub struct BoundaryContract {
     pub fragment_id: FragmentId,
     pub node_id: Option<i32>,
     pub kind: BoundaryKind,

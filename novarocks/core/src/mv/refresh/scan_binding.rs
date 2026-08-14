@@ -21,7 +21,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::table::{SqlScanKind, SqlTableVersionSelector, test_sql_scan_source};
+    use novarocks_sql::planner::table::{
+        SqlScanKind, SqlTableVersionSelector, test_sql_scan_source,
+    };
 
     #[test]
     fn sqlx2_mv_scan_binding_test_source_is_tokenized() {
@@ -30,7 +32,7 @@ mod tests {
         });
         assert!(matches!(
             source,
-            crate::sql::planner::table::ScanSource::Sql(_)
+            novarocks_sql::planner::table::ScanSource::Sql(_)
         ));
     }
 }

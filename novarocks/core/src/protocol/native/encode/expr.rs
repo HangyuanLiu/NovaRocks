@@ -21,11 +21,11 @@ use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 
 use crate::protocol::native::type_mapping::encode_type;
-use crate::sql::plan_read::{
+use novarocks_protocol::{common, expr};
+use novarocks_sql::plan_read::{
     BinOp, ExprKind, LiteralValue, SortItem, TypedExpr, UnOp, WindowBound, WindowFrame,
     WindowFrameType,
 };
-use novarocks_protocol::{common, expr};
 use novarocks_types::largeint;
 
 pub(crate) fn encode_expr(e: &TypedExpr) -> Result<expr::Expr, String> {

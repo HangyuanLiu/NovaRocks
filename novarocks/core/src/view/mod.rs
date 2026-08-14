@@ -29,13 +29,13 @@ use crate::query_execution::compiler::CatalogServiceSource;
 use crate::query_execution::kernels::ViewExecutionKernel;
 use crate::runtime::query_result::QueryResult;
 pub mod view_command;
-/// Shared StarRocks SQL parser contract for view DDL, storage, and rewrite.
-pub use crate::sql::parser::dialect::StarRocksDialect as ViewSqlDialect;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
     ConnectorViewRequest, CreateOrReplacePolicy, DropPolicy,
 };
+/// Shared StarRocks SQL syntax contract for view DDL, storage, and rewrite.
+pub use novarocks_sql::syntax::StarRocksDialect as ViewSqlDialect;
 
 #[derive(Clone, Copy)]
 pub struct ViewRequestContext<'a> {
@@ -274,9 +274,9 @@ where
             .columns
             .into_iter()
             .map(|column| {
-                let column = crate::sql::parser::ast::TableColumnDef {
+                let column = novarocks_sql::syntax::TableColumnDef {
                     name: column.name,
-                    data_type: crate::sql::parser::dialect::convert_sql_type(column.data_type)?,
+                    data_type: novarocks_sql::syntax::convert_sql_type(column.data_type)?,
                     nullable: column.nullable,
                     aggregation: None,
                     default: None,
@@ -438,23 +438,20 @@ where
             &catalog_service_snapshot,
             self.connector_control(),
             context.clone(),
-            crate::sql::catalog::TableLookupMode::SchemaOnly,
+            novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
             self.catalog_application(),
         );
-        let (resolved, _ctes, _factory) = crate::sql::analyzer::analyze(query, &provider, database)
-            .map_err(|error| format!("analyze view definition failed: {error}"))?;
-        let columns = resolved
-            .output_columns
-            .into_iter()
-            .filter(|column| !column.is_internal)
-            .map(|column| {
-                Ok(ViewColumnDefinition {
-                    name: column.name,
-                    data_type: view_sqlparser_data_type(&column.data_type)?,
-                    nullable: column.nullable,
+        let columns =
+            novarocks_sql::planning::catalog::analyze_view_query(query, &provider, database)?
+                .into_iter()
+                .map(|column| {
+                    Ok(ViewColumnDefinition {
+                        name: column.name,
+                        data_type: view_sqlparser_data_type(&column.data_type)?,
+                        nullable: column.nullable,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+                .collect::<Result<Vec<_>, String>>()?;
         if columns.is_empty() {
             return Err("CREATE VIEW: SELECT produced no output columns".to_string());
         }
@@ -552,7 +549,7 @@ fn view_sqlparser_data_type(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::parser::dialect::StarRocksDialect;
+    use novarocks_sql::syntax::StarRocksDialect;
     use sqlparser::ast as sqlast;
     use sqlparser::parser::Parser;
 

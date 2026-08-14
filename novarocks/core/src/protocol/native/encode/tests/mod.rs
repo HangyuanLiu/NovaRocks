@@ -19,28 +19,4 @@ mod expr;
 mod instance;
 mod integration;
 
-use arrow::datatypes::DataType;
-
-use crate::sql::analysis::{ExprKind, TypedExpr};
-use crate::sql::column_id::ColumnId;
-use crate::sql::common::LiteralValue;
-
-fn column_expr(id: u32, name: &str, data_type: DataType) -> TypedExpr {
-    TypedExpr {
-        kind: ExprKind::ColumnRef {
-            column_id: ColumnId::new_for_test(id),
-            qualifier: Some("t".to_string()),
-            column: name.to_string(),
-        },
-        data_type,
-        nullable: true,
-    }
-}
-
-fn int_expr(value: i64) -> TypedExpr {
-    TypedExpr {
-        kind: ExprKind::Literal(LiteralValue::Int(value)),
-        data_type: DataType::Int64,
-        nullable: false,
-    }
-}
+pub(super) use novarocks_sql::test_support::{column_expr, int_expr};

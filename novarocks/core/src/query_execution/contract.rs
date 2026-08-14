@@ -44,7 +44,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
-use crate::sql::planner::distributed::FragmentId;
+use novarocks_sql::plan_read::FragmentId;
 pub(crate) use novarocks_types::QueryId;
 
 /// Query options resolved by core before ownership crosses into frontend.

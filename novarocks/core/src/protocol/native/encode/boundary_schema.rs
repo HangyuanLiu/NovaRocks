@@ -17,7 +17,7 @@
 
 //! Read-only projection of the planner's sealed boundary catalog.
 //!
-//! The planner (`crate::sql::planner::distributed::boundary`) is the sole owner
+//! The SQL planner's sealed [`novarocks_sql::plan_read`] contract is the sole owner
 //! of boundary membership, occurrence identity, and column provenance:
 //! `build_boundary_catalog` derives every boundary seam and numbers each column
 //! occurrence with an [`ExecutionColumnId`]. This module does **not** discover
@@ -30,10 +30,9 @@
 
 use arrow::datatypes::DataType;
 
-use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::{
-    BoundaryColumn, BoundaryContract, BoundaryKind as PlannerBoundaryKind, DistributedPlan,
-    ExecutionColumnId,
+use novarocks_sql::plan_read::{
+    BoundaryColumn, BoundaryContract, BoundaryKind as PlannerBoundaryKind, ColumnId,
+    DistributedPlan, ExecutionColumnId,
 };
 
 /// The kind of boundary seam a [`BoundarySchemaReport`] describes. Every variant
@@ -152,7 +151,7 @@ fn project_boundary_column(column: &BoundaryColumn) -> BoundarySchemaColumn {
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::distributed::BoundaryKind as PlannerBoundaryKind;
+    use novarocks_sql::plan_read::BoundaryKind as PlannerBoundaryKind;
 
     use super::BoundaryKind;
 

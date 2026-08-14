@@ -23,7 +23,7 @@ use std::fmt;
 
 use crate::mv::model::MvTarget;
 use crate::mv::refresh::planning::RefreshPlanContract;
-use crate::sql::parser::ast::{
+use novarocks_sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, RefreshMaterializedViewStmt,
     ShowMaterializedViewsStmt,
 };

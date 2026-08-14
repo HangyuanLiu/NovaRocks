@@ -28,7 +28,7 @@ use novarocks_execution::runtime::query_options::QueryOptions;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::{PreparedQueryCompletion, PreparedQueryOperation};
-use crate::sql::plan_read::DistributedPlan;
+use novarocks_sql::plan_read::DistributedPlan;
 
 /// Select the completion formatter paired with one post-compile assembly.
 /// SQL owns the plan facts; Core owns the profile formatter and its

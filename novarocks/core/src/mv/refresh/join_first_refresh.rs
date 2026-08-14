@@ -7,13 +7,13 @@
 
 use crate::mv::persistence::schema as mv_schema;
 use crate::mv::rewrite::context::IcebergMvRewriteContext;
-use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
-use crate::sql::column_id::{ColumnId, ColumnRefFactory};
-use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
-use crate::sql::planner::logical::LogicalPlanNode;
-use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
 use arrow::datatypes::DataType;
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
+use novarocks_sql::column_id::{ColumnId, ColumnRefFactory};
+use novarocks_sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
+use novarocks_sql::planner::logical::LogicalPlanNode;
+use novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
 
 pub(crate) struct JoinFirstRefreshLogicalInput {
     pub(crate) plan: LogicalPlanNode,
@@ -107,7 +107,7 @@ pub(crate) fn build_join_first_refresh_append_logical_plan(
         .uuid(right_ref)
         .ok_or_else(|| format!("missing uuid for {}", right_ref.fqn()))?
         .to_string();
-    let plan = crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_apply_key_append_project(
+    let plan = novarocks_sql::planner::imv_rewrite::join_refresh_builder::build_join_apply_key_append_project(
         input.plan,
         &descriptor,
         &left_uuid,
@@ -187,7 +187,7 @@ pub(crate) fn build_join_first_refresh_logical_plan(
         .ok_or_else(|| format!("missing uuid for {}", right_ref.fqn()))?
         .to_string();
     let plan =
-        crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_apply_key_project_with_constant_insert_action(
+        novarocks_sql::planner::imv_rewrite::join_refresh_builder::build_join_apply_key_project_with_constant_insert_action(
             input.plan,
             &descriptor,
             &left_uuid,
@@ -208,26 +208,26 @@ pub(crate) fn build_join_first_refresh_logical_plan(
 }
 
 struct JoinFullRefreshApplyInput {
-    plan: crate::sql::planner::logical::LogicalPlanNode,
+    plan: novarocks_sql::planner::logical::LogicalPlanNode,
     payload_columns: Vec<OutputColumn>,
     left_row_id_column: OutputColumn,
     right_row_id_column: OutputColumn,
     join_key_pairs:
-        Vec<crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair>,
+        Vec<novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair>,
 }
 
 fn build_join_full_refresh_apply_input(
-    plan: crate::sql::planner::logical::LogicalPlanNode,
+    plan: novarocks_sql::planner::logical::LogicalPlanNode,
     schema_contract: &mv_schema::MvSchemaContract,
     left_ref: &TableIdentity,
     right_ref: &TableIdentity,
 ) -> Result<JoinFullRefreshApplyInput, String> {
-    let crate::sql::planner::logical::LogicalPlanNode {
+    let novarocks_sql::planner::logical::LogicalPlanNode {
         kind,
         mut children,
         required_output_columns: _,
     } = plan;
-    let crate::sql::planner::logical::LogicalPlanKind::Project(mut project) = kind else {
+    let novarocks_sql::planner::logical::LogicalPlanKind::Project(mut project) = kind else {
         return Err("join full refresh logical route requires a root Project".to_string());
     };
     if children.len() != 1 {
@@ -266,8 +266,8 @@ fn build_join_full_refresh_apply_input(
     project
         .items
         .push(project_item_for_column(&right_row_id_column));
-    let plan = crate::sql::planner::logical::LogicalPlanNode::new(
-        crate::sql::planner::logical::LogicalPlanKind::Project(project),
+    let plan = novarocks_sql::planner::logical::LogicalPlanNode::new(
+        novarocks_sql::planner::logical::LogicalPlanKind::Project(project),
         vec![input],
         None,
     );
@@ -312,7 +312,7 @@ struct JoinFullRefreshBaseScan {
 }
 
 fn find_join_full_refresh_base_scan(
-    plan: &crate::sql::planner::logical::LogicalPlanNode,
+    plan: &novarocks_sql::planner::logical::LogicalPlanNode,
     base_ref: &TableIdentity,
     role: &str,
 ) -> Result<JoinFullRefreshBaseScan, String> {
@@ -332,11 +332,11 @@ fn find_join_full_refresh_base_scan(
 }
 
 fn collect_join_full_refresh_base_scans(
-    plan: &crate::sql::planner::logical::LogicalPlanNode,
+    plan: &novarocks_sql::planner::logical::LogicalPlanNode,
     base_ref: &TableIdentity,
     scans: &mut Vec<JoinFullRefreshBaseScan>,
 ) {
-    if let crate::sql::planner::logical::LogicalPlanKind::Scan(scan) = &plan.kind
+    if let novarocks_sql::planner::logical::LogicalPlanKind::Scan(scan) = &plan.kind
         && let Some(source) = sql_scan_source(&scan.table.source)
         && source.table.catalog.eq_ignore_ascii_case(&base_ref.catalog)
         && source
@@ -355,10 +355,10 @@ fn collect_join_full_refresh_base_scans(
 }
 
 fn sql_scan_source(
-    source: &crate::sql::planner::table::ScanSource,
-) -> Option<&crate::sql::planner::table::SqlScanSource> {
+    source: &novarocks_sql::planner::table::ScanSource,
+) -> Option<&novarocks_sql::planner::table::SqlScanSource> {
     match source {
-        crate::sql::planner::table::ScanSource::Sql(source) => Some(source),
+        novarocks_sql::planner::table::ScanSource::Sql(source) => Some(source),
     }
 }
 
@@ -393,7 +393,7 @@ fn build_join_full_refresh_key_pairs(
     left_scan: &JoinFullRefreshBaseScan,
     right_scan: &JoinFullRefreshBaseScan,
 ) -> Result<
-    Vec<crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair>,
+    Vec<novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair>,
     String,
 > {
     let join_contract = schema_contract
@@ -414,7 +414,7 @@ fn build_join_full_refresh_key_pairs(
             let right_name =
                 current_scan_field_name(right_base_contract, right_scan, right_lineage, "right")?;
             Ok(
-                crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair {
+                novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair {
                     left_column: find_unique_scan_output_column(
                         &left_scan.output_columns,
                         &left_name,
@@ -546,46 +546,48 @@ fn build_join_full_refresh_descriptor(
     action_column: OutputColumn,
     join_apply_key_column: OutputColumn,
     join_key_pairs: Vec<
-        crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair,
+        novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair,
     >,
-) -> Result<crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor, String>
-{
+) -> Result<
+    novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor,
+    String,
+> {
     let mut output_mappings = payload_columns
         .iter()
         .map(|column| {
-            crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputMapping {
+            novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputMapping {
                 mv_output_column: column.clone(),
                 source:
-                    crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputSource::Payload(
+                    novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputSource::Payload(
                         column.column_id,
                     ),
             }
         })
         .collect::<Vec<_>>();
     output_mappings.push(
-        crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputMapping {
+        novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputMapping {
             mv_output_column: join_apply_key_column.clone(),
             source:
-                crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputSource::JoinApplyKey(
+                novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputSource::JoinApplyKey(
                     join_apply_key_column.column_id,
                 ),
         },
     );
     output_mappings.push(
-        crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputMapping {
+        novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputMapping {
             mv_output_column: action_column.clone(),
             source:
-                crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputSource::Action(
+                novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputSource::Action(
                     action_column.column_id,
                 ),
         },
     );
 
     Ok(
-        crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor {
-            mode: crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshMode::Full,
+        novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor {
+            mode: novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshMode::Full,
             mv_identity:
-                crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshMvIdentity {
+                novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshMvIdentity {
                     catalog: rewrite.target.catalog.clone(),
                     database: rewrite.target.namespace.clone(),
                     name: rewrite.target.table.clone(),
@@ -651,7 +653,7 @@ fn reserve_factory_for_logical_plan(
 }
 
 fn max_logical_plan_output_column_id(plan: &LogicalPlanNode) -> Result<u32, String> {
-    let mut max_id = crate::sql::planner::plan_output_columns(plan)?
+    let mut max_id = novarocks_sql::planner::plan_output_columns(plan)?
         .iter()
         .map(|column| column.column_id.0)
         .max()

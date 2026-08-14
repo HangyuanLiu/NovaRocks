@@ -60,10 +60,10 @@ use crate::mv::storage_observation::{
 };
 use crate::query_execution::StatementResult;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
-use crate::sql::parser::procedure::CallProcedureStmt;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
 };
+use novarocks_sql::parser::procedure::CallProcedureStmt;
 
 pub(crate) const PROCEDURE_NAME: &str = "novarocks_imv_stateless_rebuild";
 const TEST_ENABLE_ENV: &str = "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD";
@@ -417,7 +417,7 @@ mod tests {
     use crate::mv::storage_observation::{
         MvLakePublication, MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
     };
-    use crate::sql::parser::procedure::parse_call_procedure_sql;
+    use novarocks_sql::parser::procedure::parse_call_procedure_sql;
 
     #[test]
     fn guard_rejects_when_flag_absent() {

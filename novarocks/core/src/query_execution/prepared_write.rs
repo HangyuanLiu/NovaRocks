@@ -27,11 +27,11 @@ use crate::query_execution::contract::{
 };
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::sql::planner::distributed::FragmentId;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorWriteCohortId, ConnectorWriteLease, ConnectorWriteOperationId,
 };
+use novarocks_sql::plan_read::FragmentId;
 
 /// SQL-owned prepared fragments and native bundle for one connector write.
 /// It deliberately contains no backend topology, writer handle, or execution

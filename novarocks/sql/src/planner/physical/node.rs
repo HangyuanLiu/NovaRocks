@@ -169,7 +169,7 @@ pub enum PhysicalPlanKind {
 }
 
 impl PhysicalPlanKind {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn variant_names_for_test() -> &'static [&'static str] {
         &[
             "Scan",

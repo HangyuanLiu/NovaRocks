@@ -45,8 +45,8 @@ fn identity_partition_file(path: &str, id: i32) -> FixtureScanFile {
     file
 }
 
-fn id_eq(value: i64) -> crate::sql::analysis::TypedExpr {
-    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
+fn id_eq(value: i64) -> novarocks_sql::analysis::TypedExpr {
+    use novarocks_sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
 
     TypedExpr {
         kind: ExprKind::BinaryOp {
@@ -71,15 +71,15 @@ fn id_eq(value: i64) -> crate::sql::analysis::TypedExpr {
     }
 }
 
-fn unsupported_id_predicate() -> crate::sql::analysis::TypedExpr {
-    use crate::sql::analysis::{ExprKind, TypedExpr};
+fn unsupported_id_predicate() -> novarocks_sql::analysis::TypedExpr {
+    use novarocks_sql::analysis::{ExprKind, TypedExpr};
 
     TypedExpr {
         kind: ExprKind::FunctionCall {
             name: "abs".to_string(),
             args: vec![id_eq(12)],
             distinct: false,
-            volatility: crate::sql::functions::FunctionVolatility::Immutable,
+            volatility: novarocks_sql::functions::FunctionVolatility::Immutable,
         },
         data_type: DataType::Boolean,
         nullable: false,
@@ -155,8 +155,8 @@ fn delta_scan_uses_opaque_connector_read() {
     let mut root = scan_node(40);
     replace_scan_source(
         &mut root,
-        crate::sql::planner::table::test_sql_scan_source(
-            crate::sql::planner::table::SqlScanKind::Delta {
+        novarocks_sql::plan_read::table::test_sql_scan_source(
+            novarocks_sql::plan_read::table::SqlScanKind::Delta {
                 from_snapshot_id: 6,
                 to_snapshot_id: 7,
             },
@@ -227,8 +227,8 @@ fn sqlx2_frozen_snapshot_scan_uses_its_exact_admitted_file_set() {
         panic!("fixture root must be a scan");
     };
     let ScanSource::Sql(source) = &mut scan.table.source;
-    source.kind = crate::sql::planner::table::SqlScanKind::FrozenInputSet {
-        version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(11),
+    source.kind = novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet {
+        version: novarocks_sql::plan_read::table::SqlTableVersionSelector::Snapshot(11),
     };
     let plan = plan(root);
     let controls = crate::connector::FixtureControlResolver::new(registry(vec![data_file(
@@ -271,8 +271,8 @@ fn sqlx2_frozen_snapshot_scan_rejects_a_selector_without_admitted_files() {
         panic!("fixture root must be a scan");
     };
     let ScanSource::Sql(source) = &mut scan.table.source;
-    source.kind = crate::sql::planner::table::SqlScanKind::FrozenInputSet {
-        version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(11),
+    source.kind = novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet {
+        version: novarocks_sql::plan_read::table::SqlTableVersionSelector::Snapshot(11),
     };
     let controls = crate::connector::FixtureControlResolver::new(registry(vec![data_file(
         "s3://bucket/current.parquet",
@@ -282,8 +282,8 @@ fn sqlx2_frozen_snapshot_scan_rejects_a_selector_without_admitted_files() {
         panic!("fixture root must remain a scan");
     };
     let ScanSource::Sql(source) = &mut scan.table.source;
-    source.kind = crate::sql::planner::table::SqlScanKind::FrozenInputSet {
-        version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(12),
+    source.kind = novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet {
+        version: novarocks_sql::plan_read::table::SqlTableVersionSelector::Snapshot(12),
     };
     let plan = plan(root);
 

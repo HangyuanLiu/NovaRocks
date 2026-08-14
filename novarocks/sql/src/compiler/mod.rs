@@ -50,12 +50,16 @@ pub trait SqlCatalogSnapshot {
     fn planner_table_provider(&self) -> &dyn crate::catalog::PlannerTableProvider;
 }
 
-pub(crate) struct SqlPlannerTableSnapshot<'a> {
+/// Borrowed adapter over the application-owned query-local table snapshot.
+///
+/// It exposes only the catalog vocabulary required by `SqlCompileRequest` and
+/// cannot construct or mutate planner tables itself.
+pub struct SqlPlannerTableSnapshot<'a> {
     provider: &'a dyn crate::catalog::PlannerTableProvider,
 }
 
 impl<'a> SqlPlannerTableSnapshot<'a> {
-    pub(crate) fn new(provider: &'a dyn crate::catalog::PlannerTableProvider) -> Self {
+    pub fn new(provider: &'a dyn crate::catalog::PlannerTableProvider) -> Self {
         Self { provider }
     }
 }

@@ -17,10 +17,10 @@
 
 use super::type_mapping::{encode_data_partition, encode_row_mutation_effect, usize_to_u64};
 use super::{NativePlanEncodeContext, required_context_ref};
-use crate::sql::plan_read::{
+use novarocks_protocol::{common, plan};
+use novarocks_sql::plan_read::{
     ChangeStreamRouterSink, ConnectorWriteFragmentSink, ConnectorWriteInputBinding, FragmentId,
 };
-use novarocks_protocol::{common, plan};
 
 /// Encode the generic writer envelope without inspecting the provider payload.
 /// The payload is authenticated by its SPI digest and is interpreted only by

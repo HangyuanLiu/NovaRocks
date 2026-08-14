@@ -21,11 +21,11 @@ use crate::query_execution::planning::bindings::{
 use crate::query_execution::preparation::scan::{
     ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
 };
-use crate::sql::planner::distributed::{
+use novarocks_sql::plan_read::PlanScanNode;
+use novarocks_sql::plan_read::table::ScanSource;
+use novarocks_sql::planner::distributed::{
     DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId,
 };
-use crate::sql::planner::payload::PlanScanNode;
-use crate::sql::planner::table::ScanSource;
 
 mod iceberg;
 mod projection;
@@ -158,9 +158,9 @@ fn prepare_scan_node(
 ) -> Result<(), String> {
     let execution = match &scan.table.source {
         ScanSource::Sql(source) => match &source.kind {
-            crate::sql::planner::table::SqlScanKind::Data { .. }
-            | crate::sql::planner::table::SqlScanKind::FrozenInputSet {
-                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+            novarocks_sql::plan_read::table::SqlScanKind::Data { .. }
+            | novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet {
+                version: novarocks_sql::plan_read::table::SqlTableVersionSelector::Current,
             } => {
                 let query_table_bindings = query_table_bindings.ok_or_else(|| {
                     format!(
@@ -187,8 +187,9 @@ fn prepare_scan_node(
                     }
                 }
             }
-            crate::sql::planner::table::SqlScanKind::FrozenInputSet {
-                version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(snapshot_id),
+            novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet {
+                version:
+                    novarocks_sql::plan_read::table::SqlTableVersionSelector::Snapshot(snapshot_id),
             } => {
                 let query_table_bindings = query_table_bindings.ok_or_else(|| {
                     format!(
@@ -209,15 +210,15 @@ fn prepare_scan_node(
                     }
                 }
             }
-            crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+            novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet {
                 version:
-                    crate::sql::planner::table::SqlTableVersionSelector::TimestampMillis(timestamp),
+                    novarocks_sql::plan_read::table::SqlTableVersionSelector::TimestampMillis(timestamp),
             } => {
                 return Err(format!(
                     "SQL frozen scan node_id={node_id} has timestamp selector {timestamp} without an admitted snapshot file set"
                 ));
             }
-            crate::sql::planner::table::SqlScanKind::Metadata { .. } => {
+            novarocks_sql::plan_read::table::SqlScanKind::Metadata { .. } => {
                 let query_table_bindings = query_table_bindings.ok_or_else(|| {
                     format!(
                         "SQL metadata scan node_id={node_id} has binding token but no query-local binding store"
@@ -243,7 +244,7 @@ fn prepare_scan_node(
                     }
                 }
             }
-            crate::sql::planner::table::SqlScanKind::MvTargetState { facts } => {
+            novarocks_sql::plan_read::table::SqlScanKind::MvTargetState { facts } => {
                 resolve_frozen_mv_target_scan(
                     node_id,
                     source,
@@ -254,7 +255,7 @@ fn prepare_scan_node(
                     Some(&facts.partition_constraint),
                 )?
             }
-            crate::sql::planner::table::SqlScanKind::MvTargetLocator { facts } => {
+            novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator { facts } => {
                 resolve_frozen_mv_target_scan(
                     node_id,
                     source,
@@ -265,8 +266,8 @@ fn prepare_scan_node(
                     None,
                 )?
             }
-            crate::sql::planner::table::SqlScanKind::ConnectorRead
-            | crate::sql::planner::table::SqlScanKind::Delta { .. } => {
+            novarocks_sql::plan_read::table::SqlScanKind::ConnectorRead
+            | novarocks_sql::plan_read::table::SqlScanKind::Delta { .. } => {
                 let source_context = scan_source_context(&scan.table.source);
                 let resolver = resolver.ok_or_else(|| {
                     format!(
@@ -338,7 +339,7 @@ fn prepare_scan_node(
         }
         ResolvedScanExecution::SealedConnectorScan(connector_scan) => {
             let ScanSource::Sql(source) = &scan.table.source;
-            let crate::sql::planner::table::SqlScanKind::Delta {
+            let novarocks_sql::plan_read::table::SqlScanKind::Delta {
                 from_snapshot_id,
                 to_snapshot_id,
             } = source.kind
@@ -391,13 +392,13 @@ fn prepare_scan_node(
 /// generation or invokes the legacy MV scan resolver.
 fn resolve_frozen_mv_target_scan(
     node_id: i32,
-    source: &crate::sql::planner::table::SqlScanSource,
+    source: &novarocks_sql::plan_read::table::SqlScanSource,
     query_table_bindings: Option<&QueryTableBindingStore>,
     expected_uuid: &str,
     expected_snapshot_id: Option<i64>,
     lane: &str,
     target_state_partition_constraint: Option<
-        &crate::sql::planner::table::SqlMvTargetStatePartitionConstraint,
+        &novarocks_sql::plan_read::table::SqlMvTargetStatePartitionConstraint,
     >,
 ) -> Result<ResolvedScanExecution, String> {
     let query_table_bindings = query_table_bindings.ok_or_else(|| {
@@ -421,9 +422,9 @@ fn resolve_frozen_mv_target_scan(
     }
     let connector_read = match target_state_partition_constraint {
         Some(
-            crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired,
+            novarocks_sql::plan_read::table::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired,
         ) => &materialization.affected_partitions,
-        Some(crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::Unpartitioned)
+        Some(novarocks_sql::plan_read::table::SqlMvTargetStatePartitionConstraint::Unpartitioned)
         | None => &materialization.full,
     };
     Ok(ResolvedScanExecution::AdmittedConnectorRead(
@@ -470,21 +471,21 @@ fn validate_resolved_execution_kind(
 ) -> Result<(), String> {
     let valid = match source {
         ScanSource::Sql(source) => match &source.kind {
-            crate::sql::planner::table::SqlScanKind::ConnectorRead => {
+            novarocks_sql::plan_read::table::SqlScanKind::ConnectorRead => {
                 matches!(execution, ResolvedScanExecution::ConnectorRead)
             }
-            crate::sql::planner::table::SqlScanKind::Delta { .. } => {
+            novarocks_sql::plan_read::table::SqlScanKind::Delta { .. } => {
                 matches!(execution, ResolvedScanExecution::SealedConnectorScan(_))
             }
-            crate::sql::planner::table::SqlScanKind::Data { .. }
-            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => {
+            novarocks_sql::plan_read::table::SqlScanKind::Data { .. }
+            | novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet { .. } => {
                 matches!(execution, ResolvedScanExecution::AdmittedConnectorRead(_))
             }
-            crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
-            | crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => {
+            novarocks_sql::plan_read::table::SqlScanKind::MvTargetState { .. }
+            | novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator { .. } => {
                 matches!(execution, ResolvedScanExecution::AdmittedConnectorRead(_))
             }
-            crate::sql::planner::table::SqlScanKind::Metadata { .. } => {
+            novarocks_sql::plan_read::table::SqlScanKind::Metadata { .. } => {
                 matches!(execution, ResolvedScanExecution::AdmittedConnectorRead(_))
             }
         },
@@ -494,15 +495,17 @@ fn validate_resolved_execution_kind(
     }
     let required = match source {
         ScanSource::Sql(sql_source) => match sql_source.kind {
-            crate::sql::planner::table::SqlScanKind::ConnectorRead => "ConnectorRead",
-            crate::sql::planner::table::SqlScanKind::Delta { .. } => "IcebergDelta",
-            crate::sql::planner::table::SqlScanKind::Metadata { .. } => "AdmittedConnectorRead",
-            crate::sql::planner::table::SqlScanKind::Data { .. }
-            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => {
+            novarocks_sql::plan_read::table::SqlScanKind::ConnectorRead => "ConnectorRead",
+            novarocks_sql::plan_read::table::SqlScanKind::Delta { .. } => "IcebergDelta",
+            novarocks_sql::plan_read::table::SqlScanKind::Metadata { .. } => {
                 "AdmittedConnectorRead"
             }
-            crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
-            | crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => {
+            novarocks_sql::plan_read::table::SqlScanKind::Data { .. }
+            | novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet { .. } => {
+                "AdmittedConnectorRead"
+            }
+            novarocks_sql::plan_read::table::SqlScanKind::MvTargetState { .. }
+            | novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator { .. } => {
                 "AdmittedConnectorRead"
             }
         },
@@ -519,12 +522,12 @@ fn reject_target_equality_deletes(
     execution: &ResolvedScanExecution,
 ) -> Result<(), String> {
     let target_kind = match source {
-        ScanSource::Sql(crate::sql::planner::table::SqlScanSource {
-            kind: crate::sql::planner::table::SqlScanKind::MvTargetState { .. },
+        ScanSource::Sql(novarocks_sql::plan_read::table::SqlScanSource {
+            kind: novarocks_sql::plan_read::table::SqlScanKind::MvTargetState { .. },
             ..
         }) => "target-state",
-        ScanSource::Sql(crate::sql::planner::table::SqlScanSource {
-            kind: crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. },
+        ScanSource::Sql(novarocks_sql::plan_read::table::SqlScanSource {
+            kind: novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator { .. },
             ..
         }) => "target-locator",
         _ => return Ok(()),
@@ -539,13 +542,19 @@ fn reject_target_equality_deletes(
 fn scan_source_kind(source: &ScanSource) -> &'static str {
     match source {
         ScanSource::Sql(source) => match source.kind {
-            crate::sql::planner::table::SqlScanKind::ConnectorRead => "SqlConnectorRead",
-            crate::sql::planner::table::SqlScanKind::Data { .. } => "SqlData",
-            crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => "SqlFrozenInputSet",
-            crate::sql::planner::table::SqlScanKind::Metadata { .. } => "SqlMetadata",
-            crate::sql::planner::table::SqlScanKind::Delta { .. } => "SqlDelta",
-            crate::sql::planner::table::SqlScanKind::MvTargetState { .. } => "SqlMvTargetState",
-            crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => "SqlMvTargetLocator",
+            novarocks_sql::plan_read::table::SqlScanKind::ConnectorRead => "SqlConnectorRead",
+            novarocks_sql::plan_read::table::SqlScanKind::Data { .. } => "SqlData",
+            novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet { .. } => {
+                "SqlFrozenInputSet"
+            }
+            novarocks_sql::plan_read::table::SqlScanKind::Metadata { .. } => "SqlMetadata",
+            novarocks_sql::plan_read::table::SqlScanKind::Delta { .. } => "SqlDelta",
+            novarocks_sql::plan_read::table::SqlScanKind::MvTargetState { .. } => {
+                "SqlMvTargetState"
+            }
+            novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator { .. } => {
+                "SqlMvTargetLocator"
+            }
         },
     }
 }
@@ -553,7 +562,7 @@ fn scan_source_kind(source: &ScanSource) -> &'static str {
 fn scan_source_context(source: &ScanSource) -> String {
     match source {
         ScanSource::Sql(sql_source) => match sql_source.kind {
-            crate::sql::planner::table::SqlScanKind::Delta {
+            novarocks_sql::plan_read::table::SqlScanKind::Delta {
                 from_snapshot_id,
                 to_snapshot_id,
             } => format!(

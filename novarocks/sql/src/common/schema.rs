@@ -19,7 +19,11 @@ use arrow::datatypes::DataType;
 
 use crate::column_id::ColumnId;
 
-pub(crate) type CteId = u32;
+/// Query-local identifier of one already-sealed common-table-expression.
+///
+/// This scalar carries no planner construction capability; execution uses it
+/// only to correlate CTE producer and consumer artifacts in the same plan.
+pub type CteId = u32;
 
 #[derive(Clone, Debug)]
 pub struct OutputColumn {

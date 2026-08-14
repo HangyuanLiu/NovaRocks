@@ -27,12 +27,12 @@ use crate::mv::persistence::definition::{
 use crate::mv::repository::MvRepository;
 use crate::query_execution::StatementResult;
 use crate::query_execution::kernels::MvExecutionKernel;
-use crate::sql::parser::ast::{
+use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_sql::parser::ast::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
     DropMaterializedViewStmt, MaterializedViewRefreshPolicy, ShowMaterializedViewsStmt,
 };
-use crate::sql::parser::query_refs::extract_three_part_table_ref_occurrences;
-use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_sql::parser::query_refs::extract_three_part_table_ref_occurrences;
 
 #[cfg(any())]
 mod lifecycle_tests {
@@ -182,11 +182,11 @@ mod lifecycle_tests {
     }
 
     fn refresh_request() -> RefreshRequest {
-        let stmt = match crate::sql::parser::parse_sql("REFRESH MATERIALIZED VIEW mv1")
+        let stmt = match novarocks_sql::parser::parse_sql("REFRESH MATERIALIZED VIEW mv1")
             .expect("parse")
             .remove(0)
         {
-            crate::sql::parser::ast::Statement::RefreshMaterializedView(stmt) => stmt,
+            novarocks_sql::parser::ast::Statement::RefreshMaterializedView(stmt) => stmt,
             other => panic!("unexpected statement: {other:?}"),
         };
         RefreshRequest {
@@ -409,7 +409,7 @@ fn load_definition_for_alter(
     repository: &dyn MvRepository,
     current_catalog: Option<&str>,
     db: &str,
-    name: &crate::sql::parser::ast::ObjectName,
+    name: &novarocks_sql::parser::ast::ObjectName,
 ) -> Result<StoredMvDefinition, String> {
     let target = crate::mv::iceberg_refresh::resolve_refresh_target(current_catalog, db, name)?;
     let Some(definition) = repository
@@ -779,9 +779,9 @@ mod tests {
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =
-            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize sql");
+            novarocks_sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize sql");
         let statement =
-            crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse sql");
+            novarocks_sql::parser::parse_normalized_sql_raw(&normalized).expect("parse sql");
         let sqlparser::ast::Statement::Query(query) = statement else {
             panic!("expected query");
         };

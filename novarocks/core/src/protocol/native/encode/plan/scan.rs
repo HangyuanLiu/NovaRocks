@@ -28,12 +28,12 @@ use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::preparation::scan::{
     ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution,
 };
-use crate::sql::plan_read::table as table_model;
-use crate::sql::plan_read::{
+use novarocks_protocol::{common, plan};
+use novarocks_sql::plan_read::table as table_model;
+use novarocks_sql::plan_read::{
     ColumnId, ExchangeFlavor, ExchangeReceiver, OutputColumn as AnalysisOutputColumn, PlanScanNode,
     ScanVariantColumn,
 };
-use novarocks_protocol::{common, plan};
 
 pub(super) fn encode_scan_node(
     src: &PlanScanNode,
@@ -651,9 +651,8 @@ mod tests {
 
     use super::{encode_bound_scan_output_column, encode_connector_expected_schema_ipc};
     use crate::query_execution::preparation::scan::{ResolvedScanColumn, ResolvedScanColumnKind};
-    use crate::sql::analysis::OutputColumn;
-    use crate::sql::column_id::ColumnId;
     use novarocks_protocol::common;
+    use novarocks_sql::plan_read::{ColumnId, OutputColumn};
 
     #[test]
     fn connector_expected_schema_uses_domain_columns_not_encoded_type_desc() {

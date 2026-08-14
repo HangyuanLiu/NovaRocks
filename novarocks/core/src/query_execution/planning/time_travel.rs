@@ -24,15 +24,15 @@ use crate::query_execution::compiler::CatalogServiceSource;
 use crate::query_execution::kernels::{
     DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
 };
-use crate::sql::analyzer::iceberg_ref::{
+use novarocks_catalog::schema::ColumnDef;
+use novarocks_spi::connector::{ConnectorReadReferenceFacts, ConnectorReadReferenceKind};
+use novarocks_sql::analyzer::iceberg_ref::{
     IcebergRefKind, SqlIcebergNamedRef, SqlIcebergRefMetadata, SqlIcebergSnapshotLog,
     resolve_read_binding,
 };
-use crate::sql::parser::ast::ObjectName;
+use novarocks_sql::parser::ast::ObjectName;
 #[cfg(test)]
-use crate::sql::planner::table::{ScanSource, TableDef};
-use novarocks_catalog::schema::ColumnDef;
-use novarocks_spi::connector::{ConnectorReadReferenceFacts, ConnectorReadReferenceKind};
+use novarocks_sql::planner::table::{ScanSource, TableDef};
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
@@ -567,12 +567,12 @@ fn stamp_delta_table_def_change_ops(
 #[cfg(test)]
 mod tests {
     use crate::query_execution::planning::time_travel::IcebergFileForQuery;
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use novarocks_sql::planner::table::{ScanSource, TableDef};
 
     fn test_sql_source() -> ScanSource {
-        crate::sql::planner::table::test_sql_scan_source(
-            crate::sql::planner::table::SqlScanKind::FrozenInputSet {
-                version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(1),
+        novarocks_sql::planner::table::test_sql_scan_source(
+            novarocks_sql::planner::table::SqlScanKind::FrozenInputSet {
+                version: novarocks_sql::planner::table::SqlTableVersionSelector::Snapshot(1),
             },
         )
     }
@@ -584,7 +584,7 @@ mod tests {
     }
 
     fn parse_query_for_table_names(sql: &str) -> sqlparser::ast::Query {
-        let stmt = crate::sql::parser::parse_sql_raw(sql).expect("parse sql");
+        let stmt = novarocks_sql::parser::parse_sql_raw(sql).expect("parse sql");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query statement");
         };

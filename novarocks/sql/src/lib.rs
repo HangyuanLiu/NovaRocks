@@ -28,7 +28,11 @@ pub(crate) mod literal;
 pub mod mv_refresh;
 pub(crate) mod parser;
 pub mod plan_read;
+pub mod planning;
 pub mod syntax;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 pub(crate) mod optimizer;
 

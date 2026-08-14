@@ -33,11 +33,11 @@ pub(crate) mod topology;
 mod validation;
 pub(crate) mod write;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_support;
 
 pub use boundary::{BoundaryCatalog, ExecutionColumnIdAllocator};
-pub(crate) use boundary::{BoundaryColumn, BoundaryContract, BoundaryKind, ExecutionColumnId};
+pub use boundary::{BoundaryColumn, BoundaryContract, BoundaryKind, ExecutionColumnId};
 pub use fragment::{DataPartition, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
 pub use fragment::{DataSink, PartitionKind, PlanFragment};
 pub(crate) use node::distributed_kind_from_physical;

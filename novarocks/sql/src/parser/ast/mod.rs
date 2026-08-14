@@ -17,13 +17,13 @@
 // under the License.
 
 pub mod iceberg_ref;
-pub(crate) use iceberg_ref::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
+pub use iceberg_ref::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
 
 use novarocks_catalog::partition::LegacyRangePartition;
 use novarocks_catalog::schema::SqlType;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CreateCatalogStmt {
+pub struct CreateCatalogStmt {
     pub name: String,
     pub properties: Vec<(String, String)>,
     pub if_not_exists: bool,
@@ -35,7 +35,7 @@ pub(crate) struct CreateDatabaseStmt {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct CreateTableStmt {
+pub struct CreateTableStmt {
     pub name: ObjectName,
     pub kind: CreateTableKind,
     pub legacy_range_partitions: Vec<LegacyRangePartition>,
@@ -50,20 +50,20 @@ pub(crate) struct CreateTableStmt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DropCatalogStmt {
+pub struct DropCatalogStmt {
     pub name: String,
     pub if_exists: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DropDatabaseStmt {
+pub struct DropDatabaseStmt {
     pub name: ObjectName,
     pub if_exists: bool,
     pub force: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum CreateTableKind {
+pub enum CreateTableKind {
     Iceberg {
         columns: Vec<TableColumnDef>,
         key_desc: Option<TableKeyDesc>,
@@ -79,7 +79,7 @@ pub(crate) enum CreateTableKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum IcebergPartitionFieldExpr {
+pub enum IcebergPartitionFieldExpr {
     Identity { column: String },
     Year { column: String },
     Month { column: String },
@@ -91,7 +91,7 @@ pub(crate) enum IcebergPartitionFieldExpr {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum AlterIcebergPartitionSpecStmt {
+pub enum AlterIcebergPartitionSpecStmt {
     AddPartitionColumn {
         table: ObjectName,
         field: IcebergPartitionFieldExpr,
@@ -103,7 +103,7 @@ pub(crate) enum AlterIcebergPartitionSpecStmt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DropTableStmt {
+pub struct DropTableStmt {
     pub name: ObjectName,
     pub if_exists: bool,
     pub force: bool,
@@ -256,13 +256,13 @@ pub(crate) enum Statement {
 /// `DELETE FROM <table>` (no filter) is rejected — the spec recommends
 /// `INSERT OVERWRITE t SELECT * FROM t WHERE FALSE` for the truncate use case.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct DeleteStmt {
+pub struct DeleteStmt {
     pub table: ObjectName,
     pub where_clause: sqlparser::ast::Expr,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct UpdateStmt {
+pub struct UpdateStmt {
     pub table: ObjectName,
     pub alias: Option<String>,
     pub assignments: Vec<UpdateAssignment>,
@@ -271,13 +271,13 @@ pub(crate) struct UpdateStmt {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct UpdateAssignment {
+pub struct UpdateAssignment {
     pub column: String,
     pub value: sqlparser::ast::Expr,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum MutationSource {
+pub enum MutationSource {
     Table {
         name: ObjectName,
         alias: Option<String>,
@@ -294,7 +294,7 @@ pub(crate) enum MutationSource {
 /// predicate. `WHEN NOT MATCHED BY SOURCE` and lateral source subqueries are
 /// rejected at conversion time.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct MergeStmt {
+pub struct MergeStmt {
     pub table: ObjectName,
     pub target_alias: Option<String>,
     pub source: MutationSource,
@@ -304,20 +304,20 @@ pub(crate) struct MergeStmt {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct MergeWhenClause<A> {
+pub struct MergeWhenClause<A> {
     /// Optional `AND <expr>` predicate refining the clause.
     pub predicate: Option<sqlparser::ast::Expr>,
     pub action: A,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum MergeMatchedAction {
+pub enum MergeMatchedAction {
     Update { assignments: Vec<UpdateAssignment> },
     Delete,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct MergeNotMatchedAction {
+pub struct MergeNotMatchedAction {
     /// Target columns named in `INSERT (a, b, c)`. Empty when omitted (callers
     /// must align the values with the target schema in column order).
     pub columns: Vec<String>,
@@ -328,7 +328,7 @@ pub(crate) struct MergeNotMatchedAction {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct TableColumnDef {
+pub struct TableColumnDef {
     pub name: String,
     pub data_type: SqlType,
     pub nullable: bool,
@@ -337,13 +337,13 @@ pub(crate) struct TableColumnDef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TableKeyDesc {
+pub struct TableKeyDesc {
     pub kind: TableKeyKind,
     pub columns: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TableKeyKind {
+pub enum TableKeyKind {
     Duplicate,
     Unique,
     Aggregate,
@@ -351,7 +351,7 @@ pub(crate) enum TableKeyKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ColumnAggregation {
+pub enum ColumnAggregation {
     Sum,
     Min,
     Max,
@@ -368,7 +368,7 @@ pub(crate) enum ColumnAggregation {
 /// columns.  `Null` is the sentinel for `DEFAULT NULL` and is NOT persisted
 /// into the Iceberg metadata; it only suppresses duplicate-DEFAULT diagnostics.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum DefaultLiteral {
+pub enum DefaultLiteral {
     Null,
     Bool(bool),
     Int(i64),
@@ -381,7 +381,7 @@ pub(crate) enum DefaultLiteral {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ObjectName {
+pub struct ObjectName {
     pub parts: Vec<String>,
 }
 
@@ -479,7 +479,7 @@ pub(crate) enum LogicalOp {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Literal {
+pub enum Literal {
     Null,
     Bool(bool),
     Int(i64),

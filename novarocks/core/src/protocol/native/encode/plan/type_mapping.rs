@@ -16,13 +16,13 @@
 // under the License.
 
 use super::super::expr::encode_expr;
-use crate::sql::plan_read::{
-    AggMode, DataPartition, HashSource, JoinDistribution, JoinExecutionMode, JoinKind,
-    PartitionKind, PlanSetOpKind, RedistributeMode, SqlTopNType, TopNPhase,
-};
 use novarocks_catalog::schema::SqlType;
 use novarocks_protocol::{common, plan};
 use novarocks_spi::connector::ConnectorRowMutationEffect;
+use novarocks_sql::plan_read::{
+    AggMode, DataPartition, HashSource, JoinDistribution, JoinExecutionMode, JoinKind,
+    PartitionKind, PlanSetOpKind, RedistributeMode, SqlTopNType, TopNPhase,
+};
 
 pub(super) fn encode_sql_type(src: &SqlType) -> Result<common::TypeDesc, String> {
     use common::type_desc::Kind;

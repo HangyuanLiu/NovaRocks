@@ -23,8 +23,8 @@
 
 use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::preparation::scan::{ResolvedScanExecution, ScanBindingResolver};
-use crate::sql::planner::payload::PlanScanNode;
-use crate::sql::planner::table::{ScanSource, SqlScanKind};
+use novarocks_sql::planner::payload::PlanScanNode;
+use novarocks_sql::planner::table::{ScanSource, SqlScanKind};
 
 /// Exact query-local delta lookup.  It intentionally accepts neither a
 /// refresh context nor a catalog/registry, so it cannot reacquire metadata or
@@ -90,9 +90,9 @@ mod tests {
         QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
     };
     use crate::query_execution::preparation::scan::ResolvedScanExecution;
-    use crate::sql::catalog::ResolvedAnalyzerTable;
-    use crate::sql::planner::payload::PlanScanNode;
-    use crate::sql::planner::table::{
+    use novarocks_sql::catalog::ResolvedAnalyzerTable;
+    use novarocks_sql::planner::payload::PlanScanNode;
+    use novarocks_sql::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
     };
 
@@ -130,7 +130,7 @@ mod tests {
     }
 
     fn delta_scan(
-        binding: crate::sql::binding::SqlTableBindingId,
+        binding: novarocks_sql::binding::SqlTableBindingId,
         from_snapshot_id: i64,
         to_snapshot_id: i64,
     ) -> PlanScanNode {
@@ -163,7 +163,7 @@ mod tests {
         }
     }
 
-    fn binding_with_delta(binding: crate::sql::binding::SqlTableBindingId) -> QueryTableBinding {
+    fn binding_with_delta(binding: novarocks_sql::binding::SqlTableBindingId) -> QueryTableBinding {
         let source = ScanSource::Sql(SqlScanSource::new(
             binding,
             SqlTableIdentity {

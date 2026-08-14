@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use crate::sql::plan_read::OutputColumn;
+use novarocks_sql::plan_read::OutputColumn;
 
 pub(super) fn encode_fragment_output_contract(
     src: &PlanFragment,

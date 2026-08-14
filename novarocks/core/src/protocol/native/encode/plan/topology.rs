@@ -18,7 +18,7 @@
 use super::type_mapping::{encode_data_partition, encode_edge_partition_type};
 use super::write::{encode_change_stream_router_sink, encode_connector_write_fragment_sink};
 use super::*;
-use crate::sql::plan_read::FragmentId;
+use novarocks_sql::plan_read::FragmentId;
 
 pub(super) fn attach_stream_sinks(
     src: &DistributedPlan,

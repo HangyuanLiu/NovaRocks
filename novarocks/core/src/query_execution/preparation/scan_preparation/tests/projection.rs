@@ -36,9 +36,9 @@ fn version_scan_without_required_columns_rejects_unmaterializable_planner_output
     scan.required_columns = None;
     scan.columns
         .push(column(99, "stale_planner_only", DataType::Utf8, true));
-    scan.table.source = crate::sql::planner::table::test_sql_scan_source(
-        crate::sql::planner::table::SqlScanKind::Data {
-            version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(6),
+    scan.table.source = novarocks_sql::plan_read::table::test_sql_scan_source(
+        novarocks_sql::plan_read::table::SqlScanKind::Data {
+            version: novarocks_sql::plan_read::table::SqlTableVersionSelector::Snapshot(6),
         },
     );
     let plan = plan(root);
@@ -85,9 +85,9 @@ fn target_locator_projection_preserves_planner_ids_and_metadata_contract() {
         column(13, ICEBERG_ROW_ID_COL, DataType::Int64, false),
         column(14, ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true),
     ];
-    scan.table.source = crate::sql::planner::table::test_sql_scan_source(
-        crate::sql::planner::table::SqlScanKind::MvTargetLocator {
-            facts: crate::sql::planner::table::SqlMvTargetLocatorScan {
+    scan.table.source = novarocks_sql::plan_read::table::test_sql_scan_source(
+        novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator {
+            facts: novarocks_sql::plan_read::table::SqlMvTargetLocatorScan {
                 target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
                 target_snapshot_id: Some(6),
                 apply_key_column: "id".to_string(),
@@ -169,9 +169,9 @@ fn target_state_projection_keeps_declared_columns_and_row_lineage_ids() {
         column(13, ICEBERG_ROW_ID_COL, DataType::Int64, false),
         column(14, ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true),
     ];
-    scan.table.source = crate::sql::planner::table::test_sql_scan_source(
-        crate::sql::planner::table::SqlScanKind::MvTargetState {
-            facts: crate::sql::planner::table::SqlMvTargetStateScan {
+    scan.table.source = novarocks_sql::plan_read::table::test_sql_scan_source(
+        novarocks_sql::plan_read::table::SqlScanKind::MvTargetState {
+            facts: novarocks_sql::plan_read::table::SqlMvTargetStateScan {
                 target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
                 target_snapshot_id: Some(6),
                 aggregate_state_layout_version: 1,
@@ -181,12 +181,12 @@ fn target_state_projection_keeps_declared_columns_and_row_lineage_ids() {
                 physical_column_names: vec!["id".to_string(), "agg".to_string()],
                 row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
                 row_filter:
-                    crate::sql::planner::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
+                    novarocks_sql::plan_read::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
                         row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
                         branch_scope: None,
                     },
                 partition_constraint:
-                    crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::Unpartitioned,
+                    novarocks_sql::plan_read::table::SqlMvTargetStatePartitionConstraint::Unpartitioned,
             },
         },
     );
@@ -282,7 +282,7 @@ fn variant_synthetic_output_is_not_prepared_as_a_physical_column() {
         },
     ];
     scan.required_columns = Some(vec!["__nr_var_v_0".to_string()]);
-    scan.variant_columns = vec![crate::sql::common::ScanVariantColumn {
+    scan.variant_columns = vec![novarocks_sql::common::ScanVariantColumn {
         source_column_id: ColumnId::new_for_test(1),
         source_column: "v".to_string(),
         synthetic_column_id: ColumnId::new_for_test(2),

@@ -31,10 +31,8 @@ use crate::query_execution::preparation::{
     PreparedFragmentRole, PreparedFragmentSet, PreparedOutputColumn,
 };
 use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
-use crate::sql::analysis::cte::CteId;
-use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::{FragmentEdge, FragmentEdgeKind, FragmentId};
 use novarocks_execution::exec::chunk::Chunk;
+use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdge, FragmentEdgeKind, FragmentId};
 
 pub(crate) fn align_fetch_chunks_to_output_columns(
     chunks: Vec<Chunk>,
@@ -938,10 +936,10 @@ mod tests {
 
     use super::*;
     use crate::common::types::UniqueId;
-    use crate::sql::planner::distributed::{DataPartition, FragmentStreamKind};
     use novarocks_execution::exec::chunk::ChunkSchema;
     use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
     use novarocks_protocol::plan as native_plan;
+    use novarocks_sql::plan_read::{DataPartition, FragmentStreamKind};
     use novarocks_types::SlotId;
 
     fn placement(fragment_id: FragmentId, instance_lo: i64) -> FragmentInstancePlacement {

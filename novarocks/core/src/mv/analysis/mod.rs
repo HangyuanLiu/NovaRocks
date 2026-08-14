@@ -24,14 +24,14 @@ mod refresh_property_contract_tests;
 
 use std::collections::HashSet;
 
-use crate::mv::aggregate_state::mv_shape::AggregateMvShape;
 use crate::mv::aggregate_state::sql_type::arrow_data_type_to_sql_type;
-use crate::sql::analysis::{OutputColumn, QueryBody, ResolvedQuery};
-use crate::sql::column_id::ColumnId;
-use crate::sql::parser::ast::{
+use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_sql::analysis::{OutputColumn, QueryBody, ResolvedQuery};
+use novarocks_sql::column_id::ColumnId;
+use novarocks_sql::parser::ast::{
     IcebergPartitionFieldExpr, MaterializedViewDistribution, ObjectName, TableColumnDef,
 };
-use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_sql::planning::mv::AggregateMvShape;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResolvedTableRef {
@@ -98,7 +98,7 @@ fn prepare_mv_select_with_catalog_paths(
     let resolved_refs = collect_table_refs_from_query(query, current_catalog, current_database);
     let mut query_for_analysis = query.clone();
     if !retain_catalog_paths && has_three_part_refs(&resolved_refs) {
-        crate::sql::parser::query_refs::strip_catalog_from_three_part_names(
+        novarocks_sql::parser::query_refs::strip_catalog_from_three_part_names(
             &mut query_for_analysis,
         );
     }
@@ -762,14 +762,14 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::sql::analysis::ResolvedQuery;
-    use crate::sql::catalog::local::PlannerMemoryCatalog;
+    use novarocks_sql::analysis::ResolvedQuery;
+    use novarocks_sql::catalog::local::PlannerMemoryCatalog;
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =
-            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize query");
+            novarocks_sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize query");
         let statement =
-            crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse query");
+            novarocks_sql::parser::parse_normalized_sql_raw(&normalized).expect("parse query");
         let sqlparser::ast::Statement::Query(query) = statement else {
             panic!("expected query")
         };
@@ -779,7 +779,7 @@ mod tests {
     fn analyze_literal_query(sql: &str) -> ResolvedQuery {
         let query = parse_query(sql);
         let catalog = PlannerMemoryCatalog::default();
-        let (resolved, _, _) = crate::sql::analyzer::analyze(&query, &catalog, "default")
+        let (resolved, _, _) = novarocks_sql::analyzer::analyze(&query, &catalog, "default")
             .expect("analyze literal query");
         resolved
     }
@@ -876,7 +876,7 @@ mod tests {
     fn resolve_mv_name_accepts_supported_forms_and_rejects_non_default_catalog() {
         assert_eq!(
             resolve_mv_name(
-                &crate::sql::parser::ast::ObjectName {
+                &novarocks_sql::parser::ast::ObjectName {
                     parts: vec!["Orders".to_string()],
                 },
                 "Sales",
@@ -885,7 +885,7 @@ mod tests {
         );
         assert_eq!(
             resolve_mv_name(
-                &crate::sql::parser::ast::ObjectName {
+                &novarocks_sql::parser::ast::ObjectName {
                     parts: vec!["Marketing".to_string(), "Orders".to_string()],
                 },
                 "Sales",
@@ -894,7 +894,7 @@ mod tests {
         );
         assert_eq!(
             resolve_mv_name(
-                &crate::sql::parser::ast::ObjectName {
+                &novarocks_sql::parser::ast::ObjectName {
                     parts: vec![
                         "default_catalog".to_string(),
                         "Marketing".to_string(),
@@ -907,7 +907,7 @@ mod tests {
         );
         assert_eq!(
             resolve_mv_name(
-                &crate::sql::parser::ast::ObjectName {
+                &novarocks_sql::parser::ast::ObjectName {
                     parts: vec![
                         "ice".to_string(),
                         "Marketing".to_string(),

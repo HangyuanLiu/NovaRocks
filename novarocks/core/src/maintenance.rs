@@ -42,7 +42,6 @@ use crate::connector::metadata_maintenance::{
 use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::cancellation::QueryCancellationView;
 use crate::runtime::query_result::QueryResult;
-use crate::sql::parser::dialect::StarRocksDialect;
 use novarocks_spi::connector::{
     BatchReceipt, CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupPlan,
     ConnectorDistributedRewriteAttemptCheckpoint, ConnectorDistributedRewriteReceipt,
@@ -50,6 +49,7 @@ use novarocks_spi::connector::{
     ConnectorWriteCohortId, ConnectorWriteInputShape, ConnectorWriteReceipt,
     ExternalMutationEvidence, ExternalMutationOutcome, PreparedBatch,
 };
+use novarocks_sql::syntax::StarRocksDialect;
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";
 
@@ -860,7 +860,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
     ) -> Result<MaintenanceTarget, String> {
         let target = crate::catalog_application::resolver::resolve_existing_table_target(
             &self.kernel,
-            &crate::sql::parser::ast::ObjectName {
+            &novarocks_sql::syntax::ObjectName {
                 parts: name_parts.to_vec(),
             },
             context.current_catalog,
@@ -1569,19 +1569,19 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             source_binding,
         );
     let target_binding =
-        crate::query_execution::planning::write_sink::admit_prepared_connector_write_target(
+        crate::query_execution::planning::write_sink::admit_prepared_frozen_connector_write_target(
             table_bindings.as_ref(),
             rewrite_target_identity(session, cohort_id),
             cohort.preparation().clone(),
             session.lease().planning_lease(),
         )?;
-    let sink = crate::query_execution::planning::write_sink::sql_write_plan_input_for_admitted_target(
-        table_bindings.as_ref(),
-        target_binding,
-        rewrite_sink_mode(cohort.preparation().input())?,
-        crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
-        None,
-    )?;
+    let sink =
+        crate::query_execution::planning::write_sink::dml_write_plan_input_for_admitted_target(
+            table_bindings.as_ref(),
+            target_binding,
+            rewrite_sink_mode(cohort.preparation().input())?,
+            novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        )?;
     let registration = session
         .execution_registration(cohort_id)
         .map_err(|error| format!("register frozen rewrite cohort: {error}"))?;
@@ -1592,7 +1592,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             Some(execution.topology().targets().len() as f64);
     }
     let distributed_plan =
-        crate::sql::planner::pipeline::build_sql_write_distributed_plan_with_settings(
+        novarocks_sql::planning::dml::build_frozen_connector_write_distributed_plan(
             physical_plan,
             sink,
             &optimizer_settings,
@@ -1622,38 +1622,46 @@ fn prepare_frozen_rewrite_cohort_with_ports(
 fn rewrite_target_identity(
     session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
     cohort_id: ConnectorWriteCohortId,
-) -> crate::sql::planner::table::SqlTableIdentity {
-    crate::sql::planner::table::SqlTableIdentity {
-        catalog: session
+) -> novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity {
+    novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::new(
+        session
             .lease()
             .binding_key()
             .instance_id
             .as_str()
             .to_string(),
-        namespace: "__connector_rewrite".to_string(),
-        table: format!("cohort_{}", hex::encode(cohort_id.to_bytes())),
-    }
+        "__connector_rewrite",
+        format!("cohort_{}", hex::encode(cohort_id.to_bytes())),
+    )
 }
 
 fn rewrite_sink_mode(
     input: &ConnectorWriteInputShape,
-) -> Result<crate::sql::planner::distributed::write::contract::SqlWriteSinkMode, String> {
-    use crate::sql::planner::distributed::write::contract::SqlWriteSinkMode;
-
+) -> Result<novarocks_sql::planning::dml::DmlWriteSinkMode, String> {
     match input {
-        ConnectorWriteInputShape::Data { .. } => Ok(SqlWriteSinkMode::Data),
-        ConnectorWriteInputShape::RowLineage { .. } => Ok(SqlWriteSinkMode::RowLineageData),
-        ConnectorWriteInputShape::PositionDelete { .. } => Ok(SqlWriteSinkMode::PositionDeletes),
-        ConnectorWriteInputShape::DeletionVector { .. } => Ok(SqlWriteSinkMode::DeletionVectors),
-        ConnectorWriteInputShape::EqualityDelete { .. } => Ok(SqlWriteSinkMode::EqualityDeletes),
+        ConnectorWriteInputShape::Data { .. } => {
+            Ok(novarocks_sql::planning::dml::DmlWriteSinkMode::Data)
+        }
+        ConnectorWriteInputShape::RowLineage { .. } => {
+            Ok(novarocks_sql::planning::dml::DmlWriteSinkMode::RowLineageData)
+        }
+        ConnectorWriteInputShape::PositionDelete { .. } => {
+            Ok(novarocks_sql::planning::dml::DmlWriteSinkMode::PositionDeletes)
+        }
+        ConnectorWriteInputShape::DeletionVector { .. } => {
+            Ok(novarocks_sql::planning::dml::DmlWriteSinkMode::DeletionVectors)
+        }
+        ConnectorWriteInputShape::EqualityDelete { .. } => {
+            Ok(novarocks_sql::planning::dml::DmlWriteSinkMode::EqualityDeletes)
+        }
     }
 }
 
 pub(crate) fn looks_like_maintenance_statement(sql: &str) -> bool {
-    if crate::sql::parser::procedure::looks_like_call_procedure(sql) {
+    if novarocks_sql::syntax::looks_like_call_procedure(sql) {
         return true;
     }
-    let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
+    let Ok(normalized) = novarocks_sql::syntax::normalize_for_raw_parse(sql) else {
         return false;
     };
     let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {

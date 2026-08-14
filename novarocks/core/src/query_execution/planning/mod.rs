@@ -29,8 +29,8 @@ pub(crate) mod write_sink;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::query_execution::cancellation::QueryCancellationView;
-use crate::sql::compiler::{SqlCancellationObservation, SqlCompileRequest};
-use crate::sql::explain::distributed::{
+use novarocks_sql::compiler::{SqlCancellationObservation, SqlCompileRequest};
+use novarocks_sql::explain::distributed::{
     SqlExplainProfile, SqlFragmentProfile, SqlFragmentProfileView, SqlOperatorMetrics,
     SqlOperatorProfileView,
 };

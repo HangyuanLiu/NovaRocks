@@ -26,7 +26,7 @@
 //! Decisions are explicit. There is NO fallback path: incompatible
 //! contracts result in fail-fast errors that propagate to the user.
 
-use crate::sql::planner::vocabulary::ApplyKeySource;
+use novarocks_sql::planner::vocabulary::ApplyKeySource;
 
 use super::model::{
     BranchFieldValidationError, ContractDecision, JoinContractDecision, JoinSchemaValidationError,
@@ -40,7 +40,7 @@ use crate::mv::storage_observation::{
     MvObservedTargetField, MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
     MvSchemaValidationPartitionTransform,
 };
-use crate::sql::planner::vocabulary::{
+use novarocks_sql::planner::vocabulary::{
     GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
 
@@ -623,7 +623,7 @@ mod tests {
         TargetContract, TargetVisibleColumn,
     };
     use crate::mv::storage_observation::MvSchemaValidationPartitionField;
-    use crate::sql::planner::vocabulary::{
+    use novarocks_sql::planner::vocabulary::{
         BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
         JOIN_APPLY_KEY_COLUMN_NAME,
     };

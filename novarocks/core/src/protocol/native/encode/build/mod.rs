@@ -22,8 +22,8 @@ use super::boundary_schema::{BoundarySchemaReport, project_boundary_reports};
 use crate::connector::ConnectorRegistry;
 use crate::query_execution::preparation::scan::ScanBindingResolver;
 use crate::query_execution::preparation::{PreparedFragmentSet, prepare_fragments};
-use crate::sql::catalog::PlannerTableProvider;
-use crate::sql::planner::distributed::DistributedPlan;
+use novarocks_sql::catalog::PlannerTableProvider;
+use novarocks_sql::plan_read::DistributedPlan;
 
 struct TestBuildRequest<'a> {
     distributed_plan: &'a DistributedPlan,

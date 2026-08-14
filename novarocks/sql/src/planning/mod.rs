@@ -15,6 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod mv_agg_state;
-pub(crate) mod physical_column;
-pub(crate) mod sql_type;
+//! Typed SQL-owned planning entry points.
+//!
+//! Unlike [`crate::plan_read`], this module owns construction and planning
+//! decisions.  Application crates use only the narrowly scoped contracts
+//! exposed by its children; they never import the SQL planner implementation.
+
+pub mod catalog;
+pub mod dml;
+pub mod mv;
+pub mod query_execution;

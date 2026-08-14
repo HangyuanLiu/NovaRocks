@@ -44,7 +44,7 @@ pub fn parse_delete_statement(sql: &str) -> Result<Option<sqlparser::ast::Delete
     if !sql[..keyword_end].eq_ignore_ascii_case("delete") {
         return Ok(None);
     }
-    match crate::sql::parser::parse_sql_raw(sql)? {
+    match novarocks_sql::planning::dml::parse_raw_statement(sql)? {
         sqlparser::ast::Statement::Delete(delete) => Ok(Some(delete)),
         _ => Ok(None),
     }

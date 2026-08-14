@@ -34,8 +34,8 @@ use crate::protocol::native::encode::NativeFragmentBundle;
 use crate::query_execution::compiler::NativeFragmentEncodingInput;
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::runtime::query_result::QueryResult;
-use crate::sql::mv_refresh::{MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget};
-use crate::sql::parser::ast::{
+use novarocks_sql::mv_refresh::{MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget};
+use novarocks_sql::parser::ast::{
     CreateMaterializedViewStmt, IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy, Statement,
 };
 

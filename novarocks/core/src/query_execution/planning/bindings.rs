@@ -29,16 +29,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::connector::backend::ResolvedTableStatisticsPin;
-use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
-use crate::sql::catalog::ResolvedAnalyzerTable;
-use crate::sql::planner::table::{
-    ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
-};
 use arrow::datatypes::SchemaRef;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
     ConnectorWritePreparation,
+};
+use novarocks_sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
+use novarocks_sql::catalog::ResolvedAnalyzerTable;
+use novarocks_sql::planner::table::{
+    ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
 };
 
 static NEXT_BINDING_SCOPE: AtomicU64 = AtomicU64::new(1);
@@ -716,29 +716,29 @@ mod tests {
     use super::{QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore};
 
     fn local_binding() -> QueryTableBinding {
-        let binding = crate::sql::binding::SqlTableBindingId::new(
-            crate::sql::binding::SqlTableBindingScopeId::new(
+        let binding = novarocks_sql::binding::SqlTableBindingId::new(
+            novarocks_sql::binding::SqlTableBindingScopeId::new(
                 std::num::NonZeroU64::new(1).expect("scope"),
             ),
             std::num::NonZeroU32::new(1).expect("ordinal"),
         );
         QueryTableBinding::local(
-            crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+            novarocks_sql::catalog::ResolvedAnalyzerTable::from_planner(
                 Some("default_catalog"),
                 "db",
-                crate::sql::planner::table::TableDef {
+                novarocks_sql::planner::table::TableDef {
                     name: "orders".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::planner::table::ScanSource::Sql(
-                        crate::sql::planner::table::SqlScanSource::new(
+                    source: novarocks_sql::planner::table::ScanSource::Sql(
+                        novarocks_sql::planner::table::SqlScanSource::new(
                             binding,
-                            crate::sql::planner::table::SqlTableIdentity {
+                            novarocks_sql::planner::table::SqlTableIdentity {
                                 catalog: "default_catalog".to_string(),
                                 namespace: "db".to_string(),
                                 table: "orders".to_string(),
                             },
-                            crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                            novarocks_sql::planner::table::SqlScanKind::ConnectorRead,
                         ),
                     ),
                 },
@@ -781,7 +781,7 @@ mod tests {
     fn sqlx2_binding_store_rejects_cross_request_tokens_before_submission() {
         let first = QueryTableBindingStore::try_new().expect("first store");
         let second = QueryTableBindingStore::try_new().expect("second store");
-        let token = crate::sql::binding::SqlTableBindingId::new(
+        let token = novarocks_sql::binding::SqlTableBindingId::new(
             first.scope(),
             std::num::NonZeroU32::new(1).expect("nonzero"),
         );
@@ -872,7 +872,7 @@ mod tests {
             "ice",
             "db",
             "orders",
-            crate::sql::planner::table::SqlMetadataTableKind::Snapshots,
+            novarocks_sql::planner::table::SqlMetadataTableKind::Snapshots,
         );
         let metadata = store
             .resolve_or_insert(metadata_key.clone(), || Ok(local_binding()))

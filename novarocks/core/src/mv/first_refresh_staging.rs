@@ -20,7 +20,7 @@ use crate::query_execution::planning::write_sink::{
     admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::sql::mv_refresh::first_refresh::{
+use novarocks_sql::mv_refresh::first_refresh::{
     SqlMvFirstRefreshArtifact, SqlMvFirstRefreshArtifactInput, SqlMvFirstRefreshPlanner,
     SqlMvFirstRefreshPlannerInput,
 };
@@ -36,7 +36,7 @@ pub(crate) fn frozen_logical_context_from_rewrite(
         mv_definition: (*rewrite.mv_definition).clone(),
         canonical_select_query: (*rewrite.canonical_select_query).clone(),
         base_refs: rewrite.base_refs.to_vec(),
-        pin: crate::sql::mv_refresh::first_refresh::SqlMvSnapshotPin::try_from_maps(
+        pin: novarocks_sql::mv_refresh::first_refresh::SqlMvSnapshotPin::try_from_maps(
             rewrite.pin.to_snapshot_map(),
             rewrite.pin.to_table_uuid_map(),
         )?,
@@ -90,7 +90,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
             let bindings = Arc::new(QueryTableBindingStore::try_new()?);
             let target_binding = admit_prepared_connector_write_target(
                 bindings.as_ref(),
-                crate::sql::planner::table::SqlTableIdentity {
+                novarocks_sql::planner::table::SqlTableIdentity {
                     catalog: target_catalog.clone(),
                     namespace: target_namespace.clone(),
                     table: target_name.clone(),
@@ -101,8 +101,8 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
             let sink = sql_write_plan_input_for_admitted_target(
                 bindings.as_ref(),
                 target_binding,
-                crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::Data,
-                crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                novarocks_sql::planner::distributed::write::contract::SqlWriteSinkMode::Data,
+                novarocks_sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
                 None,
             )?;
             let first_refresh = SqlMvFirstRefreshPlanner::plan(SqlMvFirstRefreshPlannerInput {
@@ -165,7 +165,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 )?;
             let write_target_binding = admit_prepared_connector_write_target(
                 bindings.as_ref(),
-                crate::sql::planner::table::SqlTableIdentity {
+                novarocks_sql::planner::table::SqlTableIdentity {
                     catalog: target_catalog.clone(),
                     namespace: target_namespace.clone(),
                     table: target_name.clone(),
@@ -176,8 +176,8 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
             let sink = sql_write_plan_input_for_admitted_target(
                 bindings.as_ref(),
                 write_target_binding,
-                crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::Data,
-                crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                novarocks_sql::planner::distributed::write::contract::SqlWriteSinkMode::Data,
+                novarocks_sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
                 None,
             )?;
             let (plan, factory) =
@@ -371,8 +371,8 @@ fn validate_frozen_join_base_facts(facts: &MvFirstRefreshLogicalContext) -> Resu
 }
 
 fn parse_query_from_sql(sql: &str) -> Result<sqlparser::ast::Query, String> {
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
-    let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)?;
+    let normalized = novarocks_sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let statement = novarocks_sql::parser::parse_normalized_sql_raw(&normalized)?;
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("MV first-refresh physical artifact is not a SELECT query".to_string());
     };

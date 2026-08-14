@@ -17,7 +17,7 @@ pub mod first_refresh;
 
 /// SQL classification of an aggregate state expression in an IMV plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AggregateFunctionKind {
+pub enum AggregateFunctionKind {
     Count,
     Sum,
     Avg,
@@ -31,7 +31,7 @@ pub(crate) enum AggregateFunctionKind {
 
 /// Stable visible-output ordering for an aggregate IMV plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum VisibleAggregateOutput {
+pub enum VisibleAggregateOutput {
     GroupKey(usize),
     Aggregate(usize),
 }
@@ -58,7 +58,7 @@ impl SqlMvTarget {
     }
 }
 
-pub(crate) const FULL_REFRESH_DISABLED_MESSAGE: &str = "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
+pub const FULL_REFRESH_DISABLED_MESSAGE: &str = "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
      its previous behavior (drop target + delete definition + recreate empty target) \
      was misleading and non-atomic. To recover from a broken contract or corrupted \
      target, run DROP MATERIALIZED VIEW <name>; CREATE MATERIALIZED VIEW <name> ...; \

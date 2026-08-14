@@ -17,8 +17,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::sql::planner::distributed::{DistributedNode, DistributedNodeKind, FragmentId};
-use crate::sql::planner::table::ScanSource;
+use novarocks_sql::plan_read::table::ScanSource;
+use novarocks_sql::plan_read::{DistributedNode, DistributedNodeKind, FragmentId};
 
 pub(super) fn validate_topology_roles(
     sealed_ids: &BTreeSet<FragmentId>,

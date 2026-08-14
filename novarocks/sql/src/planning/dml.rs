@@ -1,0 +1,1005 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! SQL-owned DML syntax and planning entrypoints.
+//!
+//! Application code may retain provider leases, write fences, and execution
+//! lifecycle state, but it must not reach into parser or optimizer internals.
+//! This submodule is the deliberately narrow handoff for those DML-specific
+//! facts.  Its module hook is installed by the SQL facade integration wave.
+
+pub use crate::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
+pub use crate::parser::dialect::add_files::{AddFilesCommand, classify_add_files};
+
+const ICEBERG_FILE_PATH_COLUMN: &str = "_file";
+const ICEBERG_ROW_POSITION_COLUMN: &str = "_pos";
+const ICEBERG_ROW_ID_COLUMN: &str = "_row_id";
+const ICEBERG_LAST_UPDATED_SEQUENCE_COLUMN: &str = "_last_updated_sequence_number";
+
+/// Parse one normalized raw statement for DML admission.  The returned AST is
+/// the upstream SQL parser's public syntax tree; NovaRocks custom syntax is
+/// normalized before this boundary.
+pub fn parse_raw_statement(sql: &str) -> Result<sqlparser::ast::Statement, String> {
+    crate::parser::parse_sql_raw(sql)
+}
+
+/// Application-owned DTO for the only custom statement shape that DML needs
+/// to inspect before catalog resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TruncateCommand {
+    pub target_parts: Vec<String>,
+    pub target_ref: String,
+}
+
+/// Classify one `TRUNCATE TABLE` command without performing a catalog lookup
+/// or opening a connector session.
+pub fn parse_truncate_command(sql: &str) -> Result<Option<TruncateCommand>, String> {
+    let trimmed = sql.trim_start();
+    let keyword_end = trimmed
+        .char_indices()
+        .find_map(|(index, ch)| (!ch.is_ascii_alphabetic()).then_some(index))
+        .unwrap_or(trimmed.len());
+    if !trimmed[..keyword_end].eq_ignore_ascii_case("truncate") {
+        return Ok(None);
+    }
+    let mut statements = crate::parser::parse_sql(trimmed)?;
+    if statements.len() != 1 {
+        return Err("TRUNCATE request must contain exactly one statement".to_string());
+    }
+    match statements.remove(0) {
+        crate::parser::ast::Statement::Truncate { name, target_ref } => Ok(Some(TruncateCommand {
+            target_parts: name.parts,
+            target_ref,
+        })),
+        _ => Ok(None),
+    }
+}
+
+/// Application-neutral classification of the statistics statements recognized
+/// by NovaRocks' dialect.  Catalog resolution and durable-job ownership stay
+/// outside SQL.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StatisticsCommand {
+    AnalyzeTable {
+        target_parts: Vec<String>,
+        columns: Vec<String>,
+    },
+    ShowAnalyzeJobs,
+    CancelAnalyze {
+        job_id: String,
+    },
+    ShowTableStats {
+        target_parts: Vec<String>,
+    },
+}
+
+/// Parse one complete statistics command.  A statement outside this dialect
+/// subset is reported as `None`, preserving the caller's normal SQL routing.
+pub fn parse_statistics_command(sql: &str) -> Result<Option<StatisticsCommand>, String> {
+    let normalized = crate::parser::dialect::normalize_for_raw_parse(sql)?;
+    let mut statements = match crate::parser::parse_sql(&normalized) {
+        Ok(statements) => statements,
+        Err(_) => return Ok(None),
+    };
+    if statements.len() != 1 {
+        return Err("statistics command accepts exactly one statement".to_string());
+    }
+    match statements.pop().expect("one checked statement") {
+        crate::parser::ast::Statement::AnalyzeTable(statement) => {
+            Ok(Some(StatisticsCommand::AnalyzeTable {
+                target_parts: statement.name.parts,
+                columns: statement.columns,
+            }))
+        }
+        crate::parser::ast::Statement::ShowAnalyzeJobs(_) => {
+            Ok(Some(StatisticsCommand::ShowAnalyzeJobs))
+        }
+        crate::parser::ast::Statement::CancelAnalyze(statement) => {
+            Ok(Some(StatisticsCommand::CancelAnalyze {
+                job_id: statement.job_id,
+            }))
+        }
+        crate::parser::ast::Statement::ShowTableStats(statement) => {
+            Ok(Some(StatisticsCommand::ShowTableStats {
+                target_parts: statement.name.parts,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The SQL-visible kind of terminal row-mutation writer.  This maps one
+/// provider-signed Arrow input shape to its immutable SQL write contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DmlWriteSinkMode {
+    Data,
+    RowLineageData,
+    PositionDeletes,
+    DeletionVectors,
+    EqualityDeletes,
+}
+
+impl From<DmlWriteSinkMode> for crate::planner::distributed::write::contract::SqlWriteSinkMode {
+    fn from(value: DmlWriteSinkMode) -> Self {
+        match value {
+            DmlWriteSinkMode::Data => Self::Data,
+            DmlWriteSinkMode::RowLineageData => Self::RowLineageData,
+            DmlWriteSinkMode::PositionDeletes => Self::PositionDeletes,
+            DmlWriteSinkMode::DeletionVectors => Self::DeletionVectors,
+            DmlWriteSinkMode::EqualityDeletes => Self::EqualityDeletes,
+        }
+    }
+}
+
+/// One provider-signed input field retained in a SQL terminal contract.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DmlWriteTargetField {
+    pub token: novarocks_spi::connector::ConnectorWriteFieldToken,
+    pub column: novarocks_catalog::schema::ColumnDef,
+    pub is_hidden: bool,
+}
+
+/// Immutable SQL facts for an already admitted write target.  The binding is
+/// only an opaque request-local token; no provider table or writer handle can
+/// cross into this value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DmlWriteTarget {
+    pub binding: crate::binding::SqlTableBindingId,
+    pub catalog: String,
+    pub namespace: String,
+    pub table: String,
+    pub fields: Vec<DmlWriteTargetField>,
+}
+
+/// Opaque SQL terminal write contract.  Application code can construct it
+/// from its admitted binding facts but cannot inspect or mutate the private
+/// planner contract afterwards.
+#[derive(Clone, Debug)]
+pub struct DmlWritePlanInput(crate::planner::distributed::write::contract::SqlWritePlanInput);
+
+impl DmlWritePlanInput {
+    pub fn try_new(
+        mode: DmlWriteSinkMode,
+        target: DmlWriteTarget,
+        input_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+        input: crate::plan_read::ConnectorWriteInputBinding,
+    ) -> Result<Self, String> {
+        use crate::planner::distributed::write::contract::{
+            SqlWriteSinkContract, SqlWriteSinkTargetContract, SqlWriteTargetField,
+        };
+        use crate::planner::table::SqlTableIdentity;
+
+        let target = SqlWriteSinkTargetContract::try_new(
+            target.binding,
+            SqlTableIdentity {
+                catalog: target.catalog,
+                namespace: target.namespace,
+                table: target.table,
+            },
+            target
+                .fields
+                .into_iter()
+                .map(|field| SqlWriteTargetField {
+                    token: field.token,
+                    column: field.column,
+                    is_hidden: field.is_hidden,
+                })
+                .collect(),
+        )?;
+        Ok(Self(
+            crate::planner::distributed::write::contract::SqlWritePlanInput {
+                contract: SqlWriteSinkContract::try_new(mode.into(), target, input_columns)?,
+                input,
+                root_output_exprs: None,
+            },
+        ))
+    }
+}
+
+/// Seal one application-admitted frozen connector source into an immutable
+/// distributed terminal-write plan. The physical source and write contract
+/// remain opaque outside SQL; provider bindings, leases, and provenance stay
+/// retained by the application that admitted them.
+pub fn build_frozen_connector_write_distributed_plan(
+    source: crate::planning::query_execution::FrozenConnectorScanPlan,
+    sink: DmlWritePlanInput,
+    settings: &crate::compiler::SessionOptimizerSettings,
+) -> Result<crate::plan_read::DistributedPlan, String> {
+    crate::planner::pipeline::build_sql_write_distributed_plan_with_settings(
+        source.into_physical(),
+        sink.0,
+        settings,
+    )
+}
+
+/// Provider route facts that SQL binds to a change-stream producer.  Field
+/// names are resolved against the sealed producer output inside SQL, never by
+/// the application against an optimizer tree.
+#[derive(Clone, Debug)]
+pub struct DmlChangeStreamRoute {
+    pub route_id: novarocks_spi::connector::ConnectorWriteRouteId,
+    pub cohort_id: novarocks_spi::connector::ConnectorWriteCohortId,
+    pub accepted_effects: Vec<novarocks_spi::connector::ConnectorRowMutationEffect>,
+    pub input_fields: Vec<DmlChangeStreamRouteField>,
+    pub partition_input_tokens: Vec<novarocks_spi::connector::ConnectorWriteFieldToken>,
+    pub sink: DmlWritePlanInput,
+}
+
+#[derive(Clone, Debug)]
+pub struct DmlChangeStreamRouteField {
+    pub token: novarocks_spi::connector::ConnectorWriteFieldToken,
+    pub output_name: String,
+}
+
+/// SQL-only specification of a generated row-mutation producer.
+#[derive(Clone, Debug)]
+pub enum DmlChangeStreamKind {
+    Update {
+        target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+        new_sequence_number: i64,
+    },
+    Merge {
+        target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+        new_sequence_number: i64,
+        matched_update: bool,
+        matched_delete: bool,
+        not_matched_insert: bool,
+    },
+}
+
+/// Optional duplicate-match assertion installed immediately before change
+/// event expansion.  It is a pure SQL physical constraint; lifecycle and
+/// connector fencing remain application-owned.
+#[derive(Clone, Debug)]
+pub struct DmlPreExpandKeyedAssert {
+    pub key_column_name: String,
+    pub key_label: String,
+    pub message_prefix: String,
+}
+
+/// A request that consumes one immutable compile input and a fully admitted,
+/// provider-signed SQL write route set.
+pub struct DmlChangeStreamCompileRequest<'a> {
+    pub compile_request: crate::compiler::SqlCompileRequest<'a>,
+    pub kind: DmlChangeStreamKind,
+    pub routes: Vec<DmlChangeStreamRoute>,
+    pub pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
+}
+
+/// Read-only routing facts needed by Core when it binds a prepared write
+/// operation to fragment cohorts.  SQL keeps the mutable writer topology and
+/// all physical graph state private.
+#[derive(Clone, Debug)]
+pub struct DmlChangeStreamWriterRoute {
+    pub route_id: novarocks_spi::connector::ConnectorWriteRouteId,
+    pub cohort_id: novarocks_spi::connector::ConnectorWriteCohortId,
+    pub accepted_effects: Vec<novarocks_spi::connector::ConnectorRowMutationEffect>,
+    pub writer_fragment_id: crate::plan_read::FragmentId,
+}
+
+/// Sealed SQL plan plus the minimal immutable routing projection Core needs
+/// for normal fragment preparation and provider-session registration.
+pub struct DmlChangeStreamPlan {
+    distributed_plan: crate::plan_read::DistributedPlan,
+    writer_routes: Vec<DmlChangeStreamWriterRoute>,
+}
+
+impl DmlChangeStreamPlan {
+    pub fn distributed_plan(&self) -> &crate::plan_read::DistributedPlan {
+        &self.distributed_plan
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        crate::plan_read::DistributedPlan,
+        Vec<DmlChangeStreamWriterRoute>,
+    ) {
+        (self.distributed_plan, self.writer_routes)
+    }
+}
+
+/// Compile a generated UPDATE/MERGE change-stream query directly into a
+/// sealed distributed write plan.  No optimized tree, scalar arena, physical
+/// graph, or draft distributed plan escapes SQL.
+pub fn compile_dml_change_stream(
+    request: DmlChangeStreamCompileRequest<'_>,
+) -> Result<DmlChangeStreamPlan, String> {
+    let crate::compiler::SqlCompileOutput::Optimized(compiled) =
+        crate::compiler::SqlCompiler::compile(request.compile_request)
+            .map_err(|error| error.to_string())?
+    else {
+        return Err("change-stream intent did not produce an optimized SQL plan".to_string());
+    };
+
+    let producer = match request.kind {
+        DmlChangeStreamKind::Update {
+            target_columns,
+            new_sequence_number,
+        } => build_update_change_event_expand(
+            compiled.optimized_tree,
+            &target_columns,
+            new_sequence_number,
+        )?,
+        DmlChangeStreamKind::Merge {
+            target_columns,
+            new_sequence_number,
+            matched_update,
+            matched_delete,
+            not_matched_insert,
+        } => build_merge_change_event_expand(
+            compiled.optimized_tree,
+            &target_columns,
+            new_sequence_number,
+            matched_update,
+            matched_delete,
+            not_matched_insert,
+        )?,
+    };
+    let dag = bind_route_layout(&producer.output_columns, request.routes)?;
+    let keyed_assert = request.pre_expand_keyed_assert.map(|assertion| {
+        crate::planner::physical::PreExpandKeyedAssertSpec {
+            key_column_name: assertion.key_column_name,
+            key_label: assertion.key_label,
+            message_prefix: assertion.message_prefix,
+        }
+    });
+    let physical = crate::planner::optimizer_bridge::to_physical_plan(&producer)?;
+    let mut settings = crate::optimizer::options::SessionOptimizerSettings::default();
+    // A generated mutation plan carries before/after rows over independent
+    // branches.  A query runtime filter can describe only one branch, so it
+    // must not suppress locator rows required by a DELETE route.
+    settings.enable_global_runtime_filter = Some(false);
+    let planned = crate::planner::pipeline::build_sql_change_stream_distributed_plan_with_settings(
+        physical,
+        dag,
+        keyed_assert,
+        &settings,
+    )?;
+    let writer_routes = planned
+        .topology
+        .writer_routes
+        .iter()
+        .map(|route| DmlChangeStreamWriterRoute {
+            route_id: route.route_id,
+            cohort_id: route.cohort_id,
+            accepted_effects: route.accepted_effects.clone(),
+            writer_fragment_id: route.writer_fragment_id,
+        })
+        .collect();
+    Ok(DmlChangeStreamPlan {
+        distributed_plan: planned.distributed_plan,
+        writer_routes,
+    })
+}
+
+fn bind_route_layout(
+    output_columns: &[crate::analysis::OutputColumn],
+    routes: Vec<DmlChangeStreamRoute>,
+) -> Result<crate::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec, String> {
+    use crate::planner::distributed::write::change_stream::{
+        ChangeStreamWriteLayoutRequest, ChangeStreamWriteLayoutRoute,
+        bind_change_stream_write_layout,
+    };
+
+    let effect_output_ordinal = output_columns
+        .iter()
+        .position(|column| column.name == crate::common::ROW_MUTATION_EFFECT_COLUMN)
+        .ok_or_else(|| "row-mutation producer has no logical effect output".to_string())?;
+    let routes = routes
+        .into_iter()
+        .map(|route| {
+            let input_ordinals = route
+                .input_fields
+                .into_iter()
+                .map(|field| {
+                    output_columns
+                        .iter()
+                        .position(|column| column.name.eq_ignore_ascii_case(&field.output_name))
+                        .ok_or_else(|| {
+                            format!(
+                                "row-mutation producer has no output for Provider route field `{}`",
+                                field.output_name
+                            )
+                        })
+                        .and_then(|ordinal| {
+                            u32::try_from(ordinal).map_err(|_| {
+                                "row-mutation producer output ordinal exceeds u32".to_string()
+                            })
+                        })
+                        .map(|ordinal| {
+                            novarocks_spi::connector::ConnectorMutationRouteInput::new(
+                                field.token,
+                                ordinal,
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ChangeStreamWriteLayoutRoute {
+                route_id: route.route_id,
+                cohort_id: route.cohort_id,
+                accepted_effects: route.accepted_effects,
+                input_ordinals,
+                partition_input_tokens: route.partition_input_tokens,
+                sink: route.sink.0,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
+        producer_output_columns: output_columns,
+        effect_output_ordinal,
+        routes,
+    })
+}
+
+fn build_update_change_event_expand(
+    optimized_tree: crate::optimizer::OptimizedOperatorNode,
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
+    new_sequence_number: i64,
+) -> Result<crate::optimizer::OptimizedOperatorNode, String> {
+    let mut arena = clone_scalar_arena(&optimized_tree, "MOR UPDATE")?;
+    let child_outputs = optimized_tree.output_columns.clone();
+    let row_id = output_column_by_name(&child_outputs, "__nr_row_id", "UPDATE row id")?;
+    let distributed = distribute_producer(optimized_tree, row_id.column_id);
+    let (file, pos, targets, row_id, last_sequence, effect) =
+        allocate_change_outputs(&distributed, target_columns);
+    let mut assignments = vec![
+        output_expr(
+            &mut arena,
+            &child_outputs,
+            "__nr_file",
+            "UPDATE old file",
+            file.column_id,
+        )?,
+        output_expr(
+            &mut arena,
+            &child_outputs,
+            "__nr_pos",
+            "UPDATE old row position",
+            pos.column_id,
+        )?,
+    ];
+    for (name, output) in &targets {
+        let new_name = format!("__nr_new_{name}");
+        let expr = maybe_output_column_by_name(&child_outputs, &new_name)?
+            .map(|column| intern_column(&mut arena, &column))
+            .transpose()?
+            .unwrap_or(child_expr(
+                &mut arena,
+                &child_outputs,
+                name,
+                "UPDATE unchanged target column",
+            )?);
+        assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
+            output_column_id: output.column_id,
+            expr: Some(expr),
+        });
+    }
+    assignments.push(output_expr(
+        &mut arena,
+        &child_outputs,
+        "__nr_row_id",
+        "UPDATE old row id",
+        row_id.column_id,
+    )?);
+    let sequence = arena.intern(
+        crate::optimizer::scalar::ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
+            crate::analysis::LiteralValue::Int(new_sequence_number),
+        )),
+        arrow::datatypes::DataType::Int64,
+        false,
+    );
+    assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
+        output_column_id: last_sequence.column_id,
+        expr: Some(sequence),
+    });
+    build_change_expand(
+        distributed,
+        arena,
+        change_output_columns(&file, &pos, &targets, &row_id, &last_sequence, &effect),
+        effect.column_id,
+        vec![crate::optimizer::operator::ChangeEventSpec {
+            predicate: None,
+            effect: novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
+            assignments,
+        }],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_merge_change_event_expand(
+    optimized_tree: crate::optimizer::OptimizedOperatorNode,
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
+    new_sequence_number: i64,
+    matched_update: bool,
+    matched_delete: bool,
+    not_matched_insert: bool,
+) -> Result<crate::optimizer::OptimizedOperatorNode, String> {
+    let mut arena = clone_scalar_arena(&optimized_tree, "MOR MERGE")?;
+    let child_outputs = optimized_tree.output_columns.clone();
+    let assert_key =
+        output_column_by_name(&child_outputs, "__nr_merge_assert_key", "MERGE assert key")?;
+    let distributed = distribute_producer(optimized_tree, assert_key.column_id);
+    let (file, pos, targets, row_id, last_sequence, effect) =
+        allocate_change_outputs(&distributed, target_columns);
+    let mut delete_assignments = vec![
+        output_expr(
+            &mut arena,
+            &child_outputs,
+            "__nr_file",
+            "MERGE old file",
+            file.column_id,
+        )?,
+        output_expr(
+            &mut arena,
+            &child_outputs,
+            "__nr_pos",
+            "MERGE old row position",
+            pos.column_id,
+        )?,
+    ];
+    let mut reuse_assignments = vec![
+        output_expr(
+            &mut arena,
+            &child_outputs,
+            "__nr_file",
+            "MERGE old file",
+            file.column_id,
+        )?,
+        output_expr(
+            &mut arena,
+            &child_outputs,
+            "__nr_pos",
+            "MERGE old row position",
+            pos.column_id,
+        )?,
+    ];
+    let mut fresh_assignments = Vec::with_capacity(targets.len());
+    for (name, output) in &targets {
+        delete_assignments.push(output_expr(
+            &mut arena,
+            &child_outputs,
+            name,
+            "MERGE old target column",
+            output.column_id,
+        )?);
+        let new_name = format!("__nr_new_{name}");
+        let reuse = maybe_output_column_by_name(&child_outputs, &new_name)?
+            .map(|column| intern_column(&mut arena, &column))
+            .transpose()?
+            .unwrap_or(child_expr(
+                &mut arena,
+                &child_outputs,
+                name,
+                "MERGE unchanged target column",
+            )?);
+        reuse_assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
+            output_column_id: output.column_id,
+            expr: Some(reuse),
+        });
+        let insert_name = format!("__nr_ins_{name}");
+        if let Some(column) = maybe_output_column_by_name(&child_outputs, &insert_name)? {
+            fresh_assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
+                output_column_id: output.column_id,
+                expr: Some(intern_column(&mut arena, &column)?),
+            });
+        }
+    }
+    reuse_assignments.push(output_expr(
+        &mut arena,
+        &child_outputs,
+        "__nr_row_id",
+        "MERGE old row id",
+        row_id.column_id,
+    )?);
+    let sequence = arena.intern(
+        crate::optimizer::scalar::ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
+            crate::analysis::LiteralValue::Int(new_sequence_number),
+        )),
+        arrow::datatypes::DataType::Int64,
+        false,
+    );
+    reuse_assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
+        output_column_id: last_sequence.column_id,
+        expr: Some(sequence),
+    });
+    let mut events = Vec::new();
+    if matched_update {
+        events.push(crate::optimizer::operator::ChangeEventSpec {
+            predicate: Some(merge_action_predicate(&mut arena, &child_outputs, 1)?),
+            effect: novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
+            assignments: reuse_assignments,
+        });
+    }
+    if matched_delete {
+        events.push(crate::optimizer::operator::ChangeEventSpec {
+            predicate: Some(merge_action_predicate(&mut arena, &child_outputs, 2)?),
+            effect: novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
+            assignments: delete_assignments,
+        });
+    }
+    if not_matched_insert {
+        events.push(crate::optimizer::operator::ChangeEventSpec {
+            predicate: Some(merge_action_predicate(&mut arena, &child_outputs, 3)?),
+            effect: novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
+            assignments: fresh_assignments,
+        });
+    }
+    if events.is_empty() {
+        return Err("MOR MERGE change-stream expand requires at least one event".to_string());
+    }
+    build_change_expand(
+        distributed,
+        arena,
+        change_output_columns(&file, &pos, &targets, &row_id, &last_sequence, &effect),
+        effect.column_id,
+        events,
+    )
+}
+
+fn clone_scalar_arena(
+    optimized_tree: &crate::optimizer::OptimizedOperatorNode,
+    operation: &str,
+) -> Result<crate::optimizer::scalar::ScalarArena, String> {
+    optimized_tree
+        .execution_props
+        .scalar_arena
+        .as_deref()
+        .cloned()
+        .ok_or_else(|| format!("{operation} physical plan is missing scalar arena"))
+}
+
+fn distribute_producer(
+    optimized_tree: crate::optimizer::OptimizedOperatorNode,
+    key: crate::column_id::ColumnId,
+) -> crate::optimizer::OptimizedOperatorNode {
+    let stats = optimized_tree.stats.clone();
+    let output_columns = optimized_tree.output_columns.clone();
+    crate::optimizer::OptimizedOperatorNode {
+        op: crate::optimizer::operator::Operator::PhysicalDistribution(
+            crate::optimizer::operator::PhysicalDistributionOp {
+                spec: crate::optimizer::property::DistributionSpec::shuffle_agg([key]),
+            },
+        ),
+        children: vec![optimized_tree],
+        stats,
+        explain_stats: crate::optimizer::optimized_tree::OptimizerExplainStats::default(),
+        output_columns,
+        execution_props: crate::optimizer::optimized_tree::PlanExecutionProps::default(),
+    }
+}
+
+type ChangeOutputs = (
+    crate::analysis::OutputColumn,
+    crate::analysis::OutputColumn,
+    Vec<(String, crate::analysis::OutputColumn)>,
+    crate::analysis::OutputColumn,
+    crate::analysis::OutputColumn,
+    crate::analysis::OutputColumn,
+);
+
+fn allocate_change_outputs(
+    node: &crate::optimizer::OptimizedOperatorNode,
+    target_columns: &[novarocks_catalog::schema::ColumnDef],
+) -> ChangeOutputs {
+    let mut next = max_physical_column_id(node) + 1;
+    let mut allocate =
+        |name: &str, data_type: arrow::datatypes::DataType, nullable: bool, is_internal: bool| {
+            let output = crate::analysis::OutputColumn {
+                column_id: crate::column_id::ColumnId(next),
+                name: name.to_string(),
+                data_type,
+                nullable,
+                is_internal,
+            };
+            next += 1;
+            output
+        };
+    let file = allocate(
+        ICEBERG_FILE_PATH_COLUMN,
+        arrow::datatypes::DataType::Utf8,
+        true,
+        true,
+    );
+    let pos = allocate(
+        ICEBERG_ROW_POSITION_COLUMN,
+        arrow::datatypes::DataType::Int64,
+        true,
+        true,
+    );
+    let targets = target_columns
+        .iter()
+        .map(|column| {
+            (
+                column.name.clone(),
+                allocate(
+                    &column.name,
+                    column.data_type.clone(),
+                    column.nullable,
+                    false,
+                ),
+            )
+        })
+        .collect();
+    let row_id = allocate(
+        ICEBERG_ROW_ID_COLUMN,
+        arrow::datatypes::DataType::Int64,
+        true,
+        true,
+    );
+    let last_sequence = allocate(
+        ICEBERG_LAST_UPDATED_SEQUENCE_COLUMN,
+        arrow::datatypes::DataType::Int64,
+        true,
+        true,
+    );
+    let effect = allocate(
+        crate::common::change_stream::ROW_MUTATION_EFFECT_COLUMN,
+        arrow::datatypes::DataType::Int8,
+        false,
+        true,
+    );
+    (file, pos, targets, row_id, last_sequence, effect)
+}
+
+fn change_output_columns(
+    file: &crate::analysis::OutputColumn,
+    pos: &crate::analysis::OutputColumn,
+    targets: &[(String, crate::analysis::OutputColumn)],
+    row_id: &crate::analysis::OutputColumn,
+    last_sequence: &crate::analysis::OutputColumn,
+    effect: &crate::analysis::OutputColumn,
+) -> Vec<crate::analysis::OutputColumn> {
+    let mut columns = Vec::with_capacity(targets.len() + 6);
+    columns.push(file.clone());
+    columns.push(pos.clone());
+    columns.extend(targets.iter().map(|(_, column)| column.clone()));
+    columns.push(row_id.clone());
+    columns.push(last_sequence.clone());
+    columns.push(effect.clone());
+    columns
+}
+
+fn output_expr(
+    arena: &mut crate::optimizer::scalar::ScalarArena,
+    columns: &[crate::analysis::OutputColumn],
+    name: &str,
+    label: &str,
+    output_column_id: crate::column_id::ColumnId,
+) -> Result<crate::optimizer::operator::ChangeEventOutputExpr, String> {
+    Ok(crate::optimizer::operator::ChangeEventOutputExpr {
+        output_column_id,
+        expr: Some(child_expr(arena, columns, name, label)?),
+    })
+}
+
+fn intern_column(
+    arena: &mut crate::optimizer::scalar::ScalarArena,
+    column: &crate::analysis::OutputColumn,
+) -> Result<crate::optimizer::scalar::ScalarId, String> {
+    Ok(arena.intern(
+        crate::optimizer::scalar::ScalarNode::ColumnRef(column.column_id),
+        column.data_type.clone(),
+        column.nullable,
+    ))
+}
+
+fn child_expr(
+    arena: &mut crate::optimizer::scalar::ScalarArena,
+    columns: &[crate::analysis::OutputColumn],
+    name: &str,
+    label: &str,
+) -> Result<crate::optimizer::scalar::ScalarId, String> {
+    let column = output_column_by_name(columns, name, label)?;
+    intern_column(arena, &column)
+}
+
+fn merge_action_predicate(
+    arena: &mut crate::optimizer::scalar::ScalarArena,
+    columns: &[crate::analysis::OutputColumn],
+    action: i32,
+) -> Result<crate::optimizer::scalar::ScalarId, String> {
+    let action_expr = child_expr(arena, columns, "__nr_merge_action", "MERGE action")?;
+    let literal = arena.intern(
+        crate::optimizer::scalar::ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
+            crate::analysis::LiteralValue::Int(i64::from(action)),
+        )),
+        arrow::datatypes::DataType::Int64,
+        false,
+    );
+    Ok(arena.intern(
+        crate::optimizer::scalar::ScalarNode::BinaryOp {
+            op: crate::common::BinOp::Eq,
+            left: action_expr,
+            right: literal,
+        },
+        arrow::datatypes::DataType::Boolean,
+        false,
+    ))
+}
+
+fn build_change_expand(
+    child: crate::optimizer::OptimizedOperatorNode,
+    arena: crate::optimizer::scalar::ScalarArena,
+    output_columns: Vec<crate::analysis::OutputColumn>,
+    effect_column_id: crate::column_id::ColumnId,
+    events: Vec<crate::optimizer::operator::ChangeEventSpec>,
+) -> Result<crate::optimizer::OptimizedOperatorNode, String> {
+    let stats = child.stats.clone();
+    let mut root = crate::optimizer::OptimizedOperatorNode {
+        op: crate::optimizer::operator::Operator::PhysicalChangeEventExpand(
+            crate::optimizer::operator::ChangeEventExpandOp {
+                events,
+                output_columns: output_columns.clone(),
+                effect_column_id,
+            },
+        ),
+        children: vec![child],
+        stats,
+        explain_stats: crate::optimizer::optimized_tree::OptimizerExplainStats::default(),
+        output_columns,
+        execution_props: crate::optimizer::optimized_tree::PlanExecutionProps::default(),
+    };
+    crate::optimizer::optimized_tree::attach_scalar_arena(&mut root, std::sync::Arc::new(arena));
+    Ok(root)
+}
+
+fn output_column_by_name(
+    columns: &[crate::analysis::OutputColumn],
+    name: &str,
+    label: &str,
+) -> Result<crate::analysis::OutputColumn, String> {
+    maybe_output_column_by_name(columns, name)?.ok_or_else(|| {
+        format!("MOR UPDATE change-stream {label} column `{name}` not found in producer output")
+    })
+}
+
+fn maybe_output_column_by_name(
+    columns: &[crate::analysis::OutputColumn],
+    name: &str,
+) -> Result<Option<crate::analysis::OutputColumn>, String> {
+    let mut matches = columns
+        .iter()
+        .filter(|column| column.name.eq_ignore_ascii_case(name));
+    let Some(column) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "MOR UPDATE change-stream producer column `{name}` is ambiguous"
+        ));
+    }
+    Ok(Some(column.clone()))
+}
+
+fn max_physical_column_id(node: &crate::optimizer::OptimizedOperatorNode) -> u32 {
+    node.output_columns
+        .iter()
+        .map(|column| column.column_id.0)
+        .chain(node.children.iter().map(max_physical_column_id))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Immutable synthetic scan facts used by Core's provider-neutral statistics
+/// collector.  The binding was admitted by Core from an exact provider lease;
+/// SQL only turns it into a sealed statistics distributed plan.
+#[derive(Clone, Debug)]
+pub struct StatisticsConnectorScan {
+    pub binding: crate::binding::SqlTableBindingId,
+    pub columns: Vec<novarocks_catalog::schema::ColumnDef>,
+}
+
+/// Build the SQL-owned physical and distributed statistics program from a
+/// pinned synthetic connector scan.  Core retains the encoder, preparation,
+/// provider resolver, and result finalization.
+pub fn build_statistics_connector_plan(
+    scan: StatisticsConnectorScan,
+    metrics: novarocks_spi::connector::StatisticsMetricRequest,
+    settings: &crate::compiler::SessionOptimizerSettings,
+) -> Result<crate::plan_read::DistributedPlan, String> {
+    let mut factory = crate::column_id::ColumnRefFactory::new();
+    let scan_columns = scan
+        .columns
+        .iter()
+        .map(|column| {
+            let column_id = factory.create(
+                None,
+                column.name.clone(),
+                column.data_type.clone(),
+                column.nullable,
+            );
+            crate::analysis::OutputColumn {
+                column_id,
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                is_internal: false,
+            }
+        })
+        .collect::<Vec<_>>();
+    let physical = crate::planner::physical::PhysicalPlanNode {
+        kind: crate::planner::physical::PhysicalPlanKind::Scan(
+            crate::planner::payload::PlanScanNode {
+                database: "__statistics".to_string(),
+                table: crate::planner::table::TableDef {
+                    name: "__connector_pinned_statistics".to_string(),
+                    columns: scan.columns,
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: crate::planner::table::ScanSource::Sql(
+                        crate::planner::table::SqlScanSource::new(
+                            scan.binding,
+                            crate::planner::table::SqlTableIdentity {
+                                catalog: "__statistics".to_string(),
+                                namespace: "__statistics".to_string(),
+                                table: "__connector_pinned_statistics".to_string(),
+                            },
+                            crate::planner::table::SqlScanKind::ConnectorRead,
+                        ),
+                    ),
+                },
+                alias: None,
+                columns: scan_columns.clone(),
+                predicates: Vec::new(),
+                required_columns: None,
+                variant_columns: Vec::new(),
+                mv_rewritten_from: None,
+            },
+        ),
+        children: Vec::new(),
+        output_columns: scan_columns,
+        stats: crate::planner::physical::PhysicalPlanStats {
+            output_row_count: 0.0,
+            row_count_confidence: crate::planner::physical::PlannerConfidence::Fallback,
+            column_statistics: std::collections::HashMap::new(),
+            cost_estimate: None,
+            broadcast_decision: None,
+        },
+        probe_runtime_filters: Vec::new(),
+    };
+    crate::planner::pipeline::build_statistics_distributed_plan_with_settings(
+        physical, metrics, settings,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StatisticsCommand, parse_statistics_command, parse_truncate_command};
+
+    #[test]
+    fn dml_facade_parses_truncate_without_exposing_the_custom_ast() {
+        let command = parse_truncate_command("TRUNCATE TABLE ice.db.orders.branch_dev")
+            .expect("parse truncate")
+            .expect("truncate command");
+        assert_eq!(command.target_parts, ["ice", "db", "orders"]);
+        assert_eq!(command.target_ref, "dev");
+    }
+
+    #[test]
+    fn dml_facade_projects_statistics_command_to_dto() {
+        let command = parse_statistics_command("ANALYZE TABLE ice.db.orders (id, amount)")
+            .expect("parse analyze")
+            .expect("statistics command");
+        assert_eq!(
+            command,
+            StatisticsCommand::AnalyzeTable {
+                target_parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()],
+                columns: vec!["id".to_string(), "amount".to_string()],
+            }
+        );
+    }
+}

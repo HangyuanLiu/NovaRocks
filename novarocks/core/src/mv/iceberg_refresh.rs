@@ -19,7 +19,7 @@
 //! current Iceberg catalog. Aggregate shapes are accepted at CREATE time for
 //! target schema and contract persistence; refresh execution is gated later.
 
-use crate::sql::planner::vocabulary::ApplyKeySource;
+use novarocks_sql::planner::vocabulary::ApplyKeySource;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -31,7 +31,6 @@ use sha2::{Digest, Sha256};
 use crate::catalog_application::CatalogApplicationPort;
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::common::engine_error::EngineError;
-use crate::mv::aggregate_state::mv_shape::UnionBranchKind;
 use crate::mv::aggregate_state::physical_column::validate_unique_aggregate_physical_column_names;
 use crate::mv::analysis::rebind::rewrite_select_sql_for_rebind;
 use crate::mv::analysis::refresh_property::{
@@ -105,28 +104,33 @@ use crate::query_execution::planning::bindings::{
     MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
     QueryTableBindingStore,
 };
-#[cfg(test)]
-use crate::sql::analysis::ProjectItem;
-use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
-use crate::sql::catalog::ResolvedAnalyzerTable;
-use crate::sql::column_id::ColumnId;
-use crate::sql::mv_refresh::{FULL_REFRESH_DISABLED_MESSAGE, MvRefreshFinalizeFacts};
-use crate::sql::parser::ast::{
-    CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr, ObjectName,
-    RefreshMaterializedViewStmt,
-};
-use crate::sql::planner::table::{
-    ScanSource, SqlMvTargetLocatorScan, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
-};
-use crate::sql::planner::vocabulary::{
-    BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
-    JOIN_APPLY_KEY_COLUMN_NAME,
-};
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
 use novarocks_spi::connector::{
     ConnectorChangeWindowAdmission, ConnectorControlRegistry, ConnectorExecutionBindingKey,
     ConnectorInstanceId, ConnectorTableIdentity,
+};
+#[cfg(test)]
+use novarocks_sql::analysis::ProjectItem;
+use novarocks_sql::analysis::{ExprKind, OutputColumn, TypedExpr};
+use novarocks_sql::catalog::ResolvedAnalyzerTable;
+use novarocks_sql::column_id::ColumnId;
+use novarocks_sql::mv_refresh::{FULL_REFRESH_DISABLED_MESSAGE, MvRefreshFinalizeFacts};
+use novarocks_sql::parser::ast::{
+    CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr, ObjectName,
+    RefreshMaterializedViewStmt,
+};
+use novarocks_sql::planner::table::{
+    ScanSource, SqlMvTargetLocatorScan, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
+};
+use novarocks_sql::planner::vocabulary::{
+    BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
+    JOIN_APPLY_KEY_COLUMN_NAME,
+};
+use novarocks_sql::planning::mv::UnionBranchKind;
+use novarocks_sql::planning::mv::{
+    SqlMvAggregateCalls, SqlMvJoinAliases, extract_aggregate_sql_calls, extract_join_aliases,
+    extract_single_scan_table_fqn,
 };
 
 /// The explicit Core ports a refresh preparation may read while deriving its
@@ -197,7 +201,8 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
         request: MvRefreshPreparationRequest,
     ) -> Result<PreparedMvRefresh, String> {
         request.validate()?;
-        if request.statement != crate::sql::mv_refresh::MvRefreshStatement::from(self.statement) {
+        if request.statement != novarocks_sql::mv_refresh::MvRefreshStatement::from(self.statement)
+        {
             return Err(
                 "MV refresh preparation statement does not match the admitted SQL request"
                     .to_string(),
@@ -655,7 +660,7 @@ fn prepare_frontend_first_refresh_write(
         );
     }
     let target_contract =
-        crate::sql::mv_refresh::first_refresh::MvFirstRefreshTargetContract::try_new(
+        novarocks_sql::mv_refresh::first_refresh::MvFirstRefreshTargetContract::try_new(
             Arc::new(target_arrow_schema),
             target_field_ids,
             partition_spec_id,
@@ -742,7 +747,7 @@ fn prepare_frontend_first_refresh_write(
         )?;
         let request = crate::mv::application::MvFirstRefreshWriteRequest::try_new(
             definition.select_sql.clone(),
-            crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::Join,
+            novarocks_sql::mv_refresh::first_refresh::MvFirstRefreshShape::Join,
             target.catalog,
             target.namespace,
             target.table,
@@ -780,9 +785,7 @@ fn prepare_frontend_first_refresh_write(
         } else {
             query.clone()
         };
-        let calls = crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
-            &aggregate_query,
-        )?;
+        let calls = extract_aggregate_sql_calls(&aggregate_query)?;
         // The analyzer attaches aggregate input types to a SELECT body.  A
         // top-level branch UNION has no such body, while the first branch has
         // the validated representative aggregate layout.
@@ -806,8 +809,8 @@ fn prepare_frontend_first_refresh_write(
         let sql_calls = sql_first_refresh_aggregate_calls(&calls);
         if let Some(branch) = &schema_contract.branch {
             (
-                crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::BranchUnionAggregate,
-                crate::sql::mv_refresh::first_refresh::prepare_branch_union_aggregate_first_refresh_write_sql_with_target_schema(
+                novarocks_sql::mv_refresh::first_refresh::MvFirstRefreshShape::BranchUnionAggregate,
+                novarocks_sql::mv_refresh::first_refresh::prepare_branch_union_aggregate_first_refresh_write_sql_with_target_schema(
                     &definition.select_sql,
                     branch.branch_count as usize,
                     &sql_calls,
@@ -819,8 +822,8 @@ fn prepare_frontend_first_refresh_write(
             )
         } else if !schema_contract.bases.is_empty() {
             (
-                crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::FanInAggregate,
-                crate::sql::mv_refresh::first_refresh::prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
+                novarocks_sql::mv_refresh::first_refresh::MvFirstRefreshShape::FanInAggregate,
+                novarocks_sql::mv_refresh::first_refresh::prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
                     &definition.select_sql,
                     &sql_calls,
                     &sql_pin,
@@ -832,8 +835,8 @@ fn prepare_frontend_first_refresh_write(
             )
         } else {
             (
-                crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::Aggregate,
-                crate::sql::mv_refresh::first_refresh::prepare_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
+                novarocks_sql::mv_refresh::first_refresh::MvFirstRefreshShape::Aggregate,
+                novarocks_sql::mv_refresh::first_refresh::prepare_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
                     &definition.select_sql,
                     &sql_calls,
                     &sql_pin,
@@ -846,8 +849,8 @@ fn prepare_frontend_first_refresh_write(
         }
     } else if let Some(branch) = &schema_contract.branch {
         (
-            crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::UnionProjection,
-            crate::sql::mv_refresh::first_refresh::prepare_union_projection_first_refresh_write_sql(
+            novarocks_sql::mv_refresh::first_refresh::MvFirstRefreshShape::UnionProjection,
+            novarocks_sql::mv_refresh::first_refresh::prepare_union_projection_first_refresh_write_sql(
                 &definition.select_sql,
                 branch.branch_count as usize,
                 &sql_pin,
@@ -857,8 +860,8 @@ fn prepare_frontend_first_refresh_write(
         )
     } else {
         (
-            crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::Projection,
-            crate::sql::mv_refresh::first_refresh::prepare_projection_first_refresh_write_sql(
+            novarocks_sql::mv_refresh::first_refresh::MvFirstRefreshShape::Projection,
+            novarocks_sql::mv_refresh::first_refresh::prepare_projection_first_refresh_write_sql(
                 &definition.select_sql,
                 &sql_pin,
                 current_catalog,
@@ -1631,7 +1634,7 @@ struct IcebergMvCreatePreparation {
     >,
     expected_apply_key_field_id: i32,
     created_at_ms: i64,
-    columns: Vec<crate::sql::parser::ast::TableColumnDef>,
+    columns: Vec<novarocks_sql::parser::ast::TableColumnDef>,
     partition_fields: Vec<IcebergPartitionFieldExpr>,
     target_properties: Vec<(String, String)>,
     created_target_observation: Mutex<Option<MvTargetCreationObservation>>,
@@ -2635,14 +2638,14 @@ fn validate_aggregate_fan_in_base_refs(base_refs: &[TableIdentity]) -> Result<()
 /// immutable vocabulary.  The legacy shape continues to serve runtime merge
 /// layout construction; SQL first-refresh shaping must not depend on it.
 fn sql_first_refresh_aggregate_calls(
-    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-) -> crate::sql::mv_refresh::aggregate_shape::SqlAggregateCalls {
-    use crate::mv::aggregate_state::mv_shape::AggregateInput;
-    use crate::sql::mv_refresh::aggregate_shape::{
+    calls: &SqlMvAggregateCalls,
+) -> novarocks_sql::mv_refresh::aggregate_shape::SqlAggregateCalls {
+    use novarocks_sql::mv_refresh::aggregate_shape::{
         SqlAggregateCall, SqlAggregateGroupKey, SqlAggregateInput,
     };
+    use novarocks_sql::planning::mv::AggregateInput;
 
-    crate::sql::mv_refresh::aggregate_shape::SqlAggregateCalls {
+    novarocks_sql::mv_refresh::aggregate_shape::SqlAggregateCalls {
         group_keys: calls
             .group_keys
             .iter()
@@ -2672,8 +2675,8 @@ fn sql_first_refresh_aggregate_calls(
 /// compiler-facing immutable snapshot vocabulary.
 fn sql_first_refresh_snapshot_pin(
     pin: &crate::mv::refresh::pin::RefreshSnapshotPin,
-) -> Result<crate::sql::mv_refresh::first_refresh::SqlMvSnapshotPin, String> {
-    crate::sql::mv_refresh::first_refresh::SqlMvSnapshotPin::try_from_maps(
+) -> Result<novarocks_sql::mv_refresh::first_refresh::SqlMvSnapshotPin, String> {
+    novarocks_sql::mv_refresh::first_refresh::SqlMvSnapshotPin::try_from_maps(
         pin.to_snapshot_map(),
         pin.to_table_uuid_map(),
     )
@@ -2786,7 +2789,7 @@ fn validate_branch_union_contract(
         ));
     }
     if branch_contract.inner_apply_key_source
-        != crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
+        != novarocks_sql::planner::vocabulary::ApplyKeySource::GroupRowId
     {
         return Err(format!(
             "iceberg branch UNION ALL aggregate MV {}.{}.{} branch contract must use GroupRowId inner apply keys",
@@ -2891,7 +2894,7 @@ fn validate_union_projection_schema_contract_for_base(
         ));
     }
     if branch_contract.inner_apply_key_source
-        != crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId
+        != novarocks_sql::planner::vocabulary::ApplyKeySource::BaseRowId
     {
         return Err(format!(
             "iceberg UNION ALL projection/filter MV {}.{}.{} branch contract must use BaseRowId inner apply keys",
@@ -2948,11 +2951,13 @@ fn validate_union_projection_schema_contract_for_base(
 
 pub(crate) fn union_branch_inner_apply_key(
     branch_kind: UnionBranchKind,
-) -> crate::sql::planner::vocabulary::ApplyKeySource {
+) -> novarocks_sql::planner::vocabulary::ApplyKeySource {
     match branch_kind {
-        UnionBranchKind::Aggregate => crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId,
+        UnionBranchKind::Aggregate => {
+            novarocks_sql::planner::vocabulary::ApplyKeySource::GroupRowId
+        }
         UnionBranchKind::ProjectionFilter => {
-            crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId
+            novarocks_sql::planner::vocabulary::ApplyKeySource::BaseRowId
         }
     }
 }
@@ -2966,7 +2971,7 @@ fn create_target_columns_from_property(
     property: &RefreshFragmentProperty,
     canonical_query: &sqlparser::ast::Query,
     analysis: &MvAnalysis,
-) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
+) -> Result<Vec<novarocks_sql::parser::ast::TableColumnDef>, String> {
     match representative_aggregate_layout(property, canonical_query, analysis)? {
         None => analysis
             .output_columns
@@ -3043,31 +3048,23 @@ fn representative_aggregate_calls<'a>(
     analysis: &'a MvAnalysis,
 ) -> Result<
     (
-        crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-        &'a crate::sql::analysis::ResolvedQuery,
+        SqlMvAggregateCalls,
+        &'a novarocks_sql::analysis::ResolvedQuery,
     ),
     String,
 > {
     if matches!(property.identity, TargetIdentity::BranchScoped(_)) {
         let first_branch_ast = first_union_branch_ast_query(canonical_query)?;
-        let aggregate_calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
-                &first_branch_ast,
-            )?;
+        let aggregate_calls = extract_aggregate_sql_calls(&first_branch_ast)?;
         let resolved_query = first_union_branch_resolved_query(&analysis.resolved_query)?;
         Ok((aggregate_calls, resolved_query))
     } else {
-        let aggregate_calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
-                canonical_query,
-            )?;
+        let aggregate_calls = extract_aggregate_sql_calls(canonical_query)?;
         Ok((aggregate_calls, &analysis.resolved_query))
     }
 }
 
-/// Extract the first UNION ALL branch as a standalone AST query. Mirrors
-/// `mv_shape::flatten_union_all` + `wrap_setexpr_as_query` (kept local because
-/// those helpers are private to `mv_shape`).
+/// Extract the first UNION ALL branch as a standalone AST query.
 fn first_union_branch_ast_query(
     query: &sqlparser::ast::Query,
 ) -> Result<sqlparser::ast::Query, String> {
@@ -3117,12 +3114,16 @@ fn create_apply_key_source_property(apply_key: &ApplyKeyContract) -> &'static st
 
 fn create_apply_key_contract_source(
     apply_key: &ApplyKeyContract,
-) -> crate::sql::planner::vocabulary::ApplyKeySource {
+) -> novarocks_sql::planner::vocabulary::ApplyKeySource {
     match apply_key.column_name {
-        HIDDEN_APPLY_KEY_COLUMN_NAME => crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId,
-        JOIN_APPLY_KEY_COLUMN_NAME => crate::sql::planner::vocabulary::ApplyKeySource::JoinRowKey,
+        HIDDEN_APPLY_KEY_COLUMN_NAME => {
+            novarocks_sql::planner::vocabulary::ApplyKeySource::BaseRowId
+        }
+        JOIN_APPLY_KEY_COLUMN_NAME => {
+            novarocks_sql::planner::vocabulary::ApplyKeySource::JoinRowKey
+        }
         GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME => {
-            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
+            novarocks_sql::planner::vocabulary::ApplyKeySource::GroupRowId
         }
         other => unreachable!("unknown Iceberg MV apply-key column {other}"),
     }
@@ -3149,23 +3150,25 @@ fn descriptor_dependency_from_request(request: &CreateMvDependencyRequest) -> De
 }
 
 fn refresh_policy_descriptor_json(
-    policy: &crate::sql::parser::ast::MaterializedViewRefreshPolicy,
+    policy: &novarocks_sql::parser::ast::MaterializedViewRefreshPolicy,
     paused: bool,
 ) -> serde_json::Value {
     match policy {
-        crate::sql::parser::ast::MaterializedViewRefreshPolicy::Manual => serde_json::json!({
+        novarocks_sql::parser::ast::MaterializedViewRefreshPolicy::Manual => serde_json::json!({
             "policy": "DEFERRED_MANUAL",
             "interval_ms": null,
             "paused": paused,
         }),
-        crate::sql::parser::ast::MaterializedViewRefreshPolicy::AsyncOnChange => {
+        novarocks_sql::parser::ast::MaterializedViewRefreshPolicy::AsyncOnChange => {
             serde_json::json!({
                 "policy": "ASYNC_ON_CHANGE",
                 "interval_ms": null,
                 "paused": paused,
             })
         }
-        crate::sql::parser::ast::MaterializedViewRefreshPolicy::AsyncInterval { interval_ms } => {
+        novarocks_sql::parser::ast::MaterializedViewRefreshPolicy::AsyncInterval {
+            interval_ms,
+        } => {
             serde_json::json!({
                 "policy": "ASYNC_INTERVAL",
                 "interval_ms": interval_ms,
@@ -3319,7 +3322,7 @@ fn identity_needs_branch_id_column(identity: &TargetIdentity) -> bool {
 
 fn create_apply_key_table_column(
     apply_key: &ApplyKeyContract,
-) -> Result<crate::sql::parser::ast::TableColumnDef, String> {
+) -> Result<novarocks_sql::parser::ast::TableColumnDef, String> {
     match apply_key.column_name {
         HIDDEN_APPLY_KEY_COLUMN_NAME => Ok(apply_key_table_column()),
         JOIN_APPLY_KEY_COLUMN_NAME => Ok(join_apply_key_table_column()),
@@ -3342,25 +3345,25 @@ fn base_snapshot_status_for_refresh(
 }
 
 fn iceberg_aggregate_target_columns(
-    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &SqlMvAggregateCalls,
     analysis: &MvAnalysis,
-) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
+) -> Result<Vec<novarocks_sql::parser::ast::TableColumnDef>, String> {
     let layout = build_aggregate_layout_from_analysis(calls, analysis)?;
     iceberg_aggregate_target_columns_from_layout(&layout)
 }
 
 fn iceberg_aggregate_target_columns_from_resolved_query(
-    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-    output_columns: &[crate::sql::analysis::OutputColumn],
-    resolved_query: &crate::sql::analysis::ResolvedQuery,
-) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
+    calls: &SqlMvAggregateCalls,
+    output_columns: &[novarocks_sql::analysis::OutputColumn],
+    resolved_query: &novarocks_sql::analysis::ResolvedQuery,
+) -> Result<Vec<novarocks_sql::parser::ast::TableColumnDef>, String> {
     let layout = build_aggregate_layout_from_resolved_query(calls, output_columns, resolved_query)?;
     iceberg_aggregate_target_columns_from_layout(&layout)
 }
 
 fn iceberg_aggregate_target_columns_from_layout(
     layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
-) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
+) -> Result<Vec<novarocks_sql::parser::ast::TableColumnDef>, String> {
     validate_unique_aggregate_physical_column_names(&layout.physical_columns)?;
     Ok(layout
         .physical_columns
@@ -3370,7 +3373,7 @@ fn iceberg_aggregate_target_columns_from_layout(
 }
 
 fn build_aggregate_layout_from_analysis(
-    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &SqlMvAggregateCalls,
     analysis: &MvAnalysis,
 ) -> Result<crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout, String> {
     build_aggregate_layout_from_resolved_query(
@@ -3381,9 +3384,9 @@ fn build_aggregate_layout_from_analysis(
 }
 
 fn build_aggregate_layout_from_resolved_query(
-    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-    output_columns: &[crate::sql::analysis::OutputColumn],
-    resolved_query: &crate::sql::analysis::ResolvedQuery,
+    calls: &SqlMvAggregateCalls,
+    output_columns: &[novarocks_sql::analysis::OutputColumn],
+    resolved_query: &novarocks_sql::analysis::ResolvedQuery,
 ) -> Result<crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout, String> {
     let aggregate_input_types =
         crate::mv::aggregate_state::mv_agg_state::aggregate_input_types_from_resolved_query(
@@ -3398,14 +3401,14 @@ fn build_aggregate_layout_from_resolved_query(
 }
 
 fn first_union_branch_resolved_query(
-    resolved_query: &crate::sql::analysis::ResolvedQuery,
-) -> Result<&crate::sql::analysis::ResolvedQuery, String> {
+    resolved_query: &novarocks_sql::analysis::ResolvedQuery,
+) -> Result<&novarocks_sql::analysis::ResolvedQuery, String> {
     match &resolved_query.body {
-        crate::sql::analysis::QueryBody::SetOperation(set_op) => {
+        novarocks_sql::analysis::QueryBody::SetOperation(set_op) => {
             first_union_branch_resolved_query(&set_op.left)
         }
-        crate::sql::analysis::QueryBody::Select(_) => Ok(resolved_query),
-        crate::sql::analysis::QueryBody::Values(_) => {
+        novarocks_sql::analysis::QueryBody::Select(_) => Ok(resolved_query),
+        novarocks_sql::analysis::QueryBody::Values(_) => {
             Err("UNION ALL MV first branch requires SELECT analysis".to_string())
         }
     }
@@ -3503,7 +3506,7 @@ struct NonBranchContractCore {
 fn build_non_branch_schema_contract(
     identity: &TargetIdentity,
     query: &sqlparser::ast::Query,
-    resolved_query: &crate::sql::analysis::ResolvedQuery,
+    resolved_query: &novarocks_sql::analysis::ResolvedQuery,
     analysis: &crate::mv::analysis::MvAnalysis,
     base_refs: &[TableIdentity],
     base_field_observations: &std::collections::BTreeMap<
@@ -3551,7 +3554,7 @@ fn build_non_branch_schema_contract(
 fn build_non_branch_contract_core(
     identity: &TargetIdentity,
     query: &sqlparser::ast::Query,
-    resolved_query: &crate::sql::analysis::ResolvedQuery,
+    resolved_query: &novarocks_sql::analysis::ResolvedQuery,
     analysis: &crate::mv::analysis::MvAnalysis,
     base_refs: &[TableIdentity],
     base_field_observations: &std::collections::BTreeMap<
@@ -3569,7 +3572,7 @@ fn build_non_branch_contract_core(
                         .to_string(),
                 );
             };
-            let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
+            let lineage = novarocks_sql::analyzer::mv_lineage::build_projection_filter_lineage(
                 resolved_query,
                 &sql_mv_lineage_schema(observed_base_fields(base_field_observations, base_ref)?),
             )?;
@@ -3592,10 +3595,7 @@ fn build_non_branch_contract_core(
         // join half of a JoinAggregate. The aggregate is layered on by the
         // GroupRowId arm below.
         TargetIdentity::JoinRowKey(_, _) => {
-            let join_aliases =
-                crate::mv::aggregate_state::aggregate_sql_calls::extract_join_aliases(
-                    query,
-                )?;
+            let join_aliases = extract_join_aliases(query)?;
             let (left_contract, right_contract, output, join) =
                 build_join_base_contracts_and_lineage(
                     &join_aliases,
@@ -3635,10 +3635,9 @@ fn build_non_branch_contract_core(
 /// Whether an aggregate query's FROM clause is a fan-in UNION ALL subquery.
 ///
 /// FROM-side complement to [`extract_aggregate_sql_calls`] for distinguishing a
-/// fan-in aggregate from a single-scan aggregate WITHOUT the legacy classifier.
-/// Mirrors `mv_shape::extract_union_all_fan_in_bases`'s structural test: a
-/// fan-in FROM is exactly one relation, no joins, a non-lateral derived subquery
-/// whose body is a `UNION ALL` set operation.
+/// fan-in aggregate from a single-scan aggregate. A fan-in FROM is exactly one
+/// relation, no joins, a non-lateral derived subquery whose body is a `UNION ALL`
+/// set operation.
 fn from_clause_is_fan_in_union(query: &sqlparser::ast::Query) -> bool {
     let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
         return false;
@@ -3749,7 +3748,7 @@ fn validate_composed_aggregate_join_operator(
 }
 
 fn mixed_output_contract(
-    output_columns: &[crate::sql::analysis::OutputColumn],
+    output_columns: &[novarocks_sql::analysis::OutputColumn],
 ) -> mv_schema::OutputContract {
     mv_schema::OutputContract {
         columns: output_columns
@@ -3771,7 +3770,7 @@ fn mixed_output_contract(
 /// legacy SingleAggregate / JoinAggregate / FanInAggregate arms.
 fn build_aggregate_contract_core(
     query: &sqlparser::ast::Query,
-    resolved_query: &crate::sql::analysis::ResolvedQuery,
+    resolved_query: &novarocks_sql::analysis::ResolvedQuery,
     analysis: &crate::mv::analysis::MvAnalysis,
     base_refs: &[TableIdentity],
     base_field_observations: &std::collections::BTreeMap<
@@ -3785,8 +3784,7 @@ fn build_aggregate_contract_core(
     // simple aggregate, a join-aggregate, and a fan-in aggregate — byte-identical
     // to the legacy `AggregateSqlCalls::from(&shape)` (both share
     // `classify_aggregate_select_outputs`).
-    let aggregate_calls =
-        crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(query)?;
+    let aggregate_calls = extract_aggregate_sql_calls(query)?;
     let layout = build_aggregate_layout_from_resolved_query(
         &aggregate_calls,
         &analysis.output_columns,
@@ -3802,8 +3800,7 @@ fn build_aggregate_contract_core(
     // `build_join_base_contracts_and_lineage`; the join-alias extractor supplies
     // only the (table FQN, qualifier) pairs.
     if from_clause_is_direct_inner_on_join(query) {
-        let join_aliases =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_join_aliases(query)?;
+        let join_aliases = extract_join_aliases(query)?;
         // Aggregate over a two-table inner equi-join (legacy JoinAggregate).
         let (left_contract, right_contract, output, join) = build_join_base_contracts_and_lineage(
             &join_aliases,
@@ -3901,7 +3898,7 @@ fn build_aggregate_contract_core(
                 "aggregate iceberg MV schema contract requires one loaded base".to_string(),
             );
         };
-        let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
+        let lineage = novarocks_sql::analyzer::mv_lineage::build_projection_filter_lineage(
             resolved_query,
             &sql_mv_lineage_schema(observed_base_fields(base_field_observations, base_ref)?),
         )?;
@@ -3926,8 +3923,8 @@ fn build_aggregate_contract_core(
 /// Shared by the JoinProjectionFilter and JoinAggregate cores and by a composed
 /// join-aggregate branch.
 fn build_join_base_contracts_and_lineage(
-    join_aliases: &crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases,
-    resolved_query: &crate::sql::analysis::ResolvedQuery,
+    join_aliases: &SqlMvJoinAliases,
+    resolved_query: &novarocks_sql::analysis::ResolvedQuery,
     base_refs: &[TableIdentity],
     base_field_observations: &std::collections::BTreeMap<
         String,
@@ -3955,7 +3952,7 @@ fn build_join_base_contracts_and_lineage(
     // analyzer-resolved AST) — NOT the join aliases. The aliases supply only the
     // (table FQN, qualifier) pairs the collector keys schemas by, so the
     // persisted `join`/`output` sections are byte-identical to the legacy build.
-    let join_lineage = crate::sql::analyzer::mv_lineage::build_join_projection_filter_lineage(
+    let join_lineage = novarocks_sql::analyzer::mv_lineage::build_join_projection_filter_lineage(
         resolved_query,
         &[
             (&left_fqn, &join_aliases.left_alias, &left_schema),
@@ -4046,21 +4043,18 @@ fn build_branch_union_schema_contract(
             // neither aggregate nor join), byte-identical to the legacy
             // `ProjectionFilterMvShape.base_table`.
             let first_branch_ast = first_union_branch_ast_query(canonical_query)?;
-            let first_branch_base_table =
-                crate::mv::aggregate_state::aggregate_sql_calls::extract_single_scan_table_fqn(
-                    &first_branch_ast,
-                )?;
+            let first_branch_base_table = extract_single_scan_table_fqn(&first_branch_ast)?;
             let first_base_ref = base_ref_for_table_fqn(base_refs, &first_branch_base_table)?;
             let first_schema = sql_mv_lineage_schema(observed_base_fields(
                 base_field_observations,
                 first_base_ref,
             )?);
-            let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
+            let lineage = novarocks_sql::analyzer::mv_lineage::build_projection_filter_lineage(
                 &analysis.resolved_query,
                 &first_schema,
             )
             .or_else(|_| {
-                crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
+                novarocks_sql::analyzer::mv_lineage::build_projection_filter_lineage(
                     first_branch_resolved,
                     &first_schema,
                 )
@@ -4137,9 +4131,9 @@ fn build_branch_union_schema_contract(
     };
 
     let inner_apply_key_source = match inner {
-        TargetIdentity::BaseRowId => crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId,
+        TargetIdentity::BaseRowId => novarocks_sql::planner::vocabulary::ApplyKeySource::BaseRowId,
         TargetIdentity::GroupRowId(_) => {
-            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
+            novarocks_sql::planner::vocabulary::ApplyKeySource::GroupRowId
         }
         other => {
             return Err(format!(
@@ -4179,9 +4173,7 @@ fn union_branch_count(query: &sqlparser::ast::Query) -> u32 {
 ///   * a fan-in UNION ALL subquery in FROM -> one FQN per union branch
 ///   * a single scan                       -> [the single FROM table]
 fn branch_base_table_fqns(branch_query: &sqlparser::ast::Query) -> Result<Vec<String>, String> {
-    use crate::mv::aggregate_state::aggregate_sql_calls;
-
-    if let Ok(join_aliases) = aggregate_sql_calls::extract_join_aliases(branch_query) {
+    if let Ok(join_aliases) = extract_join_aliases(branch_query) {
         return Ok(vec![join_aliases.left_table, join_aliases.right_table]);
     }
 
@@ -4205,20 +4197,18 @@ fn branch_base_table_fqns(branch_query: &sqlparser::ast::Query) -> Result<Vec<St
             .into_iter()
             .map(|body| {
                 let branch = wrap_set_expr_as_query(branch_query, body);
-                aggregate_sql_calls::extract_single_scan_table_fqn(&branch)
+                extract_single_scan_table_fqn(&branch)
             })
             .collect();
     }
 
     // Single scan (projection/filter or aggregate over one table).
-    Ok(vec![aggregate_sql_calls::extract_single_scan_table_fqn(
-        branch_query,
-    )?])
+    Ok(vec![extract_single_scan_table_fqn(branch_query)?])
 }
 
 /// Flatten a (possibly nested) UNION ALL set-operation body into its leaf
-/// branch bodies, mirroring `mv_shape::flatten_union_all` without re-validating
-/// the UNION ALL operator (the fan-in shape is already confirmed by the caller).
+/// branch bodies without re-validating the UNION ALL operator (the fan-in shape
+/// is already confirmed by the caller).
 fn flatten_union_all_branches<'a>(
     body: &'a sqlparser::ast::SetExpr,
     out: &mut Vec<&'a sqlparser::ast::SetExpr>,
@@ -4236,7 +4226,7 @@ fn flatten_union_all_branches<'a>(
 }
 
 /// Wrap a `SetExpr` branch body as a standalone `Query`, inheriting the outer
-/// query's non-body fields. Mirrors `mv_shape::wrap_setexpr_as_query`.
+/// query's non-body fields.
 fn wrap_set_expr_as_query(
     outer: &sqlparser::ast::Query,
     body: &sqlparser::ast::SetExpr,
@@ -4358,12 +4348,12 @@ fn observed_base_fields<'a>(
 /// schema object or consults it after this conversion.
 fn sql_mv_lineage_schema(
     fields: &[crate::mv::storage_observation::MvObservedTargetField],
-) -> crate::sql::analyzer::mv_lineage::SqlMvLineageSchema {
-    crate::sql::analyzer::mv_lineage::SqlMvLineageSchema {
+) -> novarocks_sql::analyzer::mv_lineage::SqlMvLineageSchema {
+    novarocks_sql::analyzer::mv_lineage::SqlMvLineageSchema {
         fields: fields
             .iter()
             .map(
-                |field| crate::sql::analyzer::mv_lineage::SqlMvLineageField {
+                |field| novarocks_sql::analyzer::mv_lineage::SqlMvLineageField {
                     field_id: field.field_id,
                     name_at_create: field.name.clone(),
                     type_signature: field.type_signature.clone(),
@@ -4375,7 +4365,7 @@ fn sql_mv_lineage_schema(
 }
 
 fn persist_sql_mv_base_fields(
-    fields: Vec<crate::sql::analyzer::mv_lineage::SqlMvLineageField>,
+    fields: Vec<novarocks_sql::analyzer::mv_lineage::SqlMvLineageField>,
 ) -> Vec<mv_schema::BaseFieldRecord> {
     fields
         .into_iter()
@@ -4389,7 +4379,7 @@ fn persist_sql_mv_base_fields(
 }
 
 fn persist_sql_mv_qualified_field(
-    field: crate::sql::analyzer::mv_lineage::SqlMvQualifiedFieldLineage,
+    field: novarocks_sql::analyzer::mv_lineage::SqlMvQualifiedFieldLineage,
 ) -> mv_schema::QualifiedFieldLineage {
     mv_schema::QualifiedFieldLineage {
         table_fqn: field.table_fqn,
@@ -4399,30 +4389,30 @@ fn persist_sql_mv_qualified_field(
 }
 
 fn persist_sql_mv_expression_kind(
-    kind: crate::sql::analyzer::mv_lineage::SqlMvExpressionKind,
+    kind: novarocks_sql::analyzer::mv_lineage::SqlMvExpressionKind,
 ) -> mv_schema::ExpressionKind {
     match kind {
-        crate::sql::analyzer::mv_lineage::SqlMvExpressionKind::Column => {
+        novarocks_sql::analyzer::mv_lineage::SqlMvExpressionKind::Column => {
             mv_schema::ExpressionKind::Column
         }
-        crate::sql::analyzer::mv_lineage::SqlMvExpressionKind::Cast => {
+        novarocks_sql::analyzer::mv_lineage::SqlMvExpressionKind::Cast => {
             mv_schema::ExpressionKind::Cast
         }
-        crate::sql::analyzer::mv_lineage::SqlMvExpressionKind::Func => {
+        novarocks_sql::analyzer::mv_lineage::SqlMvExpressionKind::Func => {
             mv_schema::ExpressionKind::Func
         }
-        crate::sql::analyzer::mv_lineage::SqlMvExpressionKind::Literal => {
+        novarocks_sql::analyzer::mv_lineage::SqlMvExpressionKind::Literal => {
             mv_schema::ExpressionKind::Literal
         }
-        crate::sql::analyzer::mv_lineage::SqlMvExpressionKind::Mixed => {
+        novarocks_sql::analyzer::mv_lineage::SqlMvExpressionKind::Mixed => {
             mv_schema::ExpressionKind::Mixed
         }
     }
 }
 
 fn persist_sql_mv_output_contract(
-    columns: Vec<crate::sql::analyzer::mv_lineage::SqlMvOutputColumnLineage>,
-    filter: Option<crate::sql::analyzer::mv_lineage::SqlMvFilterLineage>,
+    columns: Vec<novarocks_sql::analyzer::mv_lineage::SqlMvOutputColumnLineage>,
+    filter: Option<novarocks_sql::analyzer::mv_lineage::SqlMvFilterLineage>,
 ) -> mv_schema::OutputContract {
     mv_schema::OutputContract {
         columns: columns
@@ -4452,7 +4442,7 @@ fn persist_sql_mv_output_contract(
 }
 
 fn persist_sql_mv_lineage(
-    lineage: crate::sql::analyzer::mv_lineage::SqlMvLineageResult,
+    lineage: novarocks_sql::analyzer::mv_lineage::SqlMvLineageResult,
 ) -> (Vec<mv_schema::BaseFieldRecord>, mv_schema::OutputContract) {
     (
         persist_sql_mv_base_fields(lineage.base_fields),
@@ -4461,10 +4451,10 @@ fn persist_sql_mv_lineage(
 }
 
 fn persist_sql_mv_join_contract(
-    join: crate::sql::analyzer::mv_lineage::SqlMvJoinContract,
+    join: novarocks_sql::analyzer::mv_lineage::SqlMvJoinContract,
 ) -> mv_schema::JoinContract {
     let kind = match join.kind {
-        crate::sql::analyzer::mv_lineage::SqlMvJoinContractKind::InnerEquiJoin => {
+        novarocks_sql::analyzer::mv_lineage::SqlMvJoinContractKind::InnerEquiJoin => {
             mv_schema::JoinContractKind::InnerEquiJoin
         }
     };
@@ -4664,11 +4654,11 @@ mod tests {
     use super::*;
     use crate::mv::refresh::apply_key::ApplyKeyValueType;
     use crate::mv::refresh::capabilities::PartitionPruningPolicy;
-    use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::planner::logical::*;
-    use crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr;
-    use crate::sql::planner::payload::*;
     use arrow::datatypes::DataType;
+    use novarocks_sql::optimizer::scalar::ScalarArena;
+    use novarocks_sql::planner::logical::*;
+    use novarocks_sql::planner::optimizer_bridge::logical::try_to_optimizer_expr;
+    use novarocks_sql::planner::payload::*;
     use std::cell::Cell;
 
     #[test]
@@ -4984,23 +4974,23 @@ mod tests {
 
     #[test]
     fn join_coalesce_locator_ids_reserve_rewritten_plan_outputs() {
-        let child_output = crate::sql::analysis::OutputColumn {
-            column_id: crate::sql::column_id::ColumnId(42),
+        let child_output = novarocks_sql::analysis::OutputColumn {
+            column_id: novarocks_sql::column_id::ColumnId(42),
             name: "child_k".to_string(),
             data_type: DataType::Int64,
             nullable: false,
             is_internal: false,
         };
-        let root_output = crate::sql::analysis::OutputColumn {
-            column_id: crate::sql::column_id::ColumnId(6),
+        let root_output = novarocks_sql::analysis::OutputColumn {
+            column_id: novarocks_sql::column_id::ColumnId(6),
             name: "root_k".to_string(),
             data_type: DataType::Int64,
             nullable: false,
             is_internal: false,
         };
-        let child = crate::sql::planner::logical::LogicalPlanNode::new(
-            crate::sql::planner::logical::LogicalPlanKind::Values(
-                crate::sql::planner::payload::PlanValuesNode {
+        let child = novarocks_sql::planner::logical::LogicalPlanNode::new(
+            novarocks_sql::planner::logical::LogicalPlanKind::Values(
+                novarocks_sql::planner::payload::PlanValuesNode {
                     rows: Vec::new(),
                     columns: vec![child_output.clone()],
                 },
@@ -5008,12 +4998,12 @@ mod tests {
             Vec::new(),
             None,
         );
-        let plan = crate::sql::planner::logical::LogicalPlanNode::new(
-            crate::sql::planner::logical::LogicalPlanKind::Project(
-                crate::sql::planner::payload::PlanProjectNode {
-                    items: vec![crate::sql::analysis::ProjectItem {
-                        expr: crate::sql::analysis::TypedExpr {
-                            kind: crate::sql::analysis::ExprKind::ColumnRef {
+        let plan = novarocks_sql::planner::logical::LogicalPlanNode::new(
+            novarocks_sql::planner::logical::LogicalPlanKind::Project(
+                novarocks_sql::planner::payload::PlanProjectNode {
+                    items: vec![novarocks_sql::analysis::ProjectItem {
+                        expr: novarocks_sql::analysis::TypedExpr {
+                            kind: novarocks_sql::analysis::ExprKind::ColumnRef {
                                 column_id: child_output.column_id,
                                 qualifier: None,
                                 column: child_output.name.clone(),
@@ -5030,7 +5020,7 @@ mod tests {
             vec![child],
             None,
         );
-        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let mut factory = novarocks_sql::column_id::ColumnRefFactory::new();
 
         let ids = crate::mv::refresh::join_incremental_refresh::allocate_join_coalesce_locator_column_ids(
             &mut factory,
@@ -5149,8 +5139,8 @@ mod tests {
 
     fn parse_select_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =
-            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
+            novarocks_sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
+        let stmt = novarocks_sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
         let sqlparser::ast::Statement::Query(q) = stmt else {
             panic!("expected SELECT");
         };
@@ -5162,7 +5152,7 @@ mod tests {
         let column = crate::mv::refresh::target_apply::join_apply_key_table_column();
         assert_eq!(
             column.name,
-            crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME
+            novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME
         );
     }
 
@@ -5357,12 +5347,12 @@ mod tests {
         let desc = join_coalesce_factory_test_descriptor();
         let branch_union = join_coalesce_factory_test_branch_union(&desc);
         let locator =
-            crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
-                target_binding: crate::sql::compiler::mv_rewrite::test_target_binding(),
+            novarocks_sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
+                target_binding: novarocks_sql::compiler::mv_rewrite::test_target_binding(),
                 target_table_uuid: "target-uuid".to_string(),
                 target_snapshot_id: Some(77),
             };
-        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let mut factory = novarocks_sql::column_id::ColumnRefFactory::new();
         factory.reserve_until(109);
         let locator_columns = crate::mv::refresh::join_incremental_refresh::allocate_join_coalesce_locator_column_ids(
             &mut factory,
@@ -5371,7 +5361,7 @@ mod tests {
         .expect("allocate locator column ids");
 
         let plan =
-            crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
+            novarocks_sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
                 branch_union,
                 &desc,
                 &locator,
@@ -5426,7 +5416,7 @@ mod tests {
 
     fn output_col(name: &str, ty: DataType, nullable: bool) -> OutputColumn {
         OutputColumn {
-            column_id: crate::sql::column_id::ColumnId::UNSET,
+            column_id: novarocks_sql::column_id::ColumnId::UNSET,
             name: name.to_string(),
             data_type: ty,
             nullable,
@@ -5435,8 +5425,8 @@ mod tests {
     }
 
     fn join_coalesce_factory_test_descriptor()
-    -> crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor {
-        use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
+    -> novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor {
+        use novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::{
             JoinRefreshBranchDescriptor, JoinRefreshBranchSide, JoinRefreshDescriptor,
             JoinRefreshJoinKeyPair, JoinRefreshMode, JoinRefreshMvIdentity,
             JoinRefreshOutputMapping, JoinRefreshOutputSource,
@@ -5545,14 +5535,14 @@ mod tests {
     }
 
     fn join_coalesce_factory_test_branch_union(
-        desc: &crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor,
-    ) -> crate::sql::planner::logical::LogicalPlanNode {
+        desc: &novarocks_sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor,
+    ) -> novarocks_sql::planner::logical::LogicalPlanNode {
         let mut output_columns = desc.payload_columns.clone();
         output_columns.push(desc.action_column.clone());
         output_columns.push(desc.join_apply_key_column.clone());
-        let branch = crate::sql::planner::logical::LogicalPlanNode::new(
-            crate::sql::planner::logical::LogicalPlanKind::Values(
-                crate::sql::planner::payload::PlanValuesNode {
+        let branch = novarocks_sql::planner::logical::LogicalPlanNode::new(
+            novarocks_sql::planner::logical::LogicalPlanKind::Values(
+                novarocks_sql::planner::payload::PlanValuesNode {
                     rows: Vec::new(),
                     columns: output_columns.clone(),
                 },
@@ -5560,9 +5550,9 @@ mod tests {
             Vec::new(),
             None,
         );
-        crate::sql::planner::logical::LogicalPlanNode::new(
-            crate::sql::planner::logical::LogicalPlanKind::Union(
-                crate::sql::planner::logical::LogicalUnionNode {
+        novarocks_sql::planner::logical::LogicalPlanNode::new(
+            novarocks_sql::planner::logical::LogicalPlanKind::Union(
+                novarocks_sql::planner::logical::LogicalUnionNode {
                     all: true,
                     output_columns,
                 },
@@ -5573,7 +5563,7 @@ mod tests {
     }
 
     fn collect_join_coalesce_factory_watch_columns(
-        plan: &crate::sql::planner::logical::LogicalPlanNode,
+        plan: &novarocks_sql::planner::logical::LogicalPlanNode,
         min_id: ColumnId,
     ) -> Vec<OutputColumn> {
         let mut columns = Vec::new();
@@ -5582,12 +5572,12 @@ mod tests {
     }
 
     fn collect_join_coalesce_factory_watch_columns_inner(
-        plan: &crate::sql::planner::logical::LogicalPlanNode,
+        plan: &novarocks_sql::planner::logical::LogicalPlanNode,
         min_id: ColumnId,
         columns: &mut Vec<OutputColumn>,
     ) {
         match &plan.kind {
-            crate::sql::planner::logical::LogicalPlanKind::Project(project) => {
+            novarocks_sql::planner::logical::LogicalPlanKind::Project(project) => {
                 columns.extend(project.items.iter().filter_map(|item| {
                     is_join_coalesce_factory_locator_output(&item.output_name).then(|| {
                         OutputColumn {
@@ -5600,7 +5590,7 @@ mod tests {
                     })
                 }));
             }
-            crate::sql::planner::logical::LogicalPlanKind::Aggregate(aggregate) => {
+            novarocks_sql::planner::logical::LogicalPlanKind::Aggregate(aggregate) => {
                 columns.extend(
                     aggregate
                         .output_columns
@@ -5612,7 +5602,7 @@ mod tests {
                         .cloned(),
                 );
             }
-            crate::sql::planner::logical::LogicalPlanKind::Scan(scan) => {
+            novarocks_sql::planner::logical::LogicalPlanKind::Scan(scan) => {
                 columns.extend(
                     scan.columns
                         .iter()
@@ -6045,7 +6035,7 @@ enum AllBasesAggregateRefresh<'a> {
     /// (`extract_aggregate_sql_calls`), not the legacy classifier.
     FanIn {
         schema_contract: &'a mv_schema::MvSchemaContract,
-        aggregate_calls: &'a crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+        aggregate_calls: &'a SqlMvAggregateCalls,
     },
     /// Aggregate over a composed multi-base relation, such as a nested join or
     /// a zero-key CROSS JOIN. The change stream still uses the aggregate
@@ -6053,7 +6043,7 @@ enum AllBasesAggregateRefresh<'a> {
     /// proof is required.
     ComposedAggregate {
         schema_contract: &'a mv_schema::MvSchemaContract,
-        aggregate_calls: &'a crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+        aggregate_calls: &'a SqlMvAggregateCalls,
     },
     /// UNION ALL of aggregate branches (`BranchScoped` identity): the union sits
     /// above per-branch aggregates and the first refresh injects `__branch_id__`.
@@ -6064,7 +6054,7 @@ enum AllBasesAggregateRefresh<'a> {
     /// representative of every branch under the CREATE-time homogeneity gate.
     BranchUnion {
         branch_count: usize,
-        first_branch_calls: &'a crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+        first_branch_calls: &'a SqlMvAggregateCalls,
     },
 }
 
@@ -6548,10 +6538,8 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
         // aliases from the focused join-alias extractor (not the legacy
         // classifier); base-ref matching uses the `JoinAliases`-sourced
         // validators, mirroring the execute path.
-        let join_aliases = crate::mv::aggregate_state::aggregate_sql_calls::extract_join_aliases(
-            &canonical_select_query,
-        )
-        .map_err(RefreshError::user)?;
+        let join_aliases =
+            extract_join_aliases(&canonical_select_query).map_err(RefreshError::user)?;
         if base_refs.len() != 2 {
             return Err(RefreshError::user(
                 "iceberg join materialized view refresh requires exactly two base table references",
@@ -7264,10 +7252,7 @@ fn plan_iceberg_aggregate_mv_refresh(
             // keys are never read by the plan path. Base-ref matching uses those
             // table FQNs against the analyzer-resolved base refs.
             let join_aliases =
-                crate::mv::aggregate_state::aggregate_sql_calls::extract_join_aliases(
-                    canonical_select_query,
-                )
-                .map_err(RefreshError::user)?;
+                extract_join_aliases(canonical_select_query).map_err(RefreshError::user)?;
             if base_refs.len() != 2 {
                 return Err(RefreshError::user(
                     "iceberg join aggregate MV refresh requires exactly two base table references",
@@ -7680,7 +7665,7 @@ fn alias_aggregate_refresh_group_key_projection_from_rewrite(
     };
     for (projection_index, output) in calls.visible_outputs.iter().enumerate() {
         match output {
-            crate::sql::mv_refresh::VisibleAggregateOutput::GroupKey(group_key_index) => {
+            novarocks_sql::mv_refresh::VisibleAggregateOutput::GroupKey(group_key_index) => {
                 let visible_source_index = layout
                     .group_key_source_indexes
                     .get(*group_key_index)
@@ -7714,7 +7699,7 @@ fn alias_aggregate_refresh_group_key_projection_from_rewrite(
                     ));
                 }
             }
-            crate::sql::mv_refresh::VisibleAggregateOutput::Aggregate(_) => {}
+            novarocks_sql::mv_refresh::VisibleAggregateOutput::Aggregate(_) => {}
         }
     }
     Ok(())
@@ -7764,7 +7749,7 @@ fn build_aggregate_layout_for_refresh_select_sql(
     current_catalog: Option<&str>,
     current_database: &str,
     select_sql: &str,
-    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &SqlMvAggregateCalls,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout, String> {
     let visible_query = parse_mv_select_query(select_sql)?;
@@ -7780,9 +7765,9 @@ fn build_aggregate_layout_for_refresh_select_sql(
     build_aggregate_layout_from_analysis(calls, &visible_analysis)
 }
 pub(crate) fn parse_mv_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)
+    let normalized = novarocks_sql::parser::dialect::normalize_for_raw_parse(sql)
         .map_err(|e| format!("stored MV SELECT normalize error: {e}"))?;
-    let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+    let statement = novarocks_sql::parser::parse_normalized_sql_raw(&normalized)
         .map_err(|err| format!("sql parser error: {err}"))?;
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("stored MV SQL must be a SELECT query".to_string());
@@ -7930,7 +7915,7 @@ fn validate_repartition_base_schema_contract(
 }
 
 fn validate_join_aliases_base_refs(
-    aliases: &crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases,
+    aliases: &SqlMvJoinAliases,
     base_refs: &[TableIdentity],
 ) -> Result<(), String> {
     for name in [
@@ -7953,7 +7938,7 @@ fn validate_join_aliases_base_refs(
 /// `JoinAliases.{left_table,right_table}` (the `ObjectName.to_string()` FQN form)
 /// against `base.fqn()`.
 fn join_base_refs_for_aliases<'a>(
-    aliases: &crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases,
+    aliases: &SqlMvJoinAliases,
     base_refs: &'a [TableIdentity],
 ) -> Result<(&'a TableIdentity, &'a TableIdentity), String> {
     let left_name = aliases.left_table.as_str();
@@ -8218,8 +8203,8 @@ pub(crate) fn compile_canonical_select_for_imv_with_frozen_rewrite(
     overlays: Vec<crate::query_execution::planning::catalog_materializer::QueryLocalTableOverlay>,
 ) -> Result<
     (
-        crate::sql::planner::logical::LogicalPlanNode,
-        crate::sql::column_id::ColumnRefFactory,
+        novarocks_sql::planner::logical::LogicalPlanNode,
+        novarocks_sql::column_id::ColumnRefFactory,
     ),
     RefreshError,
 > {
@@ -8236,39 +8221,39 @@ pub(crate) fn compile_canonical_select_for_imv_with_frozen_rewrite(
         overlays,
     );
     let mut query = (*rewrite.canonical_select_query).clone();
-    crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
+    novarocks_sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
     let statistics =
         crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
             query_kernel,
             materializer.query_table_bindings(),
         );
-    let catalog = crate::sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
+    let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| {
             RefreshError::user("IMV join planning requires a non-empty admitted backend topology")
         })?;
-    let request = crate::sql::compiler::SqlCompileRequest::new(
-        crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query)),
-        crate::sql::compiler::SqlCompileIntent::LogicalOnly,
-        crate::sql::compiler::SqlSessionContext {
+    let request = novarocks_sql::compiler::SqlCompileRequest::new(
+        novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query)),
+        novarocks_sql::compiler::SqlCompileIntent::LogicalOnly,
+        novarocks_sql::compiler::SqlSessionContext {
             current_catalog: None,
             current_database: rewrite.current_database.clone(),
             optimizer_settings: execution.optimizer_settings().clone(),
         },
-        crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog,
         &statistics,
-        crate::sql::functions::builtin_sql_function_catalog(),
+        novarocks_sql::functions::builtin_sql_function_catalog(),
         None,
-        crate::sql::compiler::SqlCompileControl::new(
+        novarocks_sql::compiler::SqlCompileControl::new(
             execution.deadline(),
             crate::query_execution::planning::sql_cancellation_observation(
                 execution.cancellation().clone(),
             ),
         ),
     );
-    let crate::sql::compiler::SqlCompileOutput::Logical(output) =
-        crate::sql::compiler::SqlCompiler::compile(request).map_err(|error| {
+    let novarocks_sql::compiler::SqlCompileOutput::Logical(output) =
+        novarocks_sql::compiler::SqlCompiler::compile(request).map_err(|error| {
             RefreshError::user(format!(
                 "imv plan failed for {}.{}.{}: canonical SQL compiler: {error}",
                 rewrite.target.catalog, rewrite.target.namespace, rewrite.target.table
@@ -8280,7 +8265,7 @@ pub(crate) fn compile_canonical_select_for_imv_with_frozen_rewrite(
         ));
     };
     Ok((
-        crate::sql::planner::imv_rewrite::entrypoint::normalize_imv_rewrite_root_project(
+        novarocks_sql::planner::imv_rewrite::entrypoint::normalize_imv_rewrite_root_project(
             output.logical_plan,
         ),
         output.factory,
@@ -8289,9 +8274,9 @@ pub(crate) fn compile_canonical_select_for_imv_with_frozen_rewrite(
 
 #[cfg(test)]
 pub(crate) fn normalize_imv_rewrite_root_project(
-    plan: crate::sql::planner::logical::LogicalPlanNode,
-) -> crate::sql::planner::logical::LogicalPlanNode {
-    use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
+    plan: novarocks_sql::planner::logical::LogicalPlanNode,
+) -> novarocks_sql::planner::logical::LogicalPlanNode {
+    use novarocks_sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 
     let LogicalPlanNode {
         kind,
@@ -8343,7 +8328,7 @@ pub(crate) fn normalize_imv_rewrite_root_project(
             if *column_id != aggregate_output.column_id {
                 return None;
             }
-            Some(crate::sql::analysis::OutputColumn {
+            Some(novarocks_sql::analysis::OutputColumn {
                 column_id: *column_id,
                 name: item.output_name.clone(),
                 data_type: item.expr.data_type.clone(),
@@ -8374,7 +8359,7 @@ pub(crate) fn normalize_imv_rewrite_root_project(
 
 fn refresh_explain_rewrite_disabled_rules(
     is_aggregate_refresh: bool,
-    optimizer_settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
+    optimizer_settings: &novarocks_sql::optimizer::options::SessionOptimizerSettings,
 ) -> Vec<String> {
     let mut disabled_rules = optimizer_settings.disabled_rules.clone();
     if is_aggregate_refresh
@@ -8390,7 +8375,7 @@ fn refresh_explain_rewrite_disabled_rules(
 #[cfg(test)]
 fn validate_aggregate_refresh_rewrite_outcome(
     ctx: &crate::mv::rewrite::context::IcebergMvRewriteContext,
-    outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome,
+    outcome: &novarocks_sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome,
     evidence: RewriteMergeRefreshEvidence,
 ) -> Result<(), String> {
     if evidence == RewriteMergeRefreshEvidence::JoinAggregate
@@ -8443,10 +8428,10 @@ fn validate_aggregate_refresh_rewrite_outcome(
 
 fn sql_imv_planning_input_from_rewrite(
     rewrite: &crate::mv::rewrite::context::IcebergMvRewriteContext,
-    target_binding: crate::sql::binding::SqlTableBindingId,
+    target_binding: novarocks_sql::binding::SqlTableBindingId,
     evidence: RewriteMergeRefreshEvidence,
-) -> Result<crate::sql::compiler::SqlImvPlanningInput, String> {
-    use crate::sql::compiler::SqlImvRewriteValidation;
+) -> Result<novarocks_sql::compiler::SqlImvPlanningInput, String> {
+    use novarocks_sql::compiler::SqlImvRewriteValidation;
 
     let validation = match evidence {
         RewriteMergeRefreshEvidence::None => SqlImvRewriteValidation::None,
@@ -8456,7 +8441,7 @@ fn sql_imv_planning_input_from_rewrite(
             SqlImvRewriteValidation::BranchUnionAggregate
         }
     };
-    Ok(crate::sql::compiler::SqlImvPlanningInput::new(
+    Ok(novarocks_sql::compiler::SqlImvPlanningInput::new(
         rewrite.to_sql_rewrite_snapshot(target_binding)?,
         validation,
     ))
@@ -8470,7 +8455,7 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
     store: &Arc<QueryTableBindingStore>,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<crate::sql::binding::SqlTableBindingId, String> {
+) -> Result<novarocks_sql::binding::SqlTableBindingId, String> {
     let target = &rewrite.target;
     let target_table_uuid = rewrite.target_table_uuid.clone();
     let frozen_snapshot_id = rewrite.target_snapshot_id;
@@ -8673,13 +8658,13 @@ pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
 
 #[cfg(test)]
 fn rewrite_outcome_rule_changed(
-    outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome,
+    outcome: &novarocks_sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome,
     rule_name: &str,
 ) -> bool {
     outcome.trace.events().iter().any(|event| {
         matches!(
             event,
-            crate::sql::optimizer::rewrite::trace::RewriteTraceEvent::RuleChanged { rule, .. }
+            novarocks_sql::optimizer::rewrite::trace::RewriteTraceEvent::RuleChanged { rule, .. }
                 if *rule == rule_name
         )
     })
@@ -8863,17 +8848,17 @@ mod partition_planning_tests {
 mod aggregate_refresh_rewrite_validation_tests {
     use super::*;
 
-    use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::rewrite::phase::RewritePhase;
-    use crate::sql::optimizer::rewrite::trace::RewriteTrace;
-    use crate::sql::planner::imv_rewrite::annotation::ImvPlanAnnotation;
-    use crate::sql::planner::imv_rewrite::change_stream::{
+    use novarocks_sql::column_id::ColumnId;
+    use novarocks_sql::optimizer::rewrite::phase::RewritePhase;
+    use novarocks_sql::optimizer::rewrite::trace::RewriteTrace;
+    use novarocks_sql::planner::imv_rewrite::annotation::ImvPlanAnnotation;
+    use novarocks_sql::planner::imv_rewrite::change_stream::{
         AggregateChangeStreamDescriptor, AggregateChangeStreamShape, ImvChangeStreamDescriptor,
         SignedStateAggregateProof, TargetStateProof,
     };
-    use crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome;
-    use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
-    use crate::sql::planner::payload::PlanValuesNode;
+    use novarocks_sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome;
+    use novarocks_sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
+    use novarocks_sql::planner::payload::PlanValuesNode;
 
     fn empty_values_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
@@ -9085,7 +9070,7 @@ mod join_delta_append_only_fast_path_tests {
     fn aggregate_refresh_explain_disables_join_refresh_descriptor_recording() {
         let disabled_rules = refresh_explain_rewrite_disabled_rules(
             true,
-            &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+            &novarocks_sql::optimizer::options::SessionOptimizerSettings::default(),
         );
 
         assert!(
@@ -9188,8 +9173,8 @@ mod join_delta_append_only_fast_path_tests {
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =
-            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
+            novarocks_sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
+        let stmt = novarocks_sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query");
         };
@@ -9208,7 +9193,7 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
     current_catalog: Option<&str>,
     current_database: &str,
     stmt: &RefreshMaterializedViewStmt,
-    level: crate::sql::explain::ExplainLevel,
+    level: novarocks_sql::explain::ExplainLevel,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Vec<String>, String> {
     explain_refresh_full_guard(stmt.full)?;
@@ -9294,27 +9279,28 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
             statistics_resolver,
             materializer.query_table_bindings(),
         );
-    let catalog = crate::sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
+    let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
     let mut query = (*rewrite.canonical_select_query).clone();
-    crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
-    let input = crate::sql::compiler::SqlImvPlanningInput::new(
+    novarocks_sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
+    let input = novarocks_sql::compiler::SqlImvPlanningInput::new(
         rewrite.to_sql_rewrite_snapshot(target_binding)?,
-        crate::sql::compiler::SqlImvRewriteValidation::None,
+        novarocks_sql::compiler::SqlImvRewriteValidation::None,
     );
-    let request = crate::sql::compiler::SqlCompileRequest::new(
-        crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query)),
-        crate::sql::compiler::SqlCompileIntent::LogicalOnly,
-        crate::sql::compiler::SqlSessionContext {
+    let request = novarocks_sql::compiler::SqlCompileRequest::new(
+        novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query)),
+        novarocks_sql::compiler::SqlCompileIntent::LogicalOnly,
+        novarocks_sql::compiler::SqlSessionContext {
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
-            optimizer_settings: crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+            optimizer_settings:
+                novarocks_sql::optimizer::options::SessionOptimizerSettings::default(),
         },
-        crate::sql::compiler::SqlPlanningEnvironment::NotApplicable,
+        novarocks_sql::compiler::SqlPlanningEnvironment::NotApplicable,
         &catalog,
         &statistics,
-        crate::sql::functions::builtin_sql_function_catalog(),
+        novarocks_sql::functions::builtin_sql_function_catalog(),
         None,
-        crate::sql::compiler::SqlCompileControl::new(
+        novarocks_sql::compiler::SqlCompileControl::new(
             Some(connector_context.deadline()),
             Arc::new(MvRefreshConnectorCancellationObservation {
                 cancellation: connector_context.cancellation().clone(),
@@ -9322,19 +9308,20 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
         ),
     )
     .with_imv_rewrite(&input);
-    let crate::sql::compiler::SqlCompileOutput::Logical(output) =
-        crate::sql::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
+    let novarocks_sql::compiler::SqlCompileOutput::Logical(output) =
+        novarocks_sql::compiler::SqlCompiler::compile(request)
+            .map_err(|error| error.to_string())?
     else {
         return Err("EXPLAIN REFRESH logical intent did not produce logical SQL facts".to_string());
     };
-    crate::sql::explain::explain_plan_checked(&output.logical_plan, level)
+    novarocks_sql::explain::explain_plan_checked(&output.logical_plan, level)
 }
 
 struct MvRefreshConnectorCancellationObservation {
     cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
 }
 
-impl crate::sql::compiler::SqlCancellationObservation
+impl novarocks_sql::compiler::SqlCancellationObservation
     for MvRefreshConnectorCancellationObservation
 {
     fn is_cancelled(&self) -> bool {
@@ -9412,11 +9399,11 @@ const IMV_CHANGE_STREAM_EFFECT_EXISTING: i32 = 1;
 const IMV_CHANGE_STREAM_EFFECT_APPENDED: i32 = 2;
 
 struct ImvRefreshPlannedChangeStream {
-    optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
+    optimized_tree: novarocks_sql::optimizer::OptimizedOperatorNode,
     table_bindings:
         Option<std::sync::Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>>,
     output_columns: Vec<OutputColumn>,
-    change_stream: crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
+    change_stream: novarocks_sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     producer_branches: Vec<ImvChangeStreamProducerRoute>,
     snapshot_properties: BTreeMap<String, String>,
     connector_operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
@@ -9588,7 +9575,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     for route in &provider_routes {
         crate::query_execution::planning::write_sink::admit_prepared_connector_write_target(
             target_bindings.as_ref(),
-            crate::sql::planner::table::SqlTableIdentity {
+            novarocks_sql::planner::table::SqlTableIdentity {
                 catalog: target.catalog.clone(),
                 namespace: target.namespace.clone(),
                 table: target.table.clone(),
@@ -9649,7 +9636,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                     &refresh_rewrite,
                 )?;
             }
-            crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
+            novarocks_sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
             let imv_rewrite_input = sql_imv_planning_input_from_rewrite(
                 &refresh_rewrite,
                 target_binding,
@@ -9855,16 +9842,16 @@ fn imv_change_stream_effect_output_column(existing: &[OutputColumn]) -> OutputCo
 }
 
 fn add_imv_change_stream_effect_project(
-    child: crate::sql::optimizer::OptimizedOperatorNode,
+    child: novarocks_sql::optimizer::OptimizedOperatorNode,
     child_output_columns: &[OutputColumn],
     action_output: Option<&OutputColumn>,
     row_lineage_output: Option<&OutputColumn>,
     route_mode: ImvChangeStreamEffectMode,
     route_output: OutputColumn,
-) -> Result<crate::sql::optimizer::OptimizedOperatorNode, String> {
-    use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
-    use crate::sql::optimizer::optimized_tree::{PlanExecutionProps, attach_scalar_arena};
-    use crate::sql::optimizer::scalar::ScalarNode;
+) -> Result<novarocks_sql::optimizer::OptimizedOperatorNode, String> {
+    use novarocks_sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
+    use novarocks_sql::optimizer::optimized_tree::{PlanExecutionProps, attach_scalar_arena};
+    use novarocks_sql::optimizer::scalar::ScalarNode;
 
     let existing_arena =
         child.execution_props.scalar_arena.as_ref().ok_or_else(|| {
@@ -9902,14 +9889,14 @@ fn add_imv_change_stream_effect_project(
     let mut output_columns = child_output_columns.to_vec();
     output_columns.push(route_output);
     let arena = Arc::new(arena);
-    let mut plan = crate::sql::optimizer::OptimizedOperatorNode {
+    let mut plan = novarocks_sql::optimizer::OptimizedOperatorNode {
         op: Operator::PhysicalProject(ProjectOp {
             items,
             output_qualifier: None,
         }),
         children: vec![child],
         stats,
-        explain_stats: crate::sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
+        explain_stats: novarocks_sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
         output_columns,
         execution_props: PlanExecutionProps {
             output_property: output_property.clone(),
@@ -9923,13 +9910,13 @@ fn add_imv_change_stream_effect_project(
 }
 
 fn imv_change_stream_effect_scalar(
-    arena: &mut crate::sql::optimizer::scalar::ScalarArena,
+    arena: &mut novarocks_sql::optimizer::scalar::ScalarArena,
     action_output: Option<&OutputColumn>,
     row_lineage_output: Option<&OutputColumn>,
     route_mode: ImvChangeStreamEffectMode,
-) -> Result<crate::sql::optimizer::scalar::ScalarId, String> {
-    use crate::sql::common::{BinOp, CHANGE_OP_DELETE, LiteralValue};
-    use crate::sql::optimizer::scalar::{HashableLiteral, ScalarNode};
+) -> Result<novarocks_sql::optimizer::scalar::ScalarId, String> {
+    use novarocks_sql::common::{BinOp, CHANGE_OP_DELETE, LiteralValue};
+    use novarocks_sql::optimizer::scalar::{HashableLiteral, ScalarNode};
 
     let route_value_expr = match route_mode {
         ImvChangeStreamEffectMode::Constant(route_value) => arena.intern(
@@ -10033,8 +10020,10 @@ fn iceberg_change_stream_write_dag_for_imv_refresh(
     target: &crate::catalog_application::resolver::TargetBackend,
     refresh_plan: &ImvRefreshPlannedChangeStream,
     effect_output_ordinal: Option<usize>,
-) -> Result<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec, String>
-{
+) -> Result<
+    novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
+    String,
+> {
     let bindings = refresh_plan.table_bindings.as_deref().ok_or_else(|| {
         "IMV change-stream write is missing admission-frozen query table bindings".to_string()
     })?;
@@ -10045,7 +10034,7 @@ fn iceberg_change_stream_write_dag_for_imv_refresh(
         &refresh_plan.producer_branches,
     )?;
     Ok(
-        crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec {
+        novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec {
             effect_output_ordinal: effect_output_ordinal.ok_or_else(|| {
                 "IMV change-stream plan did not install its dedicated effect column".to_string()
             })?,
@@ -10059,8 +10048,10 @@ fn provider_change_stream_write_dag_for_imv_refresh(
     refresh_plan: &ImvRefreshPlannedChangeStream,
     effect_output_ordinal: Option<usize>,
     provider_routes: &[novarocks_spi::connector::ConnectorRowMutationRoute],
-) -> Result<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec, String>
-{
+) -> Result<
+    novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
+    String,
+> {
     let bindings = refresh_plan.table_bindings.as_deref().ok_or_else(|| {
         "IMV change-stream write is missing admission-frozen query table bindings".to_string()
     })?;
@@ -10071,7 +10062,7 @@ fn provider_change_stream_write_dag_for_imv_refresh(
         provider_routes,
     )?;
     Ok(
-        crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec {
+        novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec {
             effect_output_ordinal: effect_output_ordinal.ok_or_else(|| {
                 "IMV change-stream plan did not install its dedicated effect column".to_string()
             })?,
@@ -10134,17 +10125,17 @@ fn build_imv_change_stream_routes(
     output_columns: &[OutputColumn],
     producer_branches: &[ImvChangeStreamProducerRoute],
 ) -> Result<
-    Vec<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec>,
+    Vec<novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec>,
     String,
 > {
     use crate::query_execution::planning::write_sink::sql_write_plan_input_for_admitted_target;
-    use crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec;
-    use crate::sql::planner::distributed::write::contract::{
-        ConnectorWriteInputBinding, SqlWriteSinkMode,
-    };
     use novarocks_spi::connector::{
         ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteCohortId,
         ConnectorWriteRouteId,
+    };
+    use novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec;
+    use novarocks_sql::planner::distributed::write::contract::{
+        ConnectorWriteInputBinding, SqlWriteSinkMode,
     };
 
     producer_branches
@@ -10264,15 +10255,15 @@ fn build_provider_imv_change_stream_routes(
     output_columns: &[OutputColumn],
     provider_routes: &[novarocks_spi::connector::ConnectorRowMutationRoute],
 ) -> Result<
-    Vec<crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec>,
+    Vec<novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec>,
     String,
 > {
     use crate::query_execution::planning::write_sink::sql_write_plan_input_for_admitted_target;
-    use crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec;
-    use crate::sql::planner::distributed::write::contract::{
+    use novarocks_spi::connector::{ConnectorMutationRouteInput, ConnectorWriteInputShape};
+    use novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec;
+    use novarocks_sql::planner::distributed::write::contract::{
         ConnectorWriteInputBinding, SqlWriteSinkMode,
     };
-    use novarocks_spi::connector::{ConnectorMutationRouteInput, ConnectorWriteInputShape};
 
     let mut provider_routes = provider_routes.to_vec();
     provider_routes.sort_by_key(|route| route.cohort_id());
@@ -10342,11 +10333,11 @@ fn build_provider_imv_change_stream_routes(
 fn mv_change_stream_write_binding_for_mode(
     bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
     target: &crate::catalog_application::resolver::TargetBackend,
-    mode: crate::sql::planner::distributed::write::contract::SqlWriteSinkMode,
-) -> Result<crate::sql::binding::SqlTableBindingId, String> {
-    use crate::sql::planner::distributed::write::contract::SqlWriteSinkMode;
-    use crate::sql::planner::table::ScanSource;
+    mode: novarocks_sql::planner::distributed::write::contract::SqlWriteSinkMode,
+) -> Result<novarocks_sql::binding::SqlTableBindingId, String> {
     use novarocks_spi::connector::ConnectorWriteInputShape;
+    use novarocks_sql::planner::distributed::write::contract::SqlWriteSinkMode;
+    use novarocks_sql::planner::table::ScanSource;
 
     let matches = bindings
         .captured_bindings()
@@ -10405,7 +10396,7 @@ fn output_column_by_name<'a>(
 }
 
 fn target_partition_source_ordinals_for_sql_sink(
-    sink: &crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    sink: &novarocks_sql::planner::distributed::write::contract::SqlWritePlanInput,
     output_columns: &[OutputColumn],
 ) -> Result<Vec<usize>, String> {
     // The provider consumes partition transforms from its sealed preparation;

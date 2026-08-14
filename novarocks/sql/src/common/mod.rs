@@ -36,4 +36,5 @@ pub(crate) use plan_hints::{ApplyKind, ScanVariantColumn, SqlTopNType};
 pub(crate) use row_lineage::{
     ICEBERG_FILE_PATH_COL, ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL, ICEBERG_ROW_POS_COL,
 };
-pub(crate) use schema::{CteId, OutputColumn};
+pub use schema::CteId;
+pub(crate) use schema::OutputColumn;

@@ -35,19 +35,19 @@ pub struct StatisticsCommandExecutor {
 }
 
 fn statistics_application_target(
-    name: &crate::sql::parser::ast::ObjectName,
+    parts: &[String],
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatisticsTableTarget, String> {
     let default_catalog = current_catalog.unwrap_or("default_catalog");
-    let (catalog, namespace, table) = match name.parts.as_slice() {
+    let (catalog, namespace, table) = match parts {
         [table] => (default_catalog, current_database, table.as_str()),
         [namespace, table] => (default_catalog, namespace.as_str(), table.as_str()),
         [catalog, namespace, table] => (catalog.as_str(), namespace.as_str(), table.as_str()),
         _ => {
             return Err(format!(
                 "statistics table name must be table, db.table, or catalog.db.table: {}",
-                name.parts.join(".")
+                parts.join(".")
             ));
         }
     };
@@ -147,41 +147,34 @@ impl StatisticsCommandExecutor {
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<Option<StatementResult>, String> {
-        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
-        let mut statements = match crate::sql::parser::parse_sql(&normalized) {
-            Ok(statements) => statements,
-            Err(_) => return Ok(None),
+        let Some(statement) = novarocks_sql::planning::dml::parse_statistics_command(sql)? else {
+            return Ok(None);
         };
-        if statements.len() != 1 {
-            return Err("statistics command accepts exactly one statement".to_string());
-        }
-        use crate::sql::parser::ast::Statement;
-        let statement = statements.pop().expect("one checked statement");
         let command = match statement {
-            Statement::AnalyzeTable(statement) => {
-                crate::statistics::application::StatisticsApplicationCommand::AnalyzeTable {
-                    target: statistics_application_target(
-                        &statement.name,
-                        current_catalog,
-                        current_database,
-                    )?,
-                    columns: statement.columns,
-                }
-            }
-            Statement::ShowAnalyzeJobs(_) => {
+            novarocks_sql::planning::dml::StatisticsCommand::AnalyzeTable {
+                target_parts,
+                columns,
+            } => crate::statistics::application::StatisticsApplicationCommand::AnalyzeTable {
+                target: statistics_application_target(
+                    &target_parts,
+                    current_catalog,
+                    current_database,
+                )?,
+                columns,
+            },
+            novarocks_sql::planning::dml::StatisticsCommand::ShowAnalyzeJobs => {
                 crate::statistics::application::StatisticsApplicationCommand::ShowAnalyzeJobs
             }
-            Statement::CancelAnalyze(statement) => {
+            novarocks_sql::planning::dml::StatisticsCommand::CancelAnalyze { job_id } => {
                 crate::statistics::application::StatisticsApplicationCommand::CancelAnalyze {
-                    job_id: uuid::Uuid::parse_str(&statement.job_id).map_err(|error| {
-                        format!("invalid ANALYZE job ID '{}': {error}", statement.job_id)
-                    })?,
+                    job_id: uuid::Uuid::parse_str(&job_id)
+                        .map_err(|error| format!("invalid ANALYZE job ID '{job_id}': {error}"))?,
                 }
             }
-            Statement::ShowTableStats(statement) => {
+            novarocks_sql::planning::dml::StatisticsCommand::ShowTableStats { target_parts } => {
                 crate::statistics::application::StatisticsApplicationCommand::ShowTableStats {
                     target: statistics_application_target(
-                        &statement.name,
+                        &target_parts,
                         current_catalog,
                         current_database,
                     )?,

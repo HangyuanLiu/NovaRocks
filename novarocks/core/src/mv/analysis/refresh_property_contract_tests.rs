@@ -22,16 +22,16 @@ mod tests {
     use crate::mv::refresh::contract::{
         AggregateRefreshContract, BranchRefreshContract, ImvRefreshContract, JoinRefreshContract,
     };
-    use crate::sql::analysis::{
-        ExprKind, LiteralValue, QueryBody, SortItem, SubqueryKind, TypedExpr,
-    };
-    use crate::sql::catalog::PlannerTableProvider;
-    use crate::sql::planner::table::{
-        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
-    };
     use arrow::datatypes::DataType;
     use novarocks_catalog::identifier::TableIdentity;
     use novarocks_catalog::schema::ColumnDef;
+    use novarocks_sql::analysis::{
+        ExprKind, LiteralValue, QueryBody, SortItem, SubqueryKind, TypedExpr,
+    };
+    use novarocks_sql::catalog::PlannerTableProvider;
+    use novarocks_sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
 
     struct TestIcebergCatalog;
 
@@ -41,7 +41,7 @@ mod tests {
             catalog: Option<&str>,
             database: &str,
             table: &str,
-        ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+        ) -> Result<novarocks_sql::catalog::ResolvedAnalyzerTable, String> {
             let planner = TableDef {
                 name: table.to_string(),
                 columns: vec![
@@ -53,7 +53,7 @@ mod tests {
                 iceberg_row_lineage_metadata_columns: Vec::new(),
                 source: test_scan_source(catalog.unwrap_or("ice"), database, table),
             };
-            Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+            Ok(novarocks_sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog, database, planner,
             ))
         }
@@ -61,7 +61,7 @@ mod tests {
 
     fn test_scan_source(catalog: &str, database: &str, table: &str) -> ScanSource {
         ScanSource::Sql(SqlScanSource::new(
-            crate::sql::compiler::mv_rewrite::test_target_binding(),
+            novarocks_sql::compiler::mv_rewrite::test_target_binding(),
             SqlTableIdentity {
                 catalog: catalog.to_string(),
                 namespace: database.to_string(),
@@ -75,7 +75,7 @@ mod tests {
 
     fn test_connector_source(catalog: &str, database: &str, table: &str) -> ScanSource {
         ScanSource::Sql(SqlScanSource::new(
-            crate::sql::compiler::mv_rewrite::test_target_binding(),
+            novarocks_sql::compiler::mv_rewrite::test_target_binding(),
             SqlTableIdentity {
                 catalog: catalog.to_string(),
                 namespace: database.to_string(),
@@ -106,7 +106,7 @@ mod tests {
             catalog: Option<&str>,
             database: &str,
             table: &str,
-        ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+        ) -> Result<novarocks_sql::catalog::ResolvedAnalyzerTable, String> {
             let planner = TableDef {
                 name: table.to_string(),
                 columns: vec![
@@ -118,7 +118,7 @@ mod tests {
                 iceberg_row_lineage_metadata_columns: Vec::new(),
                 source: test_connector_source(catalog.unwrap_or("ice"), database, table),
             };
-            Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+            Ok(novarocks_sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog, database, planner,
             ))
         }
@@ -133,12 +133,12 @@ mod tests {
         table_refs: &[&str],
         catalog: &dyn PlannerTableProvider,
     ) -> MvAnalysis {
-        let stmt = crate::sql::parser::parse_sql_raw(sql).expect("parse query");
+        let stmt = novarocks_sql::parser::parse_sql_raw(sql).expect("parse query");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query");
         };
         let (resolved_query, _, _) =
-            crate::sql::analyzer::analyze(&query, catalog, "sales").expect("analyze query");
+            novarocks_sql::analyzer::analyze(&query, catalog, "sales").expect("analyze query");
         MvAnalysis {
             resolved_refs: table_refs
                 .iter()
@@ -171,7 +171,7 @@ mod tests {
                 name: "abs".to_string(),
                 args: vec![int_literal(1)],
                 distinct: true,
-                volatility: crate::sql::functions::FunctionVolatility::Immutable,
+                volatility: novarocks_sql::functions::FunctionVolatility::Immutable,
             },
             data_type: DataType::Int64,
             nullable: false,
@@ -489,7 +489,7 @@ mod tests {
 
         assert_eq!(
             contract.apply_key.column_name,
-            crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME
+            novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME
         );
         assert_eq!(contract.apply_key.value_type, ApplyKeyValueType::Utf8);
         assert!(!contract.apply_key.allow_full_rebuild_on_policy_full_refresh);
@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn rejects_sql_aggregate_filter_at_parser_boundary() {
-        let err = crate::sql::parser::parse_sql_raw(
+        let err = novarocks_sql::parser::parse_sql_raw(
             "SELECT region, sum(amount) FILTER (WHERE flag) AS total
              FROM fact_east
              GROUP BY region",
@@ -1069,7 +1069,7 @@ mod tests {
                     name: function_name.to_string(),
                     args: vec![int_literal(1)],
                     distinct: false,
-                    volatility: crate::sql::functions::FunctionVolatility::Immutable,
+                    volatility: novarocks_sql::functions::FunctionVolatility::Immutable,
                 },
                 data_type: DataType::Int64,
                 nullable: false,

@@ -27,8 +27,8 @@ use crate::mv::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_o
 use crate::mv::refresh::target_apply::{
     iceberg_mv_physical_select_sql, validate_reserved_projection_output_names,
 };
-use crate::sql::planner::vocabulary::{BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME};
 use novarocks_execution::exec::chunk::Chunk;
+use novarocks_sql::planner::vocabulary::{BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME};
 
 pub(crate) fn prepare_projection_full_read_sql(
     select_sql: &str,
@@ -36,9 +36,9 @@ pub(crate) fn prepare_projection_full_read_sql(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<String, String> {
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
+    let normalized = novarocks_sql::parser::dialect::normalize_for_raw_parse(select_sql)
         .map_err(|error| format!("iceberg projection full-read SELECT normalize error: {error}"))?;
-    let mut statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+    let mut statement = novarocks_sql::parser::parse_normalized_sql_raw(&normalized)
         .map_err(|error| format!("iceberg projection full-read SELECT parse error: {error}"))?;
     let sqlparser::ast::Statement::Query(query) = &mut statement else {
         return Err("iceberg projection full read expects a SELECT query".to_string());
@@ -83,10 +83,10 @@ pub(crate) fn prepare_union_projection_full_read_sql(
     })?;
 
     let normalized =
-        crate::sql::parser::dialect::normalize_for_raw_parse(select_sql).map_err(|error| {
+        novarocks_sql::parser::dialect::normalize_for_raw_parse(select_sql).map_err(|error| {
             format!("iceberg UNION ALL MV full-read SELECT normalize error: {error}")
         })?;
-    let mut statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+    let mut statement = novarocks_sql::parser::parse_normalized_sql_raw(&normalized)
         .map_err(|error| format!("iceberg UNION ALL MV full-read SELECT parse error: {error}"))?;
     let sqlparser::ast::Statement::Query(query) = &mut statement else {
         return Err("iceberg UNION ALL MV full refresh expects a SELECT query".to_string());

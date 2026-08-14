@@ -26,8 +26,8 @@ use novarocks_spi::connector::{
     ConnectorStaticPredicateKind, MAX_CONNECTOR_STATIC_PREDICATES, validate_static_predicates,
 };
 
-use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
-use crate::sql::planner::payload::PlanScanNode;
+use novarocks_sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
+use novarocks_sql::plan_read::PlanScanNode;
 
 /// Lower independently numbered top-level scan conjuncts that have an exact,
 /// type-preserving SPI representation. The returned ID is the source
@@ -295,11 +295,11 @@ fn unnest(mut expr: &TypedExpr) -> &TypedExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::OutputColumn;
-    use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
+    use novarocks_sql::analysis::OutputColumn;
+    use novarocks_sql::column_id::ColumnId;
+    use novarocks_sql::plan_read::table::{ScanSource, TableDef};
 
     fn column(id: u32, name: &str, data_type: DataType, nullable: bool) -> TypedExpr {
         TypedExpr {
@@ -355,8 +355,8 @@ mod tests {
                     },
                 ],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::compiler::mv_rewrite::test_scan_source(
-                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                source: novarocks_sql::compiler::mv_rewrite::test_scan_source(
+                    novarocks_sql::plan_read::table::SqlScanKind::ConnectorRead,
                 ),
             },
             alias: None,

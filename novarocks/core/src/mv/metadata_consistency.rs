@@ -16,7 +16,7 @@
 // under the License.
 
 #[cfg(test)]
-use crate::sql::planner::vocabulary::ApplyKeySource;
+use novarocks_sql::planner::vocabulary::ApplyKeySource;
 
 use crate::mv::persistence::schema::MvSchemaContract;
 use crate::mv::storage_observation::MvPublishedBaseFact;
@@ -82,7 +82,7 @@ mod tests {
         HiddenApplyKeyContract, OutputColumnLineage, OutputContract, TargetContract,
         TargetVisibleColumn,
     };
-    use crate::sql::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME;
+    use novarocks_sql::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME;
 
     fn minimal_base_row_id_contract() -> MvSchemaContract {
         MvSchemaContract {

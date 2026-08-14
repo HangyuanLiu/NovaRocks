@@ -17,18 +17,18 @@
 
 use std::collections::BTreeSet;
 
-use crate::sql::planner::distributed::FragmentEdgeKind;
+use novarocks_sql::plan_read::FragmentEdgeKind;
 
 pub(super) fn sealed_cte_projection(
-    edges: &[crate::sql::planner::distributed::FragmentEdge],
-    fragment: &crate::sql::planner::distributed::PlanFragment,
+    edges: &[novarocks_sql::plan_read::FragmentEdge],
+    fragment: &novarocks_sql::plan_read::PlanFragment,
 ) -> Result<
     (
-        Option<crate::sql::analysis::cte::CteId>,
+        Option<novarocks_sql::analysis::cte::CteId>,
         Vec<(
-            crate::sql::analysis::cte::CteId,
+            novarocks_sql::analysis::cte::CteId,
             i32,
-            Vec<crate::sql::column_id::ColumnId>,
+            Vec<novarocks_sql::column_id::ColumnId>,
         )>,
     ),
     String,
@@ -89,8 +89,8 @@ pub(super) fn sealed_cte_projection(
 #[cfg(test)]
 mod tests {
     use super::sealed_cte_projection;
-    use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::distributed::{
+    use novarocks_sql::column_id::ColumnId;
+    use novarocks_sql::planner::distributed::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
     };
 

@@ -33,11 +33,11 @@ use crate::query_execution::planning::bindings::{
     QueryScanMaterialization, QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey,
     QueryTableBindingStore,
 };
-use crate::sql::binding::SqlTableBindingId;
-use crate::sql::catalog::{
+use novarocks_sql::binding::SqlTableBindingId;
+use novarocks_sql::catalog::{
     IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable,
 };
-use crate::sql::planner::table::TableDef;
+use novarocks_sql::planner::table::TableDef;
 
 /// Provider-neutral table facts admitted for one request.  Core projects the
 /// typed SPI metadata into SQL facts, preserves the opaque scan authority, and
@@ -50,7 +50,7 @@ pub(crate) struct ConnectorQueryTableMaterialization {
     pub(crate) read_table: novarocks_spi::connector::ConnectorTableHandle,
     pub(crate) read_schema: arrow::datatypes::SchemaRef,
     pub(crate) read_selector: novarocks_spi::connector::ConnectorReadSelector,
-    pub(crate) sql_ukfk_facts: crate::sql::planner::table::SqlUkFkTableFacts,
+    pub(crate) sql_ukfk_facts: novarocks_sql::planner::table::SqlUkFkTableFacts,
     pub(crate) statistics_pin: Option<crate::connector::backend::ResolvedTableStatisticsPin>,
     pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 }
@@ -191,7 +191,7 @@ pub(crate) fn connector_table_materialization_from_metadata(
         read_schema: metadata.schema.clone(),
         read_selector: novarocks_spi::connector::ConnectorReadSelector::Current,
         sql_ukfk_facts:
-            crate::sql::planner::table::SqlUkFkTableFacts::from_connector_planning_facts(
+            novarocks_sql::planner::table::SqlUkFkTableFacts::from_connector_planning_facts(
                 &metadata.schema,
                 &metadata.planning_facts,
             ),
@@ -210,18 +210,18 @@ pub(crate) fn connector_query_binding_from_materialization(
     sql_table_name: &str,
     binding: SqlTableBindingId,
 ) -> Result<QueryTableBinding, String> {
-    use crate::sql::planner::table::{ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity};
+    use novarocks_sql::planner::table::{ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity};
 
     let (scan_kind, frozen_snapshot_id) = match materialization.read_selector {
         novarocks_spi::connector::ConnectorReadSelector::Current => (
             SqlScanKind::Data {
-                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+                version: novarocks_sql::planner::table::SqlTableVersionSelector::Current,
             },
             None,
         ),
         novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot_id) => {
             let version =
-                crate::sql::planner::table::SqlTableVersionSelector::Snapshot(snapshot_id);
+                novarocks_sql::planner::table::SqlTableVersionSelector::Snapshot(snapshot_id);
             (SqlScanKind::FrozenInputSet { version }, Some(snapshot_id))
         }
         novarocks_spi::connector::ConnectorReadSelector::TimestampMicros(timestamp_micros) => {
@@ -365,7 +365,7 @@ pub(crate) trait QueryTableBindingLoader: Send + Sync {
         catalog: &str,
         namespace: &str,
         table: &str,
-        metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
+        metadata_table_type: novarocks_sql::planner::table::SqlMetadataTableKind,
         binding: SqlTableBindingId,
     ) -> Result<QueryTableBinding, String>;
 }
@@ -593,7 +593,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
+        metadata_table_type: novarocks_sql::planner::table::SqlMetadataTableKind,
     ) -> Result<TableDef, String> {
         match self.effective_catalog(catalog) {
             Some("default_catalog") | None => self
@@ -675,7 +675,7 @@ impl PlannerTableProvider for CatalogServiceMaterializer<'_> {
     }
 }
 
-impl crate::sql::compiler::SqlCatalogSnapshot for CatalogServiceMaterializer<'_> {
+impl novarocks_sql::compiler::SqlCatalogSnapshot for CatalogServiceMaterializer<'_> {
     fn planner_table_provider(&self) -> &dyn PlannerTableProvider {
         self
     }
@@ -687,7 +687,7 @@ impl IcebergMetadataTableProvider for CatalogServiceMaterializer<'_> {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
+        metadata_table_type: novarocks_sql::planner::table::SqlMetadataTableKind,
     ) -> Result<TableDef, String> {
         self.metadata_table_def(catalog, database, table, metadata_table_type)
     }
@@ -699,12 +699,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::sql::catalog::PlannerTableProvider;
-    use crate::sql::planner::table::ScanSource;
+    use novarocks_sql::catalog::PlannerTableProvider;
+    use novarocks_sql::planner::table::ScanSource;
 
     fn binding_id(scope: u64, ordinal: u32) -> SqlTableBindingId {
         SqlTableBindingId::new(
-            crate::sql::binding::SqlTableBindingScopeId::new(
+            novarocks_sql::binding::SqlTableBindingScopeId::new(
                 NonZeroU64::new(scope).expect("non-zero scope"),
             ),
             NonZeroU32::new(ordinal).expect("non-zero ordinal"),
@@ -720,8 +720,8 @@ mod tests {
                     name: "orders".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::planner::table::test_sql_scan_source(
-                        crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                    source: novarocks_sql::planner::table::test_sql_scan_source(
+                        novarocks_sql::planner::table::SqlScanKind::ConnectorRead,
                     ),
                 },
             ),
@@ -734,15 +734,15 @@ mod tests {
             name: "__nr_cow_orders".to_string(),
             columns: vec![],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::Sql(crate::sql::planner::table::SqlScanSource::new(
+            source: ScanSource::Sql(novarocks_sql::planner::table::SqlScanSource::new(
                 binding,
-                crate::sql::planner::table::SqlTableIdentity {
+                novarocks_sql::planner::table::SqlTableIdentity {
                     catalog: "ice".to_string(),
                     namespace: "db".to_string(),
                     table: "orders".to_string(),
                 },
-                crate::sql::planner::table::SqlScanKind::FrozenInputSet {
-                    version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(7),
+                novarocks_sql::planner::table::SqlScanKind::FrozenInputSet {
+                    version: novarocks_sql::planner::table::SqlTableVersionSelector::Snapshot(7),
                 },
             )),
         };
@@ -776,7 +776,7 @@ mod tests {
             _catalog: &str,
             _namespace: &str,
             _table: &str,
-            _metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
+            _metadata_table_type: novarocks_sql::planner::table::SqlMetadataTableKind,
             _binding: SqlTableBindingId,
         ) -> Result<QueryTableBinding, String> {
             Err("metadata is not part of this overlay fixture".to_string())
@@ -877,7 +877,7 @@ mod tests {
 
         assert!(matches!(
             binding.resolved.planner.source,
-            crate::sql::planner::table::ScanSource::Sql(ref source)
+            novarocks_sql::planner::table::ScanSource::Sql(ref source)
                 if source.binding == binding_id(101, 1)
         ));
     }
@@ -994,7 +994,7 @@ mod tests {
         assert!(source.binding.belongs_to(bindings.scope()));
         assert!(matches!(
             source.kind,
-            crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. }
+            novarocks_sql::planner::table::SqlScanKind::FrozenInputSet { .. }
         ));
         assert!(
             bindings

@@ -33,8 +33,8 @@ use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPoli
 use crate::mv::persistence::refresh::MvRefreshState;
 use crate::mv::repository::MvRepository;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
-use crate::sql::parser::ast::ShowMaterializedViewsStmt;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
+use novarocks_sql::parser::ast::ShowMaterializedViewsStmt;
 
 /// Lightweight projection of the iceberg base table that
 /// `validate_ivm_primary_key` needs. Built once at the top of `create_mv`
@@ -289,11 +289,14 @@ pub(crate) fn analyze_mv_select_with_ports(
         catalog_service,
         connector_control,
         connector_context.clone(),
-        crate::sql::catalog::TableLookupMode::SchemaOnly,
+        novarocks_sql::catalog::TableLookupMode::SchemaOnly,
         catalog_application,
     );
-    let (resolved, _, _) =
-        crate::sql::analyzer::analyze(prepared.query_for_analysis(), &provider, current_database)?;
+    let (resolved, _, _) = novarocks_sql::analyzer::analyze(
+        prepared.query_for_analysis(),
+        &provider,
+        current_database,
+    )?;
     Ok(finish_mv_analysis(prepared, resolved))
 }
 

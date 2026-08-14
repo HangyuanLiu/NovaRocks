@@ -9,10 +9,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::sql::column_id::ColumnRefFactory;
-use crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot;
-use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
-use crate::sql::planner::logical::LogicalPlanNode;
+use novarocks_sql::column_id::ColumnRefFactory;
+use novarocks_sql::compiler::mv_rewrite::SqlImvRewriteSnapshot;
+use novarocks_sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
+use novarocks_sql::planner::logical::LogicalPlanNode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JoinIncrementalRefreshMode {
@@ -50,13 +50,13 @@ pub(crate) fn build_join_incremental_refresh_logical_plan(
     let JoinIncrementalLogicalInput { plan, factory } = input;
     let is_aggregate_refresh = snapshot.schema_contract.aggregate.is_some();
     let factory_cell = Rc::new(RefCell::new(factory));
-    let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
-        crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
+    let outcome = novarocks_sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
+        novarocks_sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
             plan,
             snapshot: Arc::clone(snapshot),
             disabled_rules: logical_execution_disabled_rules(
                 is_aggregate_refresh,
-                &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+                &novarocks_sql::optimizer::options::SessionOptimizerSettings::default(),
             ),
             deadline: None,
             column_ref_factory: Rc::clone(&factory_cell),
@@ -94,10 +94,10 @@ pub(crate) fn build_join_incremental_refresh_logical_plan(
             });
             let locator_columns =
                 allocate_join_coalesce_locator_column_ids(&mut factory, &outcome.plan)?;
-            crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
+            novarocks_sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
                 outcome.plan,
                 &descriptor,
-                &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_snapshot(snapshot),
+                &novarocks_sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_snapshot(snapshot),
                 &mut factory,
                 locator_columns.net,
                 locator_columns.file,
@@ -118,7 +118,7 @@ pub(crate) fn build_join_incremental_refresh_logical_plan(
 
 fn logical_execution_disabled_rules(
     is_aggregate_refresh: bool,
-    optimizer_settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
+    optimizer_settings: &novarocks_sql::optimizer::options::SessionOptimizerSettings,
 ) -> Vec<String> {
     let mut disabled_rules = optimizer_settings.disabled_rules.clone();
     if !disabled_rules
@@ -205,7 +205,7 @@ pub(crate) fn reserve_factory_for_logical_plan(
 }
 
 fn max_logical_plan_output_column_id(plan: &LogicalPlanNode) -> Result<u32, String> {
-    let mut max_id = crate::sql::planner::plan_output_columns(plan)?
+    let mut max_id = novarocks_sql::planner::plan_output_columns(plan)?
         .iter()
         .map(|column| column.column_id.0)
         .max()

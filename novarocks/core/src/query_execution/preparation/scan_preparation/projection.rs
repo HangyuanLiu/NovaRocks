@@ -18,9 +18,9 @@
 use crate::query_execution::preparation::scan::{
     ResolvedReadColumn, ResolvedReadReason, ResolvedScanColumn, ResolvedScanColumnKind,
 };
-use crate::sql::column_id::ColumnId;
-use crate::sql::planner::payload::PlanScanNode;
-use crate::sql::planner::table::ScanSource;
+use novarocks_sql::column_id::ColumnId;
+use novarocks_sql::plan_read::PlanScanNode;
+use novarocks_sql::plan_read::table::ScanSource;
 
 pub(super) fn resolve_physical_columns(
     node_id: i32,
@@ -81,12 +81,12 @@ pub(super) fn resolve_physical_columns(
 
 fn refresh_scan_projected_names(source: &ScanSource) -> Option<Vec<String>> {
     match source {
-        ScanSource::Sql(crate::sql::planner::table::SqlScanSource {
-            kind: crate::sql::planner::table::SqlScanKind::MvTargetState { facts },
+        ScanSource::Sql(novarocks_sql::plan_read::table::SqlScanSource {
+            kind: novarocks_sql::plan_read::table::SqlScanKind::MvTargetState { facts },
             ..
         }) => Some(projected_target_state_column_names(facts)),
-        ScanSource::Sql(crate::sql::planner::table::SqlScanSource {
-            kind: crate::sql::planner::table::SqlScanKind::MvTargetLocator { facts },
+        ScanSource::Sql(novarocks_sql::plan_read::table::SqlScanSource {
+            kind: novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator { facts },
             ..
         }) => Some(projected_target_locator_column_names(facts)),
         _ => None,
@@ -94,7 +94,7 @@ fn refresh_scan_projected_names(source: &ScanSource) -> Option<Vec<String>> {
 }
 
 fn projected_target_state_column_names(
-    scan: &crate::sql::planner::table::SqlMvTargetStateScan,
+    scan: &novarocks_sql::plan_read::table::SqlMvTargetStateScan,
 ) -> Vec<String> {
     let mut names = Vec::new();
     push_unique_projected_name(&mut names, &scan.row_id_column_name);
@@ -105,7 +105,7 @@ fn projected_target_state_column_names(
     {
         push_unique_projected_name(&mut names, name);
     }
-    if let crate::sql::planner::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
+    if let novarocks_sql::plan_read::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
         branch_scope: Some(scope),
         ..
     } = &scan.row_filter
@@ -124,7 +124,7 @@ fn projected_target_state_column_names(
 }
 
 fn projected_target_locator_column_names(
-    scan: &crate::sql::planner::table::SqlMvTargetLocatorScan,
+    scan: &novarocks_sql::plan_read::table::SqlMvTargetLocatorScan,
 ) -> Vec<String> {
     let mut names = vec![scan.apply_key_column.clone()];
     if let Some(branch_id_column) = &scan.branch_id_column {

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::sql::planner::vocabulary::ApplyKeySource;
+use novarocks_sql::planner::vocabulary::ApplyKeySource;
 
 use crate::mv::persistence::schema::MvSchemaContract;
 use crate::mv::refresh::apply_key::ApplyKeyValueType;
@@ -126,7 +126,7 @@ mod tests {
         BranchUnionContract, HiddenApplyKeyContract, JoinContract, JoinContractKind,
         OutputContract, TargetContract,
     };
-    use crate::sql::planner::vocabulary::{
+    use novarocks_sql::planner::vocabulary::{
         GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
         JOIN_APPLY_KEY_COLUMN_NAME,
     };

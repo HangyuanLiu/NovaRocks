@@ -28,16 +28,20 @@ use super::bindings::{
     QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey, QueryTableBindingStore,
     QueryWriteTargetAdmission,
 };
-use crate::sql::analysis::TypedExpr;
-use crate::sql::binding::SqlTableBindingId;
-use crate::sql::planner::distributed::write::contract::{
-    ConnectorWriteInputBinding, SqlWritePlanInput, SqlWriteSinkContract, SqlWriteSinkMode,
-    SqlWriteSinkTargetContract, SqlWriteTargetField,
-};
-use crate::sql::planner::table::{ScanSource, SqlScanKind, SqlScanSource, TableDef};
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorWriteInputShape, ConnectorWritePreparation,
 };
+use novarocks_sql::analysis::TypedExpr;
+use novarocks_sql::binding::SqlTableBindingId;
+use novarocks_sql::planner::distributed::write::contract::{
+    ConnectorWriteInputBinding, SqlWritePlanInput, SqlWriteSinkContract, SqlWriteSinkMode,
+    SqlWriteSinkTargetContract, SqlWriteTargetField,
+};
+use novarocks_sql::planner::table::{ScanSource, SqlScanKind, SqlScanSource, TableDef};
+use novarocks_sql::planning::dml::{
+    DmlWritePlanInput, DmlWriteSinkMode, DmlWriteTarget, DmlWriteTargetField,
+};
+use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
 
 /// Project one already-admitted write target into the SQL compiler boundary.
 ///
@@ -64,7 +68,7 @@ pub(crate) fn sql_write_plan_input_from_admitted_binding(
     validate_mode(mode, preparation.input())?;
     let target = SqlWriteSinkTargetContract::try_new(
         binding,
-        crate::sql::planner::table::SqlTableIdentity {
+        novarocks_sql::planner::table::SqlTableIdentity {
             catalog: captured.resolved.catalog.identity.catalog.clone(),
             namespace: captured.resolved.catalog.identity.namespace.clone(),
             table: captured.resolved.catalog.identity.table.clone(),
@@ -117,12 +121,62 @@ pub(crate) fn sql_write_plan_input_for_admitted_target(
     )
 }
 
+/// Project an admitted write target into the opaque DML planning boundary.
+///
+/// This is intentionally separate from the legacy internal compiler helper:
+/// new application entry points must not receive the private planner write
+/// contract.  The request-local binding keeps the same exact planning lease
+/// and provider preparation through terminal planning and fragment setup.
+pub(crate) fn dml_write_plan_input_for_admitted_target(
+    bindings: &QueryTableBindingStore,
+    binding: SqlTableBindingId,
+    mode: DmlWriteSinkMode,
+    input: novarocks_sql::plan_read::ConnectorWriteInputBinding,
+) -> Result<DmlWritePlanInput, String> {
+    let captured = bindings.binding(binding)?;
+    captured.admission.exact_planning_lease().map_err(|_| {
+        "SQL write target binding is missing its admission planning lease".to_string()
+    })?;
+    let preparation = &admitted_write_target(&captured)?.preparation;
+    preparation
+        .validate()
+        .map_err(|error| format!("validate SQL write preparation: {error}"))?;
+    validate_mode(mode.into(), preparation.input())?;
+    DmlWritePlanInput::try_new(
+        mode,
+        DmlWriteTarget {
+            binding,
+            catalog: captured.resolved.catalog.identity.catalog.clone(),
+            namespace: captured.resolved.catalog.identity.namespace.clone(),
+            table: captured.resolved.catalog.identity.table.clone(),
+            fields: preparation
+                .input()
+                .fields()
+                .into_iter()
+                .map(|field| DmlWriteTargetField {
+                    token: field.token(),
+                    column: ColumnDef {
+                        name: field.field().name().to_string(),
+                        data_type: field.field().data_type().clone(),
+                        nullable: field.field().is_nullable(),
+                        write_default: None,
+                        logical_type: None,
+                    },
+                    is_hidden: false,
+                })
+                .collect(),
+        },
+        admitted_write_input_columns(preparation)?,
+        input,
+    )
+}
+
 /// Reserve a SQL write token for a sealed Provider preparation.  The exact
 /// planning lease and opaque table handle remain paired by the preparation;
 /// this function does not inspect either provider-owned value.
 pub(crate) fn admit_prepared_connector_write_target(
     bindings: &QueryTableBindingStore,
-    identity: crate::sql::planner::table::SqlTableIdentity,
+    identity: novarocks_sql::planner::table::SqlTableIdentity,
     preparation: ConnectorWritePreparation,
     planning_lease: ConnectorControlPlanningLease,
 ) -> Result<SqlTableBindingId, String> {
@@ -147,22 +201,22 @@ pub(crate) fn admit_prepared_connector_write_target(
         preparation.digest(),
     );
     bindings.resolve_or_insert_with_id(key, |binding| {
-        let planner = crate::sql::planner::table::TableDef {
+        let planner = novarocks_sql::planner::table::TableDef {
             name: identity.table.clone(),
             columns,
             iceberg_row_lineage_metadata_columns: Vec::new(),
-            source: crate::sql::planner::table::ScanSource::Sql(
-                crate::sql::planner::table::SqlScanSource::new(
+            source: novarocks_sql::planner::table::ScanSource::Sql(
+                novarocks_sql::planner::table::SqlScanSource::new(
                     binding,
                     identity.clone(),
-                    crate::sql::planner::table::SqlScanKind::Data {
-                        version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+                    novarocks_sql::planner::table::SqlScanKind::Data {
+                        version: novarocks_sql::planner::table::SqlTableVersionSelector::Current,
                     },
                 ),
             ),
         };
         Ok(QueryTableBinding {
-            resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+            resolved: novarocks_sql::catalog::ResolvedAnalyzerTable::from_planner(
                 Some(&identity.catalog),
                 &identity.namespace,
                 planner,
@@ -182,6 +236,27 @@ pub(crate) fn admit_prepared_connector_write_target(
             admitted_change_scans: std::collections::BTreeMap::new(),
         })
     })
+}
+
+/// Reserve a terminal write token for a synthetic frozen connector identity.
+/// The SQL-facing identity carries no provider handle; the preparation and
+/// exact lease remain in the application-owned binding store.
+pub(crate) fn admit_prepared_frozen_connector_write_target(
+    bindings: &QueryTableBindingStore,
+    identity: FrozenConnectorScanIdentity,
+    preparation: ConnectorWritePreparation,
+    planning_lease: ConnectorControlPlanningLease,
+) -> Result<SqlTableBindingId, String> {
+    admit_prepared_connector_write_target(
+        bindings,
+        novarocks_sql::planner::table::SqlTableIdentity {
+            catalog: identity.catalog().to_string(),
+            namespace: identity.namespace().to_string(),
+            table: identity.table().to_string(),
+        },
+        preparation,
+        planning_lease,
+    )
 }
 
 fn admitted_write_target(
@@ -242,8 +317,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::query_execution::planning::bindings::{QueryTableBinding, QueryTableBindingKey};
-    use crate::sql::catalog::ResolvedAnalyzerTable;
-    use crate::sql::planner::table::{
+    use novarocks_sql::catalog::ResolvedAnalyzerTable;
+    use novarocks_sql::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
     };
 

@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::sql::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
+use crate::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum IncrementalMvShape {
+pub enum IncrementalMvShape {
     ProjectionFilter(ProjectionFilterMvShape),
     Aggregate(AggregateMvShape),
     UnionAll(UnionAllMvShape),
@@ -27,7 +27,7 @@ pub(crate) enum IncrementalMvShape {
 }
 
 impl IncrementalMvShape {
-    pub(crate) fn base_table(&self) -> &sqlparser::ast::ObjectName {
+    pub fn base_table(&self) -> &sqlparser::ast::ObjectName {
         match self {
             IncrementalMvShape::ProjectionFilter(shape) => &shape.base_table,
             IncrementalMvShape::Aggregate(shape) => &shape.base_table,
@@ -41,51 +41,51 @@ impl IncrementalMvShape {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ProjectionFilterMvShape {
-    pub(crate) base_table: sqlparser::ast::ObjectName,
+pub struct ProjectionFilterMvShape {
+    pub base_table: sqlparser::ast::ObjectName,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AggregateMvShape {
-    pub(crate) base_table: sqlparser::ast::ObjectName,
+pub struct AggregateMvShape {
+    pub base_table: sqlparser::ast::ObjectName,
     /// All base tables that feed the aggregate when the shape has fan-in branches.
-    pub(crate) fan_in_bases: Vec<sqlparser::ast::ObjectName>,
-    pub(crate) group_keys: Vec<GroupKeyShape>,
-    pub(crate) aggregates: Vec<AggregateCallShape>,
-    pub(crate) visible_outputs: Vec<VisibleAggregateOutput>,
+    pub fan_in_bases: Vec<sqlparser::ast::ObjectName>,
+    pub group_keys: Vec<GroupKeyShape>,
+    pub aggregates: Vec<AggregateCallShape>,
+    pub visible_outputs: Vec<VisibleAggregateOutput>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum UnionBranchKind {
+pub enum UnionBranchKind {
     ProjectionFilter,
     Aggregate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct UnionAllMvShape {
-    pub(crate) branch_kind: UnionBranchKind,
-    pub(crate) branches: Vec<IncrementalMvShape>,
+pub struct UnionAllMvShape {
+    pub branch_kind: UnionBranchKind,
+    pub branches: Vec<IncrementalMvShape>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct JoinProjectionFilterMvShape {
-    pub(crate) left_table: sqlparser::ast::ObjectName,
-    pub(crate) left_alias: String,
-    pub(crate) right_table: sqlparser::ast::ObjectName,
-    pub(crate) right_alias: String,
-    pub(crate) join_keys: Vec<JoinKeyPairShape>,
+pub struct JoinProjectionFilterMvShape {
+    pub left_table: sqlparser::ast::ObjectName,
+    pub left_alias: String,
+    pub right_table: sqlparser::ast::ObjectName,
+    pub right_alias: String,
+    pub join_keys: Vec<JoinKeyPairShape>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct JoinAggregateMvShape {
-    pub(crate) join: JoinProjectionFilterMvShape,
-    pub(crate) group_keys: Vec<GroupKeyShape>,
-    pub(crate) aggregates: Vec<AggregateCallShape>,
-    pub(crate) visible_outputs: Vec<VisibleAggregateOutput>,
+pub struct JoinAggregateMvShape {
+    pub join: JoinProjectionFilterMvShape,
+    pub group_keys: Vec<GroupKeyShape>,
+    pub aggregates: Vec<AggregateCallShape>,
+    pub visible_outputs: Vec<VisibleAggregateOutput>,
 }
 
 impl JoinAggregateMvShape {
-    pub(crate) fn as_aggregate_shape_for_layout(&self) -> AggregateMvShape {
+    pub fn as_aggregate_shape_for_layout(&self) -> AggregateMvShape {
         AggregateMvShape {
             base_table: self.join.left_table.clone(),
             fan_in_bases: Vec::new(),
@@ -97,31 +97,160 @@ impl JoinAggregateMvShape {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct JoinKeyPairShape {
-    pub(crate) left_expr: sqlparser::ast::Expr,
-    pub(crate) right_expr: sqlparser::ast::Expr,
+pub struct JoinKeyPairShape {
+    pub left_expr: sqlparser::ast::Expr,
+    pub right_expr: sqlparser::ast::Expr,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GroupKeyShape {
-    pub(crate) output_name: String,
-    pub(crate) expr: sqlparser::ast::Expr,
+pub struct GroupKeyShape {
+    pub output_name: String,
+    pub expr: sqlparser::ast::Expr,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AggregateCallShape {
-    pub(crate) output_name: String,
-    pub(crate) function: AggregateFunctionKind,
-    pub(crate) input: AggregateInput,
+pub struct AggregateCallShape {
+    pub output_name: String,
+    pub function: AggregateFunctionKind,
+    pub input: AggregateInput,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum AggregateInput {
+pub enum AggregateInput {
     Star,
     Expr(Box<sqlparser::ast::Expr>),
 }
 
-pub(crate) fn classify_incremental_mv_query(
+/// Immutable aggregate projection facts for one MV refresh statement.
+///
+/// The SQL package owns this shape because it is derived entirely from the
+/// parsed SELECT.  Application code may carry it through an admitted refresh,
+/// but cannot use it to access a catalog, connector, or lifecycle state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvAggregateCalls {
+    pub group_keys: Vec<GroupKeyShape>,
+    pub aggregates: Vec<AggregateCallShape>,
+    pub visible_outputs: Vec<VisibleAggregateOutput>,
+}
+
+impl SqlMvAggregateCalls {
+    pub fn new(
+        group_keys: Vec<GroupKeyShape>,
+        aggregates: Vec<AggregateCallShape>,
+        visible_outputs: Vec<VisibleAggregateOutput>,
+    ) -> Self {
+        Self {
+            group_keys,
+            aggregates,
+            visible_outputs,
+        }
+    }
+
+    pub fn needs_retraction_count_state(&self) -> bool {
+        !self.aggregates.iter().any(|aggregate| {
+            aggregate.function == AggregateFunctionKind::Count
+                && matches!(aggregate.input, AggregateInput::Star)
+        })
+    }
+}
+
+impl From<&AggregateMvShape> for SqlMvAggregateCalls {
+    fn from(shape: &AggregateMvShape) -> Self {
+        Self::new(
+            shape.group_keys.clone(),
+            shape.aggregates.clone(),
+            shape.visible_outputs.clone(),
+        )
+    }
+}
+
+/// FROM-side facts needed by the Iceberg incremental join refresh rewriter.
+///
+/// These are parsed-query facts only: Core may carry them through a refresh,
+/// but SQL remains the sole owner of how a FROM/JOIN clause is interpreted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvJoinAliases {
+    pub left_table: String,
+    pub left_alias: String,
+    pub right_table: String,
+    pub right_alias: String,
+}
+
+/// Extract aggregate calls, GROUP BY keys, and visible output ordering from a
+/// plain aggregate SELECT without interpreting its FROM clause.
+pub fn extract_aggregate_sql_calls(
+    query: &sqlparser::ast::Query,
+) -> Result<SqlMvAggregateCalls, String> {
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Err("extract_aggregate_sql_calls: expected a plain SELECT body".to_string());
+    };
+    let (group_keys, aggregates, visible_outputs) = classify_aggregate_select_outputs(select)?;
+    Ok(SqlMvAggregateCalls::new(
+        group_keys,
+        aggregates,
+        visible_outputs,
+    ))
+}
+
+/// Extract the table names and aliases from a two-relation plain SELECT join.
+pub fn extract_join_aliases(query: &sqlparser::ast::Query) -> Result<SqlMvJoinAliases, String> {
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(
+            "extract_join_aliases: expected a plain SELECT body, not a set operation".to_string(),
+        );
+    };
+    let [from] = select.from.as_slice() else {
+        return Err(
+            "extract_join_aliases: expected exactly one FROM clause entry for a two-relation join"
+                .to_string(),
+        );
+    };
+    let [join] = from.joins.as_slice() else {
+        if from.joins.is_empty() {
+            return Err(
+                "extract_join_aliases: expected a two-relation join (FROM ... JOIN ...), but the FROM clause has no joins".to_string(),
+            );
+        }
+        return Err(format!(
+            "extract_join_aliases: expected exactly one JOIN, found {}",
+            from.joins.len()
+        ));
+    };
+    let (left_name, left_alias) = table_factor_name_and_alias(&from.relation)?;
+    let (right_name, right_alias) = table_factor_name_and_alias(&join.relation)?;
+    Ok(SqlMvJoinAliases {
+        left_table: left_name.to_string(),
+        left_alias,
+        right_table: right_name.to_string(),
+        right_alias,
+    })
+}
+
+/// Extract the base-table FQN from a plain one-relation SELECT without joins.
+pub fn extract_single_scan_table_fqn(query: &sqlparser::ast::Query) -> Result<String, String> {
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(
+            "extract_single_scan_table_fqn: expected a plain SELECT body, not a set operation"
+                .to_string(),
+        );
+    };
+    let [from] = select.from.as_slice() else {
+        return Err(
+            "extract_single_scan_table_fqn: expected exactly one FROM clause entry for a single scan"
+                .to_string(),
+        );
+    };
+    if !from.joins.is_empty() {
+        return Err(
+            "extract_single_scan_table_fqn: expected a single-scan FROM, but the FROM clause has joins"
+                .to_string(),
+        );
+    }
+    let (name, _alias) = table_factor_name_and_alias(&from.relation)?;
+    Ok(name.to_string())
+}
+
+pub fn classify_incremental_mv_query(
     query: &sqlparser::ast::Query,
 ) -> Result<IncrementalMvShape, String> {
     if matches!(
@@ -378,7 +507,7 @@ fn classify_join_aggregate_mv_query(
     })
 }
 
-pub(crate) fn classify_aggregate_select_outputs(
+pub fn classify_aggregate_select_outputs(
     select: &sqlparser::ast::Select,
 ) -> Result<
     (
@@ -492,7 +621,7 @@ fn classify_join_projection_filter_mv_query_for_select(
     })
 }
 
-pub(crate) fn table_factor_name_and_alias(
+pub fn table_factor_name_and_alias(
     factor: &sqlparser::ast::TableFactor,
 ) -> Result<(sqlparser::ast::ObjectName, String), String> {
     let sqlparser::ast::TableFactor::Table {
@@ -975,7 +1104,7 @@ fn simple_aggregate_arg_expr(
     }
 }
 
-pub(crate) fn query_has_aggregate_surface(query: &sqlparser::ast::Query) -> bool {
+pub fn query_has_aggregate_surface(query: &sqlparser::ast::Query) -> bool {
     is_probably_aggregate_query(query)
 }
 
@@ -1640,15 +1769,17 @@ fn union_all_branch_output_mismatch_error() -> String {
 ///
 /// The returned SQL string can be fed directly to the executor to produce a state-shaped
 /// Arrow batch that `materialize_aggregate_result_chunks` can consume.
-pub(crate) fn rewrite_select_sql_for_state(
+pub const AGG_RETRACTION_COUNT_STATE_COLUMN: &str = "__agg_state___ivm_row_count";
+
+pub fn rewrite_select_sql_for_state(
     select_sql: &str,
-    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &SqlMvAggregateCalls,
 ) -> Result<String, String> {
     use sqlparser::ast::{SelectItem, SetExpr, Statement};
 
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
+    let normalized = crate::parser::dialect::normalize_for_raw_parse(select_sql)
         .map_err(|e| format!("rewrite_select_sql_for_state normalize error: {e}"))?;
-    let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+    let stmt = crate::parser::parse_normalized_sql_raw(&normalized)
         .map_err(|e| format!("rewrite_select_sql_for_state parse error: {e}"))?;
     let mut stmt = stmt;
 
@@ -1684,10 +1815,9 @@ pub(crate) fn rewrite_select_sql_for_state(
             }
         }
     }
-    if crate::mv::aggregate_state::mv_agg_state::aggregate_shape_needs_retraction_count_state(calls)
-    {
+    if calls.needs_retraction_count_state() {
         new_projection.push(make_count_star_select_item(
-            crate::mv::aggregate_state::mv_agg_state::AGG_RETRACTION_COUNT_STATE_COLUMN,
+            AGG_RETRACTION_COUNT_STATE_COLUMN,
         ));
     }
     select.projection = new_projection;
@@ -1727,9 +1857,26 @@ fn state_combinator_input_expr(
 }
 
 fn aggregate_state_alias(output_name: &str) -> String {
-    let sanitized =
-        crate::mv::aggregate_state::mv_agg_state::sanitize_state_column_name(output_name);
+    let sanitized = sanitize_state_column_name(output_name);
     format!("__agg_state_{sanitized}")
+}
+
+fn sanitize_state_column_name(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "agg".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn aggregate_function_label(kind: AggregateFunctionKind) -> &'static str {
@@ -1843,12 +1990,10 @@ fn make_count_star_select_item(alias: &str) -> sqlparser::ast::SelectItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls;
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
-        let normalized =
-            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
+        let normalized = crate::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
+        let stmt = crate::parser::parse_normalized_sql_raw(&normalized).expect("parse");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("not a query: {stmt:?}");
         };
@@ -1868,9 +2013,9 @@ mod tests {
     /// `parse_normalized_sql_raw`'s trailing-token guard. Both are valid
     /// rejections of the same "unsupported in incremental MV" intent.
     fn try_classify_sql(sql: &str) -> Result<IncrementalMvShape, String> {
-        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)
+        let normalized = crate::parser::dialect::normalize_for_raw_parse(sql)
             .map_err(|e| format!("normalize: {e}"))?;
-        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)?;
+        let stmt = crate::parser::parse_normalized_sql_raw(&normalized)?;
         let sqlparser::ast::Statement::Query(query) = stmt else {
             return Err(format!("not a query: {stmt:?}"));
         };
@@ -1891,13 +2036,44 @@ mod tests {
     }
 
     fn parse_shape(sql: &str) -> Result<IncrementalMvShape, String> {
-        let normalized =
-            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
+        let normalized = crate::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
+        let stmt = crate::parser::parse_normalized_sql_raw(&normalized).expect("parse");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query");
         };
         classify_incremental_mv_query(&query)
+    }
+
+    #[test]
+    fn focused_aggregate_calls_ignore_join_from_clause() {
+        let calls = extract_aggregate_sql_calls(&parse_query(
+            "SELECT a.k, sum(a.v) FROM ice.ns.fact a JOIN ice.ns.dim b ON a.id = b.id GROUP BY a.k",
+        ))
+        .expect("aggregate calls");
+        assert_eq!(calls.group_keys.len(), 1);
+        assert_eq!(calls.aggregates.len(), 1);
+        assert_eq!(calls.aggregates[0].function, AggregateFunctionKind::Sum);
+    }
+
+    #[test]
+    fn focused_join_aliases_preserve_explicit_aliases() {
+        let aliases = extract_join_aliases(&parse_query(
+            "SELECT a.k FROM ice.ns.fact a JOIN ice.ns.dim b ON a.id = b.id",
+        ))
+        .expect("join aliases");
+        assert_eq!(aliases.left_table, "ice.ns.fact");
+        assert_eq!(aliases.left_alias, "a");
+        assert_eq!(aliases.right_table, "ice.ns.dim");
+        assert_eq!(aliases.right_alias, "b");
+    }
+
+    #[test]
+    fn focused_single_scan_fqn_rejects_join() {
+        let error = extract_single_scan_table_fqn(&parse_query(
+            "SELECT a.k FROM ice.ns.fact a JOIN ice.ns.dim b ON a.id = b.id",
+        ))
+        .expect_err("join is not a single scan");
+        assert!(error.contains("joins"), "unexpected error: {error}");
     }
 
     fn assert_rejects_with(sql: &str, needle: &str) {
@@ -2649,11 +2825,11 @@ mod tests {
             .expect("query should be accepted");
     }
 
-    fn as_aggregate_shape(shape: IncrementalMvShape) -> AggregateSqlCalls {
+    fn as_aggregate_shape(shape: IncrementalMvShape) -> SqlMvAggregateCalls {
         let IncrementalMvShape::Aggregate(shape) = shape else {
             panic!("expected aggregate shape");
         };
-        AggregateSqlCalls::from(&shape)
+        SqlMvAggregateCalls::from(&shape)
     }
 
     #[test]
@@ -2752,7 +2928,7 @@ mod tests {
     fn rewrite_select_sql_avg_without_alias() {
         let original = "SELECT k1, AVG(v2) FROM ice.ns.orders GROUP BY k1";
         let shape = match classify_sql(original).expect("classify") {
-            IncrementalMvShape::Aggregate(s) => AggregateSqlCalls::from(&s),
+            IncrementalMvShape::Aggregate(s) => SqlMvAggregateCalls::from(&s),
             _ => panic!("expected aggregate shape"),
         };
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
@@ -2769,7 +2945,7 @@ mod tests {
     fn rewrite_select_sql_avg_with_complex_argument() {
         let original = "SELECT k1, AVG(v2 + 1) AS a FROM ice.ns.orders GROUP BY k1";
         let shape = match classify_sql(original).expect("classify") {
-            IncrementalMvShape::Aggregate(s) => AggregateSqlCalls::from(&s),
+            IncrementalMvShape::Aggregate(s) => SqlMvAggregateCalls::from(&s),
             _ => panic!("expected aggregate shape"),
         };
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");

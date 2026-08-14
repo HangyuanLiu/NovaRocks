@@ -21,13 +21,13 @@ use super::expr::encode_expr;
 use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::preparation::scan::ScanExecutionBindings;
-use crate::sql::plan_read::{
+use novarocks_protocol::{common, plan};
+use novarocks_sql::plan_read::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, FragmentEdge,
     FragmentEdgeKind, FragmentEdgeOutputCatalog, FragmentStreamKind, NodeExecutionColumn,
     NodeOutputCatalog, OutputColumn as AnalysisOutputColumn, PlanFragment, TypedExpr,
     WriteContractCatalog, distributed_kind_to_physical,
 };
-use novarocks_protocol::{common, plan};
 
 use output::apply_sealed_node_output_columns;
 use relational::encode_physical_node;

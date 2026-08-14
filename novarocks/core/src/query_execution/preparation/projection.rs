@@ -22,11 +22,10 @@ use arrow::datatypes::DataType;
 use super::runtime_filter_binding::RuntimeFilterBindingTable;
 use super::scan::ScanExecutionBindings;
 use crate::runtime::scan_range::ScanRangeParams;
-use crate::sql::analysis::cte::CteId;
-use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::{BoundaryContract, FragmentEdge, FragmentId};
-use crate::sql::planner::runtime_filter::graph::RuntimeFilterGraph;
-use crate::sql::planner::runtime_filter::sealed::SealedRuntimeFilterPlan;
+use novarocks_sql::plan_read::runtime_filter::{
+    JoinBuildProgressCatalog, RuntimeFilterGraph, SealedRuntimeFilterPlan,
+};
+use novarocks_sql::plan_read::{BoundaryContract, ColumnId, CteId, FragmentEdge, FragmentId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedOutputColumn {
@@ -182,9 +181,7 @@ impl PreparedFragmentSet {
         self.runtime_filter_plan.graph()
     }
 
-    pub(crate) fn runtime_filter_join_progress(
-        &self,
-    ) -> &crate::sql::planner::runtime_filter::progress::JoinBuildProgressCatalog {
+    pub(crate) fn runtime_filter_join_progress(&self) -> &JoinBuildProgressCatalog {
         self.runtime_filter_plan.join_progress()
     }
 }
@@ -331,7 +328,7 @@ pub(crate) fn prepared_fragment_set_with_runtime_filter_for_test(
     execution_anchor_fragment_id: FragmentId,
     edges: Vec<FragmentEdge>,
     runtime_filter_graph: RuntimeFilterGraph,
-    runtime_filter_join_progress: crate::sql::planner::runtime_filter::progress::JoinBuildProgressCatalog,
+    runtime_filter_join_progress: novarocks_sql::planner::runtime_filter::progress::JoinBuildProgressCatalog,
 ) -> PreparedFragmentSet {
     let mut prepared = prepared_fragment_set_for_test(
         fragments,

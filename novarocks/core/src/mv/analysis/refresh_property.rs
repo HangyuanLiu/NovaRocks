@@ -52,18 +52,18 @@
 //! [`RefreshFragmentProperty::into_refresh_contract`] for the precise narrowing.
 
 #[cfg(test)]
-use crate::sql::planner::vocabulary::ApplyKeySource;
+use novarocks_sql::planner::vocabulary::ApplyKeySource;
 
 use crate::mv::refresh::apply_key::ApplyKeyContract;
 use crate::mv::refresh::contract::{
     AggregateRefreshContract, BranchRefreshContract, ImvRefreshContract, JoinRefreshContract,
 };
-use crate::sql::analysis::{
+use novarocks_catalog::identifier::TableIdentity;
+use novarocks_sql::analysis::{
     BinOp, ExprKind, JoinKind, QueryBody, Relation, ResolvedQuery, ResolvedSelect, ResolvedSetOp,
     SetOpKind, SortItem, TypedExpr,
 };
-use crate::sql::planner::table::ScanSource;
-use novarocks_catalog::identifier::TableIdentity;
+use novarocks_sql::planner::table::ScanSource;
 
 pub(crate) fn derive_imv_refresh_contract(
     analysis: &crate::mv::analysis::MvAnalysis,
@@ -998,7 +998,7 @@ fn collect_union_all_query<'a>(
 /// `iceberg_ref_from_resolved` in the flat classifier, but reads the identity
 /// off the scan's `ScanSource` (the relation tree, not the MV-declared refs).
 fn iceberg_ref_from_scan(
-    scan: &crate::sql::analysis::ScanRelation,
+    scan: &novarocks_sql::analysis::ScanRelation,
 ) -> Result<TableIdentity, String> {
     match &scan.table.source {
         // The IMV contract only needs the admitted SQL identity.  It must not
@@ -1008,8 +1008,8 @@ fn iceberg_ref_from_scan(
         ScanSource::Sql(source)
             if matches!(
                 source.kind,
-                crate::sql::planner::table::SqlScanKind::Data { .. }
-                    | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. }
+                novarocks_sql::planner::table::SqlScanKind::Data { .. }
+                    | novarocks_sql::planner::table::SqlScanKind::FrozenInputSet { .. }
             ) =>
         {
             Ok(TableIdentity {
@@ -1694,12 +1694,12 @@ fn join_key_side(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::PlannerTableProvider;
-    use crate::sql::planner::table::{
-        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
-    };
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
+    use novarocks_sql::catalog::PlannerTableProvider;
+    use novarocks_sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
 
     struct TestIcebergCatalog;
 
@@ -1709,7 +1709,7 @@ mod tests {
             catalog: Option<&str>,
             database: &str,
             table: &str,
-        ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+        ) -> Result<novarocks_sql::catalog::ResolvedAnalyzerTable, String> {
             let planner = TableDef {
                 name: table.to_string(),
                 columns: vec![
@@ -1721,7 +1721,7 @@ mod tests {
                 iceberg_row_lineage_metadata_columns: Vec::new(),
                 source: test_scan_source(catalog.unwrap_or("ice"), database, table),
             };
-            Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+            Ok(novarocks_sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog, database, planner,
             ))
         }
@@ -1729,7 +1729,7 @@ mod tests {
 
     fn test_scan_source(catalog: &str, database: &str, table: &str) -> ScanSource {
         ScanSource::Sql(SqlScanSource::new(
-            crate::sql::compiler::mv_rewrite::test_target_binding(),
+            novarocks_sql::compiler::mv_rewrite::test_target_binding(),
             SqlTableIdentity {
                 catalog: catalog.to_string(),
                 namespace: database.to_string(),
@@ -1752,12 +1752,12 @@ mod tests {
     }
 
     fn analyze_query(sql: &str) -> ResolvedQuery {
-        let stmt = crate::sql::parser::parse_sql_raw(sql).expect("parse query");
+        let stmt = novarocks_sql::parser::parse_sql_raw(sql).expect("parse query");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query");
         };
         let (resolved_query, _, _) =
-            crate::sql::analyzer::analyze(&query, &TestIcebergCatalog, "sales")
+            novarocks_sql::analyzer::analyze(&query, &TestIcebergCatalog, "sales")
                 .expect("analyze query");
         resolved_query
     }
@@ -2409,7 +2409,7 @@ mod tests {
         PartitionPruningPolicy, RefreshCapabilities, RefreshIdentity,
     };
     use crate::mv::refresh::snapshot::BaseSnapshotPolicy;
-    use crate::sql::planner::vocabulary::{
+    use novarocks_sql::planner::vocabulary::{
         GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
         JOIN_APPLY_KEY_COLUMN_NAME,
     };

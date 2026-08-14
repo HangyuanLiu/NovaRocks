@@ -47,11 +47,11 @@ use crate::query_execution::planning::write_sink::{
     admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{DeleteStmt, ObjectName};
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::ConnectorRowMutationStrategy;
 use novarocks_spi::connector::ConnectorWriteOperationId;
+use novarocks_sql::planning::dml::{IcebergRefSuffix, split_ref_suffix};
 
 pub(crate) fn prepare_delete_statement(
     state: &DmlExecutionKernel,
@@ -411,7 +411,7 @@ fn write_input_columns(
 }
 
 fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Query, String> {
-    match crate::sql::parser::parse_sql_raw(sql)? {
+    match novarocks_sql::planning::dml::parse_raw_statement(sql)? {
         sqlparser::ast::Statement::Query(query) => Ok(*query),
         other => Err(format!("{context}: generated non-query statement: {other}")),
     }
@@ -820,7 +820,8 @@ mod tests {
     }
 
     fn where_expr(sql: &str) -> sqlast::Expr {
-        let statement = crate::sql::parser::parse_sql_raw(sql).expect("parse query");
+        let statement =
+            novarocks_sql::planning::dml::parse_raw_statement(sql).expect("parse query");
         let sqlast::Statement::Query(query) = statement else {
             panic!("expected query");
         };

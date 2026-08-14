@@ -31,16 +31,12 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls;
-use crate::mv::aggregate_state::mv_shape::{AggregateInput, AggregateMvShape};
 use crate::mv::aggregate_state::physical_column::{
     StarRocksPhysicalColumn, starrocks_physical_column,
 };
 use crate::mv::aggregate_state::sql_type::arrow_data_type_to_sql_type;
 use crate::mv::model::AggregateStateRole;
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
-use crate::sql::analysis::OutputColumn;
-use crate::sql::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
 use novarocks_catalog::schema::SqlType;
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_execution::exec::expr::agg::{
@@ -57,6 +53,11 @@ use novarocks_execution::exec::expr::function::mv_state::{
 use novarocks_execution::exec::mv::state_codec::{
     KeyValue, decode_avg_decimal128, decode_avg_int64, decode_count_state, decode_sum_decimal128,
     decode_sum_int64,
+};
+use novarocks_sql::analysis::OutputColumn;
+use novarocks_sql::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
+use novarocks_sql::planning::mv::{
+    AggregateInput, AggregateMvShape, SqlMvAggregateCalls as AggregateSqlCalls,
 };
 
 pub(crate) const ROW_ID_COLUMN: &str = "__row_id__";
@@ -307,9 +308,9 @@ pub(crate) fn build_aggregate_mv_layout_with_input_types(
 
 pub(crate) fn aggregate_input_types_from_resolved_query(
     calls: &AggregateSqlCalls,
-    resolved: &crate::sql::analysis::ResolvedQuery,
+    resolved: &novarocks_sql::analysis::ResolvedQuery,
 ) -> Result<Vec<Option<DataType>>, String> {
-    let crate::sql::analysis::QueryBody::Select(select) = &resolved.body else {
+    let novarocks_sql::analysis::QueryBody::Select(select) = &resolved.body else {
         return Err("aggregate MV input type metadata requires SELECT analysis".to_string());
     };
     if select.projection.len() != calls.visible_outputs.len() {
@@ -326,7 +327,7 @@ pub(crate) fn aggregate_input_types_from_resolved_query(
             continue;
         };
         let projection = &select.projection[projection_index];
-        let crate::sql::analysis::ExprKind::AggregateCall { args, .. } = &projection.expr.kind
+        let novarocks_sql::analysis::ExprKind::AggregateCall { args, .. } = &projection.expr.kind
         else {
             return Err(format!(
                 "aggregate MV analyzed projection `{}` is not an aggregate expression",
@@ -1589,14 +1590,14 @@ fn key_value_to_agg_scalar(value: KeyValue) -> AggScalarValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::aggregate_state::mv_shape::{IncrementalMvShape, classify_incremental_mv_query};
-    use crate::sql::column_id::ColumnId;
     use arrow::array::{
         Array, BinaryBuilder, Int64Array, LargeBinaryArray, LargeBinaryBuilder, StringArray,
     };
     use novarocks_execution::exec::mv::state_codec::{
         encode_count_state, encode_sum_decimal128, encode_sum_int64,
     };
+    use novarocks_sql::column_id::ColumnId;
+    use novarocks_sql::planning::mv::{IncrementalMvShape, classify_incremental_mv_query};
 
     fn test_shape() -> AggregateMvShape {
         let shape = classify_incremental_mv_query(&parse_query(
@@ -1644,8 +1645,8 @@ mod tests {
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =
-            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
+            novarocks_sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
+        let stmt = novarocks_sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("not a query: {stmt:?}");
         };
@@ -2778,10 +2779,10 @@ mod tests {
 
     #[test]
     fn build_layout_avg_produces_state_columns_with_hidden_retraction_count() {
-        use crate::mv::aggregate_state::mv_shape::{
+        use novarocks_sql::mv_refresh::VisibleAggregateOutput;
+        use novarocks_sql::planning::mv::{
             AggregateCallShape, AggregateInput, AggregateMvShape, GroupKeyShape,
         };
-        use crate::sql::mv_refresh::VisibleAggregateOutput;
         use sqlparser::ast::ObjectName;
 
         let shape = AggregateMvShape {
@@ -2957,9 +2958,9 @@ mod tests {
     // ---- AVG materialize test (state-shaped input) ----
 
     fn avg_state_shape() -> AggregateMvShape {
-        let shape = crate::mv::aggregate_state::mv_shape::classify_incremental_mv_query(
-            &parse_query("select k1, avg(v2) as a from ice.ns.orders group by k1"),
-        )
+        let shape = novarocks_sql::planning::mv::classify_incremental_mv_query(&parse_query(
+            "select k1, avg(v2) as a from ice.ns.orders group by k1",
+        ))
         .expect("classify");
         let IncrementalMvShape::Aggregate(shape) = shape else {
             panic!("expected aggregate shape");
@@ -3155,9 +3156,9 @@ mod tests {
 
     #[test]
     fn avg_decimal128_layout_rejects_missing_input_scale_metadata() {
-        let shape = crate::mv::aggregate_state::mv_shape::classify_incremental_mv_query(
-            &parse_query("select k1, avg(d) as a from ice.ns.orders group by k1"),
-        )
+        let shape = novarocks_sql::planning::mv::classify_incremental_mv_query(&parse_query(
+            "select k1, avg(d) as a from ice.ns.orders group by k1",
+        ))
         .expect("classify");
         let IncrementalMvShape::Aggregate(shape) = shape else {
             panic!("expected aggregate shape");

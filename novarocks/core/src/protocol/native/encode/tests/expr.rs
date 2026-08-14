@@ -20,11 +20,14 @@ use prost::Message;
 
 use super::super::expr::encode_expr;
 use super::{column_expr, int_expr};
-use crate::sql::analysis::{ExprKind, SortItem, SubqueryKind, TypedExpr};
-use crate::sql::common::{
-    BinOp, LambdaParam, LiteralValue, UnOp, WindowBound, WindowFrame, WindowFrameType,
-};
 use novarocks_protocol::{common, expr};
+use novarocks_sql::plan_read::{
+    BinOp, ExprKind, LiteralValue, SortItem, TypedExpr, UnOp, WindowBound, WindowFrame,
+    WindowFrameType,
+};
+use novarocks_sql::test_support::{
+    native_immutable_function_expression, native_lambda_expression, subquery_placeholder_expr,
+};
 
 fn literal_expr(value: LiteralValue, data_type: DataType) -> TypedExpr {
     TypedExpr {
@@ -141,40 +144,12 @@ fn invalid_decimal_literal_widths_are_rejected() {
 fn typed_expr_variants_encode_to_expected_oneof_arms() {
     let col = column_expr(7, "a", DataType::Int64);
     let lit = int_expr(2);
-    let lambda_body = TypedExpr {
-        kind: ExprKind::BinaryOp {
-            left: Box::new(TypedExpr {
-                kind: ExprKind::LambdaParamRef {
-                    name: "x".to_string(),
-                    slot_id: 3,
-                },
-                data_type: DataType::Int64,
-                nullable: true,
-            }),
-            op: BinOp::Add,
-            right: Box::new(int_expr(1)),
-        },
-        data_type: DataType::Int64,
-        nullable: true,
-    };
     let sort_item = SortItem {
         expr: col.clone(),
         asc: false,
         nulls_first: true,
     };
-    let lambda_expr = TypedExpr {
-        kind: ExprKind::LambdaFunction {
-            params: vec![LambdaParam {
-                name: "x".to_string(),
-                slot_id: 3,
-                data_type: DataType::Int64,
-                nullable: true,
-            }],
-            body: Box::new(lambda_body.clone()),
-        },
-        data_type: DataType::Int64,
-        nullable: true,
-    };
+    let lambda_expr = native_lambda_expression();
     let Some(expr::expr::Kind::Lambda(lambda)) =
         encode_expr(&lambda_expr).expect("encode lambda").kind
     else {
@@ -222,29 +197,8 @@ fn typed_expr_variants_encode_to_expected_oneof_arms() {
             data_type: DataType::Boolean,
             nullable: false,
         },
-        TypedExpr {
-            kind: ExprKind::FunctionCall {
-                name: "abs".to_string(),
-                args: vec![col.clone()],
-                distinct: false,
-                volatility: crate::sql::functions::FunctionVolatility::Immutable,
-            },
-            data_type: DataType::Int64,
-            nullable: true,
-        },
-        TypedExpr {
-            kind: ExprKind::LambdaFunction {
-                params: vec![LambdaParam {
-                    name: "x".to_string(),
-                    slot_id: 3,
-                    data_type: DataType::Int64,
-                    nullable: true,
-                }],
-                body: Box::new(lambda_body.clone()),
-            },
-            data_type: DataType::Int64,
-            nullable: true,
-        },
+        native_immutable_function_expression(),
+        native_lambda_expression(),
         TypedExpr {
             kind: ExprKind::AggregateCall {
                 name: "sum".to_string(),
@@ -459,15 +413,7 @@ fn representative_nested_expr_fields_are_preserved() {
 
 #[test]
 fn subquery_placeholder_is_rejected_by_expr_encoder() {
-    let subquery = TypedExpr {
-        kind: ExprKind::SubqueryPlaceholder {
-            id: 42,
-            kind: SubqueryKind::Scalar,
-            data_type: DataType::Int64,
-        },
-        data_type: DataType::Int64,
-        nullable: true,
-    };
+    let subquery = subquery_placeholder_expr(42, DataType::Int64);
 
     let err = encode_expr(&subquery).expect_err("subquery must fail fast");
     assert!(err.contains("SubqueryPlaceholder"));

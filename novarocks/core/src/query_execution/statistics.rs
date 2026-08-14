@@ -341,14 +341,26 @@ pub(crate) fn build_statistics_collection_request(
             .map_err(contract_violation)?,
     );
     let source_binding = admit_statistics_scan_binding(table_bindings.as_ref(), &program)?;
-    let physical = statistics_scan_physical_plan(&program, source_binding)?;
-    let distributed =
-        crate::sql::planner::pipeline::build_statistics_distributed_plan_with_settings(
-            physical,
-            program.plan.metrics.clone(),
-            execution.optimizer_settings(),
-        )
-        .map_err(contract_violation)?;
+    let distributed = novarocks_sql::planning::dml::build_statistics_connector_plan(
+        novarocks_sql::planning::dml::StatisticsConnectorScan {
+            binding: source_binding,
+            columns: program
+                .plan
+                .scan_columns()
+                .iter()
+                .map(|column| novarocks_catalog::schema::ColumnDef {
+                    name: column.name().to_string(),
+                    data_type: column.data_type().clone(),
+                    nullable: column.nullable(),
+                    write_default: None,
+                    logical_type: None,
+                })
+                .collect(),
+        },
+        program.plan.metrics.clone(),
+        execution.optimizer_settings(),
+    )
+    .map_err(contract_violation)?;
     let resolver = PinnedStatisticsReadResolver::new(read);
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
@@ -383,74 +395,6 @@ pub(crate) fn build_statistics_collection_request(
     ))
 }
 
-fn statistics_scan_physical_plan(
-    program: &StatisticsCollectionProgram,
-    binding: crate::sql::binding::SqlTableBindingId,
-) -> Result<crate::sql::planner::physical::PhysicalPlanNode, DistributedQueryError> {
-    let mut factory = crate::sql::column_id::ColumnRefFactory::new();
-    let mut scan_columns = Vec::with_capacity(program.plan.scan_columns().len());
-    let mut table_columns = Vec::with_capacity(program.plan.scan_columns().len());
-    for column in program.plan.scan_columns() {
-        let name = column.name().to_string();
-        let data_type = column.data_type().clone();
-        let nullable = column.nullable();
-        let column_id = factory.create(None, name.clone(), data_type.clone(), nullable);
-        scan_columns.push(crate::sql::analysis::OutputColumn {
-            column_id,
-            name: name.clone(),
-            data_type: data_type.clone(),
-            nullable,
-            is_internal: false,
-        });
-        table_columns.push(novarocks_catalog::schema::ColumnDef {
-            name,
-            data_type,
-            nullable,
-            write_default: None,
-            logical_type: None,
-        });
-    }
-    Ok(crate::sql::planner::physical::PhysicalPlanNode {
-        kind: crate::sql::planner::physical::PhysicalPlanKind::Scan(
-            crate::sql::planner::payload::PlanScanNode {
-                database: "__statistics".to_string(),
-                table: crate::sql::planner::table::TableDef {
-                    name: "__connector_pinned_statistics".to_string(),
-                    columns: table_columns,
-                    iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: crate::sql::planner::table::ScanSource::Sql(
-                        crate::sql::planner::table::SqlScanSource::new(
-                            binding,
-                            crate::sql::planner::table::SqlTableIdentity {
-                                catalog: "__statistics".to_string(),
-                                namespace: "__statistics".to_string(),
-                                table: "__connector_pinned_statistics".to_string(),
-                            },
-                            crate::sql::planner::table::SqlScanKind::ConnectorRead,
-                        ),
-                    ),
-                },
-                alias: None,
-                columns: scan_columns.clone(),
-                predicates: Vec::new(),
-                required_columns: None,
-                variant_columns: Vec::new(),
-                mv_rewritten_from: None,
-            },
-        ),
-        children: Vec::new(),
-        output_columns: scan_columns,
-        stats: crate::sql::planner::physical::PhysicalPlanStats {
-            output_row_count: 0.0,
-            row_count_confidence: crate::sql::planner::physical::PlannerConfidence::Fallback,
-            column_statistics: HashMap::new(),
-            cost_estimate: None,
-            broadcast_decision: None,
-        },
-        probe_runtime_filters: Vec::new(),
-    })
-}
-
 /// Retain a request-local SQL token even though the opaque statistics read is
 /// supplied by `PinnedStatisticsReadResolver`.  The resolver holds the exact
 /// statistics lease; the binding store keeps the synthetic compiler source
@@ -458,7 +402,7 @@ fn statistics_scan_physical_plan(
 fn admit_statistics_scan_binding(
     bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
     program: &StatisticsCollectionProgram,
-) -> Result<crate::sql::binding::SqlTableBindingId, DistributedQueryError> {
+) -> Result<novarocks_sql::binding::SqlTableBindingId, DistributedQueryError> {
     use crate::query_execution::planning::bindings::{QueryTableBinding, QueryTableBindingKey};
     use crate::sql::catalog::ResolvedAnalyzerTable;
     use crate::sql::planner::table::{
@@ -537,7 +481,7 @@ impl ScanBindingResolver for PinnedStatisticsReadResolver {
     fn resolve_scan(
         &self,
         _node_id: i32,
-        _scan: &crate::sql::planner::payload::PlanScanNode,
+        _scan: &novarocks_sql::plan_read::PlanScanNode,
     ) -> Result<Option<ResolvedScanExecution>, String> {
         Ok(Some(ResolvedScanExecution::ConnectorRead))
     }
@@ -545,7 +489,7 @@ impl ScanBindingResolver for PinnedStatisticsReadResolver {
     fn resolve_connector_read(
         &self,
         _node_id: i32,
-        _scan: &crate::sql::planner::payload::PlanScanNode,
+        _scan: &novarocks_sql::plan_read::PlanScanNode,
     ) -> Result<Option<PlannedConnectorRead>, String> {
         self.read
             .lock()

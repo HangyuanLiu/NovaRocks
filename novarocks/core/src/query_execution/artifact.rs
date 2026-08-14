@@ -48,14 +48,13 @@ use crate::query_execution::schedule::{
 use crate::query_execution::write_plan::{ConnectorWriteManifest, ConnectorWritePlanAttachment};
 use crate::query_execution::{RuntimeFilterBindingFactsView, RuntimeFilterDeploymentFactsView};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
-use crate::sql::analysis::cte::CteId;
-use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::{
-    FragmentEdgeKind, FragmentId as PlannerFragmentId, FragmentStreamKind, PartitionKind,
-};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_protocol::plan::RuntimeFilterBindingTable;
+use novarocks_sql::plan_read::{
+    ColumnId, CteId, FragmentEdgeKind, FragmentId as PlannerFragmentId, FragmentStreamKind,
+    PartitionKind,
+};
 use novarocks_types::SlotId;
 
 pub use crate::query_execution::connector_binding::{
@@ -939,7 +938,7 @@ pub enum SchedulingStreamKind {
 
 #[derive(Clone, Copy)]
 pub struct SchedulingEdgeView<'a> {
-    edge: &'a crate::sql::planner::distributed::FragmentEdge,
+    edge: &'a novarocks_sql::plan_read::FragmentEdge,
 }
 
 impl SchedulingEdgeView<'_> {
@@ -1323,7 +1322,7 @@ pub fn fragment_instance_id_for_contract_test(
 
 fn build_fragment_lifecycle_projection(
     schedule: &SchedulingPlan,
-    edges: &[crate::sql::planner::distributed::FragmentEdge],
+    edges: &[novarocks_sql::plan_read::FragmentEdge],
     frozen_live_backends: BTreeMap<usize, LiveBackendTarget>,
 ) -> Result<FragmentLifecycleProjection, DistributedQueryError> {
     let mut instances_by_backend = BTreeMap::<usize, BTreeSet<UniqueId>>::new();
@@ -1394,7 +1393,7 @@ fn build_fragment_lifecycle_projection(
 
 fn populate_destinations(
     schedule: &mut SchedulingPlan,
-    edges: &[crate::sql::planner::distributed::FragmentEdge],
+    edges: &[novarocks_sql::plan_read::FragmentEdge],
 ) {
     for edge in edges {
         let destinations = schedule
@@ -1416,7 +1415,7 @@ fn populate_destinations(
 
 fn populate_sender_counts(
     schedule: &mut SchedulingPlan,
-    edges: &[crate::sql::planner::distributed::FragmentEdge],
+    edges: &[novarocks_sql::plan_read::FragmentEdge],
 ) {
     for edge in edges {
         let upstream = schedule
@@ -1815,7 +1814,7 @@ fn assemble_native_execution(
         crate::query_execution::assembly::build_stream_edge_by_source(&edges);
     let router_edges_by_source: BTreeMap<
         FragmentId,
-        (i32, Vec<&crate::sql::planner::distributed::FragmentEdge>),
+        (i32, Vec<&novarocks_sql::plan_read::FragmentEdge>),
     > = crate::query_execution::assembly::group_router_edges_by_source(&edges)
         .into_iter()
         .map(|((source_fragment_id, router_group_id), branch_edges)| {
@@ -2185,10 +2184,10 @@ mod tests {
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::{AttemptId, ExchangeRouteManifest, QueryExecutionId};
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
-    use crate::sql::planner::distributed::{
+    use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+    use novarocks_sql::plan_read::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
     };
-    use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 
     fn placement(
         fragment_id: u32,

@@ -212,70 +212,10 @@ fn prepared_connector_scan_bindings(
 
 #[test]
 fn distributed_plan_encoder_round_trips_fragments_edges_partitions_and_exchange() {
-    let output = vec![planner_output_column(10, "v", DataType::Int64)];
-    let source = crate::sql::planner::distributed::PlanFragment {
-        fragment_id: 0,
-        root: values_distributed_node(0, 11, output.clone()),
-        data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
-        output_partition: crate::sql::planner::distributed::DataPartition {
-            kind: crate::sql::planner::distributed::PartitionKind::Hash,
-            exprs: vec![column_expr(10, "v", DataType::Int64)],
-        },
-        sink: crate::sql::planner::distributed::DataSink::Noop,
-        output_exprs: None,
-        output_columns: output.clone(),
-        cte_id: None,
-        cte_exchange_nodes: Vec::new(),
-    };
-    let receiver = crate::sql::planner::distributed::DistributedNode {
-        node_id: 42,
-        fragment_id: 1,
-        tuple_ids: vec![42],
-        nullable_tuple_ids: Vec::new(),
-        limit: -1,
-        runtime_filter_binding_ids: Vec::new(),
-        children: Vec::new(),
-        stats: physical_stats(),
-        payload: crate::sql::planner::distributed::DistributedNodeKind::Exchange(
-            crate::sql::planner::distributed::ExchangeReceiver {
-                partition: crate::sql::planner::distributed::DataPartition::hash(vec![
-                    column_expr(10, "v", DataType::Int64),
-                ]),
-                source_fragment_id: 0,
-                output_columns: output.clone(),
-                output_qualifier: Some("recv".to_string()),
-                flavor: crate::sql::planner::distributed::ExchangeFlavor::Distribution,
-            },
-        ),
-    };
-    let target = crate::sql::planner::distributed::PlanFragment {
-        fragment_id: 1,
-        root: receiver,
-        data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
-        output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
-        sink: crate::sql::planner::distributed::DataSink::Result,
-        output_exprs: None,
-        output_columns: output,
-        cte_id: None,
-        cte_exchange_nodes: Vec::new(),
-    };
-    let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
-        fragments: vec![source, target],
-        root_fragment_id: 1,
-        runtime_filter_graph: Default::default(),
-        edges: vec![crate::sql::planner::distributed::FragmentEdge {
-            source_fragment_id: 0,
-            target_fragment_id: 1,
-            target_exchange_node_id: 42,
-            output_partition: crate::sql::planner::distributed::DataPartition {
-                kind: crate::sql::planner::distributed::PartitionKind::Hash,
-                exprs: vec![column_expr(10, "v", DataType::Int64)],
-            },
-            stream_kind: crate::sql::planner::distributed::FragmentStreamKind::Partitioned,
-            edge_kind: crate::sql::planner::distributed::FragmentEdgeKind::Stream,
-            output_slot_ids: vec![10],
-        }],
-    };
+    let plan = novarocks_sql::test_support::native_encoder_plan(
+        novarocks_sql::test_support::NativeEncoderPlanFixture::HashExchange,
+    )
+    .expect("native hash exchange fixture must seal");
 
     let encoded = plan::encode_distributed_plan(&plan, empty_scan_bindings())
         .expect("encode distributed plan");

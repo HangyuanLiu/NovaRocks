@@ -142,7 +142,7 @@ impl DistributedPlan {
         &self.data.write_contracts
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(in crate::planner::distributed) fn remove_fragment_output_for_test(
         &mut self,
         fragment_id: FragmentId,

@@ -17,12 +17,12 @@
 
 //! Provider-neutral materialized-view target schema helpers.
 
-use crate::sql::planner::vocabulary::{
+use novarocks_sql::planner::vocabulary::{
     BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
 
-pub(crate) fn apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {
-    crate::sql::parser::ast::TableColumnDef {
+pub(crate) fn apply_key_table_column() -> novarocks_sql::parser::ast::TableColumnDef {
+    novarocks_sql::parser::ast::TableColumnDef {
         name: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
         data_type: novarocks_catalog::schema::SqlType::BigInt,
         nullable: false,
@@ -31,8 +31,8 @@ pub(crate) fn apply_key_table_column() -> crate::sql::parser::ast::TableColumnDe
     }
 }
 
-pub(crate) fn join_apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {
-    crate::sql::parser::ast::TableColumnDef {
+pub(crate) fn join_apply_key_table_column() -> novarocks_sql::parser::ast::TableColumnDef {
+    novarocks_sql::parser::ast::TableColumnDef {
         name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
         data_type: novarocks_catalog::schema::SqlType::String,
         nullable: false,
@@ -41,8 +41,8 @@ pub(crate) fn join_apply_key_table_column() -> crate::sql::parser::ast::TableCol
     }
 }
 
-pub(crate) fn branch_id_table_column() -> crate::sql::parser::ast::TableColumnDef {
-    crate::sql::parser::ast::TableColumnDef {
+pub(crate) fn branch_id_table_column() -> novarocks_sql::parser::ast::TableColumnDef {
+    novarocks_sql::parser::ast::TableColumnDef {
         name: BRANCH_ID_COLUMN_NAME.to_string(),
         data_type: novarocks_catalog::schema::SqlType::Int,
         nullable: false,
@@ -52,9 +52,9 @@ pub(crate) fn branch_id_table_column() -> crate::sql::parser::ast::TableColumnDe
 }
 
 pub(crate) fn iceberg_mv_physical_select_sql(select_sql: &str) -> Result<String, String> {
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
+    let normalized = novarocks_sql::parser::dialect::normalize_for_raw_parse(select_sql)
         .map_err(|e| format!("iceberg MV physical SELECT normalize error: {e}"))?;
-    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+    let mut stmt = novarocks_sql::parser::parse_normalized_sql_raw(&normalized)
         .map_err(|e| format!("iceberg MV physical SELECT parse error: {e}"))?;
     let sqlparser::ast::Statement::Query(query) = &mut stmt else {
         return Err("iceberg MV physical SELECT expects a SELECT query".to_string());

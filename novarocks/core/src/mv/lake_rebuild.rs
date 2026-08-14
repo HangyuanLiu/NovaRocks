@@ -334,8 +334,8 @@ mod tests {
         MvLakePackageObservation, MvLakePublication, MvPublishedBaseFact, MvPublishedLakeFacts,
         MvPublishedRefreshTechnique,
     };
-    use crate::sql::planner::vocabulary::ApplyKeySource;
     use novarocks_spi::connector::{ConnectorInstanceId, ConnectorTableIdentity};
+    use novarocks_sql::planner::vocabulary::ApplyKeySource;
     use std::sync::Arc;
 
     fn sample_contract() -> MvSchemaContract {

@@ -265,7 +265,7 @@ fn validate_physical_aggregate_schema(
             ));
         }
         let expected_type =
-            crate::sql::literal::sql_type_to_arrow_type(&expected_column.column.data_type)
+            novarocks_sql::literal::sql_type_to_arrow_type(&expected_column.column.data_type)
                 .map_err(|e| {
                     format!(
                         "{context}: convert expected physical aggregate column `{expected_name}` type failed: {e}"
@@ -279,7 +279,7 @@ fn validate_physical_aggregate_schema(
         // `sql_type_to_arrow_type`-derived expected uses nullable inner key
         // fields. Both are semantically the same shape. Top-level column
         // nullability is still enforced by the `is_nullable` check below.
-        let type_matches = crate::sql::literal::arrow_type_equals_ignoring_metadata(
+        let type_matches = novarocks_sql::literal::arrow_type_equals_ignoring_metadata(
             actual.data_type(),
             &expected_type,
         ) || matches!(
@@ -432,9 +432,9 @@ mod tests {
     };
     use crate::mv::aggregate_state::physical_column::starrocks_physical_column;
     use crate::mv::model::AggregateStateRole;
-    use crate::sql::mv_refresh::AggregateFunctionKind;
     use novarocks_catalog::schema::SqlType;
     use novarocks_execution::exec::mv::state_codec::encode_count_state;
+    use novarocks_sql::mv_refresh::AggregateFunctionKind;
 
     fn chunk(batch: RecordBatch) -> novarocks_execution::exec::chunk::Chunk {
         record_batch_to_chunk(batch).expect("chunk")

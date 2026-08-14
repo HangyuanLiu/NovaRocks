@@ -25,12 +25,12 @@ use novarocks_spi::connector::{
 
 use crate::query_execution::planning::bindings::QueryScanMaterialization;
 use crate::runtime::scan_range::ScanRangeParams;
-use crate::sql::analysis::OutputColumn;
-use crate::sql::analysis::TypedExpr;
-use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::FragmentId;
-use crate::sql::planner::payload::PlanScanNode;
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_sql::analysis::OutputColumn;
+use novarocks_sql::analysis::TypedExpr;
+use novarocks_sql::column_id::ColumnId;
+use novarocks_sql::plan_read::FragmentId;
+use novarocks_sql::plan_read::PlanScanNode;
 
 pub(crate) trait ScanBindingResolver: Send + Sync {
     fn resolve_scan(

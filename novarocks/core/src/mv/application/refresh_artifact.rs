@@ -18,10 +18,10 @@ use novarocks_spi::connector::{
     ConnectorWriteOperationId, ConnectorWriteReceipt,
 };
 
-use crate::sql::mv_refresh::first_refresh::{
+use novarocks_sql::mv_refresh::first_refresh::{
     MvFirstRefreshPhysicalSql, MvFirstRefreshShape, MvFirstRefreshTargetContract, SqlMvSnapshotPin,
 };
-use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
+use novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
 
 /// The application commit semantics selected after first-refresh SQL planning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -22,7 +22,7 @@
 //! connector read without acquiring current metadata or any provider-specific
 //! lifecycle capability.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
@@ -40,10 +40,10 @@ use crate::query_execution::planning::bindings::{
 };
 use crate::query_execution::planning::catalog_materializer::QueryLocalTableOverlay;
 use crate::query_execution::preparation::scan::PlannedConnectorRead;
-use crate::sql::binding::SqlTableBindingId;
-use crate::sql::catalog::ResolvedAnalyzerTable;
-use crate::sql::planner::table::{
-    ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
+use novarocks_sql::binding::SqlTableBindingId;
+use novarocks_sql::planning::query_execution::{
+    build_frozen_connector_scan_plan, frozen_connector_resolved_analyzer_table,
+    matches_frozen_connector_scan, FrozenConnectorScanIdentity, FrozenConnectorScanPlan,
 };
 
 /// Plan one opaque frozen source through the exact generation that admitted it.
@@ -178,7 +178,7 @@ fn validate_execution_declaration(
 /// Admit a synthetic SQL binding for an already-planned frozen read.
 pub(crate) fn admit_frozen_connector_scan_binding(
     bindings: &QueryTableBindingStore,
-    identity: &SqlTableIdentity,
+    identity: &FrozenConnectorScanIdentity,
     input_schema: &SchemaRef,
 ) -> Result<SqlTableBindingId, String> {
     bindings.resolve_or_insert_with_id(frozen_connector_binding_key(identity), |binding| {
@@ -190,14 +190,14 @@ pub(crate) fn admit_frozen_connector_scan_binding(
 /// The overlay and resolver must be created from the same identity and binding
 /// store; neither is published to shared catalog state.
 pub(crate) fn frozen_connector_query_local_overlay(
-    identity: &SqlTableIdentity,
+    identity: &FrozenConnectorScanIdentity,
     input_schema: &SchemaRef,
 ) -> QueryLocalTableOverlay {
     let identity = identity.clone();
     let schema = input_schema.clone();
     QueryLocalTableOverlay::new(
-        identity.namespace.clone(),
-        identity.table.clone(),
+        identity.namespace().to_string(),
+        identity.table().to_string(),
         frozen_connector_binding_key(&identity),
         move |binding| {
             frozen_connector_query_table_binding(identity.clone(), schema.clone(), binding)
@@ -205,43 +205,17 @@ pub(crate) fn frozen_connector_query_local_overlay(
     )
 }
 
-fn frozen_connector_binding_key(identity: &SqlTableIdentity) -> QueryTableBindingKey {
-    QueryTableBindingKey::strict_base(&identity.catalog, &identity.namespace, &identity.table)
+fn frozen_connector_binding_key(identity: &FrozenConnectorScanIdentity) -> QueryTableBindingKey {
+    QueryTableBindingKey::strict_base(identity.catalog(), identity.namespace(), identity.table())
 }
 
 fn frozen_connector_query_table_binding(
-    identity: SqlTableIdentity,
+    identity: FrozenConnectorScanIdentity,
     input_schema: SchemaRef,
     binding: SqlTableBindingId,
 ) -> Result<QueryTableBinding, String> {
-    let columns = input_schema
-        .fields()
-        .iter()
-        .map(|field| novarocks_catalog::schema::ColumnDef {
-            name: field.name().to_string(),
-            data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
-            write_default: None,
-            logical_type: None,
-        })
-        .collect::<Vec<_>>();
-    let catalog = identity.catalog.clone();
-    let namespace = identity.namespace.clone();
     Ok(QueryTableBinding {
-        resolved: ResolvedAnalyzerTable::from_planner(
-            Some(&catalog),
-            &namespace,
-            TableDef {
-                name: identity.table.clone(),
-                columns,
-                iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: ScanSource::Sql(SqlScanSource::new(
-                    binding,
-                    identity,
-                    SqlScanKind::ConnectorRead,
-                )),
-            },
-        ),
+        resolved: frozen_connector_resolved_analyzer_table(&identity, input_schema, binding),
         statistics_pin: None,
         admission: QueryTableBindingAdmission::Local,
         scan_materialization: None,
@@ -254,79 +228,24 @@ fn frozen_connector_query_table_binding(
 
 /// Build the minimal physical scan carrier for one admitted frozen source.
 pub(crate) fn frozen_connector_scan_physical_plan(
-    identity: &SqlTableIdentity,
+    identity: &FrozenConnectorScanIdentity,
     input_schema: &SchemaRef,
     binding: SqlTableBindingId,
-) -> crate::sql::planner::physical::PhysicalPlanNode {
-    let mut factory = crate::sql::column_id::ColumnRefFactory::new();
-    let mut output_columns = Vec::with_capacity(input_schema.fields().len());
-    let mut table_columns = Vec::with_capacity(input_schema.fields().len());
-    for field in input_schema.fields() {
-        let name = field.name().to_string();
-        let data_type = field.data_type().clone();
-        let nullable = field.is_nullable();
-        let column_id = factory.create(None, name.clone(), data_type.clone(), nullable);
-        output_columns.push(crate::sql::analysis::OutputColumn {
-            column_id,
-            name: name.clone(),
-            data_type: data_type.clone(),
-            nullable,
-            is_internal: false,
-        });
-        table_columns.push(novarocks_catalog::schema::ColumnDef {
-            name,
-            data_type,
-            nullable,
-            write_default: None,
-            logical_type: None,
-        });
-    }
-    crate::sql::planner::physical::PhysicalPlanNode {
-        kind: crate::sql::planner::physical::PhysicalPlanKind::Scan(
-            crate::sql::planner::payload::PlanScanNode {
-                database: identity.namespace.clone(),
-                table: TableDef {
-                    name: identity.table.clone(),
-                    columns: table_columns,
-                    iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: ScanSource::Sql(SqlScanSource::new(
-                        binding,
-                        identity.clone(),
-                        SqlScanKind::ConnectorRead,
-                    )),
-                },
-                alias: None,
-                columns: output_columns.clone(),
-                predicates: Vec::new(),
-                required_columns: None,
-                variant_columns: Vec::new(),
-                mv_rewritten_from: None,
-            },
-        ),
-        children: Vec::new(),
-        output_columns,
-        stats: crate::sql::planner::physical::PhysicalPlanStats {
-            output_row_count: 0.0,
-            row_count_confidence: crate::sql::planner::physical::PlannerConfidence::Fallback,
-            column_statistics: HashMap::new(),
-            cost_estimate: None,
-            broadcast_decision: None,
-        },
-        probe_runtime_filters: Vec::new(),
-    }
+) -> FrozenConnectorScanPlan {
+    build_frozen_connector_scan_plan(identity, input_schema, binding)
 }
 
 /// One-shot injection of an already-planned connector read into preparation.
 pub(crate) struct FrozenConnectorReadResolver {
     binding: SqlTableBindingId,
-    identity: SqlTableIdentity,
+    identity: FrozenConnectorScanIdentity,
     read: Mutex<Option<PlannedConnectorRead>>,
 }
 
 impl FrozenConnectorReadResolver {
     pub(crate) fn new(
         binding: SqlTableBindingId,
-        identity: SqlTableIdentity,
+        identity: FrozenConnectorScanIdentity,
         read: PlannedConnectorRead,
     ) -> Self {
         Self {
@@ -336,11 +255,8 @@ impl FrozenConnectorReadResolver {
         }
     }
 
-    fn matches(&self, scan: &crate::sql::planner::payload::PlanScanNode) -> bool {
-        let ScanSource::Sql(source) = &scan.table.source;
-        source.kind == SqlScanKind::ConnectorRead
-            && source.binding == self.binding
-            && source.table == self.identity
+    fn matches(&self, scan: &novarocks_sql::plan_read::PlanScanNode) -> bool {
+        matches_frozen_connector_scan(scan, self.binding, &self.identity)
     }
 }
 
@@ -350,7 +266,7 @@ impl crate::query_execution::preparation::scan::ScanBindingResolver
     fn resolve_scan(
         &self,
         _node_id: i32,
-        scan: &crate::sql::planner::payload::PlanScanNode,
+        scan: &novarocks_sql::plan_read::PlanScanNode,
     ) -> Result<Option<crate::query_execution::preparation::scan::ResolvedScanExecution>, String>
     {
         if !self.matches(scan) {
@@ -364,7 +280,7 @@ impl crate::query_execution::preparation::scan::ScanBindingResolver
     fn resolve_connector_read(
         &self,
         _node_id: i32,
-        scan: &crate::sql::planner::payload::PlanScanNode,
+        scan: &novarocks_sql::plan_read::PlanScanNode,
     ) -> Result<Option<PlannedConnectorRead>, String> {
         if !self.matches(scan) {
             return Ok(None);
@@ -608,11 +524,7 @@ mod tests {
     #[test]
     fn generic_binding_and_physical_carrier_preserve_identity() {
         let bindings = QueryTableBindingStore::try_new().expect("binding store");
-        let identity = SqlTableIdentity {
-            catalog: "__frozen".to_string(),
-            namespace: "operation".to_string(),
-            table: "cohort_7".to_string(),
-        };
+        let identity = FrozenConnectorScanIdentity::new("__frozen", "operation", "cohort_7");
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,
@@ -621,14 +533,13 @@ mod tests {
         let binding = admit_frozen_connector_scan_binding(&bindings, &identity, &schema)
             .expect("admit frozen binding");
         let plan = frozen_connector_scan_physical_plan(&identity, &schema, binding);
-        let crate::sql::planner::physical::PhysicalPlanKind::Scan(scan) = plan.kind else {
-            panic!("expected scan")
-        };
-        let ScanSource::Sql(source) = scan.table.source;
 
-        assert_eq!(source.binding, binding);
-        assert_eq!(source.table, identity);
-        assert_eq!(plan.output_columns.len(), 1);
+        assert!(matches_frozen_connector_scan(
+            plan.scan(),
+            binding,
+            &identity
+        ));
+        assert_eq!(plan.output_column_count(), 1);
     }
 
     #[test]
@@ -645,50 +556,40 @@ mod tests {
         )
         .expect("plan frozen connector read");
         let bindings = QueryTableBindingStore::try_new().expect("binding store");
-        let identity = SqlTableIdentity {
-            catalog: "__frozen".to_string(),
-            namespace: "operation".to_string(),
-            table: "cohort_once".to_string(),
-        };
+        let identity = FrozenConnectorScanIdentity::new("__frozen", "operation", "cohort_once");
         let binding = admit_frozen_connector_scan_binding(&bindings, &identity, &metadata.schema)
             .expect("admit frozen binding");
-        let mut plan = frozen_connector_scan_physical_plan(&identity, &metadata.schema, binding);
-        let crate::sql::planner::physical::PhysicalPlanKind::Scan(scan) = &mut plan.kind else {
-            panic!("expected scan")
-        };
-        scan.predicates.push(crate::sql::analysis::TypedExpr {
-            kind: crate::sql::analysis::ExprKind::Literal(
-                crate::sql::analysis::LiteralValue::Bool(true),
-            ),
-            data_type: DataType::Boolean,
-            nullable: false,
-        });
-        let wrong_identity = SqlTableIdentity {
-            catalog: "__frozen".to_string(),
-            namespace: "operation".to_string(),
-            table: "wrong_cohort".to_string(),
-        };
+        let plan = frozen_connector_scan_physical_plan(&identity, &metadata.schema, binding)
+            .with_predicates(vec![novarocks_sql::plan_read::TypedExpr {
+                kind: novarocks_sql::plan_read::ExprKind::Literal(
+                    novarocks_sql::plan_read::LiteralValue::Bool(true),
+                ),
+                data_type: DataType::Boolean,
+                nullable: false,
+            }]);
+        let wrong_identity =
+            FrozenConnectorScanIdentity::new("__frozen", "operation", "wrong_cohort");
         let wrong_binding =
             admit_frozen_connector_scan_binding(&bindings, &wrong_identity, &metadata.schema)
                 .expect("admit wrong frozen binding");
         let wrong_plan =
             frozen_connector_scan_physical_plan(&wrong_identity, &metadata.schema, wrong_binding);
-        let crate::sql::planner::physical::PhysicalPlanKind::Scan(wrong_scan) = &wrong_plan.kind
-        else {
-            panic!("expected wrong scan")
-        };
         let resolver = FrozenConnectorReadResolver::new(binding, identity, read);
 
         assert!(
             crate::query_execution::preparation::scan::ScanBindingResolver::resolve_scan(
-                &resolver, 8, wrong_scan,
+                &resolver,
+                8,
+                wrong_plan.scan(),
             )
             .expect("wrong scan resolver call")
             .is_none()
         );
         assert!(
             crate::query_execution::preparation::scan::ScanBindingResolver::resolve_connector_read(
-                &resolver, 8, wrong_scan,
+                &resolver,
+                8,
+                wrong_plan.scan(),
             )
             .expect("wrong resolver call")
             .is_none()
@@ -696,18 +597,22 @@ mod tests {
 
         let resolved =
             crate::query_execution::preparation::scan::ScanBindingResolver::resolve_connector_read(
-                &resolver, 9, scan,
+                &resolver,
+                9,
+                plan.scan(),
             )
             .expect("first resolver call")
             .expect("frozen read");
         assert_eq!(resolved.residual_predicates.len(), 1);
         assert_eq!(
             format!("{:?}", resolved.residual_predicates),
-            format!("{:?}", scan.predicates)
+            format!("{:?}", plan.scan().predicates)
         );
         assert!(
             crate::query_execution::preparation::scan::ScanBindingResolver::resolve_connector_read(
-                &resolver, 9, scan,
+                &resolver,
+                9,
+                plan.scan(),
             )
             .expect("second resolver call")
             .is_none()

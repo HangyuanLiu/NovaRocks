@@ -29,8 +29,8 @@ use novarocks_catalog::schema_cache::SchemaCache;
 use novarocks_catalog::service::CatalogService;
 use novarocks_catalog::table::CatalogTable;
 
-use crate::sql::catalog::local::PlannerMemoryCatalog;
-use crate::sql::planner::table::TableDef;
+use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
+use novarocks_sql::planning::catalog::TableDef;
 
 #[derive(Clone, Debug)]
 pub struct CatalogRuntimeMetadata {
@@ -185,38 +185,4 @@ pub(crate) fn build_connector_catalog(
     controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
 ) -> Arc<dyn Catalog<CatalogRuntimeMetadata>> {
     Arc::new(ConnectorCatalog::new(name, controls))
-}
-
-#[cfg(test)]
-mod tests {
-    use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
-
-    use super::CatalogRuntimeMetadata;
-    use crate::sql::planner::table::TableDef;
-    use novarocks_catalog::identifier::TableIdentity;
-
-    #[test]
-    fn sqlx2_catalog_runtime_keeps_only_schema_facts() {
-        let table = TableDef {
-            name: "orders".to_string(),
-            columns: vec![ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            }],
-            iceberg_row_lineage_metadata_columns: vec![],
-            source: crate::sql::planner::table::test_sql_scan_source(
-                crate::sql::planner::table::SqlScanKind::ConnectorRead,
-            ),
-        };
-        let metadata = CatalogRuntimeMetadata::from_table_def(
-            TableIdentity::new("default_catalog", "db", "orders"),
-            &table,
-        );
-        assert_eq!(metadata.table.identity.fqn(), "default_catalog.db.orders");
-        assert_eq!(metadata.table.columns, table.columns);
-    }
 }

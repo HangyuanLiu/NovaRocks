@@ -153,7 +153,7 @@ mod request_context_tests {
     use crate::query_execution::backend::BackendTopologySnapshot;
     use crate::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
     use crate::query_execution::request_context::{RequestAdmission, RequestContext};
-    use crate::sql::optimizer::options::SessionOptimizerSettings;
+    use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::ClusterRole;
 
     #[test]

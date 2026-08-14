@@ -384,7 +384,7 @@ fn equality_delete_target_columns(delete_columns: &[Field]) -> Vec<ColumnDef> {
 }
 
 fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Query, String> {
-    match crate::sql::parser::parse_sql_raw(sql)? {
+    match novarocks_sql::planning::dml::parse_raw_statement(sql)? {
         sqlparser::ast::Statement::Query(query) => Ok(*query),
         other => Err(format!("{context}: generated non-query statement: {other}")),
     }

@@ -19,14 +19,14 @@
 
 use crate::protocol::native::encode::expr::encode_expr;
 use crate::query_execution::schedule::SchedulingPlan;
-use crate::sql::planner::distributed::FragmentEdge;
-use crate::sql::planner::runtime_filter::coverage::Coverage;
-use crate::sql::planner::runtime_filter::graph::{
+use arrow::datatypes::DataType;
+use novarocks_protocol::expr;
+use novarocks_sql::planner::distributed::FragmentEdge;
+use novarocks_sql::planner::runtime_filter::coverage::Coverage;
+use novarocks_sql::planner::runtime_filter::graph::{
     ApplyPoint, ConsumerBindingTarget, ProducerBindingTarget, RuntimeFilterBindingRole,
     RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
 };
-use arrow::datatypes::DataType;
-use novarocks_protocol::expr;
 
 use super::projection::PreparedFragmentSet;
 use super::runtime_filter_binding::{
@@ -165,17 +165,17 @@ pub enum RuntimeFilterLogicalDomainFacts {
 
 impl RuntimeFilterLogicalDomainFacts {
     fn from_sql(
-        value: &crate::sql::planner::runtime_filter::contract::RuntimeFilterLogicalDomain,
+        value: &novarocks_sql::planner::runtime_filter::contract::RuntimeFilterLogicalDomain,
     ) -> Self {
         match value {
-            crate::sql::planner::runtime_filter::contract::RuntimeFilterLogicalDomain::Membership {
+            novarocks_sql::planner::runtime_filter::contract::RuntimeFilterLogicalDomain::Membership {
                 value_type,
                 null_semantics,
             } => Self::Membership {
                 value_type: value_type.clone(),
                 null_semantics: RuntimeFilterNullSemantics::from_sql(*null_semantics),
             },
-            crate::sql::planner::runtime_filter::contract::RuntimeFilterLogicalDomain::OrderedBound(order) => {
+            novarocks_sql::planner::runtime_filter::contract::RuntimeFilterLogicalDomain::OrderedBound(order) => {
                 Self::Ordered {
                     keys: order
                         .keys
@@ -208,16 +208,16 @@ pub enum RuntimeFilterReductionFacts {
 
 impl RuntimeFilterReductionFacts {
     fn from_sql(
-        value: crate::sql::planner::runtime_filter::contract::ReductionRequirement,
+        value: novarocks_sql::planner::runtime_filter::contract::ReductionRequirement,
     ) -> Self {
         match value {
-            crate::sql::planner::runtime_filter::contract::ReductionRequirement::SetUnion => {
+            novarocks_sql::planner::runtime_filter::contract::ReductionRequirement::SetUnion => {
                 Self::SetUnion
             }
-            crate::sql::planner::runtime_filter::contract::ReductionRequirement::TightenOrderedBound => {
+            novarocks_sql::planner::runtime_filter::contract::ReductionRequirement::TightenOrderedBound => {
                 Self::TightenOrderedBound
             }
-            crate::sql::planner::runtime_filter::contract::ReductionRequirement::MergeTopKSummary(requirement) => {
+            novarocks_sql::planner::runtime_filter::contract::ReductionRequirement::MergeTopKSummary(requirement) => {
                 Self::MergeTopKSummary { k: requirement.k().get() }
             }
         }
@@ -247,8 +247,8 @@ pub enum RuntimeFilterContributionKind {
 }
 
 impl RuntimeFilterContributionKind {
-    fn from_sql(value: crate::sql::planner::runtime_filter::contract::ContributionKind) -> Self {
-        use crate::sql::planner::runtime_filter::contract::ContributionKind;
+    fn from_sql(value: novarocks_sql::planner::runtime_filter::contract::ContributionKind) -> Self {
+        use novarocks_sql::planner::runtime_filter::contract::ContributionKind;
         match value {
             ContributionKind::ValueDomainDelta => Self::ValueDomainDelta,
             ContributionKind::FinalDomainShard => Self::FinalDomainShard,
@@ -267,9 +267,9 @@ pub enum RuntimeFilterCompletionRequirement {
 
 impl RuntimeFilterCompletionRequirement {
     fn from_sql(
-        value: crate::sql::planner::runtime_filter::contract::CompletionRequirement,
+        value: novarocks_sql::planner::runtime_filter::contract::CompletionRequirement,
     ) -> Self {
-        use crate::sql::planner::runtime_filter::contract::{
+        use novarocks_sql::planner::runtime_filter::contract::{
             CompletionFenceKind, CompletionRequirement,
         };
         match value {
@@ -289,8 +289,10 @@ pub enum RuntimeFilterArtifactCapability {
 }
 
 impl RuntimeFilterArtifactCapability {
-    fn from_sql(value: crate::sql::planner::runtime_filter::contract::ArtifactCapability) -> Self {
-        use crate::sql::planner::runtime_filter::contract::ArtifactCapability;
+    fn from_sql(
+        value: novarocks_sql::planner::runtime_filter::contract::ArtifactCapability,
+    ) -> Self {
+        use novarocks_sql::planner::runtime_filter::contract::ArtifactCapability;
         match value {
             ArtifactCapability::Membership => Self::Membership,
             ArtifactCapability::OrderedRange => Self::OrderedRange,
@@ -306,8 +308,10 @@ pub enum RuntimeFilterConsumerActivation {
 }
 
 impl RuntimeFilterConsumerActivation {
-    fn from_sql(value: crate::sql::planner::runtime_filter::contract::ConsumerActivation) -> Self {
-        use crate::sql::planner::runtime_filter::contract::{
+    fn from_sql(
+        value: novarocks_sql::planner::runtime_filter::contract::ConsumerActivation,
+    ) -> Self {
+        use novarocks_sql::planner::runtime_filter::contract::{
             ConsumerActivation, LateApplyGranularity,
         };
         match value {
@@ -417,12 +421,12 @@ pub enum RuntimeFilterSortDirection {
 }
 
 impl RuntimeFilterSortDirection {
-    fn from_sql(value: crate::sql::planner::runtime_filter::contract::SortDirection) -> Self {
+    fn from_sql(value: novarocks_sql::planner::runtime_filter::contract::SortDirection) -> Self {
         match value {
-            crate::sql::planner::runtime_filter::contract::SortDirection::Ascending => {
+            novarocks_sql::planner::runtime_filter::contract::SortDirection::Ascending => {
                 Self::Ascending
             }
-            crate::sql::planner::runtime_filter::contract::SortDirection::Descending => {
+            novarocks_sql::planner::runtime_filter::contract::SortDirection::Descending => {
                 Self::Descending
             }
         }
@@ -436,10 +440,10 @@ pub enum RuntimeFilterNullOrder {
 }
 
 impl RuntimeFilterNullOrder {
-    fn from_sql(value: crate::sql::planner::runtime_filter::contract::NullOrder) -> Self {
+    fn from_sql(value: novarocks_sql::planner::runtime_filter::contract::NullOrder) -> Self {
         match value {
-            crate::sql::planner::runtime_filter::contract::NullOrder::First => Self::First,
-            crate::sql::planner::runtime_filter::contract::NullOrder::Last => Self::Last,
+            novarocks_sql::planner::runtime_filter::contract::NullOrder::First => Self::First,
+            novarocks_sql::planner::runtime_filter::contract::NullOrder::Last => Self::Last,
         }
     }
 }
@@ -561,10 +565,10 @@ impl RuntimeFilterChannelDeploymentFacts<'_> {
 
     pub fn lifecycle(self) -> RuntimeFilterDeploymentLifecycleFacts {
         match self.channel.lifecycle {
-            crate::sql::planner::runtime_filter::contract::RuntimeFilterLifecycle::CompleteOnce => {
+            novarocks_sql::planner::runtime_filter::contract::RuntimeFilterLifecycle::CompleteOnce => {
                 RuntimeFilterDeploymentLifecycleFacts::CompleteOnce
             }
-            crate::sql::planner::runtime_filter::contract::RuntimeFilterLifecycle::MonotonicUpdates => {
+            novarocks_sql::planner::runtime_filter::contract::RuntimeFilterLifecycle::MonotonicUpdates => {
                 RuntimeFilterDeploymentLifecycleFacts::MonotonicUpdates
             }
         }
@@ -617,12 +621,12 @@ pub enum RuntimeFilterNullSemantics {
 }
 
 impl RuntimeFilterNullSemantics {
-    fn from_sql(value: crate::sql::planner::runtime_filter::contract::NullSemantics) -> Self {
+    fn from_sql(value: novarocks_sql::planner::runtime_filter::contract::NullSemantics) -> Self {
         match value {
-            crate::sql::planner::runtime_filter::contract::NullSemantics::NeverMatches => {
+            novarocks_sql::planner::runtime_filter::contract::NullSemantics::NeverMatches => {
                 Self::NeverMatches
             }
-            crate::sql::planner::runtime_filter::contract::NullSemantics::NullSafeEqual => {
+            novarocks_sql::planner::runtime_filter::contract::NullSemantics::NullSafeEqual => {
                 Self::NullSafeEqual
             }
         }
@@ -812,7 +816,7 @@ pub struct RuntimeFilterFrontierEdgeFacts {
 }
 
 impl RuntimeFilterFrontierEdgeFacts {
-    fn from_sql(edge: &crate::sql::planner::runtime_filter::progress::FrontierEdge) -> Self {
+    fn from_sql(edge: &novarocks_sql::planner::runtime_filter::progress::FrontierEdge) -> Self {
         Self {
             source_fragment_id: edge.source_fragment,
             target_exchange_node_id: edge.target_exchange_node,
@@ -828,15 +832,15 @@ pub enum RuntimeFilterJoinProgressSkipReason {
 }
 
 impl RuntimeFilterJoinProgressSkipReason {
-    fn from_sql(value: crate::sql::planner::runtime_filter::progress::FrontierSkip) -> Self {
+    fn from_sql(value: novarocks_sql::planner::runtime_filter::progress::FrontierSkip) -> Self {
         match value {
-            crate::sql::planner::runtime_filter::progress::FrontierSkip::NoRfSides => {
+            novarocks_sql::planner::runtime_filter::progress::FrontierSkip::NoRfSides => {
                 Self::NoRfSides
             }
-            crate::sql::planner::runtime_filter::progress::FrontierSkip::MissingChild => {
+            novarocks_sql::planner::runtime_filter::progress::FrontierSkip::MissingChild => {
                 Self::MissingChild
             }
-            crate::sql::planner::runtime_filter::progress::FrontierSkip::UnauditedNode {
+            novarocks_sql::planner::runtime_filter::progress::FrontierSkip::UnauditedNode {
                 node_id,
             } => Self::UnauditedNode { node_id },
         }

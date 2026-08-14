@@ -103,7 +103,7 @@ enum PreparedQueryFormatter {
 }
 
 struct PreparedProfileFormatter {
-    distributed_plan: crate::sql::planner::distributed::DistributedPlan,
+    distributed_plan: novarocks_sql::plan_read::DistributedPlan,
     planning_elapsed: std::time::Duration,
     execution_started_at: std::time::Instant,
     connector_static_planning: crate::query_execution::profile::ConnectorStaticPlanningMetrics,
@@ -117,7 +117,7 @@ impl PreparedQueryCompletion {
     }
 
     pub(crate) fn profile(
-        distributed_plan: crate::sql::planner::distributed::DistributedPlan,
+        distributed_plan: novarocks_sql::plan_read::DistributedPlan,
         planning_elapsed: std::time::Duration,
         execution_started_at: std::time::Instant,
         connector_static_planning: crate::query_execution::profile::ConnectorStaticPlanningMetrics,
@@ -220,9 +220,9 @@ fn complete_profile(
         }
     }
     lines.extend(
-        crate::sql::explain::distributed::explain_distributed_plan_analyze(
+        novarocks_sql::explain::distributed::explain_distributed_plan_analyze(
             &formatter.distributed_plan,
-            crate::sql::explain::ExplainLevel::Analyze,
+            novarocks_sql::explain::ExplainLevel::Analyze,
             &actuals,
             Some(&per_fragment),
         ),

@@ -38,10 +38,10 @@ use crate::connector::data_mutation::{
 };
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::sql::parser::dialect::add_files::classify_add_files;
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_sql::planning::dml::classify_add_files;
 
-pub use crate::sql::parser::dialect::add_files::AddFilesCommand;
+pub use novarocks_sql::planning::dml::AddFilesCommand;
 
 pub struct PlanAddFilesRequest {
     pub command: AddFilesCommand,

@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::binding::SqlTableBindingId;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::binding::SqlTableBindingScopeId;
 use arrow::datatypes::Schema;
 use novarocks_catalog::schema::ColumnDef;
@@ -410,7 +410,7 @@ pub enum ScanSource {
 /// SQL/native shape projection without scan preparation.  Tests that prepare
 /// a scan must instead allocate the token from a `QueryTableBindingStore` and
 /// retain the matching materialization there.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_sql_scan_source(kind: SqlScanKind) -> ScanSource {
     use std::num::{NonZeroU32, NonZeroU64};
 

@@ -17,9 +17,9 @@
 
 use std::collections::HashSet;
 
-use crate::sql::parser::ast::TableColumnDef;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::schema::SqlType;
+use novarocks_sql::parser::ast::TableColumnDef;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StarRocksPhysicalColumn {

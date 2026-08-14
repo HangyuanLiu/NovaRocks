@@ -46,15 +46,15 @@ impl BackendCommandExecutor {
         sql: &str,
         role: ClusterRole,
     ) -> Result<Option<StatementResult>, String> {
-        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
-        let mut statements = match crate::sql::parser::parse_sql(&normalized) {
+        let normalized = novarocks_sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        let mut statements = match novarocks_sql::parser::parse_sql(&normalized) {
             Ok(statements) => statements,
             Err(_) => return Ok(None),
         };
         if statements.len() != 1 {
             return Err("backend command accepts exactly one statement".to_string());
         }
-        use crate::sql::parser::ast::Statement;
+        use novarocks_sql::parser::ast::Statement;
         match statements.pop().expect("one checked statement") {
             Statement::AddBackend(statement) => {
                 require_backend_management_role("ADD BACKEND", role)?;

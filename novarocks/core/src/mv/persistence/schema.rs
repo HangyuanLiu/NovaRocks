@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::sql::planner::vocabulary::{
+use novarocks_sql::planner::vocabulary::{
     ApplyKeySource, BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
     HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };

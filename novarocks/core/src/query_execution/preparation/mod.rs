@@ -40,7 +40,7 @@ use scan_preparation::prepare_scan_bindings;
 use topology::{collect_scan_nodes, validate_binding_keys, validate_topology_roles};
 
 pub(crate) fn prepare_fragments(
-    plan: &crate::sql::planner::distributed::DistributedPlan,
+    plan: &novarocks_sql::planner::distributed::DistributedPlan,
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     query_table_bindings: Option<&QueryTableBindingStore>,
@@ -152,7 +152,7 @@ pub(crate) fn prepare_fragments(
         let scan_node_ids = scan_nodes.into_iter().map(|(node_id, _)| node_id).collect();
         let execution_role = if matches!(
             &fragment.sink,
-            crate::sql::planner::distributed::DataSink::Statistics(_)
+            novarocks_sql::planner::distributed::DataSink::Statistics(_)
         ) {
             PreparedFragmentRole::Statistics
         } else if result_fragment_id == Some(fragment.fragment_id) {
@@ -245,7 +245,7 @@ pub(crate) fn prepare_fragments(
 }
 
 pub(crate) fn prepared_fragment_set_for_native_encode_test(
-    plan: &crate::sql::planner::distributed::DistributedPlan,
+    plan: &novarocks_sql::planner::distributed::DistributedPlan,
 ) -> Result<PreparedFragmentSet, String> {
     let mut binding_tables = runtime_filter_binding::materialize_runtime_filter_binding_tables(
         plan.runtime_filter_graph(),
@@ -262,7 +262,7 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
     for fragment in plan.fragments() {
         let role = if matches!(
             &fragment.sink,
-            crate::sql::planner::distributed::DataSink::Statistics(_)
+            novarocks_sql::planner::distributed::DataSink::Statistics(_)
         ) {
             PreparedFragmentRole::Statistics
         } else if result_fragment_id == Some(fragment.fragment_id) {
@@ -303,15 +303,15 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
 mod test_support {
     use arrow::datatypes::DataType;
 
-    use crate::sql::analysis::OutputColumn;
-    use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::distributed::{
+    use novarocks_sql::analysis::OutputColumn;
+    use novarocks_sql::column_id::ColumnId;
+    use novarocks_sql::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
     };
-    use crate::sql::planner::payload::PlanValuesNode;
-    use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+    use novarocks_sql::planner::payload::PlanValuesNode;
+    use novarocks_sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 
-    pub(super) fn result_plan() -> crate::sql::planner::distributed::DistributedPlan {
+    pub(super) fn result_plan() -> novarocks_sql::planner::distributed::DistributedPlan {
         let columns = vec![
             OutputColumn {
                 column_id: ColumnId::new_for_test(1),
@@ -358,7 +358,7 @@ mod test_support {
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+        novarocks_sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![fragment],
             root_fragment_id: 7,
             edges: Vec::new(),
@@ -374,31 +374,32 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::sql::analysis::OutputColumn;
-    use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::distributed::{
+    use novarocks_sql::analysis::OutputColumn;
+    use novarocks_sql::column_id::ColumnId;
+    use novarocks_sql::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
     };
-    use crate::sql::planner::payload::PlanValuesNode;
-    use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
-    use crate::sql::planner::runtime_filter::contract::{
+    use novarocks_sql::planner::payload::PlanValuesNode;
+    use novarocks_sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+    use novarocks_sql::planner::runtime_filter::contract::{
         BindingId, ChannelId, ConsumerActivation, LateApplyGranularity,
     };
-    use crate::sql::planner::runtime_filter::graph::RuntimeFilterBindingRoleData;
+    use novarocks_sql::planner::runtime_filter::graph::RuntimeFilterBindingRoleData;
 
-    fn draft_runtime_filter_graph() -> crate::sql::planner::distributed::DraftRuntimeFilterGraph {
-        use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
-        use crate::sql::planner::distributed::{
+    fn draft_runtime_filter_graph() -> novarocks_sql::planner::distributed::DraftRuntimeFilterGraph
+    {
+        use novarocks_sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+        use novarocks_sql::planner::distributed::{
             ActivationConstraint, DraftRuntimeFilterGraph, RequiredLiveReason,
         };
-        use crate::sql::planner::runtime_filter::contract::{
+        use novarocks_sql::planner::runtime_filter::contract::{
             ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
             ContributionKind, CoverageWitnessId, LateApplyGranularity, NullSemantics,
             PlanFragmentId, PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle,
             RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
         };
-        use crate::sql::planner::runtime_filter::coverage::Coverage;
-        use crate::sql::planner::runtime_filter::graph::{
+        use novarocks_sql::planner::runtime_filter::coverage::Coverage;
+        use novarocks_sql::planner::runtime_filter::graph::{
             ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation,
             ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRoleData,
             RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec,
@@ -487,7 +488,7 @@ mod tests {
         graph
     }
 
-    fn write_plan() -> crate::sql::planner::distributed::DistributedPlan {
+    fn write_plan() -> novarocks_sql::planner::distributed::DistributedPlan {
         let columns = vec![OutputColumn {
             column_id: ColumnId::new_for_test(1),
             name: "id".to_string(),
@@ -520,9 +521,9 @@ mod tests {
             data_partition: DataPartition::unpartitioned(),
             output_partition: DataPartition::unpartitioned(),
             sink: DataSink::ConnectorWrite(
-                crate::sql::planner::distributed::write::sink::ConnectorWriteFragmentSink {
+                novarocks_sql::planner::distributed::write::sink::ConnectorWriteFragmentSink {
                     handle: None,
-                    input: crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                    input: novarocks_sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
                     output_contract: None,
                 },
             ),
@@ -531,7 +532,7 @@ mod tests {
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+        novarocks_sql::planner::distributed::test_support::distributed_plan_for_test! {
             fragments: vec![fragment],
             root_fragment_id: 9,
             edges: Vec::new(),
@@ -571,7 +572,7 @@ mod tests {
     #[test]
     fn production_preparation_rejects_missing_non_write_output_contract() {
         let mut plan = test_support::result_plan();
-        crate::sql::planner::distributed::test_support::remove_fragment_output_for_test(
+        novarocks_sql::planner::distributed::test_support::remove_fragment_output_for_test(
             &mut plan, 7,
         );
         let registry = crate::connector::ConnectorRegistry::new();
@@ -597,7 +598,7 @@ mod tests {
 
     #[test]
     fn prepared_fragment_set_retains_sealed_runtime_filter_graph() {
-        let plan = crate::sql::planner::distributed::test_support::rebuild_test_plan(
+        let plan = novarocks_sql::planner::distributed::test_support::rebuild_test_plan(
             test_support::result_plan(),
             draft_runtime_filter_graph(),
             |builder| {

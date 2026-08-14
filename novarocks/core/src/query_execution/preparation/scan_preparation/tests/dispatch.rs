@@ -71,7 +71,7 @@ impl ScanBindingResolver for JoinRefreshDeltaResolver {
         let ScanSource::Sql(source) = &scan.table.source;
         if !matches!(
             &source.kind,
-            crate::sql::planner::table::SqlScanKind::Delta { .. }
+            novarocks_sql::plan_read::table::SqlScanKind::Delta { .. }
         ) {
             return Err("join refresh fixture resolver received a non-delta scan".to_string());
         }
@@ -80,15 +80,16 @@ impl ScanBindingResolver for JoinRefreshDeltaResolver {
                 &source.table.catalog,
                 &source.table.table,
                 match source.kind {
-                    crate::sql::planner::table::SqlScanKind::Delta {
-                        from_snapshot_id, ..
+                    novarocks_sql::plan_read::table::SqlScanKind::Delta {
+                        from_snapshot_id,
+                        ..
                     } => from_snapshot_id,
                     _ => unreachable!("validated delta source"),
                 },
                 match source.kind {
-                    crate::sql::planner::table::SqlScanKind::Delta { to_snapshot_id, .. } => {
-                        to_snapshot_id
-                    }
+                    novarocks_sql::plan_read::table::SqlScanKind::Delta {
+                        to_snapshot_id, ..
+                    } => to_snapshot_id,
                     _ => unreachable!("validated delta source"),
                 },
             ),
@@ -97,15 +98,15 @@ impl ScanBindingResolver for JoinRefreshDeltaResolver {
 }
 
 fn collect_coalesce_scan_tables(
-    node: &crate::sql::planner::distributed::DistributedNode,
-    scans: &mut std::collections::BTreeMap<String, crate::sql::planner::table::TableDef>,
+    node: &novarocks_sql::planner::distributed::DistributedNode,
+    scans: &mut std::collections::BTreeMap<String, novarocks_sql::plan_read::table::TableDef>,
     frozen_snapshots: &mut std::collections::BTreeMap<String, std::collections::BTreeSet<i64>>,
     node_ids: &mut Vec<i32>,
 ) {
     if let DistributedNodeKind::Scan(scan) = &node.payload {
         let ScanSource::Sql(source) = &scan.table.source;
-        if let crate::sql::planner::table::SqlScanKind::FrozenInputSet {
-            version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(snapshot_id),
+        if let novarocks_sql::plan_read::table::SqlScanKind::FrozenInputSet {
+            version: novarocks_sql::plan_read::table::SqlTableVersionSelector::Snapshot(snapshot_id),
         } = &source.kind
         {
             frozen_snapshots
@@ -135,7 +136,7 @@ fn collect_coalesce_scan_tables(
 }
 
 fn coalesce_materialization(
-    table: &crate::sql::planner::table::TableDef,
+    table: &novarocks_sql::plan_read::table::TableDef,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> crate::query_execution::planning::bindings::QueryScanMaterialization {
     let metadata = planning_lease
@@ -161,14 +162,14 @@ fn coalesce_materialization(
 }
 
 fn coalesce_binding(
-    table: crate::sql::planner::table::TableDef,
+    table: novarocks_sql::plan_read::table::TableDef,
     materialization: crate::query_execution::planning::bindings::QueryScanMaterialization,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     frozen_snapshot_ids: &std::collections::BTreeSet<i64>,
 ) -> crate::query_execution::planning::bindings::QueryTableBinding {
     let mv_target_read = match &table.source {
         ScanSource::Sql(source) => match &source.kind {
-            crate::sql::planner::table::SqlScanKind::MvTargetState { facts } => Some(
+            novarocks_sql::plan_read::table::SqlScanKind::MvTargetState { facts } => Some(
                 crate::query_execution::planning::bindings::MvTargetReadAdmission {
                     full: materialization.clone(),
                     affected_partitions: materialization.clone(),
@@ -176,7 +177,7 @@ fn coalesce_binding(
                     frozen_snapshot_id: facts.target_snapshot_id,
                 },
             ),
-            crate::sql::planner::table::SqlScanKind::MvTargetLocator { facts } => Some(
+            novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator { facts } => Some(
                 crate::query_execution::planning::bindings::MvTargetReadAdmission {
                     full: materialization.clone(),
                     affected_partitions: materialization.clone(),
@@ -197,7 +198,7 @@ fn coalesce_binding(
         })
         .collect();
     crate::query_execution::planning::bindings::QueryTableBinding {
-        resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+        resolved: novarocks_sql::catalog::ResolvedAnalyzerTable::from_planner(
             Some("ice"),
             "db",
             table,
@@ -221,15 +222,15 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
     use crate::query_execution::planning::bindings::{
         QueryScanMaterialization, QueryTableBindingKey, QueryTableBindingStore,
     };
-    use crate::sql::planner::table::SqlScanKind;
+    use novarocks_sql::plan_read::table::SqlScanKind;
 
     let bindings = QueryTableBindingStore::try_new_with_scope_for_test(
         NonZeroU64::new(79).expect("fixture scope"),
     );
-    let (optimized, tokens) = crate::sql::planner::imv_rewrite::entrypoint::tests::tests_support::build_tokenized_join_refresh_coalesce_plan_for_lowering(bindings.scope());
-    let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized)
+    let (optimized, tokens) = novarocks_sql::planner::imv_rewrite::entrypoint::tests::tests_support::build_tokenized_join_refresh_coalesce_plan_for_lowering(bindings.scope());
+    let physical = novarocks_sql::planner::optimizer_bridge::to_physical_plan(&optimized)
         .expect("coalesce fixture physical plan");
-    let distributed = crate::sql::planner::pipeline::build_distributed_plan(physical)
+    let distributed = novarocks_sql::planner::pipeline::build_distributed_plan(physical)
         .expect("coalesce fixture distributed plan");
 
     let mut scan_tables = std::collections::BTreeMap::new();
@@ -338,7 +339,7 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
         .flat_map(|fragment| {
             let mut sources = Vec::new();
             fn visit(
-                node: &crate::sql::planner::distributed::DistributedNode,
+                node: &novarocks_sql::planner::distributed::DistributedNode,
                 out: &mut Vec<SqlScanKind>,
             ) {
                 if let DistributedNodeKind::Scan(scan) = &node.payload {
@@ -423,15 +424,15 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
             ),
             |id| {
                 let mut resolved = source_table.clone();
-                resolved.source = ScanSource::Sql(crate::sql::planner::table::SqlScanSource::new(
+                resolved.source = ScanSource::Sql(novarocks_sql::plan_read::table::SqlScanSource::new(
                     id,
-                    crate::sql::planner::table::SqlTableIdentity {
+                    novarocks_sql::plan_read::table::SqlTableIdentity {
                         catalog: table.catalog.clone(),
                         namespace: table.namespace.clone(),
                         table: table.table.clone(),
                     },
-                    crate::sql::planner::table::SqlScanKind::Data {
-                        version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+                    novarocks_sql::plan_read::table::SqlScanKind::Data {
+                        version: novarocks_sql::plan_read::table::SqlTableVersionSelector::Current,
                     },
                 ));
                 let metadata = lease
@@ -449,7 +450,7 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
                     })
                     .expect("fixture read admission");
                 let binding = crate::query_execution::planning::bindings::QueryTableBinding {
-                    resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                    resolved: novarocks_sql::catalog::ResolvedAnalyzerTable::from_planner(
                         Some(&table.catalog),
                         "default",
                         resolved,
@@ -480,15 +481,15 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("fixture root must be a scan");
     };
-    scan.table.source = ScanSource::Sql(crate::sql::planner::table::SqlScanSource::new(
+    scan.table.source = ScanSource::Sql(novarocks_sql::plan_read::table::SqlScanSource::new(
         binding_id,
-        crate::sql::planner::table::SqlTableIdentity {
+        novarocks_sql::plan_read::table::SqlTableIdentity {
             catalog: table.catalog.clone(),
             namespace: table.namespace.clone(),
             table: table.table.clone(),
         },
-        crate::sql::planner::table::SqlScanKind::Data {
-            version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+        novarocks_sql::plan_read::table::SqlScanKind::Data {
+            version: novarocks_sql::plan_read::table::SqlTableVersionSelector::Current,
         },
     ));
 
@@ -610,8 +611,8 @@ fn duplicate_scan_node_defense_reports_exact_error() {
 #[test]
 fn refresh_only_sources_require_resolver_with_kind_and_node_id() {
     for (source, expected_kind) in [(
-        crate::sql::planner::table::test_sql_scan_source(
-            crate::sql::planner::table::SqlScanKind::Delta {
+        novarocks_sql::plan_read::table::test_sql_scan_source(
+            novarocks_sql::plan_read::table::SqlScanKind::Delta {
                 from_snapshot_id: 6,
                 to_snapshot_id: 7,
             },
@@ -637,8 +638,8 @@ fn resolver_error_reports_source_kind_node_id_and_cause() {
     let mut root = scan_node(47);
     replace_scan_source(
         &mut root,
-        crate::sql::planner::table::test_sql_scan_source(
-            crate::sql::planner::table::SqlScanKind::Delta {
+        novarocks_sql::plan_read::table::test_sql_scan_source(
+            novarocks_sql::plan_read::table::SqlScanKind::Delta {
                 from_snapshot_id: 6,
                 to_snapshot_id: 7,
             },
@@ -662,8 +663,8 @@ fn resolver_ok_none_reports_exact_required_source_error() {
     let mut root = scan_node(48);
     replace_scan_source(
         &mut root,
-        crate::sql::planner::table::test_sql_scan_source(
-            crate::sql::planner::table::SqlScanKind::Delta {
+        novarocks_sql::plan_read::table::test_sql_scan_source(
+            novarocks_sql::plan_read::table::SqlScanKind::Delta {
                 from_snapshot_id: 6,
                 to_snapshot_id: 7,
             },
@@ -689,8 +690,8 @@ fn resolver_failure_precedes_invalid_physical_projection() {
         panic!("test root must be a scan");
     };
     scan.columns[0].name = "missing".to_string();
-    scan.table.source = crate::sql::planner::table::test_sql_scan_source(
-        crate::sql::planner::table::SqlScanKind::Delta {
+    scan.table.source = novarocks_sql::plan_read::table::test_sql_scan_source(
+        novarocks_sql::plan_read::table::SqlScanKind::Delta {
             from_snapshot_id: 6,
             to_snapshot_id: 7,
         },
@@ -717,7 +718,7 @@ fn target_state_and_locator_reject_equality_deletes() {
 
     let sources = [
         (
-            crate::sql::planner::table::test_sql_scan_source(crate::sql::planner::table::SqlScanKind::MvTargetLocator { facts: crate::sql::planner::table::SqlMvTargetLocatorScan {
+            novarocks_sql::plan_read::table::test_sql_scan_source(novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator { facts: novarocks_sql::plan_read::table::SqlMvTargetLocatorScan {
                 target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
                 target_snapshot_id: Some(6),
                 apply_key_column: "id".to_string(),
@@ -726,7 +727,7 @@ fn target_state_and_locator_reject_equality_deletes() {
             "target-locator",
         ),
         (
-            crate::sql::planner::table::test_sql_scan_source(crate::sql::planner::table::SqlScanKind::MvTargetState { facts: crate::sql::planner::table::SqlMvTargetStateScan {
+            novarocks_sql::plan_read::table::test_sql_scan_source(novarocks_sql::plan_read::table::SqlScanKind::MvTargetState { facts: novarocks_sql::plan_read::table::SqlMvTargetStateScan {
                 target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
                 target_snapshot_id: Some(6),
                 aggregate_state_layout_version: 1,
@@ -736,12 +737,12 @@ fn target_state_and_locator_reject_equality_deletes() {
                 physical_column_names: vec!["id".to_string()],
                 row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
                 row_filter:
-                    crate::sql::planner::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
+                    novarocks_sql::plan_read::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
                         row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
                         branch_scope: None,
                     },
                 partition_constraint:
-                    crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::Unpartitioned,
+                    novarocks_sql::plan_read::table::SqlMvTargetStatePartitionConstraint::Unpartitioned,
             }}),
             "target-state",
         ),
@@ -786,8 +787,8 @@ fn resolver_execution_kind_must_match_semantic_source() {
     let mut version = scan_node(41);
     replace_scan_source(
         &mut version,
-        crate::sql::planner::table::test_sql_scan_source(
-            crate::sql::planner::table::SqlScanKind::ConnectorRead,
+        novarocks_sql::plan_read::table::test_sql_scan_source(
+            novarocks_sql::plan_read::table::SqlScanKind::ConnectorRead,
         ),
     );
     let resolver = StaticResolver {

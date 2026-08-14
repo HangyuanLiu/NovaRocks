@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use crate::mv::repository::MvRepository;
 use crate::mv::storage_observation::MvStorageObservationPort;
-use crate::sql::compiler::mv_rewrite::{
+use novarocks_sql::compiler::mv_rewrite::{
     MvRewriteBaseTableState, MvRewriteDefinition, MvRewriteDefinitionIndex,
 };
 

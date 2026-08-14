@@ -34,10 +34,10 @@ use crate::query_execution::planning::write_sink::{
 };
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::runtime::query_result::QueryResult;
-use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{
     MergeMatchedAction, MergeNotMatchedAction, MergeStmt, ObjectName, UpdateStmt,
 };
+use novarocks_sql::planning::dml::{IcebergRefSuffix, split_ref_suffix};
 
 fn write_commit_has_files(write_commit: &crate::query_execution::write::WriteCommitInput) -> bool {
     write_commit
@@ -2147,7 +2147,7 @@ fn max_physical_column_id(node: &crate::sql::optimizer::OptimizedOperatorNode) -
 }
 
 fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Query, String> {
-    match crate::sql::parser::parse_sql_raw(sql)? {
+    match novarocks_sql::planning::dml::parse_raw_statement(sql)? {
         sqlparser::ast::Statement::Query(query) => Ok(*query),
         other => Err(format!("{context} generated non-query statement: {other}")),
     }
@@ -6182,7 +6182,7 @@ mod tests {
 
     #[test]
     fn merge_unmatched_insert_query_uses_distributed_append_shape() {
-        let raw = crate::sql::parser::parse_sql_raw(
+        let raw = novarocks_sql::planning::dml::parse_raw_statement(
             "MERGE INTO t AS t \
              USING (SELECT 3 AS id, 4 AS v) AS s \
              ON t.id = s.id \

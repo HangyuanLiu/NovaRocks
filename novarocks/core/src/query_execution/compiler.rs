@@ -44,12 +44,12 @@ use crate::mv::application::{MvApplicationService, MvRefreshProviderActivation};
 use crate::mv::repository::MvRepository;
 #[cfg(test)]
 use crate::mv::repository::UnavailableMvRepository;
-pub use crate::sql::catalog::TableLookupMode;
-#[cfg(test)]
-use crate::sql::catalog::local::PlannerMemoryCatalog;
 use novarocks_catalog::identifier::normalize_identifier;
 #[cfg(test)]
 use novarocks_catalog::memory::DEFAULT_DATABASE;
+pub use novarocks_sql::catalog::TableLookupMode;
+#[cfg(test)]
+use novarocks_sql::catalog::local::PlannerMemoryCatalog;
 
 use crate::catalog_application::resolver as backend_resolver;
 use crate::catalog_application::statement::{
@@ -65,7 +65,7 @@ use crate::query_execution::planning::time_travel::{
     has_time_travel_refs, rewrite_time_travel_refs,
 };
 #[cfg(test)]
-use crate::sql::literal::{sql_type_to_arrow_type, sqlparser_expr_to_literal};
+use novarocks_sql::literal::{sql_type_to_arrow_type, sqlparser_expr_to_literal};
 
 use novarocks_catalog::partition::LegacyRangePartition;
 
@@ -139,7 +139,7 @@ pub fn freeze_query_mv_rewrite_definition_index(
     query_kernel: &domain::QueryPreparationKernel,
     repository: &dyn MvRepository,
     storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
-) -> Result<crate::sql::compiler::MvRewriteDefinitionIndex, String> {
+) -> Result<novarocks_sql::compiler::MvRewriteDefinitionIndex, String> {
     crate::mv::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
         repository,
         query_kernel.connector_control().as_ref(),
@@ -1130,7 +1130,7 @@ impl TestQueryCompiler {
         use sqlparser::ast as sqlast;
         let current_catalog = request_context.session().current_catalog();
         let current_database = request_context.session().current_database();
-        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        let normalized = novarocks_sql::parser::dialect::normalize_for_raw_parse(sql)?;
         let (parse_sql, forced_explain_level, force_logical_explain) =
             if let Some((rewritten, level)) = split_explain_logical_sql(&normalized) {
                 (rewritten, Some(level), true)
@@ -1139,7 +1139,7 @@ impl TestQueryCompiler {
             } else {
                 (normalized.clone(), None, false)
             };
-        let stmt = crate::sql::parser::parse_normalized_sql_raw(&parse_sql)
+        let stmt = novarocks_sql::parser::parse_normalized_sql_raw(&parse_sql)
             .map_err(|error| format_parser_error(&error.to_string()))?;
         match stmt {
             sqlast::Statement::Explain {
@@ -1160,9 +1160,9 @@ impl TestQueryCompiler {
                     &connector_context,
                 )?;
                 let level = forced_explain_level.unwrap_or(if verbose {
-                    crate::sql::explain::ExplainLevel::Verbose
+                    novarocks_sql::explain::ExplainLevel::Verbose
                 } else {
-                    crate::sql::explain::ExplainLevel::Normal
+                    novarocks_sql::explain::ExplainLevel::Normal
                 });
                 let catalog_service_snapshot = catalog_service_snapshot(&self.query);
                 let analyzer_provider = build_catalog_service_provider(
@@ -1261,7 +1261,7 @@ impl TestQueryCompiler {
                     &connector_context,
                     query_opts,
                     request_context.execution(),
-                    crate::sql::compiler::SqlCompileIntent::Query,
+                    novarocks_sql::compiler::SqlCompileIntent::Query,
                     true,
                 )?;
                 Ok(TestPreparedQueryOperation::Distributed {
@@ -1312,8 +1312,8 @@ impl TestQueryCompiler {
                 connector_context,
                 Some(query_options_for_explain_analyze(query_opts)),
                 execution,
-                crate::sql::compiler::SqlCompileIntent::Explain {
-                    level: crate::sql::explain::ExplainLevel::Analyze,
+                novarocks_sql::compiler::SqlCompileIntent::Explain {
+                    level: novarocks_sql::explain::ExplainLevel::Analyze,
                     analyze: true,
                 },
                 true,
@@ -1385,10 +1385,10 @@ pub(crate) fn connector_schema_position(
 }
 
 pub(crate) fn connector_partition_transform(
-    field: &crate::sql::parser::ast::IcebergPartitionFieldExpr,
+    field: &novarocks_sql::parser::ast::IcebergPartitionFieldExpr,
 ) -> novarocks_spi::connector::ConnectorPartitionTransform {
-    use crate::sql::parser::ast::IcebergPartitionFieldExpr;
     use novarocks_spi::connector::ConnectorPartitionTransform;
+    use novarocks_sql::parser::ast::IcebergPartitionFieldExpr;
 
     match field {
         IcebergPartitionFieldExpr::Identity { column } => ConnectorPartitionTransform::Identity {
@@ -1454,7 +1454,7 @@ fn test_request_context_with_role(
         RequestSessionContext::new(
             current_catalog.map(str::to_string),
             current_database.to_string(),
-            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_sql::optimizer::options::SessionOptimizerSettings::default(),
         ),
         QueryExecutionContext::new(
             role,
@@ -1472,13 +1472,13 @@ fn test_request_context_with_role(
             .expect("non-empty test topology"),
             None,
             cancellation.view(),
-            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_sql::optimizer::options::SessionOptimizerSettings::default(),
         ),
     )
 }
 
 fn resolve_default_view_database(
-    name: &crate::sql::parser::ast::ObjectName,
+    name: &novarocks_sql::parser::ast::ObjectName,
     current_catalog: Option<&str>,
 ) -> Result<Option<String>, String> {
     let database = match name.parts.as_slice() {
@@ -1519,8 +1519,8 @@ pub(crate) fn parse_create_table_like(
     sql: &str,
 ) -> Result<
     Option<(
-        crate::sql::parser::ast::ObjectName,
-        crate::sql::parser::ast::ObjectName,
+        novarocks_sql::parser::ast::ObjectName,
+        novarocks_sql::parser::ast::ObjectName,
     )>,
     String,
 > {
@@ -1536,7 +1536,7 @@ pub(crate) fn parse_create_table_like(
     Ok(Some((target, source)))
 }
 
-fn parse_simple_object_name(token: &str) -> Result<crate::sql::parser::ast::ObjectName, String> {
+fn parse_simple_object_name(token: &str) -> Result<novarocks_sql::parser::ast::ObjectName, String> {
     let mut parts = Vec::new();
     let mut cur = String::new();
     let mut in_backtick = false;
@@ -1559,7 +1559,7 @@ fn parse_simple_object_name(token: &str) -> Result<crate::sql::parser::ast::Obje
     if parts.is_empty() {
         return Err(format!("empty object name `{token}`"));
     }
-    Ok(crate::sql::parser::ast::ObjectName { parts })
+    Ok(novarocks_sql::parser::ast::ObjectName { parts })
 }
 
 /// Generate a `CREATE TABLE` DDL string from exact-generation connector facts.
@@ -1661,7 +1661,7 @@ pub(crate) fn build_iceberg_create_table_ddl(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn statistics_application_target(
-    name: &crate::sql::parser::ast::ObjectName,
+    name: &novarocks_sql::parser::ast::ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<crate::statistics::application::StatisticsTableTarget, String> {
@@ -1796,7 +1796,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Query plan build + execute (delegates to crate::sql::*)
+// Query plan build + execute (delegates to novarocks_sql::*)
 // ---------------------------------------------------------------------------
 
 pub(crate) fn ensure_mainline_distributed_execution(
@@ -1820,7 +1820,7 @@ pub(crate) fn ensure_mainline_distributed_execution(
 
 fn optimizer_settings_for_execution(
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
-) -> crate::sql::optimizer::options::SessionOptimizerSettings {
+) -> novarocks_sql::optimizer::options::SessionOptimizerSettings {
     let mut settings = execution
         .map(|execution| execution.optimizer_settings().clone())
         .unwrap_or_default();
@@ -1833,7 +1833,7 @@ fn optimizer_settings_for_execution(
 }
 
 pub(crate) fn scan_preparation_options(
-    settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
+    settings: &novarocks_sql::optimizer::options::SessionOptimizerSettings,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
     let target_parallelism = std::num::NonZeroUsize::new(execution.topology().targets().len())
@@ -1915,14 +1915,14 @@ fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> Que
 
 pub(crate) fn iceberg_write_shuffle_by_output_name(
     output_name: impl Into<String>,
-) -> crate::sql::compiler::RootDistributionRequirement {
-    crate::sql::compiler::RootDistributionRequirement::ShuffleOutputName(output_name.into())
+) -> novarocks_sql::compiler::RootDistributionRequirement {
+    novarocks_sql::compiler::RootDistributionRequirement::ShuffleOutputName(output_name.into())
 }
 
 pub(crate) fn iceberg_write_shuffle_by_output_index(
     output_index: usize,
-) -> crate::sql::compiler::RootDistributionRequirement {
-    crate::sql::compiler::RootDistributionRequirement::ShuffleOutputOrdinal(output_index)
+) -> novarocks_sql::compiler::RootDistributionRequirement {
+    novarocks_sql::compiler::RootDistributionRequirement::ShuffleOutputOrdinal(output_index)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1931,10 +1931,10 @@ pub(crate) fn prepare_query_as_iceberg_write(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    sink: novarocks_sql::planner::distributed::write::contract::SqlWritePlanInput,
     table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
-    root_distribution: crate::sql::compiler::RootDistributionRequirement,
+    root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<PreparedDmlWriteAssembly, String> {
     // This public write helper is also used by non-session transaction executors,
@@ -1964,10 +1964,10 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_context(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    sink: novarocks_sql::planner::distributed::write::contract::SqlWritePlanInput,
     table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
-    root_distribution: crate::sql::compiler::RootDistributionRequirement,
+    root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: Option<crate::query_execution::contract::ConnectorWritePlanningTemplate>,
@@ -1995,10 +1995,10 @@ pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_connector_context
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    sink: novarocks_sql::planner::distributed::write::contract::SqlWritePlanInput,
     table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
-    root_distribution: crate::sql::compiler::RootDistributionRequirement,
+    root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
@@ -2030,10 +2030,10 @@ pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_query_local_overl
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    sink: novarocks_sql::planner::distributed::write::contract::SqlWritePlanInput,
     table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
-    root_distribution: crate::sql::compiler::RootDistributionRequirement,
+    root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
@@ -2068,10 +2068,10 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
-    logical_plan: crate::sql::planner::logical::LogicalPlanNode,
-    factory: crate::sql::column_id::ColumnRefFactory,
-    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
-    root_distribution: crate::sql::compiler::RootDistributionRequirement,
+    logical_plan: novarocks_sql::planner::logical::LogicalPlanNode,
+    factory: novarocks_sql::column_id::ColumnRefFactory,
+    sink: novarocks_sql::planner::distributed::write::contract::SqlWritePlanInput,
+    root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
@@ -2087,35 +2087,36 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
         .ok_or_else(|| {
             "MV first-refresh write requires a non-empty admitted backend topology".to_string()
         })?;
-    let request = crate::sql::compiler::SqlCompileRequest::new_logical(
+    let request = novarocks_sql::compiler::SqlCompileRequest::new_logical(
         logical_plan,
         factory,
-        crate::sql::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
-        crate::sql::compiler::SqlSessionContext {
+        novarocks_sql::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
+        novarocks_sql::compiler::SqlSessionContext {
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
             optimizer_settings: execution.optimizer_settings().clone(),
         },
-        crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &statistics,
-        crate::sql::compiler::SqlCompileControl::new(
+        novarocks_sql::compiler::SqlCompileControl::new(
             execution.deadline(),
             crate::query_execution::planning::sql_cancellation_observation(
                 execution.cancellation().clone(),
             ),
         ),
     );
-    let crate::sql::compiler::SqlCompileOutput::Optimized(compiled) =
-        crate::sql::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
+    let novarocks_sql::compiler::SqlCompileOutput::Optimized(compiled) =
+        novarocks_sql::compiler::SqlCompiler::compile(request)
+            .map_err(|error| error.to_string())?
     else {
         return Err(
             "MV first-refresh logical write did not produce optimized SQL facts".to_string(),
         );
     };
     let physical_plan =
-        crate::sql::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
+        novarocks_sql::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
     let distributed_plan =
-        crate::sql::planner::pipeline::build_sql_write_distributed_plan_with_settings(
+        novarocks_sql::planner::pipeline::build_sql_write_distributed_plan_with_settings(
             physical_plan,
             sink,
             &optimizer_settings,
@@ -2211,10 +2212,10 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    sink: novarocks_sql::planner::distributed::write::contract::SqlWritePlanInput,
     table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
-    root_distribution: crate::sql::compiler::RootDistributionRequirement,
+    root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: Option<DistributedConnectorWrite>,
@@ -2270,41 +2271,43 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         state,
         Arc::clone(&table_bindings),
     );
-    let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
+    let catalog_snapshot =
+        novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| {
             "Iceberg write requires a non-empty admitted backend topology".to_string()
         })?;
-    let compiler_request = crate::sql::compiler::SqlCompileRequest::new(
-        crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(prepared)),
-        crate::sql::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
-        crate::sql::compiler::SqlSessionContext {
+    let compiler_request = novarocks_sql::compiler::SqlCompileRequest::new(
+        novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(prepared)),
+        novarocks_sql::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
+        novarocks_sql::compiler::SqlSessionContext {
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
             optimizer_settings: execution.optimizer_settings().clone(),
         },
-        crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
         &statistics,
-        crate::sql::functions::builtin_sql_function_catalog(),
+        novarocks_sql::functions::builtin_sql_function_catalog(),
         None,
-        crate::sql::compiler::SqlCompileControl::new(
+        novarocks_sql::compiler::SqlCompileControl::new(
             execution.deadline(),
             crate::query_execution::planning::sql_cancellation_observation(
                 execution.cancellation().clone(),
             ),
         ),
     );
-    let crate::sql::compiler::SqlCompileOutput::Optimized(compiled) =
-        crate::sql::compiler::SqlCompiler::compile(compiler_request)
+    let novarocks_sql::compiler::SqlCompileOutput::Optimized(compiled) =
+        novarocks_sql::compiler::SqlCompiler::compile(compiler_request)
             .map_err(|error| error.to_string())?
     else {
         return Err("Iceberg write intent did not produce optimized SQL facts".to_string());
     };
     let optimized_tree = compiled.optimized_tree;
-    let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
+    let physical_plan =
+        novarocks_sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
     let distributed_plan =
-        crate::sql::planner::pipeline::build_sql_write_distributed_plan_with_settings(
+        novarocks_sql::planner::pipeline::build_sql_write_distributed_plan_with_settings(
             physical_plan,
             sink,
             &optimizer_settings,
@@ -2335,10 +2338,10 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding_native_assem
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    sink: novarocks_sql::planner::distributed::write::contract::SqlWritePlanInput,
     table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
-    root_distribution: Option<crate::sql::compiler::RootDistributionRequirement>,
+    root_distribution: Option<novarocks_sql::compiler::RootDistributionRequirement>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
@@ -2374,44 +2377,45 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding_native_assem
         state,
         Arc::clone(&table_bindings),
     );
-    let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
+    let catalog_snapshot =
+        novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| {
             "Iceberg write requires a non-empty admitted backend topology".to_string()
         })?;
-    let compiler_request = crate::sql::compiler::SqlCompileRequest::new(
-        crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(prepared_query)),
-        crate::sql::compiler::SqlCompileIntent::IcebergWrite {
+    let compiler_request = novarocks_sql::compiler::SqlCompileRequest::new(
+        novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(prepared_query)),
+        novarocks_sql::compiler::SqlCompileIntent::IcebergWrite {
             root_distribution: root_distribution
-                .unwrap_or(crate::sql::compiler::RootDistributionRequirement::Any),
+                .unwrap_or(novarocks_sql::compiler::RootDistributionRequirement::Any),
         },
-        crate::sql::compiler::SqlSessionContext {
+        novarocks_sql::compiler::SqlSessionContext {
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
             optimizer_settings: execution.optimizer_settings().clone(),
         },
-        crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
         &statistics,
-        crate::sql::functions::builtin_sql_function_catalog(),
+        novarocks_sql::functions::builtin_sql_function_catalog(),
         None,
-        crate::sql::compiler::SqlCompileControl::new(
+        novarocks_sql::compiler::SqlCompileControl::new(
             execution.deadline(),
             crate::query_execution::planning::sql_cancellation_observation(
                 execution.cancellation().clone(),
             ),
         ),
     );
-    let crate::sql::compiler::SqlCompileOutput::Optimized(compiled) =
-        crate::sql::compiler::SqlCompiler::compile(compiler_request)
+    let novarocks_sql::compiler::SqlCompileOutput::Optimized(compiled) =
+        novarocks_sql::compiler::SqlCompiler::compile(compiler_request)
             .map_err(|error| error.to_string())?
     else {
         return Err("Iceberg write intent did not produce optimized SQL facts".to_string());
     };
     let physical_plan =
-        crate::sql::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
+        novarocks_sql::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
     let distributed_plan =
-        crate::sql::planner::pipeline::build_sql_write_distributed_plan_with_settings(
+        novarocks_sql::planner::pipeline::build_sql_write_distributed_plan_with_settings(
             physical_plan,
             sink,
             &optimizer_settings,
@@ -2448,7 +2452,7 @@ enum ChangeStreamWriteEntrypoint {
 struct ChangeStreamWriteBuildObservation {
     entrypoint: ChangeStreamWriteEntrypoint,
     effects: Vec<novarocks_spi::connector::ConnectorRowMutationEffect>,
-    writer_fragment_ids: Vec<Option<crate::sql::planner::distributed::FragmentId>>,
+    writer_fragment_ids: Vec<Option<novarocks_sql::planner::distributed::FragmentId>>,
 }
 
 #[cfg(test)]
@@ -2513,7 +2517,7 @@ pub(crate) fn install_change_stream_write_test_observer(
 
 #[cfg(test)]
 pub(crate) fn observe_change_stream_write_build_for_test(
-    topology: &crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
+    topology: &novarocks_sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
 ) -> Option<crate::query_execution::outcome::QueryExecutionResult> {
     let mut observer = change_stream_write_test_observer()
         .lock()
@@ -2550,7 +2554,7 @@ pub(crate) fn observe_change_stream_write_build_for_test(
 pub(crate) struct PlannedIcebergChangeStreamWrite {
     pub(crate) encoding: NativeFragmentEncodingInput,
     pub(crate) topology:
-        crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
+        novarocks_sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
 }
 
 /// MV-only change-stream facts held before Frontend native fragment assembly.
@@ -2559,18 +2563,18 @@ pub(crate) struct PlannedIcebergChangeStreamWrite {
 pub(crate) struct PlannedMvIcebergChangeStreamWrite {
     pub(crate) encoding: NativeFragmentEncodingInput,
     pub(crate) topology:
-        crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
+        novarocks_sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
 }
 
 pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_execution(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
-    optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
+    optimized_tree: &novarocks_sql::optimizer::OptimizedOperatorNode,
     query_table_bindings: Option<
         &crate::query_execution::planning::bindings::QueryTableBindingStore,
     >,
-    dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
-    pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
+    dag: &mut novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
+    pre_expand_keyed_assert: Option<novarocks_sql::planner::physical::PreExpandKeyedAssertSpec>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
     let planned = build_physical_plan_as_iceberg_change_stream_write_native_assembly(
@@ -2594,19 +2598,19 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_execution(
 pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_native_assembly(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
-    optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
+    optimized_tree: &novarocks_sql::optimizer::OptimizedOperatorNode,
     query_table_bindings: Option<
         &crate::query_execution::planning::bindings::QueryTableBindingStore,
     >,
-    dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
-    pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
+    dag: &mut novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
+    pre_expand_keyed_assert: Option<novarocks_sql::planner::physical::PreExpandKeyedAssertSpec>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PlannedMvIcebergChangeStreamWrite, String> {
     crate::connector::validate_request_context(connector_context)?;
     let optimizer_settings = change_stream_write_optimizer_settings();
-    let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(optimized_tree)?;
+    let physical_plan = novarocks_sql::planner::optimizer_bridge::to_physical_plan(optimized_tree)?;
     let planned_dp =
-        crate::sql::planner::pipeline::build_sql_change_stream_distributed_plan_with_settings(
+        novarocks_sql::planner::pipeline::build_sql_change_stream_distributed_plan_with_settings(
             physical_plan,
             dag.clone(),
             pre_expand_keyed_assert,
@@ -2753,8 +2757,8 @@ fn execute_bound_distributed_write_request(
 }
 
 fn change_stream_write_optimizer_settings()
--> crate::sql::optimizer::options::SessionOptimizerSettings {
-    let mut settings = crate::sql::optimizer::options::SessionOptimizerSettings::default();
+-> novarocks_sql::optimizer::options::SessionOptimizerSettings {
+    let mut settings = novarocks_sql::optimizer::options::SessionOptimizerSettings::default();
     // A change-stream write carries old/new row pairs and target locators across
     // independent fragments. A query runtime filter may describe only one data
     // branch, so pushing it into a locator scan can suppress rows required by a
@@ -2765,10 +2769,10 @@ fn change_stream_write_optimizer_settings()
 }
 
 pub(crate) struct PlannedIcebergChangeStreamRefreshQuery {
-    pub(crate) optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
-    pub(crate) output_columns: Vec<crate::sql::analysis::OutputColumn>,
+    pub(crate) optimized_tree: novarocks_sql::optimizer::OptimizedOperatorNode,
+    pub(crate) output_columns: Vec<novarocks_sql::analysis::OutputColumn>,
     pub(crate) change_stream:
-        crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
+        novarocks_sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     pub(crate) table_bindings:
         Option<Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>>,
 }
@@ -2776,9 +2780,9 @@ pub(crate) struct PlannedIcebergChangeStreamRefreshQuery {
 pub(crate) fn plan_query_for_iceberg_change_stream_refresh_with_statistics(
     statistics_resolver: &impl crate::query_execution::planning::statistics::QueryStatisticsResolver,
     query: &sqlparser::ast::Query,
-    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
+    analyzer_catalog: &dyn novarocks_sql::catalog::PlannerTableProvider,
     current_database: &str,
-    imv_rewrite: Option<&crate::sql::compiler::SqlImvPlanningInput>,
+    imv_rewrite: Option<&novarocks_sql::compiler::SqlImvPlanningInput>,
     table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
@@ -2786,25 +2790,25 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh_with_statistics(
         .ok_or_else(|| {
             "distributed SQL compilation requires a frozen non-zero backend count".to_string()
         })?;
-    let catalog = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
+    let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
         statistics_resolver,
         Arc::clone(&table_bindings),
     );
-    let request = crate::sql::compiler::SqlCompileRequest::new(
-        crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
-        crate::sql::compiler::SqlCompileIntent::ChangeStreamWrite,
-        crate::sql::compiler::SqlSessionContext {
+    let request = novarocks_sql::compiler::SqlCompileRequest::new(
+        novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
+        novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
+        novarocks_sql::compiler::SqlSessionContext {
             current_catalog: None,
             current_database: current_database.to_string(),
             optimizer_settings: change_stream_write_optimizer_settings(),
         },
-        crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog,
         &statistics,
-        crate::sql::functions::builtin_sql_function_catalog(),
+        novarocks_sql::functions::builtin_sql_function_catalog(),
         None,
-        crate::sql::compiler::SqlCompileControl::new(
+        novarocks_sql::compiler::SqlCompileControl::new(
             execution.deadline(),
             crate::query_execution::planning::sql_cancellation_observation(
                 execution.cancellation().clone(),
@@ -2815,8 +2819,9 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh_with_statistics(
         Some(input) => request.with_imv_rewrite(input),
         None => request,
     };
-    let crate::sql::compiler::SqlCompileOutput::Optimized(compiled) =
-        crate::sql::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
+    let novarocks_sql::compiler::SqlCompileOutput::Optimized(compiled) =
+        novarocks_sql::compiler::SqlCompiler::compile(request)
+            .map_err(|error| error.to_string())?
     else {
         return Err("change-stream intent did not produce an optimized SQL plan".to_string());
     };
@@ -2829,25 +2834,26 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh_with_statistics(
 }
 
 pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
-    logical_plan: crate::sql::planner::logical::LogicalPlanNode,
-    factory: crate::sql::column_id::ColumnRefFactory,
+    logical_plan: novarocks_sql::planner::logical::LogicalPlanNode,
+    factory: novarocks_sql::column_id::ColumnRefFactory,
 ) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
-    let statistics = crate::sql::compiler::SqlUnavailableStatisticsSnapshot;
-    let request = crate::sql::compiler::SqlCompileRequest::new_logical(
+    let statistics = novarocks_sql::compiler::SqlUnavailableStatisticsSnapshot;
+    let request = novarocks_sql::compiler::SqlCompileRequest::new_logical(
         logical_plan,
         factory,
-        crate::sql::compiler::SqlCompileIntent::ChangeStreamWrite,
-        crate::sql::compiler::SqlSessionContext {
+        novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
+        novarocks_sql::compiler::SqlSessionContext {
             current_catalog: None,
             current_database: String::new(),
             optimizer_settings: change_stream_write_optimizer_settings(),
         },
-        crate::sql::compiler::SqlPlanningEnvironment::NotApplicable,
+        novarocks_sql::compiler::SqlPlanningEnvironment::NotApplicable,
         &statistics,
-        crate::sql::compiler::SqlCompileControl::unbounded(),
+        novarocks_sql::compiler::SqlCompileControl::unbounded(),
     );
-    let crate::sql::compiler::SqlCompileOutput::Optimized(compiled) =
-        crate::sql::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
+    let novarocks_sql::compiler::SqlCompileOutput::Optimized(compiled) =
+        novarocks_sql::compiler::SqlCompiler::compile(request)
+            .map_err(|error| error.to_string())?
     else {
         return Err(
             "logical change-stream input did not produce an optimized SQL plan".to_string(),
@@ -2882,12 +2888,12 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     query_opts: Option<QueryOptions>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
-    intent: crate::sql::compiler::SqlCompileIntent,
+    intent: novarocks_sql::compiler::SqlCompileIntent,
     allow_mv_rewrite_candidates: bool,
 ) -> Result<
     (
         PreparedDistributedQueryAssembly,
-        crate::sql::planner::distributed::DistributedPlan,
+        novarocks_sql::planner::distributed::DistributedPlan,
         crate::query_execution::profile::ConnectorStaticPlanningMetrics,
     ),
     String,
@@ -2901,7 +2907,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         query_kernel,
         table_bindings.clone(),
     );
-    let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
+    let catalog_snapshot = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     // MV rewrite is an optional SQL optimization. An application composition
     // without an MV repository supplies no snapshot; a repository that is
     // available but fails to freeze remains a planning error.
@@ -2918,25 +2924,25 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
             None
         };
     let distributed_intent = match &intent {
-        crate::sql::compiler::SqlCompileIntent::Explain { analyze: true, .. } => {
+        novarocks_sql::compiler::SqlCompileIntent::Explain { analyze: true, .. } => {
             crate::query_execution::contract::DistributedQueryIntent::Profile
         }
         _ => crate::query_execution::contract::DistributedQueryIntent::Result,
     };
-    let compiler_request = crate::sql::compiler::SqlCompileRequest::new(
-        crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
+    let compiler_request = novarocks_sql::compiler::SqlCompileRequest::new(
+        novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
         intent,
-        crate::sql::compiler::SqlSessionContext {
+        novarocks_sql::compiler::SqlSessionContext {
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
             optimizer_settings: execution.optimizer_settings().clone(),
         },
-        crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
         &statistics,
-        crate::sql::functions::builtin_sql_function_catalog(),
+        novarocks_sql::functions::builtin_sql_function_catalog(),
         mv_definitions.as_ref(),
-        crate::sql::compiler::SqlCompileControl::new(
+        novarocks_sql::compiler::SqlCompileControl::new(
             execution.deadline(),
             crate::query_execution::planning::sql_cancellation_observation(
                 execution.cancellation().clone(),
@@ -2951,8 +2957,8 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
             connector_context,
         },
     };
-    let crate::sql::compiler::SqlCompileOutput::Distributed(compiled) =
-        crate::sql::compiler::SqlCompiler::compile(planning_inputs.compile_request)
+    let novarocks_sql::compiler::SqlCompileOutput::Distributed(compiled) =
+        novarocks_sql::compiler::SqlCompiler::compile(planning_inputs.compile_request)
             .map_err(|error| error.to_string())?
     else {
         return Err("query intent did not produce a distributed SQL plan".to_string());
@@ -2992,7 +2998,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
     mv_storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
-    level: crate::sql::explain::ExplainLevel,
+    level: novarocks_sql::explain::ExplainLevel,
     logical: bool,
 ) -> Result<QueryResult, String> {
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
@@ -3004,35 +3010,35 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
         query_kernel,
         table_bindings.clone(),
     );
-    let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
+    let catalog_snapshot = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     let mv_definitions = crate::mv::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
         mv_repository,
         query_kernel.connector_control().as_ref(),
         mv_storage_observation,
     )?;
     let intent = if logical {
-        crate::sql::compiler::SqlCompileIntent::LogicalOnly
+        novarocks_sql::compiler::SqlCompileIntent::LogicalOnly
     } else {
-        crate::sql::compiler::SqlCompileIntent::Explain {
+        novarocks_sql::compiler::SqlCompileIntent::Explain {
             level,
             analyze: false,
         }
     };
     let planning_inputs = crate::query_execution::planning::QueryPlanningInputs {
-        compile_request: crate::sql::compiler::SqlCompileRequest::new(
-            crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
+        compile_request: novarocks_sql::compiler::SqlCompileRequest::new(
+            novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
             intent,
-            crate::sql::compiler::SqlSessionContext {
+            novarocks_sql::compiler::SqlSessionContext {
                 current_catalog: current_catalog.map(str::to_string),
                 current_database: current_database.to_string(),
                 optimizer_settings: execution.optimizer_settings().clone(),
             },
-            crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+            novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
             &catalog_snapshot,
             &statistics,
-            crate::sql::functions::builtin_sql_function_catalog(),
+            novarocks_sql::functions::builtin_sql_function_catalog(),
             Some(&mv_definitions),
-            crate::sql::compiler::SqlCompileControl::new(
+            novarocks_sql::compiler::SqlCompileControl::new(
                 execution.deadline(),
                 crate::query_execution::planning::sql_cancellation_observation(
                     execution.cancellation().clone(),
@@ -3045,13 +3051,13 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
             connector_context,
         },
     };
-    let compiled = crate::sql::compiler::SqlCompiler::compile(planning_inputs.compile_request)
+    let compiled = novarocks_sql::compiler::SqlCompiler::compile(planning_inputs.compile_request)
         .map_err(|error| error.to_string())?;
     let lines = match compiled {
-        crate::sql::compiler::SqlCompileOutput::Logical(compiled) if logical => {
-            crate::sql::explain::explain_plan_checked(&compiled.logical_plan, level)?
+        novarocks_sql::compiler::SqlCompileOutput::Logical(compiled) if logical => {
+            novarocks_sql::explain::explain_plan_checked(&compiled.logical_plan, level)?
         }
-        crate::sql::compiler::SqlCompileOutput::ImmediateExplain(lines) if !logical => lines,
+        novarocks_sql::compiler::SqlCompileOutput::ImmediateExplain(lines) if !logical => lines,
         _ => return Err("EXPLAIN intent produced unexpected SQL facts".to_string()),
     };
     build_string_query_result("Explain String", lines)
@@ -3296,21 +3302,21 @@ fn format_parser_error(raw: &str) -> String {
 }
 
 #[cfg(test)]
-fn split_explain_costs_sql(sql: &str) -> Option<(String, crate::sql::explain::ExplainLevel)> {
+fn split_explain_costs_sql(sql: &str) -> Option<(String, novarocks_sql::explain::ExplainLevel)> {
     let body = consume_leading_keyword(consume_leading_keyword(sql, "EXPLAIN")?, "COSTS")?;
     Some((
         format!("EXPLAIN {}", body.trim_start()),
-        crate::sql::explain::ExplainLevel::Costs,
+        novarocks_sql::explain::ExplainLevel::Costs,
     ))
 }
 
 #[cfg(test)]
-fn split_explain_logical_sql(sql: &str) -> Option<(String, crate::sql::explain::ExplainLevel)> {
+fn split_explain_logical_sql(sql: &str) -> Option<(String, novarocks_sql::explain::ExplainLevel)> {
     let mut body = consume_leading_keyword(consume_leading_keyword(sql, "EXPLAIN")?, "LOGICAL")?;
-    let mut level = crate::sql::explain::ExplainLevel::Normal;
+    let mut level = novarocks_sql::explain::ExplainLevel::Normal;
     for (keyword, candidate) in [
-        ("VERBOSE", crate::sql::explain::ExplainLevel::Verbose),
-        ("COSTS", crate::sql::explain::ExplainLevel::Costs),
+        ("VERBOSE", novarocks_sql::explain::ExplainLevel::Verbose),
+        ("COSTS", novarocks_sql::explain::ExplainLevel::Costs),
     ] {
         if let Some(rest) = consume_leading_keyword(body, keyword) {
             level = candidate;
@@ -3346,8 +3352,8 @@ fn parse_explain_refresh_materialized_view(
 ) -> Option<
     Result<
         (
-            crate::sql::parser::ast::RefreshMaterializedViewStmt,
-            crate::sql::explain::ExplainLevel,
+            novarocks_sql::parser::ast::RefreshMaterializedViewStmt,
+            novarocks_sql::explain::ExplainLevel,
             bool,
         ),
         String,
@@ -3357,22 +3363,22 @@ fn parse_explain_refresh_materialized_view(
     let prefixes = [
         (
             "EXPLAIN ANALYZE REFRESH ",
-            crate::sql::explain::ExplainLevel::Analyze,
+            novarocks_sql::explain::ExplainLevel::Analyze,
             true,
         ),
         (
             "EXPLAIN VERBOSE REFRESH ",
-            crate::sql::explain::ExplainLevel::Verbose,
+            novarocks_sql::explain::ExplainLevel::Verbose,
             false,
         ),
         (
             "EXPLAIN COSTS REFRESH ",
-            crate::sql::explain::ExplainLevel::Costs,
+            novarocks_sql::explain::ExplainLevel::Costs,
             false,
         ),
         (
             "EXPLAIN REFRESH ",
-            crate::sql::explain::ExplainLevel::Normal,
+            novarocks_sql::explain::ExplainLevel::Normal,
             false,
         ),
     ];
@@ -3383,14 +3389,14 @@ fn parse_explain_refresh_materialized_view(
             .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
         {
             let body = format!("REFRESH {}", trimmed[prefix.len()..].trim_start());
-            let mut statements = match crate::sql::parser::parse_sql(&body) {
+            let mut statements = match novarocks_sql::parser::parse_sql(&body) {
                 Ok(statements) => statements,
                 Err(e) => return Some(Err(e)),
             };
             let Some(statement) = statements.pop() else {
                 return Some(Err("EXPLAIN REFRESH parsed no statement".to_string()));
             };
-            let crate::sql::parser::ast::Statement::RefreshMaterializedView(stmt) = statement
+            let novarocks_sql::parser::ast::Statement::RefreshMaterializedView(stmt) = statement
             else {
                 return Some(Err(
                     "EXPLAIN REFRESH only supports REFRESH MATERIALIZED VIEW".to_string(),
@@ -3638,7 +3644,7 @@ mod tests {
         .expect("recognized")
         .expect("parsed");
         assert_eq!(verbose.0.name.parts, vec!["mv1"]);
-        assert_eq!(verbose.1, crate::sql::explain::ExplainLevel::Verbose);
+        assert_eq!(verbose.1, novarocks_sql::explain::ExplainLevel::Verbose);
         assert!(!verbose.2);
 
         let costs = super::parse_explain_refresh_materialized_view(
@@ -3647,7 +3653,7 @@ mod tests {
         .expect("recognized")
         .expect("parsed");
         assert_eq!(costs.0.name.parts, vec!["db", "mv1"]);
-        assert_eq!(costs.1, crate::sql::explain::ExplainLevel::Costs);
+        assert_eq!(costs.1, novarocks_sql::explain::ExplainLevel::Costs);
         assert!(!costs.2);
     }
 
@@ -3658,7 +3664,7 @@ mod tests {
         )
         .expect("recognized")
         .expect("parsed");
-        assert_eq!(parsed.1, crate::sql::explain::ExplainLevel::Analyze);
+        assert_eq!(parsed.1, novarocks_sql::explain::ExplainLevel::Analyze);
         assert!(parsed.2);
     }
 
@@ -3668,19 +3674,19 @@ mod tests {
             super::split_explain_logical_sql(" EXPLAIN LOGICAL SELECT * FROM t")
                 .expect("recognized");
         assert_eq!(rewritten, "EXPLAIN SELECT * FROM t");
-        assert_eq!(level, crate::sql::explain::ExplainLevel::Normal);
+        assert_eq!(level, novarocks_sql::explain::ExplainLevel::Normal);
 
         let (rewritten, level) =
             super::split_explain_logical_sql("explain logical verbose select k from t")
                 .expect("recognized");
         assert_eq!(rewritten, "EXPLAIN select k from t");
-        assert_eq!(level, crate::sql::explain::ExplainLevel::Verbose);
+        assert_eq!(level, novarocks_sql::explain::ExplainLevel::Verbose);
 
         let (rewritten, level) =
             super::split_explain_logical_sql("EXPLAIN\nLOGICAL\nSELECT k FROM t")
                 .expect("recognized");
         assert_eq!(rewritten, "EXPLAIN SELECT k FROM t");
-        assert_eq!(level, crate::sql::explain::ExplainLevel::Normal);
+        assert_eq!(level, novarocks_sql::explain::ExplainLevel::Normal);
     }
 
     fn string_cell(result: &QueryResult, row: usize, col: usize) -> String {

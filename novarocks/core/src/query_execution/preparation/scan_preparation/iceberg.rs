@@ -23,9 +23,9 @@ use novarocks_spi::connector::{
 
 use crate::query_execution::planning::bindings::QueryScanMaterialization;
 use crate::query_execution::preparation::scan::{PlannedConnectorRead, ResolvedScanExecution};
-use crate::sql::analysis::TypedExpr;
-use crate::sql::planner::payload::PlanScanNode;
-use crate::sql::planner::table::ScanSource;
+use novarocks_sql::analysis::TypedExpr;
+use novarocks_sql::plan_read::PlanScanNode;
+use novarocks_sql::plan_read::table::ScanSource;
 
 use super::projection::effective_scan_column_names;
 
@@ -173,10 +173,10 @@ pub(super) fn plan_connector_read(
 fn connector_read_purpose(scan: &PlanScanNode) -> ConnectorReadPurpose {
     let ScanSource::Sql(source) = &scan.table.source;
     match source.kind {
-        crate::sql::planner::table::SqlScanKind::MvTargetState { .. } => {
+        novarocks_sql::plan_read::table::SqlScanKind::MvTargetState { .. } => {
             ConnectorReadPurpose::MvTargetState
         }
-        crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => {
+        novarocks_sql::plan_read::table::SqlScanKind::MvTargetLocator { .. } => {
             ConnectorReadPurpose::MvTargetLocator
         }
         _ => ConnectorReadPurpose::Query,
@@ -275,9 +275,9 @@ fn residual_predicates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, LiteralValue};
     use arrow::datatypes::DataType;
     use novarocks_spi::connector::{ConnectorPredicateDisposition, ConnectorStaticPredicateId};
+    use novarocks_sql::analysis::{ExprKind, LiteralValue};
 
     fn predicate(value: bool) -> TypedExpr {
         TypedExpr {

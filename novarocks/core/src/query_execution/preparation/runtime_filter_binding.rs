@@ -19,13 +19,13 @@ use arrow::datatypes::DataType;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::query_execution::preparation::scan::ScanExecutionBindings;
-use crate::sql::analysis::TypedExpr;
-use crate::sql::planner::distributed::{FragmentId, PlanFragment};
-use crate::sql::planner::runtime_filter::contract::{
+use novarocks_sql::analysis::TypedExpr;
+use novarocks_sql::planner::distributed::{FragmentId, PlanFragment};
+use novarocks_sql::planner::runtime_filter::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
     ContributionKind, PlanNodeId, ReductionRequirement, RuntimeFilterLogicalDomain,
 };
-use crate::sql::planner::runtime_filter::graph::{
+use novarocks_sql::planner::runtime_filter::graph::{
     ApplyPoint, ConsumerBindingTarget, ProducerBindingTarget, RuntimeFilterBindingRole,
     RuntimeFilterBindingSpec, RuntimeFilterGraph, RuntimeFilterSemanticScanDomainTarget,
 };
@@ -176,7 +176,7 @@ pub(super) fn materialize_runtime_filter_binding_tables_with_scan_bindings(
         scan_bindings: Option<&ScanExecutionBindings>,
         pending: &mut BTreeMap<BindingId, &RuntimeFilterBindingSpec>,
         table: &mut RuntimeFilterBindingTable,
-        node: &crate::sql::planner::distributed::DistributedNode,
+        node: &novarocks_sql::planner::distributed::DistributedNode,
     ) -> Result<(), String> {
         for binding_id in &node.runtime_filter_binding_ids {
             let Some(binding) = pending.remove(binding_id) else {
@@ -292,7 +292,7 @@ pub(super) fn materialize_runtime_filter_binding_tables_with_scan_bindings(
 
 fn materialize_consumer_target(
     binding_id: BindingId,
-    fragment_id: crate::sql::planner::runtime_filter::contract::PlanFragmentId,
+    fragment_id: novarocks_sql::planner::runtime_filter::contract::PlanFragmentId,
     node_id: PlanNodeId,
     target: &ConsumerBindingTarget,
     scan_bindings: Option<&ScanExecutionBindings>,
@@ -323,7 +323,7 @@ fn materialize_consumer_target(
 
 fn materialize_scan_domain_target(
     binding_id: BindingId,
-    fragment_id: crate::sql::planner::runtime_filter::contract::PlanFragmentId,
+    fragment_id: novarocks_sql::planner::runtime_filter::contract::PlanFragmentId,
     node_id: PlanNodeId,
     target: &RuntimeFilterSemanticScanDomainTarget,
     scan_bindings: Option<&ScanExecutionBindings>,
@@ -439,23 +439,23 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::sql::analysis::{ExprKind, LiteralValue};
-    use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::distributed::{
+    use novarocks_sql::analysis::{ExprKind, LiteralValue};
+    use novarocks_sql::column_id::ColumnId;
+    use novarocks_sql::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
     };
-    use crate::sql::planner::payload::PlanValuesNode;
-    use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
-    use crate::sql::planner::runtime_filter::comparator::comparator_digest_for_plan;
-    use crate::sql::planner::runtime_filter::contract::{
+    use novarocks_sql::planner::payload::PlanValuesNode;
+    use novarocks_sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+    use novarocks_sql::planner::runtime_filter::comparator::comparator_digest_for_plan;
+    use novarocks_sql::planner::runtime_filter::contract::{
         ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
         ContributionKind, CoverageWitnessId, LateApplyGranularity, NullOrder, NullSemantics,
         OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId, ReductionRequirement,
         RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
         SortDirection,
     };
-    use crate::sql::planner::runtime_filter::coverage::Coverage;
-    use crate::sql::planner::runtime_filter::graph::{
+    use novarocks_sql::planner::runtime_filter::coverage::Coverage;
+    use novarocks_sql::planner::runtime_filter::graph::{
         ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation, ProducerRequirement,
         RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
         RuntimeFilterGraph, RuntimeFilterSemanticScanDomainTarget,

@@ -952,7 +952,7 @@ pub(crate) fn target_cast_expr_sql(expr_sql: &str, column: &ColumnDef) -> Result
 }
 
 fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Query, String> {
-    match crate::sql::parser::parse_sql_raw(sql)? {
+    match novarocks_sql::planning::dml::parse_raw_statement(sql)? {
         sqlparser::ast::Statement::Query(query) => Ok(*query),
         other => Err(format!("{context}: generated non-query statement: {other}")),
     }
@@ -1204,7 +1204,7 @@ mod tests {
     }
 
     fn parse_query(sql: &str) -> sqlast::Query {
-        let stmt = crate::sql::parser::parse_sql_raw(sql).expect("parse query");
+        let stmt = novarocks_sql::planning::dml::parse_raw_statement(sql).expect("parse query");
         let sqlast::Statement::Query(query) = stmt else {
             panic!("expected query statement");
         };

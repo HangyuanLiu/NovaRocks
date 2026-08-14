@@ -23,6 +23,9 @@ edition = "2024"
 [lib]
 doctest = false
 
+[features]
+test-support = []
+
 [dependencies]
 arrow = { version = "58.2.0", features = ["prettyprint", "ipc", "ipc_compression"] }
 base64 = "0.22"

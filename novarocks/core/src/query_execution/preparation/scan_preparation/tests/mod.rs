@@ -30,15 +30,15 @@ use crate::connector::scan_model::{FixtureDeleteFile, FixtureScanFile};
 use crate::query_execution::preparation::scan::{
     ResolvedReadReason, ResolvedScanExecution, ScanBindingResolver,
 };
-use crate::sql::analysis::OutputColumn;
-use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::{
+use novarocks_catalog::schema::ColumnDef;
+use novarocks_sql::analysis::OutputColumn;
+use novarocks_sql::column_id::ColumnId;
+use novarocks_sql::plan_read::PlanScanNode;
+use novarocks_sql::plan_read::table::{ScanSource, TableDef};
+use novarocks_sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, PlanFragment,
 };
-use crate::sql::planner::payload::PlanScanNode;
-use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
-use crate::sql::planner::table::{ScanSource, TableDef};
-use novarocks_catalog::schema::ColumnDef;
+use novarocks_sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 
 fn prepare_scan_bindings(
     plan: &DistributedPlan,
@@ -77,11 +77,11 @@ fn fixture_query_table_bindings(
     use crate::query_execution::planning::bindings::{
         QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
     };
-    use crate::sql::planner::table::{SqlScanKind, SqlScanSource, SqlTableIdentity};
     use novarocks_spi::connector::{
         ConnectorControlResolver, ConnectorInstanceId, ConnectorTableIdentity,
         ConnectorTableRequest, ConnectorTableResolution,
     };
+    use novarocks_sql::plan_read::table::{SqlScanKind, SqlScanSource, SqlTableIdentity};
 
     let scan = plan
         .fragments()
@@ -158,7 +158,7 @@ fn fixture_query_table_bindings(
                 };
                 let frozen_snapshot_materializations = match &source.kind {
                     SqlScanKind::FrozenInputSet {
-                        version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(
+                        version: novarocks_sql::plan_read::table::SqlTableVersionSelector::Snapshot(
                             snapshot_id,
                         ),
                     } => {
@@ -195,7 +195,7 @@ fn fixture_query_table_bindings(
                     _ => std::collections::BTreeMap::new(),
                 };
                 Ok(QueryTableBinding {
-                    resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                    resolved: novarocks_sql::catalog::ResolvedAnalyzerTable::from_planner(
                         Some(&source.table.catalog),
                         &source.table.namespace,
                         resolved_planner,
@@ -269,7 +269,7 @@ fn source_column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
     }
 }
 
-/// The SQL table identity that [`crate::sql::planner::table::test_sql_scan_source`]
+/// The SQL table identity that [`novarocks_sql::plan_read::table::test_sql_scan_source`]
 /// embeds, restated so tests can admit a binding for the same three-part name
 /// without naming a provider.
 struct FixtureTableIdentity {
@@ -310,9 +310,9 @@ fn scan_node(node_id: i32) -> DistributedNode {
         name: "ice_t".to_string(),
         columns: vec![source_column("id", DataType::Int32, false)],
         iceberg_row_lineage_metadata_columns: Vec::new(),
-        source: crate::sql::planner::table::test_sql_scan_source(
-            crate::sql::planner::table::SqlScanKind::Data {
-                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+        source: novarocks_sql::plan_read::table::test_sql_scan_source(
+            novarocks_sql::plan_read::table::SqlScanKind::Data {
+                version: novarocks_sql::plan_read::table::SqlTableVersionSelector::Current,
             },
         ),
     };
@@ -345,7 +345,7 @@ fn scan_node(node_id: i32) -> DistributedNode {
 }
 
 fn plan(root: DistributedNode) -> DistributedPlan {
-    crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+    novarocks_sql::planner::distributed::test_support::distributed_plan_for_test! {
         fragments: vec![PlanFragment {
             fragment_id: 0,
             root,

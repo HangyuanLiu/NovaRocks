@@ -40,13 +40,13 @@ use crate::query_execution::statistics::{
     StatisticsExecutionMode, StatisticsExecutionPolicy, ThetaSketchPartial,
 };
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
-use crate::sql::planner::distributed::{
-    DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
-};
-use crate::sql::planner::payload::PlanValuesNode;
-use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 use bytes::Bytes;
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_sql::planner::distributed::{
+    DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
+};
+use novarocks_sql::planner::payload::PlanValuesNode;
+use novarocks_sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -56,7 +56,7 @@ fn test_execution(cancellation: QueryCancellationView) -> QueryExecutionContext 
         BackendTopologySnapshot::empty(0),
         None,
         cancellation,
-        crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        novarocks_sql::optimizer::options::SessionOptimizerSettings::default(),
     )
 }
 
@@ -210,7 +210,7 @@ fn real_execution_artifacts() -> (
         cte_id: None,
         cte_exchange_nodes: Vec::new(),
     };
-    let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+    let plan = novarocks_sql::planner::distributed::test_support::distributed_plan_for_test! {
         fragments: vec![fragment],
         root_fragment_id: 7,
         edges: Vec::new(),

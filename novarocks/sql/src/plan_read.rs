@@ -23,6 +23,7 @@
 
 pub use crate::analysis::{ExprKind, SortItem, TypedExpr};
 pub use crate::column_id::ColumnId;
+pub use crate::common::CteId;
 pub use crate::common::expr::{
     BinOp, JoinKind, LiteralValue, UnOp, WindowBound, WindowFrame, WindowFrameType,
 };
@@ -32,10 +33,11 @@ pub use crate::planner::distributed::write::{
     ChangeStreamRouterSink, ConnectorWriteFragmentSink, ConnectorWriteInputBinding,
 };
 pub use crate::planner::distributed::{
-    DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
-    ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentEdgeOutputCatalog, FragmentId,
-    FragmentStreamKind, NodeExecutionColumn, NodeExecutionOutput, NodeOutputCatalog, PartitionKind,
-    PlanFragment, WriteContractCatalog, distributed_kind_to_physical,
+    BoundaryColumn, BoundaryContract, BoundaryKind, DataPartition, DataSink, DistributedNode,
+    DistributedNodeKind, DistributedPlan, ExchangeFlavor, ExchangeReceiver, ExecutionColumnId,
+    FragmentEdge, FragmentEdgeKind, FragmentEdgeOutputCatalog, FragmentId, FragmentStreamKind,
+    NodeExecutionColumn, NodeExecutionOutput, NodeOutputCatalog, PartitionKind, PlanFragment,
+    WriteContractCatalog, distributed_kind_to_physical,
 };
 pub use crate::planner::payload::{PlanRowCountAssertion, PlanScanNode};
 pub use crate::planner::physical::node::{PhysicalPlanKind, PlanSetOpKind, RedistributeMode};
@@ -63,4 +65,6 @@ pub mod runtime_filter {
     pub use crate::planner::runtime_filter::graph::{
         ApplyPoint, ConsumerBindingTarget, ProducerBindingTarget,
     };
+    pub use crate::planner::runtime_filter::progress::JoinBuildProgressCatalog;
+    pub use crate::planner::runtime_filter::sealed::SealedRuntimeFilterPlan;
 }

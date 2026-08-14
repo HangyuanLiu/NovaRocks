@@ -22,7 +22,7 @@
 //! scan binding, and refresh execution state remain in the engine adapter.
 
 #[cfg(test)]
-use crate::sql::planner::vocabulary::ApplyKeySource;
+use novarocks_sql::planner::vocabulary::ApplyKeySource;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -32,8 +32,10 @@ use arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
 use crate::mv::persistence::definition::StoredMvDefinition;
 use crate::mv::persistence::schema as mv_schema;
 use crate::mv::refresh::pin::RefreshSnapshotPin;
-use crate::sql::binding::SqlTableBindingId;
-use crate::sql::compiler::mv_rewrite::{
+use mv_schema::MvSchemaContract;
+use novarocks_catalog::identifier::TableIdentity;
+use novarocks_sql::binding::SqlTableBindingId;
+use novarocks_sql::compiler::mv_rewrite::{
     SqlImvAggregateContract, SqlImvAggregateExecutionLayout, SqlImvAggregateLayout,
     SqlImvAggregateShape, SqlImvAggregateStateColumn, SqlImvAggregateStateColumnContract,
     SqlImvAggregateStateRole, SqlImvAggregateStateRoleContract, SqlImvAggregateVisibleColumn,
@@ -44,8 +46,9 @@ use crate::sql::compiler::mv_rewrite::{
     SqlImvQualifiedFieldLineage, SqlImvRewriteSnapshot, SqlImvSchemaContract, SqlImvTargetContract,
     SqlImvTargetVisibleColumn,
 };
-use mv_schema::MvSchemaContract;
-use novarocks_catalog::identifier::TableIdentity;
+use novarocks_sql::planning::mv::{
+    SqlMvAggregateCalls as AggregateSqlCalls, extract_aggregate_sql_calls,
+};
 
 /// Read-only metadata that drives Iceberg MV refresh rewrite.
 ///
@@ -315,7 +318,7 @@ impl IcebergMvRewriteContext {
         &self,
     ) -> Result<
         (
-            crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+            AggregateSqlCalls,
             crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
         ),
         String,
@@ -335,10 +338,7 @@ impl IcebergMvRewriteContext {
         } else {
             query.clone()
         };
-        let aggregate_calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
-                &aggregate_query,
-            )
+        let aggregate_calls = extract_aggregate_sql_calls(&aggregate_query)
             .map_err(|e| format!("extract aggregate calls for execution layout: {e}"))?;
 
         let arrow_schema = self.target_arrow_schema.as_ref();
@@ -356,8 +356,8 @@ impl IcebergMvRewriteContext {
                     )
                 })?;
             let arrow_field = arrow_schema.field(field_idx);
-            output_columns.push(crate::sql::analysis::OutputColumn {
-                column_id: crate::sql::column_id::ColumnId::UNSET,
+            output_columns.push(novarocks_sql::analysis::OutputColumn {
+                column_id: novarocks_sql::column_id::ColumnId::UNSET,
                 name: visible.output_name.clone(),
                 data_type: arrow_field.data_type().clone(),
                 nullable: visible.nullable,
@@ -696,11 +696,11 @@ pub(crate) fn first_union_branch_query(
 }
 
 fn aggregate_input_types_from_schema_contract(
-    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &AggregateSqlCalls,
     contract: &MvSchemaContract,
 ) -> Result<Vec<Option<DataType>>, String> {
-    use crate::mv::aggregate_state::mv_shape::AggregateInput;
-    use crate::sql::mv_refresh::VisibleAggregateOutput;
+    use novarocks_sql::mv_refresh::VisibleAggregateOutput;
+    use novarocks_sql::planning::mv::AggregateInput;
 
     let mut input_types = vec![None; calls.aggregates.len()];
     for (aggregate_index, aggregate) in calls.aggregates.iter().enumerate() {
@@ -735,9 +735,9 @@ fn aggregate_input_types_from_schema_contract(
 }
 
 fn aggregate_input_cast_type(
-    input: &crate::mv::aggregate_state::mv_shape::AggregateInput,
+    input: &novarocks_sql::planning::mv::AggregateInput,
 ) -> Result<Option<DataType>, String> {
-    let crate::mv::aggregate_state::mv_shape::AggregateInput::Expr(expr) = input else {
+    let novarocks_sql::planning::mv::AggregateInput::Expr(expr) = input else {
         return Ok(None);
     };
     explicit_cast_type(expr)
@@ -900,7 +900,6 @@ pub(crate) mod tests_support {
 
     use crate::mv::persistence::definition::StoredMvDefinition;
     use crate::mv::refresh::pin::RefreshSnapshotPin;
-    use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
     use mv_schema::{
         BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
         HiddenApplyKeyContract, JoinContract, JoinContractKind, JoinPredicateLineage,
@@ -908,6 +907,7 @@ pub(crate) mod tests_support {
         TargetContract, TargetVisibleColumn,
     };
     use novarocks_catalog::identifier::TableIdentity;
+    use novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
 
     use super::*;
 
@@ -1208,12 +1208,12 @@ mod tests {
     use std::sync::Arc;
 
     use crate::mv::refresh::pin::RefreshSnapshotPin;
-    use crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
     use mv_schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         BranchIdColumnContract, BranchUnionContract,
     };
     use novarocks_catalog::identifier::TableIdentity;
+    use novarocks_sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
 
     use super::tests_support::*;
     use super::*;
