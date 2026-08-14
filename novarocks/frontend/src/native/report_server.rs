@@ -1,11 +1,13 @@
 //! Frontend-owned report-only native endpoint.
 
+use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
+use axum::Json;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
@@ -21,9 +23,95 @@ use tonic::body::boxed;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
 
+use crate::coordinator::{QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot};
+
 use super::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
+
+#[derive(serde::Serialize)]
+struct LifecycleConvergenceDebugSnapshot {
+    execution_id: String,
+    error_source: Option<&'static str>,
+    participant_outcomes: Vec<LifecycleParticipantOutcomeDebug>,
+    /// This endpoint intentionally exposes only query-scoped immutable
+    /// terminal evidence. Process metrics are not an acceptable substitute.
+    metrics: BTreeMap<String, i64>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum LifecycleParticipantOutcomeDebug {
+    Proof,
+    Attestation { reason: String },
+    NoOutcome,
+}
+
+async fn latest_lifecycle_convergence_snapshot(
+    reader: Arc<dyn QueryLifecycleConvergenceReader>,
+) -> axum::response::Response {
+    let Some(snapshot) = reader.latest_convergence_snapshot() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(lifecycle_convergence_debug_snapshot(snapshot)).into_response()
+}
+
+fn lifecycle_convergence_debug_snapshot(
+    snapshot: QueryLifecycleConvergenceSnapshot,
+) -> LifecycleConvergenceDebugSnapshot {
+    let mut participant_outcomes = snapshot
+        .participant_outcomes
+        .iter()
+        .map(|outcome| {
+            match outcome {
+            novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::Proof { .. } => {
+                LifecycleParticipantOutcomeDebug::Proof
+            }
+            novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::NegativeAttestation(
+                attestation,
+            ) => LifecycleParticipantOutcomeDebug::Attestation {
+                reason: format!("{:?}", attestation.reason()),
+            },
+        }
+        })
+        .collect::<Vec<_>>();
+    let error_source = if participant_outcomes.iter().any(|outcome| {
+        matches!(
+            outcome,
+            LifecycleParticipantOutcomeDebug::Attestation { .. }
+        )
+    }) {
+        Some("backend-attestation")
+    } else if snapshot
+        .primary_error
+        .as_deref()
+        .is_some_and(|error| error.contains("query lifecycle NoOutcome"))
+    {
+        participant_outcomes.push(LifecycleParticipantOutcomeDebug::NoOutcome);
+        Some("no-outcome")
+    } else if snapshot.primary_error.as_deref().is_some_and(|error| {
+        error.contains("heartbeat")
+            || error.contains("coordinator")
+            || error.contains("control stream")
+    }) {
+        Some("frontend-liveness")
+    } else {
+        None
+    };
+    LifecycleConvergenceDebugSnapshot {
+        execution_id: format!(
+            "{}:{}:{}",
+            snapshot.execution_id.query_id().high(),
+            snapshot.execution_id.query_id().low(),
+            snapshot.execution_id.attempt_id().get()
+        ),
+        error_source,
+        participant_outcomes,
+        metrics: BTreeMap::new(),
+    }
+}
 
 #[derive(Clone)]
 struct FrontendReportService {
@@ -212,6 +300,7 @@ impl FrontendReportServerHandle {
         host: &str,
         port: u16,
         ingress: Arc<dyn QueryTerminalIngress>,
+        convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
     ) -> Result<Self, String> {
         let address = parse_bind_addr(host, port)?;
         let listener = TcpListener::bind(address).map_err(|error| {
@@ -252,9 +341,16 @@ impl FrontendReportServerHandle {
                             "/{}/*rest",
                             <NovaRocksGrpcServer<FrontendReportService> as NamedService>::NAME
                         );
+                        let debug_reader = Arc::clone(&convergence_reader);
                         let app = Router::new()
                             .route_service(&grpc_path, AxumGrpcService::new(service))
                             .route("/metrics", get(novarocks::service::handle_metrics))
+                            .route(
+                                LIFECYCLE_CONVERGENCE_DEBUG_PATH,
+                                get(move || {
+                                    latest_lifecycle_convergence_snapshot(Arc::clone(&debug_reader))
+                                }),
+                            )
                             .fallback(grpc_unimplemented_fallback);
                         let mut shutdown_rx = shutdown_rx;
                         axum::serve(listener, app)

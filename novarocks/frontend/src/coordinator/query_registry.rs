@@ -40,6 +40,13 @@ pub(crate) struct QueryLifecycleConvergenceSnapshot {
     pub(crate) participant_outcomes: Vec<ParticipantTerminalOutcome>,
 }
 
+/// Read-only diagnostic seam for the immutable terminal evidence retained by
+/// the query registry.  It deliberately has no access to active streams or
+/// terminal ingress mutation.
+pub(crate) trait QueryLifecycleConvergenceReader: Send + Sync {
+    fn latest_convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot>;
+}
+
 pub(crate) trait ActiveQueryAttemptControl: Send + Sync {
     fn execution_id(&self) -> QueryExecutionId;
 
@@ -123,6 +130,7 @@ struct BackendTopologyState {
 pub(crate) struct FrontendQueryRegistry {
     active: Mutex<BTreeMap<QueryKey, ActiveQuery>>,
     retained_terminal_ingress: Mutex<BTreeMap<QueryExecutionId, RetainedTerminalIngress>>,
+    latest_retained_execution: Mutex<Option<QueryExecutionId>>,
     backend_topology: Mutex<BackendTopologyState>,
 }
 
@@ -462,6 +470,14 @@ impl FrontendQueryRegistry {
             .and_then(|control| control.convergence_snapshot())
     }
 
+    fn latest_retained_convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
+        let execution_id = *self
+            .latest_retained_execution
+            .lock()
+            .expect("frontend latest retained terminal ingress lock");
+        execution_id.and_then(|execution_id| self.retained_convergence_snapshot(execution_id))
+    }
+
     pub(crate) fn preserve_failure_context(
         &self,
         query_id: QueryId,
@@ -588,6 +604,7 @@ impl FrontendQueryRegistry {
     }
 
     fn retain_terminal_control(&self, control: Arc<dyn ActiveQueryAttemptControl>) {
+        let execution_id = control.execution_id();
         let now = Instant::now();
         let mut retained = self
             .retained_terminal_ingress
@@ -604,12 +621,16 @@ impl FrontendQueryRegistry {
             }
         }
         retained.insert(
-            control.execution_id(),
+            execution_id,
             RetainedTerminalIngress {
                 control,
                 expires_at: now + TERMINAL_INGRESS_RETENTION,
             },
         );
+        *self
+            .latest_retained_execution
+            .lock()
+            .expect("frontend latest retained terminal ingress lock") = Some(execution_id);
     }
 
     fn retained_terminal_control(
@@ -622,6 +643,17 @@ impl FrontendQueryRegistry {
             .lock()
             .expect("frontend retained terminal ingress lock");
         retained.retain(|_, ingress| ingress.expires_at > now);
+        if self
+            .latest_retained_execution
+            .lock()
+            .expect("frontend latest retained terminal ingress lock")
+            .is_some_and(|latest| !retained.contains_key(&latest))
+        {
+            *self
+                .latest_retained_execution
+                .lock()
+                .expect("frontend latest retained terminal ingress lock") = None;
+        }
         retained
             .get(&execution_id)
             .map(|ingress| Arc::clone(&ingress.control))
@@ -631,6 +663,12 @@ impl FrontendQueryRegistry {
                     "query terminal snapshot execution id is stale or has no retained ingress",
                 )
             })
+    }
+}
+
+impl QueryLifecycleConvergenceReader for FrontendQueryRegistry {
+    fn latest_convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
+        self.latest_retained_convergence_snapshot()
     }
 }
 
@@ -812,6 +850,13 @@ mod tests {
                 .primary_error
                 .as_deref(),
             Some("stable test failure")
+        );
+        assert_eq!(
+            QueryLifecycleConvergenceReader::latest_convergence_snapshot(&registry)
+                .expect("latest retained control exposes convergence snapshot")
+                .execution_id,
+            execution_id,
+            "the read-only diagnostic seam returns retained attempt evidence"
         );
     }
 

@@ -47,7 +47,7 @@ use novarocks_types::QueryId;
 
 use super::backend_events::BackendQueryActivity;
 use super::query_lifecycle::{FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig};
-use super::query_registry::FrontendQueryRegistry;
+use super::query_registry::{FrontendQueryRegistry, QueryLifecycleConvergenceReader};
 use super::report::FrontendCoordinatorTerminalIngress;
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use crate::connector::{
@@ -673,6 +673,10 @@ impl FrontendDistributedQueryCoordinator {
 
     pub fn terminal_ingress(&self) -> FrontendCoordinatorTerminalIngress {
         FrontendCoordinatorTerminalIngress::new(Arc::clone(&self.registry))
+    }
+
+    pub(crate) fn convergence_reader(&self) -> Arc<dyn QueryLifecycleConvergenceReader> {
+        Arc::clone(&self.registry) as Arc<dyn QueryLifecycleConvergenceReader>
     }
 
     pub fn backend_query_activity(&self) -> BackendQueryActivity {

@@ -30,6 +30,91 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml::Value;
 
+const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
+
+#[derive(serde::Deserialize)]
+struct LifecycleConvergenceWireSnapshot {
+    execution_id: String,
+    error_source: Option<String>,
+    participant_outcomes: Vec<LifecycleParticipantOutcomeWire>,
+    metrics: BTreeMap<String, i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum LifecycleParticipantOutcomeWire {
+    Proof,
+    Attestation { reason: String },
+    NoOutcome,
+}
+
+fn query_lifecycle_structured_snapshot_from_fe(
+    port: u16,
+) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
+    let address = format!("127.0.0.1:{port}");
+    let mut stream = TcpStream::connect_timeout(
+        &address
+            .parse()
+            .with_context(|| format!("parse FE lifecycle snapshot address {address}"))?,
+        TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
+    )
+    .with_context(|| format!("connect FE lifecycle snapshot endpoint {address}"))?;
+    stream
+        .set_read_timeout(Some(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP))
+        .context("set FE lifecycle snapshot read timeout")?;
+    stream
+        .set_write_timeout(Some(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP))
+        .context("set FE lifecycle snapshot write timeout")?;
+    stream
+        .write_all(
+            format!(
+                "GET {LIFECYCLE_CONVERGENCE_DEBUG_PATH} HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n"
+            )
+            .as_bytes(),
+        )
+        .context("request FE lifecycle snapshot")?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("read FE lifecycle snapshot response")?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .context("malformed FE lifecycle snapshot HTTP response")?;
+    let status = headers.lines().next().unwrap_or("<missing status>");
+    if status.starts_with("HTTP/1.1 404") || status.starts_with("HTTP/1.0 404") {
+        return Ok(None);
+    }
+    if !status.starts_with("HTTP/1.1 200") && !status.starts_with("HTTP/1.0 200") {
+        bail!("FE lifecycle snapshot returned non-success status: {status}");
+    }
+    let wire: LifecycleConvergenceWireSnapshot =
+        serde_json::from_str(body).context("decode FE lifecycle snapshot JSON")?;
+    let error_source = match wire.error_source.as_deref() {
+        None => None,
+        Some("backend-attestation") => Some(QueryLifecycleErrorSource::BackendAttestation),
+        Some("frontend-liveness") => Some(QueryLifecycleErrorSource::FrontendLiveness),
+        Some("no-outcome") => Some(QueryLifecycleErrorSource::NoOutcome),
+        Some(source) => bail!("unknown FE lifecycle snapshot error source {source:?}"),
+    };
+    let participant_outcomes = wire
+        .participant_outcomes
+        .into_iter()
+        .map(|outcome| match outcome {
+            LifecycleParticipantOutcomeWire::Proof => ParticipantTerminalOutcomeKind::Proof,
+            LifecycleParticipantOutcomeWire::Attestation { reason } => {
+                ParticipantTerminalOutcomeKind::Attestation { reason }
+            }
+            LifecycleParticipantOutcomeWire::NoOutcome => ParticipantTerminalOutcomeKind::NoOutcome,
+        })
+        .collect();
+    Ok(Some(QueryLifecycleStructuredSnapshot {
+        execution_id: Some(wire.execution_id),
+        error_source,
+        participant_outcomes,
+        metrics: wire.metrics,
+    }))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterProcessRole {
     Fe,
@@ -1655,6 +1740,12 @@ impl ServerHandle for CrossProcessServerHandle {
 
     fn query_execution_resource_diagnostics(&self) -> String {
         self.query_execution_resource_diagnostics_impl()
+    }
+
+    fn query_lifecycle_structured_snapshot(
+        &mut self,
+    ) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
+        query_lifecycle_structured_snapshot_from_fe(self.runtime.fe_grpc_port)
     }
 
     fn be_count(&self) -> usize {

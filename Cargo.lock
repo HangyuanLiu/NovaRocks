@@ -3239,6 +3239,8 @@ dependencies = [
  "anyhow",
  "mysql",
  "novarocks-test-support",
+ "serde",
+ "serde_json",
  "toml",
 ]
 
