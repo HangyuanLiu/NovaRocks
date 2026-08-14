@@ -46,7 +46,7 @@ const FAILURE_BACKOFF_MAX_MS: i64 = 1_800_000;
 /// `max_concurrent` is a real attempt limit: one admitted attempt includes a
 /// complete policy evaluation and all of its actions for one MV.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MaintenanceCoordinatorConfig {
+pub struct MaintenanceCoordinatorConfig {
     pub(crate) enabled: bool,
     pub(crate) tick_interval_ms: u64,
     pub(crate) max_concurrent: usize,
@@ -54,6 +54,28 @@ pub(crate) struct MaintenanceCoordinatorConfig {
     pub(crate) dv_min_delete_files: i64,
     pub(crate) action_cooldown_ms: i64,
     pub(crate) max_consecutive_failures: u32,
+}
+
+impl MaintenanceCoordinatorConfig {
+    pub const fn new(
+        enabled: bool,
+        tick_interval_ms: u64,
+        max_concurrent: usize,
+        compaction_min_data_files: i64,
+        dv_min_delete_files: i64,
+        action_cooldown_ms: i64,
+        max_consecutive_failures: u32,
+    ) -> Self {
+        Self {
+            enabled,
+            tick_interval_ms,
+            max_concurrent,
+            compaction_min_data_files,
+            dv_min_delete_files,
+            action_cooldown_ms,
+            max_consecutive_failures,
+        }
+    }
 }
 
 impl Default for MaintenanceCoordinatorConfig {

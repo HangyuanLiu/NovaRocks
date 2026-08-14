@@ -264,7 +264,7 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
     // I1: load_config_and_resolve_role returns the resolved path so we thread
     // it — along with the already-validated cfg — into the execution path
     // without a second file read.
-    let (cfg, role, resolved_config_path) = load_config_and_resolve_role(&cli)?;
+    let (cfg, role, _resolved_config_path) = load_config_and_resolve_role(&cli)?;
 
     // Install the global config and initialize the tracing subscriber before
     // starting the server. Without this, standalone runs with no logging
@@ -289,8 +289,6 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    let frontend_config_path = resolved_config_path.clone();
-
     dispatch_standalone_role_with_all_in_one(
         role,
         cfg,
@@ -303,21 +301,11 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
                 )
                 .build()
                 .map_err(|error| anyhow::anyhow!("role=fe: build Tokio runtime: {error}"))?;
-            let state_store_host_config = composition::state_store_host_config(&cfg);
-            let connector_control_factories =
-                composition::compose_frontend_control_factories(&cfg, runtime.handle().clone())?;
+            let frontend_config =
+                composition::compose_frontend_server_config(&cfg, port, runtime.handle().clone())?;
             runtime
                 .block_on(novarocks_frontend::run_frontend_server_until_shutdown(
-                    novarocks_frontend::FrontendServerConfig {
-                        config: cfg,
-                        config_path: frontend_config_path,
-                        port_override: port,
-                        connector_control_factories,
-                        mv_storage_observation: std::sync::Arc::new(
-                            composition::IcebergMvStorageObservationAdapter::default(),
-                        ),
-                        state_store_host_config,
-                    },
+                    frontend_config,
                     async {
                         tokio::signal::ctrl_c().await.unwrap_or_else(|error| {
                             tracing::warn!(%error, "frontend Ctrl-C listener failed");
@@ -327,7 +315,7 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
                 .map_err(|error| anyhow::anyhow!("role=fe: {error}"))
         },
         run_standalone_be_role,
-        move |cfg, port| composition::run_all_in_one(cfg, resolved_config_path, port),
+        move |cfg, port| composition::run_all_in_one(cfg, port),
     )
 }
 

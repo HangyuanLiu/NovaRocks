@@ -81,6 +81,13 @@ pub struct ResolvedMysqlListenerSettings {
 }
 
 impl ResolvedMysqlListenerSettings {
+    pub fn new(bind_addr: SocketAddr, user: impl Into<String>) -> Self {
+        Self {
+            bind_addr,
+            user: user.into(),
+        }
+    }
+
     pub fn bind_addr(&self) -> SocketAddr {
         self.bind_addr
     }
@@ -101,10 +108,10 @@ pub fn resolve_mysql_listener_settings(
 ) -> Result<ResolvedMysqlListenerSettings, String> {
     let (mysql_port, user) =
         extract_server_settings(cfg.standalone_server.as_ref(), port_override)?;
-    Ok(ResolvedMysqlListenerSettings {
-        bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, mysql_port)),
+    Ok(ResolvedMysqlListenerSettings::new(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, mysql_port)),
         user,
-    })
+    ))
 }
 
 /// Runs the MySQL protocol listener with a ready frontend-owned session

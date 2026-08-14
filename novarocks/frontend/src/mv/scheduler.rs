@@ -35,12 +35,30 @@ use novarocks::mv::repository::{MvRepository, MvRepositoryError, MvTarget};
 
 /// Existing standalone scheduler settings, now interpreted by the frontend.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FrontendMvSchedulerConfig {
+pub struct FrontendMvSchedulerConfig {
     pub(crate) enabled: bool,
     pub(crate) tick_interval_ms: u64,
     pub(crate) max_concurrent_refreshes: usize,
     pub(crate) failure_backoff_ms: i64,
     pub(crate) max_failure_backoff_ms: i64,
+}
+
+impl FrontendMvSchedulerConfig {
+    pub const fn new(
+        enabled: bool,
+        tick_interval_ms: u64,
+        max_concurrent_refreshes: usize,
+        failure_backoff_ms: i64,
+        max_failure_backoff_ms: i64,
+    ) -> Self {
+        Self {
+            enabled,
+            tick_interval_ms,
+            max_concurrent_refreshes,
+            failure_backoff_ms,
+            max_failure_backoff_ms,
+        }
+    }
 }
 
 impl Default for FrontendMvSchedulerConfig {

@@ -282,15 +282,12 @@ impl FrontendExecutionConfig {
         self.optimizer_query_mem_limit_bytes
     }
 
-    pub(crate) fn with_mv_scheduler_config(mut self, config: FrontendMvSchedulerConfig) -> Self {
+    pub fn with_mv_scheduler_config(mut self, config: FrontendMvSchedulerConfig) -> Self {
         self.mv_scheduler = config;
         self
     }
 
-    pub(crate) fn with_mv_maintenance_config(
-        mut self,
-        config: MaintenanceCoordinatorConfig,
-    ) -> Self {
+    pub fn with_mv_maintenance_config(mut self, config: MaintenanceCoordinatorConfig) -> Self {
         self.mv_maintenance = config;
         self
     }

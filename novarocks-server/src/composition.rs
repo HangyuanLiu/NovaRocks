@@ -16,7 +16,7 @@
 // under the License.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -50,7 +50,10 @@ use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecuti
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
-use novarocks_frontend::FrontendServerConfig;
+use novarocks_frontend::{
+    ClusterBackendOpenConfig, FrontendExecutionConfig, FrontendQueryControlTimeouts,
+    FrontendServerConfig,
+};
 use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
 use novarocks_spi::connector::{
     ConnectorControlFactory, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
@@ -438,6 +441,100 @@ pub fn compose_backend_server_config(
     })
 }
 
+/// Resolve every Frontend startup input from the application wire configuration.
+pub fn compose_frontend_server_config(
+    config: &NovaRocksConfig,
+    port_override: Option<u16>,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<FrontendServerConfig> {
+    let runtime_config = &config.runtime;
+    let advertised = network::standalone_advertise_endpoint_for_config(config)
+        .map_err(|error| anyhow::anyhow!("resolve frontend advertise endpoint: {error}"))?;
+    let runtime_filter_worker_count = NonZeroUsize::new(runtime_config.actual_exec_threads())
+        .ok_or_else(|| anyhow::anyhow!("frontend runtime-filter worker count must be nonzero"))?;
+    let failure_backoff_ms = config
+        .standalone_server
+        .as_ref()
+        .map(|standalone| standalone.mv_refresh_scheduler_failure_backoff_ms.max(1));
+    let mut execution = FrontendExecutionConfig::new(
+        advertised.host,
+        advertised.port,
+        runtime_filter_worker_count,
+    )
+    .with_optimizer_query_mem_limit_bytes(runtime_config.optimizer_query_mem_limit_bytes)
+    .with_query_control_timeouts(FrontendQueryControlTimeouts {
+        heartbeat_interval_ms: runtime_config.query_control_heartbeat_interval_ms,
+        heartbeat_timeout_ms: runtime_config.query_control_heartbeat_timeout_ms,
+        init_rpc_timeout_ms: runtime_config.query_control_init_rpc_timeout_ms,
+        attach_timeout_ms: runtime_config.query_control_attach_timeout_ms,
+        stage_rpc_timeout_ms: runtime_config.query_control_stage_rpc_timeout_ms,
+        start_rpc_timeout_ms: runtime_config.query_control_start_rpc_timeout_ms,
+        terminal_drain_timeout_ms: runtime_config.query_control_terminal_drain_timeout_ms,
+        terminal_ack_timeout_ms: runtime_config.query_control_terminal_ack_timeout_ms,
+        pre_start_timeout_ms: runtime_config.query_control_pre_start_timeout_ms,
+    });
+    if let Some(standalone) = config.standalone_server.as_ref() {
+        let failure_backoff_ms = failure_backoff_ms.expect("standalone config supplies backoff");
+        execution =
+            execution.with_mv_scheduler_config(novarocks_frontend::FrontendMvSchedulerConfig::new(
+                standalone.mv_refresh_scheduler_enabled,
+                standalone.mv_refresh_scheduler_interval_ms.max(1),
+                standalone.mv_refresh_scheduler_max_concurrent.max(1),
+                failure_backoff_ms,
+                standalone
+                    .mv_refresh_scheduler_max_failure_backoff_ms
+                    .max(failure_backoff_ms),
+            ));
+        execution = execution.with_mv_maintenance_config(
+            novarocks_frontend::MaintenanceCoordinatorConfig::new(
+                standalone.iceberg_maintenance_enabled,
+                standalone.iceberg_maintenance_tick_interval_ms.max(1),
+                standalone.iceberg_maintenance_max_concurrent.max(1),
+                standalone
+                    .iceberg_maintenance_compaction_min_data_files
+                    .try_into()
+                    .unwrap_or(i64::MAX),
+                standalone
+                    .iceberg_maintenance_dv_min_delete_files
+                    .try_into()
+                    .unwrap_or(i64::MAX),
+                standalone.iceberg_maintenance_action_cooldown_ms,
+                standalone.iceberg_maintenance_max_consecutive_failures,
+            ),
+        );
+    }
+    let backend_seeds = config
+        .cluster
+        .backends
+        .iter()
+        .map(|endpoint| {
+            endpoint.parse().map_err(|error| {
+                anyhow::anyhow!("parse configured backend endpoint '{endpoint}' failed: {error}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let backend_open = ClusterBackendOpenConfig::new(
+        config.cluster.role,
+        backend_seeds,
+        Duration::from_millis(config.cluster.heartbeat_interval_ms),
+        config.cluster.heartbeat_timeout_retries,
+        Duration::from_secs(config.cluster.decommission_timeout_secs),
+    )
+    .map_err(|error| anyhow::anyhow!("open frontend backend cluster configuration: {error}"))?;
+    let mysql_listener = novarocks::server::resolve_mysql_listener_settings(config, port_override)
+        .map_err(|error| anyhow::anyhow!("resolve MySQL listener settings: {error}"))?;
+    Ok(FrontendServerConfig {
+        execution,
+        backend_open,
+        report_bind_host: config.server.host.clone(),
+        report_grpc_port: config.server.grpc_port,
+        mysql_listener,
+        connector_control_factories: compose_frontend_control_factories(config, runtime)?,
+        mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
+        state_store_host_config: state_store_host_config(config),
+    })
+}
+
 fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntimeConfig {
     let runtime = &config.runtime;
     let spill_io_threads = if runtime.spill_io_threads == 0 {
@@ -545,11 +642,7 @@ pub fn state_store_host_config(
         })
 }
 
-pub fn run_all_in_one(
-    config: NovaRocksConfig,
-    config_path: Option<PathBuf>,
-    port_override: Option<u16>,
-) -> anyhow::Result<()> {
+pub fn run_all_in_one(config: NovaRocksConfig, port_override: Option<u16>) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
@@ -558,7 +651,6 @@ pub fn run_all_in_one(
 
     runtime.block_on(run_all_in_one_until(
         config,
-        config_path,
         port_override,
         runtime.handle().clone(),
         async {
@@ -571,7 +663,6 @@ pub fn run_all_in_one(
 
 async fn run_all_in_one_until<F>(
     config: NovaRocksConfig,
-    config_path: Option<PathBuf>,
     port_override: Option<u16>,
     runtime: tokio::runtime::Handle,
     shutdown: F,
@@ -579,15 +670,7 @@ async fn run_all_in_one_until<F>(
 where
     F: Future<Output = Result<(), String>> + Send,
 {
-    let connector_control_factories = compose_frontend_control_factories(&config, runtime.clone())?;
-    let frontend_config = FrontendServerConfig {
-        config: config.clone(),
-        config_path: config_path.clone(),
-        port_override,
-        connector_control_factories,
-        mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
-        state_store_host_config: state_store_host_config(&config),
-    };
+    let frontend_config = compose_frontend_server_config(&config, port_override, runtime.clone())?;
     let frontend = novarocks_frontend::open_frontend_application_for_server(&frontend_config)
         .await
         .map_err(|error| anyhow::anyhow!("open all-in-one frontend application failed: {error}"))?;
