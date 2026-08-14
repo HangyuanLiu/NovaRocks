@@ -3420,6 +3420,7 @@ dependencies = [
  "novarocks-backend",
  "novarocks-connector-iceberg",
  "novarocks-connector-starrocks",
+ "novarocks-execution",
  "novarocks-frontend",
  "novarocks-fs",
  "novarocks-spi",

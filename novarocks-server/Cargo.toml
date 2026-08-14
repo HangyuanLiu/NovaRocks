@@ -12,6 +12,7 @@ novarocks = { path = "../novarocks/core" }
 novarocks-backend = { path = "../novarocks/backend" }
 novarocks-connector-iceberg = { path = "../novarocks/connector/iceberg" }
 novarocks-connector-starrocks = { path = "../novarocks/connector/starrocks" }
+novarocks-execution = { path = "../novarocks/execution" }
 novarocks-frontend = { path = "../novarocks/frontend" }
 novarocks-fs = { path = "../novarocks/fs" }
 novarocks-spi = { path = "../novarocks/spi" }

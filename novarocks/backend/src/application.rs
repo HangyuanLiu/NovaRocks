@@ -4,8 +4,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use novarocks::common::app_config::{self, NovaRocksConfig};
-use novarocks::common::network;
+use novarocks::common::network::AdvertiseEndpoint;
 use novarocks::connector::ConnectorRegistry;
 use novarocks::query_execution::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlAttachment, QueryInitAck, QueryInitRequest,
@@ -13,9 +12,7 @@ use novarocks::query_execution::lifecycle::{
     QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminalIngress, QueryTerminationAck,
 };
 use novarocks::service::MetricsHttpServer;
-use novarocks_execution::runtime::execution_runtime::{
-    ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
-};
+use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_spi::connector::ConnectorExecutionInstaller;
 
 use crate::exchange_receiver::BackendExchangeReceiverPort;
@@ -35,12 +32,49 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct BackendServerConfig {
-    pub config: NovaRocksConfig,
+    pub bind_host: String,
+    pub grpc_port: u16,
+    pub metrics_http_port: u16,
+    pub advertise_endpoint: AdvertiseEndpoint,
+    pub store_settings: BackendStoreSettings,
+    pub query_lifecycle_sweep_interval: Duration,
+    pub query_lifecycle_config: QueryLifecycleRegistryConfig,
+    pub execution_runtime_config: ExecutionRuntimeConfig,
     /// Provider-owned execution installers composed by the server role.
     ///
     /// Backend only owns registration and lifecycle of these contributions; it
     /// never constructs a provider-specific installer or catalog binding.
     pub execution_installers: Vec<Arc<dyn ConnectorExecutionInstaller>>,
+}
+
+/// BE-local schema-store policies resolved by application composition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackendStoreSettings {
+    enable_tablet_write_log: bool,
+    tablet_write_log_buffer_size: usize,
+    txn_info_history_size: usize,
+}
+
+impl BackendStoreSettings {
+    pub const fn new(
+        enable_tablet_write_log: bool,
+        tablet_write_log_buffer_size: usize,
+        txn_info_history_size: usize,
+    ) -> Self {
+        Self {
+            enable_tablet_write_log,
+            tablet_write_log_buffer_size,
+            txn_info_history_size,
+        }
+    }
+
+    fn install(self) {
+        novarocks::connector::schema::install_be_store_settings(
+            self.enable_tablet_write_log,
+            self.tablet_write_log_buffer_size,
+            self.txn_info_history_size,
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,14 +256,13 @@ impl Drop for QueryLifecycleSweepTask {
 }
 
 fn compose_backend_application_services(
-    config: &NovaRocksConfig,
+    execution_runtime_config: ExecutionRuntimeConfig,
+    query_lifecycle_config: QueryLifecycleRegistryConfig,
     execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
-    let execution_runtime = Arc::new(
-        ExecutionRuntime::new(execution_runtime_config(config)).map_err(|error| {
-            BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
-        })?,
-    );
+    let execution_runtime = Arc::new(ExecutionRuntime::new(execution_runtime_config).map_err(
+        |error| BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error),
+    )?);
     let controls = Arc::new(FragmentControlRegistry::default());
     let exchange_receiver_port: Arc<dyn ExchangeReceiverPort> = Arc::new(
         BackendExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
@@ -242,7 +275,7 @@ fn compose_backend_application_services(
     let query_lifecycle_registry = QueryLifecycleRegistry::new_unbound(
         novarocks::runtime::start_epoch::start_epoch(),
         local_runtime,
-        QueryLifecycleRegistryConfig::from_runtime_config(&config.runtime),
+        query_lifecycle_config,
     );
     let connector_registry = Arc::new(ConnectorRegistry::new());
     for installer in execution_installers {
@@ -370,39 +403,39 @@ impl BackendApplicationHost {
         terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
     ) -> Result<Self, BackendApplicationError> {
         let BackendServerConfig {
-            config,
+            bind_host,
+            grpc_port,
+            metrics_http_port,
+            advertise_endpoint,
+            store_settings,
+            query_lifecycle_sweep_interval,
+            query_lifecycle_config,
+            execution_runtime_config,
             execution_installers,
         } = config;
-        novarocks::connector::schema::install_be_store_settings(
-            config.runtime.enable_tablet_write_log,
-            config.runtime.tablet_write_log_buffer_size,
-            config.runtime.be_txn_info_history_size,
-        );
-
-        let advertise_endpoint = network::standalone_advertise_endpoint_for_config(&config)
-            .map_err(|error| {
-                BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
-            })?;
+        store_settings.install();
         let readiness_addr =
             advertised_probe_addr(&advertise_endpoint.host, advertise_endpoint.port).map_err(
                 |error| {
                     BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
                 },
             )?;
-        let bind_host = config.server.host.clone();
-        let grpc_port = config.server.grpc_port;
-        let services = compose_backend_application_services(&config, &execution_installers)?;
-        let metrics_http_server = if config.server.http_port == grpc_port {
+        let services = compose_backend_application_services(
+            execution_runtime_config,
+            query_lifecycle_config,
+            &execution_installers,
+        )?;
+        let metrics_http_server = if metrics_http_port == grpc_port {
             MetricsHttpServer::shared_with_grpc()
         } else {
-            MetricsHttpServer::start(&bind_host, config.server.http_port).map_err(|error| {
+            MetricsHttpServer::start(&bind_host, metrics_http_port).map_err(|error| {
                 BackendApplicationError::new(BackendApplicationErrorKind::Start, error)
             })?
         };
         let native_fragment_service = Arc::clone(&services.native_fragment_service);
         let mut query_lifecycle_sweep = QueryLifecycleSweepTask::start(
             Arc::clone(&services.query_lifecycle_registry),
-            Duration::from_millis(config.runtime.query_control_heartbeat_interval_ms),
+            query_lifecycle_sweep_interval,
         )
         .map_err(|error| BackendApplicationError::new(BackendApplicationErrorKind::Start, error))?;
 
@@ -455,61 +488,6 @@ impl BackendApplicationHost {
             query_lifecycle_sweep,
             metrics_http_server,
         })
-    }
-}
-
-fn execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntimeConfig {
-    let runtime = &config.runtime;
-    let spill_io_threads = if runtime.spill_io_threads == 0 {
-        runtime.actual_exec_threads()
-    } else {
-        runtime.spill_io_threads
-    };
-    ExecutionRuntimeConfig {
-        driver_threads: runtime.actual_exec_threads(),
-        scan_threads: runtime.actual_scan_threads(),
-        scan_queue_capacity: runtime.pipeline_scan_thread_pool_queue_size.max(1),
-        spill_io_threads,
-        spill_io_queue_capacity: runtime.spill_io_queue_size.max(1),
-        spill_storage: ExecutionSpillStorageConfig {
-            enabled: config.spill.enable,
-            local_dirs: if config.spill.local_dirs.is_empty() {
-                vec![
-                    std::env::temp_dir()
-                        .join("novarocks-spill")
-                        .to_string_lossy()
-                        .into_owned(),
-                ]
-            } else {
-                config.spill.local_dirs.clone()
-            },
-            dir_max_bytes: config.spill.dir_max_bytes,
-            block_size_bytes: config.spill.block_size_bytes.max(1),
-            ipc_compression: config.spill.ipc_compression.clone(),
-        },
-        exchange_wait_ms: runtime.exchange_wait_ms,
-        exchange_io_threads: runtime.exchange_io_threads.max(1),
-        exchange_io_max_inflight_bytes: runtime.exchange_io_max_inflight_bytes.max(1),
-        exchange_max_transmit_batched_bytes: runtime.exchange_max_transmit_batched_bytes.max(1),
-        operator_buffer_chunks: runtime.operator_buffer_chunks.max(1),
-        local_exchange_buffer_mem_limit_per_driver: runtime
-            .local_exchange_buffer_mem_limit_per_driver
-            .max(1),
-        // `-1` is the established unlimited sentinel. It must cross the
-        // application/execution boundary unchanged so local exchanges do not
-        // accidentally become one-row buffers.
-        local_exchange_max_buffered_rows: runtime.local_exchange_max_buffered_rows,
-        connector_io_tasks_per_scan_operator: runtime.connector_io_tasks_per_scan_operator.max(1),
-        scan_submit_fail_max: runtime.scan_submit_fail_max.max(1),
-        scan_submit_fail_timeout_ms: runtime.scan_submit_fail_timeout_ms.max(1),
-        runtime_filter_scan_wait_time_ms_override: runtime
-            .runtime_filter_scan_wait_time_ms_override,
-        runtime_filter_wait_timeout_ms_override: runtime.runtime_filter_wait_timeout_ms_override,
-        sink_io_worker_threads: runtime.execution_services.actual_sink_io_worker_threads(),
-        sink_io_max_blocking_threads: runtime
-            .execution_services
-            .sink_io_max_blocking_threads
-            .max(1),
     }
 }
 
@@ -665,13 +643,15 @@ fn wait_for_tcp_ready(addr: SocketAddr, timeout: Duration) -> Result<(), String>
 mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, LazyLock, Mutex};
+    use std::time::Duration;
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-        BackendServerConfig, combine_primary_and_shutdown, compose_backend_application_services,
+        BackendServerConfig, QueryLifecycleRegistryConfig, combine_primary_and_shutdown,
+        compose_backend_application_services,
     };
     use crate::native::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
-    use novarocks::common::app_config::NovaRocksConfig;
+    use novarocks::common::network::AdvertiseEndpoint;
     use novarocks::query_execution::lifecycle::contract::{
         decode_query_control_event, encode_abort_query_request, encode_query_control_attach,
         encode_query_control_command, encode_query_init_request,
@@ -681,6 +661,9 @@ mod tests {
         ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
         QueryControlEndpoint, QueryControlEvent, QueryExecutionId, QueryInitRequest,
         QueryTerminationReason,
+    };
+    use novarocks_execution::runtime::execution_runtime::{
+        ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
     use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_protocol::novarocks::{
@@ -702,14 +685,71 @@ mod tests {
         port
     }
 
+    fn execution_runtime_config() -> ExecutionRuntimeConfig {
+        ExecutionRuntimeConfig {
+            driver_threads: 1,
+            scan_threads: 1,
+            scan_queue_capacity: 1,
+            spill_io_threads: 1,
+            spill_io_queue_capacity: 1,
+            spill_storage: ExecutionSpillStorageConfig::default(),
+            exchange_wait_ms: 1,
+            exchange_io_threads: 1,
+            exchange_io_max_inflight_bytes: 1,
+            exchange_max_transmit_batched_bytes: 1,
+            operator_buffer_chunks: 1,
+            local_exchange_buffer_mem_limit_per_driver: 1,
+            local_exchange_max_buffered_rows: -1,
+            connector_io_tasks_per_scan_operator: 1,
+            scan_submit_fail_max: 1,
+            scan_submit_fail_timeout_ms: 1,
+            runtime_filter_scan_wait_time_ms_override: None,
+            runtime_filter_wait_timeout_ms_override: None,
+            sink_io_worker_threads: 1,
+            sink_io_max_blocking_threads: 1,
+        }
+    }
+
+    fn query_lifecycle_registry_config(
+        heartbeat_timeout: Duration,
+    ) -> QueryLifecycleRegistryConfig {
+        QueryLifecycleRegistryConfig::new(
+            4_096,
+            16_384,
+            Duration::from_millis(120_000),
+            heartbeat_timeout,
+            Duration::from_millis(30_000),
+            256,
+            32,
+            48 * 1024 * 1024,
+            256 * 1024 * 1024,
+            512,
+            48 * 1024 * 1024,
+            Duration::from_millis(30_000),
+            Duration::from_millis(5_000),
+            Duration::from_millis(5_000),
+            5,
+            Duration::from_millis(100),
+            Duration::from_millis(1_000),
+            Duration::from_millis(120_000),
+            4_096,
+            256 * 1024 * 1024,
+        )
+    }
+
     fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
-        let mut config = NovaRocksConfig::default();
-        config.server.host = "127.0.0.1".to_string();
-        config.server.grpc_port = grpc_port;
-        config.cluster.advertise_host = "127.0.0.1".to_string();
-        config.cluster.advertise_port = advertise_port;
         BackendServerConfig {
-            config,
+            bind_host: "127.0.0.1".to_string(),
+            grpc_port,
+            metrics_http_port: grpc_port,
+            advertise_endpoint: AdvertiseEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: advertise_port,
+            },
+            store_settings: super::BackendStoreSettings::new(false, 0, 0),
+            query_lifecycle_sweep_interval: Duration::from_millis(1_000),
+            query_lifecycle_config: query_lifecycle_registry_config(Duration::from_millis(5_000)),
+            execution_runtime_config: execution_runtime_config(),
             execution_installers: Vec::new(),
         }
     }
@@ -752,9 +792,12 @@ mod tests {
 
     #[test]
     fn application_composition_owns_one_query_lifecycle_registry() {
-        let config = NovaRocksConfig::default();
-        let services = compose_backend_application_services(&config, &[])
-            .expect("compose backend application services");
+        let services = compose_backend_application_services(
+            execution_runtime_config(),
+            query_lifecycle_registry_config(Duration::from_millis(5_000)),
+            &[],
+        )
+        .expect("compose backend application services");
 
         assert_eq!(
             Arc::strong_count(&services.query_lifecycle_registry),
@@ -768,7 +811,7 @@ mod tests {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
         let mut config = backend_config(grpc_port, grpc_port);
-        config.config.cluster.advertise_host = "127.0.0.2".to_string();
+        config.advertise_endpoint.host = "127.0.0.2".to_string();
         let error = BackendApplicationHost::open_with_readiness_timeout(
             config,
             std::time::Duration::from_millis(25),
@@ -873,8 +916,8 @@ mod tests {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
         let mut config = backend_config(grpc_port, grpc_port);
-        config.config.runtime.query_control_heartbeat_interval_ms = 50;
-        config.config.runtime.query_control_heartbeat_timeout_ms = 250;
+        config.query_lifecycle_sweep_interval = Duration::from_millis(50);
+        config.query_lifecycle_config = query_lifecycle_registry_config(Duration::from_millis(250));
         let host = BackendApplicationHost::open(config).expect("native backend host starts");
         let mut client = connect_live_client(grpc_port).await;
         let heartbeat = client

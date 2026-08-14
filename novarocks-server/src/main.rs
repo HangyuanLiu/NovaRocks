@@ -251,14 +251,11 @@ fn run_standalone_be_role(
         .thread_stack_size(novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
         .build()
         .map_err(|error| anyhow::anyhow!("role=be: build Tokio runtime: {error}"))?;
-    let execution_installers =
-        composition::compose_backend_execution_installers(&cfg, runtime.handle().clone())?;
+    let backend_config =
+        composition::compose_backend_server_config(&cfg, runtime.handle().clone())?;
     runtime
         .block_on(novarocks_backend::run_backend_server_until_signal(
-            novarocks_backend::BackendServerConfig {
-                config: cfg,
-                execution_installers,
-            },
+            backend_config,
         ))
         .map_err(|error| anyhow::anyhow!("role=be: {error}"))
 }

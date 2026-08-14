@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use novarocks::common::app_config::NovaRocksConfig;
+use novarocks::common::network;
 use novarocks::mv::persistence::descriptor::MvDescriptorV1;
 use novarocks::mv::persistence::schema::{
     MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
@@ -34,7 +35,9 @@ use novarocks::mv::storage_observation::{
     MvSchemaValidationPartitionTransform, MvStorageObservationPort, MvTargetCreationObservation,
 };
 use novarocks::query_execution::backend::BackendTopologyPort;
-use novarocks_backend::{BackendApplicationHost, BackendServerConfig};
+use novarocks_backend::{
+    BackendApplicationHost, BackendServerConfig, BackendStoreSettings, QueryLifecycleRegistryConfig,
+};
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::control_factory::IcebergControlFactory;
 use novarocks_connector_iceberg::file_reader::execution_installer::IcebergConnectorInstaller;
@@ -44,6 +47,9 @@ use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageRefreshTechnique,
 };
 use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
+use novarocks_execution::runtime::execution_runtime::{
+    ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
+};
 use novarocks_frontend::FrontendServerConfig;
 use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
 use novarocks_spi::connector::{
@@ -378,6 +384,112 @@ pub fn compose_backend_execution_installers(
     Ok(installers)
 }
 
+/// Resolve the BE-owned startup facts from the application wire configuration.
+///
+/// This is intentionally the only Server-to-Backend projection: Backend
+/// receives no root configuration and therefore cannot observe unrelated
+/// Frontend, StateStore, or connector wire sections.
+pub fn compose_backend_server_config(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<BackendServerConfig> {
+    let runtime_config = &config.runtime;
+    let advertise_endpoint = network::standalone_advertise_endpoint_for_config(config)
+        .map_err(|error| anyhow::anyhow!("resolve backend advertise endpoint: {error}"))?;
+    Ok(BackendServerConfig {
+        bind_host: config.server.host.clone(),
+        grpc_port: config.server.grpc_port,
+        metrics_http_port: config.server.http_port,
+        advertise_endpoint,
+        store_settings: BackendStoreSettings::new(
+            runtime_config.enable_tablet_write_log,
+            runtime_config.tablet_write_log_buffer_size,
+            runtime_config.be_txn_info_history_size,
+        ),
+        query_lifecycle_sweep_interval: Duration::from_millis(
+            runtime_config.query_control_heartbeat_interval_ms,
+        ),
+        query_lifecycle_config: QueryLifecycleRegistryConfig::new(
+            runtime_config.query_control_max_active_entries,
+            runtime_config.query_control_tombstone_capacity,
+            Duration::from_millis(runtime_config.query_control_tombstone_retention_ms),
+            Duration::from_millis(runtime_config.query_control_heartbeat_timeout_ms),
+            Duration::from_millis(runtime_config.query_control_pre_start_timeout_ms),
+            runtime_config.query_control_stage_max_fragments,
+            runtime_config.query_control_max_active_staging,
+            runtime_config.query_control_stage_max_encoded_bytes,
+            runtime_config.query_control_stage_max_inflight_encoded_bytes,
+            runtime_config.query_control_stage_max_dormant_workers,
+            runtime_config.query_control_terminal_max_encoded_bytes,
+            Duration::from_millis(runtime_config.query_control_terminal_drain_timeout_ms),
+            Duration::from_millis(runtime_config.query_control_terminal_ack_timeout_ms),
+            Duration::from_millis(runtime_config.query_control_terminal_fallback_rpc_timeout_ms),
+            runtime_config.query_control_terminal_fallback_max_attempts,
+            Duration::from_millis(
+                runtime_config.query_control_terminal_fallback_initial_backoff_ms,
+            ),
+            Duration::from_millis(runtime_config.query_control_terminal_fallback_max_backoff_ms),
+            Duration::from_millis(runtime_config.query_control_terminal_retention_ms),
+            runtime_config.query_control_terminal_retained_capacity,
+            runtime_config.query_control_terminal_max_retained_bytes,
+        ),
+        execution_runtime_config: backend_execution_runtime_config(config),
+        execution_installers: compose_backend_execution_installers(config, runtime)?,
+    })
+}
+
+fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntimeConfig {
+    let runtime = &config.runtime;
+    let spill_io_threads = if runtime.spill_io_threads == 0 {
+        runtime.actual_exec_threads()
+    } else {
+        runtime.spill_io_threads
+    };
+    ExecutionRuntimeConfig {
+        driver_threads: runtime.actual_exec_threads(),
+        scan_threads: runtime.actual_scan_threads(),
+        scan_queue_capacity: runtime.pipeline_scan_thread_pool_queue_size.max(1),
+        spill_io_threads,
+        spill_io_queue_capacity: runtime.spill_io_queue_size.max(1),
+        spill_storage: ExecutionSpillStorageConfig {
+            enabled: config.spill.enable,
+            local_dirs: if config.spill.local_dirs.is_empty() {
+                vec![
+                    std::env::temp_dir()
+                        .join("novarocks-spill")
+                        .to_string_lossy()
+                        .into_owned(),
+                ]
+            } else {
+                config.spill.local_dirs.clone()
+            },
+            dir_max_bytes: config.spill.dir_max_bytes,
+            block_size_bytes: config.spill.block_size_bytes.max(1),
+            ipc_compression: config.spill.ipc_compression.clone(),
+        },
+        exchange_wait_ms: runtime.exchange_wait_ms,
+        exchange_io_threads: runtime.exchange_io_threads.max(1),
+        exchange_io_max_inflight_bytes: runtime.exchange_io_max_inflight_bytes.max(1),
+        exchange_max_transmit_batched_bytes: runtime.exchange_max_transmit_batched_bytes.max(1),
+        operator_buffer_chunks: runtime.operator_buffer_chunks.max(1),
+        local_exchange_buffer_mem_limit_per_driver: runtime
+            .local_exchange_buffer_mem_limit_per_driver
+            .max(1),
+        local_exchange_max_buffered_rows: runtime.local_exchange_max_buffered_rows,
+        connector_io_tasks_per_scan_operator: runtime.connector_io_tasks_per_scan_operator.max(1),
+        scan_submit_fail_max: runtime.scan_submit_fail_max.max(1),
+        scan_submit_fail_timeout_ms: runtime.scan_submit_fail_timeout_ms.max(1),
+        runtime_filter_scan_wait_time_ms_override: runtime
+            .runtime_filter_scan_wait_time_ms_override,
+        runtime_filter_wait_timeout_ms_override: runtime.runtime_filter_wait_timeout_ms_override,
+        sink_io_worker_threads: runtime.execution_services.actual_sink_io_worker_threads(),
+        sink_io_max_blocking_threads: runtime
+            .execution_services
+            .sink_io_max_blocking_threads
+            .max(1),
+    }
+}
+
 pub fn compose_frontend_control_factories(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
@@ -479,12 +591,9 @@ where
     let frontend = novarocks_frontend::open_frontend_application_for_server(&frontend_config)
         .await
         .map_err(|error| anyhow::anyhow!("open all-in-one frontend application failed: {error}"))?;
-    let execution_installers = compose_backend_execution_installers(&config, runtime)?;
+    let backend_config = compose_backend_server_config(&config, runtime)?;
     let mut backend = match BackendApplicationHost::open_with_terminal_ingress(
-        BackendServerConfig {
-            config: config.clone(),
-            execution_installers,
-        },
+        backend_config,
         Some(frontend.terminal_ingress()),
     ) {
         Ok(backend) => backend,

@@ -321,7 +321,7 @@ impl QueryLifecycleMetricsSink for PrometheusQueryLifecycleMetricsSink {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct QueryLifecycleRegistryConfig {
+pub struct QueryLifecycleRegistryConfig {
     pub(crate) max_active_entries: usize,
     pub(crate) tombstone_capacity: usize,
     pub(crate) tombstone_retention: Duration,
@@ -345,43 +345,50 @@ pub(crate) struct QueryLifecycleRegistryConfig {
 }
 
 impl QueryLifecycleRegistryConfig {
-    pub(crate) fn from_runtime_config(
-        runtime: &novarocks::common::app_config::RuntimeConfig,
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        max_active_entries: usize,
+        tombstone_capacity: usize,
+        tombstone_retention: Duration,
+        heartbeat_timeout: Duration,
+        pre_start_timeout: Duration,
+        stage_max_fragments: usize,
+        max_active_staging: usize,
+        stage_max_encoded_bytes: usize,
+        stage_max_inflight_encoded_bytes: usize,
+        stage_max_dormant_workers: usize,
+        terminal_max_encoded_bytes: usize,
+        terminal_drain_timeout: Duration,
+        terminal_ack_timeout: Duration,
+        terminal_fallback_rpc_timeout: Duration,
+        terminal_fallback_max_attempts: usize,
+        terminal_fallback_initial_backoff: Duration,
+        terminal_fallback_max_backoff: Duration,
+        terminal_retention: Duration,
+        terminal_retained_capacity: usize,
+        terminal_max_retained_bytes: usize,
     ) -> Self {
         Self {
-            max_active_entries: runtime.query_control_max_active_entries,
-            tombstone_capacity: runtime.query_control_tombstone_capacity,
-            tombstone_retention: Duration::from_millis(
-                runtime.query_control_tombstone_retention_ms,
-            ),
-            heartbeat_timeout: Duration::from_millis(runtime.query_control_heartbeat_timeout_ms),
-            pre_start_timeout: Duration::from_millis(runtime.query_control_pre_start_timeout_ms),
-            stage_max_fragments: runtime.query_control_stage_max_fragments,
-            max_active_staging: runtime.query_control_max_active_staging,
-            stage_max_encoded_bytes: runtime.query_control_stage_max_encoded_bytes,
-            stage_max_inflight_encoded_bytes: runtime
-                .query_control_stage_max_inflight_encoded_bytes,
-            stage_max_dormant_workers: runtime.query_control_stage_max_dormant_workers,
-            terminal_max_encoded_bytes: runtime.query_control_terminal_max_encoded_bytes,
-            terminal_drain_timeout: Duration::from_millis(
-                runtime.query_control_terminal_drain_timeout_ms,
-            ),
-            terminal_ack_timeout: Duration::from_millis(
-                runtime.query_control_terminal_ack_timeout_ms,
-            ),
-            terminal_fallback_rpc_timeout: Duration::from_millis(
-                runtime.query_control_terminal_fallback_rpc_timeout_ms,
-            ),
-            terminal_fallback_max_attempts: runtime.query_control_terminal_fallback_max_attempts,
-            terminal_fallback_initial_backoff: Duration::from_millis(
-                runtime.query_control_terminal_fallback_initial_backoff_ms,
-            ),
-            terminal_fallback_max_backoff: Duration::from_millis(
-                runtime.query_control_terminal_fallback_max_backoff_ms,
-            ),
-            terminal_retention: Duration::from_millis(runtime.query_control_terminal_retention_ms),
-            terminal_retained_capacity: runtime.query_control_terminal_retained_capacity,
-            terminal_max_retained_bytes: runtime.query_control_terminal_max_retained_bytes,
+            max_active_entries,
+            tombstone_capacity,
+            tombstone_retention,
+            heartbeat_timeout,
+            pre_start_timeout,
+            stage_max_fragments,
+            max_active_staging,
+            stage_max_encoded_bytes,
+            stage_max_inflight_encoded_bytes,
+            stage_max_dormant_workers,
+            terminal_max_encoded_bytes,
+            terminal_drain_timeout,
+            terminal_ack_timeout,
+            terminal_fallback_rpc_timeout,
+            terminal_fallback_max_attempts,
+            terminal_fallback_initial_backoff,
+            terminal_fallback_max_backoff,
+            terminal_retention,
+            terminal_retained_capacity,
+            terminal_max_retained_bytes,
         }
     }
 }
