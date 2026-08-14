@@ -963,14 +963,6 @@ impl AttemptControl {
         timeout: Duration,
     ) -> Result<(), String> {
         self.wait_terminal_event(timeout, |terminal| {
-            if self.terminal_delivery_started(terminal) {
-                // A Finalize command can turn a locally drained backend into
-                // TerminalRetained before its in-flight heartbeat is handled.
-                // Terminal delivery still needs the stream reader, but no
-                // longer needs liveness heartbeats once every participant has
-                // drained.
-                return Some(Ok(()));
-            }
             if terminal.backend_stream_closed.contains(&backend_idx) {
                 return Some(Err(format!(
                     "query lifecycle backend {backend_idx} control stream closed"
@@ -1278,14 +1270,11 @@ fn control_event_reader(control: Weak<AttemptControl>, session: ActiveSession) {
                 if matches!(error.kind(), QueryLifecycleTransportErrorKind::StreamClosed)
                     && control.state.load(Ordering::Acquire) == FINALIZING =>
             {
-                // A Finalize command has already fenced normal execution. A
-                // stream can disappear before the snapshot frame; retain the
-                // participant slot and let its unary fallback complete it.
-                tracing::info!(
-                    backend_idx = session.target.backend_idx(),
-                    error = %error,
-                    "query lifecycle terminal stream closed; waiting for unary snapshot fallback"
-                );
+                // The unary fallback may still win, but the supervisor must
+                // keep checking the same generation-fenced owner. A later
+                // heartbeat failure becomes a liveness fact instead of a
+                // generic terminal timeout.
+                control.record_backend_stream_closed(session.target.backend_idx());
                 return;
             }
             Err(error) => {
@@ -1629,12 +1618,6 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
     let started = Instant::now();
     let mut sequence = 0u64;
     while control.wait_heartbeat_interval() {
-        {
-            let terminal = control.terminal.0.lock().expect("query terminal state");
-            if control.terminal_delivery_started(&terminal) {
-                return;
-            }
-        }
         sequence = match sequence.checked_add(1) {
             Some(sequence) => sequence,
             None => {
@@ -1659,10 +1642,6 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
                         ),
                         SupervisorFailureKind::HeartbeatTimeout,
                     );
-                    return;
-                }
-                let terminal = control.terminal.0.lock().expect("query terminal state");
-                if control.terminal_delivery_started(&terminal) {
                     return;
                 }
                 control.supervisor_failed(
