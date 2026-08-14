@@ -42,7 +42,9 @@ use super::{
     QueryLifecycleTransportErrorKind,
 };
 use crate::coordinator::query_registry::ActiveQueryAttemptBinding;
-use crate::coordinator::query_registry::{ActiveQueryAttemptControl, FrontendQueryRegistry};
+use crate::coordinator::query_registry::{
+    ActiveQueryAttemptControl, FrontendQueryRegistry, QueryLifecycleConvergenceSnapshot,
+};
 
 const ACTIVE: u8 = 0;
 const ABORTED: u8 = 1;
@@ -1627,6 +1629,30 @@ impl ActiveQueryAttemptControl for AttemptControl {
 
     fn retain_terminal_ingress(&self) -> bool {
         self.retain_terminal_ingress.load(Ordering::Acquire) || self.terminal_set().is_ok()
+    }
+
+    fn convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
+        let outcomes = self
+            .terminal
+            .0
+            .lock()
+            .expect("query terminal state")
+            .outcomes
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        if outcomes.is_empty() && self.state.load(Ordering::Acquire) == ACTIVE {
+            return None;
+        }
+        Some(QueryLifecycleConvergenceSnapshot {
+            execution_id: self.execution_id,
+            primary_error: self
+                .primary_error
+                .lock()
+                .expect("query lifecycle primary error")
+                .clone(),
+            participant_outcomes: outcomes,
+        })
     }
 }
 

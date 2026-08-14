@@ -29,6 +29,17 @@ use novarocks_types::UniqueId;
 
 type QueryKey = (i64, i64);
 
+/// Immutable, query-scoped terminal convergence evidence retained alongside
+/// the unary terminal ingress.  It is intentionally produced by the attempt
+/// control that owns the control streams, never reconstructed from process
+/// metrics or logs.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct QueryLifecycleConvergenceSnapshot {
+    pub(crate) execution_id: QueryExecutionId,
+    pub(crate) primary_error: Option<String>,
+    pub(crate) participant_outcomes: Vec<ParticipantTerminalOutcome>,
+}
+
 pub(crate) trait ActiveQueryAttemptControl: Send + Sync {
     fn execution_id(&self) -> QueryExecutionId;
 
@@ -47,6 +58,10 @@ pub(crate) trait ActiveQueryAttemptControl: Send + Sync {
     /// enough for a BE whose stream ACK was lost to complete unary fallback.
     fn retain_terminal_ingress(&self) -> bool {
         false
+    }
+
+    fn convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
+        None
     }
 }
 
@@ -438,6 +453,15 @@ impl FrontendQueryRegistry {
             .and_then(|query| query.first_failure.clone())
     }
 
+    pub(crate) fn retained_convergence_snapshot(
+        &self,
+        execution_id: QueryExecutionId,
+    ) -> Option<QueryLifecycleConvergenceSnapshot> {
+        self.retained_terminal_control(execution_id)
+            .ok()
+            .and_then(|control| control.convergence_snapshot())
+    }
+
     pub(crate) fn preserve_failure_context(
         &self,
         query_id: QueryId,
@@ -726,6 +750,14 @@ mod tests {
         fn retain_terminal_ingress(&self) -> bool {
             true
         }
+
+        fn convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
+            Some(QueryLifecycleConvergenceSnapshot {
+                execution_id: self.execution_id,
+                primary_error: Some("stable test failure".to_string()),
+                participant_outcomes: Vec::new(),
+            })
+        }
     }
 
     fn terminal_snapshot(execution_id: QueryExecutionId) -> QueryTerminalSnapshot {
@@ -773,6 +805,14 @@ mod tests {
                 .expect("retained ingress accepts duplicate terminal delivery")
         );
         assert_eq!(control.reports.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            registry
+                .retained_convergence_snapshot(execution_id)
+                .expect("retained control exposes its immutable convergence snapshot")
+                .primary_error
+                .as_deref(),
+            Some("stable test failure")
+        );
     }
 
     #[test]
