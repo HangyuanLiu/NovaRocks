@@ -51,44 +51,30 @@ enum LifecycleParticipantOutcomeWire {
 fn query_lifecycle_structured_snapshot_from_fe(
     port: u16,
 ) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
-    let address = format!("127.0.0.1:{port}");
-    let mut stream = TcpStream::connect_timeout(
-        &address
-            .parse()
-            .with_context(|| format!("parse FE lifecycle snapshot address {address}"))?,
-        TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
-    )
-    .with_context(|| format!("connect FE lifecycle snapshot endpoint {address}"))?;
-    stream
-        .set_read_timeout(Some(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP))
-        .context("set FE lifecycle snapshot read timeout")?;
-    stream
-        .set_write_timeout(Some(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP))
-        .context("set FE lifecycle snapshot write timeout")?;
-    stream
-        .write_all(
-            format!(
-                "GET {LIFECYCLE_CONVERGENCE_DEBUG_PATH} HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n"
-            )
-            .as_bytes(),
-        )
+    let response = reqwest::blocking::Client::builder()
+        // The FE report listener is the native h2c lifecycle endpoint. Force
+        // h2c here instead of treating an HTTP/1 timeout as an absent snapshot.
+        .http2_prior_knowledge()
+        .timeout(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP)
+        .build()
+        .context("build FE lifecycle snapshot client")?
+        .get(format!(
+            "http://127.0.0.1:{port}{LIFECYCLE_CONVERGENCE_DEBUG_PATH}"
+        ))
+        .send()
         .context("request FE lifecycle snapshot")?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .context("read FE lifecycle snapshot response")?;
-    let (headers, body) = response
-        .split_once("\r\n\r\n")
-        .context("malformed FE lifecycle snapshot HTTP response")?;
-    let status = headers.lines().next().unwrap_or("<missing status>");
-    if status.starts_with("HTTP/1.1 404") || status.starts_with("HTTP/1.0 404") {
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
-    if !status.starts_with("HTTP/1.1 200") && !status.starts_with("HTTP/1.0 200") {
-        bail!("FE lifecycle snapshot returned non-success status: {status}");
+    if !response.status().is_success() {
+        bail!(
+            "FE lifecycle snapshot returned non-success status: {}",
+            response.status()
+        );
     }
-    let wire: LifecycleConvergenceWireSnapshot =
-        serde_json::from_str(body).context("decode FE lifecycle snapshot JSON")?;
+    let wire: LifecycleConvergenceWireSnapshot = response
+        .json()
+        .context("decode FE lifecycle snapshot JSON")?;
     let error_source = match wire.error_source.as_deref() {
         None => None,
         Some("backend-attestation") => Some(QueryLifecycleErrorSource::BackendAttestation),
