@@ -2250,7 +2250,18 @@ impl QueryLifecycleRegistry {
             self.publish_tombstone(&entry, execution_id, requested_reason);
         }
         if schedule_failure_drain {
-            self.schedule_failed_terminal_drain(entry);
+            // A coordinator Abort is an authoritative instruction to stop the
+            // admitted participant.  It must not share the frontend's
+            // terminal-outcome deadline while a non-cooperative fragment is
+            // still unwinding: retain the explicit IncompleteDrain proof now.
+            // Local failures keep their bounded drain window so their own
+            // terminal facts can still be captured first.
+            let drain_timeout = if requested_reason == QueryTerminationReason::CoordinatorAbort {
+                Duration::ZERO
+            } else {
+                self.config.terminal_drain_timeout
+            };
+            self.schedule_failed_terminal_drain(entry, drain_timeout);
         }
         requested_reason
     }
@@ -2402,9 +2413,8 @@ impl QueryLifecycleRegistry {
         );
     }
 
-    fn schedule_failed_terminal_drain(&self, entry: Arc<QueryLifecycleEntry>) {
+    fn schedule_failed_terminal_drain(&self, entry: Arc<QueryLifecycleEntry>, timeout: Duration) {
         let weak = self.self_weak.clone();
-        let timeout = self.config.terminal_drain_timeout;
         std::thread::Builder::new()
             .name("query-terminal-failure-drain".to_string())
             .spawn(move || {

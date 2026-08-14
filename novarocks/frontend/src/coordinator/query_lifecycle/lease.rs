@@ -51,6 +51,7 @@ const ACTIVE: u8 = 0;
 const ABORTED: u8 = 1;
 const FINALIZING: u8 = 2;
 const FINALIZED: u8 = 3;
+const ABORT_TERMINAL_DELIVERY_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
 enum SupervisorFailureKind {
@@ -759,9 +760,19 @@ impl AttemptControl {
         self.retain_terminal_ingress.store(true, Ordering::Release);
         let primary_error = self.abort_preserving(primary_error);
         // A failed running query is allowed to finish draining after the
-        // abort acknowledgement.  Preserve a set already delivered on the
-        // stream without ever delaying or replacing the original failure.
-        QueryLifecycleAbortOutcome::new(primary_error, self.terminal_set().ok())
+        // abort acknowledgement.  Keep the control readers alive for the
+        // bounded terminal-delivery interval so their store-before-ACK path
+        // releases the BE's retained P1 record.  The original execution
+        // failure remains authoritative if convergence does not complete.
+        let terminal_set = self
+            .wait_for_all_outcomes(
+                self.config
+                    .terminal_snapshot_timeout()
+                    .min(ABORT_TERMINAL_DELIVERY_GRACE),
+            )
+            .ok()
+            .or_else(|| self.terminal_set().ok());
+        QueryLifecycleAbortOutcome::new(primary_error, terminal_set)
     }
 
     fn abort(&self, primary_error: String, force_unary: bool) -> String {
@@ -1826,8 +1837,9 @@ impl QueryLifecycleLeaseGuard for FrontendQueryLifecycleLeaseGuard {
     }
 
     fn abort_preserving(mut self: Box<Self>, primary_error: String) -> QueryLifecycleAbortOutcome {
+        let outcome = self.control.abort_with_terminal_outcome(primary_error);
         self.stop_and_join();
-        self.control.abort_with_terminal_outcome(primary_error)
+        outcome
     }
 }
 

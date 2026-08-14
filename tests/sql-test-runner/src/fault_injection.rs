@@ -930,7 +930,16 @@ where
                             let server = worker_server
                                 .lock()
                                 .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
-                            terminal_cleanup_on_all_backends(server.as_ref(), execution)?
+                            terminal_cleanup_on_all_backends(
+                                server.as_ref(),
+                                execution,
+                                !matches!(
+                                    &fault,
+                                    PostQueryFault::KillFrontendAtLifecyclePhase(
+                                        crate::types::QueryLifecyclePhase::TerminalRetained,
+                                    )
+                                ),
+                            )?
                         }
                         _ => true,
                     };
@@ -1076,7 +1085,11 @@ fn fresh_lifecycle_phase_execution(
     Ok(Some(first.clone()))
 }
 
-fn terminal_cleanup_on_all_backends(server: &dyn ServerHandle, execution_id: &str) -> Result<bool> {
+fn terminal_cleanup_on_all_backends(
+    server: &dyn ServerHandle,
+    execution_id: &str,
+    require_terminated_marker: bool,
+) -> Result<bool> {
     if server.be_count() != 3 {
         bail!(
             "post-query lifecycle terminal cleanup evidence requires exactly 3 BEs, found {}",
@@ -1095,7 +1108,7 @@ fn terminal_cleanup_on_all_backends(server: &dyn ServerHandle, execution_id: &st
                 && marker_field(line, "active").as_deref() == Some("false")
                 && marker_field(line, "tombstone").as_deref() == Some("true")
         });
-        if !terminated || !cleaned {
+        if (require_terminated_marker && !terminated) || !cleaned {
             return Ok(false);
         }
     }

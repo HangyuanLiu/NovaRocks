@@ -2104,6 +2104,62 @@ fn terminal_closeout_preserves_first_wins_termination_reason_metrics() {
 }
 
 #[test]
+fn coordinator_abort_immediately_retains_incomplete_drain_proof_for_admitted_participant() {
+    let runtime = RecordingLocalRuntime::default();
+    let registry = registry_with(runtime, 8);
+    let expected = UniqueId::new(76, 7);
+    let request = fragment_init_request_fixture(76_007, &[expected]);
+    let execution_id = request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let mut attachment = attach_control(&registry, &request);
+    assert!(matches!(
+        attachment.events.try_recv(),
+        Ok(QueryControlEvent::ControlReady)
+    ));
+    registry
+        .admit_fragment(execution_id, expected)
+        .expect("fragment permit")
+        .commit()
+        .expect("fragment admission commits");
+
+    attachment
+        .control
+        .abort("coordinator cancellation".to_string())
+        .expect("coordinator abort is accepted");
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let outcome = loop {
+        match attachment.events.try_recv() {
+            Ok(QueryControlEvent::TerminalOutcome { outcome }) => break outcome,
+            Ok(_) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("coordinator abort terminal proof was not delivered: {error}"),
+        }
+    };
+    let novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::Proof {
+        snapshot, ..
+    } = outcome
+    else {
+        panic!("coordinator abort must retain a terminal proof");
+    };
+    assert_eq!(snapshot.execution_id(), execution_id);
+    assert!(matches!(
+        snapshot
+            .fragments()
+            .first()
+            .expect("one fragment")
+            .outcome(),
+        FragmentTerminalOutcome::IncompleteDrain { .. }
+    ));
+    assert_eq!(registry.metrics_snapshot().terminal_records_frozen, 1);
+}
+
+#[test]
 fn query_lifecycle_registry_rejects_fragment_executor_without_exact_set() {
     let runtime = RecordingLocalRuntime::default();
     let registry = registry_with(runtime.clone(), 8);

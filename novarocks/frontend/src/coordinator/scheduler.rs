@@ -281,7 +281,7 @@ impl FrontendFragmentScheduler {
             draft.assign_fragment(fragment_id, placements)?;
         }
         let schedule = ValidatedFragmentSchedule::validate(view, execution_id, draft)?;
-        bind_query_lifecycle_fault_scopes(execution_id, &self.backends, &schedule.backend_ids())?;
+        bind_query_lifecycle_fault_scopes(execution_id, &self.backends)?;
         Ok(schedule)
     }
 }
@@ -290,7 +290,6 @@ impl FrontendFragmentScheduler {
 fn bind_query_lifecycle_fault_scopes(
     execution_id: QueryExecutionId,
     backends: &FrontendBackendSnapshot,
-    scheduled_backend_ids: &[usize],
 ) -> Result<(), DistributedQueryError> {
     use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, bind_armed_fault};
 
@@ -298,9 +297,6 @@ fn bind_query_lifecycle_fault_scopes(
         return Ok(());
     };
     for &(backend_index, _) in &backends.entries {
-        if !scheduled_backend_ids.contains(&backend_index) {
-            continue;
-        }
         let start_epoch = backends
             .generations
             .get(&backend_index)
@@ -365,7 +361,6 @@ fn bind_query_lifecycle_fault_scopes(
 fn bind_query_lifecycle_fault_scopes(
     _execution_id: QueryExecutionId,
     _backends: &FrontendBackendSnapshot,
-    _scheduled_backend_ids: &[usize],
 ) -> Result<(), DistributedQueryError> {
     Ok(())
 }
