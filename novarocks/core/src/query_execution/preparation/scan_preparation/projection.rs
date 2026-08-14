@@ -97,20 +97,16 @@ fn projected_target_state_column_names(
     scan: &novarocks_sql::plan_read::table::SqlMvTargetStateScan,
 ) -> Vec<String> {
     let mut names = Vec::new();
-    push_unique_projected_name(&mut names, &scan.row_id_column_name);
+    push_unique_projected_name(&mut names, scan.row_id_column_name());
     for name in scan
-        .group_key_names
+        .group_key_names()
         .iter()
-        .chain(scan.aggregate_state_names.iter())
+        .chain(scan.aggregate_state_names().iter())
     {
         push_unique_projected_name(&mut names, name);
     }
-    if let novarocks_sql::plan_read::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
-        branch_scope: Some(scope),
-        ..
-    } = &scan.row_filter
-    {
-        push_unique_projected_name(&mut names, &scope.branch_id_column_name);
+    if let Some(branch_id_column) = scan.branch_id_column_name() {
+        push_unique_projected_name(&mut names, branch_id_column);
     }
     for name in [
         novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
@@ -126,8 +122,8 @@ fn projected_target_state_column_names(
 fn projected_target_locator_column_names(
     scan: &novarocks_sql::plan_read::table::SqlMvTargetLocatorScan,
 ) -> Vec<String> {
-    let mut names = vec![scan.apply_key_column.clone()];
-    if let Some(branch_id_column) = &scan.branch_id_column {
+    let mut names = vec![scan.apply_key_column().to_string()];
+    if let Some(branch_id_column) = scan.branch_id_column() {
         push_unique_projected_name(&mut names, branch_id_column);
     }
     for name in [

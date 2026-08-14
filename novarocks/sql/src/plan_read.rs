@@ -50,10 +50,52 @@ pub use novarocks_spi::connector::{
 /// Read-only SQL table facts used by plan encoders.
 pub mod table {
     pub use crate::planner::table::{
-        ScanSource, SqlMetadataTableKind, SqlMvTargetStatePartitionConstraint,
-        SqlMvTargetStateRowFilter, SqlScanKind, SqlScanSource, SqlTableIdentity,
-        SqlTableVersionSelector, TableDef,
+        ScanSource, SqlMetadataTableKind, SqlMvTargetLocatorScan,
+        SqlMvTargetStatePartitionConstraint, SqlMvTargetStateRowFilter, SqlMvTargetStateScan,
+        SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
     };
+
+    impl SqlMvTargetStateScan {
+        /// Return the target row-id column captured by SQL admission.
+        pub fn row_id_column_name(&self) -> &str {
+            &self.row_id_column_name
+        }
+
+        /// Return the target group-key columns captured by SQL admission.
+        pub fn group_key_names(&self) -> &[String] {
+            &self.group_key_names
+        }
+
+        /// Return the aggregate-state columns captured by SQL admission.
+        pub fn aggregate_state_names(&self) -> &[String] {
+            &self.aggregate_state_names
+        }
+
+        /// Return the optional branch-id column needed by this target-state scan.
+        pub fn branch_id_column_name(&self) -> Option<&str> {
+            match &self.row_filter {
+                SqlMvTargetStateRowFilter::DeltaInputRowIds {
+                    branch_scope: Some(scope),
+                    ..
+                } => Some(&scope.branch_id_column_name),
+                SqlMvTargetStateRowFilter::DeltaInputRowIds {
+                    branch_scope: None, ..
+                } => None,
+            }
+        }
+    }
+
+    impl SqlMvTargetLocatorScan {
+        /// Return the physical apply-key column captured by SQL admission.
+        pub fn apply_key_column(&self) -> &str {
+            &self.apply_key_column
+        }
+
+        /// Return the optional branch-id column captured by SQL admission.
+        pub fn branch_id_column(&self) -> Option<&str> {
+            self.branch_id_column.as_deref()
+        }
+    }
 }
 
 /// Read-only runtime-filter planning facts used by plan encoders.
