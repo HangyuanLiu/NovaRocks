@@ -25,10 +25,12 @@ use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
 
-use crate::sql::literal::{LiteralKey, compare_literals, literal_from_batch, literal_to_key};
-use crate::sql::parser::ast::{ColumnAggregation, Literal, TableKeyDesc, TableKeyKind};
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_sql::syntax::{
+    AggregateLiteralKey, ColumnAggregation, Literal, TableKeyDesc, TableKeyKind,
+    aggregate_literal_key, compare_aggregate_literals, literal_from_batch,
+};
 
 pub(crate) fn merge_aggregate_table_rows_if_needed(
     columns: &[ColumnDef],
@@ -60,14 +62,14 @@ pub(crate) fn merge_aggregate_table_rows_if_needed(
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut merged_rows = Vec::<Vec<Literal>>::new();
-    let mut row_index_by_key = HashMap::<Vec<LiteralKey>, usize>::new();
+    let mut row_index_by_key = HashMap::<Vec<AggregateLiteralKey>, usize>::new();
     for row_idx in 0..batch.num_rows() {
         let row = (0..batch.num_columns())
             .map(|col_idx| literal_from_batch(batch.column(col_idx), row_idx))
             .collect::<Result<Vec<_>, _>>()?;
         let key = key_indices
             .iter()
-            .map(|idx| literal_to_key(&row[*idx]))
+            .map(|idx| aggregate_literal_key(&row[*idx]))
             .collect::<Vec<_>>();
         if let Some(existing_idx) = row_index_by_key.get(&key).copied() {
             let existing = merged_rows
@@ -149,7 +151,7 @@ fn merge_aggregate_table_value(
                 return Ok(());
             }
             if matches!(existing, Literal::Null)
-                || compare_literals(incoming, existing)? == std::cmp::Ordering::Less
+                || compare_aggregate_literals(incoming, existing)? == std::cmp::Ordering::Less
             {
                 *existing = incoming.clone();
             }
@@ -160,7 +162,7 @@ fn merge_aggregate_table_value(
                 return Ok(());
             }
             if matches!(existing, Literal::Null)
-                || compare_literals(incoming, existing)? == std::cmp::Ordering::Greater
+                || compare_aggregate_literals(incoming, existing)? == std::cmp::Ordering::Greater
             {
                 *existing = incoming.clone();
             }

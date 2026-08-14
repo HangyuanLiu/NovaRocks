@@ -15,90 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::datatypes::DataType;
-
 use super::super::boundary_schema::{BoundaryKind, BoundarySchemaColumn, project_boundary_reports};
 use super::*;
 use crate::connector::ConnectorRegistry;
-use crate::sql::analysis::cte::CteId;
-use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
-use crate::sql::catalog::PlannerTableProvider;
-use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::{
-    BoundaryContract, BoundaryKind as PlannerBoundaryKind, DataPartition, DistributedNode,
-    DistributedNodeKind, ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind,
-    FragmentId, FragmentStreamKind, PartitionKind, PlanFragment,
-};
-use crate::sql::planner::payload::{PlanScanNode, PlanValuesNode};
-use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
-use crate::sql::planner::table::{ScanSource, SqlScanSource, SqlTableIdentity, TableDef};
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorReadSelector, ConnectorTableIdentity,
     ConnectorTableRequest, ConnectorTableResolution,
 };
+use novarocks_sql::catalog::ResolvedAnalyzerTable;
+use novarocks_sql::plan_read::{DistributedNodeKind, DistributedPlan};
+use novarocks_sql::test_support::native_scan_fixture_binding;
 
-struct EmptyCatalog;
-
-impl PlannerTableProvider for EmptyCatalog {
-    fn resolve_table_for_analysis(
-        &self,
-        _catalog: Option<&str>,
-        database: &str,
-        table: &str,
-    ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
-        Err(format!("unexpected table lookup {database}.{table}"))
-    }
-}
-
-fn stats() -> PhysicalPlanStats {
-    PhysicalPlanStats {
-        output_row_count: 0.0,
-        row_count_confidence: PlannerConfidence::Fallback,
-        column_statistics: HashMap::new(),
-        cost_estimate: None,
-        broadcast_decision: None,
-    }
-}
-
-fn output_col(id: u32, name: &str) -> AnalysisOutputColumn {
-    AnalysisOutputColumn {
-        column_id: ColumnId::new_for_test(id),
-        name: name.to_string(),
-        data_type: DataType::Int64,
-        nullable: false,
-        is_internal: false,
-    }
-}
-
-fn physical_values_node(
-    fragment_id: FragmentId,
-    node_id: i32,
-    columns: Vec<AnalysisOutputColumn>,
-) -> DistributedNode {
-    DistributedNode {
-        node_id,
-        fragment_id,
-        tuple_ids: vec![node_id],
-        nullable_tuple_ids: Vec::new(),
-        limit: -1,
-        runtime_filter_binding_ids: Vec::new(),
-        children: Vec::new(),
-        stats: stats(),
-        payload: DistributedNodeKind::Values(PlanValuesNode {
-            rows: Vec::new(),
-            columns,
-        }),
-    }
-}
-
-/// Build-only tests model the application admission boundary explicitly: the
-/// sealed SQL source carries a token, while the exact provider lease and scan
-/// facts stay in a request-local binding store.
+/// Build-only tests model application admission explicitly: the SQL fixture
+/// supplies a copied identity snapshot, and Core creates the request-local
+/// provider binding. No test receives a mutable SQL plan or source carrier.
 pub(super) fn fixture_query_table_bindings(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
@@ -114,32 +48,31 @@ pub(super) fn fixture_query_table_bindings(
             DistributedNodeKind::Scan(scan) => Some(scan),
             _ => None,
         })?;
-    let ScanSource::Sql(source) = &scan.table.source;
-    let planning_lease = controls
-        .acquire_current(
-            &ConnectorInstanceId::parse(&source.table.catalog)
-                .expect("fixture catalog must be a valid connector instance"),
-        )
-        .ok();
-    let source = source.clone();
-    let planner = scan.table.clone();
+    let fixture = native_scan_fixture_binding(plan)?;
     let store = QueryTableBindingStore::try_new_with_scope_for_test(
         NonZeroU64::new(1).expect("fixture scope"),
     );
+    let planning_lease = controls
+        .acquire_current(
+            &ConnectorInstanceId::parse(&fixture.catalog)
+                .expect("fixture catalog must be a valid connector instance"),
+        )
+        .ok();
+    if planning_lease.is_none() && fixture.is_delta {
+        // Resolver-only negative tests deliberately omit connector admission so
+        // they can assert resolver failure before generic read planning.
+        return Some(store);
+    }
+    let planner = scan.table.clone();
+
     store
         .resolve_or_insert_with_id(
-            QueryTableBindingKey::strict_base("test_catalog", "test_db", "test_table"),
-            |binding| {
-                let mut resolved_planner = planner.clone();
-                resolved_planner.source = ScanSource::Sql(SqlScanSource::new(
-                    binding,
-                    SqlTableIdentity {
-                        catalog: source.table.catalog.clone(),
-                        namespace: source.table.namespace.clone(),
-                        table: source.table.table.clone(),
-                    },
-                    source.kind.clone(),
-                ));
+            QueryTableBindingKey::strict_base(
+                &fixture.catalog,
+                &fixture.namespace,
+                &fixture.table,
+            ),
+            |_| {
                 let lease = planning_lease.clone().ok_or_else(|| {
                     "build fixture must acquire an exact connector lease".to_string()
                 })?;
@@ -148,20 +81,20 @@ pub(super) fn fixture_query_table_bindings(
                     .metadata()
                     .load_table(ConnectorTableRequest {
                         table: ConnectorTableIdentity {
-                            instance_id: ConnectorInstanceId::parse(&source.table.catalog)
+                            instance_id: ConnectorInstanceId::parse(&fixture.catalog)
                                 .expect("fixture catalog must be valid"),
-                            namespace: Arc::from(source.table.namespace.as_str()),
-                            table: Arc::from(source.table.table.as_str()),
+                            namespace: Arc::from(fixture.namespace.as_str()),
+                            table: Arc::from(fixture.table.as_str()),
                         },
                         resolution: ConnectorTableResolution::StrictBaseTable,
                         context: crate::connector::test_request_context(),
                     })
                     .map_err(|error| error.to_string())?;
                 Ok(QueryTableBinding {
-                    resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
-                        Some(&source.table.catalog),
-                        &source.table.namespace,
-                        resolved_planner,
+                    resolved: ResolvedAnalyzerTable::from_planner(
+                        Some(&fixture.catalog),
+                        &fixture.namespace,
+                        planner.clone(),
                     ),
                     statistics_pin: None,
                     admission:
@@ -184,219 +117,6 @@ pub(super) fn fixture_query_table_bindings(
         )
         .expect("fixture query binding");
     Some(store)
-}
-
-fn iceberg_scan_plan(required_columns: Option<Vec<&str>>) -> DistributedPlan {
-    iceberg_scan_plan_with_outputs(required_columns, &["id"])
-}
-
-fn iceberg_scan_plan_with_outputs(
-    required_columns: Option<Vec<&str>>,
-    output_names: &[&str],
-) -> DistributedPlan {
-    let id = AnalysisOutputColumn {
-        column_id: ColumnId::new_for_test(1),
-        name: "id".to_string(),
-        data_type: DataType::Int32,
-        nullable: false,
-        is_internal: false,
-    };
-    let category = AnalysisOutputColumn {
-        column_id: ColumnId::new_for_test(3),
-        name: "category".to_string(),
-        data_type: DataType::Utf8,
-        nullable: true,
-        is_internal: false,
-    };
-    let all_outputs = [id, category];
-    let output_columns = output_names
-        .iter()
-        .map(|name| {
-            all_outputs
-                .iter()
-                .find(|column| column.name == *name)
-                .unwrap_or_else(|| panic!("unknown Iceberg scan test output {name}"))
-                .clone()
-        })
-        .collect::<Vec<_>>();
-    let table = TableDef {
-        name: "ice_t".to_string(),
-        columns: vec![
-            novarocks_catalog::schema::ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            },
-            novarocks_catalog::schema::ColumnDef {
-                name: "category".to_string(),
-                data_type: DataType::Utf8,
-                nullable: true,
-                write_default: None,
-                logical_type: None,
-            },
-        ],
-        iceberg_row_lineage_metadata_columns: Vec::new(),
-        source: crate::sql::planner::table::test_sql_scan_source(
-            crate::sql::planner::table::SqlScanKind::Data {
-                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
-            },
-        ),
-    };
-    let scan = DistributedNode {
-        node_id: 10,
-        fragment_id: 0,
-        tuple_ids: vec![10],
-        nullable_tuple_ids: Vec::new(),
-        limit: -1,
-        runtime_filter_binding_ids: Vec::new(),
-        children: Vec::new(),
-        stats: stats(),
-        payload: DistributedNodeKind::Scan(PlanScanNode {
-            database: "default".to_string(),
-            table,
-            alias: None,
-            columns: output_columns.clone(),
-            predicates: Vec::new(),
-            required_columns: required_columns
-                .map(|columns| columns.into_iter().map(str::to_string).collect()),
-            variant_columns: Vec::new(),
-            mv_rewritten_from: None,
-        }),
-    };
-    crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
-        fragments: vec![PlanFragment {
-            fragment_id: 0,
-            root: scan,
-            data_partition: DataPartition::unpartitioned(),
-            output_partition: DataPartition::unpartitioned(),
-            sink: crate::sql::planner::distributed::DataSink::Result,
-            output_exprs: None,
-            output_columns,
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        }],
-        root_fragment_id: 0,
-        runtime_filter_graph: Default::default(),
-        edges: Vec::new(),
-    }
-}
-
-fn native_file_range(
-    range: &crate::runtime::scan_range::ScanRangeParams,
-) -> &crate::runtime::scan_range::FileScanRange {
-    match &range.range {
-        crate::runtime::scan_range::ScanRange::File(file) => file,
-        crate::runtime::scan_range::ScanRange::BrokerFile(_) => {
-            panic!("expected native file range, got StarRocks broker-file range")
-        }
-        crate::runtime::scan_range::ScanRange::SchemaSelection(_) => {
-            panic!("expected native file range, got StarRocks schema selection")
-        }
-    }
-}
-
-fn stream_exchange_plan(flavor: ExchangeFlavor) -> DistributedPlan {
-    let columns = vec![output_col(1, "k")];
-    let producer_fragment_id = 1;
-    let consumer_fragment_id = 0;
-    let exchange_node_id = 20;
-    let producer_fragment = PlanFragment {
-        fragment_id: producer_fragment_id,
-        root: physical_values_node(producer_fragment_id, 10, columns.clone()),
-        data_partition: DataPartition::unpartitioned(),
-        output_partition: DataPartition::unpartitioned(),
-        sink: crate::sql::planner::distributed::DataSink::Noop,
-        output_exprs: None,
-        output_columns: columns.clone(),
-        cte_id: None,
-        cte_exchange_nodes: Vec::new(),
-    };
-    let consumer_fragment = PlanFragment {
-        fragment_id: consumer_fragment_id,
-        root: DistributedNode {
-            node_id: exchange_node_id,
-            fragment_id: consumer_fragment_id,
-            tuple_ids: vec![exchange_node_id],
-            nullable_tuple_ids: Vec::new(),
-            limit: -1,
-            runtime_filter_binding_ids: Vec::new(),
-            children: Vec::new(),
-            stats: stats(),
-            payload: DistributedNodeKind::Exchange(ExchangeReceiver {
-                partition: DataPartition::unpartitioned(),
-                source_fragment_id: producer_fragment_id,
-                output_columns: columns.clone(),
-                output_qualifier: None,
-                flavor,
-            }),
-        },
-        data_partition: DataPartition::unpartitioned(),
-        output_partition: DataPartition::unpartitioned(),
-        sink: crate::sql::planner::distributed::DataSink::Result,
-        output_exprs: None,
-        output_columns: columns,
-        cte_id: None,
-        cte_exchange_nodes: Vec::new(),
-    };
-    crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
-        fragments: vec![producer_fragment, consumer_fragment],
-        root_fragment_id: consumer_fragment_id,
-        runtime_filter_graph: Default::default(),
-        edges: vec![FragmentEdge {
-            source_fragment_id: producer_fragment_id,
-            target_fragment_id: consumer_fragment_id,
-            target_exchange_node_id: exchange_node_id,
-            output_partition: DataPartition::unpartitioned(),
-            stream_kind: FragmentStreamKind::Gather,
-            edge_kind: FragmentEdgeKind::Stream,
-            output_slot_ids: vec![1],
-        }],
-    }
-}
-
-fn finalized_router_plan() -> DistributedPlan {
-    let mut output_columns = vec![
-        output_col(1, "__row_mutation_effect"),
-        output_col(3, "delete_id"),
-    ];
-    output_columns[0].data_type = DataType::Int8;
-    output_columns[0].is_internal = true;
-    let dp = crate::sql::planner::distributed::test_support::distributed_plan_draft_builder_for_test! {
-        fragments: vec![PlanFragment {
-            fragment_id: 0,
-            root: physical_values_node(0, 10, output_columns.clone()),
-            data_partition: DataPartition::unpartitioned(),
-            output_partition: DataPartition::unpartitioned(),
-            sink: crate::sql::planner::distributed::DataSink::Result,
-            output_exprs: None,
-            output_columns,
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        }],
-        root_fragment_id: 0,
-        runtime_filter_graph: Default::default(),
-        edges: Vec::new(),
-    };
-    let dag = crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(
-        0,
-        vec![crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec {
-            route_id: novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([7; 32]),
-            cohort_id: novarocks_spi::connector::ConnectorWriteCohortId::from_bytes([8; 32]),
-            accepted_effects: vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete],
-            input_ordinals: vec![novarocks_spi::connector::ConnectorMutationRouteInput::new(
-                novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([9; 32]),
-                1,
-            )],
-            output_partition_ordinals: vec![1],
-            sink: crate::sql::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
-                crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
-            ),
-        }],
-    );
-    crate::sql::planner::distributed::write::plan::finalize_sql_change_stream_test_plan(dp, dag)
-        .expect("plan change-stream write")
 }
 
 mod boundary;

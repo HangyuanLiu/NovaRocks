@@ -31,6 +31,16 @@ use crate::catalog::ResolvedAnalyzerTable;
 use crate::column_id::ColumnRefFactory;
 use crate::plan_read::PlanScanNode;
 
+mod pruning;
+mod runtime_filter;
+mod static_predicate;
+
+pub use pruning::{
+    NativeMinMaxPredicate, NativeMinMaxPredicateValue, native_scan_min_max_predicates,
+};
+pub use runtime_filter::*;
+pub use static_predicate::lower_static_connector_predicates;
+
 /// Immutable SQL identity for a synthetic, application-admitted connector
 /// scan.  It carries no catalog handle or provider capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -230,8 +240,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::{
-        build_frozen_connector_scan_plan, frozen_connector_resolved_analyzer_table,
-        matches_frozen_connector_scan, FrozenConnectorScanIdentity,
+        FrozenConnectorScanIdentity, build_frozen_connector_scan_plan,
+        frozen_connector_resolved_analyzer_table, matches_frozen_connector_scan,
     };
     use crate::binding::SqlTableBindingId;
 

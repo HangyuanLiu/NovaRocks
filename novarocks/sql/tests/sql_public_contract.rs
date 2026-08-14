@@ -21,8 +21,9 @@ use novarocks_sql::catalog::{PlannerTableProvider, ResolvedAnalyzerTable};
 use novarocks_sql::compiler::{
     SessionOptimizerSettings, SqlCatalogSnapshot, SqlCompileControl, SqlCompileIntent,
     SqlCompileRequest, SqlCompiler, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
-    SqlUnavailableStatisticsSnapshot, builtin_sql_function_catalog,
+    builtin_sql_function_catalog,
 };
+use novarocks_sql::planning::dml::DmlStatisticsSnapshot;
 
 struct EmptyCatalog;
 
@@ -46,7 +47,7 @@ impl SqlCatalogSnapshot for EmptyCatalog {
 #[test]
 fn external_sql_contract_compiles_and_reads_a_sealed_plan() {
     let catalog = EmptyCatalog;
-    let statistics = SqlUnavailableStatisticsSnapshot;
+    let statistics = DmlStatisticsSnapshot::empty();
     let request = SqlCompileRequest::new(
         SqlStatementInput::Sql("SELECT 1".to_string()),
         SqlCompileIntent::Query,

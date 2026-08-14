@@ -454,9 +454,7 @@ fn prepare_managed_repartition_transition(
         connector_context,
     )?;
     validate_mv_partition_columns(Some(fields), &analysis.output_columns)?;
-    if derive_fragment_property(&analysis.resolved_query)?
-        .is_composed_aggregate_schema_contract_fallback()
-    {
+    if derive_fragment_property(&analysis)?.is_composed_aggregate_schema_contract_fallback() {
         return Err("partitioned composed aggregate Iceberg MV is not supported".to_string());
     }
 
@@ -2297,7 +2295,7 @@ fn prepare_iceberg_mv_create_with_ports(
             target.catalog, target.namespace, target.table
         )
     })?;
-    let property = derive_fragment_property(&analysis.resolved_query)?;
+    let property = derive_fragment_property(&analysis)?;
     let base_field_observations = observe_base_fields_for_refs_with_ports(
         ports,
         &resolved_dependencies.base_refs,

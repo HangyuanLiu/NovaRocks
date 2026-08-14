@@ -23,7 +23,7 @@ use arrow::datatypes::DataType;
 use crate::query_execution::compiler::CatalogServiceSource;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::runtime::query_result::QueryResult;
-use crate::sql::parser::ast::ObjectName;
+use novarocks_sql::syntax::ObjectName;
 
 pub mod application;
 pub mod command;

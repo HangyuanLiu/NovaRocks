@@ -365,7 +365,7 @@ pub(crate) trait QueryTableBindingLoader: Send + Sync {
         catalog: &str,
         namespace: &str,
         table: &str,
-        metadata_table_type: novarocks_sql::planner::table::SqlMetadataTableKind,
+        metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
         binding: SqlTableBindingId,
     ) -> Result<QueryTableBinding, String>;
 }
@@ -593,7 +593,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        metadata_table_type: novarocks_sql::planner::table::SqlMetadataTableKind,
+        metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
     ) -> Result<TableDef, String> {
         match self.effective_catalog(catalog) {
             Some("default_catalog") | None => self
@@ -687,7 +687,7 @@ impl IcebergMetadataTableProvider for CatalogServiceMaterializer<'_> {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        metadata_table_type: novarocks_sql::planner::table::SqlMetadataTableKind,
+        metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
     ) -> Result<TableDef, String> {
         self.metadata_table_def(catalog, database, table, metadata_table_type)
     }
@@ -776,7 +776,7 @@ mod tests {
             _catalog: &str,
             _namespace: &str,
             _table: &str,
-            _metadata_table_type: novarocks_sql::planner::table::SqlMetadataTableKind,
+            _metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
             _binding: SqlTableBindingId,
         ) -> Result<QueryTableBinding, String> {
             Err("metadata is not part of this overlay fixture".to_string())

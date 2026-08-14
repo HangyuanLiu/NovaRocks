@@ -403,66 +403,31 @@ fn admit_statistics_scan_binding(
     bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
     program: &StatisticsCollectionProgram,
 ) -> Result<novarocks_sql::binding::SqlTableBindingId, DistributedQueryError> {
-    use crate::query_execution::planning::bindings::{QueryTableBinding, QueryTableBindingKey};
-    use crate::sql::catalog::ResolvedAnalyzerTable;
-    use crate::sql::planner::table::{
-        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
-    };
-
-    let columns = program
-        .plan
-        .scan_columns()
-        .iter()
-        .map(|column| novarocks_catalog::schema::ColumnDef {
-            name: column.name().to_string(),
-            data_type: column.data_type().clone(),
-            nullable: column.nullable(),
-            write_default: None,
-            logical_type: None,
-        })
-        .collect::<Vec<_>>();
-    bindings
-        .resolve_or_insert_with_id(
-            QueryTableBindingKey::strict_base(
-                "__statistics",
-                "__statistics",
-                "__connector_pinned_statistics",
-            ),
-            |binding| {
-                let identity = SqlTableIdentity {
-                    catalog: "__statistics".to_string(),
-                    namespace: "__statistics".to_string(),
-                    table: "__connector_pinned_statistics".to_string(),
-                };
-                let catalog = identity.catalog.clone();
-                let namespace = identity.namespace.clone();
-                Ok(QueryTableBinding {
-                    resolved: ResolvedAnalyzerTable::from_planner(
-                        Some(&catalog),
-                        &namespace,
-                        TableDef {
-                            name: identity.table.clone(),
-                            columns,
-                            iceberg_row_lineage_metadata_columns: Vec::new(),
-                            source: ScanSource::Sql(SqlScanSource::new(
-                                binding,
-                                identity,
-                                SqlScanKind::ConnectorRead,
-                            )),
-                        },
-                    ),
-                    statistics_pin: None,
-                    admission:
-                        crate::query_execution::planning::bindings::QueryTableBindingAdmission::Local,
-                    scan_materialization: None,
-                    mv_target_read: None,
-                    write_target_admission: None,
-                    frozen_snapshot_materializations: BTreeMap::new(),
-                    admitted_change_scans: BTreeMap::new(),
-                })
-            },
-        )
-        .map_err(contract_violation)
+    let input_schema = Arc::new(arrow::datatypes::Schema::new(
+        program
+            .plan
+            .scan_columns()
+            .iter()
+            .map(|column| {
+                arrow::datatypes::Field::new(
+                    column.name(),
+                    column.data_type().clone(),
+                    column.nullable(),
+                )
+            })
+            .collect::<Vec<_>>(),
+    ));
+    let identity = novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::new(
+        "__statistics",
+        "__statistics",
+        "__connector_pinned_statistics",
+    );
+    crate::query_execution::frozen_connector_read::admit_frozen_connector_scan_binding(
+        bindings,
+        &identity,
+        &input_schema,
+    )
+    .map_err(contract_violation)
 }
 
 struct PinnedStatisticsReadResolver {

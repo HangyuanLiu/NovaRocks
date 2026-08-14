@@ -1151,8 +1151,20 @@ pub(crate) fn prepare_candidates(
             functions,
         ) {
             Ok(Some(candidate)) => {
-                let (label, stats) = statistics_context
-                    .collect_table_statistics(&candidate.target_database, &candidate.target_table);
+                let (label, stats) = match statistics_context
+                    .collect_table_statistics(&candidate.target_database, &candidate.target_table)
+                {
+                    Ok(statistics) => statistics,
+                    Err(error) => {
+                        diagnostics.push(SqlMvRewriteDiagnostic {
+                            mv_id: Some(definition.mv_id),
+                            message: format!(
+                                "mv rewrite: skipping candidate with invalid frozen statistics: {error}"
+                            ),
+                        });
+                        continue;
+                    }
+                };
                 let target_stats_ref = query_stats.add_stats(label, stats);
                 candidates.push(MvRewriteCandidate {
                     mv_name: candidate.mv_name,

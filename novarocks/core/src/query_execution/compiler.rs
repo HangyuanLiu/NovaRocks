@@ -1931,7 +1931,7 @@ pub(crate) fn prepare_query_as_iceberg_write(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    sink: novarocks_sql::planner::distributed::write::contract::SqlWritePlanInput,
+    sink: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
@@ -1964,7 +1964,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_context(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    sink: novarocks_sql::planner::distributed::write::contract::SqlWritePlanInput,
+    sink: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
@@ -2297,21 +2297,11 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
             ),
         ),
     );
-    let novarocks_sql::compiler::SqlCompileOutput::Optimized(compiled) =
-        novarocks_sql::compiler::SqlCompiler::compile(compiler_request)
-            .map_err(|error| error.to_string())?
-    else {
-        return Err("Iceberg write intent did not produce optimized SQL facts".to_string());
-    };
-    let optimized_tree = compiled.optimized_tree;
-    let physical_plan =
-        novarocks_sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let distributed_plan =
-        novarocks_sql::planner::pipeline::build_sql_write_distributed_plan_with_settings(
-            physical_plan,
-            sink,
-            &optimizer_settings,
-        )?;
+    let distributed_plan = novarocks_sql::planning::dml::compile_connector_write_distributed_plan(
+        compiler_request,
+        sink,
+        &optimizer_settings,
+    )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         DmlQueryExecutionKernel::connector_control(state),
@@ -2517,7 +2507,7 @@ pub(crate) fn install_change_stream_write_test_observer(
 
 #[cfg(test)]
 pub(crate) fn observe_change_stream_write_build_for_test(
-    topology: &novarocks_sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
+    writer_routes: &[novarocks_sql::planning::dml::DmlChangeStreamWriterRoute],
 ) -> Option<crate::query_execution::outcome::QueryExecutionResult> {
     let mut observer = change_stream_write_test_observer()
         .lock()
@@ -2527,13 +2517,11 @@ pub(crate) fn observe_change_stream_write_build_for_test(
         .observations
         .push(ChangeStreamWriteBuildObservation {
             entrypoint: ChangeStreamWriteEntrypoint::PhysicalPlan,
-            effects: topology
-                .writer_routes
+            effects: writer_routes
                 .iter()
                 .flat_map(|route| route.accepted_effects.iter().copied())
                 .collect(),
-            writer_fragment_ids: topology
-                .writer_routes
+            writer_fragment_ids: writer_routes
                 .iter()
                 .map(|route| Some(route.writer_fragment_id))
                 .collect(),
@@ -2553,8 +2541,42 @@ pub(crate) fn observe_change_stream_write_build_for_test(
 
 pub(crate) struct PlannedIcebergChangeStreamWrite {
     pub(crate) encoding: NativeFragmentEncodingInput,
-    pub(crate) topology:
-        novarocks_sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
+    /// SQL owns the mutable change-stream topology.  Core retains only the
+    /// sealed writer-route projection required for operation registration.
+    pub(crate) writer_routes: Vec<novarocks_sql::planning::dml::DmlChangeStreamWriterRoute>,
+}
+
+/// Prepare an already sealed SQL change-stream plan for native dispatch.
+///
+/// SQL owns all optimizer, physical-plan, and writer-topology construction.
+/// Core only resolves the frozen bindings while preparing fragments and keeps
+/// the resulting writer/cohort map for application-owned operation fencing.
+pub(crate) fn prepare_dml_change_stream_write_with_execution(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    plan: novarocks_sql::planning::dml::DmlChangeStreamPlan,
+    query_table_bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<PlannedIcebergChangeStreamWrite, String> {
+    crate::connector::validate_request_context(connector_context)?;
+    let (distributed_plan, writer_routes) = plan.into_parts();
+    let optimizer_settings = change_stream_write_optimizer_settings();
+    let scan_resolver =
+        crate::query_execution::planning::delta_scan::QueryTableBindingScanResolver::new(
+            query_table_bindings,
+        );
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &distributed_plan,
+        connector_control,
+        connector_context,
+        Some(query_table_bindings),
+        Some(&scan_resolver),
+        scan_preparation_options(&optimizer_settings, execution)?,
+    )?;
+    Ok(PlannedIcebergChangeStreamWrite {
+        encoding: NativeFragmentEncodingInput::new(distributed_plan, prepared),
+        writer_routes,
+    })
 }
 
 /// MV-only change-stream facts held before Frontend native fragment assembly.
@@ -2564,32 +2586,6 @@ pub(crate) struct PlannedMvIcebergChangeStreamWrite {
     pub(crate) encoding: NativeFragmentEncodingInput,
     pub(crate) topology:
         novarocks_sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
-}
-
-pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_execution(
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    execution: &crate::query_execution::request_context::QueryExecutionContext,
-    optimized_tree: &novarocks_sql::optimizer::OptimizedOperatorNode,
-    query_table_bindings: Option<
-        &crate::query_execution::planning::bindings::QueryTableBindingStore,
-    >,
-    dag: &mut novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
-    pre_expand_keyed_assert: Option<novarocks_sql::planner::physical::PreExpandKeyedAssertSpec>,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PlannedIcebergChangeStreamWrite, String> {
-    let planned = build_physical_plan_as_iceberg_change_stream_write_native_assembly(
-        connector_control,
-        execution,
-        optimized_tree,
-        query_table_bindings,
-        dag,
-        pre_expand_keyed_assert,
-        connector_context,
-    )?;
-    Ok(PlannedIcebergChangeStreamWrite {
-        encoding: planned.encoding,
-        topology: planned.topology,
-    })
 }
 
 /// Build MV change-stream fragments without encoding their native bundle.
@@ -2837,7 +2833,7 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
     logical_plan: novarocks_sql::planner::logical::LogicalPlanNode,
     factory: novarocks_sql::column_id::ColumnRefFactory,
 ) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
-    let statistics = novarocks_sql::compiler::SqlUnavailableStatisticsSnapshot;
+    let statistics = novarocks_sql::planning::dml::DmlStatisticsSnapshot::empty();
     let request = novarocks_sql::compiler::SqlCompileRequest::new_logical(
         logical_plan,
         factory,

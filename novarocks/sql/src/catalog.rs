@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::planner::table::TableDef;
+use crate::planning::catalog::MetadataTableKind;
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_catalog::table::CatalogTable;
 
@@ -76,6 +77,6 @@ pub trait IcebergMetadataTableProvider {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        metadata_table_type: crate::planner::table::SqlMetadataTableKind,
+        metadata_table_type: MetadataTableKind,
     ) -> Result<TableDef, String>;
 }

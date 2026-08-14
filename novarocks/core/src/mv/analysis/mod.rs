@@ -19,9 +19,6 @@
 
 pub(crate) mod rebind;
 pub(crate) mod refresh_property;
-#[cfg(test)]
-mod refresh_property_contract_tests;
-
 use std::collections::HashSet;
 
 use crate::mv::aggregate_state::sql_type::arrow_data_type_to_sql_type;
@@ -32,6 +29,7 @@ use novarocks_sql::parser::ast::{
     IcebergPartitionFieldExpr, MaterializedViewDistribution, ObjectName, TableColumnDef,
 };
 use novarocks_sql::planning::mv::AggregateMvShape;
+use novarocks_sql::planning::mv::SqlResolvedMvRefreshInput;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResolvedTableRef {
@@ -50,6 +48,9 @@ pub(crate) struct MvAnalysis {
     pub resolved_refs: Vec<ResolvedTableRef>,
     pub output_columns: Vec<OutputColumn>,
     pub resolved_query: ResolvedQuery,
+    /// Opaque SQL-owned carrier for refresh-property planning. Core retains it
+    /// only to hand it back to SQL; it cannot inspect the analyzer tree.
+    pub refresh_input: SqlResolvedMvRefreshInput,
 }
 
 #[derive(Clone, Debug)]
@@ -116,10 +117,12 @@ pub(crate) fn finish_mv_analysis(
     if output_columns.is_empty() {
         output_columns = resolved_output_columns_from_body(&resolved_query);
     }
+    let refresh_input = SqlResolvedMvRefreshInput::from_analysis(resolved_query.clone());
     MvAnalysis {
         resolved_refs: prepared.resolved_refs,
         output_columns,
         resolved_query,
+        refresh_input,
     }
 }
 

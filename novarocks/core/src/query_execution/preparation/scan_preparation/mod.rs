@@ -23,9 +23,7 @@ use crate::query_execution::preparation::scan::{
 };
 use novarocks_sql::plan_read::PlanScanNode;
 use novarocks_sql::plan_read::table::ScanSource;
-use novarocks_sql::planner::distributed::{
-    DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId,
-};
+use novarocks_sql::plan_read::{DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId};
 
 mod iceberg;
 mod projection;

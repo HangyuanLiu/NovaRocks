@@ -352,7 +352,7 @@ impl ScheduleBoundDistributedQuery {
                     start_epoch: target.start_epoch(),
                 })
                 .collect(),
-            has_runtime_filter_channels: !self.prepared.runtime_filter_graph().is_empty(),
+            has_runtime_filter_channels: self.prepared.runtime_filter_facts().has_channels(),
             deployment_facts: RuntimeFilterDeploymentFactsView::new(
                 &self.prepared,
                 self.schedule.planning_schedule(),

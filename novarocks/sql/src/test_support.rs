@@ -23,17 +23,22 @@
 
 use arrow::datatypes::DataType;
 
+use crate::analysis::cte::CteId;
 use crate::analysis::{ExprKind, OutputColumn, SubqueryKind, TypedExpr};
 use crate::column_id::ColumnId;
 use crate::common::{
-    BinOp, JoinKind, LambdaParam, LiteralValue, ScanVariantColumn, UnOp, WindowBound,
-    WindowFrame, WindowFrameType,
+    BinOp, JoinKind, LambdaParam, LiteralValue, ScanVariantColumn, UnOp, WindowBound, WindowFrame,
+    WindowFrameType,
 };
 use crate::functions::FunctionVolatility;
 use crate::plan_read::{DistributedPlan, SortItem};
 use crate::planner::distributed::write::change_stream::{
-    ChangeStreamRoute, ChangeStreamRouterSink,
+    ChangeStreamRoute, ChangeStreamRouterSink, ChangeStreamWriteDagSpec, ChangeStreamWriteRouteSpec,
 };
+use crate::planner::distributed::write::contract::{
+    ConnectorWriteInputBinding, test_support::simple_sql_write_plan_input,
+};
+use crate::planner::distributed::write::plan::finalize_sql_change_stream_test_plan;
 use crate::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
     ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
@@ -41,7 +46,8 @@ use crate::planner::distributed::{
 };
 use crate::planner::payload::PlanScanNode;
 use crate::planner::payload::{
-    PlanAssertOneRowNode, PlanProjectNode, PlanSortNode, PlanValuesNode,
+    AggregateCall, PlanAssertOneRowNode, PlanGenerateSeriesNode, PlanProjectNode, PlanSortNode,
+    PlanValuesNode,
 };
 use crate::planner::physical::{
     AggMode, AggregateOutputLayout, JoinDistribution, PhysicalHashAggregateNode,
@@ -73,13 +79,23 @@ pub enum NativeEncoderPlanFixture {
     NestLoopJoin,
     AssertOneRow,
     Sort,
+    PrunedConnectorScanStreamEdge,
+    AggregateLayoutStreamEdge,
+    LocalAverageStreamEdge,
+    ZeroColumnStreamEdge,
 }
 
 /// Closed sealed scan shapes used by native encoder binding tests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeScanFixture {
     DeltaWithStaleUnprojectedColumn,
+    DeltaForPreparedBinding,
     OrdinaryIcebergWithUnprojectedPayload,
+    OrdinaryIcebergIdProjection,
+    OrdinaryIcebergUnrestricted,
+    OrdinaryIcebergAllColumns,
+    OrdinaryIcebergWithRequiredPayload,
+    UnsupportedPredicate,
     RefreshSnapshot,
     RefreshMvTargetLocator,
     RefreshMvTargetState,
@@ -88,13 +104,58 @@ pub enum NativeScanFixture {
     VariantProjection,
 }
 
+/// Copied scan-admission facts for Core fixture binding. This is intentionally
+/// a snapshot, not a re-export of the tokenized SQL scan carrier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeScanFixtureBinding {
+    pub catalog: String,
+    pub namespace: String,
+    pub table: String,
+    pub is_delta: bool,
+}
+
+/// Closed build-plan shapes for Core's native-fragment projection tests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeBuildFixture {
+    BroadcastStream,
+    RandomOtherStream,
+    HashPartitionedStream,
+    LimitOffsetStream,
+    TopNSplitStream,
+    CteMulticastStream,
+    RouterStream,
+}
+
+/// Closed stream shapes used by native plan-wire topology tests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativePlanEncodingFixture {
+    ReorderedSlots,
+    LoweredSlots,
+    ZeroColumns,
+    GenerateSeries,
+}
+
 /// Build a sealed scan fixture without exporting a mutable planner draft.
 pub fn native_scan_plan(fixture: NativeScanFixture) -> Result<DistributedPlan, String> {
     match fixture {
         NativeScanFixture::DeltaWithStaleUnprojectedColumn => native_delta_scan_plan(),
+        NativeScanFixture::DeltaForPreparedBinding => native_prepared_delta_scan_plan(),
         NativeScanFixture::OrdinaryIcebergWithUnprojectedPayload => {
             native_ordinary_iceberg_scan_plan()
         }
+        NativeScanFixture::OrdinaryIcebergIdProjection => {
+            native_ordinary_iceberg_id_projection_scan_plan()
+        }
+        NativeScanFixture::OrdinaryIcebergUnrestricted => {
+            native_ordinary_iceberg_unrestricted_scan_plan()
+        }
+        NativeScanFixture::OrdinaryIcebergAllColumns => {
+            native_ordinary_iceberg_all_columns_scan_plan()
+        }
+        NativeScanFixture::OrdinaryIcebergWithRequiredPayload => {
+            native_ordinary_iceberg_required_payload_scan_plan()
+        }
+        NativeScanFixture::UnsupportedPredicate => native_unsupported_predicate_scan_plan(),
         NativeScanFixture::RefreshSnapshot => native_refresh_scan_plan(refresh_snapshot_source()),
         NativeScanFixture::RefreshMvTargetLocator => {
             native_refresh_scan_plan(mv_target_locator_source("bound_order_id"))
@@ -109,6 +170,62 @@ pub fn native_scan_plan(fixture: NativeScanFixture) -> Result<DistributedPlan, S
             native_basic_scan_plan(mv_target_state_source("order_id"))
         }
         NativeScanFixture::VariantProjection => native_variant_projection_scan_plan(),
+    }
+}
+
+/// Return the copied admission identity needed by Core's prepared-binding
+/// fixture, without exposing a scan source, binding token, or planner graph.
+pub fn native_scan_fixture_binding(plan: &DistributedPlan) -> Option<NativeScanFixtureBinding> {
+    let scan = plan
+        .fragments()
+        .iter()
+        .find_map(|fragment| match &fragment.root.payload {
+            DistributedNodeKind::Scan(scan) => Some(scan),
+            _ => None,
+        })?;
+    let crate::planner::table::ScanSource::Sql(source) = &scan.table.source;
+    Some(NativeScanFixtureBinding {
+        catalog: source.table.catalog.clone(),
+        namespace: source.table.namespace.clone(),
+        table: source.table.table.clone(),
+        is_delta: matches!(source.kind, SqlScanKind::Delta { .. }),
+    })
+}
+
+/// Build a sealed topology fixture without exposing physical-plan or draft APIs.
+pub fn native_build_plan(fixture: NativeBuildFixture) -> Result<DistributedPlan, String> {
+    match fixture {
+        NativeBuildFixture::BroadcastStream => native_broadcast_stream_plan(),
+        NativeBuildFixture::RandomOtherStream => native_random_other_stream_plan(),
+        NativeBuildFixture::HashPartitionedStream => native_hash_partitioned_stream_plan(),
+        NativeBuildFixture::LimitOffsetStream => {
+            native_stream_exchange_plan(ExchangeFlavor::LimitOffset {
+                limit: Some(1),
+                offset: Some(0),
+            })
+        }
+        NativeBuildFixture::TopNSplitStream => {
+            native_stream_exchange_plan(ExchangeFlavor::TopNSplit {
+                items: Vec::new(),
+                limit: Some(1),
+                offset: Some(0),
+            })
+        }
+        NativeBuildFixture::CteMulticastStream => native_cte_multicast_stream_plan(),
+        NativeBuildFixture::RouterStream => native_router_stream_plan(),
+    }
+}
+
+/// Build a sealed topology shape for native plan encoding without exposing a
+/// distributed draft or physical node constructors to Core tests.
+pub fn native_plan_encoding_plan(
+    fixture: NativePlanEncodingFixture,
+) -> Result<DistributedPlan, String> {
+    match fixture {
+        NativePlanEncodingFixture::ReorderedSlots => native_reordered_slots_stream_plan(),
+        NativePlanEncodingFixture::LoweredSlots => native_lowered_slots_stream_plan(),
+        NativePlanEncodingFixture::ZeroColumns => native_zero_columns_stream_plan(),
+        NativePlanEncodingFixture::GenerateSeries => native_generate_series_stream_plan(),
     }
 }
 
@@ -130,6 +247,14 @@ pub fn native_encoder_plan(fixture: NativeEncoderPlanFixture) -> Result<Distribu
         NativeEncoderPlanFixture::NestLoopJoin => native_nest_loop_join_plan(),
         NativeEncoderPlanFixture::AssertOneRow => native_assert_one_row_plan(),
         NativeEncoderPlanFixture::Sort => native_sort_plan(),
+        NativeEncoderPlanFixture::PrunedConnectorScanStreamEdge => {
+            native_pruned_connector_scan_stream_edge_plan()
+        }
+        NativeEncoderPlanFixture::AggregateLayoutStreamEdge => {
+            native_aggregate_layout_stream_edge_plan()
+        }
+        NativeEncoderPlanFixture::LocalAverageStreamEdge => native_local_average_stream_edge_plan(),
+        NativeEncoderPlanFixture::ZeroColumnStreamEdge => native_zero_column_stream_edge_plan(),
     }
 }
 
@@ -493,6 +618,550 @@ fn native_sort_plan() -> Result<DistributedPlan, String> {
     }])
 }
 
+fn native_pruned_connector_scan_stream_edge_plan() -> Result<DistributedPlan, String> {
+    let all_columns = vec![
+        output_column(1, "v1", DataType::Int64),
+        output_column(2, "s2", DataType::Utf8),
+        output_column(3, "array1", DataType::Int64),
+    ];
+    let stream_columns = vec![all_columns[1].clone(), all_columns[2].clone()];
+    let source = PlanFragment {
+        fragment_id: 0,
+        root: DistributedNode {
+            node_id: 11,
+            fragment_id: 0,
+            tuple_ids: vec![11],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children: Vec::new(),
+            stats: physical_stats(),
+            payload: DistributedNodeKind::Scan(PlanScanNode {
+                database: "db".to_string(),
+                table: connector_read_table(&[
+                    ("v1", DataType::Int64),
+                    ("s2", DataType::Utf8),
+                    ("array1", DataType::Int64),
+                ]),
+                alias: None,
+                columns: all_columns,
+                predicates: Vec::new(),
+                required_columns: Some(vec!["s2".to_string(), "array1".to_string()]),
+                variant_columns: Vec::new(),
+                mv_rewritten_from: None,
+            }),
+        },
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Noop,
+        output_exprs: None,
+        output_columns: stream_columns,
+        cte_id: None,
+        cte_exchange_nodes: Vec::new(),
+    };
+    seal_stream_edge_fixture(source, vec![2, 3])
+}
+
+fn native_aggregate_layout_stream_edge_plan() -> Result<DistributedPlan, String> {
+    let group_column = output_column(2, "c1", DataType::Utf8);
+    let source = PlanFragment {
+        fragment_id: 0,
+        root: DistributedNode {
+            node_id: 11,
+            fragment_id: 0,
+            tuple_ids: vec![11],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children: vec![values_node(0, 10, vec![group_column.clone()])],
+            stats: physical_stats(),
+            payload: DistributedNodeKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
+                mode: AggMode::Local,
+                group_by: vec![column_expr(2, "c1", DataType::Utf8)],
+                aggregates: Vec::new(),
+                is_merge: Vec::new(),
+                output_layout: AggregateOutputLayout::new(vec![group_column], Vec::new()),
+                output_columns: Vec::new(),
+                topn_runtime_filter_builds: Vec::new(),
+            })),
+        },
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Noop,
+        output_exprs: None,
+        output_columns: Vec::new(),
+        cte_id: None,
+        cte_exchange_nodes: Vec::new(),
+    };
+    seal_stream_edge_fixture(source, vec![2])
+}
+
+fn native_local_average_stream_edge_plan() -> Result<DistributedPlan, String> {
+    let group_column = output_column(2, "c0", DataType::Int64);
+    let value_column = output_column(3, "c1", DataType::Int64);
+    let average_column = output_column(15, "avg(c1)", DataType::Float64);
+    let source = PlanFragment {
+        fragment_id: 0,
+        root: DistributedNode {
+            node_id: 11,
+            fragment_id: 0,
+            tuple_ids: vec![11],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children: vec![values_node(0, 10, vec![group_column.clone(), value_column])],
+            stats: physical_stats(),
+            payload: DistributedNodeKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
+                mode: AggMode::Local,
+                group_by: vec![column_expr(2, "c0", DataType::Int64)],
+                aggregates: vec![AggregateCall {
+                    name: "avg".to_string(),
+                    args: vec![column_expr(3, "c1", DataType::Int64)],
+                    distinct: false,
+                    result_type: DataType::Float64,
+                    order_by: Vec::new(),
+                    output_column_id: ColumnId(15),
+                }],
+                is_merge: vec![false],
+                output_layout: AggregateOutputLayout::new(
+                    vec![group_column.clone()],
+                    vec![average_column.clone()],
+                ),
+                output_columns: Vec::new(),
+                topn_runtime_filter_builds: Vec::new(),
+            })),
+        },
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Noop,
+        output_exprs: None,
+        output_columns: vec![group_column, average_column],
+        cte_id: None,
+        cte_exchange_nodes: Vec::new(),
+    };
+    seal_stream_edge_fixture(source, vec![2, 15])
+}
+
+fn native_zero_column_stream_edge_plan() -> Result<DistributedPlan, String> {
+    let source = PlanFragment {
+        fragment_id: 0,
+        root: values_node(0, 10, Vec::new()),
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Noop,
+        output_exprs: None,
+        output_columns: Vec::new(),
+        cte_id: None,
+        cte_exchange_nodes: Vec::new(),
+    };
+    seal_stream_edge_fixture(source, Vec::new())
+}
+
+fn native_reordered_slots_stream_plan() -> Result<DistributedPlan, String> {
+    let source_columns = vec![
+        output_column(1, "old", DataType::Int64),
+        output_column(2, "delta", DataType::Int64),
+    ];
+    native_plan_encoding_stream_plan(
+        values_node(1, 10, source_columns.clone()),
+        source_columns,
+        vec![
+            output_column(2, "delta", DataType::Int64),
+            output_column(1, "old", DataType::Int64),
+        ],
+        vec![2, 1],
+    )
+}
+
+fn native_lowered_slots_stream_plan() -> Result<DistributedPlan, String> {
+    let source_columns = vec![
+        output_column(10, "employee_id", DataType::Int64),
+        output_column(20, "name", DataType::Utf8),
+        output_column(30, "title", DataType::Utf8),
+    ];
+    native_plan_encoding_stream_plan(
+        values_node(1, 10, source_columns.clone()),
+        source_columns,
+        vec![
+            output_column(10, "employee_id", DataType::Int64),
+            output_column(20, "name", DataType::Utf8),
+        ],
+        vec![43, 44],
+    )
+}
+
+fn native_zero_columns_stream_plan() -> Result<DistributedPlan, String> {
+    native_plan_encoding_stream_plan(
+        values_node(1, 10, Vec::new()),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+fn native_generate_series_stream_plan() -> Result<DistributedPlan, String> {
+    let source = DistributedNode {
+        node_id: 10,
+        fragment_id: 1,
+        tuple_ids: vec![10],
+        nullable_tuple_ids: Vec::new(),
+        limit: -1,
+        runtime_filter_binding_ids: Vec::new(),
+        children: Vec::new(),
+        stats: physical_stats(),
+        payload: DistributedNodeKind::GenerateSeries(PlanGenerateSeriesNode {
+            start: 1,
+            end: 3,
+            step: 1,
+            column_name: "generate_series".to_string(),
+            alias: None,
+            output_column_id: ColumnId(7),
+        }),
+    };
+    native_plan_encoding_stream_plan(
+        source,
+        Vec::new(),
+        vec![output_column(7, "generate_series", DataType::Int64)],
+        vec![7],
+    )
+}
+
+fn native_plan_encoding_stream_plan(
+    source_root: DistributedNode,
+    source_columns: Vec<OutputColumn>,
+    receiver_columns: Vec<OutputColumn>,
+    output_slot_ids: Vec<i32>,
+) -> Result<DistributedPlan, String> {
+    let source = PlanFragment {
+        fragment_id: 1,
+        root: source_root,
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Noop,
+        output_exprs: None,
+        output_columns: source_columns,
+        cte_id: None,
+        cte_exchange_nodes: Vec::new(),
+    };
+    let target = PlanFragment {
+        fragment_id: 0,
+        root: DistributedNode {
+            node_id: 20,
+            fragment_id: 0,
+            tuple_ids: vec![20],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children: Vec::new(),
+            stats: physical_stats(),
+            payload: DistributedNodeKind::Exchange(ExchangeReceiver {
+                partition: DataPartition::unpartitioned(),
+                source_fragment_id: 1,
+                output_columns: receiver_columns,
+                output_qualifier: None,
+                flavor: ExchangeFlavor::Distribution,
+            }),
+        },
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Result,
+        output_exprs: None,
+        output_columns: Vec::new(),
+        cte_id: None,
+        cte_exchange_nodes: Vec::new(),
+    };
+    crate::planner::distributed::test_support::DistributedPlanDraftBuilder::new(
+        vec![source, target],
+        Some(0),
+        vec![FragmentEdge {
+            source_fragment_id: 1,
+            target_fragment_id: 0,
+            target_exchange_node_id: 20,
+            output_partition: DataPartition::unpartitioned(),
+            stream_kind: FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids,
+        }],
+        Default::default(),
+    )
+    .seal()
+    .map_err(|error| format!("native plan topology fixture must seal: {error}"))
+}
+
+fn connector_read_table(columns: &[(&str, DataType)]) -> TableDef {
+    TableDef {
+        name: "sc2".to_string(),
+        columns: columns
+            .iter()
+            .map(|(name, data_type)| column_def(name, data_type.clone(), true))
+            .collect(),
+        iceberg_row_lineage_metadata_columns: Vec::new(),
+        source: test_sql_scan_source(SqlScanKind::ConnectorRead),
+    }
+}
+
+fn seal_stream_edge_fixture(
+    source: PlanFragment,
+    output_slot_ids: Vec<i32>,
+) -> Result<DistributedPlan, String> {
+    let target = PlanFragment {
+        fragment_id: 1,
+        root: DistributedNode {
+            node_id: 42,
+            fragment_id: 1,
+            tuple_ids: vec![42],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children: Vec::new(),
+            stats: physical_stats(),
+            payload: DistributedNodeKind::Exchange(ExchangeReceiver {
+                partition: DataPartition::unpartitioned(),
+                source_fragment_id: 0,
+                output_columns: Vec::new(),
+                output_qualifier: None,
+                flavor: ExchangeFlavor::Distribution,
+            }),
+        },
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Result,
+        output_exprs: None,
+        output_columns: Vec::new(),
+        cte_id: None,
+        cte_exchange_nodes: Vec::new(),
+    };
+    crate::planner::distributed::test_support::DistributedPlanDraftBuilder::new(
+        vec![source, target],
+        Some(1),
+        vec![FragmentEdge {
+            source_fragment_id: 0,
+            target_fragment_id: 1,
+            target_exchange_node_id: 42,
+            output_partition: DataPartition::unpartitioned(),
+            stream_kind: FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids,
+        }],
+        Default::default(),
+    )
+    .seal()
+    .map_err(|error| format!("native stream-edge fixture must seal: {error}"))
+}
+
+fn native_broadcast_stream_plan() -> Result<DistributedPlan, String> {
+    native_stream_exchange_with_topology(
+        ExchangeFlavor::Distribution,
+        DataPartition::unpartitioned(),
+        FragmentStreamKind::Broadcast,
+    )
+}
+
+fn native_random_other_stream_plan() -> Result<DistributedPlan, String> {
+    native_stream_exchange_with_topology(
+        ExchangeFlavor::Distribution,
+        DataPartition {
+            kind: PartitionKind::Random,
+            exprs: Vec::new(),
+        },
+        FragmentStreamKind::Other,
+    )
+}
+
+fn native_hash_partitioned_stream_plan() -> Result<DistributedPlan, String> {
+    native_stream_exchange_with_topology(
+        ExchangeFlavor::Distribution,
+        DataPartition::hash(vec![column_expr(1, "k", DataType::Int64)]),
+        FragmentStreamKind::Partitioned,
+    )
+}
+
+fn native_stream_exchange_plan(flavor: ExchangeFlavor) -> Result<DistributedPlan, String> {
+    native_stream_exchange_with_topology(
+        flavor,
+        DataPartition::unpartitioned(),
+        FragmentStreamKind::Gather,
+    )
+}
+
+fn native_stream_exchange_with_topology(
+    flavor: ExchangeFlavor,
+    partition: DataPartition,
+    stream_kind: FragmentStreamKind,
+) -> Result<DistributedPlan, String> {
+    let columns = vec![output_column(1, "k", DataType::Int64)];
+    let source = PlanFragment {
+        fragment_id: 1,
+        root: values_node(1, 10, columns.clone()),
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: partition.clone(),
+        sink: DataSink::Noop,
+        output_exprs: None,
+        output_columns: columns.clone(),
+        cte_id: None,
+        cte_exchange_nodes: Vec::new(),
+    };
+    let target = PlanFragment {
+        fragment_id: 0,
+        root: DistributedNode {
+            node_id: 20,
+            fragment_id: 0,
+            tuple_ids: vec![20],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children: Vec::new(),
+            stats: physical_stats(),
+            payload: DistributedNodeKind::Exchange(ExchangeReceiver {
+                partition: partition.clone(),
+                source_fragment_id: 1,
+                output_columns: columns.clone(),
+                output_qualifier: None,
+                flavor,
+            }),
+        },
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Result,
+        output_exprs: None,
+        output_columns: columns,
+        cte_id: None,
+        cte_exchange_nodes: Vec::new(),
+    };
+    crate::planner::distributed::test_support::DistributedPlanDraftBuilder::new(
+        vec![source, target],
+        Some(0),
+        vec![FragmentEdge {
+            source_fragment_id: 1,
+            target_fragment_id: 0,
+            target_exchange_node_id: 20,
+            output_partition: partition,
+            stream_kind,
+            edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: vec![1],
+        }],
+        Default::default(),
+    )
+    .seal()
+    .map_err(|error| format!("native topology fixture must seal: {error}"))
+}
+
+fn native_cte_multicast_stream_plan() -> Result<DistributedPlan, String> {
+    let cte_id: CteId = 7;
+    let producer_columns = vec![
+        output_column(1, "k", DataType::Int64),
+        output_column(2, "v", DataType::Int64),
+        output_column(3, "payload", DataType::Int64),
+    ];
+    let receive_columns = vec![producer_columns[0].clone(), producer_columns[2].clone()];
+    let receive_producer_column_ids = vec![ColumnId(1), ColumnId(3)];
+    let source = PlanFragment {
+        fragment_id: 1,
+        root: values_node(1, 10, producer_columns.clone()),
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Noop,
+        output_exprs: None,
+        output_columns: producer_columns,
+        cte_id: Some(cte_id),
+        cte_exchange_nodes: Vec::new(),
+    };
+    let target = PlanFragment {
+        fragment_id: 0,
+        root: DistributedNode {
+            node_id: 20,
+            fragment_id: 0,
+            tuple_ids: vec![20],
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children: Vec::new(),
+            stats: physical_stats(),
+            payload: DistributedNodeKind::Exchange(ExchangeReceiver {
+                partition: DataPartition::unpartitioned(),
+                source_fragment_id: 1,
+                output_columns: receive_columns.clone(),
+                output_qualifier: Some("c".to_string()),
+                flavor: ExchangeFlavor::CteMulticast {
+                    cte_id,
+                    receive_producer_column_ids: receive_producer_column_ids.clone(),
+                },
+            }),
+        },
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Result,
+        output_exprs: None,
+        output_columns: receive_columns,
+        cte_id: None,
+        cte_exchange_nodes: vec![(cte_id, 20, receive_producer_column_ids.clone())],
+    };
+    crate::planner::distributed::test_support::DistributedPlanDraftBuilder::new(
+        vec![source, target],
+        Some(0),
+        vec![FragmentEdge {
+            source_fragment_id: 1,
+            target_fragment_id: 0,
+            target_exchange_node_id: 20,
+            output_partition: DataPartition::unpartitioned(),
+            stream_kind: FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::CteMulticast {
+                cte_id,
+                receive_producer_column_ids,
+            },
+            output_slot_ids: vec![1, 3],
+        }],
+        Default::default(),
+    )
+    .seal()
+    .map_err(|error| format!("native CTE topology fixture must seal: {error}"))
+}
+
+fn native_router_stream_plan() -> Result<DistributedPlan, String> {
+    let output_columns = vec![
+        OutputColumn {
+            column_id: ColumnId(1),
+            name: "__row_mutation_effect".to_string(),
+            data_type: DataType::Int8,
+            nullable: false,
+            is_internal: true,
+        },
+        output_column(3, "delete_id", DataType::Int64),
+    ];
+    let draft = crate::planner::distributed::test_support::DistributedPlanDraftBuilder::new(
+        vec![PlanFragment {
+            fragment_id: 0,
+            root: values_node(0, 10, output_columns.clone()),
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: DataSink::Result,
+            output_exprs: None,
+            output_columns,
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        }],
+        Some(0),
+        Vec::new(),
+        Default::default(),
+    );
+    let dag = ChangeStreamWriteDagSpec {
+        effect_output_ordinal: 0,
+        routes: vec![ChangeStreamWriteRouteSpec {
+            route_id: ConnectorWriteRouteId::from_bytes([7; 32]),
+            cohort_id: ConnectorWriteCohortId::from_bytes([8; 32]),
+            accepted_effects: vec![ConnectorRowMutationEffect::Delete],
+            input_ordinals: vec![ConnectorMutationRouteInput::new(
+                ConnectorWriteFieldToken::from_bytes([9; 32]),
+                1,
+            )],
+            output_partition_ordinals: vec![1],
+            sink: simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal),
+        }],
+    };
+    finalize_sql_change_stream_test_plan(draft, dag)
+        .map_err(|error| format!("native router fixture must seal: {error}"))
+}
+
 fn native_delta_scan_plan() -> Result<DistributedPlan, String> {
     native_scan_fixture_plan(
         SqlScanKind::Delta {
@@ -505,6 +1174,19 @@ fn native_delta_scan_plan() -> Result<DistributedPlan, String> {
         ],
         vec![output_column(1, "order_id", DataType::Int64)],
         None,
+        Vec::new(),
+    )
+}
+
+fn native_prepared_delta_scan_plan() -> Result<DistributedPlan, String> {
+    native_scan_fixture_plan(
+        SqlScanKind::Delta {
+            from_snapshot_id: 6,
+            to_snapshot_id: 7,
+        },
+        vec![column_def("id", DataType::Int32, false)],
+        vec![output_column(1, "id", DataType::Int32)],
+        Some(vec!["id".to_string()]),
         Vec::new(),
     )
 }
@@ -522,6 +1204,126 @@ fn native_ordinary_iceberg_scan_plan() -> Result<DistributedPlan, String> {
         Some(vec!["order_id".to_string()]),
         Vec::new(),
     )
+}
+
+fn ordinary_iceberg_columns() -> Vec<novarocks_catalog::schema::ColumnDef> {
+    vec![
+        column_def("id", DataType::Int32, false),
+        column_def("category", DataType::Utf8, true),
+    ]
+}
+
+fn native_ordinary_iceberg_unrestricted_scan_plan() -> Result<DistributedPlan, String> {
+    native_scan_fixture_plan(
+        SqlScanKind::Data {
+            version: SqlTableVersionSelector::Current,
+        },
+        ordinary_iceberg_columns(),
+        vec![output_column(1, "id", DataType::Int32)],
+        None,
+        Vec::new(),
+    )
+}
+
+fn native_ordinary_iceberg_id_projection_scan_plan() -> Result<DistributedPlan, String> {
+    native_scan_fixture_plan(
+        SqlScanKind::Data {
+            version: SqlTableVersionSelector::Current,
+        },
+        ordinary_iceberg_columns(),
+        vec![output_column(1, "id", DataType::Int32)],
+        Some(vec!["id".to_string()]),
+        Vec::new(),
+    )
+}
+
+fn native_ordinary_iceberg_all_columns_scan_plan() -> Result<DistributedPlan, String> {
+    native_scan_fixture_plan(
+        SqlScanKind::Data {
+            version: SqlTableVersionSelector::Current,
+        },
+        ordinary_iceberg_columns(),
+        vec![
+            output_column(1, "id", DataType::Int32),
+            output_column(3, "category", DataType::Utf8),
+        ],
+        None,
+        Vec::new(),
+    )
+}
+
+fn native_ordinary_iceberg_required_payload_scan_plan() -> Result<DistributedPlan, String> {
+    native_scan_fixture_plan(
+        SqlScanKind::Data {
+            version: SqlTableVersionSelector::Current,
+        },
+        ordinary_iceberg_columns(),
+        vec![output_column(1, "id", DataType::Int32)],
+        Some(vec!["id".to_string(), "category".to_string()]),
+        Vec::new(),
+    )
+}
+
+fn native_unsupported_predicate_scan_plan() -> Result<DistributedPlan, String> {
+    let root = DistributedNode {
+        node_id: 10,
+        fragment_id: 0,
+        tuple_ids: vec![10],
+        nullable_tuple_ids: Vec::new(),
+        limit: -1,
+        runtime_filter_binding_ids: Vec::new(),
+        children: Vec::new(),
+        stats: physical_stats(),
+        payload: DistributedNodeKind::Scan(PlanScanNode {
+            database: "db".to_string(),
+            table: TableDef {
+                name: "orders".to_string(),
+                columns: ordinary_iceberg_columns(),
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                source: test_sql_scan_source(SqlScanKind::Data {
+                    version: SqlTableVersionSelector::Current,
+                }),
+            },
+            alias: None,
+            columns: vec![output_column(1, "id", DataType::Int32)],
+            predicates: vec![TypedExpr {
+                kind: ExprKind::FunctionCall {
+                    name: "abs".to_string(),
+                    args: vec![TypedExpr {
+                        kind: ExprKind::BinaryOp {
+                            left: Box::new(column_expr(1, "id", DataType::Int32)),
+                            op: BinOp::Eq,
+                            right: Box::new(TypedExpr {
+                                kind: ExprKind::Literal(LiteralValue::Int(12)),
+                                data_type: DataType::Int32,
+                                nullable: false,
+                            }),
+                        },
+                        data_type: DataType::Boolean,
+                        nullable: false,
+                    }],
+                    distinct: false,
+                    volatility: FunctionVolatility::Immutable,
+                },
+                data_type: DataType::Boolean,
+                nullable: false,
+            }],
+            required_columns: None,
+            variant_columns: Vec::new(),
+            mv_rewritten_from: None,
+        }),
+    };
+    seal_fixture_plan(vec![PlanFragment {
+        fragment_id: 0,
+        root,
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Result,
+        output_exprs: None,
+        output_columns: vec![output_column(1, "id", DataType::Int32)],
+        cte_id: None,
+        cte_exchange_nodes: Vec::new(),
+    }])
 }
 
 fn native_refresh_scan_plan(source: SqlScanKind) -> Result<DistributedPlan, String> {
@@ -980,7 +1782,10 @@ fn seal_fixture_plan(fragments: Vec<PlanFragment>) -> Result<DistributedPlan, St
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeEncoderPlanFixture, native_encoder_plan};
+    use super::{
+        NativeBuildFixture, NativeEncoderPlanFixture, native_build_plan, native_encoder_plan,
+    };
+    use super::{NativePlanEncodingFixture, native_plan_encoding_plan};
     use super::{NativeScanFixture, native_scan_plan};
 
     #[test]
@@ -996,6 +1801,10 @@ mod tests {
             NativeEncoderPlanFixture::NestLoopJoin,
             NativeEncoderPlanFixture::AssertOneRow,
             NativeEncoderPlanFixture::Sort,
+            NativeEncoderPlanFixture::PrunedConnectorScanStreamEdge,
+            NativeEncoderPlanFixture::AggregateLayoutStreamEdge,
+            NativeEncoderPlanFixture::LocalAverageStreamEdge,
+            NativeEncoderPlanFixture::ZeroColumnStreamEdge,
         ] {
             let plan = native_encoder_plan(fixture).expect("fixture must seal");
             assert!(
@@ -1004,8 +1813,45 @@ mod tests {
                     .any(|fragment| fragment.fragment_id == plan.root_fragment_id())
             );
         }
-        let scan = native_scan_plan(NativeScanFixture::DeltaWithStaleUnprojectedColumn)
-            .expect("scan fixture must seal");
-        assert_eq!(scan.fragments().len(), 1);
+        for fixture in [
+            NativeScanFixture::DeltaWithStaleUnprojectedColumn,
+            NativeScanFixture::DeltaForPreparedBinding,
+            NativeScanFixture::OrdinaryIcebergWithUnprojectedPayload,
+            NativeScanFixture::OrdinaryIcebergIdProjection,
+            NativeScanFixture::OrdinaryIcebergUnrestricted,
+            NativeScanFixture::OrdinaryIcebergAllColumns,
+            NativeScanFixture::OrdinaryIcebergWithRequiredPayload,
+            NativeScanFixture::UnsupportedPredicate,
+            NativeScanFixture::RefreshSnapshot,
+            NativeScanFixture::RefreshMvTargetLocator,
+            NativeScanFixture::RefreshMvTargetState,
+            NativeScanFixture::MvTargetLocator,
+            NativeScanFixture::MvTargetState,
+            NativeScanFixture::VariantProjection,
+        ] {
+            let scan = native_scan_plan(fixture).expect("scan fixture must seal");
+            assert_eq!(scan.fragments().len(), 1);
+        }
+        for fixture in [
+            NativePlanEncodingFixture::ReorderedSlots,
+            NativePlanEncodingFixture::LoweredSlots,
+            NativePlanEncodingFixture::ZeroColumns,
+            NativePlanEncodingFixture::GenerateSeries,
+        ] {
+            let plan = native_plan_encoding_plan(fixture).expect("plan topology fixture must seal");
+            assert_eq!(plan.fragments().len(), 2);
+        }
+        for fixture in [
+            NativeBuildFixture::BroadcastStream,
+            NativeBuildFixture::RandomOtherStream,
+            NativeBuildFixture::HashPartitionedStream,
+            NativeBuildFixture::LimitOffsetStream,
+            NativeBuildFixture::TopNSplitStream,
+            NativeBuildFixture::CteMulticastStream,
+            NativeBuildFixture::RouterStream,
+        ] {
+            let plan = native_build_plan(fixture).expect("build fixture must seal");
+            assert_eq!(plan.fragments().len(), 2);
+        }
     }
 }

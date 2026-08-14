@@ -20,8 +20,8 @@
 
 use arrow::datatypes::DataType;
 
-use crate::sql::parser::ast::TableColumnDef;
 use novarocks_catalog::schema::SqlType;
+use novarocks_sql::syntax::TableColumnDef;
 
 pub(crate) fn arrow_schema_to_table_column_defs(
     schema: &arrow::datatypes::Schema,
@@ -319,9 +319,7 @@ mod tests {
 
     #[test]
     fn parse_create_table_if_not_exists_sets_flag() {
-        use crate::sql::parser::dialect::{
-            StarRocksDialect, create_table::parse_create_table_statement,
-        };
+        use novarocks_sql::syntax::{StarRocksDialect, parse_create_table_statement};
 
         let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
             .try_with_sql("CREATE TABLE IF NOT EXISTS t AS SELECT 1 AS x")
@@ -336,9 +334,7 @@ mod tests {
 
     #[test]
     fn parse_create_table_without_if_not_exists_flag_is_false() {
-        use crate::sql::parser::dialect::{
-            StarRocksDialect, create_table::parse_create_table_statement,
-        };
+        use novarocks_sql::syntax::{StarRocksDialect, parse_create_table_statement};
 
         let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
             .try_with_sql("CREATE TABLE t AS SELECT 1 AS x")

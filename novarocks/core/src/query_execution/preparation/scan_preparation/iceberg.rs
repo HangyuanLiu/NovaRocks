@@ -23,8 +23,8 @@ use novarocks_spi::connector::{
 
 use crate::query_execution::planning::bindings::QueryScanMaterialization;
 use crate::query_execution::preparation::scan::{PlannedConnectorRead, ResolvedScanExecution};
-use novarocks_sql::analysis::TypedExpr;
 use novarocks_sql::plan_read::PlanScanNode;
+use novarocks_sql::plan_read::TypedExpr;
 use novarocks_sql::plan_read::table::ScanSource;
 
 use super::projection::effective_scan_column_names;

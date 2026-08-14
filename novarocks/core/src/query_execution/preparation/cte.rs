@@ -24,11 +24,11 @@ pub(super) fn sealed_cte_projection(
     fragment: &novarocks_sql::plan_read::PlanFragment,
 ) -> Result<
     (
-        Option<novarocks_sql::analysis::cte::CteId>,
+        Option<novarocks_sql::plan_read::CteId>,
         Vec<(
-            novarocks_sql::analysis::cte::CteId,
+            novarocks_sql::plan_read::CteId,
             i32,
-            Vec<novarocks_sql::column_id::ColumnId>,
+            Vec<novarocks_sql::plan_read::ColumnId>,
         )>,
     ),
     String,
@@ -89,8 +89,8 @@ pub(super) fn sealed_cte_projection(
 #[cfg(test)]
 mod tests {
     use super::sealed_cte_projection;
-    use novarocks_sql::column_id::ColumnId;
-    use novarocks_sql::planner::distributed::{
+    use novarocks_sql::plan_read::ColumnId;
+    use novarocks_sql::plan_read::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
     };
 

@@ -27,7 +27,7 @@ use novarocks_catalog::schema::ColumnDef;
 /// application materializes the selected table once and assigns the binding
 /// token that preparation later uses to recover the exact connector lease.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SqlTableVersionSelector {
+pub enum SqlTableVersionSelector {
     Current,
     Snapshot(i64),
     TimestampMillis(i64),

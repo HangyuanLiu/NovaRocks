@@ -147,7 +147,7 @@ impl SqlWriteSinkContract {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_support {
     use std::num::{NonZeroU32, NonZeroU64};
 

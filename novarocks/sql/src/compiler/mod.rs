@@ -104,12 +104,35 @@ impl SqlStatisticsPlan {
 /// A narrow, exact statistics capability available to one request.  It reads
 /// only bindings captured by the paired catalog snapshot; it cannot ask for a
 /// newer connector generation.
-pub trait SqlStatisticsSnapshot {
+pub(crate) trait SqlStatisticsSnapshot {
     fn collect_table_statistics(
         &self,
         database: &str,
         table: &crate::planner::table::TableDef,
-    ) -> (String, crate::optimizer::stats_input::BaseTableStatistics);
+    ) -> Result<(String, crate::optimizer::stats_input::BaseTableStatistics), SqlCompileError>;
+}
+
+impl SqlStatisticsSnapshot for crate::planning::dml::DmlStatisticsSnapshot {
+    fn collect_table_statistics(
+        &self,
+        database: &str,
+        table: &crate::planner::table::TableDef,
+    ) -> Result<(String, crate::optimizer::stats_input::BaseTableStatistics), SqlCompileError> {
+        let crate::planner::table::ScanSource::Sql(source) = &table.source;
+        let label = format!(
+            "{}.{}.{}",
+            source.table.catalog, source.table.namespace, source.table.table
+        );
+        let _ = database;
+        self.0
+            .get(source.binding)
+            .map(|entry| (entry.label.clone(), entry.statistics.clone()))
+            .map_err(|error| {
+                SqlCompileError::Compilation(format!(
+                    "frozen SQL statistics binding `{label}` is invalid: {error}"
+                ))
+            })
+    }
 }
 
 /// Required evidence for an incremental-MV rewrite.  This is data frozen by
@@ -296,28 +319,6 @@ impl SqlFunctionCatalog for SqlLogicalInputFunctions {
 static SQL_LOGICAL_INPUT_CATALOG: SqlLogicalInputCatalog = SqlLogicalInputCatalog;
 static SQL_LOGICAL_INPUT_FUNCTIONS: SqlLogicalInputFunctions = SqlLogicalInputFunctions;
 
-/// Conservative statistics source for SQL-owned logical transformations that
-/// cannot admit a new catalog binding.  Missing evidence remains missing; it
-/// is never guessed as an empty table.
-pub struct SqlUnavailableStatisticsSnapshot;
-
-impl SqlStatisticsSnapshot for SqlUnavailableStatisticsSnapshot {
-    fn collect_table_statistics(
-        &self,
-        database: &str,
-        table: &crate::planner::table::TableDef,
-    ) -> (String, crate::optimizer::stats_input::BaseTableStatistics) {
-        (
-            format!("{database}.{}", table.name),
-            crate::optimizer::stats_input::BaseTableStatistics::missing(
-                crate::optimizer::stats_input::StatsMissingReason::ConnectorUnsupported(
-                    "logical SQL compiler input has no additional statistics evidence".to_string(),
-                ),
-            ),
-        )
-    }
-}
-
 /// Complete immutable input consumed by the pure SQL compiler.
 pub struct SqlCompileRequest<'a> {
     pub(crate) statement: SqlStatementInput,
@@ -325,7 +326,7 @@ pub struct SqlCompileRequest<'a> {
     pub(crate) session: SqlSessionContext,
     pub(crate) environment: SqlPlanningEnvironment,
     pub(crate) catalog: &'a dyn SqlCatalogSnapshot,
-    pub(crate) statistics: &'a dyn SqlStatisticsSnapshot,
+    pub(crate) statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
     pub(crate) functions: &'a dyn SqlFunctionCatalog,
     pub(crate) mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
     pub(crate) imv_rewrite: Option<&'a SqlImvPlanningInput>,
@@ -340,7 +341,7 @@ impl<'a> SqlCompileRequest<'a> {
         session: SqlSessionContext,
         environment: SqlPlanningEnvironment,
         catalog: &'a dyn SqlCatalogSnapshot,
-        statistics: &'a dyn SqlStatisticsSnapshot,
+        statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
         functions: &'a dyn SqlFunctionCatalog,
         mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
         control: SqlCompileControl,
@@ -369,7 +370,7 @@ impl<'a> SqlCompileRequest<'a> {
         intent: SqlCompileIntent,
         session: SqlSessionContext,
         environment: SqlPlanningEnvironment,
-        statistics: &'a dyn SqlStatisticsSnapshot,
+        statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
         control: SqlCompileControl,
     ) -> Self {
         Self {
@@ -590,7 +591,7 @@ impl SqlCompiler {
             &mut scalar_arena,
         )
         .map_err(SqlCompileError::Compilation)?;
-        let mut statistics = collect_statistics(request.statistics, &mut optimizer_expr);
+        let mut statistics = collect_statistics(request.statistics, &mut optimizer_expr)?;
         request.check_control()?;
         let mv_rewrite = request
             .mv_rewrite
@@ -813,27 +814,28 @@ fn resolve_root_distribution_requirement(
 fn collect_statistics(
     snapshot: &dyn SqlStatisticsSnapshot,
     expr: &mut crate::optimizer::opt_expr::OptExpr,
-) -> SqlStatisticsPlan {
+) -> Result<SqlStatisticsPlan, SqlCompileError> {
     fn walk(
         snapshot: &dyn SqlStatisticsSnapshot,
         expr: &mut crate::optimizer::opt_expr::OptExpr,
         plan: &mut SqlStatisticsPlan,
-    ) {
+    ) -> Result<(), SqlCompileError> {
         if let crate::optimizer::operator::Operator::LogicalScan(scan) = &mut expr.op {
             let stats_ref = crate::optimizer::stats_input::StatsRef::new(plan.next_stats_ref);
             plan.next_stats_ref += 1;
             scan.stats_ref = Some(stats_ref);
-            let (label, stats) = snapshot.collect_table_statistics(&scan.database, &scan.table);
+            let (label, stats) = snapshot.collect_table_statistics(&scan.database, &scan.table)?;
             plan.snapshot.insert(stats_ref, label, stats);
         }
         for child in &mut expr.children {
-            walk(snapshot, child, plan);
+            walk(snapshot, child, plan)?;
         }
+        Ok(())
     }
 
     let mut plan = SqlStatisticsPlan::empty();
-    walk(snapshot, expr, &mut plan);
-    plan
+    walk(snapshot, expr, &mut plan)?;
+    Ok(plan)
 }
 
 fn apply_planning_environment(
@@ -854,8 +856,8 @@ fn apply_planning_environment(
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, LazyLock};
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -864,16 +866,6 @@ mod tests {
     impl SqlCatalogSnapshot for Catalog {
         fn planner_table_provider(&self) -> &dyn crate::catalog::PlannerTableProvider {
             panic!("control tests must not reach catalog resolution")
-        }
-    }
-    struct Statistics;
-    impl SqlStatisticsSnapshot for Statistics {
-        fn collect_table_statistics(
-            &self,
-            _database: &str,
-            _table: &crate::planner::table::TableDef,
-        ) -> (String, crate::optimizer::stats_input::BaseTableStatistics) {
-            panic!("control tests must not reach statistics collection")
         }
     }
     struct Functions;
@@ -893,7 +885,8 @@ mod tests {
     }
 
     static CATALOG: Catalog = Catalog;
-    static STATISTICS: Statistics = Statistics;
+    static STATISTICS: LazyLock<crate::planning::dml::DmlStatisticsSnapshot> =
+        LazyLock::new(crate::planning::dml::DmlStatisticsSnapshot::empty);
     static FUNCTIONS: Functions = Functions;
 
     #[derive(Default)]

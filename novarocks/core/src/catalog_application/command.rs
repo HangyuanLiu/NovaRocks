@@ -161,13 +161,13 @@ impl CatalogCommandExecutor {
             require_statement_end(&mut parser)?;
             use novarocks_sql::syntax::DropStatement;
             return match statement {
-                DropResult::Catalog(statement) => execute_drop_catalog_statement(
+                DropStatement::Catalog(statement) => execute_drop_catalog_statement(
                     &self.kernel,
                     &statement.name,
                     statement.if_exists,
                 )
                 .map(Some),
-                DropResult::Database(statement) => {
+                DropStatement::Database(statement) => {
                     if current_catalog.is_none() && statement.name.parts.len() == 1 {
                         Err("DROP DATABASE in default_catalog must be routed through the view command capability".to_string())
                     } else {
@@ -182,7 +182,7 @@ impl CatalogCommandExecutor {
                         .map(Some)
                     }
                 }
-                DropResult::Table(statement) => execute_drop_table_statement(
+                DropStatement::Table(statement) => execute_drop_table_statement(
                     &self.kernel,
                     &statement.name,
                     current_catalog,

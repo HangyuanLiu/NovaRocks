@@ -64,9 +64,7 @@ impl SqlTableBindingId {
     #[cfg(test)]
     pub(crate) fn new_for_test(ordinal: u32) -> Self {
         Self::new(
-            SqlTableBindingScopeId::new(
-                NonZeroU64::new(1).expect("test binding scope is nonzero"),
-            ),
+            SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("test binding scope is nonzero")),
             NonZeroU32::new(ordinal).expect("test binding ordinal is nonzero"),
         )
     }

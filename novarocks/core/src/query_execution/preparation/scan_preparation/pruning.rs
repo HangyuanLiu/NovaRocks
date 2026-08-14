@@ -15,135 +15,59 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Native runtime conversion of immutable SQL pruning projections.
+
+use novarocks_execution::exec::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
+use novarocks_sql::planning::query_execution::{NativeMinMaxPredicate, NativeMinMaxPredicateValue};
+
 pub(super) fn native_scan_min_max_predicates(
-    predicates: &[novarocks_sql::analysis::TypedExpr],
-) -> Vec<novarocks_execution::exec::min_max_predicate::MinMaxPredicate> {
-    let mut out = Vec::new();
-    for predicate in predicates {
-        collect_native_min_max_predicates(predicate, &mut out);
-    }
-    out
+    predicates: &[novarocks_sql::plan_read::TypedExpr],
+) -> Vec<MinMaxPredicate> {
+    novarocks_sql::planning::query_execution::native_scan_min_max_predicates(predicates)
+        .into_iter()
+        .map(native_predicate)
+        .collect()
 }
 
-fn collect_native_min_max_predicates(
-    expr: &novarocks_sql::analysis::TypedExpr,
-    out: &mut Vec<novarocks_execution::exec::min_max_predicate::MinMaxPredicate>,
-) {
-    use novarocks_sql::analysis::{BinOp, ExprKind};
-
-    match &expr.kind {
-        ExprKind::Nested(inner) => collect_native_min_max_predicates(inner, out),
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => {
-            collect_native_min_max_predicates(left, out);
-            collect_native_min_max_predicates(right, out);
-        }
-        ExprKind::BinaryOp { left, op, right } => {
-            if let Some(predicate) = native_min_max_comparison(left, *op, right) {
-                out.push(predicate);
-            } else if let Some(predicate) =
-                native_min_max_comparison(right, reverse_comparison(*op), left)
-            {
-                out.push(predicate);
-            }
-        }
-        _ => {}
+fn native_predicate(predicate: NativeMinMaxPredicate) -> MinMaxPredicate {
+    match predicate {
+        NativeMinMaxPredicate::Eq { column, value } => MinMaxPredicate::Eq {
+            column,
+            value: native_value(value),
+        },
+        NativeMinMaxPredicate::Lt { column, value } => MinMaxPredicate::Lt {
+            column,
+            value: native_value(value),
+        },
+        NativeMinMaxPredicate::Le { column, value } => MinMaxPredicate::Le {
+            column,
+            value: native_value(value),
+        },
+        NativeMinMaxPredicate::Gt { column, value } => MinMaxPredicate::Gt {
+            column,
+            value: native_value(value),
+        },
+        NativeMinMaxPredicate::Ge { column, value } => MinMaxPredicate::Ge {
+            column,
+            value: native_value(value),
+        },
     }
 }
 
-fn reverse_comparison(op: novarocks_sql::analysis::BinOp) -> novarocks_sql::analysis::BinOp {
-    use novarocks_sql::analysis::BinOp;
-    match op {
-        BinOp::Lt => BinOp::Gt,
-        BinOp::Le => BinOp::Ge,
-        BinOp::Gt => BinOp::Lt,
-        BinOp::Ge => BinOp::Le,
-        other => other,
-    }
-}
-
-fn native_min_max_comparison(
-    column: &novarocks_sql::analysis::TypedExpr,
-    op: novarocks_sql::analysis::BinOp,
-    literal: &novarocks_sql::analysis::TypedExpr,
-) -> Option<novarocks_execution::exec::min_max_predicate::MinMaxPredicate> {
-    use novarocks_execution::exec::min_max_predicate::MinMaxPredicate;
-    use novarocks_sql::analysis::{BinOp, ExprKind};
-
-    let ExprKind::ColumnRef { column: name, .. } = &column.kind else {
-        return None;
-    };
-    if column.data_type != literal.data_type {
-        return None;
-    }
-    let value = native_min_max_literal(literal)?;
-    Some(match op {
-        BinOp::Eq => MinMaxPredicate::Eq {
-            column: name.clone(),
-            value,
-        },
-        BinOp::Lt => MinMaxPredicate::Lt {
-            column: name.clone(),
-            value,
-        },
-        BinOp::Le => MinMaxPredicate::Le {
-            column: name.clone(),
-            value,
-        },
-        BinOp::Gt => MinMaxPredicate::Gt {
-            column: name.clone(),
-            value,
-        },
-        BinOp::Ge => MinMaxPredicate::Ge {
-            column: name.clone(),
-            value,
-        },
-        _ => return None,
-    })
-}
-
-fn native_min_max_literal(
-    expr: &novarocks_sql::analysis::TypedExpr,
-) -> Option<novarocks_execution::exec::min_max_predicate::MinMaxPredicateValue> {
-    use arrow::datatypes::{DataType, TimeUnit};
-    use novarocks_execution::exec::min_max_predicate::MinMaxPredicateValue;
-    use novarocks_sql::analysis::{ExprKind, LiteralValue};
-
-    let ExprKind::Literal(literal) = &expr.kind else {
-        return None;
-    };
-    match (&expr.data_type, literal) {
-        (DataType::Boolean, LiteralValue::Bool(value)) => {
-            Some(MinMaxPredicateValue::Boolean(*value))
+fn native_value(value: NativeMinMaxPredicateValue) -> MinMaxPredicateValue {
+    match value {
+        NativeMinMaxPredicateValue::Boolean(value) => MinMaxPredicateValue::Boolean(value),
+        NativeMinMaxPredicateValue::Int32(value) => MinMaxPredicateValue::Int32(value),
+        NativeMinMaxPredicateValue::Int64(value) => MinMaxPredicateValue::Int64(value),
+        NativeMinMaxPredicateValue::Float(value) => MinMaxPredicateValue::Float(value),
+        NativeMinMaxPredicateValue::Double(value) => MinMaxPredicateValue::Double(value),
+        NativeMinMaxPredicateValue::ByteArray(value) => MinMaxPredicateValue::ByteArray(value),
+        NativeMinMaxPredicateValue::Date32(value) => MinMaxPredicateValue::Date32(value),
+        NativeMinMaxPredicateValue::DateTimeMicros(value) => {
+            MinMaxPredicateValue::DateTimeMicros(value)
         }
-        (DataType::Int8 | DataType::Int16 | DataType::Int32, LiteralValue::Int(value)) => {
-            i32::try_from(*value).ok().map(MinMaxPredicateValue::Int32)
+        NativeMinMaxPredicateValue::DateTimeNanos(value) => {
+            MinMaxPredicateValue::DateTimeNanos(value)
         }
-        (DataType::Int64, LiteralValue::Int(value)) => Some(MinMaxPredicateValue::Int64(*value)),
-        (DataType::Float32, LiteralValue::Float(value)) if value.is_finite() => {
-            Some(MinMaxPredicateValue::Float(*value as f32))
-        }
-        (DataType::Float64, LiteralValue::Float(value)) if value.is_finite() => {
-            Some(MinMaxPredicateValue::Double(*value))
-        }
-        (DataType::Utf8 | DataType::LargeUtf8, LiteralValue::String(value)) => {
-            Some(MinMaxPredicateValue::ByteArray(value.as_bytes().to_vec()))
-        }
-        (DataType::Binary | DataType::LargeBinary, LiteralValue::Binary(value)) => {
-            Some(MinMaxPredicateValue::ByteArray(value.clone()))
-        }
-        (DataType::Date32, LiteralValue::Int(value)) => {
-            i32::try_from(*value).ok().map(MinMaxPredicateValue::Date32)
-        }
-        (DataType::Timestamp(TimeUnit::Microsecond, _), LiteralValue::Int(value)) => {
-            Some(MinMaxPredicateValue::DateTimeMicros(*value))
-        }
-        (DataType::Timestamp(TimeUnit::Nanosecond, _), LiteralValue::Int(value)) => {
-            Some(MinMaxPredicateValue::DateTimeNanos(*value))
-        }
-        _ => None,
     }
 }

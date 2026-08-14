@@ -51,7 +51,7 @@ pub use novarocks_spi::connector::{
 pub mod table {
     pub use crate::planner::table::{
         ScanSource, SqlMetadataTableKind, SqlMvTargetStatePartitionConstraint,
-        SqlMvTargetStateRowFilter, SqlScanKind, SqlScanSource, TableDef,
+        SqlMvTargetStateRowFilter, SqlScanKind, SqlScanSource, SqlTableVersionSelector, TableDef,
     };
 }
 

@@ -637,7 +637,7 @@ impl FrontendQuerySession {
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
-        let sql = novarocks::sql::substitute_user_variables(&sql, &assignments)
+        let sql = novarocks_sql::syntax::substitute_user_variables(&sql, &assignments)
             .map_err(classify_engine_error)?;
         let token = self.token()?;
         let mut active = self
@@ -701,8 +701,9 @@ impl FrontendQuerySession {
         let ctas_engine = Arc::clone(&self.service.ctas_engine);
         let truncate_engine = Arc::clone(&self.service.truncate_engine);
         let mut query_options = state.execution_settings.query_options();
-        query_options
-            .set_allow_throw_exception(novarocks::sql::extract_allow_throw_exception_hint(&sql));
+        query_options.set_allow_throw_exception(
+            novarocks_sql::syntax::extract_allow_throw_exception_hint(&sql),
+        );
         let is_query = is_query_statement(&sql);
         let mut worker = task::spawn_blocking(move || {
             let result = if is_query {

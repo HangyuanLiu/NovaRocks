@@ -22,7 +22,47 @@
 //! parser or planner implementation tree.
 
 pub use crate::catalog::{IcebergMetadataTableProvider, PlannerTableProvider, TableLookupMode};
+/// SQL metadata-relation vocabulary needed by application catalog admission.
+/// This is a value-only DTO; it carries neither a table definition nor a
+/// provider handle.
+pub use crate::planner::table::SqlMetadataTableKind as MetadataTableKind;
 pub use crate::planner::table::TableDef;
+
+/// Build the SQL-owned analyzer relation for an already admitted metadata
+/// table. Application code supplies only immutable identity/schema facts and
+/// the request-local binding token; the planner graph remains internal.
+pub fn resolved_metadata_table(
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    metadata_table_type: MetadataTableKind,
+    columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    iceberg_row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    binding: crate::binding::SqlTableBindingId,
+) -> crate::catalog::ResolvedAnalyzerTable {
+    use crate::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
+    };
+
+    let planner = TableDef {
+        name: table.to_string(),
+        columns,
+        iceberg_row_lineage_metadata_columns,
+        source: ScanSource::Sql(SqlScanSource::new(
+            binding,
+            SqlTableIdentity {
+                catalog: catalog.to_string(),
+                namespace: namespace.to_string(),
+                table: table.to_string(),
+            },
+            SqlScanKind::Metadata {
+                kind: metadata_table_type,
+                version: SqlTableVersionSelector::Current,
+            },
+        )),
+    };
+    crate::catalog::ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner)
+}
 
 /// The local catalog is a neutral in-memory catalog of SQL table definitions.
 pub type PlannerMemoryCatalog = novarocks_catalog::memory::MemoryCatalog<TableDef>;

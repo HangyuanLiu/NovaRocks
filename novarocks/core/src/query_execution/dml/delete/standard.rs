@@ -44,14 +44,15 @@ use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::planning::write_sink::{
-    admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
+    admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::sql::parser::ast::{DeleteStmt, ObjectName};
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::ConnectorRowMutationStrategy;
 use novarocks_spi::connector::ConnectorWriteOperationId;
-use novarocks_sql::planning::dml::{IcebergRefSuffix, split_ref_suffix};
+use novarocks_sql::planning::dml::{DmlWriteSinkMode, IcebergRefSuffix, split_ref_suffix};
+use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
+use novarocks_sql::syntax::{DeleteStmt, ObjectName};
 
 pub(crate) fn prepare_delete_statement(
     state: &DmlExecutionKernel,
@@ -171,7 +172,7 @@ struct DistributedDeleteWriteExecutor {
     state: DmlExecutionKernel,
     target: TargetBackend,
     delete_query: sqlparser::ast::Query,
-    sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    sql_write_input: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<QueryTableBindingStore>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -215,7 +216,7 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
             let distribution = if self.shuffle_by_first_output {
                 crate::query_execution::compiler::iceberg_write_shuffle_by_output_index(0)
             } else {
-                crate::sql::compiler::RootDistributionRequirement::Any
+                novarocks_sql::compiler::RootDistributionRequirement::Any
             };
             *assembly = Some(
                 crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_context(
@@ -293,8 +294,6 @@ fn prepare_delete_write(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<PreparedDelete, String> {
-    use crate::sql::planner::distributed::write::contract::SqlWriteSinkMode;
-
     let deletion_vectors = match strategy {
         ConnectorRowMutationStrategy::DeletionVector => true,
         ConnectorRowMutationStrategy::PositionDelete => false,
@@ -305,28 +304,27 @@ fn prepare_delete_write(
         }
     };
     let sink_mode = if deletion_vectors {
-        SqlWriteSinkMode::DeletionVectors
+        DmlWriteSinkMode::DeletionVectors
     } else {
-        SqlWriteSinkMode::PositionDeletes
+        DmlWriteSinkMode::PositionDeletes
     };
 
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding = admit_prepared_connector_write_target(
+    let target_binding = admit_prepared_frozen_connector_write_target(
         table_bindings.as_ref(),
-        crate::sql::planner::table::SqlTableIdentity {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-        },
+        FrozenConnectorScanIdentity::new(
+            target.catalog.clone(),
+            target.namespace.clone(),
+            target.table.clone(),
+        ),
         preparation.clone(),
         planning_lease.clone(),
     )?;
-    let sql_write_input = sql_write_plan_input_for_admitted_target(
+    let sql_write_input = dml_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),
         target_binding,
         sink_mode,
-        crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
-        None,
+        novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
     )?;
     let delete_query = build_delete_position_sink_query(
         target,

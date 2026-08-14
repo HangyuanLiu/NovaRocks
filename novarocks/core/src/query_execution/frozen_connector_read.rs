@@ -42,8 +42,8 @@ use crate::query_execution::planning::catalog_materializer::QueryLocalTableOverl
 use crate::query_execution::preparation::scan::PlannedConnectorRead;
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::query_execution::{
-    build_frozen_connector_scan_plan, frozen_connector_resolved_analyzer_table,
-    matches_frozen_connector_scan, FrozenConnectorScanIdentity, FrozenConnectorScanPlan,
+    FrozenConnectorScanIdentity, FrozenConnectorScanPlan, build_frozen_connector_scan_plan,
+    frozen_connector_resolved_analyzer_table, matches_frozen_connector_scan,
 };
 
 /// Plan one opaque frozen source through the exact generation that admitted it.

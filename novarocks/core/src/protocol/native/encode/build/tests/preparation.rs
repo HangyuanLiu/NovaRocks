@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+use novarocks_sql::plan_read::PlanScanNode;
+use novarocks_sql::test_support::{NativeScanFixture, native_scan_plan};
 
 struct SentinelDeltaResolver {
     calls: AtomicUsize,
@@ -30,17 +32,7 @@ impl crate::query_execution::preparation::scan::ScanBindingResolver for Sentinel
     {
         self.calls.fetch_add(1, Ordering::Relaxed);
         assert_eq!(node_id, 10);
-        assert!(matches!(
-            scan.table.source,
-            ScanSource::Sql(crate::sql::planner::table::SqlScanSource {
-                kind: crate::sql::planner::table::SqlScanKind::Delta {
-                    from_snapshot_id: 6,
-                    to_snapshot_id: 7,
-                    ..
-                },
-                ..
-            })
-        ));
+        assert_eq!(scan.table.name, "orders");
         Ok(Some(
             crate::query_execution::preparation::scan::ResolvedScanExecution::SealedConnectorScan(
                 crate::query_execution::preparation::scan::fixture_sealed_change_scan(
@@ -55,21 +47,8 @@ impl crate::query_execution::preparation::scan::ScanBindingResolver for Sentinel
 
 #[test]
 fn fragment_build_prepares_delta_once_without_mutating_input_plan() {
-    let plan = crate::sql::planner::distributed::test_support::rebuild_test_plan(
-        iceberg_scan_plan(Some(vec!["id"])),
-        Default::default(),
-        |draft| {
-            let DistributedNodeKind::Scan(scan) = &mut draft.fragments_mut()[0].root.payload else {
-                panic!("root must be scan");
-            };
-            scan.table.source = crate::sql::planner::table::test_sql_scan_source(
-                crate::sql::planner::table::SqlScanKind::Delta {
-                    from_snapshot_id: 6,
-                    to_snapshot_id: 7,
-                },
-            );
-        },
-    );
+    let plan = native_scan_plan(NativeScanFixture::DeltaForPreparedBinding)
+        .expect("sealed delta preparation fixture");
     let before = format!("{plan:#?}");
     let resolver = SentinelDeltaResolver {
         calls: AtomicUsize::new(0),
@@ -84,7 +63,6 @@ fn fragment_build_prepares_delta_once_without_mutating_input_plan() {
 
     let result = build_for_test(TestBuildRequest {
         distributed_plan: &plan,
-        catalog: &EmptyCatalog,
         connectors: &connectors,
         scan_binding_resolver: Some(&resolver),
     })
@@ -116,21 +94,8 @@ fn fragment_build_prepares_delta_once_without_mutating_input_plan() {
 
 #[test]
 fn fragment_build_reports_missing_delta_resolver_before_encoding() {
-    let plan = crate::sql::planner::distributed::test_support::rebuild_test_plan(
-        iceberg_scan_plan(Some(vec!["id"])),
-        Default::default(),
-        |draft| {
-            let DistributedNodeKind::Scan(scan) = &mut draft.fragments_mut()[0].root.payload else {
-                panic!("root must be scan");
-            };
-            scan.table.source = crate::sql::planner::table::test_sql_scan_source(
-                crate::sql::planner::table::SqlScanKind::Delta {
-                    from_snapshot_id: 6,
-                    to_snapshot_id: 7,
-                },
-            );
-        },
-    );
+    let plan = native_scan_plan(NativeScanFixture::DeltaForPreparedBinding)
+        .expect("sealed delta preparation fixture");
 
     let connectors = ConnectorRegistry::new();
     crate::connector::scan_model::register_planned_files_fixture(
@@ -139,12 +104,7 @@ fn fragment_build_reports_missing_delta_resolver_before_encoding() {
         Vec::new(),
         None,
     );
-    let err = match build_for_test(TestBuildRequest::result(
-        &plan,
-        &EmptyCatalog,
-        &connectors,
-        None,
-    )) {
+    let err = match build_for_test(TestBuildRequest::result(&plan, &connectors, None)) {
         Ok(_) => panic!("delta scan without resolver must fail during preparation"),
         Err(err) => err,
     };

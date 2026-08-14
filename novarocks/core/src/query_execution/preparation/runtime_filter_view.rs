@@ -21,18 +21,10 @@ use crate::protocol::native::encode::expr::encode_expr;
 use crate::query_execution::schedule::SchedulingPlan;
 use arrow::datatypes::DataType;
 use novarocks_protocol::expr;
-use novarocks_sql::planner::distributed::FragmentEdge;
-use novarocks_sql::planner::runtime_filter::coverage::Coverage;
-use novarocks_sql::planner::runtime_filter::graph::{
-    ApplyPoint, ConsumerBindingTarget, ProducerBindingTarget, RuntimeFilterBindingRole,
-    RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
-};
+use novarocks_sql::plan_read::FragmentEdge;
+use novarocks_sql::planning::query_execution as sql_facts;
 
 use super::projection::PreparedFragmentSet;
-use super::runtime_filter_binding::{
-    PreparedRuntimeFilterBinding, PreparedRuntimeFilterBindingRole,
-    PreparedRuntimeFilterConsumerTarget,
-};
 
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterBindingFactsView<'a> {
@@ -67,53 +59,55 @@ impl<'a> RuntimeFilterBindingFragmentFactsView<'a> {
     pub fn bindings(self) -> impl ExactSizeIterator<Item = RuntimeFilterBindingFacts<'a>> + 'a {
         self.fragment
             .runtime_filter_bindings()
-            .bindings()
+            .iter()
             .map(|binding| RuntimeFilterBindingFacts { binding })
     }
 }
 
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterBindingFacts<'a> {
-    binding: &'a PreparedRuntimeFilterBinding,
+    binding: &'a sql_facts::SqlRuntimeFilterBindingFacts,
 }
 
 impl<'a> RuntimeFilterBindingFacts<'a> {
     pub fn binding_id(self) -> u32 {
-        self.binding.binding_id().get()
+        self.binding.binding_id
     }
 
     pub fn channel_id(self) -> u32 {
-        self.binding.channel_id().get()
+        self.binding.channel_id
     }
 
     pub fn node_id(self) -> i32 {
-        self.binding.node_id().get()
+        self.binding.node_id
     }
 
     pub fn apply_point(self) -> RuntimeFilterApplyPoint {
-        match self.binding.apply_point() {
-            ApplyPoint::NodeInput => RuntimeFilterApplyPoint::NodeInput,
-            ApplyPoint::NodeOutput => RuntimeFilterApplyPoint::NodeOutput,
+        match self.binding.apply_point {
+            sql_facts::SqlRuntimeFilterApplyPoint::NodeInput => RuntimeFilterApplyPoint::NodeInput,
+            sql_facts::SqlRuntimeFilterApplyPoint::NodeOutput => {
+                RuntimeFilterApplyPoint::NodeOutput
+            }
         }
     }
 
     /// Core owns this generic TypedExpr-to-wire leaf projection. The Frontend
     /// receives no TypedExpr or native encoder context.
     pub fn expression(self) -> Result<expr::Expr, String> {
-        encode_expr(self.binding.expression())
+        encode_expr(&self.binding.expression)
     }
 
     pub fn logical_domain(self) -> RuntimeFilterLogicalDomainFacts {
-        RuntimeFilterLogicalDomainFacts::from_sql(self.binding.logical_domain())
+        RuntimeFilterLogicalDomainFacts::from_sql(&self.binding.logical_domain)
     }
 
     pub fn reduction(self) -> RuntimeFilterReductionFacts {
-        RuntimeFilterReductionFacts::from_sql(self.binding.reduction())
+        RuntimeFilterReductionFacts::from_sql(self.binding.reduction)
     }
 
     pub fn role(self) -> RuntimeFilterBindingRoleFacts {
-        match self.binding.role() {
-            PreparedRuntimeFilterBindingRole::Producer {
+        match &self.binding.role {
+            sql_facts::SqlRuntimeFilterBindingRoleFacts::Producer {
                 contribution_kinds,
                 completion_requirement,
                 target,
@@ -121,14 +115,14 @@ impl<'a> RuntimeFilterBindingFacts<'a> {
                 contribution_kinds: contribution_kinds
                     .iter()
                     .copied()
-                    .map(RuntimeFilterContributionKind::from_sql)
+                    .map(|value| RuntimeFilterContributionKind::from_sql(*value))
                     .collect(),
                 completion_requirement: RuntimeFilterCompletionRequirement::from_sql(
                     *completion_requirement,
                 ),
                 target: RuntimeFilterProducerTarget::from_sql(*target),
             },
-            PreparedRuntimeFilterBindingRole::Consumer {
+            sql_facts::SqlRuntimeFilterBindingRoleFacts::Consumer {
                 capabilities,
                 activation,
                 target,
@@ -136,10 +130,10 @@ impl<'a> RuntimeFilterBindingFacts<'a> {
                 capabilities: capabilities
                     .iter()
                     .copied()
-                    .map(RuntimeFilterArtifactCapability::from_sql)
+                    .map(|value| RuntimeFilterArtifactCapability::from_sql(*value))
                     .collect(),
                 activation: RuntimeFilterConsumerActivation::from_sql(*activation),
-                target: RuntimeFilterConsumerTarget::from_prepared(target),
+                target: RuntimeFilterConsumerTarget::from_sql(target),
             },
         }
     }
@@ -164,32 +158,31 @@ pub enum RuntimeFilterLogicalDomainFacts {
 }
 
 impl RuntimeFilterLogicalDomainFacts {
-    fn from_sql(
-        value: &novarocks_sql::planner::runtime_filter::contract::RuntimeFilterLogicalDomain,
-    ) -> Self {
+    fn from_sql(value: &sql_facts::SqlRuntimeFilterLogicalDomainFacts) -> Self {
         match value {
-            novarocks_sql::planner::runtime_filter::contract::RuntimeFilterLogicalDomain::Membership {
+            sql_facts::SqlRuntimeFilterLogicalDomainFacts::Membership {
                 value_type,
                 null_semantics,
             } => Self::Membership {
                 value_type: value_type.clone(),
                 null_semantics: RuntimeFilterNullSemantics::from_sql(*null_semantics),
             },
-            novarocks_sql::planner::runtime_filter::contract::RuntimeFilterLogicalDomain::OrderedBound(order) => {
-                Self::Ordered {
-                    keys: order
-                        .keys
-                        .iter()
-                        .map(|key| RuntimeFilterOrderKeyFacts {
-                            data_type: key.data_type.clone(),
-                            direction: RuntimeFilterSortDirection::from_sql(key.direction),
-                            null_order: RuntimeFilterNullOrder::from_sql(key.null_order),
-                        })
-                        .collect(),
-                    inclusive: order.inclusive,
-                    comparator_digest: order.comparator_digest.get(),
-                }
-            }
+            sql_facts::SqlRuntimeFilterLogicalDomainFacts::Ordered {
+                keys,
+                inclusive,
+                comparator_digest,
+            } => Self::Ordered {
+                keys: keys
+                    .iter()
+                    .map(|key| RuntimeFilterOrderKeyFacts {
+                        data_type: key.data_type.clone(),
+                        direction: RuntimeFilterSortDirection::from_sql(key.direction),
+                        null_order: RuntimeFilterNullOrder::from_sql(key.null_order),
+                    })
+                    .collect(),
+                inclusive: *inclusive,
+                comparator_digest: *comparator_digest,
+            },
         }
     }
 }
@@ -207,18 +200,14 @@ pub enum RuntimeFilterReductionFacts {
 }
 
 impl RuntimeFilterReductionFacts {
-    fn from_sql(
-        value: novarocks_sql::planner::runtime_filter::contract::ReductionRequirement,
-    ) -> Self {
+    fn from_sql(value: sql_facts::SqlRuntimeFilterReductionFacts) -> Self {
         match value {
-            novarocks_sql::planner::runtime_filter::contract::ReductionRequirement::SetUnion => {
-                Self::SetUnion
-            }
-            novarocks_sql::planner::runtime_filter::contract::ReductionRequirement::TightenOrderedBound => {
+            sql_facts::SqlRuntimeFilterReductionFacts::SetUnion => Self::SetUnion,
+            sql_facts::SqlRuntimeFilterReductionFacts::TightenOrderedBound => {
                 Self::TightenOrderedBound
             }
-            novarocks_sql::planner::runtime_filter::contract::ReductionRequirement::MergeTopKSummary(requirement) => {
-                Self::MergeTopKSummary { k: requirement.k().get() }
+            sql_facts::SqlRuntimeFilterReductionFacts::MergeTopKSummary { k } => {
+                Self::MergeTopKSummary { k }
             }
         }
     }
@@ -247,8 +236,8 @@ pub enum RuntimeFilterContributionKind {
 }
 
 impl RuntimeFilterContributionKind {
-    fn from_sql(value: novarocks_sql::planner::runtime_filter::contract::ContributionKind) -> Self {
-        use novarocks_sql::planner::runtime_filter::contract::ContributionKind;
+    fn from_sql(value: sql_facts::SqlRuntimeFilterContributionKind) -> Self {
+        use sql_facts::SqlRuntimeFilterContributionKind as ContributionKind;
         match value {
             ContributionKind::ValueDomainDelta => Self::ValueDomainDelta,
             ContributionKind::FinalDomainShard => Self::FinalDomainShard,
@@ -266,17 +255,11 @@ pub enum RuntimeFilterCompletionRequirement {
 }
 
 impl RuntimeFilterCompletionRequirement {
-    fn from_sql(
-        value: novarocks_sql::planner::runtime_filter::contract::CompletionRequirement,
-    ) -> Self {
-        use novarocks_sql::planner::runtime_filter::contract::{
-            CompletionFenceKind, CompletionRequirement,
-        };
+    fn from_sql(value: sql_facts::SqlRuntimeFilterCompletionRequirement) -> Self {
+        use sql_facts::SqlRuntimeFilterCompletionRequirement as CompletionRequirement;
         match value {
             CompletionRequirement::ProducerClosed => Self::ProducerClosed,
-            CompletionRequirement::FencedFinalDomain(
-                CompletionFenceKind::CommittedDomainFrozen,
-            ) => Self::FencedCommittedDomainFrozen,
+            CompletionRequirement::FencedCommittedDomainFrozen => Self::FencedCommittedDomainFrozen,
         }
     }
 }
@@ -289,10 +272,8 @@ pub enum RuntimeFilterArtifactCapability {
 }
 
 impl RuntimeFilterArtifactCapability {
-    fn from_sql(
-        value: novarocks_sql::planner::runtime_filter::contract::ArtifactCapability,
-    ) -> Self {
-        use novarocks_sql::planner::runtime_filter::contract::ArtifactCapability;
+    fn from_sql(value: sql_facts::SqlRuntimeFilterArtifactCapability) -> Self {
+        use sql_facts::SqlRuntimeFilterArtifactCapability as ArtifactCapability;
         match value {
             ArtifactCapability::Membership => Self::Membership,
             ArtifactCapability::OrderedRange => Self::OrderedRange,
@@ -308,15 +289,14 @@ pub enum RuntimeFilterConsumerActivation {
 }
 
 impl RuntimeFilterConsumerActivation {
-    fn from_sql(
-        value: novarocks_sql::planner::runtime_filter::contract::ConsumerActivation,
-    ) -> Self {
-        use novarocks_sql::planner::runtime_filter::contract::{
-            ConsumerActivation, LateApplyGranularity,
+    fn from_sql(value: sql_facts::SqlRuntimeFilterConsumerActivation) -> Self {
+        use sql_facts::{
+            SqlRuntimeFilterConsumerActivation as ConsumerActivation,
+            SqlRuntimeFilterLateApplyGranularity as LateApplyGranularity,
         };
         match value {
             ConsumerActivation::BlockingSnapshot => Self::BlockingSnapshot,
-            ConsumerActivation::NonBlockingLive { late_apply } => {
+            ConsumerActivation::NonBlockingLive(late_apply) => {
                 Self::NonBlockingLive(match late_apply {
                     LateApplyGranularity::Row => RuntimeFilterLateApplyGranularity::Row,
                     LateApplyGranularity::Batch => RuntimeFilterLateApplyGranularity::Batch,
@@ -345,18 +325,15 @@ pub enum RuntimeFilterProducerTarget {
 }
 
 impl RuntimeFilterProducerTarget {
-    fn from_sql(value: ProducerBindingTarget) -> Self {
+    fn from_sql(value: sql_facts::SqlRuntimeFilterProducerTarget) -> Self {
         match value {
-            ProducerBindingTarget::JoinBuildKey { ordinal } => Self::JoinBuildKey {
-                ordinal: u32::try_from(ordinal).expect("sealed ordinal fits u32"),
-            },
+            ProducerBindingTarget::JoinBuildKey { ordinal } => Self::JoinBuildKey { ordinal },
             ProducerBindingTarget::AggregateTopNKey {
                 group_key_ordinal,
                 limit,
             } => Self::AggregateTopNKey {
-                group_key_ordinal: u32::try_from(group_key_ordinal)
-                    .expect("sealed group ordinal fits u32"),
-                limit: limit.get(),
+                group_key_ordinal,
+                limit,
             },
         }
     }
@@ -371,14 +348,12 @@ pub enum RuntimeFilterConsumerTarget {
 }
 
 impl RuntimeFilterConsumerTarget {
-    fn from_prepared(value: &PreparedRuntimeFilterConsumerTarget) -> Self {
+    fn from_sql(value: &sql_facts::SqlRuntimeFilterConsumerTarget) -> Self {
         match value {
-            PreparedRuntimeFilterConsumerTarget::DirectInput { input_ordinal } => {
-                Self::DirectInputOrdinal(
-                    u32::try_from(*input_ordinal).expect("sealed input ordinal fits u32"),
-                )
+            sql_facts::SqlRuntimeFilterConsumerTarget::DirectInput { input_ordinal } => {
+                Self::DirectInputOrdinal(*input_ordinal)
             }
-            PreparedRuntimeFilterConsumerTarget::SourceBoundary { scan_domain } => {
+            sql_facts::SqlRuntimeFilterConsumerTarget::SourceBoundary { scan_domain } => {
                 Self::SourceBoundary {
                     scan_domain_target: scan_domain.as_ref().map(|target| {
                         RuntimeFilterScanDomainTarget {
@@ -389,20 +364,6 @@ impl RuntimeFilterConsumerTarget {
                     }),
                 }
             }
-        }
-    }
-
-    // Deployment compilation consumes lifecycle/placement facts only.  Its
-    // view exists before pinned scan preparation and must never manufacture a
-    // Scan-domain physical target from semantic SQL identity.
-    fn from_unprepared_sql(value: &ConsumerBindingTarget) -> Self {
-        match value {
-            ConsumerBindingTarget::DirectInput { input_ordinal } => Self::DirectInputOrdinal(
-                u32::try_from(*input_ordinal).expect("sealed input ordinal fits u32"),
-            ),
-            ConsumerBindingTarget::SourceBoundary { .. } => Self::SourceBoundary {
-                scan_domain_target: None,
-            },
         }
     }
 }
@@ -421,14 +382,10 @@ pub enum RuntimeFilterSortDirection {
 }
 
 impl RuntimeFilterSortDirection {
-    fn from_sql(value: novarocks_sql::planner::runtime_filter::contract::SortDirection) -> Self {
+    fn from_sql(value: sql_facts::SqlRuntimeFilterSortDirection) -> Self {
         match value {
-            novarocks_sql::planner::runtime_filter::contract::SortDirection::Ascending => {
-                Self::Ascending
-            }
-            novarocks_sql::planner::runtime_filter::contract::SortDirection::Descending => {
-                Self::Descending
-            }
+            sql_facts::SqlRuntimeFilterSortDirection::Ascending => Self::Ascending,
+            sql_facts::SqlRuntimeFilterSortDirection::Descending => Self::Descending,
         }
     }
 }
@@ -440,10 +397,10 @@ pub enum RuntimeFilterNullOrder {
 }
 
 impl RuntimeFilterNullOrder {
-    fn from_sql(value: novarocks_sql::planner::runtime_filter::contract::NullOrder) -> Self {
+    fn from_sql(value: sql_facts::SqlRuntimeFilterNullOrder) -> Self {
         match value {
-            novarocks_sql::planner::runtime_filter::contract::NullOrder::First => Self::First,
-            novarocks_sql::planner::runtime_filter::contract::NullOrder::Last => Self::Last,
+            sql_facts::SqlRuntimeFilterNullOrder::First => Self::First,
+            sql_facts::SqlRuntimeFilterNullOrder::Last => Self::Last,
         }
     }
 }
@@ -467,15 +424,17 @@ impl<'a> RuntimeFilterDeploymentFactsView<'a> {
 
     pub fn channels(self) -> impl Iterator<Item = RuntimeFilterChannelDeploymentFacts<'a>> + 'a {
         self.prepared
-            .runtime_filter_graph()
+            .runtime_filter_facts()
             .channels()
+            .iter()
             .map(|channel| RuntimeFilterChannelDeploymentFacts { channel })
     }
 
     pub fn bindings(self) -> impl Iterator<Item = RuntimeFilterDeploymentBindingFacts<'a>> + 'a {
         self.prepared
-            .runtime_filter_graph()
-            .bindings()
+            .runtime_filter_facts()
+            .deployment_bindings()
+            .iter()
             .map(|binding| RuntimeFilterDeploymentBindingFacts { binding })
     }
 
@@ -505,58 +464,22 @@ impl<'a> RuntimeFilterDeploymentFactsView<'a> {
     /// Each producer tuple has at most one sealed proof or skip provenance.
     /// The source bindings are BTreeMap ordered, so this iterator is stable.
     pub fn join_progress(self) -> impl Iterator<Item = RuntimeFilterJoinProgressFacts> + 'a {
-        let catalog = self.prepared.runtime_filter_join_progress();
         self.prepared
-            .runtime_filter_graph()
-            .bindings()
-            .filter_map(move |binding| {
-                let RuntimeFilterBindingRole::Producer(_) = &binding.role else {
-                    return None;
-                };
-                let key = (
-                    binding.channel_id,
-                    binding.binding_id,
-                    binding.location.fragment_id.get(),
-                );
-                if let Some(proof) = catalog.get(&key) {
-                    return Some(RuntimeFilterJoinProgressFacts::Proven {
-                        channel_id: proof.channel.get(),
-                        producer_binding_id: proof.producer_binding.get(),
-                        producer_fragment_id: proof.producer_fragment,
-                        join_node_id: proof.join_node_id,
-                        build_frontier: proof
-                            .build_frontier
-                            .iter()
-                            .map(RuntimeFilterFrontierEdgeFacts::from_sql)
-                            .collect(),
-                        non_build_inputs: proof
-                            .non_build_inputs
-                            .iter()
-                            .map(RuntimeFilterFrontierEdgeFacts::from_sql)
-                            .collect(),
-                    });
-                }
-                catalog
-                    .skipped(&key)
-                    .map(|skip| RuntimeFilterJoinProgressFacts::Skipped {
-                        channel_id: binding.channel_id.get(),
-                        producer_binding_id: binding.binding_id.get(),
-                        producer_fragment_id: binding.location.fragment_id.get(),
-                        join_node_id: skip.join_node_id,
-                        reason: RuntimeFilterJoinProgressSkipReason::from_sql(skip.rule),
-                    })
-            })
+            .runtime_filter_facts()
+            .join_progress()
+            .iter()
+            .map(RuntimeFilterJoinProgressFacts::from_sql)
     }
 }
 
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterChannelDeploymentFacts<'a> {
-    channel: &'a RuntimeFilterChannelSpec,
+    channel: &'a sql_facts::SqlRuntimeFilterChannelFacts,
 }
 
 impl RuntimeFilterChannelDeploymentFacts<'_> {
     pub fn channel_id(self) -> u32 {
-        self.channel.channel_id.get()
+        self.channel.channel_id
     }
 
     pub fn logical_domain(self) -> RuntimeFilterLogicalDomainFacts {
@@ -565,10 +488,10 @@ impl RuntimeFilterChannelDeploymentFacts<'_> {
 
     pub fn lifecycle(self) -> RuntimeFilterDeploymentLifecycleFacts {
         match self.channel.lifecycle {
-            novarocks_sql::planner::runtime_filter::contract::RuntimeFilterLifecycle::CompleteOnce => {
+            sql_facts::SqlRuntimeFilterLifecycleFacts::CompleteOnce => {
                 RuntimeFilterDeploymentLifecycleFacts::CompleteOnce
             }
-            novarocks_sql::planner::runtime_filter::contract::RuntimeFilterLifecycle::MonotonicUpdates => {
+            sql_facts::SqlRuntimeFilterLifecycleFacts::MonotonicUpdates => {
                 RuntimeFilterDeploymentLifecycleFacts::MonotonicUpdates
             }
         }
@@ -621,14 +544,10 @@ pub enum RuntimeFilterNullSemantics {
 }
 
 impl RuntimeFilterNullSemantics {
-    fn from_sql(value: novarocks_sql::planner::runtime_filter::contract::NullSemantics) -> Self {
+    fn from_sql(value: sql_facts::SqlRuntimeFilterNullSemantics) -> Self {
         match value {
-            novarocks_sql::planner::runtime_filter::contract::NullSemantics::NeverMatches => {
-                Self::NeverMatches
-            }
-            novarocks_sql::planner::runtime_filter::contract::NullSemantics::NullSafeEqual => {
-                Self::NullSafeEqual
-            }
+            sql_facts::SqlRuntimeFilterNullSemantics::NeverMatches => Self::NeverMatches,
+            sql_facts::SqlRuntimeFilterNullSemantics::NullSafeEqual => Self::NullSafeEqual,
         }
     }
 }
@@ -646,11 +565,17 @@ pub enum RuntimeFilterCoverageFacts {
 }
 
 impl RuntimeFilterCoverageFacts {
-    fn from_sql(coverage: &Coverage) -> Self {
+    fn from_sql(coverage: &sql_facts::SqlRuntimeFilterCoverageFacts) -> Self {
         match coverage {
-            Coverage::Leaf(witness) => Self::LeafWitnessId(witness.get()),
-            Coverage::AllOf(children) => Self::AllOf(children.iter().map(Self::from_sql).collect()),
-            Coverage::AnyOf(children) => Self::AnyOf(children.iter().map(Self::from_sql).collect()),
+            sql_facts::SqlRuntimeFilterCoverageFacts::LeafWitnessId(witness) => {
+                Self::LeafWitnessId(*witness)
+            }
+            sql_facts::SqlRuntimeFilterCoverageFacts::AllOf(children) => {
+                Self::AllOf(children.iter().map(Self::from_sql).collect())
+            }
+            sql_facts::SqlRuntimeFilterCoverageFacts::AnyOf(children) => {
+                Self::AnyOf(children.iter().map(Self::from_sql).collect())
+            }
         }
     }
 }
@@ -665,60 +590,60 @@ pub struct RuntimeFilterPolicyFacts {
 
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterDeploymentBindingFacts<'a> {
-    binding: &'a RuntimeFilterBindingSpec,
+    binding: &'a sql_facts::SqlRuntimeFilterDeploymentBindingFacts,
 }
 
 impl RuntimeFilterDeploymentBindingFacts<'_> {
     pub fn binding_id(self) -> u32 {
-        self.binding.binding_id.get()
+        self.binding.binding_id
     }
 
     pub fn channel_id(self) -> u32 {
-        self.binding.channel_id.get()
+        self.binding.channel_id
     }
 
     pub fn fragment_id(self) -> u32 {
-        self.binding.location.fragment_id.get()
+        self.binding.fragment_id
     }
 
     pub fn node_id(self) -> i32 {
-        self.binding.location.node_id.get()
+        self.binding.node_id
     }
 
     pub fn coverage_witness_id(self) -> Option<u32> {
-        self.binding
-            .coverage_witness_id
-            .map(|witness| witness.get())
+        self.binding.coverage_witness_id
     }
 
     pub fn role(self) -> RuntimeFilterDeploymentBindingRoleFacts {
         match &self.binding.role {
-            RuntimeFilterBindingRole::Producer(requirement) => {
-                RuntimeFilterDeploymentBindingRoleFacts::Producer {
-                    contribution_kinds: requirement
-                        .contribution_kinds
-                        .iter()
-                        .copied()
-                        .map(RuntimeFilterContributionKind::from_sql)
-                        .collect(),
-                    completion_requirement: RuntimeFilterCompletionRequirement::from_sql(
-                        requirement.completion_requirement,
-                    ),
-                    target: RuntimeFilterProducerTarget::from_sql(requirement.target),
-                }
-            }
-            RuntimeFilterBindingRole::Consumer(requirement) => {
-                RuntimeFilterDeploymentBindingRoleFacts::Consumer {
-                    capabilities: requirement
-                        .capabilities
-                        .iter()
-                        .copied()
-                        .map(RuntimeFilterArtifactCapability::from_sql)
-                        .collect(),
-                    activation: RuntimeFilterConsumerActivation::from_sql(requirement.activation),
-                    target: RuntimeFilterConsumerTarget::from_unprepared_sql(&requirement.target),
-                }
-            }
+            sql_facts::SqlRuntimeFilterBindingRoleFacts::Producer {
+                contribution_kinds,
+                completion_requirement,
+                target,
+            } => RuntimeFilterDeploymentBindingRoleFacts::Producer {
+                contribution_kinds: contribution_kinds
+                    .iter()
+                    .copied()
+                    .map(RuntimeFilterContributionKind::from_sql)
+                    .collect(),
+                completion_requirement: RuntimeFilterCompletionRequirement::from_sql(
+                    *completion_requirement,
+                ),
+                target: RuntimeFilterProducerTarget::from_sql(*target),
+            },
+            sql_facts::SqlRuntimeFilterBindingRoleFacts::Consumer {
+                capabilities,
+                activation,
+                target,
+            } => RuntimeFilterDeploymentBindingRoleFacts::Consumer {
+                capabilities: capabilities
+                    .iter()
+                    .copied()
+                    .map(RuntimeFilterArtifactCapability::from_sql)
+                    .collect(),
+                activation: RuntimeFilterConsumerActivation::from_sql(*activation),
+                target: RuntimeFilterConsumerTarget::from_sql(target),
+            },
         }
     }
 }
@@ -809,6 +734,47 @@ pub enum RuntimeFilterJoinProgressFacts {
     },
 }
 
+impl RuntimeFilterJoinProgressFacts {
+    fn from_sql(value: &sql_facts::SqlRuntimeFilterJoinProgressFacts) -> Self {
+        match value {
+            sql_facts::SqlRuntimeFilterJoinProgressFacts::Proven {
+                channel_id,
+                producer_binding_id,
+                producer_fragment_id,
+                join_node_id,
+                build_frontier,
+                non_build_inputs,
+            } => Self::Proven {
+                channel_id: *channel_id,
+                producer_binding_id: *producer_binding_id,
+                producer_fragment_id: *producer_fragment_id,
+                join_node_id: *join_node_id,
+                build_frontier: build_frontier
+                    .iter()
+                    .map(RuntimeFilterFrontierEdgeFacts::from_sql)
+                    .collect(),
+                non_build_inputs: non_build_inputs
+                    .iter()
+                    .map(RuntimeFilterFrontierEdgeFacts::from_sql)
+                    .collect(),
+            },
+            sql_facts::SqlRuntimeFilterJoinProgressFacts::Skipped {
+                channel_id,
+                producer_binding_id,
+                producer_fragment_id,
+                join_node_id,
+                reason,
+            } => Self::Skipped {
+                channel_id: *channel_id,
+                producer_binding_id: *producer_binding_id,
+                producer_fragment_id: *producer_fragment_id,
+                join_node_id: *join_node_id,
+                reason: RuntimeFilterJoinProgressSkipReason::from_sql(*reason),
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterFrontierEdgeFacts {
     pub source_fragment_id: u32,
@@ -816,7 +782,7 @@ pub struct RuntimeFilterFrontierEdgeFacts {
 }
 
 impl RuntimeFilterFrontierEdgeFacts {
-    fn from_sql(edge: &novarocks_sql::planner::runtime_filter::progress::FrontierEdge) -> Self {
+    fn from_sql(edge: &sql_facts::SqlRuntimeFilterFrontierEdgeFacts) -> Self {
         Self {
             source_fragment_id: edge.source_fragment,
             target_exchange_node_id: edge.target_exchange_node,
@@ -832,17 +798,13 @@ pub enum RuntimeFilterJoinProgressSkipReason {
 }
 
 impl RuntimeFilterJoinProgressSkipReason {
-    fn from_sql(value: novarocks_sql::planner::runtime_filter::progress::FrontierSkip) -> Self {
+    fn from_sql(value: sql_facts::SqlRuntimeFilterJoinProgressSkipReason) -> Self {
         match value {
-            novarocks_sql::planner::runtime_filter::progress::FrontierSkip::NoRfSides => {
-                Self::NoRfSides
+            sql_facts::SqlRuntimeFilterJoinProgressSkipReason::NoRfSides => Self::NoRfSides,
+            sql_facts::SqlRuntimeFilterJoinProgressSkipReason::MissingChild => Self::MissingChild,
+            sql_facts::SqlRuntimeFilterJoinProgressSkipReason::UnauditedNode { node_id } => {
+                Self::UnauditedNode { node_id }
             }
-            novarocks_sql::planner::runtime_filter::progress::FrontierSkip::MissingChild => {
-                Self::MissingChild
-            }
-            novarocks_sql::planner::runtime_filter::progress::FrontierSkip::UnauditedNode {
-                node_id,
-            } => Self::UnauditedNode { node_id },
         }
     }
 }

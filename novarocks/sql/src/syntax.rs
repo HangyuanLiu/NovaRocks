@@ -16,10 +16,16 @@ pub use crate::parser::ast::{
 pub use crate::parser::ast::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
 pub use crate::parser::dialect::StarRocksDialect;
 
+pub use crate::parser::dialect::substitute_user_variables;
+
 use sqlparser::parser::Parser;
 
 pub fn parse_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
     crate::parser::parse_sql_raw(sql)
+}
+
+pub fn extract_allow_throw_exception_hint(sql: &str) -> bool {
+    crate::parser::set_var_hint::extract_allow_throw_exception(sql)
 }
 
 pub fn convert_object_name(name: sqlparser::ast::ObjectName) -> Result<ObjectName, String> {
@@ -37,6 +43,67 @@ pub fn literal_from_batch(
     row_idx: usize,
 ) -> Result<Literal, String> {
     crate::literal::literal_from_batch(column, row_idx)
+}
+
+/// Hashable syntax value used only to group admitted aggregate-table rows.
+/// The representation deliberately stays independent from the literal module's
+/// internal key type.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum AggregateLiteralKey {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(u64),
+    String(String),
+}
+
+pub fn aggregate_literal_key(literal: &Literal) -> AggregateLiteralKey {
+    match literal {
+        Literal::Null => AggregateLiteralKey::Null,
+        Literal::Bool(value) => AggregateLiteralKey::Bool(*value),
+        Literal::Int(value) => AggregateLiteralKey::Int(*value),
+        Literal::Float(value) => AggregateLiteralKey::Float(value.to_bits()),
+        Literal::String(value) | Literal::Date(value) => AggregateLiteralKey::String(value.clone()),
+        Literal::Array(values) => AggregateLiteralKey::String(
+            values
+                .iter()
+                .map(|value| format!("{value:?}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        Literal::Map(entries) => AggregateLiteralKey::String(format!("{entries:?}")),
+        Literal::Struct(values) => AggregateLiteralKey::String(format!("{values:?}")),
+    }
+}
+
+pub fn compare_aggregate_literals(
+    left: &Literal,
+    right: &Literal,
+) -> Result<std::cmp::Ordering, String> {
+    crate::literal::compare_literals(left, right)
+}
+
+pub fn column_default_to_literal(
+    value: &novarocks_catalog::schema::ColumnDefault,
+    data_type: &novarocks_catalog::schema::SqlType,
+) -> Result<Literal, String> {
+    crate::literal::column_default_to_ast_literal(value, data_type)
+}
+
+pub fn latin1_string_to_bytes(value: &str) -> Result<Vec<u8>, String> {
+    crate::literal::latin1_string_to_bytes(value)
+}
+
+pub fn bytes_to_latin1_string(bytes: &[u8]) -> String {
+    crate::literal::bytes_to_latin1_string(bytes)
+}
+
+pub fn parse_date_string_to_days(value: &str) -> Result<i32, String> {
+    crate::literal::parse_date_string_to_days(value)
+}
+
+pub fn parse_datetime_string_to_micros(value: &str) -> Result<i64, String> {
+    crate::literal::parse_datetime_string_to_micros(value)
 }
 
 pub fn sqlparser_expr_to_literal(expr: &sqlparser::ast::Expr) -> Result<Literal, String> {

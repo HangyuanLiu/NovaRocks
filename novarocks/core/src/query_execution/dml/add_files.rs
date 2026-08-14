@@ -40,6 +40,7 @@ use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_sql::planning::dml::classify_add_files;
+use novarocks_sql::syntax::ObjectName;
 
 pub use novarocks_sql::planning::dml::AddFilesCommand;
 
@@ -267,7 +268,7 @@ impl AddFilesEngine for DmlExecutionKernel {
     ) -> Result<PreparedAddFiles, AddFilesPlanError> {
         let target = crate::catalog_application::resolver::resolve_existing_table_target(
             self,
-            &crate::sql::parser::ast::ObjectName {
+            &ObjectName {
                 parts: request.command.table_parts,
             },
             request.current_catalog.as_deref(),

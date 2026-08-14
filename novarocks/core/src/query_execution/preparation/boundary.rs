@@ -17,16 +17,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use novarocks_sql::planner::distributed::{
-    BoundaryContract, BoundaryKind, FragmentEdgeKind, FragmentId,
-};
+use novarocks_sql::plan_read::{BoundaryContract, BoundaryKind, FragmentEdgeKind, FragmentId};
 
 type BoundaryKey = (FragmentId, Option<i32>, BoundaryKind);
 
 pub(super) fn validate_and_group_boundary_contracts(
     result_fragment_id: Option<FragmentId>,
     write_contract_fragment_ids: &BTreeSet<FragmentId>,
-    edges: &[novarocks_sql::planner::distributed::FragmentEdge],
+    edges: &[novarocks_sql::plan_read::FragmentEdge],
     contracts: &[BoundaryContract],
     sealed_ids: &BTreeSet<FragmentId>,
 ) -> Result<BTreeMap<FragmentId, Vec<BoundaryContract>>, String> {
@@ -141,10 +139,10 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::validate_and_group_boundary_contracts;
-    use novarocks_sql::planner::distributed::{BoundaryContract, FragmentId};
+    use novarocks_sql::plan_read::{BoundaryContract, FragmentId};
 
     fn validate_contracts(
-        plan: &novarocks_sql::planner::distributed::DistributedPlan,
+        plan: &novarocks_sql::plan_read::DistributedPlan,
         contracts: &[BoundaryContract],
     ) -> Result<BTreeMap<FragmentId, Vec<BoundaryContract>>, String> {
         validate_and_group_boundary_contracts(

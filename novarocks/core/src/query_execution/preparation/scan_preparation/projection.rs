@@ -18,7 +18,7 @@
 use crate::query_execution::preparation::scan::{
     ResolvedReadColumn, ResolvedReadReason, ResolvedScanColumn, ResolvedScanColumnKind,
 };
-use novarocks_sql::column_id::ColumnId;
+use novarocks_sql::plan_read::ColumnId;
 use novarocks_sql::plan_read::PlanScanNode;
 use novarocks_sql::plan_read::table::ScanSource;
 

@@ -30,6 +30,243 @@ const ICEBERG_ROW_POSITION_COLUMN: &str = "_pos";
 const ICEBERG_ROW_ID_COLUMN: &str = "_row_id";
 const ICEBERG_LAST_UPDATED_SEQUENCE_COLUMN: &str = "_last_updated_sequence_number";
 
+/// One application-admitted, immutable statistics observation. It contains no
+/// resolver, table handle, lease, or callback, so SQL cannot retry against a
+/// newer connector generation while compiling the paired request.
+#[derive(Clone, Debug)]
+pub enum DmlStatisticsEvidence {
+    Available {
+        binding: crate::binding::SqlTableBindingId,
+        label: String,
+        columns: Vec<novarocks_catalog::schema::ColumnDef>,
+        evidence: novarocks_spi::connector::StatisticsEvidence,
+        optimizer_usable: bool,
+    },
+    Missing {
+        binding: crate::binding::SqlTableBindingId,
+        label: String,
+        reason: String,
+    },
+    Fatal {
+        binding: crate::binding::SqlTableBindingId,
+        label: String,
+        failure: DmlStatisticsFailure,
+    },
+}
+
+/// An admission-time contradiction between connector evidence and the frozen
+/// table binding.  These failures are carried into SQL unchanged; SQL never
+/// retries a catalog or statistics lookup to replace them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DmlStatisticsFailure {
+    BindingMissing,
+    OwnerMismatch,
+    IncarnationMismatch,
+    DataVersionMismatch,
+    CorruptEvidence(String),
+}
+
+/// SQL-owned opaque statistics carrier for one compile request.
+#[derive(Clone, Debug)]
+pub struct DmlStatisticsSnapshot(pub(crate) crate::optimizer::stats_input::SqlStatisticsSnapshot);
+
+impl DmlStatisticsSnapshot {
+    /// Construct an intentionally empty snapshot for an already SQL-owned
+    /// logical input. Empty means evidence is unavailable, never that a table
+    /// has zero rows.
+    pub fn empty() -> Self {
+        Self(crate::optimizer::stats_input::SqlStatisticsSnapshot::empty())
+    }
+
+    /// Seal admission-frozen connector evidence into the compiler's private
+    /// statistics representation. The public input is immutable data only;
+    /// provider handles, leases, and resolver callbacks cannot cross this
+    /// boundary.
+    pub fn from_evidence(entries: impl IntoIterator<Item = DmlStatisticsEvidence>) -> Self {
+        use crate::optimizer::stats_input::{
+            BaseTableStatistics, SqlTableStatisticsEvidence, StatsMissingReason,
+        };
+
+        let mut snapshot = crate::optimizer::stats_input::SqlStatisticsSnapshot::empty();
+        for entry in entries {
+            match entry {
+                DmlStatisticsEvidence::Available {
+                    binding,
+                    label,
+                    columns,
+                    evidence,
+                    optimizer_usable,
+                } => snapshot.insert(
+                    binding,
+                    SqlTableStatisticsEvidence {
+                        label,
+                        statistics: evidence_to_base_statistics(
+                            &evidence,
+                            &columns,
+                            optimizer_usable,
+                        ),
+                    },
+                ),
+                DmlStatisticsEvidence::Missing {
+                    binding,
+                    label,
+                    reason,
+                } => snapshot.insert(
+                    binding,
+                    SqlTableStatisticsEvidence {
+                        label,
+                        statistics: BaseTableStatistics::missing(
+                            StatsMissingReason::CatalogLoadError(reason),
+                        ),
+                    },
+                ),
+                DmlStatisticsEvidence::Fatal {
+                    binding, failure, ..
+                } => snapshot.insert_fatal(binding, match_failure(failure)),
+            }
+        }
+        Self(snapshot)
+    }
+}
+
+fn match_failure(
+    failure: DmlStatisticsFailure,
+) -> crate::optimizer::stats_input::SqlStatisticsFatalError {
+    use crate::optimizer::stats_input::SqlStatisticsFatalError;
+
+    match failure {
+        DmlStatisticsFailure::BindingMissing => SqlStatisticsFatalError::BindingMissing,
+        DmlStatisticsFailure::OwnerMismatch => SqlStatisticsFatalError::OwnerMismatch,
+        DmlStatisticsFailure::IncarnationMismatch => SqlStatisticsFatalError::IncarnationMismatch,
+        DmlStatisticsFailure::DataVersionMismatch => SqlStatisticsFatalError::DataVersionMismatch,
+        DmlStatisticsFailure::CorruptEvidence(message) => {
+            SqlStatisticsFatalError::CorruptEvidence(message)
+        }
+    }
+}
+
+fn evidence_to_base_statistics(
+    evidence: &novarocks_spi::connector::StatisticsEvidence,
+    columns: &[novarocks_catalog::schema::ColumnDef],
+    optimizer_usable: bool,
+) -> crate::optimizer::stats_input::BaseTableStatistics {
+    use crate::optimizer::statistics::Confidence;
+    use crate::optimizer::stats_input::{
+        BaseColumnStatistics, BaseTableStatistics, StatValue, StatsMissingReason, StatsSource,
+    };
+    use novarocks_spi::connector::{
+        StatisticsMetric, StatisticsMetricState, StatisticsMetricValue, StatisticsProvenance,
+    };
+
+    if !optimizer_usable {
+        return BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
+            "connector evidence is not Full+Exact for the pinned table version".to_string(),
+        ));
+    }
+    let source = match evidence.provenance {
+        StatisticsProvenance::ProviderArtifact => StatsSource::IcebergPuffin,
+        StatisticsProvenance::Manifest => StatsSource::IcebergManifest,
+        StatisticsProvenance::VisibleRows | StatisticsProvenance::Provider(_) => {
+            StatsSource::ConnectorEstimate
+        }
+    };
+    let metric_u64 = |state: Option<&StatisticsMetricState>| match state {
+        Some(StatisticsMetricState::Available(StatisticsMetricValue::U64(value))) => Some(*value),
+        Some(StatisticsMetricState::Available(StatisticsMetricValue::I64(value))) => {
+            u64::try_from(*value).ok()
+        }
+        Some(StatisticsMetricState::Available(StatisticsMetricValue::F64(value)))
+            if value.is_finite() && *value >= 0.0 && *value <= u64::MAX as f64 =>
+        {
+            Some(*value as u64)
+        }
+        _ => None,
+    };
+    let metric_f64 = |state: Option<&StatisticsMetricState>,
+                      data_type: Option<&arrow::datatypes::DataType>| {
+        let value = match state {
+            Some(StatisticsMetricState::Available(StatisticsMetricValue::U64(value))) => {
+                *value as f64
+            }
+            Some(StatisticsMetricState::Available(StatisticsMetricValue::I64(value))) => {
+                *value as f64
+            }
+            Some(StatisticsMetricState::Available(StatisticsMetricValue::F64(value))) => *value,
+            Some(StatisticsMetricState::Available(StatisticsMetricValue::Bytes(value)))
+                if matches!(data_type, Some(arrow::datatypes::DataType::FixedSizeBinary(width)) if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
+                    && value.len()
+                        == usize::try_from(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
+                            .ok()? =>
+            {
+                novarocks_types::largeint::i128_from_be_bytes(value).ok()? as f64
+            }
+            _ => return None,
+        };
+        value.is_finite().then_some(value)
+    };
+
+    let row_count = metric_u64(evidence.metrics.get(&StatisticsMetric::RowCount));
+    let row_count_stat = row_count
+        .map(|value| StatValue::known(value, Confidence::Exact, source))
+        .unwrap_or_else(|| {
+            StatValue::missing(StatsMissingReason::ColumnNotReported("row_count".into()))
+        });
+    let mut base_columns = std::collections::HashMap::new();
+    for column in columns {
+        let name = column.name.to_ascii_lowercase();
+        let key = std::sync::Arc::<str>::from(column.name.as_str());
+        let missing = || StatsMissingReason::ColumnNotReported(name.clone());
+        let null_count = metric_u64(evidence.metrics.get(&StatisticsMetric::NullCount {
+            column: std::sync::Arc::clone(&key),
+        }));
+        let nulls_fraction = match (null_count, row_count) {
+            (Some(nulls), Some(rows)) if rows > 0 => {
+                StatValue::known(nulls as f64 / rows as f64, Confidence::Exact, source)
+            }
+            (Some(0), Some(0)) => StatValue::known(0.0, Confidence::Exact, source),
+            _ => StatValue::missing(missing()),
+        };
+        base_columns.insert(
+            name.clone(),
+            BaseColumnStatistics {
+                nulls_fraction,
+                average_row_size: metric_f64(
+                    evidence.metrics.get(&StatisticsMetric::AverageSize {
+                        column: std::sync::Arc::clone(&key),
+                    }),
+                    None,
+                )
+                .map(|value| StatValue::known(value, Confidence::Exact, source))
+                .unwrap_or_else(|| StatValue::missing(missing())),
+                min_value: metric_f64(
+                    evidence.metrics.get(&StatisticsMetric::Minimum {
+                        column: std::sync::Arc::clone(&key),
+                    }),
+                    Some(&column.data_type),
+                )
+                .map(|value| StatValue::known(value, Confidence::Exact, source))
+                .unwrap_or_else(|| StatValue::missing(missing())),
+                max_value: metric_f64(
+                    evidence.metrics.get(&StatisticsMetric::Maximum {
+                        column: std::sync::Arc::clone(&key),
+                    }),
+                    Some(&column.data_type),
+                )
+                .map(|value| StatValue::known(value, Confidence::Exact, source))
+                .unwrap_or_else(|| StatValue::missing(missing())),
+                ndv: StatValue::missing(StatsMissingReason::ColumnNotReported(format!(
+                    "approximate Theta NDV for `{name}` is not an exact optimizer statistic"
+                ))),
+            },
+        );
+    }
+    BaseTableStatistics {
+        row_count: row_count_stat,
+        columns: base_columns,
+        source,
+    }
+}
+
 /// Parse one normalized raw statement for DML admission.  The returned AST is
 /// the upstream SQL parser's public syntax tree; NovaRocks custom syntax is
 /// normalized before this boundary.
@@ -226,6 +463,127 @@ pub fn build_frozen_connector_write_distributed_plan(
     )
 }
 
+/// Compile an immutable SQL request into a sealed connector-write plan.
+/// Application code supplies only the already-admitted request context and
+/// opaque terminal sink; optimizer and physical planner artifacts do not
+/// cross this boundary.
+pub fn compile_connector_write_distributed_plan(
+    request: crate::compiler::SqlCompileRequest<'_>,
+    sink: DmlWritePlanInput,
+    settings: &crate::compiler::SessionOptimizerSettings,
+) -> Result<crate::plan_read::DistributedPlan, String> {
+    let crate::compiler::SqlCompileOutput::Optimized(compiled) =
+        crate::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
+    else {
+        return Err("connector write intent did not produce optimized SQL facts".to_string());
+    };
+    let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
+    crate::planner::pipeline::build_sql_write_distributed_plan_with_settings(
+        physical, sink.0, settings,
+    )
+}
+
+/// Compile one immutable query request directly to its sealed distributed
+/// plan. This is the read-side counterpart to the DML write entrypoints and
+/// keeps optimized/scalar graphs inside SQL.
+pub fn compile_query_distributed_plan(
+    request: crate::compiler::SqlCompileRequest<'_>,
+) -> Result<crate::plan_read::DistributedPlan, String> {
+    crate::compiler::SqlCompiler::compile(request)
+        .map_err(|error| error.to_string())?
+        .into_distributed_plan()
+        .map_err(|error| error.to_string())
+}
+
+/// SQL-owned, immutable CTAS source artifact. Its optimizer graph never
+/// leaves this module; application code may inspect only the source schema,
+/// stable capture fingerprint, and sealed write plan derived from it.
+#[derive(Clone, Debug)]
+pub struct DmlCtasSourcePlan {
+    optimized: crate::optimizer::OptimizedOperatorNode,
+}
+
+/// One source output field exposed to CTAS target admission.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DmlSourceColumn {
+    pub name: String,
+    pub data_type: arrow::datatypes::DataType,
+    pub nullable: bool,
+}
+
+impl DmlCtasSourcePlan {
+    pub fn output_columns(&self) -> Vec<DmlSourceColumn> {
+        self.optimized
+            .output_columns
+            .iter()
+            .map(|column| DmlSourceColumn {
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+            })
+            .collect()
+    }
+
+    /// Versioned digest of the frozen in-memory optimizer artifact used to
+    /// bind CTAS source preparation to exactly one compilation.
+    pub fn capture_fingerprint(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+
+        let material = format!("{:#?}", self.optimized);
+        let mut digest = Sha256::new();
+        for part in [
+            b"novarocks.ctas-optimized-capture.v1".as_slice(),
+            material.as_bytes(),
+        ] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part);
+        }
+        digest.finalize().into()
+    }
+}
+
+/// Compile one CTAS source into an opaque SQL artifact. The source must be
+/// optimized, but no distributed sink is selected until the application has
+/// completed target admission.
+pub fn compile_ctas_source(
+    request: crate::compiler::SqlCompileRequest<'_>,
+) -> Result<DmlCtasSourcePlan, String> {
+    let crate::compiler::SqlCompileOutput::Optimized(compiled) =
+        crate::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
+    else {
+        return Err("CTAS source did not produce optimized SQL facts".to_string());
+    };
+    Ok(DmlCtasSourcePlan {
+        optimized: compiled.optimized_tree,
+    })
+}
+
+/// Attach an already admitted CTAS write schema to its frozen source and
+/// return the sealed distributed write plan.
+pub fn build_ctas_connector_write_distributed_plan(
+    source: &DmlCtasSourcePlan,
+    target_schema: arrow::datatypes::SchemaRef,
+    settings: &crate::compiler::SessionOptimizerSettings,
+) -> Result<crate::plan_read::DistributedPlan, String> {
+    let physical = crate::planner::optimizer_bridge::to_physical_plan(&source.optimized)?;
+    crate::planner::pipeline::build_connector_write_distributed_plan(
+        physical,
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput {
+            target_schema,
+            input: crate::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+            root_output_exprs: None,
+        },
+        settings,
+    )
+}
+
+/// Test-only sealed connector-write fixture for application encoder tests.
+/// The distributed graph remains opaque; callers receive only its read model.
+#[doc(hidden)]
+pub fn native_encoder_test_fixture_plan() -> Result<crate::plan_read::DistributedPlan, String> {
+    crate::planner::distributed::native_encoder_test_fixture_plan()
+}
+
 /// Provider route facts that SQL binds to a change-stream producer.  Field
 /// names are resolved against the sealed producer output inside SQL, never by
 /// the application against an optimizer tree.
@@ -278,6 +636,18 @@ pub struct DmlChangeStreamCompileRequest<'a> {
     pub kind: DmlChangeStreamKind,
     pub routes: Vec<DmlChangeStreamRoute>,
     pub pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
+}
+
+/// Optimizer policy for generated mutation change streams.  This stays in the
+/// SQL facade so callers do not reproduce a physical-plan safety rule.
+pub fn dml_change_stream_optimizer_settings() -> crate::optimizer::options::SessionOptimizerSettings
+{
+    let mut settings = crate::optimizer::options::SessionOptimizerSettings::default();
+    // A generated mutation plan carries before/after rows over independent
+    // branches. A query runtime filter can describe only one branch, so it
+    // must not suppress locator rows required by a DELETE route.
+    settings.enable_global_runtime_filter = Some(false);
+    settings
 }
 
 /// Read-only routing facts needed by Core when it binds a prepared write
@@ -359,11 +729,7 @@ pub fn compile_dml_change_stream(
         }
     });
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&producer)?;
-    let mut settings = crate::optimizer::options::SessionOptimizerSettings::default();
-    // A generated mutation plan carries before/after rows over independent
-    // branches.  A query runtime filter can describe only one branch, so it
-    // must not suppress locator rows required by a DELETE route.
-    settings.enable_global_runtime_filter = Some(false);
+    let settings = dml_change_stream_optimizer_settings();
     let planned = crate::planner::pipeline::build_sql_change_stream_distributed_plan_with_settings(
         physical,
         dag,
@@ -978,7 +1344,10 @@ pub fn build_statistics_connector_plan(
 
 #[cfg(test)]
 mod tests {
-    use super::{StatisticsCommand, parse_statistics_command, parse_truncate_command};
+    use super::{
+        StatisticsCommand, dml_change_stream_optimizer_settings, parse_statistics_command,
+        parse_truncate_command,
+    };
 
     #[test]
     fn dml_facade_parses_truncate_without_exposing_the_custom_ast() {
@@ -1000,6 +1369,14 @@ mod tests {
                 target_parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()],
                 columns: vec!["id".to_string(), "amount".to_string()],
             }
+        );
+    }
+
+    #[test]
+    fn change_stream_facade_disables_global_runtime_filters() {
+        assert_eq!(
+            dml_change_stream_optimizer_settings().enable_global_runtime_filter,
+            Some(false)
         );
     }
 }

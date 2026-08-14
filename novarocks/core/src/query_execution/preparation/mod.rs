@@ -40,13 +40,15 @@ use scan_preparation::prepare_scan_bindings;
 use topology::{collect_scan_nodes, validate_binding_keys, validate_topology_roles};
 
 pub(crate) fn prepare_fragments(
-    plan: &novarocks_sql::planner::distributed::DistributedPlan,
+    plan: &novarocks_sql::plan_read::DistributedPlan,
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     query_table_bindings: Option<&QueryTableBindingStore>,
     resolver: Option<&dyn scan::ScanBindingResolver>,
     scan_options: ScanPreparationOptions,
 ) -> Result<PreparedFragmentSet, String> {
+    let runtime_filter_facts =
+        novarocks_sql::planning::query_execution::project_runtime_filter_facts(plan)?;
     let sealed_ids = plan
         .fragments()
         .iter()
@@ -109,11 +111,14 @@ pub(crate) fn prepare_fragments(
     )?;
     // Scan-domain target ordinals are derived only after the exact provider read
     // is pinned.  Never materialize RF bindings against a later catalog view.
-    let mut runtime_filter_binding_tables =
-        runtime_filter_binding::materialize_runtime_filter_binding_tables_with_scan_bindings(
-            plan.runtime_filter_graph(),
-            plan.fragments(),
-            Some(&scan_bindings),
+    let source_resolutions = runtime_filter_binding::resolve_runtime_filter_source_targets(
+        runtime_filter_facts.source_scan_requests().cloned(),
+        &scan_bindings,
+    )?;
+    let runtime_filter_facts =
+        novarocks_sql::planning::query_execution::finalize_runtime_filter_facts(
+            runtime_filter_facts,
+            source_resolutions,
         )?;
 
     let mut by_fragment = BTreeMap::new();
@@ -152,7 +157,7 @@ pub(crate) fn prepare_fragments(
         let scan_node_ids = scan_nodes.into_iter().map(|(node_id, _)| node_id).collect();
         let execution_role = if matches!(
             &fragment.sink,
-            novarocks_sql::planner::distributed::DataSink::Statistics(_)
+            novarocks_sql::plan_read::DataSink::Statistics(_)
         ) {
             PreparedFragmentRole::Statistics
         } else if result_fragment_id == Some(fragment.fragment_id) {
@@ -200,9 +205,9 @@ pub(crate) fn prepare_fragments(
             .unwrap_or_default();
         let prepared = projection::prepared_fragment(
             fragment.fragment_id,
-            runtime_filter_binding_tables
-                .remove(&fragment.fragment_id)
-                .expect("binding materialization creates one table per fragment"),
+            runtime_filter_facts
+                .bindings_for_fragment(fragment.fragment_id)
+                .to_vec(),
             scan_node_ids,
             execution_role,
             output_columns,
@@ -217,7 +222,6 @@ pub(crate) fn prepare_fragments(
             ));
         }
     }
-    debug_assert!(runtime_filter_binding_tables.is_empty());
 
     validate_binding_keys(
         "scan ranges",
@@ -240,17 +244,20 @@ pub(crate) fn prepare_fragments(
         topological_fragment_order,
         execution_anchor_fragment_id,
         plan.edges().to_vec(),
-        plan.sealed_runtime_filter_plan().clone(),
+        runtime_filter_facts,
     ))
 }
 
 pub(crate) fn prepared_fragment_set_for_native_encode_test(
-    plan: &novarocks_sql::planner::distributed::DistributedPlan,
+    plan: &novarocks_sql::plan_read::DistributedPlan,
 ) -> Result<PreparedFragmentSet, String> {
-    let mut binding_tables = runtime_filter_binding::materialize_runtime_filter_binding_tables(
-        plan.runtime_filter_graph(),
-        plan.fragments(),
-    )?;
+    let runtime_filter_facts =
+        novarocks_sql::planning::query_execution::project_runtime_filter_facts(plan)?;
+    let runtime_filter_facts =
+        novarocks_sql::planning::query_execution::finalize_runtime_filter_facts(
+            runtime_filter_facts,
+            Vec::new(),
+        )?;
     let result_fragment_id = plan.topology().result_fragment_id();
     let terminal_write_fragment_ids = plan
         .topology()
@@ -262,7 +269,7 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
     for fragment in plan.fragments() {
         let role = if matches!(
             &fragment.sink,
-            novarocks_sql::planner::distributed::DataSink::Statistics(_)
+            novarocks_sql::plan_read::DataSink::Statistics(_)
         ) {
             PreparedFragmentRole::Statistics
         } else if result_fragment_id == Some(fragment.fragment_id) {
@@ -276,9 +283,9 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
             fragment.fragment_id,
             projection::prepared_fragment(
                 fragment.fragment_id,
-                binding_tables
-                    .remove(&fragment.fragment_id)
-                    .expect("binding materialization creates one table per fragment"),
+                runtime_filter_facts
+                    .bindings_for_fragment(fragment.fragment_id)
+                    .to_vec(),
                 Vec::new(),
                 role,
                 Vec::new(),
@@ -288,14 +295,13 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
             ),
         );
     }
-    debug_assert!(binding_tables.is_empty());
     Ok(PreparedFragmentSet::new(
         by_fragment,
         scan::ScanExecutionBindings::default(),
         plan.topology().topological_fragment_order().to_vec(),
         plan.topology().execution_anchor_fragment_id(),
         plan.edges().to_vec(),
-        plan.sealed_runtime_filter_plan().clone(),
+        runtime_filter_facts,
     ))
 }
 
@@ -303,15 +309,15 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
 mod test_support {
     use arrow::datatypes::DataType;
 
-    use novarocks_sql::analysis::OutputColumn;
-    use novarocks_sql::column_id::ColumnId;
-    use novarocks_sql::planner::distributed::{
+    use novarocks_sql::plan_read::ColumnId;
+    use novarocks_sql::plan_read::OutputColumn;
+    use novarocks_sql::plan_read::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
     };
     use novarocks_sql::planner::payload::PlanValuesNode;
     use novarocks_sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 
-    pub(super) fn result_plan() -> novarocks_sql::planner::distributed::DistributedPlan {
+    pub(super) fn result_plan() -> novarocks_sql::plan_read::DistributedPlan {
         let columns = vec![
             OutputColumn {
                 column_id: ColumnId::new_for_test(1),
@@ -358,7 +364,7 @@ mod test_support {
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        novarocks_sql::planner::distributed::test_support::distributed_plan_for_test! {
+        novarocks_sql::plan_read::test_support::distributed_plan_for_test! {
             fragments: vec![fragment],
             root_fragment_id: 7,
             edges: Vec::new(),
@@ -369,126 +375,17 @@ mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use arrow::datatypes::DataType;
 
     use super::*;
-    use novarocks_sql::analysis::OutputColumn;
-    use novarocks_sql::column_id::ColumnId;
-    use novarocks_sql::planner::distributed::{
+    use novarocks_sql::plan_read::ColumnId;
+    use novarocks_sql::plan_read::OutputColumn;
+    use novarocks_sql::plan_read::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
     };
     use novarocks_sql::planner::payload::PlanValuesNode;
     use novarocks_sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
-    use novarocks_sql::planner::runtime_filter::contract::{
-        BindingId, ChannelId, ConsumerActivation, LateApplyGranularity,
-    };
-    use novarocks_sql::planner::runtime_filter::graph::RuntimeFilterBindingRoleData;
-
-    fn draft_runtime_filter_graph() -> novarocks_sql::planner::distributed::DraftRuntimeFilterGraph
-    {
-        use novarocks_sql::analysis::{ExprKind, LiteralValue, TypedExpr};
-        use novarocks_sql::planner::distributed::{
-            ActivationConstraint, DraftRuntimeFilterGraph, RequiredLiveReason,
-        };
-        use novarocks_sql::planner::runtime_filter::contract::{
-            ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
-            ContributionKind, CoverageWitnessId, LateApplyGranularity, NullSemantics,
-            PlanFragmentId, PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle,
-            RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
-        };
-        use novarocks_sql::planner::runtime_filter::coverage::Coverage;
-        use novarocks_sql::planner::runtime_filter::graph::{
-            ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation,
-            ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRoleData,
-            RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec,
-        };
-
-        let channel_id = ChannelId::new(1);
-        let witness_id = CoverageWitnessId::new(1);
-        let location = PlanLocation {
-            fragment_id: PlanFragmentId::new(7),
-            node_id: PlanNodeId::new(70),
-        };
-        let expression = || TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::Int(1)),
-            data_type: DataType::Int64,
-            nullable: false,
-        };
-        let mut graph = DraftRuntimeFilterGraph::default();
-        graph
-            .insert_channel(RuntimeFilterChannelSpec {
-                channel_id,
-                logical_domain: RuntimeFilterLogicalDomain::Membership {
-                    value_type: DataType::Int64,
-                    null_semantics: NullSemantics::NullSafeEqual,
-                },
-                lifecycle: RuntimeFilterLifecycle::CompleteOnce,
-                availability_coverage: Coverage::AllOf(vec![Coverage::Leaf(witness_id)]),
-                terminal_coverage: Coverage::AllOf(vec![Coverage::Leaf(witness_id)]),
-                reduction_requirement: ReductionRequirement::SetUnion,
-                allowed_contribution_kinds: BTreeSet::from([
-                    ContributionKind::FinalDomainShard,
-                    ContributionKind::ProducerClosed,
-                ]),
-                required_consumer_capabilities: BTreeSet::from([
-                    ArtifactCapability::Membership,
-                    ArtifactCapability::EmptyDomain,
-                ]),
-                policy: RuntimeFilterPolicyRequirement {
-                    max_contribution_bytes: 1024,
-                    max_artifact_bytes: 4096,
-                    deadline_ms: 30_000,
-                    max_retries: 3,
-                },
-            })
-            .expect("unique channel");
-        graph
-            .insert_binding(RuntimeFilterBindingSpecData {
-                binding_id: BindingId::new(1),
-                channel_id,
-                coverage_witness_id: Some(witness_id),
-                location,
-                expression: expression(),
-                apply_point: ApplyPoint::NodeOutput,
-                role: RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
-                    contribution_kinds: BTreeSet::from([
-                        ContributionKind::FinalDomainShard,
-                        ContributionKind::ProducerClosed,
-                    ]),
-                    completion_requirement: CompletionRequirement::FencedFinalDomain(
-                        CompletionFenceKind::CommittedDomainFrozen,
-                    ),
-                    target: ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
-                }),
-            })
-            .expect("unique producer binding");
-        graph
-            .insert_binding(RuntimeFilterBindingSpecData {
-                binding_id: BindingId::new(2),
-                channel_id,
-                coverage_witness_id: None,
-                location,
-                expression: expression(),
-                apply_point: ApplyPoint::NodeInput,
-                role: RuntimeFilterBindingRoleData::Consumer(ConsumerRequirementData {
-                    capabilities: BTreeSet::from([
-                        ArtifactCapability::Membership,
-                        ArtifactCapability::EmptyDomain,
-                    ]),
-                    activation: ActivationConstraint::LiveOnly {
-                        late_apply: LateApplyGranularity::Batch,
-                        reason: RequiredLiveReason::FencedFinalDomainContract,
-                    },
-                    target: ConsumerBindingTarget::DirectInput { input_ordinal: 0 },
-                }),
-            })
-            .expect("unique consumer binding");
-        graph
-    }
-
-    fn write_plan() -> novarocks_sql::planner::distributed::DistributedPlan {
+    fn write_plan() -> novarocks_sql::plan_read::DistributedPlan {
         let columns = vec![OutputColumn {
             column_id: ColumnId::new_for_test(1),
             name: "id".to_string(),
@@ -521,9 +418,9 @@ mod tests {
             data_partition: DataPartition::unpartitioned(),
             output_partition: DataPartition::unpartitioned(),
             sink: DataSink::ConnectorWrite(
-                novarocks_sql::planner::distributed::write::sink::ConnectorWriteFragmentSink {
+                novarocks_sql::plan_read::write::sink::ConnectorWriteFragmentSink {
                     handle: None,
-                    input: novarocks_sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                    input: novarocks_sql::plan_read::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
                     output_contract: None,
                 },
             ),
@@ -532,7 +429,7 @@ mod tests {
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        novarocks_sql::planner::distributed::test_support::distributed_plan_for_test! {
+        novarocks_sql::plan_read::test_support::distributed_plan_for_test! {
             fragments: vec![fragment],
             root_fragment_id: 9,
             edges: Vec::new(),
@@ -572,9 +469,7 @@ mod tests {
     #[test]
     fn production_preparation_rejects_missing_non_write_output_contract() {
         let mut plan = test_support::result_plan();
-        novarocks_sql::planner::distributed::test_support::remove_fragment_output_for_test(
-            &mut plan, 7,
-        );
+        novarocks_sql::plan_read::test_support::remove_fragment_output_for_test(&mut plan, 7);
         let registry = crate::connector::ConnectorRegistry::new();
         let controls = crate::connector::FixtureControlResolver::new(registry.clone());
         let error = match prepare_fragments(
@@ -593,57 +488,6 @@ mod tests {
         assert_eq!(
             error,
             "prepared sealed output mismatch fragment_id=7: non-write fragment is missing FragmentEdgeOutputCatalog output"
-        );
-    }
-
-    #[test]
-    fn prepared_fragment_set_retains_sealed_runtime_filter_graph() {
-        let plan = novarocks_sql::planner::distributed::test_support::rebuild_test_plan(
-            test_support::result_plan(),
-            draft_runtime_filter_graph(),
-            |builder| {
-                builder.fragments_mut()[0].root.runtime_filter_binding_ids =
-                    vec![BindingId::new(1), BindingId::new(2)];
-            },
-        );
-        let registry = crate::connector::ConnectorRegistry::new();
-        let controls = crate::connector::FixtureControlResolver::new(registry.clone());
-        let prepared = prepare_fragments(
-            &plan,
-            &controls,
-            &crate::connector::test_request_context(),
-            None,
-            None,
-            ScanPreparationOptions::single_backend_fixture(),
-        )
-        .expect("prepare sealed graph");
-
-        assert_eq!(prepared.runtime_filter_graph().channel_count(), 1);
-        assert_eq!(prepared.runtime_filter_graph().binding_count(), 2);
-        let RuntimeFilterBindingRoleData::Consumer(consumer) = &prepared
-            .runtime_filter_graph()
-            .binding(BindingId::new(2))
-            .expect("sealed consumer binding")
-            .role
-        else {
-            panic!("binding 2 must remain a consumer");
-        };
-        assert_eq!(
-            consumer.activation,
-            ConsumerActivation::NonBlockingLive {
-                late_apply: LateApplyGranularity::Batch,
-            }
-        );
-        assert_eq!(
-            prepared
-                .runtime_filter_graph()
-                .channel(ChannelId::new(1))
-                .unwrap()
-                .policy,
-            plan.runtime_filter_graph()
-                .channel(ChannelId::new(1))
-                .unwrap()
-                .policy
         );
     }
 }

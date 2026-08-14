@@ -29,16 +29,17 @@ use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::planning::write_sink::{
-    admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
+    admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
-use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
     ConnectorWriteIntent, ConnectorWriteOperationId,
 };
+use novarocks_sql::planning::dml::DmlWriteSinkMode;
+use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
+use novarocks_sql::syntax::{Literal, parse_date_string_to_days, parse_datetime_string_to_micros};
 
 pub(crate) fn prepare_equality_delete_statement(
     state: &DmlExecutionKernel,
@@ -123,7 +124,7 @@ struct DistributedEqualityDeleteWriteExecutor {
     state: DmlExecutionKernel,
     target: crate::catalog_application::resolver::TargetBackend,
     delete_query: sqlparser::ast::Query,
-    sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    sql_write_input: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<QueryTableBindingStore>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -167,7 +168,7 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
                     self.sql_write_input.clone(),
                     Arc::clone(&self.table_bindings),
                     None,
-                    crate::sql::compiler::RootDistributionRequirement::Any,
+                    novarocks_sql::compiler::RootDistributionRequirement::Any,
                     Some(&self.execution),
                     &self.connector_context,
                     Some(self.connector_write.clone()),
@@ -252,22 +253,21 @@ fn prepare_equality_delete_distributed_write(
         ConnectorWriteAdmissionPurpose::OrdinaryDml,
         connector_context.clone(),
     )?;
-    let target_binding = admit_prepared_connector_write_target(
+    let target_binding = admit_prepared_frozen_connector_write_target(
         table_bindings.as_ref(),
-        crate::sql::planner::table::SqlTableIdentity {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-        },
+        FrozenConnectorScanIdentity::new(
+            target.catalog.clone(),
+            target.namespace.clone(),
+            target.table.clone(),
+        ),
         preparation.clone(),
         planning_lease.clone(),
     )?;
-    let sql_write_input = sql_write_plan_input_for_admitted_target(
+    let sql_write_input = dml_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),
         target_binding,
-        crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::EqualityDeletes,
-        crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
-        None,
+        DmlWriteSinkMode::EqualityDeletes,
+        novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
     )?;
 
     let connector_operation_id = ConnectorWriteOperationId::new();
@@ -732,7 +732,7 @@ mod tests {
         ConnectorTableMetadata, ConnectorTablePlanningFacts,
     };
 
-    use crate::sql::parser::ast::Literal;
+    use novarocks_sql::syntax::Literal;
 
     struct NeverCancelled;
 

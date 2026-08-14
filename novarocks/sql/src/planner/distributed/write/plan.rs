@@ -298,7 +298,7 @@ pub(in crate::planner::distributed) fn with_sql_change_stream_write(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn finalize_sql_change_stream_test_plan(
     builder: crate::planner::distributed::test_support::DistributedPlanDraftBuilder,
     dag: ChangeStreamWriteDagSpec,

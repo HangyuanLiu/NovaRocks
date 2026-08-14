@@ -43,7 +43,7 @@ use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
-use novarocks_sql::planning::catalog::sqlparser_expr_to_literal;
+use novarocks_sql::syntax::sqlparser_expr_to_literal;
 
 /// Exact dependencies needed by catalog-drop statements.
 ///

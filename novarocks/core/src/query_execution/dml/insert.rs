@@ -35,10 +35,10 @@ use crate::query_execution::dml::external_write_fence::{
 use crate::query_execution::dml::iceberg_writer;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::request_context::{QueryExecutionContext, RequestContext};
-use crate::sql::parser::ast::{Literal, ObjectName};
 use crate::statistics::StatisticsEngine;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_sql::planning::dml::parse_raw_statement;
+use novarocks_sql::syntax::{Literal, ObjectName};
 
 pub use crate::query_execution::dml::iceberg_writer::PreparedIcebergWriteNativeEncoding;
 
