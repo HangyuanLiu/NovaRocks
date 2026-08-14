@@ -8,7 +8,7 @@ superseded-by: null
 date: 2026-08-14
 provenance:
   - "discussion: 2026-08-14 application configuration wire and resolved-value ownership after Core engine retirement"
-  - "PR: pending — application configuration owner cut"
+  - "PR: https://github.com/NovaRocks/NovaRocks/pull/901"
 code-anchors:
   - "novarocks-server/src/main.rs (load_config_and_resolve_role)"
   - "novarocks-server/src/composition.rs (run_all_in_one_until)"
