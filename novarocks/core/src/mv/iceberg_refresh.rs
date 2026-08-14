@@ -119,9 +119,11 @@ use novarocks_sql::planning::mv::{
     MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
     MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
     MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME, SqlMvAggregateCalls,
-    SqlMvAggregateLayoutScope, SqlMvApplyKeySourceFacts, SqlMvJoinAliases,
-    SqlMvPersistedApplyKeySourceFacts, extract_aggregate_sql_calls, extract_join_aliases,
-    extract_single_scan_table_fqn, mv_apply_key_source_from_column_name,
+    SqlMvAggregateLayoutScope, SqlMvApplyKeySourceFacts, SqlMvExpressionLineageKind,
+    SqlMvJoinAliases, SqlMvJoinContractKindFacts, SqlMvLineageScope, SqlMvObservedFieldFacts,
+    SqlMvObservedSchemaFacts, SqlMvOutputColumnFacts, SqlMvPersistedApplyKeySourceFacts,
+    extract_aggregate_sql_calls, extract_join_aliases, extract_single_scan_table_fqn,
+    mv_apply_key_source_from_column_name,
 };
 use novarocks_sql::syntax::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr,
@@ -3293,20 +3295,6 @@ fn iceberg_aggregate_target_columns_from_layout(
         .collect())
 }
 
-fn first_union_branch_resolved_query(
-    resolved_query: &novarocks_sql::analysis::ResolvedQuery,
-) -> Result<&novarocks_sql::analysis::ResolvedQuery, String> {
-    match &resolved_query.body {
-        novarocks_sql::analysis::QueryBody::SetOperation(set_op) => {
-            first_union_branch_resolved_query(&set_op.left)
-        }
-        novarocks_sql::analysis::QueryBody::Select(_) => Ok(resolved_query),
-        novarocks_sql::analysis::QueryBody::Values(_) => {
-            Err("UNION ALL MV first branch requires SELECT analysis".to_string())
-        }
-    }
-}
-
 /// Build the persisted [`MvSchemaContract`] for a new Iceberg MV, dispatching
 /// on the synthesized [`TargetIdentity`].
 ///
@@ -3364,7 +3352,6 @@ fn build_iceberg_mv_schema_contract(
         _ => build_non_branch_schema_contract(
             &property.identity,
             canonical_query,
-            &analysis.resolved_query,
             analysis,
             base_refs,
             base_field_observations,
@@ -3395,11 +3382,10 @@ struct NonBranchContractCore {
 }
 
 /// Build a full (branch-free) schema contract for a non-branch identity over
-/// `query`/`resolved_query`. Used for top-level non-branch MVs.
+/// opaque analyzed SQL input. Used for top-level non-branch MVs.
 fn build_non_branch_schema_contract(
     identity: &TargetIdentity,
     query: &sqlparser::ast::Query,
-    resolved_query: &novarocks_sql::analysis::ResolvedQuery,
     analysis: &crate::mv::analysis::MvAnalysis,
     base_refs: &[TableIdentity],
     base_field_observations: &std::collections::BTreeMap<
@@ -3412,7 +3398,6 @@ fn build_non_branch_schema_contract(
     let core = build_non_branch_contract_core(
         identity,
         query,
-        resolved_query,
         analysis,
         base_refs,
         base_field_observations,
@@ -3441,13 +3426,12 @@ fn build_non_branch_schema_contract(
 }
 
 /// Build the core of a non-branch contract for `identity` over
-/// `query`/`resolved_query`, classifying any shape data locally. This is the
+/// query and opaque analyzed SQL input, classifying any shape data locally. This is the
 /// per-identity dispatch that the legacy per-`RefreshStrategy` match performed,
 /// reproduced verbatim but keyed on the identity.
 fn build_non_branch_contract_core(
     identity: &TargetIdentity,
     query: &sqlparser::ast::Query,
-    resolved_query: &novarocks_sql::analysis::ResolvedQuery,
     analysis: &crate::mv::analysis::MvAnalysis,
     base_refs: &[TableIdentity],
     base_field_observations: &std::collections::BTreeMap<
@@ -3465,11 +3449,14 @@ fn build_non_branch_contract_core(
                         .to_string(),
                 );
             };
-            let lineage = novarocks_sql::analyzer::mv_lineage::build_projection_filter_lineage(
-                resolved_query,
-                &sql_mv_lineage_schema(observed_base_fields(base_field_observations, base_ref)?),
-            )?;
-            let (base_fields, output) = persist_sql_mv_lineage(lineage);
+            let lineage_schema = sql_mv_lineage_schema(observed_base_fields(
+                base_field_observations,
+                base_ref,
+            )?);
+            let lineage = analysis
+                .refresh_input
+                .projection_schema_lineage_facts(SqlMvLineageScope::WholeQuery, &lineage_schema)?;
+            let (base_fields, output) = persist_sql_mv_projection_lineage(lineage);
             Ok(NonBranchContractCore {
                 contract_version: 1,
                 bases: vec![base_contract(
@@ -3492,7 +3479,8 @@ fn build_non_branch_contract_core(
             let (left_contract, right_contract, output, join) =
                 build_join_base_contracts_and_lineage(
                     &join_aliases,
-                    resolved_query,
+                    analysis,
+                    SqlMvLineageScope::WholeQuery,
                     base_refs,
                     base_field_observations,
                 )?;
@@ -3509,7 +3497,6 @@ fn build_non_branch_contract_core(
         TargetIdentity::GroupRowId(_) => {
             build_aggregate_contract_core(
                 query,
-                resolved_query,
                 analysis,
                 SqlMvAggregateLayoutScope::WholeQuery,
                 base_refs,
@@ -3641,9 +3628,7 @@ fn validate_composed_aggregate_join_operator(
     }
 }
 
-fn mixed_output_contract(
-    output_columns: &[novarocks_sql::analysis::OutputColumn],
-) -> mv_schema::OutputContract {
+fn mixed_output_contract(output_columns: &[SqlMvOutputColumnFacts]) -> mv_schema::OutputContract {
     mv_schema::OutputContract {
         columns: output_columns
             .iter()
@@ -3664,7 +3649,6 @@ fn mixed_output_contract(
 /// legacy SingleAggregate / JoinAggregate / FanInAggregate arms.
 fn build_aggregate_contract_core(
     query: &sqlparser::ast::Query,
-    resolved_query: &novarocks_sql::analysis::ResolvedQuery,
     analysis: &crate::mv::analysis::MvAnalysis,
     aggregate_layout_scope: SqlMvAggregateLayoutScope,
     base_refs: &[TableIdentity],
@@ -3676,8 +3660,7 @@ fn build_aggregate_contract_core(
 ) -> Result<NonBranchContractCore, String> {
     // SQL derives aggregate calls, visible output facts, and argument types
     // from one matching admitted/analyzed query. Core receives only that
-    // immutable layout input; `resolved_query` remains below solely for the
-    // still-separate lineage cut.
+    // immutable layout input.
     let aggregate_layout_facts = analysis
         .refresh_input
         .aggregate_layout_facts(query, aggregate_layout_scope)?;
@@ -3690,16 +3673,19 @@ fn build_aggregate_contract_core(
     //   * a two-table inner equi-join FROM    -> JoinAggregate core
     //   * a fan-in UNION ALL subquery in FROM -> FanInAggregate core
     //   * a single scan                       -> SingleAggregate core
-    // The join lineage (predicate field-ids, output/filter lineage, per-base
-    // narrowing) is still derived from the resolved AST inside
-    // `build_join_base_contracts_and_lineage`; the join-alias extractor supplies
-    // only the (table FQN, qualifier) pairs.
+    // SQL derives join lineage (predicate field-ids, output/filter lineage, and
+    // per-base narrowing) from the opaque analyzed input; the join-alias
+    // extractor supplies only immutable syntax facts.
     if from_clause_is_direct_inner_on_join(query) {
         let join_aliases = extract_join_aliases(query)?;
         // Aggregate over a two-table inner equi-join (legacy JoinAggregate).
         let (left_contract, right_contract, output, join) = build_join_base_contracts_and_lineage(
             &join_aliases,
-            resolved_query,
+            analysis,
+            match aggregate_layout_scope {
+                SqlMvAggregateLayoutScope::WholeQuery => SqlMvLineageScope::WholeQuery,
+                SqlMvAggregateLayoutScope::FirstUnionBranch => SqlMvLineageScope::FirstUnionBranch,
+            },
             base_refs,
             base_field_observations,
         )?;
@@ -3793,11 +3779,16 @@ fn build_aggregate_contract_core(
                 "aggregate iceberg MV schema contract requires one loaded base".to_string(),
             );
         };
-        let lineage = novarocks_sql::analyzer::mv_lineage::build_projection_filter_lineage(
-            resolved_query,
-            &sql_mv_lineage_schema(observed_base_fields(base_field_observations, base_ref)?),
-        )?;
-        let (base_fields, output) = persist_sql_mv_lineage(lineage);
+        let lineage_schema =
+            sql_mv_lineage_schema(observed_base_fields(base_field_observations, base_ref)?);
+        let lineage_scope = match aggregate_layout_scope {
+            SqlMvAggregateLayoutScope::WholeQuery => SqlMvLineageScope::WholeQuery,
+            SqlMvAggregateLayoutScope::FirstUnionBranch => SqlMvLineageScope::FirstUnionBranch,
+        };
+        let lineage = analysis
+            .refresh_input
+            .projection_schema_lineage_facts(lineage_scope, &lineage_schema)?;
+        let (base_fields, output) = persist_sql_mv_projection_lineage(lineage);
         Ok(NonBranchContractCore {
             contract_version: 3,
             bases: vec![base_contract(
@@ -3814,12 +3805,13 @@ fn build_aggregate_contract_core(
 }
 
 /// Build the left/right base contracts (with join lineage field narrowing) and
-/// the join contract for a two-table inner equi-join over `resolved_query`.
+/// the join contract for a two-table inner equi-join over opaque SQL analysis.
 /// Shared by the JoinProjectionFilter and JoinAggregate cores and by a composed
 /// join-aggregate branch.
 fn build_join_base_contracts_and_lineage(
     join_aliases: &SqlMvJoinAliases,
-    resolved_query: &novarocks_sql::analysis::ResolvedQuery,
+    analysis: &crate::mv::analysis::MvAnalysis,
+    lineage_scope: SqlMvLineageScope,
     base_refs: &[TableIdentity],
     base_field_observations: &std::collections::BTreeMap<
         String,
@@ -3840,44 +3832,35 @@ fn build_join_base_contracts_and_lineage(
         sql_mv_lineage_schema(observed_base_fields(base_field_observations, left_ref)?);
     let right_schema =
         sql_mv_lineage_schema(observed_base_fields(base_field_observations, right_ref)?);
-    let left_fqn = left_ref.fqn();
-    let right_fqn = right_ref.fqn();
-    // The join predicate field-ids, output-column lineage, filter lineage, and
-    // per-base field narrowing are all derived from `resolved_query` (the
-    // analyzer-resolved AST) — NOT the join aliases. The aliases supply only the
-    // (table FQN, qualifier) pairs the collector keys schemas by, so the
-    // persisted `join`/`output` sections are byte-identical to the legacy build.
-    let join_lineage = novarocks_sql::analyzer::mv_lineage::build_join_projection_filter_lineage(
-        resolved_query,
-        &[
-            (&left_fqn, &join_aliases.left_alias, &left_schema),
-            (&right_fqn, &join_aliases.right_alias, &right_schema),
-        ],
+    let lineage_aliases = SqlMvJoinAliases {
+        left_table: left_ref.fqn(),
+        left_alias: join_aliases.left_alias.clone(),
+        right_table: right_ref.fqn(),
+        right_alias: join_aliases.right_alias.clone(),
+    };
+    // SQL owns alias interpretation, predicate normalization, and the
+    // analyzed tree. Core retains provider observations and maps only the
+    // immutable lineage values into its persisted schema contract.
+    let join_lineage = analysis.refresh_input.join_schema_lineage_facts(
+        lineage_scope,
+        &lineage_aliases,
+        &left_schema,
+        &right_schema,
     )?;
-    let left_fields = join_lineage
-        .base_fields_by_table
-        .get(&left_fqn)
-        .cloned()
-        .unwrap_or_default();
-    let right_fields = join_lineage
-        .base_fields_by_table
-        .get(&right_fqn)
-        .cloned()
-        .unwrap_or_default();
     let left_contract = base_contract(
         left_ref,
         observed_base(base_field_observations, left_ref)?,
         Some(join_aliases.left_alias.clone()),
-        persist_sql_mv_base_fields(left_fields),
+        persist_sql_mv_base_fields(join_lineage.left_base_fields()),
     );
     let right_contract = base_contract(
         right_ref,
         observed_base(base_field_observations, right_ref)?,
         Some(join_aliases.right_alias.clone()),
-        persist_sql_mv_base_fields(right_fields),
+        persist_sql_mv_base_fields(join_lineage.right_base_fields()),
     );
-    let output = persist_sql_mv_output_contract(join_lineage.output_columns, join_lineage.filter);
-    let join = persist_sql_mv_join_contract(join_lineage.join);
+    let output = persist_sql_mv_output_contract(join_lineage.output());
+    let join = persist_sql_mv_join_contract(&join_lineage);
     Ok((left_contract, right_contract, output, join))
 }
 
@@ -3903,7 +3886,6 @@ fn build_branch_union_schema_contract(
 ) -> Result<mv_schema::MvSchemaContract, String> {
     let branch_id_field_id = target_field_id_by_column(target_observation, BRANCH_ID_COLUMN_NAME)?;
     let branch_count = union_branch_count(canonical_query);
-    let first_branch_resolved = first_union_branch_resolved_query(&analysis.resolved_query)?;
 
     // Full cross-branch base set (every branch's bases, full schema).
     let all_bases = base_refs
@@ -3944,17 +3926,11 @@ fn build_branch_union_schema_contract(
                 base_field_observations,
                 first_base_ref,
             )?);
-            let lineage = novarocks_sql::analyzer::mv_lineage::build_projection_filter_lineage(
-                &analysis.resolved_query,
+            let lineage = analysis.refresh_input.projection_schema_lineage_facts(
+                SqlMvLineageScope::WholeQueryOrFirstUnionBranch,
                 &first_schema,
-            )
-            .or_else(|_| {
-                novarocks_sql::analyzer::mv_lineage::build_projection_filter_lineage(
-                    first_branch_resolved,
-                    &first_schema,
-                )
-            })?;
-            let (_, output) = persist_sql_mv_lineage(lineage);
+            )?;
+            let (_, output) = persist_sql_mv_projection_lineage(lineage);
             let base = all_bases.first().cloned().expect("non-empty checked above");
             mv_schema::MvSchemaContract {
                 contract_version: 1,
@@ -3993,7 +3969,6 @@ fn build_branch_union_schema_contract(
             let first_branch_refs = first_branch_base_refs(&first_branch_ast, base_refs)?;
             let core = build_aggregate_contract_core(
                 &first_branch_ast,
-                first_branch_resolved,
                 analysis,
                 SqlMvAggregateLayoutScope::FirstUnionBranch,
                 &first_branch_refs,
@@ -4237,129 +4212,114 @@ fn observed_base_fields<'a>(
     Ok(observed_base(base_field_observations, base_ref)?.fields())
 }
 
-/// Project provider schema metadata into the SQL-owned lineage vocabulary at
-/// the application boundary. The SQL analyzer never retains the provider
-/// schema object or consults it after this conversion.
+/// Project provider schema metadata into immutable SQL facade input. The SQL
+/// package receives no provider handle and Core retains the observation used
+/// to build the persisted base contract.
 fn sql_mv_lineage_schema(
     fields: &[crate::mv::storage_observation::MvObservedTargetField],
-) -> novarocks_sql::analyzer::mv_lineage::SqlMvLineageSchema {
-    novarocks_sql::analyzer::mv_lineage::SqlMvLineageSchema {
-        fields: fields
+) -> SqlMvObservedSchemaFacts {
+    SqlMvObservedSchemaFacts::new(
+        fields
             .iter()
-            .map(
-                |field| novarocks_sql::analyzer::mv_lineage::SqlMvLineageField {
-                    field_id: field.field_id,
-                    name_at_create: field.name.clone(),
-                    type_signature: field.type_signature.clone(),
-                    required: !field.nullable,
-                },
-            )
+            .map(|field| {
+                SqlMvObservedFieldFacts::new(
+                    field.field_id,
+                    field.name.clone(),
+                    field.type_signature.clone(),
+                    !field.nullable,
+                )
+            })
             .collect(),
-    }
+    )
 }
 
 fn persist_sql_mv_base_fields(
-    fields: Vec<novarocks_sql::analyzer::mv_lineage::SqlMvLineageField>,
+    fields: &[SqlMvObservedFieldFacts],
 ) -> Vec<mv_schema::BaseFieldRecord> {
     fields
-        .into_iter()
+        .iter()
         .map(|field| mv_schema::BaseFieldRecord {
-            field_id: field.field_id,
-            name_at_create: field.name_at_create,
-            type_signature: field.type_signature,
-            required: field.required,
+            field_id: field.field_id(),
+            name_at_create: field.name_at_create().to_string(),
+            type_signature: field.type_signature().to_string(),
+            required: field.required(),
         })
         .collect()
 }
 
 fn persist_sql_mv_qualified_field(
-    field: novarocks_sql::analyzer::mv_lineage::SqlMvQualifiedFieldLineage,
+    field: &novarocks_sql::planning::mv::SqlMvQualifiedFieldLineageFacts,
 ) -> mv_schema::QualifiedFieldLineage {
     mv_schema::QualifiedFieldLineage {
-        table_fqn: field.table_fqn,
-        qualifier_at_create: field.qualifier_at_create,
-        field_id: field.field_id,
+        table_fqn: field.table_fqn().to_string(),
+        qualifier_at_create: field.qualifier_at_create().to_string(),
+        field_id: field.field_id(),
     }
 }
 
-fn persist_sql_mv_expression_kind(
-    kind: novarocks_sql::analyzer::mv_lineage::SqlMvExpressionKind,
-) -> mv_schema::ExpressionKind {
+fn persist_sql_mv_expression_kind(kind: SqlMvExpressionLineageKind) -> mv_schema::ExpressionKind {
     match kind {
-        novarocks_sql::analyzer::mv_lineage::SqlMvExpressionKind::Column => {
-            mv_schema::ExpressionKind::Column
-        }
-        novarocks_sql::analyzer::mv_lineage::SqlMvExpressionKind::Cast => {
-            mv_schema::ExpressionKind::Cast
-        }
-        novarocks_sql::analyzer::mv_lineage::SqlMvExpressionKind::Func => {
-            mv_schema::ExpressionKind::Func
-        }
-        novarocks_sql::analyzer::mv_lineage::SqlMvExpressionKind::Literal => {
-            mv_schema::ExpressionKind::Literal
-        }
-        novarocks_sql::analyzer::mv_lineage::SqlMvExpressionKind::Mixed => {
-            mv_schema::ExpressionKind::Mixed
-        }
+        SqlMvExpressionLineageKind::Column => mv_schema::ExpressionKind::Column,
+        SqlMvExpressionLineageKind::Cast => mv_schema::ExpressionKind::Cast,
+        SqlMvExpressionLineageKind::Func => mv_schema::ExpressionKind::Func,
+        SqlMvExpressionLineageKind::Literal => mv_schema::ExpressionKind::Literal,
+        SqlMvExpressionLineageKind::Mixed => mv_schema::ExpressionKind::Mixed,
     }
 }
 
 fn persist_sql_mv_output_contract(
-    columns: Vec<novarocks_sql::analyzer::mv_lineage::SqlMvOutputColumnLineage>,
-    filter: Option<novarocks_sql::analyzer::mv_lineage::SqlMvFilterLineage>,
+    output: &novarocks_sql::planning::mv::SqlMvOutputLineageFacts,
 ) -> mv_schema::OutputContract {
     mv_schema::OutputContract {
-        columns: columns
-            .into_iter()
+        columns: output
+            .columns()
+            .iter()
             .map(|column| mv_schema::OutputColumnLineage {
                 expression: mv_schema::ExpressionLineage {
-                    kind: persist_sql_mv_expression_kind(column.expression.kind),
-                    referenced_base_field_ids: column.expression.referenced_base_field_ids,
+                    kind: persist_sql_mv_expression_kind(column.kind()),
+                    referenced_base_field_ids: column.referenced_base_field_ids().to_vec(),
                     referenced_base_fields: column
-                        .expression
-                        .referenced_base_fields
-                        .into_iter()
+                        .referenced_base_fields()
+                        .iter()
                         .map(persist_sql_mv_qualified_field)
                         .collect(),
                 },
             })
             .collect(),
-        filter: filter.map(|filter| mv_schema::FilterLineage {
-            referenced_base_field_ids: filter.referenced_base_field_ids,
+        filter: output.filter().map(|filter| mv_schema::FilterLineage {
+            referenced_base_field_ids: filter.referenced_base_field_ids().to_vec(),
             referenced_base_fields: filter
-                .referenced_base_fields
-                .into_iter()
+                .referenced_base_fields()
+                .iter()
                 .map(persist_sql_mv_qualified_field)
                 .collect(),
         }),
     }
 }
 
-fn persist_sql_mv_lineage(
-    lineage: novarocks_sql::analyzer::mv_lineage::SqlMvLineageResult,
+fn persist_sql_mv_projection_lineage(
+    lineage: novarocks_sql::planning::mv::SqlMvProjectionLineageFacts,
 ) -> (Vec<mv_schema::BaseFieldRecord>, mv_schema::OutputContract) {
     (
-        persist_sql_mv_base_fields(lineage.base_fields),
-        persist_sql_mv_output_contract(lineage.output_columns, lineage.filter),
+        persist_sql_mv_base_fields(lineage.base_fields()),
+        persist_sql_mv_output_contract(lineage.output()),
     )
 }
 
 fn persist_sql_mv_join_contract(
-    join: novarocks_sql::analyzer::mv_lineage::SqlMvJoinContract,
+    join: &novarocks_sql::planning::mv::SqlMvJoinLineageFacts,
 ) -> mv_schema::JoinContract {
-    let kind = match join.kind {
-        novarocks_sql::analyzer::mv_lineage::SqlMvJoinContractKind::InnerEquiJoin => {
-            mv_schema::JoinContractKind::InnerEquiJoin
-        }
+    let kind = match join.kind() {
+        SqlMvJoinContractKindFacts::InnerEquiJoin => mv_schema::JoinContractKind::InnerEquiJoin,
     };
     mv_schema::JoinContract {
         kind,
         predicates: join
-            .predicates
-            .into_iter()
+            .predicates()
+            .iter()
             .map(|predicate| mv_schema::JoinPredicateLineage {
-                left: persist_sql_mv_qualified_field(predicate.left),
-                right: persist_sql_mv_qualified_field(predicate.right),
+                left: persist_sql_mv_qualified_field(predicate.left()),
+                right: persist_sql_mv_qualified_field(predicate.right()),
             })
             .collect(),
     }

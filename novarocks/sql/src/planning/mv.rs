@@ -257,6 +257,14 @@ mod refresh_property_facade_tests {
         SqlResolvedMvRefreshInput::from_analysis(resolved)
     }
 
+    fn observed_schema() -> SqlMvObservedSchemaFacts {
+        SqlMvObservedSchemaFacts::new(vec![
+            SqlMvObservedFieldFacts::new(10, "id".to_string(), "long".to_string(), true),
+            SqlMvObservedFieldFacts::new(11, "region".to_string(), "string".to_string(), false),
+            SqlMvObservedFieldFacts::new(12, "amount".to_string(), "long".to_string(), false),
+        ])
+    }
+
     #[test]
     fn refresh_property_contract_projects_immutable_facts() {
         let facts = RefreshFragmentProperty {
@@ -325,6 +333,93 @@ mod refresh_property_facade_tests {
         assert!(!facts.output_columns[0].nullable);
         assert_eq!(facts.output_columns[1].name, "region");
         assert!(facts.output_columns[1].nullable);
+    }
+
+    #[test]
+    fn opaque_refresh_input_projects_projection_lineage_from_observed_schema() {
+        let facts = analyzed_refresh_input(
+            "SELECT id, amount + 1 AS adjusted FROM fact_east WHERE region IS NOT NULL",
+        )
+        .projection_schema_lineage_facts(SqlMvLineageScope::WholeQuery, &observed_schema())
+        .expect("projection lineage");
+
+        assert_eq!(
+            facts
+                .base_fields()
+                .iter()
+                .map(SqlMvObservedFieldFacts::field_id)
+                .collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+        assert_eq!(facts.output().columns().len(), 2);
+        assert_eq!(
+            facts.output().columns()[0].referenced_base_field_ids(),
+            &[10]
+        );
+        assert_eq!(
+            facts.output().columns()[1].referenced_base_field_ids(),
+            &[12]
+        );
+        assert_eq!(
+            facts
+                .output()
+                .filter()
+                .expect("filter lineage")
+                .referenced_base_field_ids(),
+            &[11]
+        );
+    }
+
+    #[test]
+    fn opaque_refresh_input_projects_join_lineage_with_alias_and_predicate_order() {
+        let aliases = SqlMvJoinAliases {
+            left_table: "ice.sales.fact_east".to_string(),
+            left_alias: "l".to_string(),
+            right_table: "ice.sales.fact_west".to_string(),
+            right_alias: "r".to_string(),
+        };
+        let facts = analyzed_refresh_input(
+            "SELECT l.id, r.amount FROM fact_east l JOIN fact_west r ON r.id = l.id WHERE l.region IS NOT NULL",
+        )
+        .join_schema_lineage_facts(
+            SqlMvLineageScope::WholeQuery,
+            &aliases,
+            &observed_schema(),
+            &observed_schema(),
+        )
+        .expect("join lineage");
+
+        assert_eq!(facts.kind(), SqlMvJoinContractKindFacts::InnerEquiJoin);
+        assert_eq!(facts.left_base_fields().len(), 2);
+        assert_eq!(facts.right_base_fields().len(), 2);
+        let predicate = &facts.predicates()[0];
+        assert_eq!(predicate.left().table_fqn(), "ice.sales.fact_east");
+        assert_eq!(predicate.left().qualifier_at_create(), "l");
+        assert_eq!(predicate.right().table_fqn(), "ice.sales.fact_west");
+        assert_eq!(predicate.right().qualifier_at_create(), "r");
+    }
+
+    #[test]
+    fn opaque_refresh_input_falls_back_to_first_union_branch_and_fails_closed() {
+        let union =
+            analyzed_refresh_input("SELECT id FROM fact_east UNION ALL SELECT id FROM fact_west")
+                .projection_schema_lineage_facts(
+                    SqlMvLineageScope::WholeQueryOrFirstUnionBranch,
+                    &observed_schema(),
+                )
+                .expect("first branch fallback");
+        assert_eq!(union.base_fields()[0].field_id(), 10);
+
+        let missing = SqlMvObservedSchemaFacts::new(vec![SqlMvObservedFieldFacts::new(
+            10,
+            "id".to_string(),
+            "long".to_string(),
+            true,
+        )]);
+        let error = analyzed_refresh_input("SELECT region FROM fact_east")
+            .projection_schema_lineage_facts(SqlMvLineageScope::WholeQuery, &missing)
+            .expect_err("unobserved field must fail closed");
+        assert!(error.contains("region"), "unexpected error: {error}");
     }
 
     #[test]
@@ -513,6 +608,74 @@ impl SqlResolvedMvRefreshInput {
             group_key_source_indexes,
         })
     }
+
+    /// Derive field-id lineage for a single-base MV projection/filter without
+    /// exposing the analyzed query or lineage collector to application code.
+    pub fn projection_schema_lineage_facts(
+        &self,
+        scope: SqlMvLineageScope,
+        base_schema: &SqlMvObservedSchemaFacts,
+    ) -> Result<SqlMvProjectionLineageFacts, String> {
+        let build = |resolved| {
+            crate::analyzer::mv_lineage::build_projection_filter_lineage(
+                resolved,
+                &sql_mv_lineage_schema(base_schema),
+            )
+            .map(sql_mv_projection_lineage_facts)
+        };
+        match scope {
+            SqlMvLineageScope::WholeQuery => build(&self.0),
+            SqlMvLineageScope::FirstUnionBranch => {
+                build(first_union_branch_resolved_query(&self.0)?)
+            }
+            SqlMvLineageScope::WholeQueryOrFirstUnionBranch => {
+                build(&self.0).or_else(|_| build(first_union_branch_resolved_query(&self.0)?))
+            }
+        }
+    }
+
+    /// Derive qualified join lineage from opaque analysis and application-owned
+    /// observed schemas. SQL owns alias interpretation and predicate ordering;
+    /// Core retains the provider observations and persistence mapping.
+    pub fn join_schema_lineage_facts(
+        &self,
+        scope: SqlMvLineageScope,
+        aliases: &SqlMvJoinAliases,
+        left_schema: &SqlMvObservedSchemaFacts,
+        right_schema: &SqlMvObservedSchemaFacts,
+    ) -> Result<SqlMvJoinLineageFacts, String> {
+        let resolved = match scope {
+            SqlMvLineageScope::WholeQuery => &self.0,
+            SqlMvLineageScope::FirstUnionBranch => first_union_branch_resolved_query(&self.0)?,
+            SqlMvLineageScope::WholeQueryOrFirstUnionBranch => {
+                return Err(
+                    "join MV lineage does not support whole-query fallback scope".to_string(),
+                );
+            }
+        };
+        let left_schema_facts = sql_mv_lineage_schema(left_schema);
+        let right_schema_facts = sql_mv_lineage_schema(right_schema);
+        let lineage = crate::analyzer::mv_lineage::build_join_projection_filter_lineage(
+            resolved,
+            &[
+                (
+                    aliases.left_table.as_str(),
+                    aliases.left_alias.as_str(),
+                    &left_schema_facts,
+                ),
+                (
+                    aliases.right_table.as_str(),
+                    aliases.right_alias.as_str(),
+                    &right_schema_facts,
+                ),
+            ],
+        )?;
+        Ok(sql_mv_join_lineage_facts(
+            lineage,
+            &aliases.left_table,
+            &aliases.right_table,
+        ))
+    }
 }
 
 impl resolved_mv_refresh_input_private::Sealed for crate::analysis::ResolvedQuery {}
@@ -591,6 +754,232 @@ pub struct SqlMvAggregateCallFacts {
     function: AggregateFunctionKind,
     count_star: bool,
     visible_source_index: usize,
+}
+
+/// Immutable provider-schema facts admitted into SQL lineage analysis. This
+/// value contains no provider handle, catalog snapshot, or mutable schema.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvObservedSchemaFacts {
+    fields: Vec<SqlMvObservedFieldFacts>,
+}
+
+impl SqlMvObservedSchemaFacts {
+    pub fn new(fields: Vec<SqlMvObservedFieldFacts>) -> Self {
+        Self { fields }
+    }
+
+    pub fn fields(&self) -> &[SqlMvObservedFieldFacts] {
+        &self.fields
+    }
+}
+
+/// One observed provider field projected as a plain immutable SQL fact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvObservedFieldFacts {
+    field_id: i32,
+    name_at_create: String,
+    type_signature: String,
+    required: bool,
+}
+
+impl SqlMvObservedFieldFacts {
+    pub fn new(
+        field_id: i32,
+        name_at_create: String,
+        type_signature: String,
+        required: bool,
+    ) -> Self {
+        Self {
+            field_id,
+            name_at_create,
+            type_signature,
+            required,
+        }
+    }
+
+    pub fn field_id(&self) -> i32 {
+        self.field_id
+    }
+
+    pub fn name_at_create(&self) -> &str {
+        &self.name_at_create
+    }
+
+    pub fn type_signature(&self) -> &str {
+        &self.type_signature
+    }
+
+    pub fn required(&self) -> bool {
+        self.required
+    }
+}
+
+/// Selects which opaque analyzed query supplies MV schema lineage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqlMvLineageScope {
+    WholeQuery,
+    FirstUnionBranch,
+    WholeQueryOrFirstUnionBranch,
+}
+
+/// Plain SQL lineage category persisted by Core in its own schema contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqlMvExpressionLineageKind {
+    Column,
+    Cast,
+    Func,
+    Literal,
+    Mixed,
+}
+
+/// One qualified provider field referenced by SQL lineage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvQualifiedFieldLineageFacts {
+    table_fqn: String,
+    qualifier_at_create: String,
+    field_id: i32,
+}
+
+impl SqlMvQualifiedFieldLineageFacts {
+    pub fn table_fqn(&self) -> &str {
+        &self.table_fqn
+    }
+
+    pub fn qualifier_at_create(&self) -> &str {
+        &self.qualifier_at_create
+    }
+
+    pub fn field_id(&self) -> i32 {
+        self.field_id
+    }
+}
+
+/// Immutable expression-level field-id lineage facts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvExpressionLineageFacts {
+    kind: SqlMvExpressionLineageKind,
+    referenced_base_field_ids: Vec<i32>,
+    referenced_base_fields: Vec<SqlMvQualifiedFieldLineageFacts>,
+}
+
+impl SqlMvExpressionLineageFacts {
+    pub fn kind(&self) -> SqlMvExpressionLineageKind {
+        self.kind
+    }
+
+    pub fn referenced_base_field_ids(&self) -> &[i32] {
+        &self.referenced_base_field_ids
+    }
+
+    pub fn referenced_base_fields(&self) -> &[SqlMvQualifiedFieldLineageFacts] {
+        &self.referenced_base_fields
+    }
+}
+
+/// Immutable output/filter lineage for one SQL MV query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvOutputLineageFacts {
+    columns: Vec<SqlMvExpressionLineageFacts>,
+    filter: Option<SqlMvFilterLineageFacts>,
+}
+
+impl SqlMvOutputLineageFacts {
+    pub fn columns(&self) -> &[SqlMvExpressionLineageFacts] {
+        &self.columns
+    }
+
+    pub fn filter(&self) -> Option<&SqlMvFilterLineageFacts> {
+        self.filter.as_ref()
+    }
+}
+
+/// Immutable lineage for an MV filter predicate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvFilterLineageFacts {
+    referenced_base_field_ids: Vec<i32>,
+    referenced_base_fields: Vec<SqlMvQualifiedFieldLineageFacts>,
+}
+
+impl SqlMvFilterLineageFacts {
+    pub fn referenced_base_field_ids(&self) -> &[i32] {
+        &self.referenced_base_field_ids
+    }
+
+    pub fn referenced_base_fields(&self) -> &[SqlMvQualifiedFieldLineageFacts] {
+        &self.referenced_base_fields
+    }
+}
+
+/// SQL lineage facts for a single observed base schema.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvProjectionLineageFacts {
+    base_fields: Vec<SqlMvObservedFieldFacts>,
+    output: SqlMvOutputLineageFacts,
+}
+
+impl SqlMvProjectionLineageFacts {
+    pub fn base_fields(&self) -> &[SqlMvObservedFieldFacts] {
+        &self.base_fields
+    }
+
+    pub fn output(&self) -> &SqlMvOutputLineageFacts {
+        &self.output
+    }
+}
+
+/// SQL-owned normalized join contract kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqlMvJoinContractKindFacts {
+    InnerEquiJoin,
+}
+
+/// SQL-owned normalized join predicate facts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvJoinPredicateLineageFacts {
+    left: SqlMvQualifiedFieldLineageFacts,
+    right: SqlMvQualifiedFieldLineageFacts,
+}
+
+impl SqlMvJoinPredicateLineageFacts {
+    pub fn left(&self) -> &SqlMvQualifiedFieldLineageFacts {
+        &self.left
+    }
+
+    pub fn right(&self) -> &SqlMvQualifiedFieldLineageFacts {
+        &self.right
+    }
+}
+
+/// Immutable join lineage facts derived from two observed base schemas.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvJoinLineageFacts {
+    left_base_fields: Vec<SqlMvObservedFieldFacts>,
+    right_base_fields: Vec<SqlMvObservedFieldFacts>,
+    output: SqlMvOutputLineageFacts,
+    kind: SqlMvJoinContractKindFacts,
+    predicates: Vec<SqlMvJoinPredicateLineageFacts>,
+}
+
+impl SqlMvJoinLineageFacts {
+    pub fn left_base_fields(&self) -> &[SqlMvObservedFieldFacts] {
+        &self.left_base_fields
+    }
+
+    pub fn right_base_fields(&self) -> &[SqlMvObservedFieldFacts] {
+        &self.right_base_fields
+    }
+
+    pub fn output(&self) -> &SqlMvOutputLineageFacts {
+        &self.output
+    }
+
+    pub fn kind(&self) -> SqlMvJoinContractKindFacts {
+        self.kind
+    }
+
+    pub fn predicates(&self) -> &[SqlMvJoinPredicateLineageFacts] {
+        &self.predicates
+    }
 }
 
 impl SqlMvAggregateCallFacts {
@@ -711,6 +1100,143 @@ pub fn validate_reserved_projection_output_names(
         }
     }
     Ok(())
+}
+
+fn sql_mv_lineage_schema(
+    schema: &SqlMvObservedSchemaFacts,
+) -> crate::analyzer::mv_lineage::SqlMvLineageSchema {
+    crate::analyzer::mv_lineage::SqlMvLineageSchema {
+        fields: schema
+            .fields()
+            .iter()
+            .map(|field| crate::analyzer::mv_lineage::SqlMvLineageField {
+                field_id: field.field_id(),
+                name_at_create: field.name_at_create().to_string(),
+                type_signature: field.type_signature().to_string(),
+                required: field.required(),
+            })
+            .collect(),
+    }
+}
+
+fn sql_mv_observed_field_facts(
+    field: crate::analyzer::mv_lineage::SqlMvLineageField,
+) -> SqlMvObservedFieldFacts {
+    SqlMvObservedFieldFacts::new(
+        field.field_id,
+        field.name_at_create,
+        field.type_signature,
+        field.required,
+    )
+}
+
+fn sql_mv_qualified_field_lineage_facts(
+    field: crate::analyzer::mv_lineage::SqlMvQualifiedFieldLineage,
+) -> SqlMvQualifiedFieldLineageFacts {
+    SqlMvQualifiedFieldLineageFacts {
+        table_fqn: field.table_fqn,
+        qualifier_at_create: field.qualifier_at_create,
+        field_id: field.field_id,
+    }
+}
+
+fn sql_mv_expression_lineage_kind_facts(
+    kind: crate::analyzer::mv_lineage::SqlMvExpressionKind,
+) -> SqlMvExpressionLineageKind {
+    match kind {
+        crate::analyzer::mv_lineage::SqlMvExpressionKind::Column => {
+            SqlMvExpressionLineageKind::Column
+        }
+        crate::analyzer::mv_lineage::SqlMvExpressionKind::Cast => SqlMvExpressionLineageKind::Cast,
+        crate::analyzer::mv_lineage::SqlMvExpressionKind::Func => SqlMvExpressionLineageKind::Func,
+        crate::analyzer::mv_lineage::SqlMvExpressionKind::Literal => {
+            SqlMvExpressionLineageKind::Literal
+        }
+        crate::analyzer::mv_lineage::SqlMvExpressionKind::Mixed => {
+            SqlMvExpressionLineageKind::Mixed
+        }
+    }
+}
+
+fn sql_mv_output_lineage_facts(
+    columns: Vec<crate::analyzer::mv_lineage::SqlMvOutputColumnLineage>,
+    filter: Option<crate::analyzer::mv_lineage::SqlMvFilterLineage>,
+) -> SqlMvOutputLineageFacts {
+    SqlMvOutputLineageFacts {
+        columns: columns
+            .into_iter()
+            .map(|column| SqlMvExpressionLineageFacts {
+                kind: sql_mv_expression_lineage_kind_facts(column.expression.kind),
+                referenced_base_field_ids: column.expression.referenced_base_field_ids,
+                referenced_base_fields: column
+                    .expression
+                    .referenced_base_fields
+                    .into_iter()
+                    .map(sql_mv_qualified_field_lineage_facts)
+                    .collect(),
+            })
+            .collect(),
+        filter: filter.map(|filter| SqlMvFilterLineageFacts {
+            referenced_base_field_ids: filter.referenced_base_field_ids,
+            referenced_base_fields: filter
+                .referenced_base_fields
+                .into_iter()
+                .map(sql_mv_qualified_field_lineage_facts)
+                .collect(),
+        }),
+    }
+}
+
+fn sql_mv_projection_lineage_facts(
+    lineage: crate::analyzer::mv_lineage::SqlMvLineageResult,
+) -> SqlMvProjectionLineageFacts {
+    SqlMvProjectionLineageFacts {
+        base_fields: lineage
+            .base_fields
+            .into_iter()
+            .map(sql_mv_observed_field_facts)
+            .collect(),
+        output: sql_mv_output_lineage_facts(lineage.output_columns, lineage.filter),
+    }
+}
+
+fn sql_mv_join_lineage_facts(
+    mut lineage: crate::analyzer::mv_lineage::SqlMvJoinLineageResult,
+    left_table: &str,
+    right_table: &str,
+) -> SqlMvJoinLineageFacts {
+    let kind = match lineage.join.kind {
+        crate::analyzer::mv_lineage::SqlMvJoinContractKind::InnerEquiJoin => {
+            SqlMvJoinContractKindFacts::InnerEquiJoin
+        }
+    };
+    SqlMvJoinLineageFacts {
+        left_base_fields: lineage
+            .base_fields_by_table
+            .remove(left_table)
+            .unwrap_or_default()
+            .into_iter()
+            .map(sql_mv_observed_field_facts)
+            .collect(),
+        right_base_fields: lineage
+            .base_fields_by_table
+            .remove(right_table)
+            .unwrap_or_default()
+            .into_iter()
+            .map(sql_mv_observed_field_facts)
+            .collect(),
+        output: sql_mv_output_lineage_facts(lineage.output_columns, lineage.filter),
+        kind,
+        predicates: lineage
+            .join
+            .predicates
+            .into_iter()
+            .map(|predicate| SqlMvJoinPredicateLineageFacts {
+                left: sql_mv_qualified_field_lineage_facts(predicate.left),
+                right: sql_mv_qualified_field_lineage_facts(predicate.right),
+            })
+            .collect(),
+    }
 }
 
 fn aggregate_input_types_from_resolved_query(
