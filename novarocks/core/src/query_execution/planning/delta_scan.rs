@@ -109,7 +109,7 @@ mod tests {
         }
     }
 
-    fn admitted_scan() -> ConnectorScan {
+    fn admitted_scan(from_snapshot_id: i64, to_snapshot_id: i64) -> ConnectorScan {
         let owner = ConnectorExecutionBindingKey {
             instance_id: ConnectorInstanceId::parse("ice").expect("instance ID"),
             incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
@@ -123,7 +123,7 @@ mod tests {
         .expect("request context");
         ConnectorScan::try_new_change_window(
             owner.clone(),
-            ConnectorChangeWindow::new(10, 20),
+            ConnectorChangeWindow::new(from_snapshot_id, to_snapshot_id),
             ConnectorChangeWindowAdmission::MetadataOnly,
             ConnectorScanHandle::try_new(owner.instance_id, Bytes::from_static(b"change-v1"))
                 .expect("scan handle"),
@@ -162,7 +162,7 @@ mod tests {
                         binding,
                         6,
                         7,
-                        admitted_scan(),
+                        admitted_scan(6, 7),
                     ))
                 },
             )
@@ -206,7 +206,7 @@ mod tests {
                         binding,
                         6,
                         7,
-                        admitted_scan(),
+                        admitted_scan(6, 7),
                     ))
                 },
             )
