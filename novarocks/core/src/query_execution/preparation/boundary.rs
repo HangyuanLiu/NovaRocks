@@ -145,8 +145,10 @@ mod tests {
         plan: &novarocks_sql::plan_read::DistributedPlan,
         contracts: &[BoundaryContract],
     ) -> Result<BTreeMap<FragmentId, Vec<BoundaryContract>>, String> {
+        let facts =
+            novarocks_sql::planning::query_execution::project_execution_preparation_facts(plan);
         validate_and_group_boundary_contracts(
-            plan.topology().result_fragment_id(),
+            facts.result_fragment_id(),
             &BTreeSet::new(),
             plan.edges(),
             contracts,
@@ -161,7 +163,9 @@ mod tests {
     #[test]
     fn malformed_boundary_groups_and_occurrences_use_production_validation() {
         let plan = super::super::test_support::result_plan();
-        let valid = plan.boundaries().contracts();
+        let facts =
+            novarocks_sql::planning::query_execution::project_execution_preparation_facts(&plan);
+        let valid = facts.boundary_contracts();
         validate_contracts(&plan, valid).expect("sealed boundary catalog");
 
         let missing = validate_contracts(&plan, &[]).expect_err("missing group must fail");

@@ -121,6 +121,18 @@ pub enum NativeScanFixture {
     JoinRefreshCoalesce,
 }
 
+/// Confirm the closed MV scan fixture carries a tokenized `Data(Current)`
+/// source. The source itself remains SQL-private; Core tests receive only this
+/// immutable invariant.
+pub fn native_mv_data_current_scan_is_tokenized() -> bool {
+    matches!(
+        test_sql_scan_source(SqlScanKind::Data {
+            version: SqlTableVersionSelector::Current,
+        }),
+        crate::planner::table::ScanSource::Sql(_)
+    )
+}
+
 /// Copied scan-admission facts for Core fixture binding. This is intentionally
 /// a snapshot, not a re-export of the tokenized SQL scan carrier.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2286,12 +2298,18 @@ fn seal_fixture_plan(fragments: Vec<PlanFragment>) -> Result<DistributedPlan, St
 
 #[cfg(test)]
 mod tests {
+    use super::native_mv_data_current_scan_is_tokenized;
     use super::{
         NativeBuildFixture, NativeEncoderPlanFixture, NativePreparationFixture, native_build_plan,
         native_encoder_plan, native_preparation_plan,
     };
     use super::{NativePlanEncodingFixture, native_plan_encoding_plan};
     use super::{NativeScanFixture, native_scan_plan};
+
+    #[test]
+    fn native_mv_data_current_scan_fixture_remains_tokenized() {
+        assert!(native_mv_data_current_scan_is_tokenized());
+    }
 
     #[test]
     fn native_encoder_fixtures_return_complete_sealed_plans() {

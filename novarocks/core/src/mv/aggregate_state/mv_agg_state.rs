@@ -1653,7 +1653,7 @@ mod tests {
     use novarocks_execution::exec::mv::state_codec::{
         encode_count_state, encode_sum_decimal128, encode_sum_int64,
     };
-    use novarocks_sql::column_id::ColumnId;
+    use novarocks_sql::plan_read::ColumnId;
     use novarocks_sql::planning::mv::{IncrementalMvShape, classify_incremental_mv_query};
 
     fn test_shape() -> AggregateMvShape {

@@ -462,7 +462,7 @@ mod tests {
 
     fn planner_column(id: u32, name: &str, data_type: DataType, nullable: bool) -> OutputColumn {
         OutputColumn {
-            column_id: ColumnId::new_for_test(id),
+            column_id: ColumnId(id),
             name: name.to_string(),
             data_type,
             nullable,
@@ -521,7 +521,7 @@ mod tests {
             .expect("valid binding");
 
         let resolved = &bindings.binding(41).expect("binding").physical_columns[0];
-        assert_eq!(resolved.planner.column_id, ColumnId::new_for_test(17));
+        assert_eq!(resolved.planner.column_id, ColumnId(17));
         assert_eq!(resolved.planner.data_type, DataType::LargeBinary);
         assert!(resolved.planner.nullable);
         assert_eq!(resolved.source.logical_type, Some(SqlType::Json));
@@ -564,7 +564,7 @@ mod tests {
                 44,
                 Vec::new(),
                 vec![ResolvedReadColumn {
-                    planner_column_id: Some(ColumnId::new_for_test(9)),
+                    planner_column_id: Some(ColumnId(9)),
                     source: hidden,
                     reason: ResolvedReadReason::EqualityDeleteKey,
                 }],

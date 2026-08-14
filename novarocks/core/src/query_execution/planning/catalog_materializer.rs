@@ -669,15 +669,18 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use novarocks_sql::binding::SqlTableBindingAllocator;
     use novarocks_sql::catalog::PlannerTableProvider;
 
     fn binding_id(scope: u64, ordinal: u32) -> SqlTableBindingId {
-        SqlTableBindingId::new(
-            novarocks_sql::binding::SqlTableBindingScopeId::new(
-                NonZeroU64::new(scope).expect("non-zero scope"),
-            ),
-            NonZeroU32::new(ordinal).expect("non-zero ordinal"),
-        )
+        let ordinal = NonZeroU32::new(ordinal).expect("non-zero ordinal");
+        let mut allocator =
+            SqlTableBindingAllocator::try_new(NonZeroU64::new(scope).expect("non-zero scope"))
+                .expect("test binding allocator");
+        for _ in 1..ordinal.get() {
+            allocator.allocate().expect("non-zero test binding ordinal");
+        }
+        allocator.allocate().expect("non-zero test binding ordinal")
     }
 
     fn local_binding(binding: SqlTableBindingId) -> QueryTableBinding {

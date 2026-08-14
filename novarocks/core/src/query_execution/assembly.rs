@@ -1229,7 +1229,7 @@ mod tests {
                     exprs: Vec::new(),
                 },
                 vec![13],
-                vec![ColumnId::new_for_test(13)],
+                vec![ColumnId(13)],
             )],
             &BTreeMap::from([(2, vec![destination])]),
         )

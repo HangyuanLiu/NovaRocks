@@ -922,8 +922,9 @@ pub(crate) mod tests_support {
         TargetContract, TargetVisibleColumn,
     };
     use novarocks_catalog::identifier::TableIdentity;
-
-    const JOIN_APPLY_KEY_COLUMN_NAME: &str = "__nova_join_row_key";
+    use novarocks_sql::planning::mv::{
+        MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME, SqlMvApplyKeySourceFacts,
+    };
 
     use super::*;
 
@@ -1020,7 +1021,7 @@ pub(crate) mod tests_support {
                 hidden_apply_key: HiddenApplyKeyContract {
                     column_name: "k".to_string(),
                     target_field_id: 100,
-                    source: ApplyKeySource::BaseRowId,
+                    source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
                 },
                 partition: None,
             },
@@ -1128,7 +1129,7 @@ pub(crate) mod tests_support {
         contract.target.visible_columns[1].output_name = "v".to_string();
         contract.target.hidden_apply_key.column_name = JOIN_APPLY_KEY_COLUMN_NAME.to_string();
         contract.target.hidden_apply_key.target_field_id = 999;
-        contract.target.hidden_apply_key.source = ApplyKeySource::JoinRowKey;
+        contract.target.hidden_apply_key.source = SqlMvApplyKeySourceFacts::JoinRowKey.into();
         contract.bases = vec![
             join_base_contract("ice.db.l", "uuid-l", "l"),
             join_base_contract("ice.db.r", "uuid-r", "r"),
@@ -1229,6 +1230,7 @@ mod tests {
         BranchIdColumnContract, BranchUnionContract,
     };
     use novarocks_catalog::identifier::TableIdentity;
+    use novarocks_sql::planning::mv::SqlMvApplyKeySourceFacts;
 
     const BRANCH_ID_COLUMN_NAME: &str = "__branch_id__";
 
@@ -1721,7 +1723,7 @@ mod tests {
                 target_field_id: 4242,
             },
             branch_count: 2,
-            inner_apply_key_source: ApplyKeySource::BaseRowId,
+            inner_apply_key_source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
         });
         let contract = Arc::new(contract);
 
@@ -1767,7 +1769,7 @@ mod tests {
         let mut contract = make_schema_contract();
         contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
         contract.target.hidden_apply_key.target_field_id = 999;
-        contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
+        contract.target.hidden_apply_key.source = SqlMvApplyKeySourceFacts::GroupRowId.into();
         contract.aggregate = Some(AggregateStateContract {
             state_layout_version: 1,
             row_id_column_name: "__row_id__".to_string(),
