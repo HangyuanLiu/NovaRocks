@@ -1406,6 +1406,7 @@ mod tests {
             "plan_fragment.sink.change_stream_router.routes[0].accepted_effects[0]"
         );
         assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidEnum);
+        assert_eq!(protocol.detail(), "native RowMutationEffect is unspecified");
     }
 
     #[test]
@@ -1426,6 +1427,10 @@ mod tests {
             "plan_fragment.sink.change_stream_router.routes[0].input_ordinals[0]"
         );
         assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+        assert_eq!(
+            protocol.detail(),
+            "native router output ordinal 1 is out of range"
+        );
     }
 
     #[test]
@@ -1447,6 +1452,10 @@ mod tests {
             "plan_fragment.sink.change_stream_router.routes[0].output_partition_ordinals[0]"
         );
         assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+        assert_eq!(
+            protocol.detail(),
+            "native CHANGE_STREAM_ROUTER_SINK partition ordinal 1 is out of range"
+        );
     }
 
     #[test]

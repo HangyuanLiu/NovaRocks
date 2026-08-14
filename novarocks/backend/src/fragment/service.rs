@@ -786,7 +786,7 @@ mod tests {
     use novarocks::query_execution::lifecycle::{
         AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
         ParticipantRole, QueryControlAttach, QueryControlAttachment, QueryControlEndpoint,
-        QueryExecutionId, QueryInitOutcome, QueryInitRequest,
+        QueryExecutionId, QueryInitOutcome, QueryInitRequest, StageFragment,
     };
     use novarocks_execution::runtime::fragment::{
         DormantFragmentHandle, FragmentOutcome, prepare_fragment,
@@ -801,6 +801,7 @@ mod tests {
         FRAGMENT_EXECUTOR_FAILURE_MESSAGE, start_with_fragment_failure_trigger,
     };
     use crate::native::ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
+    use crate::query_lifecycle::stage::StartGate;
 
     use super::{
         NativeFragmentLifecycleEvent, NativeFragmentRequest, NativeFragmentService,
@@ -1058,6 +1059,53 @@ mod tests {
                 NativeFragmentLifecycleEvent::Started,
             ]
         );
+    }
+
+    #[test]
+    fn malformed_staged_fragment_does_not_consume_lifecycle_admission() {
+        let _service_guard = SERVICE_TEST_LOCK.lock().expect("service test lock");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let service = NativeFragmentService::with_lifecycle_observer(move |event| {
+            captured.lock().expect("lifecycle events").push(event);
+        });
+        let request = values_result_request(81_400, 81_402);
+        let _control = make_control_ready(&service, &request, [request.fragment_instance_id()]);
+        let malformed = StageFragment::new(
+            proto::plan::PlanFragment::default(),
+            proto::novarocks::InstanceParams {
+                query_id: Some(proto::common::UniqueId {
+                    hi: 81_400,
+                    lo: 81_401,
+                }),
+                fragment_instance_id: Some(proto::common::UniqueId {
+                    hi: 81_402,
+                    lo: 81_403,
+                }),
+                backend_num: 3,
+                query_options: Some(proto::novarocks::QueryOptions {
+                    batch_size: 1024,
+                    pipeline_dop: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("stage fragment retains a valid identity");
+
+        let error = service
+            .stage_fragments(
+                request.execution_id(),
+                &[malformed],
+                Arc::new(StartGate::new()),
+            )
+            .expect_err("malformed wire fragment must fail during ingress decode");
+        assert!(error.to_string().contains("plan_fragment.root"));
+        assert!(events.lock().expect("lifecycle events").is_empty());
+
+        service
+            .submit(request)
+            .expect("malformed Stage must not consume the exact lifecycle admission");
     }
 
     #[test]

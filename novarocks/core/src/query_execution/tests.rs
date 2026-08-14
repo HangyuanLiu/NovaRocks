@@ -17,8 +17,7 @@
 
 use crate::query_execution::artifact::{
     BackendPlacement, ConnectorBindingInstallBarrier, ConnectorBindingInstallLease,
-    FragmentScheduleDraft, PreparedDistributedQuery, RuntimeFilterBoundPreparedDistributedQuery,
-    ValidatedFragmentSchedule,
+    FragmentScheduleDraft, ValidatedFragmentSchedule,
 };
 use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::cancellation::{
@@ -50,32 +49,6 @@ use bytes::Bytes;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-
-fn bind_empty_runtime_filter_tables(
-    artifacts: PreparedDistributedQuery,
-) -> Result<RuntimeFilterBoundPreparedDistributedQuery, DistributedQueryError> {
-    let attachment = {
-        let view = artifacts.runtime_filter_binding_view();
-        let tables = view
-            .facts()
-            .fragments()
-            .map(|fragment| {
-                if fragment.bindings().len() != 0 {
-                    return Err(DistributedQueryError::new(
-                        DistributedQueryErrorKind::Failed,
-                        "test lifecycle fixture requires explicit runtime-filter bindings",
-                    ));
-                }
-                Ok(novarocks_protocol::plan::RuntimeFilterBindingTable {
-                    fragment_id: fragment.fragment_id(),
-                    bindings: Vec::new(),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        view.seal(tables)?
-    };
-    artifacts.attach_runtime_filter_bindings(attachment)
-}
 
 fn test_execution(cancellation: QueryCancellationView) -> QueryExecutionContext {
     QueryExecutionContext::new(
@@ -351,7 +324,14 @@ fn query_control_typestate_initializes_before_native_assembly() {
     )
     .expect("valid init options");
 
-    let scheduled = bind_empty_runtime_filter_tables(parts.artifacts)
+    let attachment = parts
+        .artifacts
+        .runtime_filter_binding_view()
+        .seal_empty()
+        .expect("seal explicit empty runtime-filter bindings");
+    let scheduled = parts
+        .artifacts
+        .attach_runtime_filter_bindings(attachment)
         .expect("bind explicit empty runtime-filter tables")
         .bind_schedule(schedule)
         .expect("bind schedule");

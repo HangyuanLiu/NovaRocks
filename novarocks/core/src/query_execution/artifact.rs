@@ -294,6 +294,30 @@ impl<'a> RuntimeFilterBindingEncodingView<'a> {
             tables: by_fragment,
         })
     }
+
+    /// Seal the only valid empty binding attachment.  Callers cannot use this
+    /// to discard bindings: any fragment that requires one is rejected before
+    /// the attachment is created.
+    pub(crate) fn seal_empty(
+        self,
+    ) -> Result<RuntimeFilterBindingAttachment, DistributedQueryError> {
+        let tables = self
+            .facts
+            .fragments()
+            .map(|fragment| {
+                if fragment.bindings().len() != 0 {
+                    return Err(contract_error(
+                        "empty runtime-filter binding attachment cannot discard fragment bindings",
+                    ));
+                }
+                Ok(RuntimeFilterBindingTable {
+                    fragment_id: fragment.fragment_id(),
+                    bindings: Vec::new(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.seal(tables)
+    }
 }
 
 /// A core artifact bound to one validated schedule. Query initialization/control

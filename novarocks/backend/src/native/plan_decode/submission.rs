@@ -375,6 +375,7 @@ mod tests {
         let protocol = error.protocol().expect("protocol error");
         assert_eq!(protocol.path().to_string(), "plan_fragment.root");
         assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(protocol.detail(), "native PlanFragment requires root");
     }
 
     #[test]
@@ -436,6 +437,10 @@ mod tests {
             "plan_fragment.root.children[0].payload"
         );
         assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(
+            protocol.detail(),
+            "native DistributedNode 0 requires payload"
+        );
     }
 
     #[test]
@@ -466,6 +471,7 @@ mod tests {
             "plan_fragment.root.payload.physical.values.rows[0].values[0].type"
         );
         assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(protocol.detail(), "native Expr requires type");
     }
 
     #[test]
@@ -504,6 +510,7 @@ mod tests {
             "plan_fragment.root.payload.physical.values.rows[0].values[0].binary_op.left"
         );
         assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(protocol.detail(), "native Expr requires left");
     }
 
     #[test]
@@ -533,6 +540,10 @@ mod tests {
             "plan_fragment.root.payload.physical.scan.table"
         );
         assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(
+            protocol.detail(),
+            "native ScanNode node_id=11 requires table"
+        );
     }
 
     #[test]
@@ -552,6 +563,7 @@ mod tests {
         let protocol = error.protocol().expect("protocol error");
         assert_eq!(protocol.path().to_string(), "plan_fragment.sink.noop");
         assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(protocol.detail(), "native NOOP sink marker must be true");
     }
 
     #[test]
