@@ -1,0 +1,115 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! JoinCommutativity transformation rule.
+//!
+//! Swaps children of a LogicalJoin: `A JOIN B` -> `B JOIN A`, adjusting the
+//! join type to preserve semantics (LeftOuter <-> RightOuter, etc.).
+
+use crate::common::JoinKind;
+use crate::optimizer::memo::{MExpr, Memo};
+use crate::optimizer::operator::{LogicalJoinOp, Operator};
+use crate::optimizer::rule::{NewExpr, Rule, RuleType};
+
+pub(crate) struct JoinCommutativity;
+
+/// Map a join type to its commuted (left/right swapped) equivalent.
+fn commute_join_kind(kind: JoinKind) -> JoinKind {
+    match kind {
+        JoinKind::Inner => JoinKind::Inner,
+        JoinKind::Cross => JoinKind::Cross,
+        JoinKind::FullOuter => JoinKind::FullOuter,
+        JoinKind::LeftOuter => JoinKind::RightOuter,
+        JoinKind::RightOuter => JoinKind::LeftOuter,
+        JoinKind::LeftSemi => JoinKind::RightSemi,
+        JoinKind::RightSemi => JoinKind::LeftSemi,
+        JoinKind::LeftAnti => JoinKind::RightAnti,
+        JoinKind::RightAnti => JoinKind::LeftAnti,
+        // NullAwareLeftAnti is asymmetric (the null-key build-side check
+        // tests one specific side) and has no "right" mirror in our exec
+        // layer. Keep it as-is — the `matches()` filter above already
+        // excludes it from this rule's input set, this is just defence in
+        // depth for any future caller.
+        JoinKind::NullAwareLeftAnti => JoinKind::NullAwareLeftAnti,
+    }
+}
+
+impl Rule for JoinCommutativity {
+    fn name(&self) -> &str {
+        "JoinCommutativity"
+    }
+
+    fn rule_type(&self) -> RuleType {
+        RuleType::Transformation
+    }
+
+    fn matches(&self, op: &Operator) -> bool {
+        // Only commute joins where both directions are well-supported by
+        // the execution engine.  SEMI/ANTI joins use LEFT variants only;
+        // flipping to RIGHT SEMI/ANTI causes tuple/slot mismatches in the
+        // fragment builder because the output schema assumptions differ.
+        matches!(op, Operator::LogicalJoin(j)
+            if matches!(j.join_type,
+                JoinKind::Inner | JoinKind::Cross | JoinKind::FullOuter
+                | JoinKind::LeftOuter | JoinKind::RightOuter))
+    }
+
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalJoin(op) = &expr.op else {
+            return vec![];
+        };
+
+        // A join must have exactly two children: [left, right].
+        if expr.children.len() != 2 {
+            return vec![];
+        }
+
+        let left = expr.children[0];
+        let right = expr.children[1];
+
+        // Swap children and adjust the join type.
+        vec![NewExpr {
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: commute_join_kind(op.join_type),
+                condition: op.condition.clone(),
+            }),
+            children: vec![right, left],
+        }]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commute_symmetric_kinds() {
+        assert_eq!(commute_join_kind(JoinKind::Inner), JoinKind::Inner);
+        assert_eq!(commute_join_kind(JoinKind::Cross), JoinKind::Cross);
+        assert_eq!(commute_join_kind(JoinKind::FullOuter), JoinKind::FullOuter);
+    }
+
+    #[test]
+    fn commute_asymmetric_kinds() {
+        assert_eq!(commute_join_kind(JoinKind::LeftOuter), JoinKind::RightOuter);
+        assert_eq!(commute_join_kind(JoinKind::RightOuter), JoinKind::LeftOuter);
+        assert_eq!(commute_join_kind(JoinKind::LeftSemi), JoinKind::RightSemi);
+        assert_eq!(commute_join_kind(JoinKind::RightSemi), JoinKind::LeftSemi);
+        assert_eq!(commute_join_kind(JoinKind::LeftAnti), JoinKind::RightAnti);
+        assert_eq!(commute_join_kind(JoinKind::RightAnti), JoinKind::LeftAnti);
+    }
+}

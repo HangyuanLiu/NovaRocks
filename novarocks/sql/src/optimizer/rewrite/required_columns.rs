@@ -1,0 +1,2723 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Phase 1 of column pruning: top-down tagging pass.
+//!
+//! Walks the logical plan tree and writes `required_output_columns:
+//! Option<HashSet<ColumnId>>` on every operator node based on what the
+//! *parent* operator needs.
+//!
+//! Semantics:
+//! - `parent_needed = None` at the root means "all outputs required".
+//! - `Some(set)` means "downstream needs exactly this ColumnId set".
+//! - After this pass every node has `Some(_)` so Phase-2 pruning rules
+//!   can read a local tag without recursing.
+//!
+//! This module does **not** prune anything.  Pruning (removing items /
+//! output_columns entries) is done in Phase-2 `Prune*Columns` rules.
+//!
+//! Spec: `docs/design/specs/2026-05-28-oq-1-column-pruning-arch-refactor-design.md` §5.
+
+use std::collections::HashSet;
+
+use crate::column_id::ColumnId;
+use crate::common::CteId;
+use crate::optimizer::operator::{Operator, UnionOp};
+use crate::optimizer::opt_expr::OptExpr;
+use crate::optimizer::rewrite::context::RewriteContext;
+use crate::optimizer::rewrite::phase::RewritePhase;
+use crate::optimizer::rewrite::result::RewriteResult;
+use crate::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
+use crate::optimizer::rewrite::rules::utils::{
+    collect_output_ids_opt, collect_output_ids_ordered_opt,
+};
+use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+/// Walk `expr` top-down and stamp `required_output_columns` on every operator.
+///
+/// `parent_needed = None` means the root has no caller restriction (all outputs
+/// required).  Each operator type computes its own child's needed set and
+/// recurses.
+pub(crate) fn tag_required_columns(
+    expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    match &expr.op {
+        Operator::LogicalScan(_) => tag_scan(expr, parent_needed),
+        Operator::LogicalValues(_) => tag_values(expr, parent_needed),
+        Operator::LogicalGenerateSeries(_) => tag_generate_series(expr, parent_needed),
+        Operator::LogicalProject(_) => tag_project(expr, arena, parent_needed),
+        Operator::LogicalFilter(_) => tag_filter(expr, arena, parent_needed),
+        Operator::LogicalSort(_) => tag_sort(expr, arena, parent_needed),
+        Operator::LogicalLimit(_) => tag_limit(expr, arena, parent_needed),
+        Operator::LogicalAggregate(_) => tag_aggregate(expr, arena, parent_needed),
+        Operator::LogicalJoin(_) => tag_join(expr, arena, parent_needed),
+        Operator::LogicalUnion(_) => tag_union(expr, arena, parent_needed),
+        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
+            tag_passthrough(expr, arena, parent_needed)
+        }
+        Operator::LogicalIntersect(_) => tag_intersect(expr, arena, parent_needed),
+        Operator::LogicalExcept(_) => tag_except(expr, arena, parent_needed),
+        Operator::LogicalCTEAnchor(_) => tag_cte_anchor(expr, arena, parent_needed),
+        Operator::LogicalCTEConsume(_) => tag_cte_consume(expr, parent_needed),
+        Operator::LogicalCTEProduce(_) => tag_cte_produce(expr, arena, parent_needed),
+        Operator::LogicalWindow(_) => tag_window(expr, arena, parent_needed),
+        Operator::LogicalRepeat(_) => tag_repeat(expr, arena, parent_needed),
+        Operator::LogicalChangeEventExpand(_) => {
+            tag_change_event_expand(expr, arena, parent_needed)
+        }
+        Operator::LogicalTableFunction(_) => tag_table_function(expr, arena, parent_needed),
+        Operator::LogicalAssertOneRow(_) => tag_assert_one_row(expr, arena, parent_needed),
+        _ => {
+            // Conservative: require all below (Apply, IMV markers, physical ops).
+            let children = expr.children;
+            OptExpr {
+                op: expr.op,
+                children: children
+                    .into_iter()
+                    .map(|child| tag_required_columns(child, arena, None))
+                    .collect(),
+                required_output_columns: None,
+            }
+        }
+    }
+}
+
+fn tag_passthrough(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    expr.required_output_columns = parent_needed.clone();
+    let children = expr.children;
+    OptExpr {
+        op: expr.op,
+        children: children
+            .into_iter()
+            .map(|child| tag_required_columns(child, arena, parent_needed.clone()))
+            .collect(),
+        required_output_columns: parent_needed,
+    }
+}
+
+/// Conservative: require everything below, prune nothing.
+fn tag_assert_one_row(
+    expr: OptExpr,
+    arena: &ScalarArena,
+    _parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    debug_assert!(matches!(expr.op, Operator::LogicalAssertOneRow(_)));
+    let mut children = expr.children;
+    let input = children.remove(0);
+    OptExpr {
+        op: expr.op,
+        children: vec![tag_required_columns(input, arena, None)],
+        required_output_columns: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Leaf handlers
+// ---------------------------------------------------------------------------
+
+fn tag_scan(mut expr: OptExpr, parent_needed: Option<HashSet<ColumnId>>) -> OptExpr {
+    let Operator::LogicalScan(scan) = &expr.op else {
+        unreachable!()
+    };
+    let needed =
+        parent_needed.unwrap_or_else(|| scan.columns.iter().map(|c| c.column_id).collect());
+    expr.required_output_columns = Some(needed);
+    expr
+}
+
+fn tag_values(mut expr: OptExpr, parent_needed: Option<HashSet<ColumnId>>) -> OptExpr {
+    let Operator::LogicalValues(node) = &expr.op else {
+        unreachable!()
+    };
+    let needed =
+        parent_needed.unwrap_or_else(|| node.columns.iter().map(|c| c.column_id).collect());
+    expr.required_output_columns = Some(needed);
+    expr
+}
+
+/// GenerateSeries is a leaf with one output ColumnId.  Like Scan/Values, a
+/// `None` parent means all leaf outputs are required.
+fn tag_generate_series(mut expr: OptExpr, parent_needed: Option<HashSet<ColumnId>>) -> OptExpr {
+    let Operator::LogicalGenerateSeries(node) = &expr.op else {
+        unreachable!()
+    };
+    let needed = parent_needed.unwrap_or_else(|| {
+        if node.output_column_id == ColumnId::UNSET {
+            HashSet::new()
+        } else {
+            HashSet::from([node.output_column_id])
+        }
+    });
+    expr.required_output_columns = Some(needed);
+    expr
+}
+
+// ---------------------------------------------------------------------------
+// Unary handlers
+// ---------------------------------------------------------------------------
+
+fn collect_scalar_column_id_refs(arena: &ScalarArena, expr: ScalarId) -> HashSet<ColumnId> {
+    let mut out = HashSet::new();
+    collect_scalar_column_id_refs_inner(arena, expr, &mut out);
+    out
+}
+
+fn collect_scalar_column_id_refs_inner(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    out: &mut HashSet<ColumnId>,
+) {
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(column_id) => {
+            if *column_id != ColumnId::UNSET {
+                out.insert(*column_id);
+            }
+        }
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
+        ScalarNode::BinaryOp { left, right, .. } => {
+            collect_scalar_column_id_refs_inner(arena, *left, out);
+            collect_scalar_column_id_refs_inner(arena, *right, out);
+        }
+        ScalarNode::UnaryOp { child, .. }
+        | ScalarNode::Cast { child, .. }
+        | ScalarNode::IsNull { child, .. }
+        | ScalarNode::IsTruthValue { child, .. }
+        | ScalarNode::Nested(child) => collect_scalar_column_id_refs_inner(arena, *child, out),
+        ScalarNode::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_scalar_column_id_refs_inner(arena, *arg, out);
+            }
+        }
+        ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
+            collect_scalar_column_id_refs_inner(arena, *body, out);
+        }
+        ScalarNode::AggregateCall { args, order_by, .. } => {
+            for arg in args {
+                collect_scalar_column_id_refs_inner(arena, *arg, out);
+            }
+            for item in order_by {
+                collect_scalar_column_id_refs_inner(arena, item.expr, out);
+            }
+        }
+        ScalarNode::InList { child, list, .. } => {
+            collect_scalar_column_id_refs_inner(arena, *child, out);
+            for item in list {
+                collect_scalar_column_id_refs_inner(arena, *item, out);
+            }
+        }
+        ScalarNode::Between {
+            child, low, high, ..
+        } => {
+            collect_scalar_column_id_refs_inner(arena, *child, out);
+            collect_scalar_column_id_refs_inner(arena, *low, out);
+            collect_scalar_column_id_refs_inner(arena, *high, out);
+        }
+        ScalarNode::Like { child, pattern, .. } => {
+            collect_scalar_column_id_refs_inner(arena, *child, out);
+            collect_scalar_column_id_refs_inner(arena, *pattern, out);
+        }
+        ScalarNode::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_scalar_column_id_refs_inner(arena, *operand, out);
+            }
+            for (when, then) in when_then {
+                collect_scalar_column_id_refs_inner(arena, *when, out);
+                collect_scalar_column_id_refs_inner(arena, *then, out);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_scalar_column_id_refs_inner(arena, *else_expr, out);
+            }
+        }
+        ScalarNode::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_scalar_column_id_refs_inner(arena, *arg, out);
+            }
+            for item in partition_by {
+                collect_scalar_column_id_refs_inner(arena, *item, out);
+            }
+            for item in order_by {
+                collect_scalar_column_id_refs_inner(arena, item.expr, out);
+            }
+        }
+    }
+}
+
+fn scalar_is_assert_true(arena: &ScalarArena, expr: ScalarId) -> bool {
+    matches!(
+        arena.node(expr),
+        ScalarNode::FunctionCall { name, .. } if name == "assert_true"
+    )
+}
+
+fn tag_project(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    let Operator::LogicalProject(node) = &expr.op else {
+        unreachable!()
+    };
+    expr.required_output_columns = parent_needed.clone();
+    // child_needed = union of ColumnRefs of items whose output_column_id is in
+    // parent_needed (or all items when parent_needed is None).
+    //
+    // assert_true items are ALWAYS included in child_needed regardless of
+    // parent_needed: they carry runtime correctness checks (e.g. the per-group
+    // row-check from ScalarApplyToJoin) whose column refs (e.g. the count
+    // column from the grouping aggregate) must remain available to the child.
+    // This mirrors the StarRocks PruneProjectColumnsRule carve-out.
+    let child_needed: HashSet<ColumnId> = node
+        .items
+        .iter()
+        .filter(|item| match &parent_needed {
+            None => true,
+            Some(n) => {
+                let is_needed = n.contains(&item.output_column_id);
+                let is_assert_true = scalar_is_assert_true(arena, item.expr);
+                is_needed || is_assert_true
+            }
+        })
+        .flat_map(|item| collect_scalar_column_id_refs(arena, item.expr))
+        .collect();
+    let mut children = expr.children;
+    let input = children.remove(0);
+    OptExpr {
+        op: expr.op,
+        children: vec![tag_required_columns(input, arena, Some(child_needed))],
+        required_output_columns: parent_needed,
+    }
+}
+
+fn tag_filter(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    let Operator::LogicalFilter(node) = &expr.op else {
+        unreachable!()
+    };
+    expr.required_output_columns = parent_needed.clone();
+    // Child needs everything the parent needs PLUS all columns referenced in
+    // the predicate.  When parent_needed is None (keep all), propagate None so
+    // the child also keeps all columns instead of collapsing to just the
+    // predicate refs.
+    let child_needed = parent_needed.as_ref().map(|needed| {
+        let mut child = needed.clone();
+        child.extend(collect_scalar_column_id_refs(arena, node.predicate));
+        child
+    });
+    let mut children = expr.children;
+    let input = children.remove(0);
+    OptExpr {
+        op: expr.op,
+        children: vec![tag_required_columns(input, arena, child_needed)],
+        required_output_columns: parent_needed,
+    }
+}
+
+fn tag_sort(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    let Operator::LogicalSort(node) = &expr.op else {
+        unreachable!()
+    };
+    expr.required_output_columns = parent_needed.clone();
+    // When parent_needed is None (keep all), propagate None so the child also
+    // keeps all columns instead of collapsing to just the sort-key refs.
+    let child_needed = parent_needed.as_ref().map(|needed| {
+        let mut child = needed.clone();
+        for item in &node.items {
+            child.extend(collect_scalar_column_id_refs(arena, item.expr));
+        }
+        for &sid in &node.analytic_partition_exprs {
+            child.extend(collect_scalar_column_id_refs(arena, sid));
+        }
+        child
+    });
+    let mut children = expr.children;
+    let input = children.remove(0);
+    OptExpr {
+        op: expr.op,
+        children: vec![tag_required_columns(input, arena, child_needed)],
+        required_output_columns: parent_needed,
+    }
+}
+
+fn tag_limit(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    debug_assert!(matches!(expr.op, Operator::LogicalLimit(_)));
+    expr.required_output_columns = parent_needed.clone();
+    // Limit is transparent: passes parent_needed straight through.
+    let mut children = expr.children;
+    let input = children.remove(0);
+    OptExpr {
+        op: expr.op,
+        children: vec![tag_required_columns(input, arena, parent_needed.clone())],
+        required_output_columns: parent_needed,
+    }
+}
+
+fn tag_aggregate(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    let Operator::LogicalAggregate(node) = &expr.op else {
+        unreachable!()
+    };
+
+    let effective_parent_needed = parent_needed
+        .as_ref()
+        .map(|needed| node.effective_required_outputs(needed));
+    expr.required_output_columns = effective_parent_needed.clone();
+
+    let child_needed: Option<HashSet<ColumnId>> = effective_parent_needed.as_ref().map(|needed| {
+        let mut required_inputs: HashSet<ColumnId> = HashSet::new();
+        for &gb in &node.group_by {
+            required_inputs.extend(collect_scalar_column_id_refs(arena, gb));
+        }
+        for agg in &node.aggregates {
+            if needed.contains(&agg.output_column_id) {
+                for &arg in &agg.args {
+                    required_inputs.extend(collect_scalar_column_id_refs(arena, arg));
+                }
+                for item in &agg.order_by {
+                    required_inputs.extend(collect_scalar_column_id_refs(arena, item.expr));
+                }
+            }
+        }
+        required_inputs
+    });
+
+    let mut children = expr.children;
+    let input = children.remove(0);
+    OptExpr {
+        op: expr.op,
+        children: vec![tag_required_columns(input, arena, child_needed)],
+        required_output_columns: effective_parent_needed,
+    }
+}
+
+fn tag_window(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    debug_assert!(matches!(expr.op, Operator::LogicalWindow(_)));
+    expr.required_output_columns = parent_needed.clone();
+    // Window output columns carry fresh ColumnIds (allocated by the planner)
+    // that are distinct from the child's ids, so we cannot reliably map
+    // parent_needed back to child column ids.  Pass None to the child so all
+    // input columns are preserved and no column is spuriously dropped.
+    let mut children = expr.children;
+    let input = children.remove(0);
+    OptExpr {
+        op: expr.op,
+        children: vec![tag_required_columns(input, arena, None)],
+        required_output_columns: parent_needed,
+    }
+}
+
+fn tag_repeat(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    let Operator::LogicalRepeat(node) = &expr.op else {
+        unreachable!()
+    };
+    expr.required_output_columns = parent_needed.clone();
+    let child_needed = if parent_needed.is_none() {
+        None
+    } else if node.all_rollup_column_ids.len() == node.all_rollup_columns.len() {
+        let grouping_output_ids: HashSet<ColumnId> = node
+            .grouping_fn_ids
+            .iter()
+            .map(|(_, column_id)| *column_id)
+            .collect();
+        let mut needed = parent_needed.clone().unwrap_or_default();
+        needed.retain(|column_id| !grouping_output_ids.contains(column_id));
+        needed.extend(node.all_rollup_column_ids.iter().copied());
+        Some(needed)
+    } else {
+        None
+    };
+    let mut children = expr.children;
+    let input = children.remove(0);
+    OptExpr {
+        op: expr.op,
+        children: vec![tag_required_columns(input, arena, child_needed)],
+        required_output_columns: parent_needed,
+    }
+}
+
+fn tag_change_event_expand(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    let Operator::LogicalChangeEventExpand(node) = &expr.op else {
+        unreachable!()
+    };
+    expr.required_output_columns = parent_needed.clone();
+    let mut child_needed = HashSet::new();
+    for event in &node.events {
+        if let Some(predicate) = event.predicate {
+            child_needed.extend(collect_scalar_column_id_refs(arena, predicate));
+        }
+        for assignment in &event.assignments {
+            if let Some(expr) = assignment.expr {
+                child_needed.extend(collect_scalar_column_id_refs(arena, expr));
+            }
+        }
+    }
+    let mut children = expr.children;
+    let input = children.remove(0);
+    OptExpr {
+        op: expr.op,
+        children: vec![tag_required_columns(input, arena, Some(child_needed))],
+        required_output_columns: parent_needed,
+    }
+}
+
+fn tag_table_function(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    debug_assert!(matches!(expr.op, Operator::LogicalTableFunction(_)));
+    expr.required_output_columns = parent_needed.clone();
+    // The function's args reference INPUT columns that may not appear in
+    // parent_needed (e.g. UNNEST(t.arr) where parent only sees the exploded
+    // output).  Pass None to the child so no input column is spuriously dropped.
+    let mut children = expr.children;
+    let input = children.remove(0);
+    OptExpr {
+        op: expr.op,
+        children: vec![tag_required_columns(input, arena, None)],
+        required_output_columns: parent_needed,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Binary / n-ary handlers
+// ---------------------------------------------------------------------------
+
+fn tag_join(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    let Operator::LogicalJoin(node) = &expr.op else {
+        unreachable!()
+    };
+    let result_needed = parent_needed.clone();
+    expr.required_output_columns = result_needed.clone();
+
+    // When parent_needed is None (keep all), propagate None to both children so
+    // they also keep all columns.  When Some, compute combined = parent_needed ∪
+    // condition refs, then split by which child produces each id.
+    let (left_needed, right_needed) = match parent_needed {
+        None => (None, None),
+        Some(mut combined) => {
+            if let Some(cond_id) = node.condition {
+                combined.extend(collect_scalar_column_id_refs(arena, cond_id));
+            }
+            let left_outputs = collect_output_ids_opt(expr.left());
+            let right_outputs = collect_output_ids_opt(expr.right());
+            let left: HashSet<ColumnId> = combined
+                .iter()
+                .filter(|id| left_outputs.contains(id))
+                .copied()
+                .collect();
+            let right: HashSet<ColumnId> = combined
+                .iter()
+                .filter(|id| right_outputs.contains(id))
+                .copied()
+                .collect();
+            (Some(left), Some(right))
+        }
+    };
+
+    let mut children = expr.children;
+    let right = children.pop().unwrap();
+    let left = children.pop().unwrap();
+    OptExpr {
+        op: expr.op,
+        children: vec![
+            tag_required_columns(left, arena, left_needed),
+            tag_required_columns(right, arena, right_needed),
+        ],
+        required_output_columns: result_needed,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Set operation handlers (Gap 4)
+// ---------------------------------------------------------------------------
+
+fn tag_union(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    let Operator::LogicalUnion(node) = &expr.op else {
+        unreachable!()
+    };
+    let node = node.clone();
+
+    if !node.all {
+        let children = expr.children;
+        return OptExpr {
+            op: expr.op,
+            children: children
+                .into_iter()
+                .map(|child| tag_required_columns(child, arena, None))
+                .collect(),
+            required_output_columns: parent_needed,
+        };
+    }
+
+    let join_refresh_protocol_ids = join_refresh_union_protocol_ids(&node);
+    let parent_needed =
+        require_join_refresh_union_protocol_columns(join_refresh_protocol_ids, parent_needed);
+
+    // Resolve which positions in the output schema are needed.
+    let outputs: Vec<ColumnId> = node.output_columns.iter().map(|c| c.column_id).collect();
+    let needed_positions: Vec<usize> = match &parent_needed {
+        None => (0..outputs.len()).collect(),
+        Some(n) => outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, id)| n.contains(id).then_some(i))
+            .collect(),
+    };
+
+    expr.required_output_columns = parent_needed.clone();
+    let children = expr.children;
+    OptExpr {
+        op: expr.op,
+        children: children
+            .into_iter()
+            .enumerate()
+            .map(|(child_idx, child)| {
+                let child_outputs = node
+                    .child_output_columns
+                    .get(child_idx)
+                    .filter(|columns| columns.len() == outputs.len())
+                    .map(|columns| {
+                        columns
+                            .iter()
+                            .map(|column| column.column_id)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| collect_output_ids_ordered_opt(&child));
+                let mut child_needed: HashSet<ColumnId> = needed_positions
+                    .iter()
+                    .filter_map(|&i| child_outputs.get(i).copied())
+                    .collect();
+                require_join_refresh_branch_protocol_columns(&node, child_idx, &mut child_needed);
+                tag_required_columns(child, arena, Some(child_needed))
+            })
+            .collect(),
+        required_output_columns: parent_needed,
+    }
+}
+
+fn join_refresh_union_protocol_ids(node: &UnionOp) -> Option<Vec<ColumnId>> {
+    let has_action = node
+        .output_columns
+        .iter()
+        .any(is_join_refresh_action_column);
+    let has_join_apply_key = node
+        .output_columns
+        .iter()
+        .any(is_join_refresh_apply_key_column);
+    if !has_action || !has_join_apply_key {
+        return None;
+    }
+
+    Some(
+        node.output_columns
+            .iter()
+            .filter(|column| is_join_refresh_protocol_column(column))
+            .map(|column| column.column_id)
+            .collect(),
+    )
+}
+
+fn require_join_refresh_union_protocol_columns(
+    protocol_ids: Option<Vec<ColumnId>>,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> Option<HashSet<ColumnId>> {
+    let Some(protocol_ids) = protocol_ids else {
+        return parent_needed;
+    };
+
+    match parent_needed {
+        None => None,
+        Some(mut needed) => {
+            for protocol_id in protocol_ids {
+                needed.insert(protocol_id);
+            }
+            Some(needed)
+        }
+    }
+}
+
+fn require_join_refresh_branch_protocol_columns(
+    node: &UnionOp,
+    child_idx: usize,
+    child_needed: &mut HashSet<ColumnId>,
+) {
+    let Some(child_outputs) = node.child_output_columns.get(child_idx) else {
+        return;
+    };
+    let has_join_refresh_protocol = node
+        .output_columns
+        .iter()
+        .any(is_join_refresh_action_column)
+        && node
+            .output_columns
+            .iter()
+            .any(is_join_refresh_apply_key_column);
+    if !has_join_refresh_protocol {
+        return;
+    }
+
+    for column in child_outputs {
+        if is_join_refresh_protocol_column(column) {
+            child_needed.insert(column.column_id);
+        }
+    }
+}
+
+fn is_join_refresh_protocol_column(column: &crate::analysis::OutputColumn) -> bool {
+    is_join_refresh_action_column(column)
+        || is_join_refresh_apply_key_column(column)
+        || is_join_refresh_row_id_column(column)
+}
+
+fn is_join_refresh_action_column(column: &crate::analysis::OutputColumn) -> bool {
+    column.is_internal
+        && column
+            .name
+            .eq_ignore_ascii_case(crate::common::CHANGE_OP_COLUMN)
+}
+
+fn is_join_refresh_apply_key_column(column: &crate::analysis::OutputColumn) -> bool {
+    column
+        .name
+        .eq_ignore_ascii_case(crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME)
+}
+
+fn is_join_refresh_row_id_column(column: &crate::analysis::OutputColumn) -> bool {
+    column
+        .name
+        .eq_ignore_ascii_case(crate::common::ICEBERG_ROW_ID_COL)
+}
+
+fn tag_intersect(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    debug_assert!(matches!(expr.op, Operator::LogicalIntersect(_)));
+    expr.required_output_columns = parent_needed.clone();
+    let children = expr.children;
+    OptExpr {
+        op: expr.op,
+        children: children
+            .into_iter()
+            .map(|child| tag_required_columns(child, arena, None))
+            .collect(),
+        required_output_columns: parent_needed,
+    }
+}
+
+fn tag_except(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    debug_assert!(matches!(expr.op, Operator::LogicalExcept(_)));
+    expr.required_output_columns = parent_needed.clone();
+    let children = expr.children;
+    OptExpr {
+        op: expr.op,
+        children: children
+            .into_iter()
+            .map(|child| tag_required_columns(child, arena, None))
+            .collect(),
+        required_output_columns: parent_needed,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CTE handlers (Gap 3 — two-walk pattern)
+// ---------------------------------------------------------------------------
+
+fn tag_cte_consume(mut expr: OptExpr, parent_needed: Option<HashSet<ColumnId>>) -> OptExpr {
+    let Operator::LogicalCTEConsume(node) = &expr.op else {
+        unreachable!()
+    };
+    // Leaf in this walk — always store Some(_) so that subtree_untagged
+    // returns false after tagging.  When parent_needed is None (no restriction
+    // from above), default to keeping all of this node's own output ids, which
+    // is the correct "keep-all" signal for the CTE two-walk.
+    expr.required_output_columns = Some(
+        parent_needed.unwrap_or_else(|| node.output_columns.iter().map(|c| c.column_id).collect()),
+    );
+    expr
+}
+
+fn tag_cte_produce(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    debug_assert!(matches!(expr.op, Operator::LogicalCTEProduce(_)));
+    expr.required_output_columns = parent_needed.clone();
+    // The produce-side needed ids are already in the producer's output id
+    // space (translate_consume_to_produce_ids mapped them).  Pass them
+    // straight through to the CTE body.
+    let mut children = expr.children;
+    let input = children.remove(0);
+    OptExpr {
+        op: expr.op,
+        children: vec![tag_required_columns(input, arena, parent_needed.clone())],
+        required_output_columns: parent_needed,
+    }
+}
+
+fn tag_cte_anchor(
+    mut expr: OptExpr,
+    arena: &ScalarArena,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> OptExpr {
+    debug_assert!(matches!(expr.op, Operator::LogicalCTEAnchor(_)));
+
+    // children[0] = produce, children[1] = consumer subtree
+    let mut children = expr.children;
+    let consumer = children.pop().unwrap();
+    let produce = children.pop().unwrap();
+
+    // --- Walk 1: tag the consumer subtree with parent_needed. ---
+    // This stamps required_output_columns on every CTEConsume for this cte_id.
+    let consumer = tag_required_columns(consumer, arena, parent_needed.clone());
+
+    let Operator::LogicalCTEAnchor(anchor) = &expr.op else {
+        unreachable!()
+    };
+    let mut produce_needed = HashSet::new();
+    collect_cte_producer_needs(&consumer, anchor.cte_id, &mut produce_needed);
+
+    // --- Walk 2: tag the producer subtree in producer ColumnId space. ---
+    let produce = tag_required_columns(produce, arena, Some(produce_needed));
+
+    expr.children = vec![produce, consumer];
+    expr.required_output_columns = parent_needed;
+    expr
+}
+
+// ---------------------------------------------------------------------------
+// CTE helpers
+// ---------------------------------------------------------------------------
+
+/// Recursively traverse `expr` and union matching CTEConsume requirements after
+/// translating consumer-side ColumnIds to producer-side ColumnIds.
+fn collect_cte_producer_needs(expr: &OptExpr, target_id: CteId, acc: &mut HashSet<ColumnId>) {
+    match &expr.op {
+        Operator::LogicalCTEConsume(consume) if consume.cte_id == target_id => {
+            debug_assert_eq!(
+                consume.output_columns.len(),
+                consume.producer_column_ids.len(),
+                "CTEConsume mapping arity must be validated before pruning"
+            );
+            let Some(required) = &expr.required_output_columns else {
+                for producer_id in &consume.producer_column_ids {
+                    acc.insert(*producer_id);
+                }
+                return;
+            };
+            if required.is_empty() {
+                if let Some((_, producer_id)) = consume.first_mapping_pair() {
+                    acc.insert(producer_id);
+                }
+                return;
+            }
+            for consumer_id in required {
+                if let Some(producer_id) = consume.producer_column_for_consumer(*consumer_id) {
+                    acc.insert(producer_id);
+                }
+            }
+        }
+        Operator::LogicalCTEConsume(_) => {}
+        _ => {
+            for child in &expr.children {
+                collect_cte_producer_needs(child, target_id, acc);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TagRequiredColumns rewrite rule
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when the plan tree rooted at `expr` has not yet been tagged
+/// by the Phase-1 tagging pass.
+///
+/// **Why we check first-child rather than the root node itself**:
+/// `tag_required_columns(root, arena, None)` stores `parent_needed = None` on the
+/// root operator (semantics: "all outputs required, no restriction from the
+/// parent"), but it ALWAYS stores `Some(_)` on every *leaf* node (Scan,
+/// Values, GenerateSeries, CTEConsume).  Non-leaf nodes at the root that
+/// received `parent_needed = None` therefore still carry
+/// `required_output_columns = None` after being tagged.  Using the root's own
+/// field as the guard would cause the rule to re-fire on every fixed-point
+/// iteration.
+///
+/// The fix: for leaf nodes, check the node's own field (leaves always get
+/// `Some(_)` after tagging).  For non-leaf nodes, check the first child's
+/// field recursively — after tagging, the deepest leaf will have `Some(_)`.
+fn subtree_untagged(expr: &OptExpr) -> bool {
+    match &expr.op {
+        // Leaves: always get `Some(_)` after tagging.
+        Operator::LogicalScan(_)
+        | Operator::LogicalValues(_)
+        | Operator::LogicalGenerateSeries(_)
+        | Operator::LogicalCTEConsume(_) => expr.required_output_columns.is_none(),
+        // Non-leaves: check the first child (which will itself be a leaf or
+        // recurse further until a leaf is reached).
+        _ => expr
+            .children
+            .first()
+            .map_or(false, |child| subtree_untagged(child)),
+    }
+}
+
+/// Phase-1 tagging rule: walks the plan top-down via [`tag_required_columns`]
+/// and stamps `required_output_columns` on every operator node.
+///
+/// The rule fires once per subtree: `matches` uses [`subtree_untagged`] which
+/// checks the first reachable leaf rather than the root node itself.  This is
+/// necessary because `tag_required_columns(root, arena, None)` stores `None` on
+/// the root (semantics: "no parent restriction"), but always stores `Some(_)`
+/// on leaf nodes.  After `apply` returns, all leaves carry `Some(_)`, so
+/// `subtree_untagged` returns `false` and the rule does not re-fire.
+///
+/// TopDown driver post-`apply` child walk: after the root fires and tags the
+/// whole tree, `rewrite_children` recurses into already-tagged children.
+/// `matches` returns `false` for each (their leaves are `Some(_)`), so no
+/// re-tagging occurs.
+///
+/// The pipeline's fixed-point loop re-runs the stage; on the second pass
+/// `subtree_untagged == false` everywhere, `phase_changed == false`, and the
+/// loop exits cleanly.
+///
+/// **No behavior change**: this pass only writes metadata.  Nothing reads
+/// `required_output_columns` until the per-operator prune rules are registered
+/// in a later task.
+///
+/// This intentionally keeps the default Leaf pattern. It is a top-down
+/// whole-tree tagging pass driven by parent-needed state, not a per-node
+/// structural rewrite.
+pub(crate) struct TagRequiredColumns;
+
+impl LogicalRewriteRule for TagRequiredColumns {
+    fn name(&self) -> &'static str {
+        "TagRequiredColumns"
+    }
+
+    fn phase(&self) -> RewritePhase {
+        RewritePhase::StructuralRewrite
+    }
+
+    fn traversal(&self) -> RewriteTraversal {
+        RewriteTraversal::TopDown
+    }
+
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        subtree_untagged(expr)
+    }
+
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        let arena_rc = ctx.scalar_arena();
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(expr, &arena, None);
+        Ok(RewriteResult::Changed(tagged))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::cte::CteId;
+    use crate::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn};
+    use crate::optimizer::operator::{
+        AggregateOutputLayout, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, ExceptOp, FilterOp,
+        GenerateSeriesOp, ImvDeltaOp, IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp,
+        ProjectOp, RepeatOp, ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec, ScanOp,
+        SortOp, TableFunctionOp, UnionOp, ValuesOp, WindowOp,
+    };
+    use crate::optimizer::scalar::{ScalarArena, SortKey};
+    use crate::planner::table::{ScanSource, TableDef};
+    use arrow::datatypes::DataType;
+    use novarocks_catalog::schema::ColumnDef;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    // -----------------------------------------------------------------------
+    // Test helpers
+    // -----------------------------------------------------------------------
+
+    fn make_arena() -> Rc<RefCell<ScalarArena>> {
+        Rc::new(RefCell::new(ScalarArena::new()))
+    }
+
+    fn make_output_column(id: ColumnId, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: id,
+            name: name.to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    fn col_ref_scalar(arena: &mut ScalarArena, id: ColumnId) -> crate::optimizer::scalar::ScalarId {
+        let expr = crate::analysis::TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: id,
+                qualifier: None,
+                column: format!("c{}", id.0),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        };
+        crate::planner::optimizer_bridge::scalar::intern_typed(arena, &expr)
+    }
+
+    fn int_literal_scalar(arena: &mut ScalarArena, v: i64) -> crate::optimizer::scalar::ScalarId {
+        let expr = crate::analysis::TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(v)),
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        crate::planner::optimizer_bridge::scalar::intern_typed(arena, &expr)
+    }
+
+    fn binop_scalar(
+        arena: &mut ScalarArena,
+        left: crate::optimizer::scalar::ScalarId,
+        op: BinOp,
+        right: crate::optimizer::scalar::ScalarId,
+    ) -> crate::optimizer::scalar::ScalarId {
+        let left_typed = crate::planner::optimizer_bridge::scalar::materialize(arena, left);
+        let right_typed = crate::planner::optimizer_bridge::scalar::materialize(arena, right);
+        let expr = crate::analysis::TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left_typed),
+                op,
+                right: Box::new(right_typed),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        crate::planner::optimizer_bridge::scalar::intern_typed(arena, &expr)
+    }
+
+    fn make_scan_with_ids(
+        arena_rc: &Rc<RefCell<ScalarArena>>,
+        id_a: u32,
+        id_b: u32,
+        id_c: u32,
+    ) -> OptExpr {
+        let _ = arena_rc; // scan predicates empty; arena not needed here
+        let table = TableDef {
+            name: "t".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "a".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                ColumnDef {
+                    name: "b".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                ColumnDef {
+                    name: "c".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+            ],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: crate::compiler::mv_rewrite::test_scan_source(
+                crate::planner::table::SqlScanKind::ConnectorRead,
+            ),
+        };
+        OptExpr::leaf(Operator::LogicalScan(ScanOp {
+            database: "d".to_string(),
+            table,
+            alias: None,
+            stats_ref: None,
+            columns: vec![
+                make_output_column(ColumnId::new_for_test(id_a), "a"),
+                make_output_column(ColumnId::new_for_test(id_b), "b"),
+                make_output_column(ColumnId::new_for_test(id_c), "c"),
+            ],
+            predicates: vec![],
+            required_columns: None,
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        }))
+    }
+
+    fn scan_with_3_cols(arena_rc: &Rc<RefCell<ScalarArena>>) -> OptExpr {
+        make_scan_with_ids(arena_rc, 1, 2, 3)
+    }
+
+    fn make_values_with_columns(columns: Vec<OutputColumn>) -> OptExpr {
+        OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+            rows: vec![],
+            columns,
+        }))
+    }
+
+    fn make_project_with_columns(
+        arena_rc: &Rc<RefCell<ScalarArena>>,
+        columns: Vec<OutputColumn>,
+    ) -> OptExpr {
+        let mut arena = arena_rc.borrow_mut();
+        let items = columns
+            .iter()
+            .map(|column| ScalarProjectItem {
+                expr: col_ref_scalar(&mut arena, column.column_id),
+                output_name: column.name.clone(),
+                output_column_id: column.column_id,
+                expr_display: None,
+            })
+            .collect::<Vec<_>>();
+        drop(arena);
+        OptExpr::new(
+            Operator::LogicalProject(ProjectOp {
+                items,
+                output_qualifier: None,
+            }),
+            vec![make_values_with_columns(columns)],
+        )
+    }
+
+    fn needed_set(ids: &[u32]) -> HashSet<ColumnId> {
+        ids.iter().map(|&id| ColumnId::new_for_test(id)).collect()
+    }
+
+    fn required_columns(expr: &OptExpr) -> &HashSet<ColumnId> {
+        expr.required_output_columns
+            .as_ref()
+            .expect("expected required_output_columns to be tagged")
+    }
+
+    fn scan_required_columns(expr: &OptExpr) -> &HashSet<ColumnId> {
+        assert!(
+            matches!(&expr.op, Operator::LogicalScan(_)),
+            "expected Scan node"
+        );
+        required_columns(expr)
+    }
+
+    // -----------------------------------------------------------------------
+    // Scan tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_scan_with_none_keeps_all_cols() {
+        let arena_rc = make_arena();
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(scan_with_3_cols(&arena_rc), &arena, None);
+        assert!(matches!(&tagged.op, Operator::LogicalScan(_)));
+        let req = required_columns(&tagged);
+        assert_eq!(req.len(), 3);
+        assert!(req.contains(&ColumnId::new_for_test(1)));
+        assert!(req.contains(&ColumnId::new_for_test(2)));
+        assert!(req.contains(&ColumnId::new_for_test(3)));
+    }
+
+    #[test]
+    fn tag_scan_with_subset_keeps_only_those() {
+        let arena_rc = make_arena();
+        let arena = arena_rc.borrow();
+        let subset = needed_set(&[2]);
+        let tagged =
+            tag_required_columns(scan_with_3_cols(&arena_rc), &arena, Some(subset.clone()));
+        assert!(matches!(&tagged.op, Operator::LogicalScan(_)));
+        assert_eq!(required_columns(&tagged), &subset);
+    }
+
+    // -----------------------------------------------------------------------
+    // Project tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_project_filters_child_needed_by_output_column_id() {
+        // Project[a→101, b→102] <- Scan[a@1, b@2, c@3]
+        // parent_needed = {102 (b)}
+        // Expected: scan.required_output_columns = {2}  (only b from scan)
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let col1 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(1));
+        let col2 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(2));
+        drop(arena_mut);
+
+        let project = OptExpr::new(
+            Operator::LogicalProject(ProjectOp {
+                items: vec![
+                    ScalarProjectItem {
+                        output_column_id: ColumnId::new_for_test(101),
+                        output_name: "a".to_string(),
+                        expr: col1,
+                        expr_display: None,
+                    },
+                    ScalarProjectItem {
+                        output_column_id: ColumnId::new_for_test(102),
+                        output_name: "b".to_string(),
+                        expr: col2,
+                        expr_display: None,
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+        let arena = arena_rc.borrow();
+        let needed = needed_set(&[102]);
+        let tagged = tag_required_columns(project, &arena, Some(needed.clone()));
+
+        assert!(matches!(&tagged.op, Operator::LogicalProject(_)));
+        assert_eq!(tagged.required_output_columns.as_ref().unwrap(), &needed);
+
+        let input = tagged.unary_input();
+        assert!(matches!(&input.op, Operator::LogicalScan(_)));
+        let scan_req = required_columns(input);
+        assert!(
+            scan_req.contains(&ColumnId::new_for_test(2)),
+            "scan should keep b"
+        );
+        assert!(
+            !scan_req.contains(&ColumnId::new_for_test(1)),
+            "scan should NOT keep a"
+        );
+    }
+
+    #[test]
+    fn tag_project_with_none_parent_includes_all_item_refs() {
+        // parent_needed=None: child_needed = union of all items' column refs
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let col1 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(1));
+        let col2 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(2));
+        drop(arena_mut);
+
+        let project = OptExpr::new(
+            Operator::LogicalProject(ProjectOp {
+                items: vec![
+                    ScalarProjectItem {
+                        output_column_id: ColumnId::new_for_test(101),
+                        output_name: "a".to_string(),
+                        expr: col1,
+                        expr_display: None,
+                    },
+                    ScalarProjectItem {
+                        output_column_id: ColumnId::new_for_test(102),
+                        output_name: "b".to_string(),
+                        expr: col2,
+                        expr_display: None,
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(project, &arena, None);
+        assert!(matches!(&tagged.op, Operator::LogicalProject(_)));
+        // required_output_columns should be None (transparent)
+        assert!(tagged.required_output_columns.is_none());
+        let input = tagged.unary_input();
+        assert!(matches!(&input.op, Operator::LogicalScan(_)));
+        let scan_req = required_columns(input);
+        // Both a(1) and b(2) referenced; c(3) not in any item expr
+        assert!(scan_req.contains(&ColumnId::new_for_test(1)));
+        assert!(scan_req.contains(&ColumnId::new_for_test(2)));
+        assert!(!scan_req.contains(&ColumnId::new_for_test(3)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Filter test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_filter_adds_predicate_cols_to_child_needed() {
+        // Filter(c@3 > 0) <- Scan[a@1, b@2, c@3]
+        // parent_needed = {1}
+        // Expected: child_needed = {1, 3}
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let col3 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(3));
+        let zero = int_literal_scalar(&mut arena_mut, 0);
+        let pred = binop_scalar(&mut arena_mut, col3, BinOp::Gt, zero);
+        drop(arena_mut);
+
+        let filter = OptExpr::new(
+            Operator::LogicalFilter(FilterOp { predicate: pred }),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(filter, &arena, Some(needed_set(&[1])));
+        assert!(matches!(&tagged.op, Operator::LogicalFilter(_)));
+        let input = tagged.unary_input();
+        assert!(matches!(&input.op, Operator::LogicalScan(_)));
+        let req = required_columns(input);
+        assert!(
+            req.contains(&ColumnId::new_for_test(1)),
+            "a needed by parent"
+        );
+        assert!(
+            req.contains(&ColumnId::new_for_test(3)),
+            "c needed by predicate"
+        );
+        assert!(!req.contains(&ColumnId::new_for_test(2)), "b not needed");
+    }
+
+    // -----------------------------------------------------------------------
+    // Aggregate test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_aggregate_prunes_unused_aggregate_inputs_from_child_needed() {
+        let id_group = ColumnId::new_for_test(1);
+        let id_sum_arg = ColumnId::new_for_test(2);
+        let id_sum_order = ColumnId::new_for_test(3);
+        let id_count_arg = ColumnId::new_for_test(4);
+        let out_group = ColumnId::new_for_test(101);
+        let out_sum = ColumnId::new_for_test(201);
+        let out_count = ColumnId::new_for_test(202);
+
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let group_ref = col_ref_scalar(&mut arena_mut, id_group);
+        let sum_arg = col_ref_scalar(&mut arena_mut, id_sum_arg);
+        let sum_order = col_ref_scalar(&mut arena_mut, id_sum_order);
+        let count_arg = col_ref_scalar(&mut arena_mut, id_count_arg);
+        drop(arena_mut);
+
+        let group_column = make_output_column(out_group, "g");
+        let sum_column = make_output_column(out_sum, "sum_a");
+        let count_column = make_output_column(out_count, "count_b");
+        let layout = AggregateOutputLayout::new(
+            vec![group_column.clone()],
+            vec![sum_column.clone(), count_column.clone()],
+        );
+        let mut aggregate = OptExpr::new(
+            Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![group_ref],
+                vec![
+                    ScalarAggregateSpec {
+                        output_column_id: out_sum,
+                        name: "sum".to_string(),
+                        args: vec![sum_arg],
+                        distinct: false,
+                        order_by: vec![SortKey {
+                            expr: sum_order,
+                            asc: true,
+                            nulls_first: false,
+                            display: None,
+                        }],
+                    },
+                    ScalarAggregateSpec {
+                        output_column_id: out_count,
+                        name: "count".to_string(),
+                        args: vec![count_arg],
+                        distinct: false,
+                        order_by: vec![],
+                    },
+                ],
+                layout,
+                vec![group_column, sum_column, count_column],
+            )),
+            vec![make_values_with_columns(vec![
+                make_output_column(id_group, "g"),
+                make_output_column(id_sum_arg, "a"),
+                make_output_column(id_sum_order, "ord"),
+                make_output_column(id_count_arg, "b"),
+            ])],
+        );
+
+        let mut parent_needed = HashSet::new();
+        parent_needed.insert(out_sum);
+        aggregate.required_output_columns = None;
+
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(aggregate, &arena, Some(parent_needed));
+        let child_needed = tagged.children[0]
+            .required_output_columns
+            .as_ref()
+            .expect("child must be tagged");
+
+        assert!(child_needed.contains(&id_group), "group-by input must stay");
+        assert!(
+            child_needed.contains(&id_sum_arg),
+            "retained sum input must stay"
+        );
+        assert!(
+            child_needed.contains(&id_sum_order),
+            "retained sum order-by input must stay"
+        );
+        assert!(
+            !child_needed.contains(&id_count_arg),
+            "unused count input must be pruned"
+        );
+    }
+
+    #[test]
+    fn tag_aggregate_empty_parent_needed_uses_same_fallback_for_child_inputs() {
+        let id_arg = ColumnId::new_for_test(2);
+        let out_sum = ColumnId::new_for_test(201);
+
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let sum_arg = col_ref_scalar(&mut arena_mut, id_arg);
+        drop(arena_mut);
+
+        let sum_column = make_output_column(out_sum, "sum_a");
+        let layout = AggregateOutputLayout::new(vec![], vec![sum_column.clone()]);
+        let aggregate = OptExpr::new(
+            Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![],
+                vec![ScalarAggregateSpec {
+                    output_column_id: out_sum,
+                    name: "sum".to_string(),
+                    args: vec![sum_arg],
+                    distinct: false,
+                    order_by: vec![],
+                }],
+                layout,
+                vec![sum_column],
+            )),
+            vec![make_values_with_columns(vec![make_output_column(
+                id_arg, "a",
+            )])],
+        );
+
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(aggregate, &arena, Some(HashSet::new()));
+
+        assert!(
+            tagged
+                .required_output_columns
+                .as_ref()
+                .expect("aggregate must be tagged")
+                .contains(&out_sum),
+            "fallback output must be the scalar aggregate output"
+        );
+        assert!(
+            tagged.children[0]
+                .required_output_columns
+                .as_ref()
+                .expect("child must be tagged")
+                .contains(&id_arg),
+            "fallback aggregate output must keep its input dependency"
+        );
+    }
+
+    /// tag_aggregate with parent_needed=None propagates None to the child
+    /// (None-propagation discipline — child keeps all its columns).
+    #[test]
+    fn tag_aggregate_none_parent_propagates_none_to_child() {
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let col1 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(1));
+        let col2 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(2));
+        drop(arena_mut);
+
+        let group_by = vec![col1];
+        let aggregates = vec![ScalarAggregateSpec {
+            output_column_id: ColumnId::new_for_test(301),
+            name: "sum".to_string(),
+            args: vec![col2],
+            distinct: false,
+            order_by: vec![],
+        }];
+        let output_columns = vec![make_output_column(ColumnId::new_for_test(301), "sum_x")];
+        let output_layout = AggregateOutputLayout::new(
+            vec![make_output_column(ColumnId::new_for_test(1), "y")],
+            output_columns.clone(),
+        );
+        let agg = OptExpr::new(
+            Operator::LogicalAggregate(LogicalAggregateOp::single(
+                group_by,
+                aggregates,
+                output_layout,
+                output_columns,
+            )),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(agg, &arena, None);
+        assert!(matches!(&tagged.op, Operator::LogicalAggregate(_)));
+        // Aggregate receives None → keeps None on itself.
+        assert!(tagged.required_output_columns.is_none());
+        let input = tagged.unary_input();
+        assert!(matches!(&input.op, Operator::LogicalScan(_)));
+        // Child got None → Scan expands to all columns.
+        let req = required_columns(input);
+        assert_eq!(req.len(), 3, "scan keeps all 3 columns");
+    }
+
+    // -----------------------------------------------------------------------
+    // Join test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_join_splits_needed_by_child_outputs_and_adds_condition_cols() {
+        // Join[INNER, on a@1=d@4] <- {Scan_l[a@1,b@2,c@3], Scan_r[d@4,e@5,f@6]}
+        // parent_needed = {2, 6}
+        // Expected:
+        //   left_needed  = {1, 2}  (join cond a + parent b)
+        //   right_needed = {4, 6}  (join cond d + parent f)
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let col1 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(1));
+        let col4 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(4));
+        let cond = binop_scalar(&mut arena_mut, col1, BinOp::Eq, col4);
+        drop(arena_mut);
+
+        let join = OptExpr::new(
+            Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(cond),
+            }),
+            vec![
+                make_scan_with_ids(&arena_rc, 1, 2, 3),
+                make_scan_with_ids(&arena_rc, 4, 5, 6),
+            ],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(join, &arena, Some(needed_set(&[2, 6])));
+        assert!(matches!(&tagged.op, Operator::LogicalJoin(_)));
+        let left = tagged.left();
+        assert!(matches!(&left.op, Operator::LogicalScan(_)));
+        let right = tagged.right();
+        assert!(matches!(&right.op, Operator::LogicalScan(_)));
+        let lreq = required_columns(left);
+        let rreq = required_columns(right);
+        assert_eq!(lreq.len(), 2);
+        assert!(lreq.contains(&ColumnId::new_for_test(1)));
+        assert!(lreq.contains(&ColumnId::new_for_test(2)));
+        assert_eq!(rreq.len(), 2);
+        assert!(rreq.contains(&ColumnId::new_for_test(4)));
+        assert!(rreq.contains(&ColumnId::new_for_test(6)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Union position-aligned test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_union_position_aligned_propagation() {
+        // Union[output: x@1001, y@1002, z@1003]
+        //   <- Scan_a[a@1, b@2, c@3]
+        //   <- Scan_b[d@4, e@5, f@6]
+        // parent_needed = {1002}  (position 1 = y)
+        // Expected:
+        //   Scan_a: {2}  (position 1 = b@2)
+        //   Scan_b: {5}  (position 1 = e@5)
+        let arena_rc = make_arena();
+        let union = OptExpr::new(
+            Operator::LogicalUnion(UnionOp {
+                all: true,
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(1001), "x"),
+                    make_output_column(ColumnId::new_for_test(1002), "y"),
+                    make_output_column(ColumnId::new_for_test(1003), "z"),
+                ],
+                child_output_columns: vec![
+                    vec![
+                        make_output_column(ColumnId::new_for_test(1), "a"),
+                        make_output_column(ColumnId::new_for_test(2), "b"),
+                        make_output_column(ColumnId::new_for_test(3), "c"),
+                    ],
+                    vec![
+                        make_output_column(ColumnId::new_for_test(4), "d"),
+                        make_output_column(ColumnId::new_for_test(5), "e"),
+                        make_output_column(ColumnId::new_for_test(6), "f"),
+                    ],
+                ],
+            }),
+            vec![
+                make_scan_with_ids(&arena_rc, 1, 2, 3),
+                make_scan_with_ids(&arena_rc, 4, 5, 6),
+            ],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(union, &arena, Some(needed_set(&[1002])));
+        assert!(matches!(&tagged.op, Operator::LogicalUnion(_)));
+        let a_req = scan_required_columns(tagged.child(0));
+        let b_req = scan_required_columns(tagged.child(1));
+        assert_eq!(a_req.len(), 1);
+        assert!(
+            a_req.contains(&ColumnId::new_for_test(2)),
+            "position 1 = b@2"
+        );
+        assert_eq!(b_req.len(), 1);
+        assert!(
+            b_req.contains(&ColumnId::new_for_test(5)),
+            "position 1 = e@5"
+        );
+    }
+
+    #[test]
+    fn tag_union_preserves_join_refresh_protocol_columns() {
+        let arena_rc = make_arena();
+        let mut action =
+            make_output_column(ColumnId::new_for_test(14), crate::common::CHANGE_OP_COLUMN);
+        action.data_type = DataType::Int8;
+        action.is_internal = true;
+        let mut join_apply_key = make_output_column(
+            ColumnId::new_for_test(15),
+            crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
+        );
+        join_apply_key.data_type = DataType::Utf8;
+        join_apply_key.is_internal = true;
+        let mut row_id = make_output_column(
+            ColumnId::new_for_test(19),
+            crate::common::ICEBERG_ROW_ID_COL,
+        );
+        row_id.data_type = DataType::Int64;
+        row_id.is_internal = true;
+        let output_columns = vec![
+            make_output_column(ColumnId::new_for_test(1), "id"),
+            make_output_column(ColumnId::new_for_test(2), "region"),
+            make_output_column(ColumnId::new_for_test(3), "amount"),
+            make_output_column(ColumnId::new_for_test(9), "category"),
+            action,
+            row_id,
+            join_apply_key,
+        ];
+        let left_columns = output_columns.clone();
+        let right_columns = output_columns.clone();
+        let union = OptExpr::new(
+            Operator::LogicalUnion(UnionOp {
+                all: true,
+                output_columns,
+                child_output_columns: vec![],
+            }),
+            vec![
+                make_values_with_columns(left_columns),
+                make_values_with_columns(right_columns),
+            ],
+        );
+
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(union, &arena, Some(needed_set(&[1, 2, 3, 9])));
+
+        assert_eq!(
+            required_columns(&tagged),
+            &needed_set(&[1, 2, 3, 9, 14, 15, 19]),
+            "join refresh UNION must keep internal protocol and row-lineage columns in its own required set"
+        );
+        for child in &tagged.children {
+            assert_eq!(
+                required_columns(child),
+                &needed_set(&[1, 2, 3, 9, 14, 15, 19]),
+                "join refresh UNION must pass protocol and row-lineage columns to each branch by position"
+            );
+        }
+    }
+
+    #[test]
+    fn tag_union_maps_join_refresh_protocol_columns_through_child_output_metadata() {
+        let arena_rc = make_arena();
+        let mut action =
+            make_output_column(ColumnId::new_for_test(14), crate::common::CHANGE_OP_COLUMN);
+        action.data_type = DataType::Int8;
+        action.is_internal = true;
+        let mut join_apply_key = make_output_column(
+            ColumnId::new_for_test(20),
+            crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
+        );
+        join_apply_key.data_type = DataType::Utf8;
+        join_apply_key.is_internal = false;
+        let mut row_id = make_output_column(
+            ColumnId::new_for_test(19),
+            crate::common::ICEBERG_ROW_ID_COL,
+        );
+        row_id.data_type = DataType::Int64;
+        row_id.is_internal = true;
+        let mut branch_row_id = make_output_column(
+            ColumnId::new_for_test(91),
+            crate::common::ICEBERG_ROW_ID_COL,
+        );
+        branch_row_id.data_type = DataType::Int64;
+        branch_row_id.is_internal = true;
+        let output_columns = vec![
+            make_output_column(ColumnId::new_for_test(1), "id"),
+            make_output_column(ColumnId::new_for_test(2), "region"),
+            make_output_column(ColumnId::new_for_test(3), "amount"),
+            make_output_column(ColumnId::new_for_test(9), "category"),
+            action.clone(),
+            row_id,
+            join_apply_key.clone(),
+        ];
+        let branch_columns = vec![
+            make_output_column(ColumnId::new_for_test(1), "id"),
+            make_output_column(ColumnId::new_for_test(2), "region"),
+            make_output_column(ColumnId::new_for_test(3), "amount"),
+            make_output_column(ColumnId::new_for_test(90), "_file"),
+            make_output_column(ColumnId::new_for_test(9), "category"),
+            action.clone(),
+            branch_row_id,
+            join_apply_key.clone(),
+        ];
+        let branch_union_columns = vec![
+            branch_columns[0].clone(),
+            branch_columns[1].clone(),
+            branch_columns[2].clone(),
+            branch_columns[4].clone(),
+            branch_columns[5].clone(),
+            branch_columns[6].clone(),
+            branch_columns[7].clone(),
+        ];
+        let union = OptExpr::new(
+            Operator::LogicalUnion(UnionOp {
+                all: true,
+                output_columns,
+                child_output_columns: vec![branch_union_columns.clone(), branch_union_columns],
+            }),
+            vec![
+                make_project_with_columns(&arena_rc, branch_columns.clone()),
+                make_project_with_columns(&arena_rc, branch_columns),
+            ],
+        );
+
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(union, &arena, Some(needed_set(&[1, 2, 3, 9])));
+
+        assert_eq!(
+            required_columns(&tagged),
+            &needed_set(&[1, 2, 3, 9, 14, 19, 20]),
+            "join refresh UNION must keep action, row lineage, and join row key"
+        );
+        for child in &tagged.children {
+            assert!(
+                required_columns(child).contains(&ColumnId::new_for_test(20)),
+                "branch project must keep join row key even when its wide output position differs from the UNION output"
+            );
+            assert!(
+                required_columns(child).contains(&ColumnId::new_for_test(91)),
+                "branch project must keep row-lineage even when its wide output position differs from the UNION output"
+            );
+            assert!(
+                !required_columns(child).contains(&ColumnId::new_for_test(90)),
+                "branch project should use child_output_columns mapping instead of wide child positions"
+            );
+        }
+    }
+
+    #[test]
+    fn tag_union_distinct_preserves_all_child_columns() {
+        let arena_rc = make_arena();
+        let union = OptExpr::new(
+            Operator::LogicalUnion(UnionOp {
+                all: false,
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(1001), "x"),
+                    make_output_column(ColumnId::new_for_test(1002), "y"),
+                    make_output_column(ColumnId::new_for_test(1003), "z"),
+                ],
+                child_output_columns: vec![
+                    vec![
+                        make_output_column(ColumnId::new_for_test(1), "a"),
+                        make_output_column(ColumnId::new_for_test(2), "b"),
+                        make_output_column(ColumnId::new_for_test(3), "c"),
+                    ],
+                    vec![
+                        make_output_column(ColumnId::new_for_test(4), "d"),
+                        make_output_column(ColumnId::new_for_test(5), "e"),
+                        make_output_column(ColumnId::new_for_test(6), "f"),
+                    ],
+                ],
+            }),
+            vec![
+                make_scan_with_ids(&arena_rc, 1, 2, 3),
+                make_scan_with_ids(&arena_rc, 4, 5, 6),
+            ],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(union, &arena, Some(needed_set(&[1002])));
+        assert!(matches!(&tagged.op, Operator::LogicalUnion(_)));
+        let a_req = scan_required_columns(tagged.child(0));
+        let b_req = scan_required_columns(tagged.child(1));
+        assert_eq!(a_req.len(), 3);
+        assert_eq!(b_req.len(), 3);
+        for id in [1, 2, 3] {
+            assert!(a_req.contains(&ColumnId::new_for_test(id)));
+        }
+        for id in [4, 5, 6] {
+            assert!(b_req.contains(&ColumnId::new_for_test(id)));
+        }
+    }
+
+    #[test]
+    fn tag_intersect_preserves_all_child_columns() {
+        let arena_rc = make_arena();
+        let intersect = OptExpr::new(
+            Operator::LogicalIntersect(IntersectOp {
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(1001), "x"),
+                    make_output_column(ColumnId::new_for_test(1002), "y"),
+                    make_output_column(ColumnId::new_for_test(1003), "z"),
+                ],
+                child_output_columns: vec![],
+            }),
+            vec![
+                make_scan_with_ids(&arena_rc, 1, 2, 3),
+                make_scan_with_ids(&arena_rc, 4, 5, 6),
+            ],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(intersect, &arena, Some(needed_set(&[1002])));
+        assert!(matches!(&tagged.op, Operator::LogicalIntersect(_)));
+        assert_eq!(scan_required_columns(tagged.child(0)).len(), 3);
+        assert_eq!(scan_required_columns(tagged.child(1)).len(), 3);
+    }
+
+    #[test]
+    fn tag_except_preserves_all_child_columns() {
+        let arena_rc = make_arena();
+        let except = OptExpr::new(
+            Operator::LogicalExcept(ExceptOp {
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(1001), "x"),
+                    make_output_column(ColumnId::new_for_test(1002), "y"),
+                    make_output_column(ColumnId::new_for_test(1003), "z"),
+                ],
+                child_output_columns: vec![],
+            }),
+            vec![
+                make_scan_with_ids(&arena_rc, 1, 2, 3),
+                make_scan_with_ids(&arena_rc, 4, 5, 6),
+            ],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(except, &arena, Some(needed_set(&[1002])));
+        assert!(matches!(&tagged.op, Operator::LogicalExcept(_)));
+        assert_eq!(scan_required_columns(tagged.child(0)).len(), 3);
+        assert_eq!(scan_required_columns(tagged.child(1)).len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // CTEAnchor two-walk test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_cte_anchor_translates_consumer_needed_ids_to_producer_ids() {
+        let arena_rc = make_arena();
+        let arena = arena_rc.borrow();
+        let cte_id: CteId = 7;
+        let producer_k = make_output_column(ColumnId::new_for_test(101), "k");
+        let producer_v = make_output_column(ColumnId::new_for_test(102), "v");
+        let consumer_k = make_output_column(ColumnId::new_for_test(201), "k");
+        let consumer_v = make_output_column(ColumnId::new_for_test(202), "v");
+
+        let produce = OptExpr::new(
+            Operator::LogicalCTEProduce(CTEProduceOp {
+                cte_id,
+                output_columns: vec![producer_k.clone(), producer_v.clone()],
+            }),
+            vec![make_scan_with_ids(&arena_rc, 101, 102, 900)],
+        );
+        let consume = OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
+            cte_id,
+            alias: "c".to_string(),
+            output_columns: vec![consumer_k.clone(), consumer_v.clone()],
+            producer_column_ids: vec![producer_k.column_id, producer_v.column_id],
+        }));
+        let anchor = OptExpr::new(
+            Operator::LogicalCTEAnchor(CTEAnchorOp { cte_id }),
+            vec![produce, consume],
+        );
+
+        let tagged = tag_required_columns(anchor, &arena, Some(needed_set(&[202])));
+        let produce = tagged.child(0);
+        assert_eq!(
+            produce.required_output_columns.as_ref().unwrap(),
+            &needed_set(&[102])
+        );
+        assert_eq!(
+            produce.child(0).required_output_columns.as_ref().unwrap(),
+            &needed_set(&[102])
+        );
+    }
+
+    #[test]
+    fn tag_cte_anchor_unions_multi_consumer_producer_ids() {
+        let cte_id: CteId = 42;
+        let arena_rc = make_arena();
+        let producer_a = make_output_column(ColumnId::new_for_test(101), "a");
+        let producer_b = make_output_column(ColumnId::new_for_test(102), "b");
+        let producer_c = make_output_column(ColumnId::new_for_test(103), "c");
+
+        let produce = OptExpr::new(
+            Operator::LogicalCTEProduce(CTEProduceOp {
+                cte_id,
+                output_columns: vec![producer_a.clone(), producer_b.clone(), producer_c.clone()],
+            }),
+            vec![make_scan_with_ids(&arena_rc, 101, 102, 103)],
+        );
+
+        let consume_a = OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
+            cte_id,
+            alias: "a".to_string(),
+            output_columns: vec![
+                make_output_column(ColumnId::new_for_test(201), "a0"),
+                make_output_column(ColumnId::new_for_test(202), "a1"),
+                make_output_column(ColumnId::new_for_test(203), "a2"),
+            ],
+            producer_column_ids: vec![
+                producer_a.column_id,
+                producer_b.column_id,
+                producer_c.column_id,
+            ],
+        }));
+        let consume_b = OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
+            cte_id,
+            alias: "b".to_string(),
+            output_columns: vec![
+                make_output_column(ColumnId::new_for_test(301), "b0"),
+                make_output_column(ColumnId::new_for_test(302), "b1"),
+                make_output_column(ColumnId::new_for_test(303), "b2"),
+            ],
+            producer_column_ids: vec![
+                producer_a.column_id,
+                producer_b.column_id,
+                producer_c.column_id,
+            ],
+        }));
+
+        let consumer = OptExpr::new(
+            Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: None,
+            }),
+            vec![consume_a, consume_b],
+        );
+        let anchor = OptExpr::new(
+            Operator::LogicalCTEAnchor(CTEAnchorOp { cte_id }),
+            vec![produce, consumer],
+        );
+
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(anchor, &arena, Some(needed_set(&[201, 303])));
+        let produce = tagged.child(0);
+        assert_eq!(
+            produce.required_output_columns.as_ref().unwrap(),
+            &needed_set(&[101, 103])
+        );
+        assert_eq!(
+            produce.child(0).required_output_columns.as_ref().unwrap(),
+            &needed_set(&[101, 103])
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Window test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_window_passes_none_to_child_keeps_all_input_cols() {
+        // Window node must pass None to its child because window output_columns
+        // carry fresh ColumnIds distinct from the child's ids — any attempt to
+        // remap them risks under-tagging.  The safe fallback is None (keep all).
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let part_by = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(2));
+        let order_by = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(3));
+        drop(arena_mut);
+
+        let window = OptExpr::new(
+            Operator::LogicalWindow(WindowOp {
+                window_exprs: vec![ScalarWindowSpec {
+                    output_column_id: ColumnId::new_for_test(301),
+                    name: "row_number".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    partition_by: vec![part_by],
+                    order_by: vec![SortKey {
+                        expr: order_by,
+                        asc: true,
+                        nulls_first: false,
+                        display: None,
+                    }],
+                    window_frame: None,
+                    ignore_nulls: false,
+                }],
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(1), "a"),
+                    make_output_column(ColumnId::new_for_test(2), "b"),
+                    make_output_column(ColumnId::new_for_test(301), "row_number"),
+                ],
+            }),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(window, &arena, Some(needed_set(&[1])));
+        assert!(matches!(&tagged.op, Operator::LogicalWindow(_)));
+        // The window node itself records the parent's request.
+        assert_eq!(
+            tagged.required_output_columns.as_ref().unwrap(),
+            &needed_set(&[1])
+        );
+        let input = tagged.unary_input();
+        assert!(matches!(&input.op, Operator::LogicalScan(_)));
+        // Child got None → Scan expands to all its columns.
+        let req = required_columns(input);
+        assert_eq!(req.len(), 3, "scan keeps all 3 input columns");
+        assert!(req.contains(&ColumnId::new_for_test(1)));
+        assert!(req.contains(&ColumnId::new_for_test(2)));
+        assert!(req.contains(&ColumnId::new_for_test(3)));
+    }
+
+    #[test]
+    fn tag_window_with_none_parent_child_also_keeps_all() {
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let part_by = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(2));
+        let order_by = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(3));
+        drop(arena_mut);
+
+        let window = OptExpr::new(
+            Operator::LogicalWindow(WindowOp {
+                window_exprs: vec![ScalarWindowSpec {
+                    output_column_id: ColumnId::new_for_test(301),
+                    name: "row_number".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    partition_by: vec![part_by],
+                    order_by: vec![SortKey {
+                        expr: order_by,
+                        asc: true,
+                        nulls_first: false,
+                        display: None,
+                    }],
+                    window_frame: None,
+                    ignore_nulls: false,
+                }],
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(1), "a"),
+                    make_output_column(ColumnId::new_for_test(2), "b"),
+                    make_output_column(ColumnId::new_for_test(301), "row_number"),
+                ],
+            }),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(window, &arena, None);
+        assert!(matches!(&tagged.op, Operator::LogicalWindow(_)));
+        assert!(tagged.required_output_columns.is_none());
+        let input = tagged.unary_input();
+        assert!(matches!(&input.op, Operator::LogicalScan(_)));
+        // None propagated → Scan keeps all columns.
+        let req = required_columns(input);
+        assert_eq!(req.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sort / Limit passthrough tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_sort_adds_key_cols_to_child_needed() {
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let col3 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(3));
+        drop(arena_mut);
+
+        let sort = OptExpr::new(
+            Operator::LogicalSort(SortOp {
+                items: vec![SortKey {
+                    expr: col3,
+                    asc: true,
+                    nulls_first: false,
+                    display: None,
+                }],
+                analytic_partition_exprs: vec![],
+                partition_limit: None,
+                topn_type: None,
+            }),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(sort, &arena, Some(needed_set(&[1])));
+        assert!(matches!(&tagged.op, Operator::LogicalSort(_)));
+        let input = tagged.unary_input();
+        assert!(matches!(&input.op, Operator::LogicalScan(_)));
+        let req = required_columns(input);
+        assert!(req.contains(&ColumnId::new_for_test(1)), "parent needed a");
+        assert!(
+            req.contains(&ColumnId::new_for_test(3)),
+            "sort key c needed"
+        );
+        assert!(!req.contains(&ColumnId::new_for_test(2)));
+    }
+
+    #[test]
+    fn tag_limit_passes_needed_through() {
+        let arena_rc = make_arena();
+        let limit = OptExpr::new(
+            Operator::LogicalLimit(LimitOp {
+                limit: Some(10),
+                offset: None,
+            }),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+        let needed = needed_set(&[2]);
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(limit, &arena, Some(needed.clone()));
+        assert!(matches!(&tagged.op, Operator::LogicalLimit(_)));
+        assert_eq!(tagged.required_output_columns.as_ref().unwrap(), &needed);
+        let input = tagged.unary_input();
+        assert!(matches!(&input.op, Operator::LogicalScan(_)));
+        // Exactly the parent needed set passed through.
+        assert_eq!(required_columns(input), &needed_set(&[2]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Values leaf test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_values_with_none_stamps_all_ids() {
+        let arena_rc = make_arena();
+        let arena = arena_rc.borrow();
+        let values = OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![
+                make_output_column(ColumnId::new_for_test(5), "x"),
+                make_output_column(ColumnId::new_for_test(6), "y"),
+            ],
+        }));
+        let tagged = tag_required_columns(values, &arena, None);
+        assert!(matches!(&tagged.op, Operator::LogicalValues(_)));
+        let req = required_columns(&tagged);
+        assert_eq!(req.len(), 2);
+        assert!(req.contains(&ColumnId::new_for_test(5)));
+        assert!(req.contains(&ColumnId::new_for_test(6)));
+    }
+
+    // -----------------------------------------------------------------------
+    // None-propagation tests (Fix 4/5/6: Filter/Sort/Join must not collapse
+    // None to an empty set — they must pass None through to children).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_filter_none_parent_propagates_none_to_child() {
+        // Filter(pred on c@3) <- Scan[a@1, b@2, c@3]
+        // parent_needed = None
+        // Correct: child gets None → Scan keeps all {1,2,3}.
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let col3 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(3));
+        let zero = int_literal_scalar(&mut arena_mut, 0);
+        let pred = binop_scalar(&mut arena_mut, col3, BinOp::Gt, zero);
+        drop(arena_mut);
+
+        let filter = OptExpr::new(
+            Operator::LogicalFilter(FilterOp { predicate: pred }),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(filter, &arena, None);
+        assert!(matches!(&tagged.op, Operator::LogicalFilter(_)));
+        assert!(
+            tagged.required_output_columns.is_none(),
+            "filter keeps None on itself"
+        );
+        let input = tagged.unary_input();
+        assert!(matches!(&input.op, Operator::LogicalScan(_)));
+        // None propagated → Scan expands to all columns.
+        let req = required_columns(input);
+        assert_eq!(
+            req.len(),
+            3,
+            "scan must keep all 3 columns, not just predicate ref c"
+        );
+        assert!(req.contains(&ColumnId::new_for_test(1)), "a@1 kept");
+        assert!(req.contains(&ColumnId::new_for_test(2)), "b@2 kept");
+        assert!(req.contains(&ColumnId::new_for_test(3)), "c@3 kept");
+    }
+
+    #[test]
+    fn tag_sort_none_parent_propagates_none_to_child() {
+        // Sort(order by c@3) <- Scan[a@1, b@2, c@3]
+        // parent_needed = None
+        // Correct: child gets None → Scan keeps all {1,2,3}.
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let col3 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(3));
+        let col2 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(2));
+        drop(arena_mut);
+
+        let sort = OptExpr::new(
+            Operator::LogicalSort(SortOp {
+                items: vec![SortKey {
+                    expr: col3,
+                    asc: true,
+                    nulls_first: false,
+                    display: None,
+                }],
+                analytic_partition_exprs: vec![col2],
+                partition_limit: None,
+                topn_type: None,
+            }),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(sort, &arena, None);
+        assert!(matches!(&tagged.op, Operator::LogicalSort(_)));
+        assert!(
+            tagged.required_output_columns.is_none(),
+            "sort keeps None on itself"
+        );
+        let input = tagged.unary_input();
+        assert!(matches!(&input.op, Operator::LogicalScan(_)));
+        // None propagated → Scan expands to all columns.
+        let req = required_columns(input);
+        assert_eq!(
+            req.len(),
+            3,
+            "scan must keep all 3 columns, not just sort/partition refs"
+        );
+        assert!(req.contains(&ColumnId::new_for_test(1)), "a@1 kept");
+        assert!(req.contains(&ColumnId::new_for_test(2)), "b@2 kept");
+        assert!(req.contains(&ColumnId::new_for_test(3)), "c@3 kept");
+    }
+
+    #[test]
+    fn tag_join_none_parent_propagates_none_to_both_children() {
+        // Join[INNER, on a@1=d@4] <- {Scan_l[a@1,b@2,c@3], Scan_r[d@4,e@5,f@6]}
+        // parent_needed = None
+        // Correct: both children get None → each Scan keeps all its columns.
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let col1 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(1));
+        let col4 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(4));
+        let cond = binop_scalar(&mut arena_mut, col1, BinOp::Eq, col4);
+        drop(arena_mut);
+
+        let join = OptExpr::new(
+            Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(cond),
+            }),
+            vec![
+                make_scan_with_ids(&arena_rc, 1, 2, 3),
+                make_scan_with_ids(&arena_rc, 4, 5, 6),
+            ],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(join, &arena, None);
+        assert!(matches!(&tagged.op, Operator::LogicalJoin(_)));
+        assert!(
+            tagged.required_output_columns.is_none(),
+            "join keeps None on itself"
+        );
+        let left = tagged.left();
+        assert!(matches!(&left.op, Operator::LogicalScan(_)));
+        let right = tagged.right();
+        assert!(matches!(&right.op, Operator::LogicalScan(_)));
+        // None propagated → each Scan expands to all its columns.
+        let lreq = required_columns(left);
+        let rreq = required_columns(right);
+        assert_eq!(lreq.len(), 3, "left scan keeps all 3 columns");
+        assert!(lreq.contains(&ColumnId::new_for_test(1)));
+        assert!(lreq.contains(&ColumnId::new_for_test(2)));
+        assert!(lreq.contains(&ColumnId::new_for_test(3)));
+        assert_eq!(rreq.len(), 3, "right scan keeps all 3 columns");
+        assert!(rreq.contains(&ColumnId::new_for_test(4)));
+        assert!(rreq.contains(&ColumnId::new_for_test(5)));
+        assert!(rreq.contains(&ColumnId::new_for_test(6)));
+    }
+
+    #[test]
+    fn tag_join_splits_needed_columns_through_imv_delta_marker() {
+        let arena_rc = make_arena();
+        let delta_action = ColumnId::new_for_test(14);
+        let left_scan = make_scan_with_ids(&arena_rc, 1, delta_action.0, 3);
+        let left_delta = OptExpr::new(
+            Operator::LogicalImvDelta(ImvDeltaOp {
+                is_root: false,
+                action_column: Some(delta_action),
+                branch_scope: None,
+            }),
+            vec![left_scan],
+        );
+        let right_scan = make_scan_with_ids(&arena_rc, 4, 5, 6);
+        let join = OptExpr::new(
+            Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: None,
+            }),
+            vec![left_delta, right_scan],
+        );
+
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(join, &arena, Some(needed_set(&[14])));
+        let left_marker = tagged.left();
+        let left_scan = left_marker.unary_input();
+        let right_scan = tagged.right();
+
+        assert_eq!(required_columns(left_marker), &needed_set(&[14]));
+        assert_eq!(required_columns(left_scan), &needed_set(&[14]));
+        assert!(
+            required_columns(right_scan).is_empty(),
+            "right side should not receive left delta action requirement"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Keep-all tests for Repeat and TableFunction (Fix 1/2):
+    // even when parent_needed omits a column the operator needs from its input,
+    // the child retains all columns because the handler passes None.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_repeat_maps_parent_needed_and_rollup_keys_to_child_ids() {
+        // Repeat node referencing rollup columns b@2 by ColumnId.
+        // parent_needed = {1}  (only a — does NOT include the rollup column b@2).
+        // The handler sends {1,2} to the child: parent output a@1 plus
+        // rollup key b@2 needed by Repeat's nulling/grouping logic.
+        let arena_rc = make_arena();
+        let repeat = OptExpr::new(
+            Operator::LogicalRepeat(RepeatOp {
+                repeat_column_ref_list: vec![vec!["b".to_string()]],
+                repeat_column_ref_ids: vec![vec![ColumnId::new_for_test(2)]],
+                grouping_ids: vec![1],
+                all_rollup_columns: vec!["b".to_string()],
+                all_rollup_column_ids: vec![ColumnId::new_for_test(2)],
+                grouping_key_aliases: vec![],
+                grouping_fn_args: vec![],
+                grouping_fn_arg_ids: vec![],
+                grouping_fn_ids: vec![],
+            }),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(repeat, &arena, Some(needed_set(&[1])));
+        assert!(matches!(&tagged.op, Operator::LogicalRepeat(_)));
+        // Repeat records parent_needed on itself.
+        assert_eq!(
+            tagged.required_output_columns.as_ref().unwrap(),
+            &needed_set(&[1])
+        );
+        let input = tagged.unary_input();
+        assert!(matches!(&input.op, Operator::LogicalScan(_)));
+        let req = required_columns(input);
+        assert_eq!(req.len(), 2, "scan keeps parent-needed and rollup key ids");
+        assert!(req.contains(&ColumnId::new_for_test(1)));
+        assert!(req.contains(&ColumnId::new_for_test(2)));
+        assert!(!req.contains(&ColumnId::new_for_test(3)));
+    }
+
+    #[test]
+    fn tag_repeat_parent_none_preserves_all_child_outputs() {
+        let arena_rc = make_arena();
+        let repeat = OptExpr::new(
+            Operator::LogicalRepeat(RepeatOp {
+                repeat_column_ref_list: vec![vec!["b".to_string()]],
+                repeat_column_ref_ids: vec![vec![ColumnId::new_for_test(2)]],
+                grouping_ids: vec![1],
+                all_rollup_columns: vec!["b".to_string()],
+                all_rollup_column_ids: vec![ColumnId::new_for_test(2)],
+                grouping_key_aliases: vec![],
+                grouping_fn_args: vec![],
+                grouping_fn_arg_ids: vec![],
+                grouping_fn_ids: vec![],
+            }),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(repeat, &arena, None);
+        assert!(matches!(&tagged.op, Operator::LogicalRepeat(_)));
+        assert!(
+            tagged.required_output_columns.is_none(),
+            "Repeat root should keep the all-required None marker"
+        );
+        let input = tagged.unary_input();
+        assert!(matches!(&input.op, Operator::LogicalScan(_)));
+        let req = required_columns(input);
+        assert_eq!(req.len(), 3, "child scan must keep all outputs");
+        assert!(req.contains(&ColumnId::new_for_test(1)));
+        assert!(req.contains(&ColumnId::new_for_test(2)));
+        assert!(req.contains(&ColumnId::new_for_test(3)));
+    }
+
+    #[test]
+    fn change_event_expand_required_columns_include_predicates_and_assignments() {
+        use crate::optimizer::operator::{
+            ChangeEventExpandOp, ChangeEventOutputExpr, ChangeEventSpec,
+        };
+
+        let arena_rc = make_arena();
+        let predicate;
+        let assignment_expr;
+        {
+            let mut arena = arena_rc.borrow_mut();
+            let c1 = col_ref_scalar(&mut arena, ColumnId::new_for_test(1));
+            let one = int_literal_scalar(&mut arena, 1);
+            predicate = binop_scalar(&mut arena, c1, BinOp::Eq, one);
+            assignment_expr = col_ref_scalar(&mut arena, ColumnId::new_for_test(2));
+        }
+
+        let output_columns = vec![
+            make_output_column(ColumnId::new_for_test(101), "_file"),
+            make_output_column(ColumnId::new_for_test(102), "_pos"),
+            make_output_column(ColumnId::new_for_test(103), "__change_op"),
+        ];
+        let expand = OptExpr::new(
+            Operator::LogicalChangeEventExpand(ChangeEventExpandOp {
+                events: vec![ChangeEventSpec {
+                    predicate: Some(predicate),
+                    effect: novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
+                    assignments: vec![
+                        ChangeEventOutputExpr {
+                            output_column_id: ColumnId::new_for_test(101),
+                            expr: Some(assignment_expr),
+                        },
+                        ChangeEventOutputExpr {
+                            output_column_id: ColumnId::new_for_test(103),
+                            expr: None,
+                        },
+                    ],
+                }],
+                output_columns,
+                effect_column_id: ColumnId::new_for_test(103),
+            }),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(expand, &arena, Some(needed_set(&[103])));
+        assert!(matches!(&tagged.op, Operator::LogicalChangeEventExpand(_)));
+        assert_eq!(required_columns(&tagged), &needed_set(&[103]));
+        assert_eq!(
+            scan_required_columns(tagged.unary_input()),
+            &needed_set(&[1, 2])
+        );
+    }
+
+    #[test]
+    fn tag_generate_series_parent_none_requires_output_id() {
+        let output_id = ColumnId::new_for_test(301);
+        let arena_rc = make_arena();
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(
+            OptExpr::leaf(Operator::LogicalGenerateSeries(GenerateSeriesOp {
+                start: 1,
+                end: 3,
+                step: 1,
+                column_name: "x".to_string(),
+                alias: Some("gs".to_string()),
+                output_column_id: output_id,
+            })),
+            &arena,
+            None,
+        );
+        assert!(matches!(&tagged.op, Operator::LogicalGenerateSeries(_)));
+        let req = required_columns(&tagged);
+        assert_eq!(req.len(), 1);
+        assert!(req.contains(&output_id));
+    }
+
+    #[test]
+    fn tag_table_function_passes_none_to_child_even_when_parent_needed_is_narrow() {
+        // TableFunction: UNNEST(arr@2) → exploded_col@401
+        // parent_needed = {401}  (only the function output — does NOT include arr@2).
+        // The handler must pass None to the child so arr@2 (the arg) is not dropped.
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let col2 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(2));
+        drop(arena_mut);
+
+        let tf = OptExpr::new(
+            Operator::LogicalTableFunction(TableFunctionOp {
+                function_name: "unnest".to_string(),
+                args: vec![col2],
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(1), "a"),
+                    make_output_column(ColumnId::new_for_test(401), "unnested"),
+                ],
+                alias: None,
+                is_left_join: false,
+            }),
+            vec![scan_with_3_cols(&arena_rc)],
+        );
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(tf, &arena, Some(needed_set(&[401])));
+        assert!(matches!(&tagged.op, Operator::LogicalTableFunction(_)));
+        // TableFunction records parent_needed on itself.
+        assert_eq!(
+            tagged.required_output_columns.as_ref().unwrap(),
+            &needed_set(&[401])
+        );
+        let input = tagged.unary_input();
+        assert!(matches!(&input.op, Operator::LogicalScan(_)));
+        // Child got None → Scan expands to all columns, including arr@2.
+        let req = required_columns(input);
+        assert_eq!(
+            req.len(),
+            3,
+            "scan keeps all 3 columns, including arr@2 needed by function arg"
+        );
+        assert!(req.contains(&ColumnId::new_for_test(1)));
+        assert!(
+            req.contains(&ColumnId::new_for_test(2)),
+            "arr@2 must be kept for UNNEST arg"
+        );
+        assert!(req.contains(&ColumnId::new_for_test(3)));
+    }
+
+    // -----------------------------------------------------------------------
+    // TagRequiredColumns rule end-to-end pipeline test
+    // -----------------------------------------------------------------------
+
+    /// Verify that `TagRequiredColumns` runs through the full
+    /// `query_rewrite_pipeline` and stamps `required_output_columns = Some(_)`
+    /// on both nodes of a Project → Scan plan.
+    #[test]
+    fn tag_required_columns_rule_runs_through_pipeline_and_stamps_nodes() {
+        use crate::optimizer::rewrite::context::RewriteContext;
+        use crate::optimizer::rewrite::registry::query_rewrite_pipeline;
+        use std::collections::HashMap;
+
+        let arena_rc = make_arena();
+        let mut arena_mut = arena_rc.borrow_mut();
+        let col1 = col_ref_scalar(&mut arena_mut, ColumnId::new_for_test(1));
+        drop(arena_mut);
+
+        let plan = OptExpr::new(
+            Operator::LogicalProject(ProjectOp {
+                items: vec![ScalarProjectItem {
+                    output_column_id: ColumnId::new_for_test(101),
+                    output_name: "a".to_string(),
+                    expr: col1,
+                    expr_display: None,
+                }],
+                output_qualifier: None,
+            }),
+            vec![OptExpr::leaf(Operator::LogicalScan(ScanOp {
+                database: "db".to_string(),
+                table: crate::planner::table::TableDef {
+                    name: "t".to_string(),
+                    columns: vec![novarocks_catalog::schema::ColumnDef {
+                        name: "a".to_string(),
+                        data_type: arrow::datatypes::DataType::Int32,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    }],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: crate::compiler::mv_rewrite::test_scan_source(
+                        crate::planner::table::SqlScanKind::ConnectorRead,
+                    ),
+                },
+                alias: None,
+                stats_ref: None,
+                columns: vec![make_output_column(ColumnId::new_for_test(1), "a")],
+                predicates: vec![],
+                required_columns: None,
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }))],
+        );
+
+        let pipeline = query_rewrite_pipeline();
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_query_stats_input(
+            crate::optimizer::stats_input::OptimizerStatsInput::from_test_table_statistics(
+                &HashMap::new(),
+            ),
+        );
+        ctx.set_scalar_arena(arena_rc.clone());
+        let result = pipeline.rewrite(plan, &mut ctx).unwrap();
+
+        // After the pipeline, the Scan leaf must have Some(_) on
+        // required_output_columns — proof that TagRequiredColumns ran and
+        // stamped the leaf.
+        //
+        // Note: the root Project carries `required_output_columns = None`
+        // because it was called as the tree root (parent_needed = None), which
+        // is the correct metadata: "no parent restriction on the root".
+        // Only leaf nodes are guaranteed to hold `Some(_)` after tagging.
+        assert!(
+            matches!(&result.op, Operator::LogicalProject(_)),
+            "expected Project at root after pipeline rewrite"
+        );
+
+        let input = result.unary_input();
+        assert!(
+            matches!(&input.op, Operator::LogicalScan(_)),
+            "expected Scan child after pipeline rewrite"
+        );
+        assert!(
+            input.required_output_columns.is_some(),
+            "Scan.required_output_columns must be Some(_) after TagRequiredColumns stage ran"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // tag_cte_consume with None parent — must store Some(all output ids)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_cte_consume_with_none_parent_stores_some_all_output_ids() {
+        let cte_id: CteId = 99;
+        let consume = OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
+            cte_id,
+            alias: "c".to_string(),
+            output_columns: vec![
+                make_output_column(ColumnId::new_for_test(10), "x"),
+                make_output_column(ColumnId::new_for_test(20), "y"),
+                make_output_column(ColumnId::new_for_test(30), "z"),
+            ],
+            producer_column_ids: vec![
+                ColumnId::new_for_test(10),
+                ColumnId::new_for_test(20),
+                ColumnId::new_for_test(30),
+            ],
+        }));
+
+        let tagged = tag_cte_consume(consume, None);
+
+        assert!(matches!(&tagged.op, Operator::LogicalCTEConsume(_)));
+        let req = tagged
+            .required_output_columns
+            .as_ref()
+            .expect("required_output_columns must be Some(_) after tagging with None parent");
+        assert!(
+            req.contains(&ColumnId::new_for_test(10)),
+            "x@10 must be kept"
+        );
+        assert!(
+            req.contains(&ColumnId::new_for_test(20)),
+            "y@20 must be kept"
+        );
+        assert!(
+            req.contains(&ColumnId::new_for_test(30)),
+            "z@30 must be kept"
+        );
+        assert_eq!(req.len(), 3, "all 3 output ids kept");
+    }
+
+    #[test]
+    fn tag_cte_anchor_with_none_parent_consume_leaf_is_some() {
+        let cte_id: CteId = 88;
+        let arena_rc = make_arena();
+
+        let scan = make_scan_with_ids(&arena_rc, 10, 20, 30);
+        let produce = OptExpr::new(
+            Operator::LogicalCTEProduce(CTEProduceOp {
+                cte_id,
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(10), "a"),
+                    make_output_column(ColumnId::new_for_test(20), "b"),
+                    make_output_column(ColumnId::new_for_test(30), "c"),
+                ],
+            }),
+            vec![scan],
+        );
+
+        let consume = OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
+            cte_id,
+            alias: "u".to_string(),
+            output_columns: vec![
+                make_output_column(ColumnId::new_for_test(101), "p"),
+                make_output_column(ColumnId::new_for_test(102), "q"),
+            ],
+            producer_column_ids: vec![ColumnId::new_for_test(10), ColumnId::new_for_test(20)],
+        }));
+
+        let anchor = OptExpr::new(
+            Operator::LogicalCTEAnchor(CTEAnchorOp { cte_id }),
+            vec![produce, consume],
+        );
+
+        let arena = arena_rc.borrow();
+        let tagged = tag_required_columns(anchor, &arena, None);
+
+        assert!(matches!(&tagged.op, Operator::LogicalCTEAnchor(_)));
+        let consumer = tagged.child(1);
+        assert!(matches!(&consumer.op, Operator::LogicalCTEConsume(_)));
+        // The leaf must be Some(_) — not None — so subtree_untagged is false.
+        assert!(
+            consumer.required_output_columns.is_some(),
+            "CTEConsume.required_output_columns must be Some(_) after tagging with None parent"
+        );
+        // All output ids must be present (keep-all semantics).
+        let req = required_columns(consumer);
+        assert!(req.contains(&ColumnId::new_for_test(101)), "p@101 kept");
+        assert!(req.contains(&ColumnId::new_for_test(102)), "q@102 kept");
+        assert_eq!(req.len(), 2, "both output ids kept");
+    }
+}

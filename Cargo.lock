@@ -3161,6 +3161,7 @@ dependencies = [
  "novarocks-fs",
  "novarocks-protocol",
  "novarocks-spi",
+ "novarocks-sql",
  "novarocks-state-store",
  "novarocks-types",
  "novarocks-version",
@@ -3364,6 +3365,7 @@ dependencies = [
  "novarocks-fs",
  "novarocks-protocol",
  "novarocks-spi",
+ "novarocks-sql",
  "novarocks-state-store",
  "novarocks-types",
  "prost 0.13.5",
@@ -3446,6 +3448,26 @@ dependencies = [
  "bytes",
  "sha2",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "novarocks-sql"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "base64 0.22.1",
+ "chrono",
+ "hex",
+ "md-5",
+ "novarocks-catalog",
+ "novarocks-spi",
+ "novarocks-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlparser",
+ "tracing",
  "uuid",
 ]
 

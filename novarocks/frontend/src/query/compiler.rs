@@ -41,13 +41,13 @@ use novarocks::query_execution::post_compile::{
     PostCompileIntent, prepare_compiled_distributed_query,
 };
 use novarocks::query_execution::request_context::{QueryExecutionContext, RequestContext};
-use novarocks::sql::compiler::{
+use novarocks::view::ViewRequestContext;
+use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_sql::compiler::{
     ExplainLevel, SqlCompileControl, SqlCompileIntent, SqlCompileRequest, SqlCompiler,
     SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
 };
-use novarocks::sql::syntax::{normalize_for_raw_parse, parse_normalized_sql_raw};
-use novarocks::view::ViewRequestContext;
-use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_sql::syntax::{normalize_for_raw_parse, parse_normalized_sql_raw};
 
 #[derive(Clone)]
 pub(crate) struct FrontendQueryCompiler {
@@ -273,9 +273,9 @@ impl FrontendQueryCompiler {
         current_catalog: Option<&str>,
         current_database: &str,
         execution: &QueryExecutionContext,
-        materializer: &'a dyn novarocks::sql::compiler::SqlCatalogSnapshot,
-        statistics: &'a dyn novarocks::sql::compiler::SqlStatisticsSnapshot,
-        mv_definitions: Option<&'a novarocks::sql::compiler::MvRewriteDefinitionIndex>,
+        materializer: &'a dyn novarocks_sql::compiler::SqlCatalogSnapshot,
+        statistics: &'a dyn novarocks_sql::compiler::SqlStatisticsSnapshot,
+        mv_definitions: Option<&'a novarocks_sql::compiler::MvRewriteDefinitionIndex>,
         intent: SqlCompileIntent,
     ) -> Result<SqlCompileRequest<'a>, String> {
         let backend_count =

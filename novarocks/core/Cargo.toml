@@ -29,6 +29,7 @@ novarocks-execution = { path = "../execution" }
 novarocks-fs = { path = "../fs" }
 novarocks-protocol = { path = "../protocol" }
 novarocks-spi = { path = "../spi" }
+novarocks-sql = { path = "../sql" }
 novarocks-types = { path = "../types" }
 novarocks-version = { path = "../version" }
 novarocks-state-store = { path = "../state-store" }
