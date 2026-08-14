@@ -22,6 +22,7 @@
 //! parser or planner implementation tree.
 
 use crate::planner::table::TableDef;
+use novarocks_catalog::memory::MemoryCatalogEntry;
 
 pub use crate::catalog::{
     IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable, TableLookupMode,
@@ -167,7 +168,7 @@ pub fn resolve_local_catalog_table(
     database: &str,
     table: &str,
 ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
-    let planner = catalog.get(database, table)?;
+    let planner = catalog.get(database, table)?.0;
     Ok(crate::catalog::ResolvedAnalyzerTable::from_planner(
         Some("default_catalog"),
         database,
@@ -181,6 +182,18 @@ pub fn catalog_table(
     materialization: &crate::catalog::ResolvedAnalyzerTable,
 ) -> novarocks_catalog::table::CatalogTable {
     materialization.catalog.clone()
+}
+
+/// Read durable local-catalog schema facts without exposing the SQL planner
+/// entry used to store them.
+pub fn local_catalog_table(
+    catalog: &PlannerMemoryCatalog,
+    database: &str,
+    table: &str,
+) -> Result<novarocks_catalog::table::CatalogTable, String> {
+    Ok(catalog
+        .get(database, table)?
+        .to_catalog_table("default_catalog", database))
 }
 
 /// Return the request-local binding token carried by an opaque analyzer
@@ -209,8 +222,29 @@ pub fn frozen_input_snapshot_id(
     }
 }
 
-/// The local catalog is a neutral in-memory catalog of SQL table definitions.
-pub type PlannerMemoryCatalog = novarocks_catalog::memory::MemoryCatalog<TableDef>;
+/// Opaque local-catalog entry.  Only SQL may inspect the enclosed planner
+/// definition; application code can hold the catalog and request neutral facts
+/// through this module.
+#[derive(Clone, Debug)]
+pub struct SqlLocalCatalogEntry(TableDef);
+
+impl MemoryCatalogEntry for SqlLocalCatalogEntry {
+    fn table_name(&self) -> &str {
+        &self.0.name
+    }
+
+    fn to_catalog_table(
+        &self,
+        catalog: &str,
+        database: &str,
+    ) -> novarocks_catalog::table::CatalogTable {
+        self.0.to_catalog_table(catalog, database)
+    }
+}
+
+/// The local catalog is a neutral in-memory catalog whose planner entries are
+/// opaque outside SQL.
+pub type PlannerMemoryCatalog = novarocks_catalog::memory::MemoryCatalog<SqlLocalCatalogEntry>;
 
 /// Register one closed connector-read relation for an application behavior
 /// test. The fixture keeps the `TableDef` and scan-source construction inside
@@ -225,14 +259,14 @@ pub fn register_test_connector_read_table(
 ) -> Result<(), String> {
     catalog.register(
         database,
-        TableDef {
+        SqlLocalCatalogEntry(TableDef {
             name: table.to_string(),
             columns,
             iceberg_row_lineage_metadata_columns: Vec::new(),
             source: crate::planner::table::test_sql_scan_source(
                 crate::planner::table::SqlScanKind::ConnectorRead,
             ),
-        },
+        }),
     )
 }
 

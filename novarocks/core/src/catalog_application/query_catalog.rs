@@ -30,7 +30,6 @@ use novarocks_catalog::service::CatalogService;
 use novarocks_catalog::table::CatalogTable;
 
 use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
-use novarocks_sql::planning::catalog::TableDef;
 
 #[derive(Clone, Debug)]
 pub struct CatalogRuntimeMetadata {
@@ -38,17 +37,13 @@ pub struct CatalogRuntimeMetadata {
 }
 
 impl CatalogRuntimeMetadata {
-    fn from_table_def(identity: TableIdentity, table_def: &TableDef) -> Self {
+    fn from_local_catalog_table(identity: TableIdentity, table: CatalogTable) -> Self {
         // Registry cache entries describe only durable SQL catalog facts.
         // They intentionally retain neither a scan source nor a connector
         // descriptor: every query receives fresh provider authority through
         // the query-local materialization envelope and binding store.
         Self {
-            table: CatalogTable {
-                identity,
-                columns: table_def.columns.clone(),
-                hidden_columns: table_def.iceberg_row_lineage_metadata_columns.clone(),
-            },
+            table: CatalogTable { identity, ..table },
         }
     }
 
@@ -71,7 +66,8 @@ impl CatalogRuntimeMetadata {
 /// The registry keeps durable SQL catalog facts only. Provider authority is
 /// supplied separately through the exact Connector control lease captured for
 /// each request.
-pub type QueryCatalogService = CatalogService<TableDef, CatalogRuntimeMetadata>;
+pub type QueryCatalogService =
+    CatalogService<novarocks_sql::planning::catalog::SqlLocalCatalogEntry, CatalogRuntimeMetadata>;
 
 struct InternalCatalog {
     name: String,
@@ -97,14 +93,12 @@ impl Catalog<CatalogRuntimeMetadata> for InternalCatalog {
         namespace: &str,
         table: &str,
     ) -> Result<CatalogRuntimeMetadata, String> {
-        let table_def = self
-            .local
-            .read()
-            .expect("internal catalog read lock")
-            .get(namespace, table)?;
-        Ok(CatalogRuntimeMetadata::from_table_def(
+        let local = self.local.read().expect("internal catalog read lock");
+        let table =
+            novarocks_sql::planning::catalog::local_catalog_table(&local, namespace, table)?;
+        Ok(CatalogRuntimeMetadata::from_local_catalog_table(
             TableIdentity::new(&self.name, namespace, table),
-            &table_def,
+            table,
         ))
     }
 }
