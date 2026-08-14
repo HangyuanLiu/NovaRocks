@@ -93,12 +93,29 @@ fn fixture_query_table_bindings(
     for fragment in plan.fragments() {
         collect(&fragment.root, &mut fixture_facts);
     }
+    // One physical table binding can occur both as a current/locator read and
+    // as one or more frozen reads. Preserve every frozen selector before the
+    // per-binding fixture admission below coalesces repeated scan facts.
+    let frozen_snapshot_ids = fixture_facts
+        .iter()
+        .filter_map(|facts| {
+            facts
+                .frozen_snapshot_id()
+                .map(|snapshot_id| (facts.binding(), snapshot_id))
+        })
+        .collect::<Vec<_>>();
     fixture_facts.sort_by_key(|facts| facts.binding().ordinal().get());
     fixture_facts.dedup_by_key(|facts| facts.binding());
     let store = QueryTableBindingStore::try_new_with_scope_for_test(
         NonZeroU64::new(1).expect("fixture scope"),
     );
     for facts in fixture_facts {
+        let binding_frozen_snapshot_ids = frozen_snapshot_ids
+            .iter()
+            .filter_map(|(binding, snapshot_id)| {
+                (*binding == facts.binding()).then_some(*snapshot_id)
+            })
+            .collect::<Vec<_>>();
         if facts.category() == SqlScanPreparationCategory::ConnectorRead {
             // This source kind is supplied by its dedicated resolver tests;
             // no catalog admission is expected before resolver dispatch.
@@ -150,8 +167,9 @@ fn fixture_query_table_bindings(
                     statistics_pin: None,
                     planning_lease: lease.clone(),
                 };
-                let frozen_snapshot_materializations = match facts.frozen_snapshot_id() {
-                    Some(snapshot_id) => {
+                let frozen_snapshot_materializations = binding_frozen_snapshot_ids
+                    .into_iter()
+                    .map(|snapshot_id| {
                         let lease = planning_lease.clone().ok_or_else(|| {
                             "frozen scan fixture must acquire an exact connector lease".to_string()
                         })?;
@@ -169,7 +187,7 @@ fn fixture_query_table_bindings(
                                 context: crate::connector::test_request_context(),
                             })
                             .map_err(|error| error.to_string())?;
-                        std::collections::BTreeMap::from([(
+                        Ok((
                             snapshot_id,
                             QueryScanMaterialization {
                                 table: metadata.table,
@@ -178,10 +196,9 @@ fn fixture_query_table_bindings(
                                 statistics_pin: None,
                                 planning_lease: lease,
                             },
-                        )])
-                    }
-                    _ => std::collections::BTreeMap::new(),
-                };
+                        ))
+                    })
+                    .collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
                 Ok(QueryTableBinding {
                     resolved: materialize_connector_read_table(ConnectorReadTableFacts {
                         catalog: facts.identity().catalog().to_string(),
