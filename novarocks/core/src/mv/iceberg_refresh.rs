@@ -19,8 +19,6 @@
 //! current Iceberg catalog. Aggregate shapes are accepted at CREATE time for
 //! target schema and contract persistence; refresh execution is gated later.
 
-use novarocks_sql::planner::vocabulary::ApplyKeySource;
-
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -112,21 +110,22 @@ use novarocks_sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use novarocks_sql::catalog::ResolvedAnalyzerTable;
 use novarocks_sql::column_id::ColumnId;
 use novarocks_sql::mv_refresh::{FULL_REFRESH_DISABLED_MESSAGE, MvRefreshFinalizeFacts};
-use novarocks_sql::parser::ast::{
-    CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr, ObjectName,
-    RefreshMaterializedViewStmt,
-};
 use novarocks_sql::planner::table::{
     ScanSource, SqlMvTargetLocatorScan, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
 };
-use novarocks_sql::planner::vocabulary::{
-    BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
-    JOIN_APPLY_KEY_COLUMN_NAME,
-};
 use novarocks_sql::planning::mv::UnionBranchKind;
 use novarocks_sql::planning::mv::{
-    SqlMvAggregateCalls, SqlMvJoinAliases, extract_aggregate_sql_calls, extract_join_aliases,
-    extract_single_scan_table_fqn,
+    MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
+    MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+    MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
+    MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME, SqlMvAggregateCalls,
+    SqlMvApplyKeySourceFacts, SqlMvJoinAliases, SqlMvPersistedApplyKeySourceFacts,
+    extract_aggregate_sql_calls, extract_join_aliases, extract_single_scan_table_fqn,
+    mv_apply_key_source_from_column_name,
+};
+use novarocks_sql::syntax::{
+    CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr,
+    MaterializedViewRefreshPolicy, ObjectName, RefreshMaterializedViewStmt, TableColumnDef,
 };
 
 /// The explicit Core ports a refresh preparation may read while deriving its
@@ -1618,7 +1617,7 @@ struct IcebergMvCreatePreparation {
     >,
     expected_apply_key_field_id: i32,
     created_at_ms: i64,
-    columns: Vec<novarocks_sql::parser::ast::TableColumnDef>,
+    columns: Vec<TableColumnDef>,
     partition_fields: Vec<IcebergPartitionFieldExpr>,
     target_properties: Vec<(String, String)>,
     created_target_observation: Mutex<Option<MvTargetCreationObservation>>,
@@ -2772,8 +2771,10 @@ fn validate_branch_union_contract(
             query_branch_count
         ));
     }
-    if branch_contract.inner_apply_key_source
-        != novarocks_sql::planner::vocabulary::ApplyKeySource::GroupRowId
+    if branch_contract
+        .inner_apply_key_source
+        .sql_mv_apply_key_source_facts()
+        != SqlMvApplyKeySourceFacts::GroupRowId
     {
         return Err(format!(
             "iceberg branch UNION ALL aggregate MV {}.{}.{} branch contract must use GroupRowId inner apply keys",
@@ -2877,8 +2878,10 @@ fn validate_union_projection_schema_contract_for_base(
             branch_count
         ));
     }
-    if branch_contract.inner_apply_key_source
-        != novarocks_sql::planner::vocabulary::ApplyKeySource::BaseRowId
+    if branch_contract
+        .inner_apply_key_source
+        .sql_mv_apply_key_source_facts()
+        != SqlMvApplyKeySourceFacts::BaseRowId
     {
         return Err(format!(
             "iceberg UNION ALL projection/filter MV {}.{}.{} branch contract must use BaseRowId inner apply keys",
@@ -2935,14 +2938,10 @@ fn validate_union_projection_schema_contract_for_base(
 
 pub(crate) fn union_branch_inner_apply_key(
     branch_kind: UnionBranchKind,
-) -> novarocks_sql::planner::vocabulary::ApplyKeySource {
+) -> SqlMvApplyKeySourceFacts {
     match branch_kind {
-        UnionBranchKind::Aggregate => {
-            novarocks_sql::planner::vocabulary::ApplyKeySource::GroupRowId
-        }
-        UnionBranchKind::ProjectionFilter => {
-            novarocks_sql::planner::vocabulary::ApplyKeySource::BaseRowId
-        }
+        UnionBranchKind::Aggregate => SqlMvApplyKeySourceFacts::GroupRowId,
+        UnionBranchKind::ProjectionFilter => SqlMvApplyKeySourceFacts::BaseRowId,
     }
 }
 
@@ -2955,7 +2954,7 @@ fn create_target_columns_from_property(
     property: &RefreshFragmentProperty,
     canonical_query: &sqlparser::ast::Query,
     analysis: &MvAnalysis,
-) -> Result<Vec<novarocks_sql::parser::ast::TableColumnDef>, String> {
+) -> Result<Vec<TableColumnDef>, String> {
     match representative_aggregate_layout(property, canonical_query, analysis)? {
         None => analysis
             .output_columns
@@ -3088,29 +3087,14 @@ fn observe_base_fields_for_refs_with_ports(
 }
 
 fn create_apply_key_source_property(apply_key: &ApplyKeyContract) -> &'static str {
-    match apply_key.column_name {
-        HIDDEN_APPLY_KEY_COLUMN_NAME => ApplyKeySource::BaseRowId.table_property_value(),
-        JOIN_APPLY_KEY_COLUMN_NAME => ApplyKeySource::JoinRowKey.table_property_value(),
-        GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME => ApplyKeySource::GroupRowId.table_property_value(),
-        other => unreachable!("unknown Iceberg MV apply-key column {other}"),
-    }
+    mv_apply_key_source_from_column_name(apply_key.column_name)
+        .expect("known Iceberg MV apply-key column")
+        .table_property_value()
 }
 
-fn create_apply_key_contract_source(
-    apply_key: &ApplyKeyContract,
-) -> novarocks_sql::planner::vocabulary::ApplyKeySource {
-    match apply_key.column_name {
-        HIDDEN_APPLY_KEY_COLUMN_NAME => {
-            novarocks_sql::planner::vocabulary::ApplyKeySource::BaseRowId
-        }
-        JOIN_APPLY_KEY_COLUMN_NAME => {
-            novarocks_sql::planner::vocabulary::ApplyKeySource::JoinRowKey
-        }
-        GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME => {
-            novarocks_sql::planner::vocabulary::ApplyKeySource::GroupRowId
-        }
-        other => unreachable!("unknown Iceberg MV apply-key column {other}"),
-    }
+fn create_apply_key_contract_source(apply_key: &ApplyKeyContract) -> SqlMvApplyKeySourceFacts {
+    mv_apply_key_source_from_column_name(apply_key.column_name)
+        .expect("known Iceberg MV apply-key column")
 }
 
 fn descriptor_dependency_from_request(request: &CreateMvDependencyRequest) -> DescriptorDependency {
@@ -3134,25 +3118,23 @@ fn descriptor_dependency_from_request(request: &CreateMvDependencyRequest) -> De
 }
 
 fn refresh_policy_descriptor_json(
-    policy: &novarocks_sql::parser::ast::MaterializedViewRefreshPolicy,
+    policy: &MaterializedViewRefreshPolicy,
     paused: bool,
 ) -> serde_json::Value {
     match policy {
-        novarocks_sql::parser::ast::MaterializedViewRefreshPolicy::Manual => serde_json::json!({
+        MaterializedViewRefreshPolicy::Manual => serde_json::json!({
             "policy": "DEFERRED_MANUAL",
             "interval_ms": null,
             "paused": paused,
         }),
-        novarocks_sql::parser::ast::MaterializedViewRefreshPolicy::AsyncOnChange => {
+        MaterializedViewRefreshPolicy::AsyncOnChange => {
             serde_json::json!({
                 "policy": "ASYNC_ON_CHANGE",
                 "interval_ms": null,
                 "paused": paused,
             })
         }
-        novarocks_sql::parser::ast::MaterializedViewRefreshPolicy::AsyncInterval {
-            interval_ms,
-        } => {
+        MaterializedViewRefreshPolicy::AsyncInterval { interval_ms } => {
             serde_json::json!({
                 "policy": "ASYNC_INTERVAL",
                 "interval_ms": interval_ms,
@@ -3304,9 +3286,7 @@ fn identity_needs_branch_id_column(identity: &TargetIdentity) -> bool {
     matches!(identity, TargetIdentity::BranchScoped(_))
 }
 
-fn create_apply_key_table_column(
-    apply_key: &ApplyKeyContract,
-) -> Result<novarocks_sql::parser::ast::TableColumnDef, String> {
+fn create_apply_key_table_column(apply_key: &ApplyKeyContract) -> Result<TableColumnDef, String> {
     match apply_key.column_name {
         HIDDEN_APPLY_KEY_COLUMN_NAME => Ok(apply_key_table_column()),
         JOIN_APPLY_KEY_COLUMN_NAME => Ok(join_apply_key_table_column()),
@@ -3331,7 +3311,7 @@ fn base_snapshot_status_for_refresh(
 fn iceberg_aggregate_target_columns(
     calls: &SqlMvAggregateCalls,
     analysis: &MvAnalysis,
-) -> Result<Vec<novarocks_sql::parser::ast::TableColumnDef>, String> {
+) -> Result<Vec<TableColumnDef>, String> {
     let layout = build_aggregate_layout_from_analysis(calls, analysis)?;
     iceberg_aggregate_target_columns_from_layout(&layout)
 }
@@ -3340,14 +3320,14 @@ fn iceberg_aggregate_target_columns_from_resolved_query(
     calls: &SqlMvAggregateCalls,
     output_columns: &[novarocks_sql::analysis::OutputColumn],
     resolved_query: &novarocks_sql::analysis::ResolvedQuery,
-) -> Result<Vec<novarocks_sql::parser::ast::TableColumnDef>, String> {
+) -> Result<Vec<TableColumnDef>, String> {
     let layout = build_aggregate_layout_from_resolved_query(calls, output_columns, resolved_query)?;
     iceberg_aggregate_target_columns_from_layout(&layout)
 }
 
 fn iceberg_aggregate_target_columns_from_layout(
     layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
-) -> Result<Vec<novarocks_sql::parser::ast::TableColumnDef>, String> {
+) -> Result<Vec<TableColumnDef>, String> {
     validate_unique_aggregate_physical_column_names(&layout.physical_columns)?;
     Ok(layout
         .physical_columns
@@ -4115,10 +4095,8 @@ fn build_branch_union_schema_contract(
     };
 
     let inner_apply_key_source = match inner {
-        TargetIdentity::BaseRowId => novarocks_sql::planner::vocabulary::ApplyKeySource::BaseRowId,
-        TargetIdentity::GroupRowId(_) => {
-            novarocks_sql::planner::vocabulary::ApplyKeySource::GroupRowId
-        }
+        TargetIdentity::BaseRowId => SqlMvApplyKeySourceFacts::BaseRowId,
+        TargetIdentity::GroupRowId(_) => SqlMvApplyKeySourceFacts::GroupRowId,
         other => {
             return Err(format!(
                 "iceberg MV UNION ALL branch inner apply key undefined for identity {other:?}"
@@ -4131,7 +4109,7 @@ fn build_branch_union_schema_contract(
             target_field_id: branch_id_field_id,
         },
         branch_count,
-        inner_apply_key_source,
+        inner_apply_key_source: inner_apply_key_source.into(),
     });
     Ok(contract)
 }
@@ -4473,7 +4451,7 @@ fn target_contract(
     target_observation: &MvTargetCreationObservation,
     actual_apply_key_field_id: i32,
     hidden_apply_key_column_name: &str,
-    hidden_apply_key_source: ApplyKeySource,
+    hidden_apply_key_source: SqlMvApplyKeySourceFacts,
 ) -> Result<mv_schema::TargetContract, String> {
     Ok(mv_schema::TargetContract {
         table_fqn: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
@@ -4504,7 +4482,7 @@ fn target_contract(
         hidden_apply_key: mv_schema::HiddenApplyKeyContract {
             column_name: hidden_apply_key_column_name.to_string(),
             target_field_id: actual_apply_key_field_id,
-            source: hidden_apply_key_source,
+            source: hidden_apply_key_source.into(),
         },
         partition: Some(target_observation.partition.clone()),
     })
@@ -5033,7 +5011,7 @@ mod tests {
                 hidden_apply_key: HiddenApplyKeyContract {
                     column_name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
                     target_field_id: 1,
-                    source: ApplyKeySource::JoinRowKey,
+                    source: SqlMvApplyKeySourceFacts::JoinRowKey.into(),
                 },
                 partition: None,
             },
@@ -5063,10 +5041,7 @@ mod tests {
     #[test]
     fn iceberg_join_mv_uses_join_apply_key_column() {
         let column = crate::mv::refresh::target_apply::join_apply_key_table_column();
-        assert_eq!(
-            column.name,
-            novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME
-        );
+        assert_eq!(column.name, JOIN_APPLY_KEY_COLUMN_NAME);
     }
 
     #[test]
@@ -5075,19 +5050,19 @@ mod tests {
 
         assert_eq!(
             create_apply_key_source_property(&ApplyKeyContract::projection_filter()),
-            ApplyKeySource::BaseRowId.table_property_value()
+            SqlMvApplyKeySourceFacts::BaseRowId.table_property_value()
         );
         assert_eq!(
             create_apply_key_source_property(&ApplyKeyContract::join_projection_filter()),
-            ApplyKeySource::JoinRowKey.table_property_value()
+            SqlMvApplyKeySourceFacts::JoinRowKey.table_property_value()
         );
         assert_eq!(
             create_apply_key_source_property(&ApplyKeyContract::aggregate_group_row()),
-            ApplyKeySource::GroupRowId.table_property_value()
+            SqlMvApplyKeySourceFacts::GroupRowId.table_property_value()
         );
         assert_eq!(
             create_apply_key_source_property(&ApplyKeyContract::join_aggregate_group_row()),
-            ApplyKeySource::GroupRowId.table_property_value()
+            SqlMvApplyKeySourceFacts::GroupRowId.table_property_value()
         );
     }
 
@@ -8342,7 +8317,7 @@ mod partition_planning_tests {
                 hidden_apply_key: HiddenApplyKeyContract {
                     column_name: "__nova_base_row_id".to_string(),
                     target_field_id: 11,
-                    source: ApplyKeySource::BaseRowId,
+                    source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
                 },
                 partition: Some(MvPartitionContract {
                     target_spec_id: 7,

@@ -27,6 +27,166 @@ pub const MV_HIDDEN_APPLY_KEY_COLUMN_NAME: &str =
 /// SQL-owned join apply-key label used by immutable join-delta query shaping.
 pub const MV_JOIN_APPLY_KEY_COLUMN_NAME: &str =
     crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
+/// SQL-owned aggregate apply-key label used by immutable aggregate refresh
+/// contracts.
+pub const MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME: &str =
+    crate::planner::vocabulary::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME;
+
+/// Immutable SQL-owned classification of an MV hidden apply key.
+///
+/// Application code may persist this fact through its own schema contract, but
+/// it must not name SQL planner vocabulary directly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlMvApplyKeySourceFacts {
+    BaseRowId,
+    JoinRowKey,
+    GroupRowId,
+}
+
+impl SqlMvApplyKeySourceFacts {
+    /// Stable spelling used by the Iceberg table-property contract.
+    pub const fn table_property_value(self) -> &'static str {
+        match self {
+            Self::BaseRowId => "base._row_id",
+            Self::JoinRowKey => "JoinRowKey",
+            Self::GroupRowId => "GroupRowId",
+        }
+    }
+
+    /// Stable spelling used by the persisted MV schema contract.
+    pub const fn persisted_label(self) -> &'static str {
+        match self {
+            Self::BaseRowId => "BaseRowId",
+            Self::JoinRowKey => "JoinRowKey",
+            Self::GroupRowId => "GroupRowId",
+        }
+    }
+
+    /// SQL-owned internal target-column label for this apply-key source.
+    pub const fn column_name(self) -> &'static str {
+        match self {
+            Self::BaseRowId => MV_HIDDEN_APPLY_KEY_COLUMN_NAME,
+            Self::JoinRowKey => MV_JOIN_APPLY_KEY_COLUMN_NAME,
+            Self::GroupRowId => MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+        }
+    }
+
+    /// Decode the stable persisted spelling without exposing planner
+    /// vocabulary to application code.
+    pub fn try_from_persisted_label(label: &str) -> Result<Self, String> {
+        match label {
+            "BaseRowId" | "BASE_ROW_ID" => Ok(Self::BaseRowId),
+            "JoinRowKey" | "JOIN_ROW_KEY" => Ok(Self::JoinRowKey),
+            "GroupRowId" | "GROUP_ROW_ID" => Ok(Self::GroupRowId),
+            _ => Err("MV hidden apply-key source is unsupported".to_string()),
+        }
+    }
+}
+
+/// Recover immutable apply-key facts from an admitted internal column name.
+pub fn mv_apply_key_source_from_column_name(
+    column_name: &str,
+) -> Result<SqlMvApplyKeySourceFacts, String> {
+    match column_name {
+        MV_HIDDEN_APPLY_KEY_COLUMN_NAME => Ok(SqlMvApplyKeySourceFacts::BaseRowId),
+        MV_JOIN_APPLY_KEY_COLUMN_NAME => Ok(SqlMvApplyKeySourceFacts::JoinRowKey),
+        MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME => Ok(SqlMvApplyKeySourceFacts::GroupRowId),
+        _ => Err(format!("unknown Iceberg MV apply-key column {column_name}")),
+    }
+}
+
+impl From<SqlMvApplyKeySourceFacts> for crate::planner::vocabulary::ApplyKeySource {
+    fn from(value: SqlMvApplyKeySourceFacts) -> Self {
+        match value {
+            SqlMvApplyKeySourceFacts::BaseRowId => Self::BaseRowId,
+            SqlMvApplyKeySourceFacts::JoinRowKey => Self::JoinRowKey,
+            SqlMvApplyKeySourceFacts::GroupRowId => Self::GroupRowId,
+        }
+    }
+}
+
+mod persisted_apply_key_source_private {
+    pub trait Sealed {}
+}
+
+/// Projects legacy persisted planner values back into immutable SQL facts.
+///
+/// This is an extension trait so application code can validate an already
+/// loaded schema contract without naming the private planner vocabulary.
+pub trait SqlMvPersistedApplyKeySourceFacts: persisted_apply_key_source_private::Sealed {
+    fn sql_mv_apply_key_source_facts(self) -> SqlMvApplyKeySourceFacts;
+}
+
+impl persisted_apply_key_source_private::Sealed for crate::planner::vocabulary::ApplyKeySource {}
+
+impl SqlMvPersistedApplyKeySourceFacts for crate::planner::vocabulary::ApplyKeySource {
+    fn sql_mv_apply_key_source_facts(self) -> SqlMvApplyKeySourceFacts {
+        match self {
+            Self::BaseRowId => SqlMvApplyKeySourceFacts::BaseRowId,
+            Self::JoinRowKey => SqlMvApplyKeySourceFacts::JoinRowKey,
+            Self::GroupRowId => SqlMvApplyKeySourceFacts::GroupRowId,
+        }
+    }
+}
+
+#[cfg(test)]
+mod apply_key_facts_tests {
+    use super::*;
+
+    #[test]
+    fn apply_key_facts_own_all_internal_column_labels() {
+        assert_eq!(
+            SqlMvApplyKeySourceFacts::BaseRowId.column_name(),
+            MV_HIDDEN_APPLY_KEY_COLUMN_NAME
+        );
+        assert_eq!(
+            SqlMvApplyKeySourceFacts::JoinRowKey.column_name(),
+            MV_JOIN_APPLY_KEY_COLUMN_NAME
+        );
+        assert_eq!(
+            SqlMvApplyKeySourceFacts::GroupRowId.column_name(),
+            MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
+        );
+    }
+
+    #[test]
+    fn apply_key_facts_round_trip_column_and_persisted_labels() {
+        for source in [
+            SqlMvApplyKeySourceFacts::BaseRowId,
+            SqlMvApplyKeySourceFacts::JoinRowKey,
+            SqlMvApplyKeySourceFacts::GroupRowId,
+        ] {
+            assert_eq!(
+                mv_apply_key_source_from_column_name(source.column_name())
+                    .expect("known internal column"),
+                source
+            );
+            assert_eq!(
+                SqlMvApplyKeySourceFacts::try_from_persisted_label(source.persisted_label())
+                    .expect("known persisted label"),
+                source
+            );
+            let persisted: crate::planner::vocabulary::ApplyKeySource = source.into();
+            assert_eq!(persisted.sql_mv_apply_key_source_facts(), source);
+        }
+    }
+
+    #[test]
+    fn apply_key_facts_keep_legacy_property_spelling() {
+        assert_eq!(
+            SqlMvApplyKeySourceFacts::BaseRowId.table_property_value(),
+            "base._row_id"
+        );
+        assert_eq!(
+            SqlMvApplyKeySourceFacts::JoinRowKey.table_property_value(),
+            "JoinRowKey"
+        );
+        assert_eq!(
+            SqlMvApplyKeySourceFacts::GroupRowId.table_property_value(),
+            "GroupRowId"
+        );
+    }
+}
 
 mod resolved_mv_refresh_input_private {
     pub trait Sealed {}
