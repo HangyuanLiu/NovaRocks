@@ -39,7 +39,7 @@ use novarocks::query_execution::lifecycle::{
     QueryTerminalRuntimeFilterScanNotEvaluatedV1, QueryTerminalRuntimeFilterSubscriptionTerminalV1,
     QueryTerminalRuntimeFilterTransportRouteKeyV1, QueryTerminalRuntimeFilterTransportRouteV1,
     QueryTerminalSnapshot, QueryTerminationAck, QueryTerminationReason, RuntimeFilterContribution,
-    StageDigest, StageDigestVersion,
+    StageDigest, StageDigestVersion, p0_max_encoded_len,
 };
 use novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
 use novarocks_execution::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
@@ -1221,14 +1221,6 @@ impl QueryLifecycleRegistry {
             CONTROL_EVENT_BUFFER_CAPACITY + RESERVED_CONTROL_EVENT_CAPACITY + 1,
         );
         let (observations_tx, observations_rx) = tokio::sync::watch::channel(None);
-        events_tx
-            .try_send(QueryControlEvent::ControlReady)
-            .map_err(|error| {
-                QueryLifecycleError::new(
-                    QueryLifecycleErrorCode::Internal,
-                    format!("publish ControlReady failed: {error}"),
-                )
-            })?;
         let local_drained_event_permit =
             events_tx.clone().try_reserve_owned().map_err(|error| {
                 QueryLifecycleError::new(
@@ -1249,6 +1241,8 @@ impl QueryLifecycleRegistry {
                 format!("reserve terminal control event failed: {error}"),
             )
         })?;
+        let p0_bytes = p0_max_encoded_len(&entry.manifest);
+        self.reserve_terminal_p0(attach.execution_id(), p0_bytes)?;
         {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             match state.phase {
@@ -1258,6 +1252,7 @@ impl QueryLifecycleRegistry {
                 | QueryLifecyclePhase::Tombstone => {
                     let phase = phase_name(state.phase);
                     drop(state);
+                    self.release_terminal_record(attach.execution_id());
                     return Err(self.attach_error(
                         &attach,
                         QueryLifecycleErrorCode::Terminated,
@@ -1272,6 +1267,7 @@ impl QueryLifecycleRegistry {
                 | QueryLifecyclePhase::Running => {
                     let phase = phase_name(state.phase);
                     drop(state);
+                    self.release_terminal_record(attach.execution_id());
                     return Err(self.attach_error(
                         &attach,
                         QueryLifecycleErrorCode::Conflict,
@@ -1295,6 +1291,23 @@ impl QueryLifecycleRegistry {
             {
                 state.pre_start_deadline = None;
             }
+        }
+        if let Err(error) = events_tx.try_send(QueryControlEvent::ControlReady) {
+            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            state.phase = QueryLifecyclePhase::Initialized;
+            state.frontend_owner_epoch = None;
+            state.last_heartbeat = None;
+            state.events = None;
+            state.observations = None;
+            state.local_drained_event_permit = None;
+            state.terminal_snapshot_event_permit = None;
+            state.terminal_event_permit = None;
+            drop(state);
+            self.release_terminal_record(attach.execution_id());
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Internal,
+                format!("publish ControlReady failed: {error}"),
+            ));
         }
         info!(
             target: "novarocks::query_lifecycle",
@@ -2673,22 +2686,77 @@ impl QueryLifecycleRegistry {
         bytes: usize,
     ) -> Result<(), QueryLifecycleError> {
         let mut state = self.state.lock().expect("query lifecycle registry lock");
-        if state.terminal_retained.len() >= self.config.terminal_retained_capacity {
-            return Err(QueryLifecycleError::new(
-                QueryLifecycleErrorCode::Capacity,
-                "query terminal retained-record capacity is exhausted",
-            ));
+        let Some(previous_bytes) = state.terminal_retained.get(&execution_id).copied() else {
+            return self.reserve_terminal_p0_locked(&mut state, execution_id, bytes);
+        };
+        if bytes <= previous_bytes {
+            return Ok(());
         }
-        if state.terminal_retained_bytes.saturating_add(bytes)
-            > self.config.terminal_max_retained_bytes
-        {
+        let delta = bytes - previous_bytes;
+        let next_bytes = state
+            .terminal_retained_bytes
+            .checked_add(delta)
+            .ok_or_else(|| {
+                QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Capacity,
+                    "query terminal retained-byte accounting overflowed",
+                )
+            })?;
+        if next_bytes > self.config.terminal_max_retained_bytes {
             return Err(QueryLifecycleError::new(
                 QueryLifecycleErrorCode::Capacity,
                 "query terminal retained-byte capacity is exhausted",
             ));
         }
         state.terminal_retained.insert(execution_id, bytes);
-        state.terminal_retained_bytes = state.terminal_retained_bytes.saturating_add(bytes);
+        state.terminal_retained_bytes = next_bytes;
+        Ok(())
+    }
+
+    fn reserve_terminal_p0(
+        &self,
+        execution_id: QueryExecutionId,
+        bytes: usize,
+    ) -> Result<(), QueryLifecycleError> {
+        let mut state = self.state.lock().expect("query lifecycle registry lock");
+        self.reserve_terminal_p0_locked(&mut state, execution_id, bytes)
+    }
+
+    fn reserve_terminal_p0_locked(
+        &self,
+        state: &mut QueryLifecycleRegistryState,
+        execution_id: QueryExecutionId,
+        bytes: usize,
+    ) -> Result<(), QueryLifecycleError> {
+        if state.terminal_retained.contains_key(&execution_id) {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Conflict,
+                "query terminal P0 reservation already exists",
+            ));
+        }
+        if state.terminal_retained.len() >= self.config.terminal_retained_capacity {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Capacity,
+                "query terminal retained-record capacity is exhausted",
+            ));
+        }
+        let next_bytes = state
+            .terminal_retained_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| {
+                QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Capacity,
+                    "query terminal retained-byte accounting overflowed",
+                )
+            })?;
+        if next_bytes > self.config.terminal_max_retained_bytes {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Capacity,
+                "query terminal retained-byte capacity is exhausted",
+            ));
+        }
+        state.terminal_retained.insert(execution_id, bytes);
+        state.terminal_retained_bytes = next_bytes;
         Ok(())
     }
 
@@ -3007,6 +3075,7 @@ impl QueryLifecycleRegistry {
                 .get_or_insert(QueryInitOutcome::RejectedTerminated);
             entry.init_completed.notify_all();
         }
+        self.release_terminal_record(execution_id);
         let mut state = self.state.lock().expect("query lifecycle registry lock");
         state.active_entries = state.active_entries.saturating_sub(1);
         state.tombstones.push_back(execution_id);
