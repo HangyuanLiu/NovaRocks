@@ -1130,7 +1130,7 @@ impl TestQueryCompiler {
         use sqlparser::ast as sqlast;
         let current_catalog = request_context.session().current_catalog();
         let current_database = request_context.session().current_database();
-        let normalized = novarocks_sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
         let (parse_sql, forced_explain_level, force_logical_explain) =
             if let Some((rewritten, level)) = split_explain_logical_sql(&normalized) {
                 (rewritten, Some(level), true)
@@ -1139,7 +1139,7 @@ impl TestQueryCompiler {
             } else {
                 (normalized.clone(), None, false)
             };
-        let stmt = novarocks_sql::parser::parse_normalized_sql_raw(&parse_sql)
+        let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&parse_sql)
             .map_err(|error| format_parser_error(&error.to_string()))?;
         match stmt {
             sqlast::Statement::Explain {
@@ -1160,9 +1160,9 @@ impl TestQueryCompiler {
                     &connector_context,
                 )?;
                 let level = forced_explain_level.unwrap_or(if verbose {
-                    novarocks_sql::explain::ExplainLevel::Verbose
+                    novarocks_sql::compiler::ExplainLevel::Verbose
                 } else {
-                    novarocks_sql::explain::ExplainLevel::Normal
+                    novarocks_sql::compiler::ExplainLevel::Normal
                 });
                 let catalog_service_snapshot = catalog_service_snapshot(&self.query);
                 let analyzer_provider = build_catalog_service_provider(
@@ -1313,7 +1313,7 @@ impl TestQueryCompiler {
                 Some(query_options_for_explain_analyze(query_opts)),
                 execution,
                 novarocks_sql::compiler::SqlCompileIntent::Explain {
-                    level: novarocks_sql::explain::ExplainLevel::Analyze,
+                    level: novarocks_sql::compiler::ExplainLevel::Analyze,
                     analyze: true,
                 },
                 true,
@@ -1385,10 +1385,10 @@ pub(crate) fn connector_schema_position(
 }
 
 pub(crate) fn connector_partition_transform(
-    field: &novarocks_sql::parser::ast::IcebergPartitionFieldExpr,
+    field: &novarocks_sql::syntax::IcebergPartitionFieldExpr,
 ) -> novarocks_spi::connector::ConnectorPartitionTransform {
     use novarocks_spi::connector::ConnectorPartitionTransform;
-    use novarocks_sql::parser::ast::IcebergPartitionFieldExpr;
+    use novarocks_sql::syntax::IcebergPartitionFieldExpr;
 
     match field {
         IcebergPartitionFieldExpr::Identity { column } => ConnectorPartitionTransform::Identity {
@@ -1454,7 +1454,7 @@ fn test_request_context_with_role(
         RequestSessionContext::new(
             current_catalog.map(str::to_string),
             current_database.to_string(),
-            novarocks_sql::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_sql::compiler::SessionOptimizerSettings::default(),
         ),
         QueryExecutionContext::new(
             role,
@@ -1472,13 +1472,13 @@ fn test_request_context_with_role(
             .expect("non-empty test topology"),
             None,
             cancellation.view(),
-            novarocks_sql::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_sql::compiler::SessionOptimizerSettings::default(),
         ),
     )
 }
 
 fn resolve_default_view_database(
-    name: &novarocks_sql::parser::ast::ObjectName,
+    name: &novarocks_sql::syntax::ObjectName,
     current_catalog: Option<&str>,
 ) -> Result<Option<String>, String> {
     let database = match name.parts.as_slice() {
@@ -1519,8 +1519,8 @@ pub(crate) fn parse_create_table_like(
     sql: &str,
 ) -> Result<
     Option<(
-        novarocks_sql::parser::ast::ObjectName,
-        novarocks_sql::parser::ast::ObjectName,
+        novarocks_sql::syntax::ObjectName,
+        novarocks_sql::syntax::ObjectName,
     )>,
     String,
 > {
@@ -1536,7 +1536,7 @@ pub(crate) fn parse_create_table_like(
     Ok(Some((target, source)))
 }
 
-fn parse_simple_object_name(token: &str) -> Result<novarocks_sql::parser::ast::ObjectName, String> {
+fn parse_simple_object_name(token: &str) -> Result<novarocks_sql::syntax::ObjectName, String> {
     let mut parts = Vec::new();
     let mut cur = String::new();
     let mut in_backtick = false;
@@ -1559,7 +1559,7 @@ fn parse_simple_object_name(token: &str) -> Result<novarocks_sql::parser::ast::O
     if parts.is_empty() {
         return Err(format!("empty object name `{token}`"));
     }
-    Ok(novarocks_sql::parser::ast::ObjectName { parts })
+    Ok(novarocks_sql::syntax::ObjectName { parts })
 }
 
 /// Generate a `CREATE TABLE` DDL string from exact-generation connector facts.
@@ -1661,7 +1661,7 @@ pub(crate) fn build_iceberg_create_table_ddl(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn statistics_application_target(
-    name: &novarocks_sql::parser::ast::ObjectName,
+    name: &novarocks_sql::syntax::ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<crate::statistics::application::StatisticsTableTarget, String> {
@@ -1820,7 +1820,7 @@ pub(crate) fn ensure_mainline_distributed_execution(
 
 fn optimizer_settings_for_execution(
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
-) -> novarocks_sql::optimizer::options::SessionOptimizerSettings {
+) -> novarocks_sql::compiler::SessionOptimizerSettings {
     let mut settings = execution
         .map(|execution| execution.optimizer_settings().clone())
         .unwrap_or_default();
@@ -1833,7 +1833,7 @@ fn optimizer_settings_for_execution(
 }
 
 pub(crate) fn scan_preparation_options(
-    settings: &novarocks_sql::optimizer::options::SessionOptimizerSettings,
+    settings: &novarocks_sql::compiler::SessionOptimizerSettings,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
     let target_parallelism = std::num::NonZeroUsize::new(execution.topology().targets().len())
@@ -2288,7 +2288,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
         &statistics,
-        novarocks_sql::functions::builtin_sql_function_catalog(),
+        novarocks_sql::compiler::builtin_sql_function_catalog(),
         None,
         novarocks_sql::compiler::SqlCompileControl::new(
             execution.deadline(),
@@ -2387,7 +2387,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding_native_assem
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
         &statistics,
-        novarocks_sql::functions::builtin_sql_function_catalog(),
+        novarocks_sql::compiler::builtin_sql_function_catalog(),
         None,
         novarocks_sql::compiler::SqlCompileControl::new(
             execution.deadline(),
@@ -2579,6 +2579,44 @@ pub(crate) fn prepare_dml_change_stream_write_with_execution(
     })
 }
 
+/// Prepare an already sealed SQL connector-write plan for the frontend-owned
+/// MV lifecycle.  SQL owns all compile/physical decisions; Core only pairs the
+/// sealed plan with the exact admitted bindings and connector write template.
+pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    distributed_plan: novarocks_sql::plan_read::DistributedPlan,
+    query_table_bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+) -> Result<crate::mv::application::PreparedMvNativeWriteAssembly, String> {
+    crate::connector::validate_request_context(connector_context)?;
+    let scan_resolver =
+        crate::query_execution::planning::delta_scan::QueryTableBindingScanResolver::new(
+            query_table_bindings,
+        );
+    let settings = optimizer_settings_for_execution(Some(execution));
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &distributed_plan,
+        connector_control,
+        connector_context,
+        Some(query_table_bindings),
+        Some(&scan_resolver),
+        scan_preparation_options(&settings, execution)?,
+    )?;
+    let cohort_id = connector_write.cohort_id();
+    let exact_lease = connector_write.lease();
+    Ok(crate::mv::application::PreparedMvNativeWriteAssembly::new(
+        NativeFragmentEncodingInput::new(distributed_plan, prepared),
+        None,
+        crate::query_execution::contract::ConnectorWriteOperationRegistration::single(
+            connector_write,
+        ),
+        cohort_id,
+        exact_lease,
+    ))
+}
+
 /// MV-only change-stream facts held before Frontend native fragment assembly.
 /// It deliberately retains the exact prepared fragments paired with their
 /// distributed plan and exposes no mutable planning or connector state.
@@ -2752,9 +2790,8 @@ fn execute_bound_distributed_write_request(
     })
 }
 
-fn change_stream_write_optimizer_settings()
--> novarocks_sql::optimizer::options::SessionOptimizerSettings {
-    let mut settings = novarocks_sql::optimizer::options::SessionOptimizerSettings::default();
+fn change_stream_write_optimizer_settings() -> novarocks_sql::compiler::SessionOptimizerSettings {
+    let mut settings = novarocks_sql::compiler::SessionOptimizerSettings::default();
     // A change-stream write carries old/new row pairs and target locators across
     // independent fragments. A query runtime filter may describe only one data
     // branch, so pushing it into a locator scan can suppress rows required by a
@@ -2802,7 +2839,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh_with_statistics(
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog,
         &statistics,
-        novarocks_sql::functions::builtin_sql_function_catalog(),
+        novarocks_sql::compiler::builtin_sql_function_catalog(),
         None,
         novarocks_sql::compiler::SqlCompileControl::new(
             execution.deadline(),
@@ -2936,7 +2973,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
         &statistics,
-        novarocks_sql::functions::builtin_sql_function_catalog(),
+        novarocks_sql::compiler::builtin_sql_function_catalog(),
         mv_definitions.as_ref(),
         novarocks_sql::compiler::SqlCompileControl::new(
             execution.deadline(),
@@ -2994,7 +3031,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
     mv_storage_observation: &dyn crate::mv::storage_observation::MvStorageObservationPort,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
-    level: novarocks_sql::explain::ExplainLevel,
+    level: novarocks_sql::compiler::ExplainLevel,
     logical: bool,
 ) -> Result<QueryResult, String> {
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
@@ -3032,7 +3069,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
             novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
             &catalog_snapshot,
             &statistics,
-            novarocks_sql::functions::builtin_sql_function_catalog(),
+            novarocks_sql::compiler::builtin_sql_function_catalog(),
             Some(&mv_definitions),
             novarocks_sql::compiler::SqlCompileControl::new(
                 execution.deadline(),
@@ -3298,21 +3335,21 @@ fn format_parser_error(raw: &str) -> String {
 }
 
 #[cfg(test)]
-fn split_explain_costs_sql(sql: &str) -> Option<(String, novarocks_sql::explain::ExplainLevel)> {
+fn split_explain_costs_sql(sql: &str) -> Option<(String, novarocks_sql::compiler::ExplainLevel)> {
     let body = consume_leading_keyword(consume_leading_keyword(sql, "EXPLAIN")?, "COSTS")?;
     Some((
         format!("EXPLAIN {}", body.trim_start()),
-        novarocks_sql::explain::ExplainLevel::Costs,
+        novarocks_sql::compiler::ExplainLevel::Costs,
     ))
 }
 
 #[cfg(test)]
-fn split_explain_logical_sql(sql: &str) -> Option<(String, novarocks_sql::explain::ExplainLevel)> {
+fn split_explain_logical_sql(sql: &str) -> Option<(String, novarocks_sql::compiler::ExplainLevel)> {
     let mut body = consume_leading_keyword(consume_leading_keyword(sql, "EXPLAIN")?, "LOGICAL")?;
-    let mut level = novarocks_sql::explain::ExplainLevel::Normal;
+    let mut level = novarocks_sql::compiler::ExplainLevel::Normal;
     for (keyword, candidate) in [
-        ("VERBOSE", novarocks_sql::explain::ExplainLevel::Verbose),
-        ("COSTS", novarocks_sql::explain::ExplainLevel::Costs),
+        ("VERBOSE", novarocks_sql::compiler::ExplainLevel::Verbose),
+        ("COSTS", novarocks_sql::compiler::ExplainLevel::Costs),
     ] {
         if let Some(rest) = consume_leading_keyword(body, keyword) {
             level = candidate;
@@ -3348,8 +3385,8 @@ fn parse_explain_refresh_materialized_view(
 ) -> Option<
     Result<
         (
-            novarocks_sql::parser::ast::RefreshMaterializedViewStmt,
-            novarocks_sql::explain::ExplainLevel,
+            novarocks_sql::syntax::RefreshMaterializedViewStmt,
+            novarocks_sql::compiler::ExplainLevel,
             bool,
         ),
         String,
@@ -3359,22 +3396,22 @@ fn parse_explain_refresh_materialized_view(
     let prefixes = [
         (
             "EXPLAIN ANALYZE REFRESH ",
-            novarocks_sql::explain::ExplainLevel::Analyze,
+            novarocks_sql::compiler::ExplainLevel::Analyze,
             true,
         ),
         (
             "EXPLAIN VERBOSE REFRESH ",
-            novarocks_sql::explain::ExplainLevel::Verbose,
+            novarocks_sql::compiler::ExplainLevel::Verbose,
             false,
         ),
         (
             "EXPLAIN COSTS REFRESH ",
-            novarocks_sql::explain::ExplainLevel::Costs,
+            novarocks_sql::compiler::ExplainLevel::Costs,
             false,
         ),
         (
             "EXPLAIN REFRESH ",
-            novarocks_sql::explain::ExplainLevel::Normal,
+            novarocks_sql::compiler::ExplainLevel::Normal,
             false,
         ),
     ];
@@ -3385,20 +3422,16 @@ fn parse_explain_refresh_materialized_view(
             .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
         {
             let body = format!("REFRESH {}", trimmed[prefix.len()..].trim_start());
-            let mut statements = match novarocks_sql::parser::parse_sql(&body) {
-                Ok(statements) => statements,
-                Err(e) => return Some(Err(e)),
+            let statement = match novarocks_sql::syntax::parse_mv_admitted_statement(&body) {
+                Ok(novarocks_sql::syntax::MvAdmittedStatement::Refresh(statement)) => statement,
+                Ok(_) => {
+                    return Some(Err(
+                        "EXPLAIN REFRESH only supports REFRESH MATERIALIZED VIEW".to_string(),
+                    ));
+                }
+                Err(error) => return Some(Err(error)),
             };
-            let Some(statement) = statements.pop() else {
-                return Some(Err("EXPLAIN REFRESH parsed no statement".to_string()));
-            };
-            let novarocks_sql::parser::ast::Statement::RefreshMaterializedView(stmt) = statement
-            else {
-                return Some(Err(
-                    "EXPLAIN REFRESH only supports REFRESH MATERIALIZED VIEW".to_string(),
-                ));
-            };
-            return Some(Ok((stmt, level, analyze)));
+            return Some(Ok((statement, level, analyze)));
         }
     }
     None
@@ -3640,7 +3673,7 @@ mod tests {
         .expect("recognized")
         .expect("parsed");
         assert_eq!(verbose.0.name.parts, vec!["mv1"]);
-        assert_eq!(verbose.1, novarocks_sql::explain::ExplainLevel::Verbose);
+        assert_eq!(verbose.1, novarocks_sql::compiler::ExplainLevel::Verbose);
         assert!(!verbose.2);
 
         let costs = super::parse_explain_refresh_materialized_view(
@@ -3649,7 +3682,7 @@ mod tests {
         .expect("recognized")
         .expect("parsed");
         assert_eq!(costs.0.name.parts, vec!["db", "mv1"]);
-        assert_eq!(costs.1, novarocks_sql::explain::ExplainLevel::Costs);
+        assert_eq!(costs.1, novarocks_sql::compiler::ExplainLevel::Costs);
         assert!(!costs.2);
     }
 
@@ -3660,7 +3693,7 @@ mod tests {
         )
         .expect("recognized")
         .expect("parsed");
-        assert_eq!(parsed.1, novarocks_sql::explain::ExplainLevel::Analyze);
+        assert_eq!(parsed.1, novarocks_sql::compiler::ExplainLevel::Analyze);
         assert!(parsed.2);
     }
 
@@ -3670,19 +3703,19 @@ mod tests {
             super::split_explain_logical_sql(" EXPLAIN LOGICAL SELECT * FROM t")
                 .expect("recognized");
         assert_eq!(rewritten, "EXPLAIN SELECT * FROM t");
-        assert_eq!(level, novarocks_sql::explain::ExplainLevel::Normal);
+        assert_eq!(level, novarocks_sql::compiler::ExplainLevel::Normal);
 
         let (rewritten, level) =
             super::split_explain_logical_sql("explain logical verbose select k from t")
                 .expect("recognized");
         assert_eq!(rewritten, "EXPLAIN select k from t");
-        assert_eq!(level, novarocks_sql::explain::ExplainLevel::Verbose);
+        assert_eq!(level, novarocks_sql::compiler::ExplainLevel::Verbose);
 
         let (rewritten, level) =
             super::split_explain_logical_sql("EXPLAIN\nLOGICAL\nSELECT k FROM t")
                 .expect("recognized");
         assert_eq!(rewritten, "EXPLAIN SELECT k FROM t");
-        assert_eq!(level, novarocks_sql::explain::ExplainLevel::Normal);
+        assert_eq!(level, novarocks_sql::compiler::ExplainLevel::Normal);
     }
 
     fn string_cell(result: &QueryResult, row: usize, col: usize) -> String {

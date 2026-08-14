@@ -24,7 +24,7 @@ use crate::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use std::collections::BTreeSet;
 
-pub(crate) use self::sql_shape::SqlMvSnapshotPin;
+pub use self::sql_shape::SqlMvSnapshotPin;
 use self::sql_shape::{
     branch_union_queries, pin_state_sql, prepare_projection_full_read_sql,
     prepare_union_projection_full_read_sql,
@@ -67,10 +67,10 @@ pub(crate) struct SqlMvFirstRefreshPlan {
     target_contract: MvFirstRefreshTargetContract,
     target_binding: SqlTableBindingId,
     root_distribution: RootDistributionRequirement,
-    artifact: SqlMvFirstRefreshArtifact,
+    artifact: SqlMvFirstRefreshPlanArtifact,
 }
 
-pub(crate) enum SqlMvFirstRefreshArtifact {
+pub(crate) enum SqlMvFirstRefreshPlanArtifact {
     Sql(MvFirstRefreshPhysicalSql),
     Logical {
         plan: LogicalPlanNode,
@@ -88,7 +88,7 @@ impl SqlMvFirstRefreshPlanner {
         let (artifact, root_hash_column) = match input.artifact {
             SqlMvFirstRefreshArtifactInput::Sql(sql) => {
                 let root_hash_column = sql.root_hash_column().to_string();
-                (SqlMvFirstRefreshArtifact::Sql(sql), root_hash_column)
+                (SqlMvFirstRefreshPlanArtifact::Sql(sql), root_hash_column)
             }
             SqlMvFirstRefreshArtifactInput::Logical {
                 plan,
@@ -101,7 +101,7 @@ impl SqlMvFirstRefreshPlanner {
                     );
                 }
                 (
-                    SqlMvFirstRefreshArtifact::Logical { plan, factory },
+                    SqlMvFirstRefreshPlanArtifact::Logical { plan, factory },
                     root_hash_column,
                 )
             }
@@ -138,7 +138,7 @@ impl SqlMvFirstRefreshPlan {
         &self.root_distribution
     }
 
-    pub(crate) fn into_artifact(self) -> SqlMvFirstRefreshArtifact {
+    pub(crate) fn into_artifact(self) -> SqlMvFirstRefreshPlanArtifact {
         self.artifact
     }
 }
@@ -179,6 +179,626 @@ pub(crate) struct MvFirstRefreshPhysicalSql {
     root_hash_column: String,
 }
 
+/// Move-only SQL source artifact for a first-refresh write.
+///
+/// Applications can retain and hand this value back to SQL, but cannot read
+/// its SQL text or obtain a logical/physical planner graph from it.
+pub struct SqlMvFirstRefreshArtifact(MvFirstRefreshPhysicalSql);
+
+impl SqlMvFirstRefreshArtifact {
+    fn from_physical(physical: MvFirstRefreshPhysicalSql) -> Self {
+        Self(physical)
+    }
+
+    pub fn root_hash_column(&self) -> &str {
+        self.0.root_hash_column()
+    }
+
+    fn sql(&self) -> &str {
+        self.0.sql()
+    }
+}
+
+/// Immutable application facts required to consume one opaque first-refresh
+/// source.  Connector handles, write leases, lifecycle state and wire payloads
+/// are deliberately absent.
+pub struct SqlMvFirstRefreshCompileContext<'a> {
+    pub current_catalog: Option<String>,
+    pub current_database: String,
+    pub optimizer_settings: crate::compiler::SessionOptimizerSettings,
+    pub environment: crate::compiler::SqlPlanningEnvironment,
+    pub catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
+    pub statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
+    pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    pub control: crate::compiler::SqlCompileControl,
+    pub sink: crate::planning::dml::DmlWritePlanInput,
+}
+
+/// Compile an opaque first-refresh source directly into a sealed connector
+/// write plan.  No raw SQL, logical plan, optimizer tree, or physical graph
+/// can cross this terminal boundary.
+pub fn compile_mv_first_refresh_connector_write(
+    artifact: SqlMvFirstRefreshArtifact,
+    context: SqlMvFirstRefreshCompileContext<'_>,
+) -> Result<crate::plan_read::DistributedPlan, String> {
+    let root_distribution = crate::compiler::RootDistributionRequirement::ShuffleOutputName(
+        artifact.root_hash_column().to_string(),
+    );
+    let settings = context.optimizer_settings.clone();
+    let request = crate::compiler::SqlCompileRequest::new(
+        crate::compiler::SqlStatementInput::Sql(artifact.sql().to_string()),
+        crate::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
+        crate::compiler::SqlSessionContext {
+            current_catalog: context.current_catalog,
+            current_database: context.current_database,
+            optimizer_settings: context.optimizer_settings,
+        },
+        context.environment,
+        context.catalog,
+        context.statistics,
+        context.functions,
+        None,
+        context.control,
+    );
+    crate::planning::dml::compile_connector_write_distributed_plan(request, context.sink, &settings)
+}
+
+/// Immutable inputs for the join-MV first-refresh terminal.  The snapshot is
+/// already sealed by the compiler facade; the query is syntax only, not a
+/// logical or physical planner graph.
+pub struct SqlMvJoinFirstRefreshCompileContext<'a> {
+    pub canonical_query: Box<sqlparser::ast::Query>,
+    pub rewrite_snapshot: crate::compiler::SqlImvRewriteSnapshotHandle,
+    pub expected_root_hash_column: String,
+    pub current_catalog: Option<String>,
+    pub current_database: String,
+    pub optimizer_settings: crate::compiler::SessionOptimizerSettings,
+    pub environment: crate::compiler::SqlPlanningEnvironment,
+    pub catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
+    pub statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
+    pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    pub control: crate::compiler::SqlCompileControl,
+    pub sink: crate::planning::dml::DmlWritePlanInput,
+}
+
+/// Compile the canonical join first-refresh query all the way to a sealed
+/// connector-write plan.  SQL alone creates the hidden join key, validates
+/// frozen lineage and physicalizes the resulting append projection.
+pub fn compile_join_first_refresh_connector_write(
+    context: SqlMvJoinFirstRefreshCompileContext<'_>,
+) -> Result<crate::plan_read::DistributedPlan, String> {
+    let snapshot = context.rewrite_snapshot.snapshot();
+    let root_hash_column = snapshot
+        .schema_contract
+        .target
+        .hidden_apply_key
+        .column_name
+        .clone();
+    if !root_hash_column.eq_ignore_ascii_case(&context.expected_root_hash_column) {
+        return Err(
+            "join first-refresh root hash column does not match the sealed target contract"
+                .to_string(),
+        );
+    }
+    let settings = context.optimizer_settings.clone();
+    let mut query = *context.canonical_query;
+    crate::planning::mv::strip_catalog_from_three_part_names(&mut query);
+    let request = plain_join_first_refresh_logical_request(
+        query,
+        context.current_catalog.clone(),
+        context.current_database.clone(),
+        context.optimizer_settings.clone(),
+        context.environment,
+        context.catalog,
+        context.statistics,
+        context.functions,
+        context.control.clone(),
+    );
+    let crate::compiler::SqlCompileOutput::Logical(logical) =
+        crate::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
+    else {
+        return Err(
+            "join first-refresh logical intent did not produce logical SQL facts".to_string(),
+        );
+    };
+    let (plan, factory) = build_join_first_refresh_append_logical_plan(
+        crate::planner::imv_rewrite::entrypoint::normalize_imv_rewrite_root_project(
+            logical.logical_plan,
+        ),
+        logical.factory,
+        snapshot,
+    )?;
+    let logical_request = crate::compiler::SqlCompileRequest::new_logical(
+        plan,
+        factory,
+        crate::compiler::SqlCompileIntent::IcebergWrite {
+            root_distribution: crate::compiler::RootDistributionRequirement::ShuffleOutputName(
+                root_hash_column,
+            ),
+        },
+        crate::compiler::SqlSessionContext {
+            current_catalog: context.current_catalog,
+            current_database: context.current_database,
+            optimizer_settings: context.optimizer_settings,
+        },
+        context.environment,
+        context.statistics,
+        context.control,
+    );
+    crate::planning::dml::compile_connector_write_distributed_plan(
+        logical_request,
+        context.sink,
+        &settings,
+    )
+}
+
+/// Deliberately builds a plain `LogicalOnly` request.  The sealed rewrite
+/// snapshot is consumed only after canonical planning to construct the join
+/// append descriptor; injecting it here would silently change the prior Core
+/// canonical-query semantics.
+fn plain_join_first_refresh_logical_request<'a>(
+    query: sqlparser::ast::Query,
+    current_catalog: Option<String>,
+    current_database: String,
+    optimizer_settings: crate::compiler::SessionOptimizerSettings,
+    environment: crate::compiler::SqlPlanningEnvironment,
+    catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
+    statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
+    functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    control: crate::compiler::SqlCompileControl,
+) -> crate::compiler::SqlCompileRequest<'a> {
+    crate::compiler::SqlCompileRequest::new(
+        crate::compiler::SqlStatementInput::ParsedQuery(Box::new(query)),
+        crate::compiler::SqlCompileIntent::LogicalOnly,
+        crate::compiler::SqlSessionContext {
+            current_catalog,
+            current_database,
+            optimizer_settings,
+        },
+        environment,
+        catalog,
+        statistics,
+        functions,
+        None,
+        control,
+    )
+}
+
+fn build_join_first_refresh_append_logical_plan(
+    plan: crate::planner::logical::LogicalPlanNode,
+    mut factory: crate::column_id::ColumnRefFactory,
+    snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
+) -> Result<
+    (
+        crate::planner::logical::LogicalPlanNode,
+        crate::column_id::ColumnRefFactory,
+    ),
+    String,
+> {
+    let (left, right) = join_base_snapshots(snapshot)?;
+    let crate::planner::logical::LogicalPlanNode {
+        kind, mut children, ..
+    } = plan;
+    let crate::planner::logical::LogicalPlanKind::Project(mut project) = kind else {
+        return Err("join first-refresh requires a root Project".to_string());
+    };
+    if children.len() != 1 {
+        return Err(format!(
+            "join first-refresh root Project expected one input, got {}",
+            children.len()
+        ));
+    }
+    let input = children.remove(0);
+    let payload_columns = project
+        .items
+        .iter()
+        .map(|item| crate::analysis::OutputColumn {
+            column_id: item.output_column_id,
+            name: item.output_name.clone(),
+            data_type: item.expr.data_type.clone(),
+            nullable: item.expr.nullable,
+            is_internal: false,
+        })
+        .collect::<Vec<_>>();
+    validate_join_payload(snapshot, &payload_columns)?;
+    let left_scan = find_unique_base_scan(&input, &left.table, "left")?;
+    let right_scan = find_unique_base_scan(&input, &right.table, "right")?;
+    let left_row_id = find_row_id_column(&left_scan, "left")?;
+    let right_row_id = find_row_id_column(&right_scan, "right")?;
+    let key_pairs = join_key_pairs(snapshot, &left.table, &right.table, &left_scan, &right_scan)?;
+    project.items.push(project_item(&left_row_id));
+    project.items.push(project_item(&right_row_id));
+    let input = crate::planner::logical::LogicalPlanNode::new(
+        crate::planner::logical::LogicalPlanKind::Project(project),
+        vec![input],
+        None,
+    );
+    reserve_factory_for_plan(&mut factory, &input)?;
+    let join_apply_key_id = factory.create(
+        None,
+        "__nova_join_row_key".to_string(),
+        arrow::datatypes::DataType::Utf8,
+        false,
+    );
+    let action_id = factory.create(
+        None,
+        crate::common::CHANGE_OP_COLUMN.to_string(),
+        arrow::datatypes::DataType::Int8,
+        false,
+    );
+    let join_apply_key = output_column(
+        join_apply_key_id,
+        "__nova_join_row_key",
+        arrow::datatypes::DataType::Utf8,
+        false,
+        true,
+    );
+    let action = output_column(
+        action_id,
+        crate::common::CHANGE_OP_COLUMN,
+        arrow::datatypes::DataType::Int8,
+        false,
+        true,
+    );
+    let descriptor = build_join_descriptor(
+        snapshot,
+        &left.table,
+        &right.table,
+        payload_columns,
+        left_row_id,
+        right_row_id,
+        action,
+        join_apply_key,
+        key_pairs,
+    )?;
+    descriptor
+        .validate()
+        .map_err(|error| format!("join first-refresh descriptor is invalid: {error}"))?;
+    let plan =
+        crate::planner::imv_rewrite::join_refresh_builder::build_join_apply_key_append_project(
+            input,
+            &descriptor,
+            &left.table_uuid,
+            &right.table_uuid,
+            join_apply_key_id.0,
+        )
+        .map_err(|error| format!("build join first-refresh append projection: {error}"))?;
+    reserve_factory_for_plan(&mut factory, &plan)?;
+    Ok((plan, factory))
+}
+
+fn join_base_snapshots(
+    snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
+) -> Result<
+    (
+        &crate::compiler::mv_rewrite::SqlImvBaseSnapshot,
+        &crate::compiler::mv_rewrite::SqlImvBaseSnapshot,
+    ),
+    String,
+> {
+    let predicate = snapshot
+        .schema_contract
+        .join
+        .as_ref()
+        .and_then(|join| join.predicates.first())
+        .ok_or_else(|| "join first-refresh snapshot has no join predicate facts".to_string())?;
+    let left = snapshot
+        .base_snapshots
+        .iter()
+        .find(|base| {
+            base.table
+                .fqn()
+                .eq_ignore_ascii_case(&predicate.left.table_fqn)
+        })
+        .ok_or_else(|| {
+            "join first-refresh left base is absent from the sealed snapshot".to_string()
+        })?;
+    let right = snapshot
+        .base_snapshots
+        .iter()
+        .find(|base| {
+            base.table
+                .fqn()
+                .eq_ignore_ascii_case(&predicate.right.table_fqn)
+        })
+        .ok_or_else(|| {
+            "join first-refresh right base is absent from the sealed snapshot".to_string()
+        })?;
+    if left.table.fqn().eq_ignore_ascii_case(&right.table.fqn()) {
+        return Err("join first-refresh requires distinct left and right bases".to_string());
+    }
+    Ok((left, right))
+}
+
+fn validate_join_payload(
+    snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
+    payload_columns: &[crate::analysis::OutputColumn],
+) -> Result<(), String> {
+    let expected = &snapshot.schema_contract.target.visible_columns;
+    if payload_columns.len() != expected.len() {
+        return Err(
+            "join first-refresh payload count does not match the sealed target contract"
+                .to_string(),
+        );
+    }
+    for (actual, expected) in payload_columns.iter().zip(expected) {
+        if !actual.name.eq_ignore_ascii_case(&expected.output_name) {
+            return Err(format!(
+                "join first-refresh payload column `{}` does not match target `{}`",
+                actual.name, expected.output_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct JoinBaseScan {
+    columns: Vec<crate::analysis::OutputColumn>,
+}
+
+fn find_unique_base_scan(
+    plan: &crate::planner::logical::LogicalPlanNode,
+    base: &novarocks_catalog::identifier::TableIdentity,
+    role: &str,
+) -> Result<JoinBaseScan, String> {
+    let mut scans = Vec::new();
+    collect_base_scans(plan, base, &mut scans);
+    match scans.as_slice() {
+        [scan] => Ok(scan.clone()),
+        [] => Err(format!(
+            "join first-refresh cannot find {role} base scan {}",
+            base.fqn()
+        )),
+        _ => Err(format!(
+            "join first-refresh found multiple {role} base scans {}",
+            base.fqn()
+        )),
+    }
+}
+
+fn collect_base_scans(
+    plan: &crate::planner::logical::LogicalPlanNode,
+    base: &novarocks_catalog::identifier::TableIdentity,
+    scans: &mut Vec<JoinBaseScan>,
+) {
+    if let crate::planner::logical::LogicalPlanKind::Scan(scan) = &plan.kind
+        && let crate::planner::table::ScanSource::Sql(source) = &scan.table.source
+        && source.table.catalog.eq_ignore_ascii_case(&base.catalog)
+        && source.table.namespace.eq_ignore_ascii_case(&base.namespace)
+        && source.table.table.eq_ignore_ascii_case(&base.table)
+    {
+        scans.push(JoinBaseScan {
+            columns: scan.columns.clone(),
+        });
+    }
+    for child in &plan.children {
+        collect_base_scans(child, base, scans);
+    }
+}
+
+fn find_row_id_column(
+    scan: &JoinBaseScan,
+    role: &str,
+) -> Result<crate::analysis::OutputColumn, String> {
+    let column = find_unique_column(
+        &scan.columns,
+        crate::common::ICEBERG_ROW_ID_COL,
+        &format!("{role} row-id"),
+    )?;
+    if column.data_type != arrow::datatypes::DataType::Int64 || column.nullable {
+        return Err(format!(
+            "join first-refresh {role} row-id has invalid shape"
+        ));
+    }
+    Ok(output_column(
+        column.column_id,
+        crate::common::ICEBERG_ROW_ID_COL,
+        arrow::datatypes::DataType::Int64,
+        false,
+        true,
+    ))
+}
+
+fn join_key_pairs(
+    snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
+    left: &novarocks_catalog::identifier::TableIdentity,
+    right: &novarocks_catalog::identifier::TableIdentity,
+    left_scan: &JoinBaseScan,
+    right_scan: &JoinBaseScan,
+) -> Result<Vec<crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair>, String>
+{
+    let join = snapshot
+        .schema_contract
+        .join
+        .as_ref()
+        .ok_or_else(|| "join first-refresh snapshot has no join contract".to_string())?;
+    join.predicates
+        .iter()
+        .map(|predicate| {
+            let (left_lineage, right_lineage) =
+                if predicate.left.table_fqn.eq_ignore_ascii_case(&left.fqn())
+                    && predicate.right.table_fqn.eq_ignore_ascii_case(&right.fqn())
+                {
+                    (&predicate.left, &predicate.right)
+                } else if predicate.left.table_fqn.eq_ignore_ascii_case(&right.fqn())
+                    && predicate.right.table_fqn.eq_ignore_ascii_case(&left.fqn())
+                {
+                    (&predicate.right, &predicate.left)
+                } else {
+                    return Err(
+                        "join first-refresh predicate does not align with sealed bases".to_string(),
+                    );
+                };
+            let left_name = base_field_name(snapshot, &left.fqn(), left_lineage.field_id)?;
+            let right_name = base_field_name(snapshot, &right.fqn(), right_lineage.field_id)?;
+            Ok(
+                crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair {
+                    left_column: find_unique_column(
+                        &left_scan.columns,
+                        &left_name,
+                        "left join key",
+                    )?,
+                    right_column: find_unique_column(
+                        &right_scan.columns,
+                        &right_name,
+                        "right join key",
+                    )?,
+                },
+            )
+        })
+        .collect()
+}
+
+fn base_field_name(
+    snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
+    table_fqn: &str,
+    field_id: i32,
+) -> Result<String, String> {
+    snapshot
+        .schema_contract
+        .bases
+        .iter()
+        .find(|base| base.table_fqn.eq_ignore_ascii_case(table_fqn))
+        .and_then(|base| base.fields.iter().find(|field| field.field_id == field_id))
+        .map(|field| field.name_at_create.clone())
+        .ok_or_else(|| {
+            format!(
+                "join first-refresh lineage references unknown base field {table_fqn}#{field_id}"
+            )
+        })
+}
+
+fn build_join_descriptor(
+    snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
+    left: &novarocks_catalog::identifier::TableIdentity,
+    right: &novarocks_catalog::identifier::TableIdentity,
+    payload_columns: Vec<crate::analysis::OutputColumn>,
+    left_row_id_column: crate::analysis::OutputColumn,
+    right_row_id_column: crate::analysis::OutputColumn,
+    action_column: crate::analysis::OutputColumn,
+    join_apply_key_column: crate::analysis::OutputColumn,
+    join_key_pairs: Vec<
+        crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair,
+    >,
+) -> Result<crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor, String> {
+    use crate::planner::imv_rewrite::join_refresh_descriptor as descriptor;
+    let mut output_mappings = payload_columns
+        .iter()
+        .map(|column| descriptor::JoinRefreshOutputMapping {
+            mv_output_column: column.clone(),
+            source: descriptor::JoinRefreshOutputSource::Payload(column.column_id),
+        })
+        .collect::<Vec<_>>();
+    output_mappings.push(descriptor::JoinRefreshOutputMapping {
+        mv_output_column: join_apply_key_column.clone(),
+        source: descriptor::JoinRefreshOutputSource::JoinApplyKey(join_apply_key_column.column_id),
+    });
+    output_mappings.push(descriptor::JoinRefreshOutputMapping {
+        mv_output_column: action_column.clone(),
+        source: descriptor::JoinRefreshOutputSource::Action(action_column.column_id),
+    });
+    Ok(descriptor::JoinRefreshDescriptor {
+        mode: descriptor::JoinRefreshMode::Full,
+        mv_identity: descriptor::JoinRefreshMvIdentity {
+            catalog: snapshot.target.catalog.clone(),
+            database: snapshot.target.namespace.clone(),
+            name: snapshot.target.table.clone(),
+        },
+        left_base_fqn: left.fqn(),
+        right_base_fqn: right.fqn(),
+        left_row_id_column,
+        right_row_id_column,
+        action_column,
+        join_apply_key_column,
+        payload_columns,
+        join_key_pairs,
+        output_mappings,
+        branches: Vec::new(),
+        needs_target_locator: false,
+    })
+}
+
+fn find_unique_column(
+    columns: &[crate::analysis::OutputColumn],
+    name: &str,
+    role: &str,
+) -> Result<crate::analysis::OutputColumn, String> {
+    let matches = columns
+        .iter()
+        .filter(|column| column.name.eq_ignore_ascii_case(name))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [column] => Ok((*column).clone()),
+        [] => Err(format!(
+            "join first-refresh cannot find {role} column {name}"
+        )),
+        _ => Err(format!(
+            "join first-refresh found multiple {role} columns named {name}"
+        )),
+    }
+}
+
+fn project_item(column: &crate::analysis::OutputColumn) -> crate::analysis::ProjectItem {
+    crate::analysis::ProjectItem {
+        expr: crate::analysis::TypedExpr {
+            kind: crate::analysis::ExprKind::ColumnRef {
+                column_id: column.column_id,
+                qualifier: None,
+                column: column.name.clone(),
+            },
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+        },
+        output_name: column.name.clone(),
+        output_column_id: column.column_id,
+    }
+}
+
+fn output_column(
+    column_id: crate::column_id::ColumnId,
+    name: &str,
+    data_type: arrow::datatypes::DataType,
+    nullable: bool,
+    is_internal: bool,
+) -> crate::analysis::OutputColumn {
+    crate::analysis::OutputColumn {
+        column_id,
+        name: name.to_string(),
+        data_type,
+        nullable,
+        is_internal,
+    }
+}
+
+fn reserve_factory_for_plan(
+    factory: &mut crate::column_id::ColumnRefFactory,
+    plan: &crate::planner::logical::LogicalPlanNode,
+) -> Result<(), String> {
+    let mut max_id = crate::planner::plan_output_columns(plan)?
+        .iter()
+        .map(|column| column.column_id.0)
+        .max()
+        .unwrap_or(0);
+    for child in &plan.children {
+        max_id = max_id.max(max_plan_column_id(child)?);
+    }
+    factory.reserve_until(max_id.saturating_add(1));
+    Ok(())
+}
+
+fn max_plan_column_id(plan: &crate::planner::logical::LogicalPlanNode) -> Result<u32, String> {
+    let mut max_id = crate::planner::plan_output_columns(plan)?
+        .iter()
+        .map(|column| column.column_id.0)
+        .max()
+        .unwrap_or(0);
+    for child in &plan.children {
+        max_id = max_id.max(max_plan_column_id(child)?);
+    }
+    Ok(max_id)
+}
+
 impl MvFirstRefreshPhysicalSql {
     pub(crate) fn sql(&self) -> &str {
         &self.sql
@@ -206,8 +826,13 @@ pub(crate) enum MvFirstRefreshShape {
 /// Target facts frozen before a first-refresh writer is admitted.  It carries
 /// Arrow schema and field identities, never an Iceberg table/client or a
 /// provider decoder.
+/// Opaque, value-only target facts for first-refresh SQL shaping.
+///
+/// This is deliberately not an IMV planner graph: Core may construct it from
+/// already frozen target facts, but it contains neither provider authority nor
+/// a mutable planner tree.
 #[derive(Clone)]
-pub(crate) struct MvFirstRefreshTargetContract {
+pub struct MvFirstRefreshTargetContract {
     schema: SchemaRef,
     field_ids: Vec<i32>,
     partition_spec_id: i32,
@@ -215,7 +840,7 @@ pub(crate) struct MvFirstRefreshTargetContract {
 }
 
 impl MvFirstRefreshTargetContract {
-    pub(crate) fn try_new(
+    pub fn try_new(
         schema: SchemaRef,
         field_ids: Vec<i32>,
         partition_spec_id: i32,
@@ -238,19 +863,19 @@ impl MvFirstRefreshTargetContract {
         })
     }
 
-    pub(crate) fn schema(&self) -> &SchemaRef {
+    pub fn schema(&self) -> &SchemaRef {
         &self.schema
     }
 
-    pub(crate) fn field_ids(&self) -> &[i32] {
+    pub fn field_ids(&self) -> &[i32] {
         &self.field_ids
     }
 
-    pub(crate) const fn partition_spec_id(&self) -> i32 {
+    pub const fn partition_spec_id(&self) -> i32 {
         self.partition_spec_id
     }
 
-    pub(crate) fn hidden_hash_key(&self) -> &str {
+    pub fn hidden_hash_key(&self) -> &str {
         &self.hidden_hash_key
     }
 
@@ -290,12 +915,14 @@ pub(crate) fn prepare_projection_first_refresh_write_sql(
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<MvFirstRefreshPhysicalSql, String> {
+) -> Result<SqlMvFirstRefreshArtifact, String> {
     let sql = prepare_projection_full_read_sql(select_sql, pin, current_catalog, current_database)?;
-    Ok(MvFirstRefreshPhysicalSql {
-        sql,
-        root_hash_column: crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
-    })
+    Ok(SqlMvFirstRefreshArtifact::from_physical(
+        MvFirstRefreshPhysicalSql {
+            sql,
+            root_hash_column: crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+        },
+    ))
 }
 
 pub(crate) fn prepare_union_projection_first_refresh_write_sql(
@@ -304,7 +931,7 @@ pub(crate) fn prepare_union_projection_first_refresh_write_sql(
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<MvFirstRefreshPhysicalSql, String> {
+) -> Result<SqlMvFirstRefreshArtifact, String> {
     let sql = prepare_union_projection_full_read_sql(
         select_sql,
         branch_count,
@@ -312,10 +939,12 @@ pub(crate) fn prepare_union_projection_first_refresh_write_sql(
         current_catalog,
         current_database,
     )?;
-    Ok(MvFirstRefreshPhysicalSql {
-        sql,
-        root_hash_column: crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
-    })
+    Ok(SqlMvFirstRefreshArtifact::from_physical(
+        MvFirstRefreshPhysicalSql {
+            sql,
+            root_hash_column: crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+        },
+    ))
 }
 
 pub(crate) fn prepare_aggregate_first_refresh_write_sql(
@@ -324,7 +953,7 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql(
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<MvFirstRefreshPhysicalSql, String> {
+) -> Result<SqlMvFirstRefreshArtifact, String> {
     prepare_aggregate_first_refresh_write_sql_with_target_schema(
         select_sql,
         calls,
@@ -342,7 +971,7 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema(
     current_catalog: Option<&str>,
     current_database: &str,
     target_schema: Option<&Schema>,
-) -> Result<MvFirstRefreshPhysicalSql, String> {
+) -> Result<SqlMvFirstRefreshArtifact, String> {
     prepare_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
         select_sql,
         calls,
@@ -362,7 +991,7 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema_and_i
     current_database: &str,
     target_schema: Option<&Schema>,
     aggregate_input_types: Option<&[Option<DataType>]>,
-) -> Result<MvFirstRefreshPhysicalSql, String> {
+) -> Result<SqlMvFirstRefreshArtifact, String> {
     let state_sql = prepare_aggregate_first_refresh_state_sql(
         select_sql,
         calls,
@@ -370,16 +999,18 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema_and_i
         current_catalog,
         current_database,
     )?;
-    Ok(MvFirstRefreshPhysicalSql {
-        sql: aggregate_physical_sql(
-            &state_sql,
-            calls,
-            None,
-            target_schema,
-            aggregate_input_types,
-        )?,
-        root_hash_column: SQL_MV_ROW_ID_COLUMN.to_string(),
-    })
+    Ok(SqlMvFirstRefreshArtifact::from_physical(
+        MvFirstRefreshPhysicalSql {
+            sql: aggregate_physical_sql(
+                &state_sql,
+                calls,
+                None,
+                target_schema,
+                aggregate_input_types,
+            )?,
+            root_hash_column: SQL_MV_ROW_ID_COLUMN.to_string(),
+        },
+    ))
 }
 
 /// Fan-in aggregate first refresh uses the same state-shaped physical project
@@ -392,7 +1023,7 @@ pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql(
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<MvFirstRefreshPhysicalSql, String> {
+) -> Result<SqlMvFirstRefreshArtifact, String> {
     prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema(
         select_sql,
         calls,
@@ -410,7 +1041,7 @@ pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schem
     current_catalog: Option<&str>,
     current_database: &str,
     target_schema: Option<&Schema>,
-) -> Result<MvFirstRefreshPhysicalSql, String> {
+) -> Result<SqlMvFirstRefreshArtifact, String> {
     prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
         select_sql,
         calls,
@@ -430,7 +1061,7 @@ pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schem
     current_database: &str,
     target_schema: Option<&Schema>,
     aggregate_input_types: Option<&[Option<DataType>]>,
-) -> Result<MvFirstRefreshPhysicalSql, String> {
+) -> Result<SqlMvFirstRefreshArtifact, String> {
     prepare_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
         select_sql,
         calls,
@@ -452,7 +1083,7 @@ pub(crate) fn prepare_composed_aggregate_first_refresh_write_sql(
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<MvFirstRefreshPhysicalSql, String> {
+) -> Result<SqlMvFirstRefreshArtifact, String> {
     prepare_aggregate_first_refresh_write_sql(
         select_sql,
         calls,
@@ -469,7 +1100,7 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql(
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<MvFirstRefreshPhysicalSql, String> {
+) -> Result<SqlMvFirstRefreshArtifact, String> {
     prepare_branch_union_aggregate_first_refresh_write_sql_with_target_schema(
         select_sql,
         branch_count,
@@ -489,7 +1120,7 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql_with_target
     current_catalog: Option<&str>,
     current_database: &str,
     target_schema: Option<&Schema>,
-) -> Result<MvFirstRefreshPhysicalSql, String> {
+) -> Result<SqlMvFirstRefreshArtifact, String> {
     let branches = prepare_branch_union_aggregate_first_refresh_state_sqls(
         select_sql,
         branch_count,
@@ -510,10 +1141,12 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql_with_target
         })
         .collect::<Result<Vec<_>, _>>()?
         .join(" UNION ALL ");
-    Ok(MvFirstRefreshPhysicalSql {
-        sql,
-        root_hash_column: SQL_MV_ROW_ID_COLUMN.to_string(),
-    })
+    Ok(SqlMvFirstRefreshArtifact::from_physical(
+        MvFirstRefreshPhysicalSql {
+            sql,
+            root_hash_column: SQL_MV_ROW_ID_COLUMN.to_string(),
+        },
+    ))
 }
 
 fn prepare_aggregate_first_refresh_state_sql(
@@ -771,7 +1404,7 @@ fn quote_sql_identifier(identifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
-    use std::num::{NonZeroU32, NonZeroU64};
+    use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
     use std::sync::Arc;
 
     use super::*;
@@ -797,6 +1430,61 @@ mod tests {
         .expect("valid SQL target contract")
     }
 
+    struct CanonicalCatalog;
+
+    impl crate::compiler::SqlCatalogSnapshot for CanonicalCatalog {
+        fn planner_table_provider(&self) -> &dyn crate::catalog::PlannerTableProvider {
+            panic!("plain canonical request construction must not resolve a catalog")
+        }
+    }
+
+    struct CanonicalFunctions;
+
+    impl crate::compiler::SqlFunctionCatalog for CanonicalFunctions {
+        fn resolve_scalar_signature(
+            &self,
+            _name: &str,
+            _arg_types: &[arrow::datatypes::DataType],
+        ) -> Result<crate::functions::ResolvedScalarFunction, crate::functions::ResolveError>
+        {
+            panic!("plain canonical request construction must not resolve functions")
+        }
+
+        fn volatility(&self, _name: &str) -> crate::functions::FunctionVolatility {
+            panic!("plain canonical request construction must not resolve functions")
+        }
+    }
+
+    #[test]
+    fn join_first_refresh_canonical_request_avoids_imv_rewrite_and_terminal_is_sealed() {
+        let statement =
+            crate::parser::parse_normalized_sql_raw("SELECT 1").expect("parse canonical query");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("fixture must be a query");
+        };
+        let catalog = CanonicalCatalog;
+        let statistics = crate::planning::dml::DmlStatisticsSnapshot::empty();
+        let functions = CanonicalFunctions;
+        let request = plain_join_first_refresh_logical_request(
+            *query,
+            None,
+            "db".to_string(),
+            crate::compiler::SessionOptimizerSettings::default(),
+            crate::compiler::SqlPlanningEnvironment::Distributed {
+                backend_count: NonZeroUsize::new(1).expect("non-zero"),
+            },
+            &catalog,
+            &statistics,
+            &functions,
+            crate::compiler::SqlCompileControl::unbounded(),
+        );
+        assert!(request.imv_rewrite.is_none());
+        let _: fn(
+            SqlMvJoinFirstRefreshCompileContext<'_>,
+        ) -> Result<crate::plan_read::DistributedPlan, String> =
+            compile_join_first_refresh_connector_write;
+    }
+
     #[test]
     fn sqlx2_mv_first_refresh_plan_is_sql_only_and_binding_scoped() {
         let plan = SqlMvFirstRefreshPlanner::plan(SqlMvFirstRefreshPlannerInput {
@@ -818,7 +1506,7 @@ mod tests {
         assert_eq!(plan.target_contract().hidden_hash_key(), "__apply_key__");
         assert!(matches!(
             plan.into_artifact(),
-            SqlMvFirstRefreshArtifact::Sql(_)
+            SqlMvFirstRefreshPlanArtifact::Sql(_)
         ));
     }
 

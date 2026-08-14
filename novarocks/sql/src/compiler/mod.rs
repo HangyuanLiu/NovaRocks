@@ -30,7 +30,18 @@ use std::time::Instant;
 pub use crate::explain::ExplainLevel;
 pub use crate::functions::builtin_sql_function_catalog;
 pub use crate::optimizer::options::SessionOptimizerSettings;
-pub use mv_rewrite::MvRewriteDefinitionIndex;
+pub use mv_rewrite::{
+    MvRewriteDefinitionIndex, SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
+    SqlImvAggregateExecutionStateColumnFacts, SqlImvAggregateStateColumnFacts,
+    SqlImvAggregateStateRoleFacts, SqlImvAggregateVisibleColumnFacts, SqlImvApplyKeySourceFacts,
+    SqlImvBaseContractFacts, SqlImvBaseFieldFacts, SqlImvBaseSnapshotFacts,
+    SqlImvBranchContractFacts, SqlImvExpressionFacts, SqlImvExpressionKindFacts,
+    SqlImvJoinContractFacts, SqlImvJoinKindFacts, SqlImvJoinPredicateFacts,
+    SqlImvOutputColumnFacts, SqlImvPartitionFacts, SqlImvPartitionFieldFacts,
+    SqlImvPartitionTransformFacts, SqlImvQualifiedFieldFacts, SqlImvRefreshHistoryFacts,
+    SqlImvRewriteSnapshotBuilder, SqlImvRewriteSnapshotHandle, SqlImvSchemaContractFacts,
+    SqlImvTargetColumnsFacts, SqlImvTargetContractFacts, SqlImvTargetVisibleColumnFacts,
+};
 
 /// SQL's read-only observation of statement cancellation.
 ///
@@ -139,7 +150,7 @@ impl SqlStatisticsSnapshot for crate::planning::dml::DmlStatisticsSnapshot {
 /// application admission, not a callback that can re-enter application code
 /// while the compiler is running.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SqlImvRewriteValidation {
+pub enum SqlImvRewriteValidation {
     None,
     Aggregate,
     JoinAggregate,
@@ -150,20 +161,21 @@ pub(crate) enum SqlImvRewriteValidation {
 /// rewrite pipeline and its validation; application provides only the exact
 /// immutable refresh facts captured for this statement.
 #[derive(Clone)]
-pub(crate) struct SqlImvPlanningInput {
-    pub(crate) snapshot: Arc<mv_rewrite::SqlImvRewriteSnapshot>,
+pub struct SqlImvPlanningInput {
+    snapshot: SqlImvRewriteSnapshotHandle,
     pub(crate) validation: SqlImvRewriteValidation,
 }
 
 impl SqlImvPlanningInput {
-    pub(crate) fn new(
-        snapshot: Arc<mv_rewrite::SqlImvRewriteSnapshot>,
-        validation: SqlImvRewriteValidation,
-    ) -> Self {
+    pub fn new(snapshot: SqlImvRewriteSnapshotHandle, validation: SqlImvRewriteValidation) -> Self {
         Self {
             snapshot,
             validation,
         }
+    }
+
+    pub(crate) fn snapshot(&self) -> &Arc<mv_rewrite::SqlImvRewriteSnapshot> {
+        self.snapshot.snapshot()
     }
 }
 
@@ -560,7 +572,7 @@ impl SqlCompiler {
                         crate::planner::imv_rewrite::entrypoint::normalize_imv_rewrite_root_project(
                             logical_plan,
                         ),
-                    snapshot: Arc::clone(&input.snapshot),
+                    snapshot: Arc::clone(input.snapshot()),
                     disabled_rules: settings.disabled_rules.clone(),
                     deadline: request.deadline(),
                     column_ref_factory: std::rc::Rc::clone(&factory_cell),
@@ -718,7 +730,7 @@ pub(crate) fn validate_imv_rewrite_outcome(
     input: &SqlImvPlanningInput,
     outcome: &crate::planner::imv_rewrite::entrypoint::ImvRewriteOutcome,
 ) -> Result<(), SqlCompileError> {
-    let target = input.snapshot.target.fqn();
+    let target = input.snapshot().target.fqn();
     let rule_changed = |rule_name: &str| {
         outcome.trace.events().iter().any(|event| {
             matches!(
@@ -1078,7 +1090,7 @@ mod tests {
     #[test]
     fn sqlx2_kernel_rejects_missing_aggregate_rewrite_evidence() {
         let input = SqlImvPlanningInput::new(
-            crate::compiler::mv_rewrite::test_incremental_snapshot(),
+            crate::compiler::mv_rewrite::test_incremental_snapshot_handle(),
             SqlImvRewriteValidation::Aggregate,
         );
         let outcome = crate::planner::imv_rewrite::entrypoint::ImvRewriteOutcome {

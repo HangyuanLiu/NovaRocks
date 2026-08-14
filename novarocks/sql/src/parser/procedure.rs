@@ -25,14 +25,14 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ProcedureArgMode {
+pub enum ProcedureArgMode {
     Named,
     Positional,
     Empty,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum ProcedureArgValue {
+pub enum ProcedureArgValue {
     String(String),
     Boolean(bool),
     Integer(i64),
@@ -42,21 +42,21 @@ pub(crate) enum ProcedureArgValue {
 }
 
 impl ProcedureArgValue {
-    pub(crate) fn as_string(&self) -> Option<&str> {
+    pub fn as_string(&self) -> Option<&str> {
         match self {
             ProcedureArgValue::String(value) => Some(value),
             _ => None,
         }
     }
 
-    pub(crate) fn as_bool(&self) -> Option<bool> {
+    pub fn as_bool(&self) -> Option<bool> {
         match self {
             ProcedureArgValue::Boolean(value) => Some(*value),
             _ => None,
         }
     }
 
-    pub(crate) fn as_string_map(&self) -> Option<&BTreeMap<String, String>> {
+    pub fn as_string_map(&self) -> Option<&BTreeMap<String, String>> {
         match self {
             ProcedureArgValue::StringMap(value) => Some(value),
             _ => None,
@@ -65,22 +65,22 @@ impl ProcedureArgValue {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ProcedureArg {
-    pub(crate) name: Option<String>,
-    pub(crate) value: ProcedureArgValue,
+pub struct ProcedureArg {
+    pub name: Option<String>,
+    pub value: ProcedureArgValue,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct CallProcedureStmt {
-    pub(crate) catalog: String,
-    pub(crate) namespace: String,
-    pub(crate) procedure: String,
-    pub(crate) args: Vec<ProcedureArg>,
-    pub(crate) mode: ProcedureArgMode,
+pub struct CallProcedureStmt {
+    pub catalog: String,
+    pub namespace: String,
+    pub procedure: String,
+    pub args: Vec<ProcedureArg>,
+    pub mode: ProcedureArgMode,
 }
 
 impl CallProcedureStmt {
-    pub(crate) fn arg(&self, name: &str) -> Option<&ProcedureArgValue> {
+    pub fn arg(&self, name: &str) -> Option<&ProcedureArgValue> {
         let normalized = normalize_procedure_identifier(name).ok()?;
         self.args.iter().find_map(|arg| {
             if arg.name.as_deref() == Some(normalized.as_str()) {
@@ -114,7 +114,7 @@ fn normalize_procedure_identifier(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_ascii_lowercase())
 }
 
-pub(crate) fn looks_like_call_procedure(sql: &str) -> bool {
+pub fn looks_like_call_procedure(sql: &str) -> bool {
     let Ok(normalized) = crate::parser::dialect::normalize_for_raw_parse(sql) else {
         return false;
     };
@@ -124,7 +124,7 @@ pub(crate) fn looks_like_call_procedure(sql: &str) -> bool {
     parser.parse_keyword(Keyword::CALL)
 }
 
-pub(crate) fn parse_call_procedure_sql(sql: &str) -> Result<CallProcedureStmt, String> {
+pub fn parse_call_procedure_sql(sql: &str) -> Result<CallProcedureStmt, String> {
     let mut parser = Parser::new(&StarRocksDialect)
         .try_with_sql(sql)
         .map_err(|e| format!("parse CALL procedure: {e}"))?;

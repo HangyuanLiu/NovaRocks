@@ -66,8 +66,12 @@ impl IcebergMetadataTableProvider for PlannerMemoryCatalog {
         database: &str,
         table: &str,
         _metadata_table_type: crate::planner::table::SqlMetadataTableKind,
-    ) -> Result<TableDef, String> {
-        self.get(database, table)
+    ) -> Result<ResolvedAnalyzerTable, String> {
+        Ok(ResolvedAnalyzerTable::from_planner(
+            Some(DEFAULT_CATALOG),
+            database,
+            self.get(database, table)?,
+        ))
     }
 }
 

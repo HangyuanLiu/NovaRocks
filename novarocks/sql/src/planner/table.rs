@@ -94,10 +94,25 @@ pub enum SqlScanKind {
 /// separate from an application catalog handle so the optimizer can reason
 /// about identity without being able to reach a provider.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SqlTableIdentity {
+pub struct SqlTableIdentity {
     pub(crate) catalog: String,
     pub(crate) namespace: String,
     pub(crate) table: String,
+}
+
+impl SqlTableIdentity {
+    /// Construct immutable table identity facts for a request-local SQL
+    /// binding. This contains no catalog or connector handle.
+    pub fn try_new(catalog: String, namespace: String, table: String) -> Result<Self, String> {
+        if catalog.is_empty() || namespace.is_empty() || table.is_empty() {
+            return Err("SQL table identity is incomplete".to_string());
+        }
+        Ok(Self {
+            catalog,
+            namespace,
+            table,
+        })
+    }
 }
 
 /// Immutable SQL facts that make UK/FK rewrites sound for one admitted table

@@ -643,6 +643,13 @@ fn prepare_frontend_first_refresh_write(
         }
     };
     let target_arrow_schema = target_binding.physical_write_schema()?.as_ref().clone();
+    let target_write_fields = Arc::<[arrow::datatypes::Field]>::from(
+        target_arrow_schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>(),
+    );
     let target_field_ids = target_binding.observation().field_ids().to_vec();
     let observed_spec_id = target_binding.partition().target_spec_id;
     let partition_spec_id = schema_contract
@@ -745,7 +752,6 @@ fn prepare_frontend_first_refresh_write(
         )?;
         let request = crate::mv::application::MvFirstRefreshWriteRequest::try_new(
             definition.select_sql.clone(),
-            novarocks_sql::mv_refresh::first_refresh::MvFirstRefreshShape::Join,
             target.catalog,
             target.namespace,
             target.table,
@@ -754,7 +760,7 @@ fn prepare_frontend_first_refresh_write(
             current_database.to_string(),
             expected_target_snapshot_id,
             table,
-            target_contract,
+            Arc::clone(&target_write_fields),
             observed_binding,
             attempt.write_operation_id,
         )?;
@@ -774,7 +780,7 @@ fn prepare_frontend_first_refresh_write(
         });
     }
     let sql_pin = sql_first_refresh_snapshot_pin(&pin)?;
-    let (shape, physical_sql) = if capabilities.has_agg_state {
+    let physical_sql = if capabilities.has_agg_state {
         // A branch UNION ALL has no top-level GROUP BY. Its aggregate-state
         // layout is defined by the first branch and CREATE-time validation
         // guarantees the remaining branches share that layout.
@@ -806,9 +812,7 @@ fn prepare_frontend_first_refresh_write(
         // application boundary; no SQL module receives the legacy MV shape.
         let sql_calls = sql_first_refresh_aggregate_calls(&calls);
         if let Some(branch) = &schema_contract.branch {
-            (
-                novarocks_sql::mv_refresh::first_refresh::MvFirstRefreshShape::BranchUnionAggregate,
-                novarocks_sql::mv_refresh::first_refresh::prepare_branch_union_aggregate_first_refresh_write_sql_with_target_schema(
+            novarocks_sql::mv_refresh::first_refresh::prepare_branch_union_aggregate_first_refresh_write_sql_with_target_schema(
                     &definition.select_sql,
                     branch.branch_count as usize,
                     &sql_calls,
@@ -816,12 +820,9 @@ fn prepare_frontend_first_refresh_write(
                     current_catalog,
                     current_database,
                     Some(target_contract.schema()),
-                )?,
-            )
+                )?
         } else if !schema_contract.bases.is_empty() {
-            (
-                novarocks_sql::mv_refresh::first_refresh::MvFirstRefreshShape::FanInAggregate,
-                novarocks_sql::mv_refresh::first_refresh::prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
+            novarocks_sql::mv_refresh::first_refresh::prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
                     &definition.select_sql,
                     &sql_calls,
                     &sql_pin,
@@ -829,12 +830,9 @@ fn prepare_frontend_first_refresh_write(
                     current_database,
                     Some(target_contract.schema()),
                     Some(&aggregate_layout.aggregate_input_types),
-                )?,
-            )
+                )?
         } else {
-            (
-                novarocks_sql::mv_refresh::first_refresh::MvFirstRefreshShape::Aggregate,
-                novarocks_sql::mv_refresh::first_refresh::prepare_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
+            novarocks_sql::mv_refresh::first_refresh::prepare_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
                     &definition.select_sql,
                     &sql_calls,
                     &sql_pin,
@@ -842,30 +840,23 @@ fn prepare_frontend_first_refresh_write(
                     current_database,
                     Some(target_contract.schema()),
                     Some(&aggregate_layout.aggregate_input_types),
-                )?,
-            )
+                )?
         }
     } else if let Some(branch) = &schema_contract.branch {
-        (
-            novarocks_sql::mv_refresh::first_refresh::MvFirstRefreshShape::UnionProjection,
-            novarocks_sql::mv_refresh::first_refresh::prepare_union_projection_first_refresh_write_sql(
-                &definition.select_sql,
-                branch.branch_count as usize,
-                &sql_pin,
-                current_catalog,
-                current_database,
-            )?,
-        )
+        novarocks_sql::mv_refresh::first_refresh::prepare_union_projection_first_refresh_write_sql(
+            &definition.select_sql,
+            branch.branch_count as usize,
+            &sql_pin,
+            current_catalog,
+            current_database,
+        )?
     } else {
-        (
-            novarocks_sql::mv_refresh::first_refresh::MvFirstRefreshShape::Projection,
-            novarocks_sql::mv_refresh::first_refresh::prepare_projection_first_refresh_write_sql(
-                &definition.select_sql,
-                &sql_pin,
-                current_catalog,
-                current_database,
-            )?,
-        )
+        novarocks_sql::mv_refresh::first_refresh::prepare_projection_first_refresh_write_sql(
+            &definition.select_sql,
+            &sql_pin,
+            current_catalog,
+            current_database,
+        )?
     };
     let table = first_refresh_target_handle(
         retained_repartition_target.map(|retained| retained.binding.handle()),
@@ -875,7 +866,6 @@ fn prepare_frontend_first_refresh_write(
     )?;
     let request = crate::mv::application::MvFirstRefreshWriteRequest::try_new(
         definition.select_sql,
-        shape,
         target.catalog,
         target.namespace,
         target.table,
@@ -884,7 +874,7 @@ fn prepare_frontend_first_refresh_write(
         current_database.to_string(),
         expected_target_snapshot_id,
         table,
-        target_contract,
+        target_write_fields,
         observed_binding,
         attempt.write_operation_id,
     )?;

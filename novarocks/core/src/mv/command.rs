@@ -22,6 +22,10 @@ use std::sync::Arc;
 use crate::query_execution::StatementResult;
 use crate::query_execution::kernels::MvExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
+use novarocks_sql::syntax::{
+    AlterMaterializedViewAction, AlterMaterializedViewStmt, MvAdmittedStatement, ObjectName,
+    RefreshMaterializedViewStmt, parse_call_procedure_sql, parse_mv_admitted_statement,
+};
 
 #[derive(Clone)]
 pub struct MvCommandExecutor {
@@ -44,7 +48,7 @@ impl MvCommandExecutor {
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &QueryExecutionContext,
     ) -> Result<Option<StatementResult>, String> {
-        let normalized = novarocks_sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
         if let Some(parsed) = parse_explain_refresh_materialized_view(&normalized) {
             let (statement, level, analyze) = parsed?;
             if analyze {
@@ -70,9 +74,8 @@ impl MvCommandExecutor {
             .map(StatementResult::Query)
             .map(Some);
         }
-        if novarocks_sql::parser::procedure::looks_like_call_procedure(&normalized) {
-            let statement =
-                novarocks_sql::parser::procedure::parse_call_procedure_sql(&normalized)?;
+        if novarocks_sql::syntax::looks_like_call_procedure(&normalized) {
+            let statement = parse_call_procedure_sql(&normalized)?;
             if statement.procedure == crate::mv::stateless_rebuild::PROCEDURE_NAME {
                 return crate::mv::stateless_rebuild::execute_novarocks_imv_stateless_rebuild(
                     self.kernel.connector_control().as_ref(),
@@ -85,38 +88,31 @@ impl MvCommandExecutor {
                 .map(Some);
             }
         }
-        let mut statements = match novarocks_sql::parser::parse_sql(&normalized) {
-            Ok(statements) => statements,
+        let statement = match parse_mv_admitted_statement(&normalized) {
+            Ok(statement) => statement,
             Err(_) => return Ok(None),
         };
-        if statements.len() != 1 {
-            return Err("MV command accepts exactly one statement".to_string());
-        }
-        match statements.pop().expect("one checked statement") {
-            novarocks_sql::parser::ast::Statement::CreateMaterializedView(statement) => {
-                crate::mv::flow::create_mv_with_kernel(
-                    &self.kernel,
-                    current_catalog,
-                    current_database,
-                    &statement,
-                    connector_context,
-                )
-                .map(Some)
-            }
-            novarocks_sql::parser::ast::Statement::DropMaterializedView(statement) => {
-                crate::mv::flow::drop_mv_with_kernel(
-                    &self.kernel,
-                    current_catalog,
-                    current_database,
-                    &statement,
-                    connector_context,
-                )
-                .map(Some)
-            }
-            novarocks_sql::parser::ast::Statement::AlterMaterializedView(statement)
+        match statement {
+            MvAdmittedStatement::Create(statement) => crate::mv::flow::create_mv_with_kernel(
+                &self.kernel,
+                current_catalog,
+                current_database,
+                &statement,
+                connector_context,
+            )
+            .map(Some),
+            MvAdmittedStatement::Drop(statement) => crate::mv::flow::drop_mv_with_kernel(
+                &self.kernel,
+                current_catalog,
+                current_database,
+                &statement,
+                connector_context,
+            )
+            .map(Some),
+            MvAdmittedStatement::Alter(statement)
                 if !matches!(
                     &statement.action,
-                    novarocks_sql::parser::ast::AlterMaterializedViewAction::Repartition(_)
+                    AlterMaterializedViewAction::Repartition(_)
                 ) =>
             {
                 crate::mv::flow::alter_mv_with_kernel(
@@ -128,7 +124,7 @@ impl MvCommandExecutor {
                 )
                 .map(Some)
             }
-            novarocks_sql::parser::ast::Statement::AlterMaterializedView(statement) => self
+            MvAdmittedStatement::Alter(statement) => self
                 .execute_repartition(
                     current_catalog,
                     current_database,
@@ -137,7 +133,7 @@ impl MvCommandExecutor {
                     execution,
                 )
                 .map(Some),
-            novarocks_sql::parser::ast::Statement::RefreshMaterializedView(statement) => self
+            MvAdmittedStatement::Refresh(statement) => self
                 .execute_refresh(
                     current_catalog,
                     current_database,
@@ -146,11 +142,10 @@ impl MvCommandExecutor {
                     execution,
                 )
                 .map(Some),
-            novarocks_sql::parser::ast::Statement::ShowMaterializedViews(statement) => {
+            MvAdmittedStatement::Show(statement) => {
                 crate::mv::flow::list_mvs_with_kernel(&self.kernel, current_catalog, &statement)
                     .map(Some)
             }
-            _ => Ok(None),
         }
     }
 
@@ -168,13 +163,11 @@ impl MvCommandExecutor {
         &self,
         current_catalog: Option<&str>,
         current_database: &str,
-        statement: &novarocks_sql::parser::ast::AlterMaterializedViewStmt,
+        statement: &AlterMaterializedViewStmt,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &QueryExecutionContext,
     ) -> Result<StatementResult, String> {
-        let novarocks_sql::parser::ast::AlterMaterializedViewAction::Repartition(fields) =
-            &statement.action
-        else {
+        let AlterMaterializedViewAction::Repartition(fields) = &statement.action else {
             return Err("MV repartition executor received a non-repartition action".to_string());
         };
         let target = crate::mv::iceberg_refresh::resolve_refresh_target(
@@ -187,7 +180,7 @@ impl MvCommandExecutor {
             database: target.namespace,
             name: target.table,
         };
-        let refresh_statement = novarocks_sql::parser::ast::RefreshMaterializedViewStmt {
+        let refresh_statement = RefreshMaterializedViewStmt {
             name: statement.name.clone(),
             full: false,
         };
@@ -220,7 +213,7 @@ impl MvCommandExecutor {
         &self,
         current_catalog: Option<&str>,
         current_database: &str,
-        statement: &novarocks_sql::parser::ast::RefreshMaterializedViewStmt,
+        statement: &RefreshMaterializedViewStmt,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &QueryExecutionContext,
     ) -> Result<StatementResult, String> {
@@ -252,8 +245,8 @@ impl MvCommandExecutor {
             let target_catalog = target.catalog.clone();
             let target_database = target.database.clone();
             let target_name = target.name.clone();
-            let step_statement = novarocks_sql::parser::ast::RefreshMaterializedViewStmt {
-                name: novarocks_sql::parser::ast::ObjectName {
+            let step_statement = RefreshMaterializedViewStmt {
+                name: ObjectName {
                     parts: vec![target_database.clone(), target_name],
                 },
                 full: false,
@@ -299,7 +292,7 @@ fn parse_explain_refresh_materialized_view(
 ) -> Option<
     Result<
         (
-            novarocks_sql::parser::ast::RefreshMaterializedViewStmt,
+            RefreshMaterializedViewStmt,
             novarocks_sql::explain::ExplainLevel,
             bool,
         ),
@@ -336,16 +329,11 @@ fn parse_explain_refresh_materialized_view(
             .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
         {
             let body = format!("REFRESH {}", trimmed[prefix.len()..].trim_start());
-            let mut statements = match novarocks_sql::parser::parse_sql(&body) {
-                Ok(statements) => statements,
+            let statement = match parse_mv_admitted_statement(&body) {
+                Ok(statement) => statement,
                 Err(error) => return Some(Err(error)),
             };
-            let Some(statement) = statements.pop() else {
-                return Some(Err("EXPLAIN REFRESH parsed no statement".to_string()));
-            };
-            let novarocks_sql::parser::ast::Statement::RefreshMaterializedView(statement) =
-                statement
-            else {
+            let MvAdmittedStatement::Refresh(statement) = statement else {
                 return Some(Err(
                     "EXPLAIN REFRESH only supports REFRESH MATERIALIZED VIEW".to_string(),
                 ));

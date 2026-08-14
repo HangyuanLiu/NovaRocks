@@ -34,10 +34,8 @@ use crate::query_execution::planning::bindings::{
     QueryTableBindingStore,
 };
 use novarocks_sql::binding::SqlTableBindingId;
-use novarocks_sql::catalog::{
-    IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable,
-};
-use novarocks_sql::planner::table::TableDef;
+use novarocks_sql::catalog::{IcebergMetadataTableProvider, PlannerTableProvider};
+use novarocks_sql::planning::catalog::ResolvedAnalyzerTable;
 
 /// Provider-neutral table facts admitted for one request.  Core projects the
 /// typed SPI metadata into SQL facts, preserves the opaque scan authority, and
@@ -50,7 +48,7 @@ pub(crate) struct ConnectorQueryTableMaterialization {
     pub(crate) read_table: novarocks_spi::connector::ConnectorTableHandle,
     pub(crate) read_schema: arrow::datatypes::SchemaRef,
     pub(crate) read_selector: novarocks_spi::connector::ConnectorReadSelector,
-    pub(crate) sql_ukfk_facts: novarocks_sql::planner::table::SqlUkFkTableFacts,
+    pub(crate) sql_planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts,
     pub(crate) statistics_pin: Option<crate::connector::backend::ResolvedTableStatisticsPin>,
     pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 }
@@ -190,11 +188,7 @@ pub(crate) fn connector_table_materialization_from_metadata(
         read_table: metadata.table,
         read_schema: metadata.schema.clone(),
         read_selector: novarocks_spi::connector::ConnectorReadSelector::Current,
-        sql_ukfk_facts:
-            novarocks_sql::planner::table::SqlUkFkTableFacts::from_connector_planning_facts(
-                &metadata.schema,
-                &metadata.planning_facts,
-            ),
+        sql_planning_facts: metadata.planning_facts,
         statistics_pin,
         planning_lease,
     })
@@ -210,44 +204,21 @@ pub(crate) fn connector_query_binding_from_materialization(
     sql_table_name: &str,
     binding: SqlTableBindingId,
 ) -> Result<QueryTableBinding, String> {
-    use novarocks_sql::planner::table::{ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity};
-
-    let (scan_kind, frozen_snapshot_id) = match materialization.read_selector {
-        novarocks_spi::connector::ConnectorReadSelector::Current => (
-            SqlScanKind::Data {
-                version: novarocks_sql::planner::table::SqlTableVersionSelector::Current,
-            },
-            None,
-        ),
-        novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot_id) => {
-            let version =
-                novarocks_sql::planner::table::SqlTableVersionSelector::Snapshot(snapshot_id);
-            (SqlScanKind::FrozenInputSet { version }, Some(snapshot_id))
-        }
-        novarocks_spi::connector::ConnectorReadSelector::TimestampMicros(timestamp_micros) => {
-            return Err(format!(
-                "connector read selector timestamp {timestamp_micros} must resolve to a snapshot before SQL materialization"
-            ));
-        }
-    };
-    let planner = TableDef {
-        name: sql_table_name.to_string(),
-        columns: materialization.columns,
-        iceberg_row_lineage_metadata_columns: materialization.row_lineage_metadata_columns,
-        source: ScanSource::Sql(
-            SqlScanSource::new(
-                binding,
-                SqlTableIdentity {
-                    catalog: catalog.to_string(),
-                    namespace: namespace.to_string(),
-                    table: sql_table_name.to_string(),
-                },
-                scan_kind,
-            )
-            .with_ukfk_facts(materialization.sql_ukfk_facts),
-        ),
-    };
-    let frozen_snapshot_materializations = frozen_snapshot_id
+    let sql_materialization = novarocks_sql::planning::catalog::materialize_connector_read_table(
+        novarocks_sql::planning::catalog::ConnectorReadTableFacts {
+            catalog: catalog.to_string(),
+            namespace: namespace.to_string(),
+            table: sql_table_name.to_string(),
+            columns: materialization.columns,
+            iceberg_row_lineage_metadata_columns: materialization.row_lineage_metadata_columns,
+            schema: materialization.read_schema.clone(),
+            binding,
+            selector: materialization.read_selector,
+            planning_facts: materialization.sql_planning_facts,
+        },
+    )?;
+    let frozen_snapshot_materializations = sql_materialization
+        .frozen_snapshot_id()
         .into_iter()
         .map(|snapshot_id| {
             (
@@ -265,7 +236,7 @@ pub(crate) fn connector_query_binding_from_materialization(
         })
         .collect();
     Ok(QueryTableBinding {
-        resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
+        resolved: sql_materialization.into_resolved_table(),
         statistics_pin: materialization.statistics_pin.clone(),
         admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
         scan_materialization: Some(QueryScanMaterialization {
@@ -391,7 +362,7 @@ pub struct CatalogServiceMaterializer<'a> {
 
 /// One application-owned relation overlay for a generated query.
 ///
-/// The overlay is a binding factory, not a `TableDef`: generated COW and MV
+/// The overlay is a binding factory, not a planner table definition: generated COW and MV
 /// reads must supply their frozen provider facts to the request-local store
 /// before SQL sees the resulting tokenized table.  Keeping the factory here
 /// prevents a synthetic relation from leaking into the shared catalog.
@@ -543,22 +514,17 @@ impl<'a> CatalogServiceMaterializer<'a> {
                 {
                     return self.resolve_query_local_overlay(overlay);
                 }
-                let planner = self
+                let local = self
                     .service
                     .local()
                     .read()
-                    .expect("catalog service local read lock")
-                    .get(database, table)?;
+                    .expect("catalog service local read lock");
+                let resolved = novarocks_sql::planning::catalog::resolve_local_catalog_table(
+                    &local, database, table,
+                )?;
                 let key = QueryTableBindingKey::analysis_lookup("default_catalog", database, table);
                 let token = self.bind_for_sql(key, |binding| {
-                    Ok(QueryTableBinding::local(
-                        ResolvedAnalyzerTable::from_planner(
-                            Some("default_catalog"),
-                            database,
-                            planner,
-                        ),
-                        binding,
-                    ))
+                    Ok(QueryTableBinding::local(resolved, binding))
                 })?;
                 Ok(self.bindings.binding(token)?.resolved.clone())
             }
@@ -594,14 +560,18 @@ impl<'a> CatalogServiceMaterializer<'a> {
         database: &str,
         table: &str,
         metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
-    ) -> Result<TableDef, String> {
+    ) -> Result<ResolvedAnalyzerTable, String> {
         match self.effective_catalog(catalog) {
-            Some("default_catalog") | None => self
-                .service
-                .local()
-                .read()
-                .expect("catalog service local read lock")
-                .get(database, table),
+            Some("default_catalog") | None => {
+                let local = self
+                    .service
+                    .local()
+                    .read()
+                    .expect("catalog service local read lock");
+                novarocks_sql::planning::catalog::resolve_local_catalog_table(
+                    &local, database, table,
+                )
+            }
             Some(catalog) => {
                 let observation = self.require_catalog_admission(catalog)?;
                 let key =
@@ -616,7 +586,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
                     )
                 })?;
                 self.verify_catalog_admission(catalog, observation.as_ref())?;
-                Ok(self.bindings.binding(token)?.resolved.planner.clone())
+                Ok(self.bindings.binding(token)?.resolved.clone())
             }
         }
     }
@@ -633,7 +603,7 @@ fn project_binding_for_sql(
 impl CatalogProvider for CatalogServiceMaterializer<'_> {
     fn get_table(&self, database: &str, table: &str) -> Result<CatalogTable, String> {
         self.resolve_table_for_analysis_once(None, database, table)
-            .map(|resolved| resolved.catalog)
+            .map(|resolved| novarocks_sql::planning::catalog::catalog_table(&resolved))
     }
 
     fn get_table_in_catalog(
@@ -643,7 +613,7 @@ impl CatalogProvider for CatalogServiceMaterializer<'_> {
         table: &str,
     ) -> Result<CatalogTable, String> {
         self.resolve_table_for_analysis_once(catalog, database, table)
-            .map(|resolved| resolved.catalog)
+            .map(|resolved| novarocks_sql::planning::catalog::catalog_table(&resolved))
     }
 
     fn get_legacy_range_partition(
@@ -688,7 +658,7 @@ impl IcebergMetadataTableProvider for CatalogServiceMaterializer<'_> {
         database: &str,
         table: &str,
         metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
-    ) -> Result<TableDef, String> {
+    ) -> Result<ResolvedAnalyzerTable, String> {
         self.metadata_table_def(catalog, database, table, metadata_table_type)
     }
 }
@@ -700,7 +670,6 @@ mod tests {
 
     use super::*;
     use novarocks_sql::catalog::PlannerTableProvider;
-    use novarocks_sql::planner::table::ScanSource;
 
     fn binding_id(scope: u64, ordinal: u32) -> SqlTableBindingId {
         SqlTableBindingId::new(
@@ -713,41 +682,24 @@ mod tests {
 
     fn local_binding(binding: SqlTableBindingId) -> QueryTableBinding {
         QueryTableBinding::local(
-            ResolvedAnalyzerTable::from_planner(
-                Some("default_catalog"),
-                "db",
-                TableDef {
-                    name: "orders".to_string(),
-                    columns: vec![],
-                    iceberg_row_lineage_metadata_columns: vec![],
-                    source: novarocks_sql::planner::table::test_sql_scan_source(
-                        novarocks_sql::planner::table::SqlScanKind::ConnectorRead,
-                    ),
-                },
+            test_connector_read_materialization(
+                "default_catalog",
+                "orders",
+                binding,
+                novarocks_spi::connector::ConnectorReadSelector::Current,
             ),
             binding,
         )
     }
 
     fn frozen_overlay_binding(binding: SqlTableBindingId) -> QueryTableBinding {
-        let planner = TableDef {
-            name: "__nr_cow_orders".to_string(),
-            columns: vec![],
-            iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::Sql(novarocks_sql::planner::table::SqlScanSource::new(
-                binding,
-                novarocks_sql::planner::table::SqlTableIdentity {
-                    catalog: "ice".to_string(),
-                    namespace: "db".to_string(),
-                    table: "orders".to_string(),
-                },
-                novarocks_sql::planner::table::SqlScanKind::FrozenInputSet {
-                    version: novarocks_sql::planner::table::SqlTableVersionSelector::Snapshot(7),
-                },
-            )),
-        };
         QueryTableBinding {
-            resolved: ResolvedAnalyzerTable::from_planner(Some("ice"), "db", planner),
+            resolved: test_connector_read_materialization(
+                "ice",
+                "__nr_cow_orders",
+                binding,
+                novarocks_spi::connector::ConnectorReadSelector::SnapshotId(7),
+            ),
             statistics_pin: None,
             admission: QueryTableBindingAdmission::Local,
             scan_materialization: None,
@@ -756,6 +708,29 @@ mod tests {
             frozen_snapshot_materializations: BTreeMap::new(),
             admitted_change_scans: BTreeMap::new(),
         }
+    }
+
+    fn test_connector_read_materialization(
+        catalog: &str,
+        table: &str,
+        binding: SqlTableBindingId,
+        selector: novarocks_spi::connector::ConnectorReadSelector,
+    ) -> ResolvedAnalyzerTable {
+        novarocks_sql::planning::catalog::materialize_connector_read_table(
+            novarocks_sql::planning::catalog::ConnectorReadTableFacts {
+                catalog: catalog.to_string(),
+                namespace: "db".to_string(),
+                table: table.to_string(),
+                columns: Vec::new(),
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                schema: std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+                binding,
+                selector,
+                planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
+            },
+        )
+        .expect("test catalog facts materialize")
+        .into_resolved_table()
     }
 
     struct OverlayLoader;
@@ -876,9 +851,8 @@ mod tests {
                 .expect("local scan must be tokenized before SQL receives it");
 
         assert!(matches!(
-            binding.resolved.planner.source,
-            novarocks_sql::planner::table::ScanSource::Sql(ref source)
-                if source.binding == binding_id(101, 1)
+            novarocks_sql::planning::catalog::table_binding_id(&binding.resolved),
+            token if token == binding_id(101, 1)
         ));
     }
 
@@ -988,17 +962,15 @@ mod tests {
         let resolved = materializer
             .resolve_table_for_analysis(None, "db", "__nr_cow_orders")
             .expect("query-local overlay resolves");
-        let ScanSource::Sql(source) = resolved.planner.source else {
-            panic!("SQL must not receive the overlay's legacy scan source");
-        };
-        assert!(source.binding.belongs_to(bindings.scope()));
-        assert!(matches!(
-            source.kind,
-            novarocks_sql::planner::table::SqlScanKind::FrozenInputSet { .. }
-        ));
+        let binding_id = novarocks_sql::planning::catalog::table_binding_id(&resolved);
+        assert!(binding_id.belongs_to(bindings.scope()));
+        assert_eq!(
+            novarocks_sql::planning::catalog::frozen_input_snapshot_id(&resolved),
+            Some(7)
+        );
         assert!(
             bindings
-                .scan_materialization(source.binding)
+                .scan_materialization(binding_id)
                 .expect("binding materialization")
                 .is_none(),
             "analysis-only overlays do not manufacture a provider read handle"

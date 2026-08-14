@@ -379,12 +379,14 @@ impl<'a> super::AnalyzerContext<'a> {
                             "iceberg metadata table lookup is not supported by this catalog"
                                 .to_string()
                         })?;
-                    let table_def = metadata_provider.get_iceberg_metadata_table(
-                        catalog_override.as_deref(),
-                        &db_lower,
-                        &tbl_lower,
-                        metadata_ty.clone(),
-                    )?;
+                    let table_def = metadata_provider
+                        .get_iceberg_metadata_table(
+                            catalog_override.as_deref(),
+                            &db_lower,
+                            &tbl_lower,
+                            metadata_ty.clone(),
+                        )?
+                        .planner;
                     let alias_name = alias.as_ref().map(|a| a.name.value.clone());
 
                     // Metadata aliases are materialized by the application

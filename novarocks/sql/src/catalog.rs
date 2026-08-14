@@ -78,5 +78,5 @@ pub trait IcebergMetadataTableProvider {
         database: &str,
         table: &str,
         metadata_table_type: MetadataTableKind,
-    ) -> Result<TableDef, String>;
+    ) -> Result<ResolvedAnalyzerTable, String>;
 }

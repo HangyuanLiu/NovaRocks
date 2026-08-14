@@ -7,14 +7,20 @@
 
 pub use super::parser::{normalize_for_raw_parse, parse_normalized_sql_raw};
 pub use crate::parser::ast::{
-    AlterIcebergPartitionSpecStmt, ColumnAggregation, CreateCatalogStmt, CreateTableKind,
-    CreateTableStmt, DefaultLiteral, DeleteStmt, DropCatalogStmt, DropDatabaseStmt, DropTableStmt,
-    IcebergPartitionFieldExpr, Literal, MergeMatchedAction, MergeNotMatchedAction, MergeStmt,
-    MergeWhenClause, MutationSource, ObjectName, TableColumnDef, TableKeyDesc, TableKeyKind,
-    UpdateAssignment, UpdateStmt,
+    AlterIcebergPartitionSpecStmt, AlterMaterializedViewAction, AlterMaterializedViewStmt,
+    ColumnAggregation, CreateCatalogStmt, CreateMaterializedViewStmt, CreateTableKind,
+    CreateTableStmt, DefaultLiteral, DeleteStmt, DropCatalogStmt, DropDatabaseStmt,
+    DropMaterializedViewStmt, DropTableStmt, IcebergPartitionFieldExpr, Literal,
+    MaterializedViewDistribution, MaterializedViewRefreshPolicy, MergeMatchedAction,
+    MergeNotMatchedAction, MergeStmt, MergeWhenClause, MutationSource, ObjectName,
+    RefreshMaterializedViewStmt, ShowMaterializedViewsStmt, TableColumnDef, TableKeyDesc,
+    TableKeyKind, UpdateAssignment, UpdateStmt,
 };
 pub use crate::parser::ast::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
 pub use crate::parser::dialect::StarRocksDialect;
+pub use crate::parser::procedure::{
+    CallProcedureStmt, ProcedureArg, ProcedureArgMode, ProcedureArgValue,
+};
 
 pub use crate::parser::dialect::substitute_user_variables;
 
@@ -22,6 +28,69 @@ use sqlparser::parser::Parser;
 
 pub fn parse_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
     crate::parser::parse_sql_raw(sql)
+}
+
+/// Typed, closed materialized-view command admission surface.
+///
+/// This intentionally does not expose the parser's generic statement enum:
+/// consumers can handle only the five MV command forms supported by this
+/// contract.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MvAdmittedStatement {
+    Create(CreateMaterializedViewStmt),
+    Drop(DropMaterializedViewStmt),
+    Alter(AlterMaterializedViewStmt),
+    Refresh(RefreshMaterializedViewStmt),
+    Show(ShowMaterializedViewsStmt),
+}
+
+pub fn parse_mv_admitted_statement(sql: &str) -> Result<MvAdmittedStatement, String> {
+    let mut statements = match crate::parser::parse_sql(sql) {
+        Ok(statements) => statements,
+        Err(error) if error == "parse_sql: only materialized-view DDL is recognized in Phase 1" => {
+            return Err("statement is not a materialized-view command".to_string());
+        }
+        Err(error) => return Err(error),
+    };
+    if statements.len() != 1 {
+        return Err("materialized-view command accepts exactly one statement".to_string());
+    }
+    match statements.pop().expect("one checked statement") {
+        crate::parser::ast::Statement::CreateMaterializedView(statement) => {
+            Ok(MvAdmittedStatement::Create(statement))
+        }
+        crate::parser::ast::Statement::DropMaterializedView(statement) => {
+            Ok(MvAdmittedStatement::Drop(statement))
+        }
+        crate::parser::ast::Statement::AlterMaterializedView(statement) => {
+            Ok(MvAdmittedStatement::Alter(statement))
+        }
+        crate::parser::ast::Statement::RefreshMaterializedView(statement) => {
+            Ok(MvAdmittedStatement::Refresh(statement))
+        }
+        crate::parser::ast::Statement::ShowMaterializedViews(statement) => {
+            Ok(MvAdmittedStatement::Show(statement))
+        }
+        _ => Err("statement is not a materialized-view command".to_string()),
+    }
+}
+
+/// Return every three-part table reference in one admitted SELECT statement.
+///
+/// Raw sqlparser nodes remain inside the SQL crate; callers receive only the
+/// normalized `(catalog, namespace, table)` facts they need for admission.
+pub fn three_part_table_ref_occurrences(
+    sql: &str,
+) -> Result<Vec<(String, String, String)>, String> {
+    let statement = crate::parser::parse_sql_raw(sql)?;
+    let sqlparser::ast::Statement::Query(query) = statement else {
+        return Err("three-part table reference extraction requires a SELECT query".to_string());
+    };
+    Ok(crate::parser::query_refs::extract_three_part_table_ref_occurrences(&query))
+}
+
+pub fn parse_call_procedure_sql(sql: &str) -> Result<CallProcedureStmt, String> {
+    crate::parser::procedure::parse_call_procedure_sql(sql)
 }
 
 pub fn extract_allow_throw_exception_hint(sql: &str) -> bool {
@@ -196,5 +265,28 @@ pub fn parse_alter_iceberg_ref(sql: &str) -> Result<Option<AlterIcebergRefStmt>,
     match statements.pop().expect("one checked statement") {
         crate::parser::ast::Statement::AlterIcebergRef(statement) => Ok(Some(statement)),
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MvAdmittedStatement, parse_mv_admitted_statement};
+
+    #[test]
+    fn mv_admission_exposes_only_typed_mv_syntax() {
+        let statement = parse_mv_admitted_statement("REFRESH MATERIALIZED VIEW analytics.mv")
+            .expect("MV refresh should be admitted");
+        let MvAdmittedStatement::Refresh(statement) = statement else {
+            panic!("expected typed REFRESH MATERIALIZED VIEW statement");
+        };
+        assert_eq!(statement.name.parts, ["analytics", "mv"]);
+        assert!(!statement.full);
+    }
+
+    #[test]
+    fn mv_admission_rejects_non_mv_statement_without_exposing_parser_enum() {
+        let error = parse_mv_admitted_statement("SELECT 1")
+            .expect_err("non-MV syntax must not be admitted through the MV contract");
+        assert_eq!(error, "statement is not a materialized-view command");
     }
 }

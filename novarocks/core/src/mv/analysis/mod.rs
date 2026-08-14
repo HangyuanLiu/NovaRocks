@@ -23,13 +23,11 @@ use std::collections::HashSet;
 
 use crate::mv::aggregate_state::sql_type::arrow_data_type_to_sql_type;
 use novarocks_catalog::identifier::normalize_identifier;
-use novarocks_sql::analysis::{OutputColumn, QueryBody, ResolvedQuery};
-use novarocks_sql::column_id::ColumnId;
-use novarocks_sql::parser::ast::{
-    IcebergPartitionFieldExpr, MaterializedViewDistribution, ObjectName, TableColumnDef,
+use novarocks_sql::planning::mv::{
+    SqlMvOutputColumnFacts, SqlResolvedMvRefreshInput, SqlResolvedMvRefreshInputSource,
+    strip_catalog_from_three_part_names,
 };
-use novarocks_sql::planning::mv::AggregateMvShape;
-use novarocks_sql::planning::mv::SqlResolvedMvRefreshInput;
+use novarocks_sql::syntax::{IcebergPartitionFieldExpr, ObjectName, TableColumnDef};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResolvedTableRef {
@@ -46,8 +44,7 @@ pub(crate) enum ResolvedTableRef {
 #[derive(Clone, Debug)]
 pub(crate) struct MvAnalysis {
     pub resolved_refs: Vec<ResolvedTableRef>,
-    pub output_columns: Vec<OutputColumn>,
-    pub resolved_query: ResolvedQuery,
+    pub output_columns: Vec<SqlMvOutputColumnFacts>,
     /// Opaque SQL-owned carrier for refresh-property planning. Core retains it
     /// only to hand it back to SQL; it cannot inspect the analyzer tree.
     pub refresh_input: SqlResolvedMvRefreshInput,
@@ -99,9 +96,7 @@ fn prepare_mv_select_with_catalog_paths(
     let resolved_refs = collect_table_refs_from_query(query, current_catalog, current_database);
     let mut query_for_analysis = query.clone();
     if !retain_catalog_paths && has_three_part_refs(&resolved_refs) {
-        novarocks_sql::parser::query_refs::strip_catalog_from_three_part_names(
-            &mut query_for_analysis,
-        );
+        strip_catalog_from_three_part_names(&mut query_for_analysis);
     }
     Ok(PreparedMvSelect {
         resolved_refs,
@@ -109,24 +104,20 @@ fn prepare_mv_select_with_catalog_paths(
     })
 }
 
-pub(crate) fn finish_mv_analysis(
-    prepared: PreparedMvSelect,
-    resolved_query: ResolvedQuery,
-) -> MvAnalysis {
-    let mut output_columns = resolved_query.output_columns.clone();
-    if output_columns.is_empty() {
-        output_columns = resolved_output_columns_from_body(&resolved_query);
-    }
-    let refresh_input = SqlResolvedMvRefreshInput::from_analysis(resolved_query.clone());
+pub(crate) fn finish_mv_analysis<T>(prepared: PreparedMvSelect, source: T) -> MvAnalysis
+where
+    T: SqlResolvedMvRefreshInputSource,
+{
+    let refresh_input = SqlResolvedMvRefreshInput::from_analysis(source);
+    let output_columns = refresh_input.analysis_facts().output_columns;
     MvAnalysis {
         resolved_refs: prepared.resolved_refs,
         output_columns,
-        resolved_query,
         refresh_input,
     }
 }
 
-pub(crate) fn analyze_mv_select_with<Register, Analyze>(
+pub(crate) fn analyze_mv_select_with<Register, Analyze, T>(
     query: &sqlparser::ast::Query,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -135,12 +126,13 @@ pub(crate) fn analyze_mv_select_with<Register, Analyze>(
 ) -> Result<MvAnalysis, String>
 where
     Register: FnOnce(&[ResolvedTableRef]) -> Result<(), String>,
-    Analyze: FnOnce(&sqlparser::ast::Query) -> Result<ResolvedQuery, String>,
+    Analyze: FnOnce(&sqlparser::ast::Query) -> Result<T, String>,
+    T: SqlResolvedMvRefreshInputSource,
 {
     let prepared = prepare_mv_select(query, current_catalog, current_database)?;
     register(prepared.resolved_refs())?;
-    let resolved_query = analyze(prepared.query_for_analysis())?;
-    Ok(finish_mv_analysis(prepared, resolved_query))
+    let source = analyze(prepared.query_for_analysis())?;
+    Ok(finish_mv_analysis(prepared, source))
 }
 
 fn validate_mv_select_raw_query_clauses(query: &sqlparser::ast::Query) -> Result<(), String> {
@@ -457,60 +449,6 @@ fn qualify_current_catalog_refs_in_factor(
     }
 }
 
-fn resolved_output_columns_from_body(resolved: &ResolvedQuery) -> Vec<OutputColumn> {
-    match &resolved.body {
-        QueryBody::Select(select) => select
-            .projection
-            .iter()
-            .map(|item| OutputColumn {
-                column_id: ColumnId::UNSET,
-                name: item.output_name.clone(),
-                data_type: item.expr.data_type.clone(),
-                nullable: item.expr.nullable,
-                is_internal: false,
-            })
-            .collect(),
-        _ => resolved.output_columns.clone(),
-    }
-}
-
-pub(crate) fn validate_distribution_columns(
-    distribution: &MaterializedViewDistribution,
-    output_columns: &[OutputColumn],
-) -> Result<(), String> {
-    for column in &distribution.hash_columns {
-        let exists = output_columns
-            .iter()
-            .any(|output| output.name.eq_ignore_ascii_case(column));
-        if !exists {
-            return Err(format!(
-                "DISTRIBUTED BY column `{column}` not in MV output schema"
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_aggregate_distribution_columns(
-    distribution: &MaterializedViewDistribution,
-    shape: &AggregateMvShape,
-) -> Result<(), String> {
-    let group_key_outputs = shape
-        .group_keys
-        .iter()
-        .map(|group_key| normalize_identifier(&group_key.output_name))
-        .collect::<Result<HashSet<_>, _>>()?;
-    for column in &distribution.hash_columns {
-        let normalized = normalize_identifier(column)?;
-        if !group_key_outputs.contains(&normalized) {
-            return Err(format!(
-                "aggregate MV distribution column `{column}` must be a GROUP BY key output column; DISTRIBUTED BY HASH for aggregate MV can only reference GROUP BY keys"
-            ));
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn resolve_mv_name(
     name: &ObjectName,
     current_database: &str,
@@ -545,7 +483,7 @@ pub(crate) fn resolve_mv_name(
 
 pub(crate) fn validate_mv_partition_columns(
     partition_by: Option<&[IcebergPartitionFieldExpr]>,
-    output_columns: &[OutputColumn],
+    output_columns: &[SqlMvOutputColumnFacts],
 ) -> Result<(), String> {
     let Some(partition_by) = partition_by else {
         return Ok(());
@@ -568,7 +506,7 @@ pub(crate) fn validate_mv_partition_columns(
 
 pub(crate) fn validate_starrocks_mv_partition_columns(
     partition_by: Option<&[IcebergPartitionFieldExpr]>,
-    output_columns: &[OutputColumn],
+    output_columns: &[SqlMvOutputColumnFacts],
 ) -> Result<(), String> {
     if let Some(fields) = partition_by {
         for field in fields {
@@ -747,7 +685,7 @@ fn has_three_part_refs(resolved_refs: &[ResolvedTableRef]) -> bool {
 }
 
 pub(crate) fn output_column_to_table_column(
-    column: &OutputColumn,
+    column: &SqlMvOutputColumnFacts,
 ) -> Result<TableColumnDef, String> {
     Ok(TableColumnDef {
         name: column.name.clone(),
@@ -760,31 +698,17 @@ pub(crate) fn output_column_to_table_column(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-
-    use arrow::datatypes::DataType;
-
     use super::*;
-    use novarocks_sql::analysis::ResolvedQuery;
-    use novarocks_sql::catalog::local::PlannerMemoryCatalog;
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =
-            novarocks_sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize query");
+            novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize query");
         let statement =
-            novarocks_sql::parser::parse_normalized_sql_raw(&normalized).expect("parse query");
+            novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse query");
         let sqlparser::ast::Statement::Query(query) = statement else {
             panic!("expected query")
         };
         *query
-    }
-
-    fn analyze_literal_query(sql: &str) -> ResolvedQuery {
-        let query = parse_query(sql);
-        let catalog = PlannerMemoryCatalog::default();
-        let (resolved, _, _) = novarocks_sql::analyzer::analyze(&query, &catalog, "default")
-            .expect("analyze literal query");
-        resolved
     }
 
     #[test]
@@ -849,37 +773,10 @@ mod tests {
     }
 
     #[test]
-    fn finish_mv_analysis_uses_resolved_output_columns_when_present() {
-        let query = parse_query("SELECT 1 AS projected_name");
-        let prepared = prepare_mv_select(&query, None, "default").expect("prepare query");
-        let mut resolved = analyze_literal_query("SELECT 1 AS projected_name");
-        resolved.output_columns[0].name = "resolved_name".to_string();
-
-        let analysis = finish_mv_analysis(prepared, resolved);
-
-        assert_eq!(analysis.output_columns[0].name, "resolved_name");
-        assert_eq!(analysis.output_columns[0].data_type, DataType::Int64);
-    }
-
-    #[test]
-    fn finish_mv_analysis_falls_back_to_projection_outputs_when_analyzer_output_is_empty() {
-        let query = parse_query("SELECT 1 AS projection_name");
-        let prepared = prepare_mv_select(&query, None, "default").expect("prepare query");
-        let mut resolved = analyze_literal_query("SELECT 1 AS projection_name");
-        resolved.output_columns.clear();
-
-        let analysis = finish_mv_analysis(prepared, resolved);
-
-        assert_eq!(analysis.output_columns.len(), 1);
-        assert_eq!(analysis.output_columns[0].name, "projection_name");
-        assert_eq!(analysis.output_columns[0].data_type, DataType::Int64);
-    }
-
-    #[test]
     fn resolve_mv_name_accepts_supported_forms_and_rejects_non_default_catalog() {
         assert_eq!(
             resolve_mv_name(
-                &novarocks_sql::parser::ast::ObjectName {
+                &novarocks_sql::syntax::ObjectName {
                     parts: vec!["Orders".to_string()],
                 },
                 "Sales",
@@ -888,7 +785,7 @@ mod tests {
         );
         assert_eq!(
             resolve_mv_name(
-                &novarocks_sql::parser::ast::ObjectName {
+                &novarocks_sql::syntax::ObjectName {
                     parts: vec!["Marketing".to_string(), "Orders".to_string()],
                 },
                 "Sales",
@@ -897,7 +794,7 @@ mod tests {
         );
         assert_eq!(
             resolve_mv_name(
-                &novarocks_sql::parser::ast::ObjectName {
+                &novarocks_sql::syntax::ObjectName {
                     parts: vec![
                         "default_catalog".to_string(),
                         "Marketing".to_string(),
@@ -910,7 +807,7 @@ mod tests {
         );
         assert_eq!(
             resolve_mv_name(
-                &novarocks_sql::parser::ast::ObjectName {
+                &novarocks_sql::syntax::ObjectName {
                     parts: vec![
                         "ice".to_string(),
                         "Marketing".to_string(),
@@ -934,77 +831,5 @@ mod tests {
 
         assert!(canonical.contains("ice.sales.orders"), "{canonical}");
         assert!(canonical.contains("ice.marketing.customers"), "{canonical}");
-    }
-
-    #[test]
-    fn analysis_orchestration_preserves_staged_contract() {
-        let query = parse_query(
-            "SELECT a.id, b.id FROM Ice.Sales.First a JOIN ICE.Sales.Second b ON a.id = b.id",
-        );
-        let events = RefCell::new(Vec::new());
-        let registered_refs = RefCell::new(Vec::new());
-        let analyzer_sql = RefCell::new(String::new());
-        let mut resolved = analyze_literal_query("SELECT 1 AS projection_name");
-        resolved.output_columns[0].name = "resolved_name".to_string();
-
-        let analysis = analyze_mv_select_with(
-            &query,
-            Some("ice"),
-            "sales",
-            |refs: &[ResolvedTableRef]| {
-                events.borrow_mut().push("register");
-                registered_refs.borrow_mut().extend_from_slice(refs);
-                Ok(())
-            },
-            |query_for_analysis: &sqlparser::ast::Query| {
-                events.borrow_mut().push("analyze");
-                *analyzer_sql.borrow_mut() = query_for_analysis.to_string();
-                Ok(resolved)
-            },
-        )
-        .expect("analyze through shared orchestration");
-
-        assert_eq!(&*events.borrow(), &["register", "analyze"]);
-        assert_eq!(
-            &*registered_refs.borrow(),
-            &[
-                ResolvedTableRef::Iceberg {
-                    catalog: "ice".to_string(),
-                    namespace: "sales".to_string(),
-                    table: "first".to_string(),
-                },
-                ResolvedTableRef::Iceberg {
-                    catalog: "ice".to_string(),
-                    namespace: "sales".to_string(),
-                    table: "second".to_string(),
-                },
-            ]
-        );
-        let analyzer_sql = analyzer_sql.borrow().to_ascii_lowercase();
-        assert!(analyzer_sql.contains("sales.first"), "{analyzer_sql}");
-        assert!(analyzer_sql.contains("sales.second"), "{analyzer_sql}");
-        assert!(!analyzer_sql.contains("ice.sales"), "{analyzer_sql}");
-        assert_eq!(analysis.output_columns[0].name, "resolved_name");
-
-        let fallback_events = RefCell::new(Vec::new());
-        let mut fallback_resolved = analyze_literal_query("SELECT 1 AS projection_name");
-        fallback_resolved.output_columns.clear();
-        let fallback = analyze_mv_select_with(
-            &query,
-            Some("ice"),
-            "sales",
-            |_: &[ResolvedTableRef]| {
-                fallback_events.borrow_mut().push("register");
-                Ok(())
-            },
-            |_: &sqlparser::ast::Query| {
-                fallback_events.borrow_mut().push("analyze");
-                Ok(fallback_resolved)
-            },
-        )
-        .expect("analyze fallback through shared orchestration");
-
-        assert_eq!(&*fallback_events.borrow(), &["register", "analyze"]);
-        assert_eq!(fallback.output_columns[0].name, "projection_name");
     }
 }

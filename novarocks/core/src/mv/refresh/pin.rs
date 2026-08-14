@@ -280,7 +280,7 @@ mod tests {
     use super::*;
 
     fn parse_select_for_test(sql: &str) -> sqlparser::ast::Query {
-        let statement = novarocks_sql::parser::parse_sql_raw(sql).expect("test SQL must parse");
+        let statement = novarocks_sql::syntax::parse_sql_raw(sql).expect("test SQL must parse");
         let sqlparser::ast::Statement::Query(query) = statement else {
             panic!("test SQL must be a query");
         };

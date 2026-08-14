@@ -327,8 +327,10 @@ pub enum RuntimeFilterProducerTarget {
 impl RuntimeFilterProducerTarget {
     fn from_sql(value: sql_facts::SqlRuntimeFilterProducerTarget) -> Self {
         match value {
-            ProducerBindingTarget::JoinBuildKey { ordinal } => Self::JoinBuildKey { ordinal },
-            ProducerBindingTarget::AggregateTopNKey {
+            sql_facts::SqlRuntimeFilterProducerTarget::JoinBuildKey { ordinal } => {
+                Self::JoinBuildKey { ordinal }
+            }
+            sql_facts::SqlRuntimeFilterProducerTarget::AggregateTopNKey {
                 group_key_ordinal,
                 limit,
             } => Self::AggregateTopNKey {

@@ -17,14 +17,17 @@ use novarocks_catalog::identifier::TableIdentity;
 
 use crate::planner::vocabulary::{BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME};
 
+/// Opaque, copied snapshot identity facts consumed by first-refresh SQL
+/// shaping. It owns values only; it carries no catalog, table, or planning
+/// graph handle.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct SqlMvSnapshotPin {
+pub struct SqlMvSnapshotPin {
     snapshots: BTreeMap<String, i64>,
     table_uuids: BTreeMap<String, String>,
 }
 
 impl SqlMvSnapshotPin {
-    pub(crate) fn try_from_maps(
+    pub fn try_from_maps(
         snapshots: BTreeMap<String, i64>,
         table_uuids: BTreeMap<String, String>,
     ) -> Result<Self, String> {
@@ -65,19 +68,21 @@ impl SqlMvSnapshotPin {
         .expect("test MV snapshot pin must be valid")
     }
 
-    pub(crate) fn get(&self, table: &TableIdentity) -> Option<i64> {
+    /// Return the captured snapshot for a frozen identity.
+    pub fn get(&self, table: &TableIdentity) -> Option<i64> {
         self.snapshots.get(&table.fqn()).copied()
     }
 
-    pub(crate) fn uuid(&self, table: &TableIdentity) -> Option<&str> {
+    /// Return the captured table incarnation for a frozen identity.
+    pub fn uuid(&self, table: &TableIdentity) -> Option<&str> {
         self.table_uuids.get(&table.fqn()).map(String::as_str)
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.snapshots.len()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.snapshots.is_empty()
     }
 

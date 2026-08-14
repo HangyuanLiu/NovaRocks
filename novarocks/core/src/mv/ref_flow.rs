@@ -28,7 +28,7 @@ use novarocks_spi::connector::{
     ConnectorTableIdentity, ConnectorTableResolution, CreateOrReplacePolicy, DropPolicy,
     ExternalMutationFinalization,
 };
-use novarocks_sql::parser::ast::{
+use novarocks_sql::syntax::{
     AlterIcebergRefAction, AlterIcebergRefStmt, ObjectName, SnapshotAnchor,
 };
 

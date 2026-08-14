@@ -36,7 +36,7 @@ use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_sql::mv_refresh::VisibleAggregateOutput;
 use novarocks_sql::planning::mv::{
-    SqlMvAggregateCalls as AggregateSqlCalls, extract_aggregate_sql_calls,
+    MV_BRANCH_ID_COLUMN_NAME, SqlMvAggregateCalls as AggregateSqlCalls, extract_aggregate_sql_calls,
 };
 
 pub(crate) struct AggregateStateRead {
@@ -282,7 +282,7 @@ fn append_branch_id_to_chunk(chunk: Chunk, branch_id: i32) -> Result<Chunk, Stri
         .cloned()
         .collect::<Vec<_>>();
     fields.push(Arc::new(arrow::datatypes::Field::new(
-        novarocks_sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME,
+        MV_BRANCH_ID_COLUMN_NAME,
         arrow::datatypes::DataType::Int32,
         false,
     )));
@@ -303,9 +303,9 @@ fn append_branch_id_to_chunk(chunk: Chunk, branch_id: i32) -> Result<Chunk, Stri
 }
 
 fn parse_stored_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
-    let normalized = novarocks_sql::parser::dialect::normalize_for_raw_parse(sql)
+    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)
         .map_err(|error| format!("stored MV SELECT normalize error: {error}"))?;
-    let statement = novarocks_sql::parser::parse_normalized_sql_raw(&normalized)
+    let statement = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
         .map_err(|error| format!("sql parser error: {error}"))?;
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("stored MV SQL must be a SELECT query".to_string());
@@ -695,9 +695,9 @@ mod tests {
     use novarocks_sql::mv_refresh::AggregateFunctionKind;
 
     fn parse_calls(sql: &str) -> AggregateSqlCalls {
-        let normalized = novarocks_sql::parser::dialect::normalize_for_raw_parse(sql)
+        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)
             .expect("normalize aggregate select");
-        let stmt = novarocks_sql::parser::parse_normalized_sql_raw(&normalized)
+        let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
             .expect("parse aggregate select");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query");
@@ -802,10 +802,10 @@ mod tests {
     }
 
     fn first_branch_calls(select_sql: &str) -> AggregateSqlCalls {
-        let normalized = novarocks_sql::parser::dialect::normalize_for_raw_parse(select_sql)
-            .expect("normalize union");
+        let normalized =
+            novarocks_sql::syntax::normalize_for_raw_parse(select_sql).expect("normalize union");
         let stmt =
-            novarocks_sql::parser::parse_normalized_sql_raw(&normalized).expect("parse union");
+            novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse union");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected union query");
         };

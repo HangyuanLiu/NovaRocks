@@ -4561,7 +4561,7 @@ mod tests {
             database: &str,
             table: &str,
             metadata_table_type: SqlMetadataTableKind,
-        ) -> Result<TableDef, String> {
+        ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
             let mut table_def = self.get_table(database, table)?;
             table_def.columns = metadata_table_columns(&metadata_table_type);
             table_def.source = sql_test_scan_source(
@@ -4573,7 +4573,9 @@ mod tests {
                     version: SqlTableVersionSelector::Current,
                 },
             );
-            Ok(table_def)
+            Ok(crate::catalog::ResolvedAnalyzerTable::from_planner(
+                catalog, database, table_def,
+            ))
         }
     }
 
@@ -6771,12 +6773,11 @@ mod tests {
             database: &str,
             table: &str,
             metadata_table_type: SqlMetadataTableKind,
-        ) -> Result<TableDef, String> {
-            Ok(Self::metadata_table_def(
+        ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+            Ok(crate::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog,
                 database,
-                table,
-                metadata_table_type,
+                Self::metadata_table_def(catalog, database, table, metadata_table_type),
             ))
         }
     }
@@ -6846,7 +6847,7 @@ mod tests {
                 database: &str,
                 table: &str,
                 metadata_table_type: SqlMetadataTableKind,
-            ) -> Result<TableDef, String> {
+            ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
                 self.0
                     .set(metadata_table_type == SqlMetadataTableKind::Partitions);
                 CatalogAwareTestCatalog.get_iceberg_metadata_table(
@@ -6898,7 +6899,7 @@ mod tests {
                 database: &str,
                 table: &str,
                 metadata_table_type: SqlMetadataTableKind,
-            ) -> Result<TableDef, String> {
+            ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
                 assert_eq!(catalog, Some("ice"));
                 assert_eq!(database, "db");
                 assert_eq!(table, "orders");

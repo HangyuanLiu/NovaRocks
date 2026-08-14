@@ -54,10 +54,11 @@ use novarocks_execution::exec::mv::state_codec::{
     KeyValue, decode_avg_decimal128, decode_avg_int64, decode_count_state, decode_sum_decimal128,
     decode_sum_int64,
 };
-use novarocks_sql::analysis::OutputColumn;
 use novarocks_sql::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
+use novarocks_sql::plan_read::OutputColumn;
 use novarocks_sql::planning::mv::{
     AggregateInput, AggregateMvShape, SqlMvAggregateCalls as AggregateSqlCalls,
+    SqlResolvedMvRefreshInput, SqlResolvedMvRefreshInputSource,
 };
 
 pub(crate) const ROW_ID_COLUMN: &str = "__row_id__";
@@ -306,40 +307,14 @@ pub(crate) fn build_aggregate_mv_layout_with_input_types(
     })
 }
 
-pub(crate) fn aggregate_input_types_from_resolved_query(
+pub(crate) fn aggregate_input_types_from_resolved_query<T>(
     calls: &AggregateSqlCalls,
-    resolved: &novarocks_sql::analysis::ResolvedQuery,
-) -> Result<Vec<Option<DataType>>, String> {
-    let novarocks_sql::analysis::QueryBody::Select(select) = &resolved.body else {
-        return Err("aggregate MV input type metadata requires SELECT analysis".to_string());
-    };
-    if select.projection.len() != calls.visible_outputs.len() {
-        return Err(format!(
-            "aggregate MV input type projection count mismatch: analyzed_projection={} shape_outputs={}",
-            select.projection.len(),
-            calls.visible_outputs.len()
-        ));
-    }
-
-    let mut input_types = vec![None; calls.aggregates.len()];
-    for (projection_index, visible_output) in calls.visible_outputs.iter().enumerate() {
-        let VisibleAggregateOutput::Aggregate(aggregate_index) = visible_output else {
-            continue;
-        };
-        let projection = &select.projection[projection_index];
-        let novarocks_sql::analysis::ExprKind::AggregateCall { args, .. } = &projection.expr.kind
-        else {
-            return Err(format!(
-                "aggregate MV analyzed projection `{}` is not an aggregate expression",
-                projection.output_name
-            ));
-        };
-        let slot = input_types.get_mut(*aggregate_index).ok_or_else(|| {
-            format!("aggregate MV aggregate index out of range: aggregate_index={aggregate_index}")
-        })?;
-        *slot = args.first().map(|arg| arg.data_type.clone());
-    }
-    Ok(input_types)
+    source: T,
+) -> Result<Vec<Option<DataType>>, String>
+where
+    T: SqlResolvedMvRefreshInputSource,
+{
+    SqlResolvedMvRefreshInput::from_analysis(source).aggregate_input_types(calls)
 }
 
 pub(crate) fn aggregate_shape_needs_retraction_count_state(calls: &AggregateSqlCalls) -> bool {
@@ -1644,9 +1619,8 @@ mod tests {
     }
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
-        let normalized =
-            novarocks_sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = novarocks_sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
+        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize");
+        let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("not a query: {stmt:?}");
         };

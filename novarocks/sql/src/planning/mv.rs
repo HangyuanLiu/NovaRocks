@@ -17,6 +17,17 @@
 
 use crate::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
 
+/// SQL-owned branch marker used by sealed UNION ALL MV refresh layouts.
+/// Application materialization may attach only this immutable column label;
+/// the planner vocabulary remains private.
+pub const MV_BRANCH_ID_COLUMN_NAME: &str = crate::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
+/// SQL-owned hidden apply-key label used by sealed projection refresh layouts.
+pub const MV_HIDDEN_APPLY_KEY_COLUMN_NAME: &str =
+    crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME;
+/// SQL-owned join apply-key label used by immutable join-delta query shaping.
+pub const MV_JOIN_APPLY_KEY_COLUMN_NAME: &str =
+    crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
+
 mod resolved_mv_refresh_input_private {
     pub trait Sealed {}
 }
@@ -144,6 +155,71 @@ mod refresh_property_facade_tests {
     }
 
     #[test]
+    fn opaque_refresh_input_projects_only_output_schema_facts() {
+        let facts =
+            analyzed_refresh_input("SELECT id AS order_id, region FROM fact_east").analysis_facts();
+
+        assert_eq!(facts.output_columns.len(), 2);
+        assert_eq!(facts.output_columns[0].name, "order_id");
+        assert_eq!(facts.output_columns[0].data_type, DataType::Int64);
+        assert!(!facts.output_columns[0].nullable);
+        assert_eq!(facts.output_columns[1].name, "region");
+        assert!(facts.output_columns[1].nullable);
+    }
+
+    #[test]
+    fn opaque_refresh_input_derives_aggregate_argument_types() {
+        let sql = "SELECT region, sum(amount) AS total, avg(amount) AS average \
+                   FROM fact_east GROUP BY region";
+        let statement = crate::parser::parse_sql_raw(sql).expect("parse query");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query");
+        };
+        let calls = extract_aggregate_sql_calls(&query).expect("extract aggregate calls");
+
+        let input_types = analyzed_refresh_input(sql)
+            .aggregate_input_types(&calls)
+            .expect("derive aggregate input types");
+
+        assert_eq!(
+            input_types,
+            vec![Some(DataType::Int64), Some(DataType::Int64)]
+        );
+    }
+
+    #[test]
+    fn target_apply_facade_projects_internal_columns_and_physical_select() {
+        let apply_key = mv_internal_target_column(SqlMvInternalTargetColumn::ApplyKey);
+        assert_eq!(apply_key.name, MV_HIDDEN_APPLY_KEY_COLUMN_NAME);
+        assert_eq!(
+            apply_key.data_type,
+            novarocks_catalog::schema::SqlType::BigInt
+        );
+        assert!(!apply_key.nullable);
+
+        let physical = iceberg_mv_physical_select_sql("SELECT id FROM fact_east")
+            .expect("shape physical projection");
+        assert!(
+            physical.contains(&format!("_row_id AS {MV_HIDDEN_APPLY_KEY_COLUMN_NAME}")),
+            "{physical}"
+        );
+
+        let reserved = iceberg_mv_physical_select_sql(&format!(
+            "SELECT id AS {MV_HIDDEN_APPLY_KEY_COLUMN_NAME} FROM fact_east"
+        ))
+        .expect_err("reserved internal alias must fail");
+        assert!(
+            reserved.contains("reserved for internal apply key"),
+            "{reserved}"
+        );
+
+        assert_eq!(
+            iceberg_mv_physical_select_sql("SELECT * FROM fact_east"),
+            Err("iceberg MV physical SELECT requires explicit projection columns".to_string())
+        );
+    }
+
+    #[test]
     fn facade_rejects_unsupported_refresh_shapes() {
         for sql in [
             "SELECT DISTINCT region FROM fact_east",
@@ -185,6 +261,45 @@ impl SqlResolvedMvRefreshInput {
     pub fn refresh_contract(&self) -> Result<SqlImvRefreshContractFacts, String> {
         self.refresh_property()?.into_refresh_contract()
     }
+
+    /// Project only the MV output facts application code needs to construct its
+    /// target schema. Analyzer columns remain private to the SQL crate.
+    pub fn analysis_facts(&self) -> SqlMvAnalysisFacts {
+        let output_columns = if self.0.output_columns.is_empty() {
+            match &self.0.body {
+                crate::analysis::QueryBody::Select(select) => select
+                    .projection
+                    .iter()
+                    .map(|item| SqlMvOutputColumnFacts {
+                        name: item.output_name.clone(),
+                        data_type: item.expr.data_type.clone(),
+                        nullable: item.expr.nullable,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            self.0
+                .output_columns
+                .iter()
+                .map(|column| SqlMvOutputColumnFacts {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                })
+                .collect()
+        };
+        SqlMvAnalysisFacts { output_columns }
+    }
+
+    /// Derive aggregate argument types without leaking the analyzed expression
+    /// tree to Core's aggregate-state builder.
+    pub fn aggregate_input_types(
+        &self,
+        calls: &SqlMvAggregateCalls,
+    ) -> Result<Vec<Option<arrow::datatypes::DataType>>, String> {
+        aggregate_input_types_from_resolved_query(calls, &self.0)
+    }
 }
 
 impl resolved_mv_refresh_input_private::Sealed for crate::analysis::ResolvedQuery {}
@@ -193,6 +308,171 @@ impl SqlResolvedMvRefreshInputSource for crate::analysis::ResolvedQuery {
     fn into_sql_resolved_mv_refresh_input(self) -> SqlResolvedMvRefreshInput {
         SqlResolvedMvRefreshInput(self)
     }
+}
+
+impl resolved_mv_refresh_input_private::Sealed for &crate::analysis::ResolvedQuery {}
+
+impl SqlResolvedMvRefreshInputSource for &crate::analysis::ResolvedQuery {
+    fn into_sql_resolved_mv_refresh_input(self) -> SqlResolvedMvRefreshInput {
+        SqlResolvedMvRefreshInput(self.clone())
+    }
+}
+
+/// Plain output-schema facts projected from an opaque analyzed MV query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvAnalysisFacts {
+    pub output_columns: Vec<SqlMvOutputColumnFacts>,
+}
+
+/// SQL type and nullability facts for one visible MV output column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvOutputColumnFacts {
+    pub name: String,
+    pub data_type: arrow::datatypes::DataType,
+    pub nullable: bool,
+}
+
+/// Immutable schema facts for one SQL-owned internal MV target column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvInternalTargetColumnFacts {
+    pub name: String,
+    pub data_type: novarocks_catalog::schema::SqlType,
+    pub nullable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqlMvInternalTargetColumn {
+    ApplyKey,
+    JoinApplyKey,
+    BranchId,
+}
+
+pub fn mv_internal_target_column(
+    kind: SqlMvInternalTargetColumn,
+) -> SqlMvInternalTargetColumnFacts {
+    use novarocks_catalog::schema::SqlType;
+
+    match kind {
+        SqlMvInternalTargetColumn::ApplyKey => SqlMvInternalTargetColumnFacts {
+            name: MV_HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+            data_type: SqlType::BigInt,
+            nullable: false,
+        },
+        SqlMvInternalTargetColumn::JoinApplyKey => SqlMvInternalTargetColumnFacts {
+            name: MV_JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
+            data_type: SqlType::String,
+            nullable: false,
+        },
+        SqlMvInternalTargetColumn::BranchId => SqlMvInternalTargetColumnFacts {
+            name: MV_BRANCH_ID_COLUMN_NAME.to_string(),
+            data_type: SqlType::Int,
+            nullable: false,
+        },
+    }
+}
+
+/// Shape a physical Iceberg MV projection under SQL's parser ownership.
+pub fn iceberg_mv_physical_select_sql(select_sql: &str) -> Result<String, String> {
+    let normalized = crate::parser::dialect::normalize_for_raw_parse(select_sql)
+        .map_err(|e| format!("iceberg MV physical SELECT normalize error: {e}"))?;
+    let mut statement = crate::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("iceberg MV physical SELECT parse error: {e}"))?;
+    let sqlparser::ast::Statement::Query(query) = &mut statement else {
+        return Err("iceberg MV physical SELECT expects a SELECT query".to_string());
+    };
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+        return Err("iceberg MV physical SELECT expects a SELECT body".to_string());
+    };
+
+    validate_reserved_projection_output_names(
+        select,
+        &[(MV_HIDDEN_APPLY_KEY_COLUMN_NAME, "apply key")],
+    )?;
+    for item in &select.projection {
+        match item {
+            sqlparser::ast::SelectItem::UnnamedExpr(_)
+            | sqlparser::ast::SelectItem::ExprWithAlias { .. } => {}
+            sqlparser::ast::SelectItem::Wildcard(_)
+            | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => {
+                return Err(
+                    "iceberg MV physical SELECT requires explicit projection columns".to_string(),
+                );
+            }
+        }
+    }
+    select
+        .projection
+        .push(sqlparser::ast::SelectItem::ExprWithAlias {
+            expr: sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("_row_id")),
+            alias: sqlparser::ast::Ident::new(MV_HIDDEN_APPLY_KEY_COLUMN_NAME),
+        });
+    Ok(statement.to_string())
+}
+
+pub fn validate_reserved_projection_output_names(
+    select: &sqlparser::ast::Select,
+    reserved: &[(&str, &str)],
+) -> Result<(), String> {
+    for item in &select.projection {
+        let output_name = match item {
+            sqlparser::ast::SelectItem::UnnamedExpr(expr) => Some(expr.to_string()),
+            sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+            sqlparser::ast::SelectItem::Wildcard(_)
+            | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => None,
+        };
+        let Some(output_name) = output_name else {
+            continue;
+        };
+        for (reserved_name, purpose) in reserved {
+            if output_name.eq_ignore_ascii_case(reserved_name) {
+                return Err(format!(
+                    "Iceberg MV output column name {reserved_name} is reserved for internal {purpose}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn aggregate_input_types_from_resolved_query(
+    calls: &SqlMvAggregateCalls,
+    resolved: &crate::analysis::ResolvedQuery,
+) -> Result<Vec<Option<arrow::datatypes::DataType>>, String> {
+    let crate::analysis::QueryBody::Select(select) = &resolved.body else {
+        return Err("aggregate MV input type metadata requires SELECT analysis".to_string());
+    };
+    if select.projection.len() != calls.visible_outputs.len() {
+        return Err(format!(
+            "aggregate MV input type projection count mismatch: analyzed_projection={} shape_outputs={}",
+            select.projection.len(),
+            calls.visible_outputs.len()
+        ));
+    }
+
+    let mut input_types = vec![None; calls.aggregates.len()];
+    for (projection_index, visible_output) in calls.visible_outputs.iter().enumerate() {
+        let VisibleAggregateOutput::Aggregate(aggregate_index) = visible_output else {
+            continue;
+        };
+        let projection = &select.projection[projection_index];
+        let crate::analysis::ExprKind::AggregateCall { args, .. } = &projection.expr.kind else {
+            return Err(format!(
+                "aggregate MV analyzed projection `{}` is not an aggregate expression",
+                projection.output_name
+            ));
+        };
+        let slot = input_types.get_mut(*aggregate_index).ok_or_else(|| {
+            format!("aggregate MV aggregate index out of range: aggregate_index={aggregate_index}")
+        })?;
+        *slot = args.first().map(|arg| arg.data_type.clone());
+    }
+    Ok(input_types)
+}
+
+/// Normalize catalog-qualified raw syntax for the local analyzer route. The
+/// parser visitor stays SQL-owned; Core only supplies the syntax query.
+pub fn strip_catalog_from_three_part_names(query: &mut sqlparser::ast::Query) {
+    crate::parser::query_refs::strip_catalog_from_three_part_names(query);
 }
 
 /// Immutable refresh contract selected by SQL property analysis. Core maps this

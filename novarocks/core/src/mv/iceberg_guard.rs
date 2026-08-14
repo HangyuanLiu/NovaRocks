@@ -197,11 +197,11 @@ fn sql_mentions_identifier(sql: &str, normalized_identifier: &str) -> bool {
 }
 
 fn sql_projects_target_wildcard(sql: &str, target: &MvDependencyTarget) -> bool {
-    let Ok(normalized) = novarocks_sql::parser::dialect::normalize_for_raw_parse(sql) else {
+    let Ok(normalized) = novarocks_sql::syntax::normalize_for_raw_parse(sql) else {
         return false;
     };
     let Ok(sqlparser::ast::Statement::Query(query)) =
-        novarocks_sql::parser::parse_normalized_sql_raw(&normalized)
+        novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
     else {
         return false;
     };

@@ -132,8 +132,8 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
             name_parts: vec![step.target.name.clone()],
             full: false,
         };
-        let ast_statement = novarocks_sql::parser::ast::RefreshMaterializedViewStmt {
-            name: novarocks_sql::parser::ast::ObjectName {
+        let ast_statement = novarocks_sql::syntax::RefreshMaterializedViewStmt {
+            name: novarocks_sql::syntax::ObjectName {
                 parts: vec![step.target.name.clone()],
             },
             full: false,

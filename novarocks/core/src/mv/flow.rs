@@ -28,11 +28,11 @@ use crate::mv::repository::MvRepository;
 use crate::query_execution::StatementResult;
 use crate::query_execution::kernels::MvExecutionKernel;
 use novarocks_catalog::identifier::normalize_identifier;
-use novarocks_sql::parser::ast::{
+use novarocks_sql::syntax::three_part_table_ref_occurrences;
+use novarocks_sql::syntax::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
     DropMaterializedViewStmt, MaterializedViewRefreshPolicy, ShowMaterializedViewsStmt,
 };
-use novarocks_sql::parser::query_refs::extract_three_part_table_ref_occurrences;
 
 #[cfg(any())]
 mod lifecycle_tests {
@@ -182,12 +182,11 @@ mod lifecycle_tests {
     }
 
     fn refresh_request() -> RefreshRequest {
-        let stmt = match novarocks_sql::parser::parse_sql("REFRESH MATERIALIZED VIEW mv1")
-            .expect("parse")
-            .remove(0)
-        {
-            novarocks_sql::parser::ast::Statement::RefreshMaterializedView(stmt) => stmt,
-            other => panic!("unexpected statement: {other:?}"),
+        let novarocks_sql::syntax::MvAdmittedStatement::Refresh(stmt) =
+            novarocks_sql::syntax::parse_mv_admitted_statement("REFRESH MATERIALIZED VIEW mv1")
+                .expect("parse")
+        else {
+            panic!("expected REFRESH MATERIALIZED VIEW");
         };
         RefreshRequest {
             target: MvTarget {
@@ -409,7 +408,7 @@ fn load_definition_for_alter(
     repository: &dyn MvRepository,
     current_catalog: Option<&str>,
     db: &str,
-    name: &novarocks_sql::parser::ast::ObjectName,
+    name: &novarocks_sql::syntax::ObjectName,
 ) -> Result<StoredMvDefinition, String> {
     let target = crate::mv::iceberg_refresh::resolve_refresh_target(current_catalog, db, name)?;
     let Some(definition) = repository
@@ -686,7 +685,7 @@ pub(crate) fn validate_incremental_mv_base_ref(
     query: &sqlparser::ast::Query,
     base_ref: &novarocks_catalog::identifier::TableIdentity,
 ) -> Result<(String, String, String), String> {
-    let refs = extract_three_part_table_ref_occurrences(query);
+    let refs = three_part_table_ref_occurrences(&query.to_string())?;
     if refs.len() != 1 {
         return Err(format!(
             "incremental MV refresh stored SQL must reference exactly one 3-part Iceberg table, got {}",
@@ -779,9 +778,9 @@ mod tests {
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =
-            novarocks_sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize sql");
+            novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize sql");
         let statement =
-            novarocks_sql::parser::parse_normalized_sql_raw(&normalized).expect("parse sql");
+            novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse sql");
         let sqlparser::ast::Statement::Query(query) = statement else {
             panic!("expected query");
         };

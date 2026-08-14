@@ -34,7 +34,7 @@ use crate::mv::persistence::refresh::MvRefreshState;
 use crate::mv::repository::MvRepository;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
-use novarocks_sql::parser::ast::ShowMaterializedViewsStmt;
+use novarocks_sql::syntax::ShowMaterializedViewsStmt;
 
 /// Lightweight projection of the iceberg base table that
 /// `validate_ivm_primary_key` needs. Built once at the top of `create_mv`

@@ -35,6 +35,282 @@ use crate::planner::table::ScanSource;
 
 use super::{SqlFunctionCatalog, SqlStatisticsPlan, SqlStatisticsSnapshot};
 
+/// Immutable base-snapshot facts submitted by the application to an IMV
+/// rewrite snapshot builder.  This is deliberately a value-only boundary:
+/// it contains neither a provider table nor a request lifecycle capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvBaseSnapshotFacts {
+    table: novarocks_catalog::identifier::TableIdentity,
+    snapshot_id: i64,
+    table_uuid: String,
+}
+
+impl SqlImvBaseSnapshotFacts {
+    pub fn try_new(
+        table: novarocks_catalog::identifier::TableIdentity,
+        snapshot_id: i64,
+        table_uuid: String,
+    ) -> Result<Self, String> {
+        if snapshot_id < 0 || table_uuid.trim().is_empty() {
+            return Err("IMV base snapshot facts are incomplete".to_string());
+        }
+        Ok(Self {
+            table,
+            snapshot_id,
+            table_uuid,
+        })
+    }
+
+    fn into_snapshot(self) -> SqlImvBaseSnapshot {
+        SqlImvBaseSnapshot {
+            table: self.table,
+            snapshot_id: self.snapshot_id,
+            table_uuid: self.table_uuid,
+        }
+    }
+}
+
+/// Immutable target-column facts copied from the admitted target schema.
+/// Defaults and provider metadata are intentionally absent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SqlImvTargetColumnsFacts {
+    columns: Arc<[novarocks_catalog::schema::ColumnDef]>,
+}
+
+impl SqlImvTargetColumnsFacts {
+    pub fn try_new(columns: Vec<novarocks_catalog::schema::ColumnDef>) -> Result<Self, String> {
+        if columns.is_empty()
+            || columns.iter().any(|column| column.name.trim().is_empty())
+            || columns.iter().enumerate().any(|(index, column)| {
+                columns[..index]
+                    .iter()
+                    .any(|other| other.name.eq_ignore_ascii_case(&column.name))
+            })
+        {
+            return Err("IMV target column facts are invalid".to_string());
+        }
+        Ok(Self {
+            columns: Arc::from(columns),
+        })
+    }
+
+    fn into_columns(self) -> Arc<[novarocks_catalog::schema::ColumnDef]> {
+        self.columns
+    }
+}
+
+/// The value-only foundation of a sealed IMV rewrite snapshot.  Additional
+/// contract facts are supplied by the SQL-owned builder; applications can
+/// never recover or mutate the resulting planner snapshot.
+pub struct SqlImvRewriteSnapshotBuilder {
+    target: novarocks_catalog::identifier::TableIdentity,
+    target_binding: SqlTableBindingId,
+    mv_id: i64,
+    base_snapshots: Vec<SqlImvBaseSnapshotFacts>,
+    target_columns: Option<SqlImvTargetColumnsFacts>,
+    refresh_history: Option<SqlImvRefreshHistoryFacts>,
+    schema_contract: Option<SqlImvSchemaContractFacts>,
+    aggregate_execution: Option<SqlImvAggregateExecutionFacts>,
+}
+
+impl SqlImvRewriteSnapshotBuilder {
+    pub fn try_new(
+        target: novarocks_catalog::identifier::TableIdentity,
+        target_binding: SqlTableBindingId,
+        mv_id: i64,
+    ) -> Result<Self, String> {
+        if mv_id < 0 {
+            return Err("IMV rewrite snapshot has an invalid MV identity".to_string());
+        }
+        Ok(Self {
+            target,
+            target_binding,
+            mv_id,
+            base_snapshots: Vec::new(),
+            target_columns: None,
+            refresh_history: None,
+            schema_contract: None,
+            aggregate_execution: None,
+        })
+    }
+
+    pub fn add_base_snapshot(&mut self, base: SqlImvBaseSnapshotFacts) -> Result<(), String> {
+        if self.base_snapshots.iter().any(|existing| {
+            existing
+                .table
+                .catalog
+                .eq_ignore_ascii_case(&base.table.catalog)
+                && existing
+                    .table
+                    .namespace
+                    .eq_ignore_ascii_case(&base.table.namespace)
+                && existing.table.table.eq_ignore_ascii_case(&base.table.table)
+        }) {
+            return Err(format!(
+                "IMV rewrite snapshot has duplicate base {}",
+                base.table.fqn()
+            ));
+        }
+        self.base_snapshots.push(base);
+        Ok(())
+    }
+
+    pub fn target(&self) -> &novarocks_catalog::identifier::TableIdentity {
+        &self.target
+    }
+
+    pub fn target_binding(&self) -> SqlTableBindingId {
+        self.target_binding
+    }
+
+    pub fn mv_id(&self) -> i64 {
+        self.mv_id
+    }
+
+    pub fn base_count(&self) -> usize {
+        self.base_snapshots.len()
+    }
+
+    pub fn set_target_columns(&mut self, columns: SqlImvTargetColumnsFacts) -> Result<(), String> {
+        if self.target_columns.is_some() {
+            return Err("IMV rewrite snapshot target columns were submitted twice".to_string());
+        }
+        self.target_columns = Some(columns);
+        Ok(())
+    }
+
+    pub fn set_refresh_history(
+        &mut self,
+        history: SqlImvRefreshHistoryFacts,
+    ) -> Result<(), String> {
+        if self.refresh_history.is_some() {
+            return Err("IMV rewrite snapshot refresh history was submitted twice".to_string());
+        }
+        self.refresh_history = Some(history);
+        Ok(())
+    }
+
+    pub fn set_schema_contract(
+        &mut self,
+        contract: SqlImvSchemaContractFacts,
+    ) -> Result<(), String> {
+        if self.schema_contract.is_some() {
+            return Err("IMV rewrite snapshot schema contract was submitted twice".to_string());
+        }
+        self.schema_contract = Some(contract);
+        Ok(())
+    }
+
+    pub fn set_aggregate_execution(
+        &mut self,
+        layout: SqlImvAggregateExecutionFacts,
+    ) -> Result<(), String> {
+        if self.aggregate_execution.is_some() {
+            return Err("IMV rewrite snapshot aggregate execution was submitted twice".to_string());
+        }
+        self.aggregate_execution = Some(layout);
+        Ok(())
+    }
+
+    /// Seal the submitted copied facts.  The returned handle intentionally has
+    /// no accessors for the planner snapshot or its private graph vocabulary.
+    pub fn build(mut self) -> Result<SqlImvRewriteSnapshotHandle, String> {
+        let base_snapshots = self.take_base_snapshots()?;
+        let target_columns = self.take_target_columns()?;
+        let history = self
+            .refresh_history
+            .take()
+            .ok_or_else(|| "IMV rewrite snapshot has no refresh history facts".to_string())?;
+        let schema_contract = self
+            .schema_contract
+            .take()
+            .ok_or_else(|| "IMV rewrite snapshot has no schema contract facts".to_string())?;
+        let aggregate_execution = self.aggregate_execution.take().map(|facts| facts.inner);
+        let snapshot = SqlImvRewriteSnapshot::from_frozen_parts(
+            self.target,
+            self.target_binding,
+            self.mv_id,
+            base_snapshots,
+            history.previous_snapshot_ids,
+            history.previous_table_uuids,
+            history.target_snapshot_id,
+            history.target_table_uuid,
+            target_columns,
+            Arc::new(schema_contract.inner),
+            aggregate_execution,
+        )?;
+        Ok(SqlImvRewriteSnapshotHandle(Arc::new(snapshot)))
+    }
+
+    fn take_base_snapshots(&mut self) -> Result<Arc<[SqlImvBaseSnapshot]>, String> {
+        if self.base_snapshots.is_empty() {
+            return Err("IMV rewrite snapshot has no base table snapshots".to_string());
+        }
+        Ok(Arc::from(
+            std::mem::take(&mut self.base_snapshots)
+                .into_iter()
+                .map(SqlImvBaseSnapshotFacts::into_snapshot)
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn take_target_columns(
+        &mut self,
+    ) -> Result<Arc<[novarocks_catalog::schema::ColumnDef]>, String> {
+        self.target_columns
+            .take()
+            .map(SqlImvTargetColumnsFacts::into_columns)
+            .ok_or_else(|| "IMV rewrite snapshot has no target column facts".to_string())
+    }
+}
+
+/// Opaque sealed IMV rewrite facts.  Cloning this handle only shares the
+/// immutable SQL-owned snapshot; it cannot expose or mutate planner state.
+#[derive(Clone)]
+pub struct SqlImvRewriteSnapshotHandle(Arc<SqlImvRewriteSnapshot>);
+
+impl SqlImvRewriteSnapshotHandle {
+    pub(crate) fn snapshot(&self) -> &Arc<SqlImvRewriteSnapshot> {
+        &self.0
+    }
+}
+
+/// Frozen refresh-history values.  Snapshot pins are identifiers only; table
+/// handles, leases and catalog callbacks are deliberately excluded.
+pub struct SqlImvRefreshHistoryFacts {
+    previous_snapshot_ids: BTreeMap<String, i64>,
+    previous_table_uuids: BTreeMap<String, String>,
+    target_snapshot_id: Option<i64>,
+    target_table_uuid: String,
+}
+
+impl SqlImvRefreshHistoryFacts {
+    pub fn try_new(
+        previous_snapshot_ids: BTreeMap<String, i64>,
+        previous_table_uuids: BTreeMap<String, String>,
+        target_snapshot_id: Option<i64>,
+        target_table_uuid: String,
+    ) -> Result<Self, String> {
+        if target_snapshot_id.is_some_and(|snapshot_id| snapshot_id < 0)
+            || target_table_uuid.trim().is_empty()
+            || previous_snapshot_ids
+                .iter()
+                .any(|(table, snapshot_id)| table.trim().is_empty() || *snapshot_id < 0)
+            || previous_table_uuids
+                .iter()
+                .any(|(table, uuid)| table.trim().is_empty() || uuid.trim().is_empty())
+        {
+            return Err("IMV refresh history facts are invalid".to_string());
+        }
+        Ok(Self {
+            previous_snapshot_ids,
+            previous_table_uuids,
+            target_snapshot_id,
+            target_table_uuid,
+        })
+    }
+}
+
 /// One base-table snapshot admitted for an incremental MV refresh.
 ///
 /// The compiler identifies a base by its canonical identity and never asks a
@@ -259,6 +535,651 @@ pub(crate) struct SqlImvSchemaContract {
     pub(crate) target: SqlImvTargetContract,
 }
 
+/// SQL-owned expression classification admitted from persisted lineage facts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlImvExpressionKindFacts {
+    Column,
+    Cast,
+    Func,
+    Literal,
+    Mixed,
+}
+
+impl From<SqlImvExpressionKindFacts> for SqlImvExpressionKind {
+    fn from(value: SqlImvExpressionKindFacts) -> Self {
+        match value {
+            SqlImvExpressionKindFacts::Column => Self::Column,
+            SqlImvExpressionKindFacts::Cast => Self::Cast,
+            SqlImvExpressionKindFacts::Func => Self::Func,
+            SqlImvExpressionKindFacts::Literal => Self::Literal,
+            SqlImvExpressionKindFacts::Mixed => Self::Mixed,
+        }
+    }
+}
+
+/// A qualified base field recorded at MV creation.  Its identity is copied as
+/// strings and an id; it cannot be used to resolve a current provider table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvQualifiedFieldFacts {
+    inner: SqlImvQualifiedFieldLineage,
+}
+
+impl SqlImvQualifiedFieldFacts {
+    pub fn try_new(
+        table_fqn: String,
+        qualifier_at_create: String,
+        field_id: i32,
+    ) -> Result<Self, String> {
+        if table_fqn.trim().is_empty() || qualifier_at_create.trim().is_empty() || field_id < 0 {
+            return Err("IMV qualified field facts are invalid".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvQualifiedFieldLineage {
+                table_fqn,
+                qualifier_at_create,
+                field_id,
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvExpressionFacts {
+    inner: SqlImvExpressionLineage,
+}
+
+impl SqlImvExpressionFacts {
+    pub fn try_new(
+        kind: SqlImvExpressionKindFacts,
+        referenced_base_field_ids: Vec<i32>,
+        referenced_base_fields: Vec<SqlImvQualifiedFieldFacts>,
+    ) -> Result<Self, String> {
+        if referenced_base_field_ids
+            .iter()
+            .any(|field_id| *field_id < 0)
+            || referenced_base_field_ids
+                .windows(2)
+                .any(|ids| ids[0] == ids[1])
+        {
+            return Err("IMV expression field-id facts are invalid".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvExpressionLineage {
+                kind: kind.into(),
+                referenced_base_field_ids,
+                referenced_base_fields: referenced_base_fields
+                    .into_iter()
+                    .map(|facts| facts.inner)
+                    .collect(),
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvOutputColumnFacts {
+    inner: SqlImvOutputColumnLineage,
+}
+
+impl SqlImvOutputColumnFacts {
+    pub fn new(expression: SqlImvExpressionFacts) -> Self {
+        Self {
+            inner: SqlImvOutputColumnLineage {
+                expression: expression.inner,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvBaseFieldFacts {
+    inner: SqlImvBaseField,
+}
+
+impl SqlImvBaseFieldFacts {
+    pub fn try_new(field_id: i32, name_at_create: String) -> Result<Self, String> {
+        if field_id < 0 || name_at_create.trim().is_empty() {
+            return Err("IMV base field facts are invalid".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvBaseField {
+                field_id,
+                name_at_create,
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvBaseContractFacts {
+    inner: SqlImvBaseContract,
+}
+
+impl SqlImvBaseContractFacts {
+    pub fn try_new(
+        table_fqn: String,
+        alias_at_create: Option<String>,
+        fields: Vec<SqlImvBaseFieldFacts>,
+    ) -> Result<Self, String> {
+        if table_fqn.trim().is_empty()
+            || fields.is_empty()
+            || fields.iter().enumerate().any(|(index, field)| {
+                fields[..index]
+                    .iter()
+                    .any(|other| other.inner.field_id == field.inner.field_id)
+            })
+        {
+            return Err("IMV base contract facts are invalid".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvBaseContract {
+                table_fqn,
+                alias_at_create,
+                fields: fields.into_iter().map(|facts| facts.inner).collect(),
+            },
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlImvJoinKindFacts {
+    InnerEquiJoin,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvJoinPredicateFacts {
+    inner: SqlImvJoinPredicateLineage,
+}
+
+impl SqlImvJoinPredicateFacts {
+    pub fn try_new(
+        left: SqlImvQualifiedFieldFacts,
+        right: SqlImvQualifiedFieldFacts,
+    ) -> Result<Self, String> {
+        if left
+            .inner
+            .table_fqn
+            .eq_ignore_ascii_case(&right.inner.table_fqn)
+            && left.inner.field_id == right.inner.field_id
+        {
+            return Err("IMV join predicate facts cannot compare one field to itself".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvJoinPredicateLineage {
+                left: left.inner,
+                right: right.inner,
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvJoinContractFacts {
+    inner: SqlImvJoinContract,
+}
+
+impl SqlImvJoinContractFacts {
+    pub fn try_new(
+        kind: SqlImvJoinKindFacts,
+        predicates: Vec<SqlImvJoinPredicateFacts>,
+    ) -> Result<Self, String> {
+        if predicates.is_empty() {
+            return Err("IMV join contract has no equality predicates".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvJoinContract {
+                kind: match kind {
+                    SqlImvJoinKindFacts::InnerEquiJoin => SqlImvJoinContractKind::InnerEquiJoin,
+                },
+                predicates: predicates.into_iter().map(|facts| facts.inner).collect(),
+            },
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlImvAggregateStateRoleFacts {
+    Single,
+    RetractionCount,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvAggregateStateColumnFacts {
+    inner: SqlImvAggregateStateColumnContract,
+}
+
+impl SqlImvAggregateStateColumnFacts {
+    pub fn try_new(
+        column_name: String,
+        type_signature: String,
+        role: SqlImvAggregateStateRoleFacts,
+    ) -> Result<Self, String> {
+        if column_name.trim().is_empty() || type_signature.trim().is_empty() {
+            return Err("IMV aggregate state column facts are invalid".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvAggregateStateColumnContract {
+                column_name,
+                type_signature,
+                role: match role {
+                    SqlImvAggregateStateRoleFacts::Single => {
+                        SqlImvAggregateStateRoleContract::Single
+                    }
+                    SqlImvAggregateStateRoleFacts::RetractionCount => {
+                        SqlImvAggregateStateRoleContract::RetractionCount
+                    }
+                },
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvAggregateContractFacts {
+    inner: SqlImvAggregateContract,
+}
+
+impl SqlImvAggregateContractFacts {
+    pub fn try_new(
+        state_layout_version: u16,
+        row_id_column_name: String,
+        state_columns: Vec<SqlImvAggregateStateColumnFacts>,
+    ) -> Result<Self, String> {
+        if state_layout_version == 0
+            || row_id_column_name.trim().is_empty()
+            || state_columns.is_empty()
+            || state_columns.iter().enumerate().any(|(index, column)| {
+                state_columns[..index].iter().any(|other| {
+                    other
+                        .inner
+                        .column_name
+                        .eq_ignore_ascii_case(&column.inner.column_name)
+                })
+            })
+        {
+            return Err("IMV aggregate contract facts are invalid".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvAggregateContract {
+                state_layout_version,
+                row_id_column_name,
+                state_columns: state_columns.into_iter().map(|facts| facts.inner).collect(),
+            },
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlImvApplyKeySourceFacts {
+    BaseRowId,
+    JoinRowKey,
+    GroupRowId,
+}
+
+impl SqlImvApplyKeySourceFacts {
+    /// Decode the stable persisted spelling without exposing SQL planner
+    /// vocabulary to the persistence adapter.
+    pub fn try_from_persisted_label(label: &str) -> Result<Self, String> {
+        match label {
+            "BaseRowId" | "BASE_ROW_ID" => Ok(Self::BaseRowId),
+            "JoinRowKey" | "JOIN_ROW_KEY" => Ok(Self::JoinRowKey),
+            "GroupRowId" | "GROUP_ROW_ID" => Ok(Self::GroupRowId),
+            _ => Err("IMV hidden apply-key source is unsupported".to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SqlImvPartitionTransformFacts {
+    Identity,
+    Year,
+    Month,
+    Day,
+    Hour,
+    Bucket { num_buckets: u32 },
+    Truncate { width: u32 },
+    Void,
+}
+
+impl SqlImvPartitionTransformFacts {
+    fn into_internal(self) -> Result<SqlImvPartitionTransform, String> {
+        match self {
+            Self::Identity => Ok(SqlImvPartitionTransform::Identity),
+            Self::Year => Ok(SqlImvPartitionTransform::Year),
+            Self::Month => Ok(SqlImvPartitionTransform::Month),
+            Self::Day => Ok(SqlImvPartitionTransform::Day),
+            Self::Hour => Ok(SqlImvPartitionTransform::Hour),
+            Self::Bucket { num_buckets } if num_buckets > 0 => {
+                Ok(SqlImvPartitionTransform::Bucket { num_buckets })
+            }
+            Self::Truncate { width } if width > 0 => {
+                Ok(SqlImvPartitionTransform::Truncate { width })
+            }
+            Self::Void => Ok(SqlImvPartitionTransform::Void),
+            _ => Err("IMV partition transform facts are invalid".to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvPartitionFieldFacts {
+    partition_field_name: String,
+    source_target_field_id: i32,
+    transform: SqlImvPartitionTransformFacts,
+}
+
+impl SqlImvPartitionFieldFacts {
+    pub fn try_new(
+        partition_field_name: String,
+        source_target_field_id: i32,
+        transform: SqlImvPartitionTransformFacts,
+    ) -> Result<Self, String> {
+        if partition_field_name.trim().is_empty() || source_target_field_id < 0 {
+            return Err("IMV partition field facts are invalid".to_string());
+        }
+        transform.clone().into_internal()?;
+        Ok(Self {
+            partition_field_name,
+            source_target_field_id,
+            transform,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvPartitionFacts {
+    inner: SqlImvPartitionContract,
+}
+
+impl SqlImvPartitionFacts {
+    pub fn try_new(
+        target_spec_id: i32,
+        fields: Vec<SqlImvPartitionFieldFacts>,
+    ) -> Result<Self, String> {
+        if target_spec_id < 0
+            || fields.is_empty()
+            || fields.iter().enumerate().any(|(index, field)| {
+                fields[..index].iter().any(|other| {
+                    other
+                        .partition_field_name
+                        .eq_ignore_ascii_case(&field.partition_field_name)
+                })
+            })
+        {
+            return Err("IMV partition facts are invalid".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvPartitionContract {
+                target_spec_id,
+                fields: fields
+                    .into_iter()
+                    .map(|facts| {
+                        Ok(SqlImvPartitionField {
+                            partition_field_name: facts.partition_field_name,
+                            source_target_field_id: facts.source_target_field_id,
+                            transform: facts.transform.into_internal()?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvTargetVisibleColumnFacts {
+    inner: SqlImvTargetVisibleColumn,
+}
+
+impl SqlImvTargetVisibleColumnFacts {
+    pub fn try_new(output_name: String, target_field_id: i32) -> Result<Self, String> {
+        if output_name.trim().is_empty() || target_field_id < 0 {
+            return Err("IMV target visible-column facts are invalid".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvTargetVisibleColumn {
+                output_name,
+                target_field_id,
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvTargetContractFacts {
+    inner: SqlImvTargetContract,
+}
+
+impl SqlImvTargetContractFacts {
+    pub fn try_new(
+        visible_columns: Vec<SqlImvTargetVisibleColumnFacts>,
+        hidden_apply_key_column_name: String,
+        hidden_apply_key_source: SqlImvApplyKeySourceFacts,
+        partition: Option<SqlImvPartitionFacts>,
+    ) -> Result<Self, String> {
+        if visible_columns.is_empty()
+            || hidden_apply_key_column_name.trim().is_empty()
+            || visible_columns.iter().enumerate().any(|(index, column)| {
+                visible_columns[..index].iter().any(|other| {
+                    other
+                        .inner
+                        .target_field_id
+                        .eq(&column.inner.target_field_id)
+                        || other
+                            .inner
+                            .output_name
+                            .eq_ignore_ascii_case(&column.inner.output_name)
+                })
+            })
+        {
+            return Err("IMV target contract facts are invalid".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvTargetContract {
+                visible_columns: visible_columns
+                    .into_iter()
+                    .map(|facts| facts.inner)
+                    .collect(),
+                hidden_apply_key: SqlImvHiddenApplyKey {
+                    column_name: hidden_apply_key_column_name,
+                    source: match hidden_apply_key_source {
+                        SqlImvApplyKeySourceFacts::BaseRowId => {
+                            crate::planner::vocabulary::ApplyKeySource::BaseRowId
+                        }
+                        SqlImvApplyKeySourceFacts::JoinRowKey => {
+                            crate::planner::vocabulary::ApplyKeySource::JoinRowKey
+                        }
+                        SqlImvApplyKeySourceFacts::GroupRowId => {
+                            crate::planner::vocabulary::ApplyKeySource::GroupRowId
+                        }
+                    },
+                },
+                partition: partition.map(|facts| facts.inner),
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvBranchContractFacts {
+    inner: SqlImvBranchContract,
+}
+
+impl SqlImvBranchContractFacts {
+    pub fn try_new(branch_id_column_name: String) -> Result<Self, String> {
+        if branch_id_column_name.trim().is_empty() {
+            return Err("IMV branch contract facts are invalid".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvBranchContract {
+                branch_id_column_name,
+            },
+        })
+    }
+}
+
+/// Fully validated value-only image of the persisted MV schema contract.
+/// The wrapper does not provide a raw-contract accessor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvSchemaContractFacts {
+    inner: SqlImvSchemaContract,
+}
+
+impl SqlImvSchemaContractFacts {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        bases: Vec<SqlImvBaseContractFacts>,
+        output_columns: Vec<SqlImvOutputColumnFacts>,
+        join: Option<SqlImvJoinContractFacts>,
+        aggregate: Option<SqlImvAggregateContractFacts>,
+        branch: Option<SqlImvBranchContractFacts>,
+        target: SqlImvTargetContractFacts,
+    ) -> Result<Self, String> {
+        if bases.is_empty()
+            || output_columns.is_empty()
+            || bases.iter().enumerate().any(|(index, base)| {
+                bases[..index].iter().any(|other| {
+                    other
+                        .inner
+                        .table_fqn
+                        .eq_ignore_ascii_case(&base.inner.table_fqn)
+                })
+            })
+        {
+            return Err("IMV schema contract facts are incomplete or duplicate".to_string());
+        }
+        if join.is_some() && bases.len() < 2 {
+            return Err("IMV join contract requires at least two bases".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvSchemaContract {
+                bases: bases.into_iter().map(|facts| facts.inner).collect(),
+                output_columns: output_columns
+                    .into_iter()
+                    .map(|facts| facts.inner)
+                    .collect(),
+                join: join.map(|facts| facts.inner),
+                aggregate: aggregate.map(|facts| facts.inner),
+                branch: branch.map(|facts| facts.inner),
+                target: target.inner,
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvAggregateVisibleColumnFacts {
+    inner: SqlImvAggregateVisibleColumn,
+}
+
+impl SqlImvAggregateVisibleColumnFacts {
+    pub fn try_new(
+        name: String,
+        data_type: arrow::datatypes::DataType,
+        nullable: bool,
+    ) -> Result<Self, String> {
+        if name.trim().is_empty() {
+            return Err("IMV aggregate visible-column facts are invalid".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvAggregateVisibleColumn {
+                name,
+                data_type,
+                nullable,
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvAggregateExecutionStateColumnFacts {
+    inner: SqlImvAggregateStateColumn,
+}
+
+impl SqlImvAggregateExecutionStateColumnFacts {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        name: String,
+        data_type: arrow::datatypes::DataType,
+        nullable: bool,
+        visible_source_index: usize,
+        aggregate_index: usize,
+        function: crate::mv_refresh::AggregateFunctionKind,
+        state_role: SqlImvAggregateStateRoleFacts,
+        count_star: bool,
+    ) -> Result<Self, String> {
+        if name.trim().is_empty() {
+            return Err("IMV aggregate execution state-column facts are invalid".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvAggregateStateColumn {
+                name,
+                data_type,
+                nullable,
+                visible_source_index,
+                aggregate_index,
+                function,
+                state_role: match state_role {
+                    SqlImvAggregateStateRoleFacts::Single => SqlImvAggregateStateRole::Single,
+                    SqlImvAggregateStateRoleFacts::RetractionCount => {
+                        SqlImvAggregateStateRole::RetractionCount
+                    }
+                },
+                count_star,
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlImvAggregateExecutionFacts {
+    inner: SqlImvAggregateExecutionLayout,
+}
+
+impl SqlImvAggregateExecutionFacts {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        group_key_count: usize,
+        visible_outputs: Vec<crate::mv_refresh::VisibleAggregateOutput>,
+        row_id_column_name: String,
+        visible_columns: Vec<SqlImvAggregateVisibleColumnFacts>,
+        state_columns: Vec<SqlImvAggregateExecutionStateColumnFacts>,
+        group_key_source_indexes: Vec<usize>,
+        physical_column_names: Vec<String>,
+        aggregate_input_types: Vec<Option<arrow::datatypes::DataType>>,
+    ) -> Result<Self, String> {
+        if row_id_column_name.trim().is_empty()
+            || visible_columns.is_empty()
+            || state_columns.is_empty()
+            || physical_column_names.is_empty()
+            || physical_column_names
+                .iter()
+                .any(|name| name.trim().is_empty())
+        {
+            return Err("IMV aggregate execution facts are incomplete".to_string());
+        }
+        Ok(Self {
+            inner: SqlImvAggregateExecutionLayout {
+                shape: SqlImvAggregateShape {
+                    group_key_count,
+                    visible_outputs,
+                },
+                layout: SqlImvAggregateLayout {
+                    row_id_column_name,
+                    visible_columns: visible_columns
+                        .into_iter()
+                        .map(|facts| facts.inner)
+                        .collect(),
+                    state_columns: state_columns.into_iter().map(|facts| facts.inner).collect(),
+                    group_key_source_indexes,
+                    physical_column_names,
+                    aggregate_input_types,
+                },
+            },
+        })
+    }
+}
+
 /// Immutable, query-scoped facts consumed by incremental-MV rewrite rules.
 ///
 /// This is the SQL boundary for refresh planning.  It intentionally contains
@@ -446,6 +1367,11 @@ pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
         )
         .expect("SQL-only test IMV snapshot"),
     )
+}
+
+#[cfg(test)]
+pub(crate) fn test_incremental_snapshot_handle() -> SqlImvRewriteSnapshotHandle {
+    SqlImvRewriteSnapshotHandle(test_incremental_snapshot())
 }
 
 /// SQL-only scan fixture for rewrite-rule tests.  Test plans must exercise the
@@ -1417,5 +2343,113 @@ mod tests {
     #[test]
     fn sqlx2_mv_candidate_limit_is_sixteen_successes() {
         assert_eq!(MAX_SUCCESSFUL_MV_REWRITE_CANDIDATES, 16);
+    }
+
+    #[test]
+    fn sealed_snapshot_builder_rejects_incomplete_and_duplicate_base_facts() {
+        let target = novarocks_catalog::identifier::TableIdentity {
+            catalog: "iceberg".to_string(),
+            namespace: "db".to_string(),
+            table: "mv".to_string(),
+        };
+        let base = novarocks_catalog::identifier::TableIdentity {
+            catalog: "iceberg".to_string(),
+            namespace: "db".to_string(),
+            table: "base".to_string(),
+        };
+        assert!(SqlImvBaseSnapshotFacts::try_new(base.clone(), -1, "uuid".to_string()).is_err());
+
+        let mut builder =
+            SqlImvRewriteSnapshotBuilder::try_new(target, SqlTableBindingId::new_for_test(1), 7)
+                .expect("valid sealed snapshot builder");
+        builder
+            .add_base_snapshot(
+                SqlImvBaseSnapshotFacts::try_new(base.clone(), 42, "uuid".to_string())
+                    .expect("valid base facts"),
+            )
+            .expect("first base is accepted");
+        assert_eq!(builder.base_count(), 1);
+        assert!(
+            builder
+                .add_base_snapshot(
+                    SqlImvBaseSnapshotFacts::try_new(base, 43, "other".to_string())
+                        .expect("valid duplicate shape"),
+                )
+                .is_err()
+        );
+        assert!(SqlImvTargetColumnsFacts::try_new(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn sealed_snapshot_builder_accepts_complete_value_only_facts() {
+        let target = novarocks_catalog::identifier::TableIdentity::new("iceberg", "db", "mv");
+        let base = novarocks_catalog::identifier::TableIdentity::new("iceberg", "db", "base");
+        let mut builder =
+            SqlImvRewriteSnapshotBuilder::try_new(target.clone(), test_target_binding(), 7)
+                .expect("builder");
+        builder
+            .add_base_snapshot(
+                SqlImvBaseSnapshotFacts::try_new(base, 42, "uuid-base".to_string())
+                    .expect("base snapshot"),
+            )
+            .expect("base accepted");
+        builder
+            .set_target_columns(
+                SqlImvTargetColumnsFacts::try_new(vec![novarocks_catalog::schema::ColumnDef {
+                    name: "k".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                }])
+                .expect("target columns"),
+            )
+            .expect("target columns accepted");
+        builder
+            .set_refresh_history(
+                SqlImvRefreshHistoryFacts::try_new(
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    Some(10),
+                    "uuid-target".to_string(),
+                )
+                .expect("history"),
+            )
+            .expect("history accepted");
+        let base_contract = SqlImvBaseContractFacts::try_new(
+            "iceberg.db.base".to_string(),
+            None,
+            vec![SqlImvBaseFieldFacts::try_new(1, "k".to_string()).expect("base field")],
+        )
+        .expect("base contract");
+        let output = SqlImvOutputColumnFacts::new(
+            SqlImvExpressionFacts::try_new(SqlImvExpressionKindFacts::Column, vec![1], Vec::new())
+                .expect("output lineage"),
+        );
+        let target_contract = SqlImvTargetContractFacts::try_new(
+            vec![
+                SqlImvTargetVisibleColumnFacts::try_new("k".to_string(), 1)
+                    .expect("visible target"),
+            ],
+            "__nova_base_row_id".to_string(),
+            SqlImvApplyKeySourceFacts::BaseRowId,
+            None,
+        )
+        .expect("target contract");
+        builder
+            .set_schema_contract(
+                SqlImvSchemaContractFacts::try_new(
+                    vec![base_contract],
+                    vec![output],
+                    None,
+                    None,
+                    None,
+                    target_contract,
+                )
+                .expect("schema contract"),
+            )
+            .expect("schema contract accepted");
+        let sealed = builder.build().expect("complete facts seal");
+        assert_eq!(sealed.snapshot().target, target);
     }
 }

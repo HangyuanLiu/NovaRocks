@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_sql::planning::mv::MV_JOIN_APPLY_KEY_COLUMN_NAME;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SnapshotWindow {
     pub(crate) from: i64,
@@ -208,7 +210,7 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
          SUM(CASE WHEN net > 0 THEN 1 ELSE 0 END) <= 1 \
          AND SUM(CASE WHEN net < 0 THEN 1 ELSE 0 END) <= 1, \
          'join delta multiple pending payloads for key'))",
-        novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
+        MV_JOIN_APPLY_KEY_COLUMN_NAME,
     );
     let coalesced_cte = format!(
         "__nr_join_delta_coalesced AS (\
@@ -216,8 +218,7 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
          FROM __nr_join_delta_payload_coalesced pc \
          JOIN __nr_join_delta_key_shape ks \
          ON pc.{} = ks.{})",
-        novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
-        novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
+        MV_JOIN_APPLY_KEY_COLUMN_NAME, MV_JOIN_APPLY_KEY_COLUMN_NAME,
     );
     let ctes = branch_ctes
         .into_iter()
@@ -229,7 +230,7 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
         ])
         .collect::<Vec<_>>()
         .join(", ");
-    let key = novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
+    let key = MV_JOIN_APPLY_KEY_COLUMN_NAME;
     let sql = format!(
         "WITH {ctes} \
          SELECT {final_select} \
@@ -282,7 +283,7 @@ fn wrap_join_apply_key_query(
         JOIN_LEFT_ROW_ID_COLUMN,
         sql_string_literal(right_uuid),
         JOIN_RIGHT_ROW_ID_COLUMN,
-        novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
+        MV_JOIN_APPLY_KEY_COLUMN_NAME,
     ));
     items.push(format!(
         "CAST({} AS TINYINT) AS {}",
@@ -410,7 +411,7 @@ fn is_reserved_payload_projection_name(normalized: &str) -> bool {
     ) || normalized == novarocks_execution::exec::change_op::CHANGE_OP_COLUMN
         || normalized == JOIN_LEFT_ROW_ID_COLUMN
         || normalized == JOIN_RIGHT_ROW_ID_COLUMN
-        || normalized == novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME
+        || normalized == MV_JOIN_APPLY_KEY_COLUMN_NAME
         || normalized.starts_with("__nr_join_delta_branch_")
 }
 
@@ -433,15 +434,14 @@ fn change_stream_select_list(
         JOIN_LEFT_ROW_ID_COLUMN,
         sql_string_literal(right_uuid),
         JOIN_RIGHT_ROW_ID_COLUMN,
-        novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
+        MV_JOIN_APPLY_KEY_COLUMN_NAME,
     ));
     items.push(novarocks_execution::exec::change_op::CHANGE_OP_COLUMN.to_string());
     items.join(", ")
 }
 
 fn payload_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
-    let mut items =
-        vec![novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME.to_string()];
+    let mut items = vec![MV_JOIN_APPLY_KEY_COLUMN_NAME.to_string()];
     items.extend(payload_columns.iter().map(|ident| ident.to_string()));
     items.push(format!(
         "SUM({}) AS net",
@@ -451,15 +451,14 @@ fn payload_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> S
 }
 
 fn payload_group_by_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
-    let mut items =
-        vec![novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME.to_string()];
+    let mut items = vec![MV_JOIN_APPLY_KEY_COLUMN_NAME.to_string()];
     items.extend(payload_columns.iter().map(|ident| ident.to_string()));
     items.join(", ")
 }
 
 fn key_shape_select_list() -> String {
     [
-        novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
+        MV_JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
         "SUM(CASE WHEN net > 0 THEN 1 ELSE 0 END) AS pending_inserts".to_string(),
         "SUM(CASE WHEN net < 0 THEN 1 ELSE 0 END) AS pending_deletes".to_string(),
     ]
@@ -471,7 +470,7 @@ fn valid_payload_select_list(payload_columns: &[sqlparser::ast::Ident]) -> Strin
         .iter()
         .map(|ident| format!("pc.{ident} AS {ident}"))
         .collect::<Vec<_>>();
-    let key = novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
+    let key = MV_JOIN_APPLY_KEY_COLUMN_NAME;
     items.push(format!("pc.{key} AS {key}"));
     items.push("pc.net AS net".to_string());
     items.join(", ")
@@ -482,7 +481,7 @@ fn final_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> Str
         .iter()
         .map(|ident| format!("coalesced.{ident} AS {ident}"))
         .collect::<Vec<_>>();
-    let key = novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
+    let key = MV_JOIN_APPLY_KEY_COLUMN_NAME;
     items.push(format!("coalesced.{key} AS {key}"));
     items.push(format!(
         "CAST(CASE WHEN coalesced.net > 0 THEN {} ELSE {} END AS TINYINT) AS {}",
@@ -512,8 +511,8 @@ fn quote_sql_identifier(identifier: &str) -> String {
 }
 
 fn parse_query_from_sql(sql: &str) -> Result<sqlparser::ast::Query, String> {
-    let normalized = novarocks_sql::parser::dialect::normalize_for_raw_parse(sql)?;
-    let stmt = novarocks_sql::parser::parse_normalized_sql_raw(&normalized)?;
+    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
+    let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)?;
     let sqlparser::ast::Statement::Query(query) = stmt else {
         return Err("expected generated SQL to parse as query".to_string());
     };
@@ -894,10 +893,7 @@ mod tests {
         assert_sql_contains(&rendered, JOIN_LEFT_ROW_ID_COLUMN);
         assert_sql_contains(&rendered, "'right-uuid'");
         assert_sql_contains(&rendered, JOIN_RIGHT_ROW_ID_COLUMN);
-        assert_sql_contains(
-            &rendered,
-            novarocks_sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
-        );
+        assert_sql_contains(&rendered, MV_JOIN_APPLY_KEY_COLUMN_NAME);
         assert_sql_contains(&rendered, "GROUP BY __nova_join_row_key");
         assert_sql_contains(&rendered, "SUM(__change_op)");
         assert_sql_contains(&rendered, "__nr_join_delta_payload_coalesced");
@@ -1222,9 +1218,8 @@ mod tests {
     }
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
-        let normalized =
-            novarocks_sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = novarocks_sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
+        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize");
+        let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query");
         };
