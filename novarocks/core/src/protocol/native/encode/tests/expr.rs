@@ -19,30 +19,16 @@ use arrow::datatypes::DataType;
 use prost::Message;
 
 use super::super::expr::encode_expr;
-use super::{column_expr, int_expr};
 use novarocks_protocol::{common, expr};
-use novarocks_sql::plan_read::{
-    BinOp, ExprKind, LiteralValue, SortItem, TypedExpr, UnOp, WindowBound, WindowFrame,
-    WindowFrameType,
-};
+use novarocks_sql::plan_read::{LiteralValue, TypedExpr};
 use novarocks_sql::test_support::{
-    native_immutable_function_expression, native_lambda_expression, subquery_placeholder_expr,
+    native_cast_expression, native_expression_variants, native_lambda_expression,
+    native_lambda_parameter_expression, native_literal_expression, native_window_expression,
+    subquery_placeholder_expr,
 };
 
 fn literal_expr(value: LiteralValue, data_type: DataType) -> TypedExpr {
-    TypedExpr {
-        kind: ExprKind::Literal(value),
-        data_type,
-        nullable: false,
-    }
-}
-
-fn bool_expr(value: bool) -> TypedExpr {
-    literal_expr(LiteralValue::Bool(value), DataType::Boolean)
-}
-
-fn string_expr(value: &str) -> TypedExpr {
-    literal_expr(LiteralValue::String(value.to_string()), DataType::Utf8)
+    native_literal_expression(value, data_type)
 }
 
 fn assert_expr_roundtrip(encoded: expr::Expr) -> expr::Expr {
@@ -142,13 +128,6 @@ fn invalid_decimal_literal_widths_are_rejected() {
 
 #[test]
 fn typed_expr_variants_encode_to_expected_oneof_arms() {
-    let col = column_expr(7, "a", DataType::Int64);
-    let lit = int_expr(2);
-    let sort_item = SortItem {
-        expr: col.clone(),
-        asc: false,
-        nulls_first: true,
-    };
     let lambda_expr = native_lambda_expression();
     let Some(expr::expr::Kind::Lambda(lambda)) =
         encode_expr(&lambda_expr).expect("encode lambda").kind
@@ -169,131 +148,7 @@ fn typed_expr_variants_encode_to_expected_oneof_arms() {
         common::PrimitiveType::try_from(scalar.r#type).expect("known primitive"),
         common::PrimitiveType::Bigint
     );
-    let variants = vec![
-        column_expr(1, "c1", DataType::Int64),
-        TypedExpr {
-            kind: ExprKind::LambdaParamRef {
-                name: "x".to_string(),
-                slot_id: 3,
-            },
-            data_type: DataType::Int64,
-            nullable: true,
-        },
-        lit.clone(),
-        TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(col.clone()),
-                op: BinOp::Gt,
-                right: Box::new(lit.clone()),
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        },
-        TypedExpr {
-            kind: ExprKind::UnaryOp {
-                op: UnOp::Not,
-                expr: Box::new(bool_expr(true)),
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        },
-        native_immutable_function_expression(),
-        native_lambda_expression(),
-        TypedExpr {
-            kind: ExprKind::AggregateCall {
-                name: "sum".to_string(),
-                args: vec![col.clone()],
-                distinct: true,
-                order_by: vec![sort_item.clone()],
-            },
-            data_type: DataType::Int64,
-            nullable: true,
-        },
-        TypedExpr {
-            kind: ExprKind::Cast {
-                expr: Box::new(col.clone()),
-                target: DataType::Float64,
-            },
-            data_type: DataType::Float64,
-            nullable: true,
-        },
-        TypedExpr {
-            kind: ExprKind::IsNull {
-                expr: Box::new(col.clone()),
-                negated: true,
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        },
-        TypedExpr {
-            kind: ExprKind::InList {
-                expr: Box::new(string_expr("x")),
-                list: vec![string_expr("a"), string_expr("b")],
-                negated: false,
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        },
-        TypedExpr {
-            kind: ExprKind::Between {
-                expr: Box::new(col.clone()),
-                low: Box::new(int_expr(1)),
-                high: Box::new(int_expr(9)),
-                negated: true,
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        },
-        TypedExpr {
-            kind: ExprKind::Like {
-                expr: Box::new(string_expr("abc")),
-                pattern: Box::new(string_expr("a%")),
-                negated: true,
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        },
-        TypedExpr {
-            kind: ExprKind::Case {
-                operand: None,
-                when_then: vec![(bool_expr(true), int_expr(1))],
-                else_expr: Some(Box::new(int_expr(0))),
-            },
-            data_type: DataType::Int64,
-            nullable: true,
-        },
-        TypedExpr {
-            kind: ExprKind::IsTruthValue {
-                expr: Box::new(bool_expr(false)),
-                value: false,
-                negated: true,
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        },
-        TypedExpr {
-            kind: ExprKind::Nested(Box::new(col.clone())),
-            data_type: DataType::Int64,
-            nullable: true,
-        },
-        TypedExpr {
-            kind: ExprKind::WindowCall {
-                name: "rank".to_string(),
-                args: vec![],
-                distinct: false,
-                partition_by: vec![col.clone()],
-                order_by: vec![sort_item],
-                window_frame: Some(WindowFrame {
-                    frame_type: WindowFrameType::Rows,
-                    start: WindowBound::UnboundedPreceding,
-                    end: WindowBound::CurrentRow,
-                }),
-                ignore_nulls: false,
-            },
-            data_type: DataType::Int64,
-            nullable: false,
-        },
-    ];
+    let variants = native_expression_variants();
 
     let names = variants
         .iter()
@@ -331,16 +186,7 @@ fn typed_expr_variants_encode_to_expected_oneof_arms() {
 
 #[test]
 fn representative_nested_expr_fields_are_preserved() {
-    let col = column_expr(7, "amount", DataType::Int64);
-
-    let cast = TypedExpr {
-        kind: ExprKind::Cast {
-            expr: Box::new(col.clone()),
-            target: DataType::Float64,
-        },
-        data_type: DataType::Float64,
-        nullable: true,
-    };
+    let cast = native_cast_expression();
     let Some(expr::expr::Kind::Cast(cast)) = encode_expr(&cast).expect("encode cast").kind else {
         panic!("expected cast");
     };
@@ -357,14 +203,7 @@ fn representative_nested_expr_fields_are_preserved() {
         common::PrimitiveType::Double
     );
 
-    let lambda_param = TypedExpr {
-        kind: ExprKind::LambdaParamRef {
-            name: "x".to_string(),
-            slot_id: 3,
-        },
-        data_type: DataType::Int64,
-        nullable: true,
-    };
+    let lambda_param = native_lambda_parameter_expression();
     let Some(expr::expr::Kind::LambdaParamRef(param)) = encode_expr(&lambda_param)
         .expect("encode lambda param")
         .kind
@@ -374,28 +213,7 @@ fn representative_nested_expr_fields_are_preserved() {
     assert_eq!(param.slot_id, 3);
     assert_eq!(param.name.as_deref(), Some("x"));
 
-    let sort_item = SortItem {
-        expr: col.clone(),
-        asc: false,
-        nulls_first: true,
-    };
-    let window = TypedExpr {
-        kind: ExprKind::WindowCall {
-            name: "rank".to_string(),
-            args: vec![],
-            distinct: false,
-            partition_by: vec![col],
-            order_by: vec![sort_item],
-            window_frame: Some(WindowFrame {
-                frame_type: WindowFrameType::Rows,
-                start: WindowBound::UnboundedPreceding,
-                end: WindowBound::CurrentRow,
-            }),
-            ignore_nulls: false,
-        },
-        data_type: DataType::Int64,
-        nullable: false,
-    };
+    let window = native_window_expression();
     let Some(expr::expr::Kind::WindowCall(window)) =
         encode_expr(&window).expect("encode window").kind
     else {

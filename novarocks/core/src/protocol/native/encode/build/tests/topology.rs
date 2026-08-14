@@ -17,7 +17,9 @@
 
 use std::collections::BTreeSet;
 
-use novarocks_sql::plan_read::{ColumnId, ExprKind, FragmentStreamKind, PartitionKind};
+use novarocks_sql::plan_read::{
+    ColumnId, FragmentStreamKind, PartitionKind, SqlExpressionReadKind, expression_read,
+};
 use novarocks_sql::test_support::{NativeBuildFixture, native_build_plan};
 
 use super::*;
@@ -150,13 +152,13 @@ fn fragment_build_preserves_finalized_router_edge() {
     let edge = &result.0.scheduling_view().edges()[0];
     assert!(matches!(edge.output_partition.kind, PartitionKind::Hash));
     assert_eq!(edge.output_partition.exprs.len(), 1);
-    let ExprKind::ColumnRef {
+    let SqlExpressionReadKind::ColumnRef {
         column_id, column, ..
-    } = &edge.output_partition.exprs[0].kind
+    } = expression_read(&edge.output_partition.exprs[0]).kind
     else {
         panic!("expected router HASH partition column ref");
     };
-    assert_eq!(*column_id, ColumnId(3));
+    assert_eq!(column_id, ColumnId(3));
     assert_eq!(column, "delete_id");
     assert_eq!(edge.stream_kind, FragmentStreamKind::Partitioned);
 

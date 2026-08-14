@@ -48,8 +48,6 @@ use novarocks_catalog::identifier::normalize_identifier;
 #[cfg(test)]
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 pub use novarocks_sql::catalog::TableLookupMode;
-#[cfg(test)]
-use novarocks_sql::catalog::local::PlannerMemoryCatalog;
 
 use crate::catalog_application::resolver as backend_resolver;
 use crate::catalog_application::statement::{

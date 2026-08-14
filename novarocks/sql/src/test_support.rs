@@ -2095,6 +2095,56 @@ pub fn native_immutable_function_expression() -> TypedExpr {
     }
 }
 
+/// A sealed cast expression for native protocol encoder tests.
+pub fn native_cast_expression() -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::Cast {
+            expr: Box::new(column_expr(7, "amount", DataType::Int64)),
+            target: DataType::Float64,
+        },
+        data_type: DataType::Float64,
+        nullable: true,
+    }
+}
+
+/// A sealed lambda parameter reference for native protocol encoder tests.
+pub fn native_lambda_parameter_expression() -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::LambdaParamRef {
+            name: "x".to_string(),
+            slot_id: 3,
+        },
+        data_type: DataType::Int64,
+        nullable: true,
+    }
+}
+
+/// A sealed window expression for native protocol encoder tests.
+pub fn native_window_expression() -> TypedExpr {
+    let column = column_expr(7, "amount", DataType::Int64);
+    TypedExpr {
+        kind: ExprKind::WindowCall {
+            name: "rank".to_string(),
+            args: vec![],
+            distinct: false,
+            partition_by: vec![column.clone()],
+            order_by: vec![SortItem {
+                expr: column,
+                asc: false,
+                nulls_first: true,
+            }],
+            window_frame: Some(WindowFrame {
+                frame_type: WindowFrameType::Rows,
+                start: WindowBound::UnboundedPreceding,
+                end: WindowBound::CurrentRow,
+            }),
+            ignore_nulls: false,
+        },
+        data_type: DataType::Int64,
+        nullable: false,
+    }
+}
+
 /// A deliberately unsupported placeholder used to assert the encoder's
 /// fail-fast branch without exposing the private subquery-kind enum.
 pub fn subquery_placeholder_expr(id: u32, data_type: DataType) -> TypedExpr {
@@ -2109,12 +2159,17 @@ pub fn subquery_placeholder_expr(id: u32, data_type: DataType) -> TypedExpr {
     }
 }
 
-fn literal_expr(value: LiteralValue, data_type: DataType) -> TypedExpr {
+/// A sealed literal expression for native protocol encoder tests.
+pub fn native_literal_expression(value: LiteralValue, data_type: DataType) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(value),
         data_type,
         nullable: false,
     }
+}
+
+fn literal_expr(value: LiteralValue, data_type: DataType) -> TypedExpr {
+    native_literal_expression(value, data_type)
 }
 
 fn bool_expr(value: bool) -> TypedExpr {
