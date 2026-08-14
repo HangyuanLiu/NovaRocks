@@ -319,6 +319,44 @@ impl QueryTableBinding {
     }
 }
 
+/// Build the complete owner-side admission retained by delta-preparation
+/// tests. The SQL scan itself comes from a sealed SQL fixture; this helper
+/// only pairs its opaque request-local token with one provider-sealed change
+/// window and never exposes a planner table constructor.
+#[cfg(test)]
+pub(crate) fn admitted_change_window_binding_for_test(
+    binding: SqlTableBindingId,
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+    scan: novarocks_spi::connector::ConnectorScan,
+) -> QueryTableBinding {
+    let resolved = catalog::materialize_connector_read_table(
+        novarocks_sql::planning::catalog::ConnectorReadTableFacts {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            columns: Vec::new(),
+            iceberg_row_lineage_metadata_columns: Vec::new(),
+            schema: std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+            binding,
+            selector: ConnectorReadSelector::Current,
+            planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
+        },
+    )
+    .expect("test catalog facts materialize")
+    .into_resolved_table();
+    QueryTableBinding {
+        resolved,
+        statistics_pin: None,
+        admission: QueryTableBindingAdmission::Local,
+        scan_materialization: None,
+        mv_target_read: None,
+        write_target_admission: None,
+        frozen_snapshot_materializations: BTreeMap::new(),
+        admitted_change_scans: BTreeMap::from([((from_snapshot_id, to_snapshot_id), scan)]),
+    }
+}
+
 struct StoredBinding {
     id: SqlTableBindingId,
 }

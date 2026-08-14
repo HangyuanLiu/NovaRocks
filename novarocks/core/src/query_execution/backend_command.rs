@@ -46,35 +46,24 @@ impl BackendCommandExecutor {
         sql: &str,
         role: ClusterRole,
     ) -> Result<Option<StatementResult>, String> {
-        let normalized = novarocks_sql::parser::dialect::normalize_for_raw_parse(sql)?;
-        let mut statements = match novarocks_sql::parser::parse_sql(&normalized) {
-            Ok(statements) => statements,
-            Err(_) => return Ok(None),
-        };
-        if statements.len() != 1 {
-            return Err("backend command accepts exactly one statement".to_string());
-        }
-        use novarocks_sql::parser::ast::Statement;
-        match statements.pop().expect("one checked statement") {
-            Statement::AddBackend(statement) => {
+        match novarocks_sql::syntax::parse_backend_management_command(sql)? {
+            Some(novarocks_sql::syntax::BackendManagementCommand::Add { address }) => {
                 require_backend_management_role("ADD BACKEND", role)?;
-                let endpoint = statement.addr.parse().map_err(|error| {
-                    format!("invalid backend address '{}': {error}", statement.addr)
-                })?;
+                let endpoint = address
+                    .parse()
+                    .map_err(|error| format!("invalid backend address '{address}': {error}"))?;
                 self.kernel.topology().add_backend(endpoint)?;
                 Ok(Some(StatementResult::Ok))
             }
-            Statement::DropBackend(statement) => {
+            Some(novarocks_sql::syntax::BackendManagementCommand::Drop { address, force }) => {
                 require_backend_management_role("DROP BACKEND", role)?;
-                let endpoint = statement.addr.parse().map_err(|error| {
-                    format!("invalid backend address '{}': {error}", statement.addr)
-                })?;
-                self.kernel
-                    .topology()
-                    .drop_backend(endpoint, statement.force)?;
+                let endpoint = address
+                    .parse()
+                    .map_err(|error| format!("invalid backend address '{address}': {error}"))?;
+                self.kernel.topology().drop_backend(endpoint, force)?;
                 Ok(Some(StatementResult::Ok))
             }
-            Statement::ShowBackends(_) => {
+            Some(novarocks_sql::syntax::BackendManagementCommand::Show) => {
                 if role == ClusterRole::Be {
                     return Err("SHOW BACKENDS is not available in role=be".to_string());
                 }
@@ -84,7 +73,7 @@ impl BackendCommandExecutor {
                     .map(StatementResult::Query)
                     .map(Some)
             }
-            _ => Ok(None),
+            None => Ok(None),
         }
     }
 }

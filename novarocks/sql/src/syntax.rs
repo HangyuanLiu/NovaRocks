@@ -75,6 +75,47 @@ pub fn parse_mv_admitted_statement(sql: &str) -> Result<MvAdmittedStatement, Str
     }
 }
 
+/// Closed syntax accepted by the Frontend backend-membership command owner.
+/// Parser AST variants remain inside SQL; consumers receive only the immutable
+/// address and force facts needed to invoke their topology capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BackendManagementCommand {
+    Add { address: String },
+    Drop { address: String, force: bool },
+    Show,
+}
+
+/// Parse one backend-management command without exposing the generic parser
+/// statement enum. Non-backend SQL and parser rejection remain a probe miss,
+/// while the historical multi-statement error remains fail-closed.
+pub fn parse_backend_management_command(
+    sql: &str,
+) -> Result<Option<BackendManagementCommand>, String> {
+    let normalized = crate::parser::dialect::normalize_for_raw_parse(sql)?;
+    let mut statements = match crate::parser::parse_sql(&normalized) {
+        Ok(statements) => statements,
+        Err(_) => return Ok(None),
+    };
+    if statements.len() != 1 {
+        return Err("backend command accepts exactly one statement".to_string());
+    }
+    match statements.pop().expect("one checked statement") {
+        crate::parser::ast::Statement::AddBackend(statement) => {
+            Ok(Some(BackendManagementCommand::Add {
+                address: statement.addr,
+            }))
+        }
+        crate::parser::ast::Statement::DropBackend(statement) => {
+            Ok(Some(BackendManagementCommand::Drop {
+                address: statement.addr,
+                force: statement.force,
+            }))
+        }
+        crate::parser::ast::Statement::ShowBackends(_) => Ok(Some(BackendManagementCommand::Show)),
+        _ => Ok(None),
+    }
+}
+
 /// Return every three-part table reference in one admitted SELECT statement.
 ///
 /// Raw sqlparser nodes remain inside the SQL crate; callers receive only the
@@ -270,7 +311,10 @@ pub fn parse_alter_iceberg_ref(sql: &str) -> Result<Option<AlterIcebergRefStmt>,
 
 #[cfg(test)]
 mod tests {
-    use super::{MvAdmittedStatement, parse_mv_admitted_statement};
+    use super::{
+        BackendManagementCommand, MvAdmittedStatement, parse_backend_management_command,
+        parse_mv_admitted_statement,
+    };
 
     #[test]
     fn mv_admission_exposes_only_typed_mv_syntax() {
@@ -288,5 +332,36 @@ mod tests {
         let error = parse_mv_admitted_statement("SELECT 1")
             .expect_err("non-MV syntax must not be admitted through the MV contract");
         assert_eq!(error, "statement is not a materialized-view command");
+    }
+
+    #[test]
+    fn backend_management_admission_exposes_only_closed_command_facts() {
+        assert_eq!(
+            parse_backend_management_command("ADD BACKEND '127.0.0.1:19070'")
+                .expect("parse ADD BACKEND"),
+            Some(BackendManagementCommand::Add {
+                address: "127.0.0.1:19070".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_backend_management_command("DROP BACKEND '127.0.0.1:19070' FORCE")
+                .expect("parse DROP BACKEND"),
+            Some(BackendManagementCommand::Drop {
+                address: "127.0.0.1:19070".to_string(),
+                force: true,
+            })
+        );
+        assert_eq!(
+            parse_backend_management_command("SHOW BACKENDS").expect("parse SHOW BACKENDS"),
+            Some(BackendManagementCommand::Show)
+        );
+    }
+
+    #[test]
+    fn backend_management_admission_treats_other_sql_as_a_probe_miss() {
+        assert_eq!(
+            parse_backend_management_command("SELECT 1").expect("non-backend probe"),
+            None
+        );
     }
 }
