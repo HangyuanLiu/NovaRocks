@@ -447,56 +447,58 @@ impl BackendRuntimeFilterSession {
         terminal: ProducerSequence,
     ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation> {
         let install = self.producer_install(binding_id)?;
-        let binding_closed =
-            {
-                let mut progress = self
-                    .producer_progress
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                let binding = progress.get_mut(&binding_id).ok_or_else(|| {
-                    contract_violation(
-                        RuntimeFilterContractViolationKind::UnauthorizedBinding,
-                        "producer binding has not been opened in this Backend session",
-                    )
-                })?;
-                if binding.terminal.is_some() {
-                    return Ok(RuntimeFilterSubmitOutcome::TerminalNoop);
-                }
-                let instance = binding.instances.get_mut(&fragment_instance_id).ok_or_else(|| {
+        let binding_closed = {
+            let mut progress = self
+                .producer_progress
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let binding = progress.get_mut(&binding_id).ok_or_else(|| {
                 contract_violation(
                     RuntimeFilterContractViolationKind::UnauthorizedBinding,
-                    "producer fragment instance has not been opened in this Backend session",
+                    "producer binding has not been opened in this Backend session",
                 )
             })?;
-                validate_open_partition(instance, partition)?;
-                match instance.terminal_partitions.get(&partition) {
-                    Some(previous) if *previous == terminal => {
-                        return Ok(RuntimeFilterSubmitOutcome::TerminalNoop);
-                    }
-                    Some(_) => {
-                        return Err(contract_violation(
-                            RuntimeFilterContractViolationKind::ContractMismatch,
-                            "producer partition closed with a conflicting terminal sequence",
-                        ));
-                    }
-                    None => {
-                        instance.terminal_partitions.insert(partition, terminal);
-                        let closed = install
-                            .expected_fragment_instances()
-                            .iter()
-                            .all(|expected| {
-                                binding
-                                    .instances
-                                    .get(expected)
-                                    .is_some_and(BackendOpenedProducer::is_closed)
-                            });
-                        if closed {
-                            binding.terminal = Some(BackendProducerBindingTerminal::Closed);
-                        }
-                        closed
-                    }
+            if binding.terminal.is_some() {
+                return Ok(RuntimeFilterSubmitOutcome::TerminalNoop);
+            }
+            let instance = binding
+                .instances
+                .get_mut(&fragment_instance_id)
+                .ok_or_else(|| {
+                    contract_violation(
+                        RuntimeFilterContractViolationKind::UnauthorizedBinding,
+                        "producer fragment instance has not been opened in this Backend session",
+                    )
+                })?;
+            validate_open_partition(instance, partition)?;
+            match instance.terminal_partitions.get(&partition) {
+                Some(previous) if *previous == terminal => {
+                    return Ok(RuntimeFilterSubmitOutcome::TerminalNoop);
                 }
-            };
+                Some(_) => {
+                    return Err(contract_violation(
+                        RuntimeFilterContractViolationKind::ContractMismatch,
+                        "producer partition closed with a conflicting terminal sequence",
+                    ));
+                }
+                None => {
+                    instance.terminal_partitions.insert(partition, terminal);
+                    let closed = install
+                        .expected_fragment_instances()
+                        .iter()
+                        .all(|expected| {
+                            binding
+                                .instances
+                                .get(expected)
+                                .is_some_and(BackendOpenedProducer::is_closed)
+                        });
+                    if closed {
+                        binding.terminal = Some(BackendProducerBindingTerminal::Closed);
+                    }
+                    closed
+                }
+            }
+        };
         if !binding_closed {
             return Ok(RuntimeFilterSubmitOutcome::CoverageStillPossible);
         }
@@ -1482,6 +1484,62 @@ mod tests {
             handle.acquire(Duration::ZERO),
             SnapshotAcquireOutcome::Unavailable(UnavailableReason::ProducerFailed)
         ));
+    }
+
+    #[test]
+    fn consumer_subscription_rejects_an_uninstalled_binding_at_bind_time() {
+        let fixture = BackendRuntimeFilterFixture::membership();
+        let schema = fixture.producer_contract().contract().clone();
+        let consumer = BackendConsumerInstall::new(
+            RuntimeFilterConsumerContract::membership_blocking(
+                RuntimeFilterBindingId::new(70),
+                RuntimeFilterChannelId::new(11),
+                schema.clone(),
+            )
+            .unwrap(),
+            ConsumerArtifactProfile::new(BTreeSet::from([ArtifactKind::ValueSet]), None).unwrap(),
+            [BackendRouteEdgeId::new(101)],
+            [instance(51)],
+        )
+        .unwrap();
+        let channel = BackendChannelInstall::new(
+            RuntimeFilterChannelId::new(11),
+            schema.clone(),
+            BackendChannelLifecycle::CompleteOnce,
+            BackendCoverage::witness(BackendCoverageWitnessId::new(29)),
+            BackendCoverage::witness(BackendCoverageWitnessId::new(29)),
+            BackendMaterializationPolicy::new(8, 3, 5, 1, 1024, 1024, 1).unwrap(),
+            1024,
+            1024,
+            [],
+            [consumer],
+            [],
+        )
+        .unwrap();
+        let session = BackendRuntimeFilterSession::from_channel_install(
+            fixture.identity(),
+            channel,
+            Arc::new(CollectingBackendRuntimeFilterEventObserver::default()),
+        )
+        .unwrap();
+        let error = match session.subscribe(
+            instance(51),
+            RuntimeFilterSubscriptionRequest::new(
+                RuntimeFilterConsumerContract::membership_blocking(
+                    RuntimeFilterBindingId::new(71),
+                    RuntimeFilterChannelId::new(11),
+                    schema,
+                )
+                .unwrap(),
+            ),
+        ) {
+            Ok(_) => panic!("uninstalled binding must fail before execution starts"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            RuntimeFilterContractViolationKind::UnauthorizedBinding
+        );
     }
 
     #[test]

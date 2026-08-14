@@ -26,6 +26,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use novarocks_execution::runtime_filter::{
@@ -66,8 +67,6 @@ pub(crate) enum RuntimeFilterObservationError {
     UnknownTransportRoute(BackendTransportEventIdentity),
     UnknownConsumer(BackendConsumerSubscriptionIdentity),
     IdentityMismatch,
-    InvalidVersion,
-    VersionRegression,
     ConflictingChannelTerminal {
         channel: BackendChannelIdentity,
         observed: RuntimeFilterChannelTerminal,
@@ -76,7 +75,6 @@ pub(crate) enum RuntimeFilterObservationError {
     DeliveryConflict,
     DeliveryResourceLimit,
     InvalidRowEffect,
-    CounterOverflow,
 }
 
 impl fmt::Display for RuntimeFilterObservationError {
@@ -99,6 +97,7 @@ pub(crate) struct RuntimeFilterChannelObservation {
     completed: u64,
     unavailable: u64,
     cancelled: u64,
+    terminal_conflicted: bool,
 }
 
 impl RuntimeFilterChannelObservation {
@@ -250,6 +249,8 @@ pub(crate) struct RuntimeFilterConsumerObservation {
     scan_pruned: u64,
     scan_not_evaluated: u64,
     scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedObservation,
+    outcome_conflicted: bool,
+    terminal_conflicted: bool,
 }
 
 impl RuntimeFilterConsumerObservation {
@@ -335,6 +336,7 @@ pub(crate) struct RuntimeFilterObservationSnapshot {
     producer_streams: Vec<RuntimeFilterProducerStreamObservation>,
     transport_routes: Vec<RuntimeFilterTransportObservation>,
     consumers: Vec<RuntimeFilterConsumerObservation>,
+    anomalies: RuntimeFilterObservationAnomalies,
 }
 
 impl RuntimeFilterObservationSnapshot {
@@ -352,6 +354,98 @@ impl RuntimeFilterObservationSnapshot {
 
     pub(crate) fn consumers(&self) -> &[RuntimeFilterConsumerObservation] {
         &self.consumers
+    }
+
+    pub(crate) const fn anomalies(&self) -> &RuntimeFilterObservationAnomalies {
+        &self.anomalies
+    }
+}
+
+/// Diagnostics for facts that cannot be projected into the sealed observation
+/// manifest. They describe telemetry quality only; they never veto query
+/// execution or terminalization.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterObservationAnomalies {
+    unattributed: RuntimeFilterUnattributedObservations,
+    conflicting_reports: RuntimeFilterConflictingReportObservations,
+    saturated: u64,
+    late_after_seal: u64,
+    rejected: u64,
+}
+
+impl RuntimeFilterObservationAnomalies {
+    pub(crate) const fn unattributed(&self) -> RuntimeFilterUnattributedObservations {
+        self.unattributed
+    }
+
+    pub(crate) const fn conflicting_reports(&self) -> RuntimeFilterConflictingReportObservations {
+        self.conflicting_reports
+    }
+
+    pub(crate) const fn saturated(&self) -> u64 {
+        self.saturated
+    }
+
+    pub(crate) const fn late_after_seal(&self) -> u64 {
+        self.late_after_seal
+    }
+
+    pub(crate) const fn rejected(&self) -> u64 {
+        self.rejected
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterUnattributedObservations {
+    participant: u64,
+    channel: u64,
+    producer_instance: u64,
+    producer_stream: u64,
+    transport_route: u64,
+    consumer: u64,
+    identity_mismatch: u64,
+}
+
+impl RuntimeFilterUnattributedObservations {
+    pub(crate) const fn participant(&self) -> u64 {
+        self.participant
+    }
+    pub(crate) const fn channel(&self) -> u64 {
+        self.channel
+    }
+    pub(crate) const fn producer_instance(&self) -> u64 {
+        self.producer_instance
+    }
+    pub(crate) const fn producer_stream(&self) -> u64 {
+        self.producer_stream
+    }
+    pub(crate) const fn transport_route(&self) -> u64 {
+        self.transport_route
+    }
+    pub(crate) const fn consumer(&self) -> u64 {
+        self.consumer
+    }
+    pub(crate) const fn identity_mismatch(&self) -> u64 {
+        self.identity_mismatch
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterConflictingReportObservations {
+    channel_terminal: u64,
+    consumer_outcome: u64,
+    consumer_terminal: u64,
+}
+
+impl RuntimeFilterConflictingReportObservations {
+    pub(crate) const fn channel_terminal(&self) -> u64 {
+        self.channel_terminal
+    }
+    pub(crate) const fn consumer_outcome(&self) -> u64 {
+        self.consumer_outcome
+    }
+    pub(crate) const fn consumer_terminal(&self) -> u64 {
+        self.consumer_terminal
     }
 }
 
@@ -374,12 +468,14 @@ struct ObservationState {
         BTreeMap<BackendProducerStreamIdentity, RuntimeFilterProducerStreamObservation>,
     transport_routes: BTreeMap<BackendTransportEventIdentity, RuntimeFilterTransportObservation>,
     consumers: BTreeMap<BackendConsumerSubscriptionIdentity, RuntimeFilterConsumerObservation>,
-    error: Option<RuntimeFilterObservationError>,
+    anomalies: RuntimeFilterObservationAnomalies,
+    sealed: Option<RuntimeFilterObservationSnapshot>,
 }
 
 // Design: ADR-0068 (docs/adr/ADR-0068-backend-owned-runtime-filter-terminal-observation.md)
 pub(crate) struct RuntimeFilterObservationStore {
     state: Mutex<ObservationState>,
+    saturated: AtomicU64,
 }
 
 impl RuntimeFilterObservationStore {
@@ -477,8 +573,10 @@ impl RuntimeFilterObservationStore {
                 producer_streams: BTreeMap::new(),
                 transport_routes,
                 consumers,
-                error: None,
+                anomalies: RuntimeFilterObservationAnomalies::default(),
+                sealed: None,
             }),
+            saturated: AtomicU64::new(0),
         }
     }
 
@@ -489,7 +587,8 @@ impl RuntimeFilterObservationStore {
         partition_count: u32,
     ) {
         let mut state = self.lock();
-        if state.error.is_some() {
+        if state.sealed.is_some() {
+            increment_field(&mut state.anomalies.late_after_seal, 1, &self.saturated);
             return;
         }
         let key = ProducerInstanceIdentity {
@@ -523,38 +622,48 @@ impl RuntimeFilterObservationStore {
             },
         };
         if let Err(error) = result {
-            remember_error(&mut state, error);
+            record_anomaly(&mut state, error, &self.saturated);
         }
     }
 
     pub(crate) fn fold(&self, event: &BackendRuntimeFilterEvent) {
         let mut state = self.lock();
-        if state.error.is_some() {
+        if state.sealed.is_some() {
+            increment_field(&mut state.anomalies.late_after_seal, 1, &self.saturated);
             return;
         }
-        if let Err(error) = fold_event(&mut state, event) {
-            remember_error(&mut state, error);
+        if let Err(error) = fold_event(&mut state, event, &self.saturated) {
+            record_anomaly(&mut state, error, &self.saturated);
         }
     }
 
     pub(crate) fn reject(&self, error: RuntimeFilterObservationError) {
         let mut state = self.lock();
-        remember_error(&mut state, error);
+        if state.sealed.is_some() {
+            increment_field(&mut state.anomalies.late_after_seal, 1, &self.saturated);
+            return;
+        }
+        record_anomaly(&mut state, error, &self.saturated);
     }
 
-    pub(crate) fn capture(
-        &self,
-    ) -> Result<RuntimeFilterObservationSnapshot, RuntimeFilterObservationError> {
+    pub(crate) fn capture(&self) -> RuntimeFilterObservationSnapshot {
         let state = self.lock();
-        if let Some(error) = &state.error {
-            return Err(error.clone());
+        state
+            .sealed
+            .clone()
+            .unwrap_or_else(|| snapshot(&state, self.saturated.load(Ordering::Relaxed)))
+    }
+
+    /// Freezes the contribution that terminalization may retain. Later events
+    /// are intentionally observable only as process-local anomaly metrics.
+    pub(crate) fn seal(&self) -> RuntimeFilterObservationSnapshot {
+        let mut state = self.lock();
+        if let Some(snapshot) = &state.sealed {
+            return snapshot.clone();
         }
-        Ok(RuntimeFilterObservationSnapshot {
-            channels: state.channels.values().cloned().collect(),
-            producer_streams: state.producer_streams.values().cloned().collect(),
-            transport_routes: state.transport_routes.values().cloned().collect(),
-            consumers: state.consumers.values().cloned().collect(),
-        })
+        let frozen = snapshot(&state, self.saturated.load(Ordering::Relaxed));
+        state.sealed = Some(frozen.clone());
+        frozen
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ObservationState> {
@@ -588,10 +697,12 @@ impl RuntimeFilterObservationEmitter {
             .register_producer_instance(channel, fragment_instance_id, partition_count);
     }
 
-    pub(crate) fn capture(
-        &self,
-    ) -> Result<RuntimeFilterObservationSnapshot, RuntimeFilterObservationError> {
+    pub(crate) fn capture(&self) -> RuntimeFilterObservationSnapshot {
         self.store.capture()
+    }
+
+    pub(crate) fn seal(&self) -> RuntimeFilterObservationSnapshot {
+        self.store.seal()
     }
 
     pub(crate) fn reject(&self, error: RuntimeFilterObservationError) {
@@ -619,6 +730,7 @@ impl BackendRuntimeFilterEventObserver for RuntimeFilterObservationEmitter {
 fn fold_event(
     state: &mut ObservationState,
     event: &BackendRuntimeFilterEvent,
+    saturated: &AtomicU64,
 ) -> Result<(), RuntimeFilterObservationError> {
     match event {
         BackendRuntimeFilterEvent::DeploymentInstalled { participant } => {
@@ -631,103 +743,74 @@ fn fold_event(
         }
         BackendRuntimeFilterEvent::ContributionAccepted { stream, sequence } => {
             let stream = producer_stream_mut(state, *stream)?;
-            if stream
-                .latest_accepted_sequence
-                .is_some_and(|latest| *sequence < latest)
-            {
-                return Err(RuntimeFilterObservationError::VersionRegression);
-            }
-            stream.latest_accepted_sequence = Some(*sequence);
-            stream.accepted = increment(stream.accepted, 1)?;
+            stream.latest_accepted_sequence =
+                max_option(stream.latest_accepted_sequence, *sequence);
+            stream.accepted = increment(stream.accepted, 1, saturated);
         }
         BackendRuntimeFilterEvent::ContributionDuplicateIgnored { stream, .. } => {
             let stream = producer_stream_mut(state, *stream)?;
-            stream.duplicate = increment(stream.duplicate, 1)?;
+            stream.duplicate = increment(stream.duplicate, 1, saturated);
         }
         BackendRuntimeFilterEvent::ContributionStaleIgnored { stream, .. } => {
             let stream = producer_stream_mut(state, *stream)?;
-            stream.stale = increment(stream.stale, 1)?;
+            stream.stale = increment(stream.stale, 1, saturated);
         }
         BackendRuntimeFilterEvent::ContributionConflictRejected { stream, .. } => {
             let stream = producer_stream_mut(state, *stream)?;
-            stream.conflict = increment(stream.conflict, 1)?;
+            stream.conflict = increment(stream.conflict, 1, saturated);
         }
         BackendRuntimeFilterEvent::ContributionResourceLimitRejected { stream, .. } => {
             let stream = producer_stream_mut(state, *stream)?;
-            stream.resource_limit = increment(stream.resource_limit, 1)?;
+            stream.resource_limit = increment(stream.resource_limit, 1, saturated);
         }
         BackendRuntimeFilterEvent::LogicalVersionPublished { channel, version } => {
-            validate_version(*version)?;
             let channel = channel_mut(state, *channel)?;
-            if channel.latest_published_version == Some(*version) {
-                return Ok(());
-            }
-            advance_version(&mut channel.latest_published_version, *version)?;
-            channel.published = increment(channel.published, 1)?;
+            channel.latest_published_version =
+                max_option(channel.latest_published_version, *version);
+            channel.published = increment(channel.published, 1, saturated);
         }
         BackendRuntimeFilterEvent::ChannelCompleted { channel, version } => {
-            validate_version(*version)?;
-            let channel = channel_mut(state, *channel)?;
-            advance_version(&mut channel.latest_published_version, *version)?;
-            let terminal = RuntimeFilterChannelTerminal::Completed(*version);
-            if channel.terminal == Some(terminal) {
-                return Ok(());
+            let conflicted = {
+                let channel = channel_mut(state, *channel)?;
+                channel.latest_published_version =
+                    max_option(channel.latest_published_version, *version);
+                channel.completed = increment(channel.completed, 1, saturated);
+                join_channel_terminal(channel, RuntimeFilterChannelTerminal::Completed(*version))
+            };
+            if conflicted {
+                increment_field(
+                    &mut state.anomalies.conflicting_reports.channel_terminal,
+                    1,
+                    saturated,
+                );
             }
-            if channel.terminal
-                == Some(RuntimeFilterChannelTerminal::Unavailable(
-                    UnavailableReason::IncompleteCoverage,
-                ))
-            {
-                // A distributed AnyOf channel may first learn that one owner
-                // completed without an artifact and later receive the final
-                // artifact from another owner. The participant-level channel
-                // outcome is Completed, not a conflicting terminal.
-                channel.terminal = Some(terminal);
-                channel.completed = 1;
-                channel.unavailable = 0;
-                return Ok(());
-            }
-            if let Some(observed) = channel.terminal {
-                return Err(RuntimeFilterObservationError::ConflictingChannelTerminal {
-                    channel: channel.identity,
-                    observed,
-                    incoming: terminal,
-                });
-            }
-            channel.terminal = Some(terminal);
-            channel.completed = increment(channel.completed, 1)?;
         }
         BackendRuntimeFilterEvent::ChannelUnavailable { channel, reason } => {
-            let channel = channel_mut(state, *channel)?;
-            let terminal = RuntimeFilterChannelTerminal::Unavailable(*reason);
-            if channel.terminal == Some(terminal) {
-                return Ok(());
+            let conflicted = {
+                let channel = channel_mut(state, *channel)?;
+                channel.unavailable = increment(channel.unavailable, 1, saturated);
+                join_channel_terminal(channel, RuntimeFilterChannelTerminal::Unavailable(*reason))
+            };
+            if conflicted {
+                increment_field(
+                    &mut state.anomalies.conflicting_reports.channel_terminal,
+                    1,
+                    saturated,
+                );
             }
-            if *reason == UnavailableReason::IncompleteCoverage
-                && matches!(
-                    channel.terminal,
-                    Some(RuntimeFilterChannelTerminal::Completed(_))
-                )
-            {
-                // The same AnyOf race in the opposite arrival order is an
-                // idempotent no-op once an artifact has completed the channel.
-                return Ok(());
-            }
-            if let Some(observed) = channel.terminal {
-                return Err(RuntimeFilterObservationError::ConflictingChannelTerminal {
-                    channel: channel.identity,
-                    observed,
-                    incoming: terminal,
-                });
-            }
-            channel.terminal = Some(terminal);
-            channel.unavailable = increment(channel.unavailable, 1)?;
         }
         BackendRuntimeFilterEvent::ChannelCancelled { channel } => {
-            let channel = channel_mut(state, *channel)?;
-            if channel.terminal.is_none() {
-                channel.terminal = Some(RuntimeFilterChannelTerminal::Cancelled);
-                channel.cancelled = increment(channel.cancelled, 1)?;
+            let conflicted = {
+                let channel = channel_mut(state, *channel)?;
+                channel.cancelled = increment(channel.cancelled, 1, saturated);
+                join_channel_terminal(channel, RuntimeFilterChannelTerminal::Cancelled)
+            };
+            if conflicted {
+                increment_field(
+                    &mut state.anomalies.conflicting_reports.channel_terminal,
+                    1,
+                    saturated,
+                );
             }
         }
         BackendRuntimeFilterEvent::TransportEnvelope {
@@ -735,63 +818,126 @@ fn fold_event(
             kind,
             bytes,
         } => {
-            let bytes = u64::try_from(*bytes)
-                .map_err(|_| RuntimeFilterObservationError::CounterOverflow)?;
+            let bytes = u64::try_from(*bytes).unwrap_or(u64::MAX);
             let route = state.transport_routes.get_mut(identity).ok_or(
                 RuntimeFilterObservationError::UnknownTransportRoute(*identity),
             )?;
-            let total_bytes = increment(route.bytes, bytes)?;
+            let total_bytes = increment(route.bytes, bytes, saturated);
             match kind {
                 BackendTransportEventKind::Sent => {
-                    route.sent = increment(route.sent, 1)?;
-                    route.sent_bytes = increment(route.sent_bytes, bytes)?;
+                    route.sent = increment(route.sent, 1, saturated);
+                    route.sent_bytes = increment(route.sent_bytes, bytes, saturated);
                 }
                 BackendTransportEventKind::Retried => {
-                    route.retried = increment(route.retried, 1)?;
-                    route.retried_bytes = increment(route.retried_bytes, bytes)?;
+                    route.retried = increment(route.retried, 1, saturated);
+                    route.retried_bytes = increment(route.retried_bytes, bytes, saturated);
                 }
                 BackendTransportEventKind::Acked(_status) => {
-                    route.acked = increment(route.acked, 1)?;
-                    route.acked_bytes = increment(route.acked_bytes, bytes)?;
+                    route.acked = increment(route.acked, 1, saturated);
+                    route.acked_bytes = increment(route.acked_bytes, bytes, saturated);
                 }
                 BackendTransportEventKind::FailedOpen(_reason) => {
-                    route.failed_open = increment(route.failed_open, 1)?;
-                    route.failed_open_bytes = increment(route.failed_open_bytes, bytes)?;
+                    route.failed_open = increment(route.failed_open, 1, saturated);
+                    route.failed_open_bytes = increment(route.failed_open_bytes, bytes, saturated);
                 }
             }
             route.bytes = total_bytes;
         }
         BackendRuntimeFilterEvent::SubscriptionAcquired { identity, version } => {
-            validate_version(*version)?;
-            let consumer = consumer_mut(state, *identity)?;
-            advance_version(&mut consumer.latest_delivered_version, *version)?;
-            consumer.outcome = Some(RuntimeFilterConsumerOutcome::Acquired);
+            let conflicted = {
+                let consumer = consumer_mut(state, *identity)?;
+                consumer.latest_delivered_version =
+                    max_option(consumer.latest_delivered_version, *version);
+                join_consumer_outcome(consumer, RuntimeFilterConsumerOutcome::Acquired)
+            };
+            if conflicted {
+                increment_field(
+                    &mut state.anomalies.conflicting_reports.consumer_outcome,
+                    1,
+                    saturated,
+                );
+            }
         }
         BackendRuntimeFilterEvent::SubscriptionTimedOut { identity } => {
-            consumer_mut(state, *identity)?.outcome = Some(RuntimeFilterConsumerOutcome::TimedOut);
+            let conflicted = join_consumer_outcome(
+                consumer_mut(state, *identity)?,
+                RuntimeFilterConsumerOutcome::TimedOut,
+            );
+            if conflicted {
+                increment_field(
+                    &mut state.anomalies.conflicting_reports.consumer_outcome,
+                    1,
+                    saturated,
+                );
+            }
         }
         BackendRuntimeFilterEvent::SubscriptionUnavailable { identity, reason } => {
-            consumer_mut(state, *identity)?.outcome =
-                Some(RuntimeFilterConsumerOutcome::Unavailable(*reason));
+            let conflicted = join_consumer_outcome(
+                consumer_mut(state, *identity)?,
+                RuntimeFilterConsumerOutcome::Unavailable(*reason),
+            );
+            if conflicted {
+                increment_field(
+                    &mut state.anomalies.conflicting_reports.consumer_outcome,
+                    1,
+                    saturated,
+                );
+            }
         }
         BackendRuntimeFilterEvent::SubscriptionUnsupported { identity, reason } => {
-            consumer_mut(state, *identity)?.outcome =
-                Some(RuntimeFilterConsumerOutcome::Unsupported(*reason));
+            let conflicted = join_consumer_outcome(
+                consumer_mut(state, *identity)?,
+                RuntimeFilterConsumerOutcome::Unsupported(*reason),
+            );
+            if conflicted {
+                increment_field(
+                    &mut state.anomalies.conflicting_reports.consumer_outcome,
+                    1,
+                    saturated,
+                );
+            }
         }
         BackendRuntimeFilterEvent::SubscriptionCancelled { identity } => {
-            consumer_mut(state, *identity)?.outcome = Some(RuntimeFilterConsumerOutcome::Cancelled);
+            let conflicted = join_consumer_outcome(
+                consumer_mut(state, *identity)?,
+                RuntimeFilterConsumerOutcome::Cancelled,
+            );
+            if conflicted {
+                increment_field(
+                    &mut state.anomalies.conflicting_reports.consumer_outcome,
+                    1,
+                    saturated,
+                );
+            }
         }
         BackendRuntimeFilterEvent::LiveSubscriptionUpdated {
             identity,
             version,
             terminal,
         } => {
-            validate_version(*version)?;
-            let consumer = consumer_mut(state, *identity)?;
-            advance_version(&mut consumer.latest_delivered_version, *version)?;
-            consumer.outcome = Some(RuntimeFilterConsumerOutcome::Acquired);
-            if let Some(terminal) = terminal {
-                consumer.terminal = Some(*terminal);
+            let (outcome_conflicted, terminal_conflicted) = {
+                let consumer = consumer_mut(state, *identity)?;
+                consumer.latest_delivered_version =
+                    max_option(consumer.latest_delivered_version, *version);
+                let outcome_conflicted =
+                    join_consumer_outcome(consumer, RuntimeFilterConsumerOutcome::Acquired);
+                let terminal_conflicted =
+                    terminal.is_some_and(|terminal| join_consumer_terminal(consumer, terminal));
+                (outcome_conflicted, terminal_conflicted)
+            };
+            if outcome_conflicted {
+                increment_field(
+                    &mut state.anomalies.conflicting_reports.consumer_outcome,
+                    1,
+                    saturated,
+                );
+            }
+            if terminal_conflicted {
+                increment_field(
+                    &mut state.anomalies.conflicting_reports.consumer_terminal,
+                    1,
+                    saturated,
+                );
             }
         }
         BackendRuntimeFilterEvent::LiveSubscriptionIdle {
@@ -799,13 +945,20 @@ fn fold_event(
             latest_version,
             terminal,
         } => {
-            let consumer = consumer_mut(state, *identity)?;
-            if let Some(version) = latest_version {
-                validate_version(*version)?;
-                advance_version(&mut consumer.latest_delivered_version, *version)?;
-            }
-            if let Some(terminal) = terminal {
-                consumer.terminal = Some(*terminal);
+            let terminal_conflicted = {
+                let consumer = consumer_mut(state, *identity)?;
+                if let Some(version) = latest_version {
+                    consumer.latest_delivered_version =
+                        max_option(consumer.latest_delivered_version, *version);
+                }
+                terminal.is_some_and(|terminal| join_consumer_terminal(consumer, terminal))
+            };
+            if terminal_conflicted {
+                increment_field(
+                    &mut state.anomalies.conflicting_reports.consumer_terminal,
+                    1,
+                    saturated,
+                );
             }
         }
         BackendRuntimeFilterEvent::LiveSubscriptionTerminal {
@@ -813,20 +966,28 @@ fn fold_event(
             terminal,
             retained_version,
         } => {
-            let consumer = consumer_mut(state, *identity)?;
-            if let Some(version) = retained_version {
-                validate_version(*version)?;
-                advance_version(&mut consumer.latest_delivered_version, *version)?;
+            let terminal_conflicted = {
+                let consumer = consumer_mut(state, *identity)?;
+                if let Some(version) = retained_version {
+                    consumer.latest_delivered_version =
+                        max_option(consumer.latest_delivered_version, *version);
+                }
+                join_consumer_terminal(consumer, *terminal)
+            };
+            if terminal_conflicted {
+                increment_field(
+                    &mut state.anomalies.conflicting_reports.consumer_terminal,
+                    1,
+                    saturated,
+                );
             }
-            consumer.terminal = Some(*terminal);
         }
         BackendRuntimeFilterEvent::LoopbackDelivered {
             channel,
             consumer_binding_id,
             route_edge_id,
-            version,
+            version: _,
         } => {
-            validate_version(*version)?;
             if channel.binding_id() != *consumer_binding_id {
                 return Err(RuntimeFilterObservationError::IdentityMismatch);
             }
@@ -842,15 +1003,12 @@ fn fold_event(
             input_rows,
             output_rows,
         } => {
-            validate_version(*logical_version)?;
-            if output_rows > input_rows {
-                return Err(RuntimeFilterObservationError::InvalidRowEffect);
-            }
             let consumer = consumer_mut(state, *identity)?;
-            advance_version(&mut consumer.latest_applied_version, *logical_version)?;
-            let evaluations = increment(consumer.row_evaluations, 1)?;
-            let input = increment(consumer.row_input, *input_rows)?;
-            let output = increment(consumer.row_output, *output_rows)?;
+            consumer.latest_applied_version =
+                max_option(consumer.latest_applied_version, *logical_version);
+            let evaluations = increment(consumer.row_evaluations, 1, saturated);
+            let input = increment(consumer.row_input, *input_rows, saturated);
+            let output = increment(consumer.row_output, *output_rows, saturated);
             consumer.row_evaluations = evaluations;
             consumer.row_input = input;
             consumer.row_output = output;
@@ -860,17 +1018,19 @@ fn fold_event(
             logical_version,
             decision,
         } => {
-            validate_version(*logical_version)?;
             let consumer = consumer_mut(state, *identity)?;
-            advance_version(&mut consumer.latest_applied_version, *logical_version)?;
-            let evaluated = increment(consumer.scan_evaluated, 1)?;
+            consumer.latest_applied_version =
+                max_option(consumer.latest_applied_version, *logical_version);
+            let evaluated = increment(consumer.scan_evaluated, 1, saturated);
             let (kept, pruned) = match decision {
-                RuntimeFilterScanUnitDecision::Kept => {
-                    (increment(consumer.scan_kept, 1)?, consumer.scan_pruned)
-                }
-                RuntimeFilterScanUnitDecision::Pruned => {
-                    (consumer.scan_kept, increment(consumer.scan_pruned, 1)?)
-                }
+                RuntimeFilterScanUnitDecision::Kept => (
+                    increment(consumer.scan_kept, 1, saturated),
+                    consumer.scan_pruned,
+                ),
+                RuntimeFilterScanUnitDecision::Pruned => (
+                    consumer.scan_kept,
+                    increment(consumer.scan_pruned, 1, saturated),
+                ),
             };
             consumer.scan_evaluated = evaluated;
             consumer.scan_kept = kept;
@@ -878,14 +1038,11 @@ fn fold_event(
         }
         BackendRuntimeFilterEvent::ConsumerScanUnitNotEvaluated {
             identity,
-            observed_version,
+            observed_version: _,
             reason,
         } => {
             let consumer = consumer_mut(state, *identity)?;
-            if let Some(version) = observed_version {
-                validate_version(*version)?;
-            }
-            consumer.scan_not_evaluated = increment(consumer.scan_not_evaluated, 1)?;
+            consumer.scan_not_evaluated = increment(consumer.scan_not_evaluated, 1, saturated);
             let counter = match reason {
                 RuntimeFilterScanUnitNotEvaluatedReason::UnitFactsMissing(_) => {
                     &mut consumer.scan_not_evaluated_reasons.unit_facts_missing
@@ -914,7 +1071,7 @@ fn fold_event(
                     &mut consumer.scan_not_evaluated_reasons.snapshot_not_published
                 }
             };
-            *counter = increment(*counter, 1)?;
+            *counter = increment(*counter, 1, saturated);
         }
     }
     Ok(())
@@ -976,35 +1133,178 @@ fn consumer_mut(
         .ok_or(RuntimeFilterObservationError::UnknownConsumer(identity))
 }
 
-fn validate_version(version: LogicalVersion) -> Result<(), RuntimeFilterObservationError> {
-    if version.get() == 0 {
-        return Err(RuntimeFilterObservationError::InvalidVersion);
-    }
-    Ok(())
+fn max_option<T: Ord>(current: Option<T>, observed: T) -> Option<T> {
+    Some(match current {
+        Some(current) => current.max(observed),
+        None => observed,
+    })
 }
 
-fn advance_version(
-    current: &mut Option<LogicalVersion>,
-    observed: LogicalVersion,
-) -> Result<(), RuntimeFilterObservationError> {
-    if current.is_some_and(|current| observed < current) {
-        return Err(RuntimeFilterObservationError::VersionRegression);
+fn increment(current: u64, delta: u64, saturated: &AtomicU64) -> u64 {
+    let value = current.saturating_add(delta);
+    if value == u64::MAX && (current != u64::MAX || delta != 0) {
+        saturated.fetch_add(1, Ordering::Relaxed);
     }
-    if current.is_none_or(|current| observed > current) {
-        *current = Some(observed);
-    }
-    Ok(())
+    value
 }
 
-fn increment(current: u64, delta: u64) -> Result<u64, RuntimeFilterObservationError> {
-    current
-        .checked_add(delta)
-        .ok_or(RuntimeFilterObservationError::CounterOverflow)
+fn increment_field(field: &mut u64, delta: u64, saturated: &AtomicU64) {
+    *field = increment(*field, delta, saturated);
 }
 
-fn remember_error(state: &mut ObservationState, error: RuntimeFilterObservationError) {
-    if state.error.is_none() {
-        state.error = Some(error);
+fn snapshot(state: &ObservationState, saturated: u64) -> RuntimeFilterObservationSnapshot {
+    let mut anomalies = state.anomalies;
+    anomalies.saturated = saturated;
+    RuntimeFilterObservationSnapshot {
+        channels: state.channels.values().cloned().collect(),
+        producer_streams: state.producer_streams.values().cloned().collect(),
+        transport_routes: state.transport_routes.values().cloned().collect(),
+        consumers: state.consumers.values().cloned().collect(),
+        anomalies,
+    }
+}
+
+fn record_anomaly(
+    state: &mut ObservationState,
+    error: RuntimeFilterObservationError,
+    saturated: &AtomicU64,
+) {
+    match error {
+        RuntimeFilterObservationError::UnknownParticipant => {
+            increment_field(&mut state.anomalies.unattributed.participant, 1, saturated);
+        }
+        RuntimeFilterObservationError::UnknownChannel(_) => {
+            increment_field(&mut state.anomalies.unattributed.channel, 1, saturated);
+        }
+        RuntimeFilterObservationError::UnknownProducerInstance { .. }
+        | RuntimeFilterObservationError::ProducerInstanceNotOpened { .. }
+        | RuntimeFilterObservationError::ConflictingProducerPartitionCount { .. }
+        | RuntimeFilterObservationError::ProducerPartitionCountExceeded => {
+            increment_field(
+                &mut state.anomalies.unattributed.producer_instance,
+                1,
+                saturated,
+            );
+        }
+        RuntimeFilterObservationError::UnknownProducerStream(_) => {
+            increment_field(
+                &mut state.anomalies.unattributed.producer_stream,
+                1,
+                saturated,
+            );
+        }
+        RuntimeFilterObservationError::UnknownTransportRoute(_) => {
+            increment_field(
+                &mut state.anomalies.unattributed.transport_route,
+                1,
+                saturated,
+            );
+        }
+        RuntimeFilterObservationError::UnknownConsumer(_) => {
+            increment_field(&mut state.anomalies.unattributed.consumer, 1, saturated);
+        }
+        RuntimeFilterObservationError::IdentityMismatch => {
+            increment_field(
+                &mut state.anomalies.unattributed.identity_mismatch,
+                1,
+                saturated,
+            );
+        }
+        RuntimeFilterObservationError::ConflictingChannelTerminal { .. } => {
+            increment_field(
+                &mut state.anomalies.conflicting_reports.channel_terminal,
+                1,
+                saturated,
+            );
+        }
+        RuntimeFilterObservationError::DeliveryConflict
+        | RuntimeFilterObservationError::DeliveryResourceLimit
+        | RuntimeFilterObservationError::InvalidRowEffect => {
+            increment_field(&mut state.anomalies.rejected, 1, saturated);
+        }
+    };
+}
+
+fn join_channel_terminal(
+    channel: &mut RuntimeFilterChannelObservation,
+    incoming: RuntimeFilterChannelTerminal,
+) -> bool {
+    if channel.terminal_conflicted {
+        return false;
+    }
+    let Some(observed) = channel.terminal else {
+        channel.terminal = Some(incoming);
+        return false;
+    };
+    match join_channel_terminal_values(observed, incoming) {
+        Some(joined) => {
+            channel.terminal = Some(joined);
+            false
+        }
+        None => {
+            channel.terminal = None;
+            channel.terminal_conflicted = true;
+            true
+        }
+    }
+}
+
+fn join_channel_terminal_values(
+    left: RuntimeFilterChannelTerminal,
+    right: RuntimeFilterChannelTerminal,
+) -> Option<RuntimeFilterChannelTerminal> {
+    use RuntimeFilterChannelTerminal::{Completed, Unavailable};
+
+    match (left, right) {
+        (Completed(left), Completed(right)) => Some(Completed(left.max(right))),
+        (Completed(version), Unavailable(UnavailableReason::IncompleteCoverage))
+        | (Unavailable(UnavailableReason::IncompleteCoverage), Completed(version)) => {
+            Some(Completed(version))
+        }
+        (left, right) if left == right => Some(left),
+        _ => None,
+    }
+}
+
+fn join_consumer_outcome(
+    consumer: &mut RuntimeFilterConsumerObservation,
+    incoming: RuntimeFilterConsumerOutcome,
+) -> bool {
+    if consumer.outcome_conflicted {
+        return false;
+    }
+    match consumer.outcome {
+        None => {
+            consumer.outcome = Some(incoming);
+            false
+        }
+        Some(observed) if observed == incoming => false,
+        Some(_) => {
+            consumer.outcome = None;
+            consumer.outcome_conflicted = true;
+            true
+        }
+    }
+}
+
+fn join_consumer_terminal(
+    consumer: &mut RuntimeFilterConsumerObservation,
+    incoming: LiveTerminal,
+) -> bool {
+    if consumer.terminal_conflicted {
+        return false;
+    }
+    match consumer.terminal {
+        None => {
+            consumer.terminal = Some(incoming);
+            false
+        }
+        Some(observed) if observed == incoming => false,
+        Some(_) => {
+            consumer.terminal = None;
+            consumer.terminal_conflicted = true;
+            true
+        }
     }
 }
 
@@ -1017,6 +1317,7 @@ fn channel_observation(identity: BackendChannelIdentity) -> RuntimeFilterChannel
         completed: 0,
         unavailable: 0,
         cancelled: 0,
+        terminal_conflicted: false,
     }
 }
 
@@ -1068,6 +1369,8 @@ fn consumer_observation(
         scan_pruned: 0,
         scan_not_evaluated: 0,
         scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedObservation::default(),
+        outcome_conflicted: false,
+        terminal_conflicted: false,
     }
 }
 
@@ -1227,7 +1530,7 @@ mod tests {
             reason: RuntimeFilterScanUnitNotEvaluatedReason::SnapshotUnavailable,
         });
 
-        let frozen = emitter.capture().expect("capture");
+        let frozen = emitter.capture();
         assert_eq!(frozen.producer_streams().len(), 1);
         assert_eq!(
             frozen.producer_streams()[0].latest_accepted_sequence(),
@@ -1241,8 +1544,8 @@ mod tests {
             .iter()
             .find(|channel| channel.identity() == fixture.producer_channel)
             .expect("producer channel observation");
-        assert_eq!(channel.published(), 1);
-        assert_eq!(channel.completed(), 1);
+        assert_eq!(channel.published(), 2);
+        assert_eq!(channel.completed(), 2);
         assert_eq!(frozen.transport_routes()[0].sent(), 1);
         assert_eq!(frozen.transport_routes()[0].bytes(), 17);
         assert_eq!(frozen.consumers()[0].row_input(), 100);
@@ -1258,11 +1561,11 @@ mod tests {
             output_rows: 5,
         });
         assert_eq!(frozen.consumers()[0].row_input(), 100);
-        assert_eq!(emitter.capture().unwrap().consumers()[0].row_input(), 110);
+        assert_eq!(emitter.capture().consumers()[0].row_input(), 110);
     }
 
     #[test]
-    fn anyof_completion_supersedes_incomplete_owner_in_both_arrival_orders() {
+    fn terminal_join_is_order_independent_and_keeps_event_counters_truthful() {
         for completed_first in [false, true] {
             let fixture = fixture();
             let emitter = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
@@ -1282,7 +1585,7 @@ mod tests {
                 emitter.record(completed);
             }
 
-            let frozen = emitter.capture().expect("AnyOf completion");
+            let frozen = emitter.capture();
             let channel = frozen
                 .channels()
                 .iter()
@@ -1295,12 +1598,12 @@ mod tests {
                 ))
             );
             assert_eq!(channel.completed(), 1);
-            assert_eq!(channel.unavailable(), 0);
+            assert_eq!(channel.unavailable(), 1);
         }
     }
 
     #[test]
-    fn cross_driver_effect_reordering_currently_sticks_version_regression() {
+    fn cross_driver_effect_reordering_keeps_the_highest_observed_version() {
         let fixture = fixture();
         let emitter = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
         for version in [LogicalVersion::new(2), LogicalVersion::FIRST] {
@@ -1312,14 +1615,20 @@ mod tests {
             });
         }
 
+        let captured = emitter.capture();
+        let consumer = &captured.consumers()[0];
         assert_eq!(
-            emitter.capture(),
-            Err(RuntimeFilterObservationError::VersionRegression)
+            consumer.latest_applied_version(),
+            Some(LogicalVersion::new(2))
         );
+        assert_eq!(consumer.row_evaluations(), 2);
+        assert_eq!(consumer.row_input(), 2);
+        assert_eq!(consumer.row_output(), 2);
+        assert_eq!(captured.anomalies().rejected(), 0);
     }
 
     #[test]
-    fn unknown_or_unopened_stream_is_a_first_wins_sticky_error() {
+    fn unattributed_events_are_counted_without_poisoning_the_contribution() {
         let fixture = fixture();
         let emitter = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
         let stream = BackendProducerStreamIdentity::new(
@@ -1331,14 +1640,10 @@ mod tests {
             stream,
             sequence: 1,
         });
-        emitter.reject(RuntimeFilterObservationError::CounterOverflow);
-        assert_eq!(
-            emitter.capture(),
-            Err(RuntimeFilterObservationError::ProducerInstanceNotOpened {
-                channel: fixture.producer_channel,
-                fragment_instance_id: fixture.producer_instance,
-            })
-        );
+        emitter.reject(RuntimeFilterObservationError::DeliveryConflict);
+        let captured = emitter.capture();
+        assert_eq!(captured.anomalies().unattributed().producer_instance(), 1);
+        assert_eq!(captured.anomalies().rejected(), 1);
     }
 
     #[test]
@@ -1355,12 +1660,8 @@ mod tests {
             stream: out_of_bound,
             sequence: 1,
         });
-        assert_eq!(
-            emitter.capture(),
-            Err(RuntimeFilterObservationError::UnknownProducerStream(
-                out_of_bound
-            ))
-        );
+        let captured = emitter.capture();
+        assert_eq!(captured.anomalies().unattributed().producer_stream(), 1);
     }
 
     struct PanickingObserver;
@@ -1383,7 +1684,7 @@ mod tests {
             input_rows: 10,
             output_rows: 4,
         });
-        assert_eq!(emitter.capture().unwrap().consumers()[0].row_input(), 10);
+        assert_eq!(emitter.capture().consumers()[0].row_input(), 10);
     }
 
     struct ReentrantObserver {
@@ -1416,7 +1717,7 @@ mod tests {
             RuntimeFilterObservationEmitter::from_install(&fixture.install, Some(observer.clone()));
         *observer.emitter.lock().unwrap() = Arc::downgrade(&emitter);
         emitter.record(event);
-        let captured = emitter.capture().unwrap();
+        let captured = emitter.capture();
         let consumer = &captured.consumers()[0];
         assert_eq!(consumer.row_evaluations(), 1);
         assert_eq!(consumer.row_input(), 10);
@@ -1442,12 +1743,12 @@ mod tests {
             }));
         }
         for _ in 0..10 {
-            let _ = emitter.capture().expect("concurrent capture");
+            let _ = emitter.capture();
         }
         for worker in workers {
             worker.join().expect("worker");
         }
-        let captured = emitter.capture().unwrap();
+        let captured = emitter.capture();
         let consumer = &captured.consumers()[0];
         assert_eq!(consumer.row_evaluations(), 400);
         assert_eq!(consumer.row_input(), 400);
@@ -1455,7 +1756,7 @@ mod tests {
     }
 
     #[test]
-    fn counter_overflow_is_sticky_and_never_wraps() {
+    fn counters_saturate_and_mark_the_observation() {
         let fixture = fixture();
         let store = RuntimeFilterObservationStore::from_install(&fixture.install);
         {
@@ -1472,9 +1773,66 @@ mod tests {
             input_rows: 1,
             output_rows: 0,
         });
-        assert_eq!(
-            store.capture(),
-            Err(RuntimeFilterObservationError::CounterOverflow)
-        );
+        let captured = store.capture();
+        assert_eq!(captured.consumers()[0].row_input(), u64::MAX);
+        assert_eq!(captured.anomalies().saturated(), 1);
+    }
+
+    #[test]
+    fn arrival_order_does_not_change_the_folded_snapshot() {
+        let fixture = fixture();
+        let first = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
+        let second = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
+        let events = [
+            BackendRuntimeFilterEvent::ConsumerRowsEvaluated {
+                identity: fixture.consumer,
+                logical_version: LogicalVersion::new(2),
+                input_rows: 10,
+                output_rows: 4,
+            },
+            BackendRuntimeFilterEvent::ConsumerRowsEvaluated {
+                identity: fixture.consumer,
+                logical_version: LogicalVersion::FIRST,
+                input_rows: 3,
+                output_rows: 1,
+            },
+            BackendRuntimeFilterEvent::LogicalVersionPublished {
+                channel: fixture.producer_channel,
+                version: LogicalVersion::new(2),
+            },
+            BackendRuntimeFilterEvent::LogicalVersionPublished {
+                channel: fixture.producer_channel,
+                version: LogicalVersion::FIRST,
+            },
+        ];
+        for event in &events {
+            first.record(event.clone());
+        }
+        for event in events.into_iter().rev() {
+            second.record(event);
+        }
+        assert_eq!(first.capture(), second.capture());
+    }
+
+    #[test]
+    fn seal_freezes_the_contribution_and_marks_late_events() {
+        let fixture = fixture();
+        let emitter = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
+        emitter.record(BackendRuntimeFilterEvent::ConsumerRowsEvaluated {
+            identity: fixture.consumer,
+            logical_version: LogicalVersion::FIRST,
+            input_rows: 10,
+            output_rows: 4,
+        });
+        let frozen = emitter.seal();
+        emitter.record(BackendRuntimeFilterEvent::ConsumerRowsEvaluated {
+            identity: fixture.consumer,
+            logical_version: LogicalVersion::new(2),
+            input_rows: 5,
+            output_rows: 2,
+        });
+        assert_eq!(frozen.consumers()[0].row_input(), 10);
+        assert_eq!(emitter.capture(), frozen);
+        assert_eq!(emitter.store.lock().anomalies.late_after_seal, 1);
     }
 }
