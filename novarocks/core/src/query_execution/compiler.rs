@@ -63,7 +63,7 @@ use crate::query_execution::planning::time_travel::{
     has_time_travel_refs, rewrite_time_travel_refs,
 };
 #[cfg(test)]
-use novarocks_sql::literal::{sql_type_to_arrow_type, sqlparser_expr_to_literal};
+use novarocks_sql::syntax::{sql_type_to_arrow_type, sqlparser_expr_to_literal};
 
 use novarocks_catalog::partition::LegacyRangePartition;
 

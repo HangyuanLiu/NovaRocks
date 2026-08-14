@@ -159,7 +159,7 @@ fn encode_stream_fixture(fixture: NativeEncoderPlanFixture) -> wire_plan::Distri
     encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode distributed plan")
 }
 
-fn encoded_exchange(encoded: &wire_plan::DistributedPlan) -> &wire_plan::ExchangeNode {
+fn encoded_exchange(encoded: &wire_plan::DistributedPlan) -> &wire_plan::ExchangeReceiver {
     let target_fragment = encoded
         .fragments
         .iter()

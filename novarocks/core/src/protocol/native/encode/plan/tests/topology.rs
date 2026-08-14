@@ -23,7 +23,9 @@ fn encode_fixture(fixture: NativePlanEncodingFixture) -> plan::DistributedPlan {
     encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan")
 }
 
-fn stream_nodes(encoded: &plan::DistributedPlan) -> (&plan::DataStreamSink, &plan::ExchangeNode) {
+fn stream_nodes(
+    encoded: &plan::DistributedPlan,
+) -> (&plan::DataStreamSink, &plan::ExchangeReceiver) {
     let source = encoded
         .fragments
         .iter()
