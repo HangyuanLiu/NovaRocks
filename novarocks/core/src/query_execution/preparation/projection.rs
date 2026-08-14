@@ -125,7 +125,10 @@ struct PreparedPlanProjection {
     edges: Vec<FragmentEdge>,
 }
 
-pub(crate) struct PreparedFragmentSet {
+/// Exact scan/binding preparation for one sealed distributed plan. Its fields
+/// remain private; Frontend can only pass it to the native encoder paired with
+/// the matching Core-produced plan carrier.
+pub struct PreparedFragmentSet {
     by_fragment: BTreeMap<FragmentId, PreparedFragment>,
     scan_bindings: ScanExecutionBindings,
     projection: PreparedPlanProjection,

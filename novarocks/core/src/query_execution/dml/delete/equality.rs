@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
@@ -128,6 +128,7 @@ struct DistributedEqualityDeleteWriteExecutor {
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    native_assembly: Mutex<Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>>,
 }
 
 impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
@@ -149,20 +150,46 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
         )
     }
 
-    fn run(&self) -> Result<QueryExecutionResult, String> {
-        let result = crate::query_execution::compiler::execute_query_as_iceberg_write_with_connector_context(
-            &self.state,
-            Some(&self.target.catalog),
-            &self.target.namespace,
-            &self.delete_query,
-            self.sql_write_input.clone(),
-            Arc::clone(&self.table_bindings),
-            None,
-            crate::sql::compiler::RootDistributionRequirement::Any,
-            Some(&self.execution),
-            &self.connector_context,
-            Some(self.connector_write.clone()),
-        )?;
+    fn native_encoding(
+        &self,
+    ) -> Result<crate::query_execution::dml::delete::DeleteNativeEncoding<'_>, String> {
+        let mut assembly = self
+            .native_assembly
+            .lock()
+            .expect("prepared equality DELETE native assembly lock poisoned");
+        if assembly.is_none() {
+            *assembly = Some(
+                crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_context(
+                    &self.state,
+                    Some(&self.target.catalog),
+                    &self.target.namespace,
+                    &self.delete_query,
+                    self.sql_write_input.clone(),
+                    Arc::clone(&self.table_bindings),
+                    None,
+                    crate::sql::compiler::RootDistributionRequirement::Any,
+                    Some(&self.execution),
+                    &self.connector_context,
+                    Some(self.connector_write.clone()),
+                )?,
+            );
+        }
+        Ok(crate::query_execution::dml::delete::DeleteNativeEncoding { assembly })
+    }
+
+    fn run_with_native_bundle(
+        &self,
+        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    ) -> Result<QueryExecutionResult, String> {
+        let result = self
+            .native_assembly
+            .lock()
+            .expect("prepared equality DELETE native assembly lock poisoned")
+            .take()
+            .ok_or_else(|| {
+                "prepared equality DELETE native assembly was already consumed".to_string()
+            })?
+            .finish(native_bundle)?;
         if result.write_abort.is_none() && result.connector_completion.is_none() {
             return Err(
                 "ADD EQUALITY DELETE completed without a sealed connector write completion for non-empty input"
@@ -261,6 +288,7 @@ fn prepare_equality_delete_distributed_write(
         execution: execution.clone(),
         connector_context: connector_context.clone(),
         connector_write,
+        native_assembly: Mutex::new(None),
     };
     Ok(prepared_delete(
         DeleteOperation {

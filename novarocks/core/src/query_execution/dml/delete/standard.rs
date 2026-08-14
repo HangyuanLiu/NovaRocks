@@ -30,7 +30,7 @@
 //!    which commits the generated position-delete files and drives
 //!    finalization lifecycle.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
@@ -180,6 +180,7 @@ struct DistributedDeleteWriteExecutor {
     /// is shuffled by its first column. Position deletes have no such
     /// requirement. Both follow from the provider-signed strategy.
     shuffle_by_first_output: bool,
+    native_assembly: Mutex<Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>>,
 }
 
 impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
@@ -203,26 +204,48 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
         )
     }
 
-    fn run(&self) -> Result<QueryExecutionResult, String> {
-        let distribution = if self.shuffle_by_first_output {
-            crate::query_execution::compiler::iceberg_write_shuffle_by_output_index(0)
-        } else {
-            crate::sql::compiler::RootDistributionRequirement::Any
-        };
-        let result = crate::query_execution::compiler::execute_query_as_iceberg_write_with_connector_context(
-            &self.state,
-            Some(&self.target.catalog),
-            &self.target.namespace,
-            &self.delete_query,
-            self.sql_write_input.clone(),
-            Arc::clone(&self.table_bindings),
-            None,
-            distribution,
-            Some(&self.execution),
-            &self.connector_context,
-            Some(self.connector_write.clone()),
-        )?;
-        Ok(result)
+    fn native_encoding(
+        &self,
+    ) -> Result<crate::query_execution::dml::delete::DeleteNativeEncoding<'_>, String> {
+        let mut assembly = self
+            .native_assembly
+            .lock()
+            .expect("prepared DELETE native assembly lock poisoned");
+        if assembly.is_none() {
+            let distribution = if self.shuffle_by_first_output {
+                crate::query_execution::compiler::iceberg_write_shuffle_by_output_index(0)
+            } else {
+                crate::sql::compiler::RootDistributionRequirement::Any
+            };
+            *assembly = Some(
+                crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_context(
+                    &self.state,
+                    Some(&self.target.catalog),
+                    &self.target.namespace,
+                    &self.delete_query,
+                    self.sql_write_input.clone(),
+                    Arc::clone(&self.table_bindings),
+                    None,
+                    distribution,
+                    Some(&self.execution),
+                    &self.connector_context,
+                    Some(self.connector_write.clone()),
+                )?,
+            );
+        }
+        Ok(crate::query_execution::dml::delete::DeleteNativeEncoding { assembly })
+    }
+
+    fn run_with_native_bundle(
+        &self,
+        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    ) -> Result<QueryExecutionResult, String> {
+        self.native_assembly
+            .lock()
+            .expect("prepared DELETE native assembly lock poisoned")
+            .take()
+            .ok_or_else(|| "prepared DELETE native assembly was already consumed".to_string())?
+            .finish(native_bundle)
     }
 
     fn commit_terminal(
@@ -332,6 +355,7 @@ fn prepare_delete_write(
         // output is shuffled by its first column; position deletes have no such
         // requirement.
         shuffle_by_first_output: deletion_vectors,
+        native_assembly: Mutex::new(None),
     };
     Ok(prepared_delete(
         DeleteOperation {

@@ -68,11 +68,18 @@ impl WriteExecutor for IcebergInsertWriteExecutor<'_> {
         &self,
         _spec: &WriteTransactionSpec,
     ) -> Result<CoordinatedWriteReport<Self::CommitHandle>, String> {
+        let encoding = self
+            .engine
+            .iceberg_write_native_encoding(self.prepared.handle.as_ref())?;
+        let input = encoding.input()?;
+        let native_bundle =
+            novarocks::protocol::native::encode::encode_native_fragment_bundle(input.source())?;
+        drop(encoding);
         Ok(
-            match self
-                .engine
-                .run_iceberg_write(self.prepared.handle.as_ref())?
-            {
+            match self.engine.run_iceberg_write_with_native_bundle(
+                self.prepared.handle.as_ref(),
+                native_bundle,
+            )? {
                 IcebergWriteReport::Aborted {
                     reason,
                     has_staged_files: _,

@@ -20,8 +20,10 @@
 //! It preserves the Core kernel's sealed request and completion contracts while
 //! keeping Frontend admission independent from the Core `engine` namespace.
 
+use novarocks::protocol::native::encode::encode_native_fragment_bundle;
+use novarocks::query_execution::PreparedQueryDistributedOperation;
 use novarocks::query_execution::PreparedQueryOperation;
-use novarocks::query_execution::compiler::CoreQueryCompiler;
+use novarocks::query_execution::compiler::{CorePreparedQueryOperation, CoreQueryCompiler};
 use novarocks::query_execution::request_context::RequestContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
 
@@ -41,6 +43,21 @@ impl FrontendQueryCompiler {
         context: &RequestContext,
         query_options: Option<QueryOptions>,
     ) -> Result<PreparedQueryOperation, String> {
-        self.kernel.prepare(sql, context, query_options)
+        match self.kernel.prepare(sql, context, query_options)? {
+            CorePreparedQueryOperation::Immediate(operation) => {
+                Ok(PreparedQueryOperation::Immediate(operation))
+            }
+            CorePreparedQueryOperation::Distributed {
+                assembly,
+                completion,
+            } => {
+                let encoding = assembly.encoding();
+                let native_bundle = encode_native_fragment_bundle(encoding.source())?;
+                let request = assembly.finish(native_bundle)?;
+                Ok(PreparedQueryOperation::Distributed(
+                    PreparedQueryDistributedOperation::new(request, completion),
+                ))
+            }
+        }
     }
 }

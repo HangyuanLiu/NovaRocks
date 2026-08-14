@@ -54,4 +54,5 @@ pub(crate) use runtime_filter_progress::{
     JoinBuildProgressSkip,
 };
 pub use seal::DistributedPlan;
+pub(crate) use seal::native_encoder_test_fixture_plan;
 pub use topology::TopologyContract;

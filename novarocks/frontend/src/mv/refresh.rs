@@ -36,6 +36,7 @@ use novarocks::mv::persistence::refresh::{
 use novarocks::mv::repository::{
     BeginFrontendMvRefreshIntentRequest, MvRepository, MvRepositoryError,
 };
+use novarocks::protocol::native::encode::encode_native_fragment_bundle;
 use novarocks::query_execution::ConnectorWriteCompletion;
 use novarocks::query_execution::contract::ConnectorWriteExecutionRegistration;
 use novarocks::query_execution::prepared_write::PreparedDistributedWriteRequest;
@@ -95,7 +96,7 @@ impl FrontendMvRefreshProviderActivationPort {
         planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
         lease: &novarocks_spi::connector::ConnectorWriteLease,
         execution: &novarocks::query_execution::request_context::QueryExecutionContext,
-    ) -> Result<PreparedDistributedWriteRequest, MvApplicationError> {
+    ) -> Result<novarocks::mv::application::PreparedMvNativeWriteAssembly, MvApplicationError> {
         let activation = self
             .activation
             .read()
@@ -374,12 +375,15 @@ fn execute_data_refresh(
         ));
     }
     let publication_intent = prepared.publication_intent().clone();
-    let write = dependencies.provider_activation.activate_write(
+    let assembly = dependencies.provider_activation.activate_write(
         prepared,
         planning_lease,
         &write_lease,
         execution,
     )?;
+    let encoding = assembly.native_encoding();
+    let native_bundle = encode_native_fragment_bundle(encoding.source()).map_err(invalid)?;
+    let write = assembly.finish(native_bundle).map_err(invalid)?;
     if write.write_operation_id() != attempt.write_operation_id {
         return Err(invalid(
             "SQL-prepared MV write does not use the frontend-preallocated operation ID",
@@ -1073,6 +1077,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use novarocks::mv::application::PreparedMvNativeWriteAssembly;
     use novarocks::mv::application::{
         MvRefreshCommittedFacts, MvRefreshProviderActivation, MvRefreshProviderActivationSink,
         MvRefreshPublicationIntent, PreparedMvRefreshWrite,
@@ -1081,7 +1086,6 @@ mod tests {
         FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
         FrontendMvRefreshCommittedVersion,
     };
-    use novarocks::query_execution::prepared_write::PreparedDistributedWriteRequest;
     use novarocks::query_execution::request_context::QueryExecutionContext;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,
@@ -1111,7 +1115,7 @@ mod tests {
             _planning_lease: &ConnectorControlPlanningLease,
             _exact_lease: &ConnectorWriteLease,
             _execution: &QueryExecutionContext,
-        ) -> Result<PreparedDistributedWriteRequest, String> {
+        ) -> Result<PreparedMvNativeWriteAssembly, String> {
             unreachable!("the composition test never binds a write")
         }
 

@@ -299,7 +299,11 @@ fn prepare_iceberg_distributed_write(
         },
         source: IcebergWriteSource::CoordinatedPlan,
     };
-    Ok(PreparedIcebergWrite { executor, spec })
+    Ok(PreparedIcebergWrite {
+        executor,
+        spec,
+        native_assembly: Mutex::new(None),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -413,6 +417,64 @@ pub(crate) fn iceberg_connector_table_handle(
 pub(crate) struct PreparedIcebergWrite {
     executor: PreparedIcebergWriteExecutor,
     spec: IcebergWriteTransactionSpec,
+    native_assembly: Mutex<Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>>,
+}
+
+/// Borrowed encoder input for an exact prepared INSERT. The mutex guard stays
+/// held until Frontend finishes encoding, preventing a competing execution
+/// from consuming or replacing the sealed plan/preparation pair.
+pub struct PreparedIcebergWriteNativeEncoding<'a> {
+    inner: PreparedIcebergWriteNativeEncodingInner<'a>,
+}
+
+enum PreparedIcebergWriteNativeEncodingInner<'a> {
+    Assembly(
+        std::sync::MutexGuard<
+            'a,
+            Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>,
+        >,
+    ),
+    TestFixture(&'static crate::query_execution::compiler::NativeFragmentEncodingInput),
+}
+
+impl PreparedIcebergWriteNativeEncoding<'_> {
+    pub fn input(
+        &self,
+    ) -> Result<&crate::query_execution::compiler::NativeFragmentEncodingInput, String> {
+        match &self.inner {
+            PreparedIcebergWriteNativeEncodingInner::Assembly(assembly) => assembly
+                .as_ref()
+                .map(crate::query_execution::compiler::PreparedDmlWriteAssembly::encoding)
+                .ok_or_else(|| {
+                    "prepared Iceberg write native assembly was already consumed".to_string()
+                }),
+            PreparedIcebergWriteNativeEncodingInner::TestFixture(input) => Ok(input),
+        }
+    }
+
+    /// Test-only fixture used by frontend DML doubles. It creates a minimal
+    /// sealed writer plan and matching prepared fragments, so tests exercise
+    /// the real native encoder without a Core-side encoding fallback.
+    #[doc(hidden)]
+    pub fn test_fixture() -> Result<PreparedIcebergWriteNativeEncoding<'static>, String> {
+        use std::sync::OnceLock;
+
+        static INPUT: OnceLock<crate::query_execution::compiler::NativeFragmentEncodingInput> =
+            OnceLock::new();
+        let input = INPUT.get_or_init(|| {
+            let plan = crate::sql::planner::distributed::native_encoder_test_fixture_plan()
+                .expect("test native INSERT fixture plan must seal");
+            let prepared =
+                crate::query_execution::preparation::prepared_fragment_set_for_native_encode_test(
+                    &plan,
+                )
+                .expect("test native INSERT fixture must prepare");
+            crate::query_execution::compiler::NativeFragmentEncodingInput::new(plan, prepared)
+        });
+        Ok(PreparedIcebergWriteNativeEncoding {
+            inner: PreparedIcebergWriteNativeEncodingInner::TestFixture(input),
+        })
+    }
 }
 
 impl PreparedIcebergWrite {
@@ -456,8 +518,10 @@ impl PreparedIcebergWrite {
         )
     }
 
-    pub(crate) fn run_coordinated_write(&self) -> Result<QueryExecutionResult, String> {
-        crate::query_execution::compiler::execute_query_as_iceberg_write_with_connector_context(
+    fn prepare_native_assembly(
+        &self,
+    ) -> Result<crate::query_execution::compiler::PreparedDmlWriteAssembly, String> {
+        crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_context(
             &self.executor.state,
             Some(&self.executor.target.catalog),
             &self.executor.target.namespace,
@@ -472,6 +536,33 @@ impl PreparedIcebergWrite {
         )
     }
 
+    pub(crate) fn native_encoding(&self) -> Result<PreparedIcebergWriteNativeEncoding<'_>, String> {
+        let mut assembly = self
+            .native_assembly
+            .lock()
+            .expect("prepared Iceberg write native assembly lock poisoned");
+        if assembly.is_none() {
+            *assembly = Some(self.prepare_native_assembly()?);
+        }
+        Ok(PreparedIcebergWriteNativeEncoding {
+            inner: PreparedIcebergWriteNativeEncodingInner::Assembly(assembly),
+        })
+    }
+
+    pub(crate) fn run_coordinated_write_with_native_bundle(
+        &self,
+        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    ) -> Result<QueryExecutionResult, String> {
+        self.native_assembly
+            .lock()
+            .expect("prepared Iceberg write native assembly lock poisoned")
+            .take()
+            .ok_or_else(|| {
+                "prepared Iceberg write native assembly was already consumed".to_string()
+            })?
+            .finish(native_bundle)
+    }
+
     /// Convert a validated Iceberg write into SQL's inert distributed-write
     /// handoff. This registers no writer attempt and executes no query; the
     /// connector control service has already retained the provider-private
@@ -480,29 +571,6 @@ impl PreparedIcebergWrite {
     /// Frontend application owners use this form when they must persist their
     /// intent and retain an exact connector lease before submitting native
     /// fragments.
-    pub(crate) fn into_prepared_distributed_write(
-        self,
-    ) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String>
-    {
-        let Self { executor, .. } = self;
-        let execution = executor.execution.as_ref().ok_or_else(|| {
-            "prepared distributed Iceberg write requires an admitted execution context".to_string()
-        })?;
-        crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_binding(
-            &executor.state,
-            Some(&executor.target.catalog),
-            &executor.target.namespace,
-            &executor.query,
-            executor.sql_write_input,
-            executor.table_bindings,
-            None,
-            None,
-            execution,
-            &executor.connector_context,
-            executor.connector_write,
-        )
-    }
-
     pub(crate) fn commit_terminal(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -520,113 +588,6 @@ impl PreparedIcebergWrite {
 
     pub(crate) fn finalize(&self) -> Result<(), String> {
         invalidate_iceberg_caches(&self.executor.state, &self.executor.target)
-    }
-
-    /// Convert an inert prepared append into the mutation reverse-port
-    /// execution.  The returned object retains the exact connector session
-    /// created during request binding so a post-bind failure has a typed abort
-    /// capability instead of being silently abandoned.
-    pub(crate) fn into_mutation_execution(
-        self,
-    ) -> Result<Arc<dyn crate::query_execution::dml::mutation_flow::MutationExecution>, String>
-    {
-        let state = self.executor.state.clone();
-        let target = self.executor.target.clone();
-        let connector_context = self.executor.connector_context.clone();
-        let execution = self.executor.execution.clone().ok_or_else(|| {
-            "prepared Iceberg mutation write requires an admitted execution context".to_string()
-        })?;
-        let prepared_request = self.into_prepared_distributed_write()?;
-        Ok(Arc::new(PreparedIcebergWriteMutationExecution {
-            state,
-            target,
-            execution,
-            prepared_request: Mutex::new(Some(prepared_request)),
-            connector_context,
-            operation_session: Mutex::new(None),
-        }))
-    }
-}
-
-struct PreparedIcebergWriteMutationExecution {
-    state: DmlExecutionKernel,
-    target: TargetBackend,
-    execution: QueryExecutionContext,
-    prepared_request:
-        Mutex<Option<crate::query_execution::prepared_write::PreparedDistributedWriteRequest>>,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    operation_session:
-        Mutex<Option<crate::query_execution::write_operation::ConnectorWriteOperationSession>>,
-}
-
-impl crate::query_execution::dml::mutation_flow::MutationExecution
-    for PreparedIcebergWriteMutationExecution
-{
-    fn stage(&self) -> Result<QueryExecutionResult, String> {
-        let prepared_request = self
-            .prepared_request
-            .lock()
-            .expect("prepared Iceberg mutation request lock poisoned")
-            .take()
-            .ok_or_else(|| "prepared Iceberg mutation request was already consumed".to_string())?;
-        let bound = crate::query_execution::dml::write::bind_prepared_distributed_write_request(
-            self.state.query_execution(),
-            &self.execution,
-            prepared_request,
-        )?;
-        let bound = match bound {
-            crate::query_execution::dml::write::BoundDistributedWriteBinding::Bound(bound) => bound,
-            crate::query_execution::dml::write::BoundDistributedWriteBinding::AbortRequired {
-                session,
-                reason,
-            } => {
-                *self
-                    .operation_session
-                    .lock()
-                    .expect("prepared Iceberg mutation session lock poisoned") = Some(session);
-                return Err(reason);
-            }
-        };
-        *self
-            .operation_session
-            .lock()
-            .expect("prepared Iceberg mutation session lock poisoned") = Some(bound.session);
-        crate::query_execution::dml::write::execute_bound_distributed_write_request(
-            self.state.query_execution(),
-            bound.request,
-        )
-    }
-
-    fn needs_abort_on_stage_error(&self) -> bool {
-        self.operation_session
-            .lock()
-            .expect("prepared Iceberg mutation session lock poisoned")
-            .is_some()
-    }
-
-    fn abort_terminal(
-        &self,
-    ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
-        let session = self
-            .operation_session
-            .lock()
-            .expect("prepared Iceberg mutation session lock poisoned")
-            .clone()
-            .ok_or_else(|| {
-                "prepared Iceberg mutation terminal abort requires a retained operation session"
-                    .to_string()
-            })?;
-        session
-            .abort(self.connector_context.clone())
-            .map_err(|error| error.to_string())
-    }
-
-    fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
-        self.connector_context.clone()
-    }
-
-    fn finalize(&self) -> Result<(), String> {
-        invalidate_iceberg_caches(&self.state, &self.target)
     }
 }
 

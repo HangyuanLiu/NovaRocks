@@ -319,9 +319,13 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
             "prepared binding missing coalesce scan node {node_id}"
         );
     }
-    let native =
-        crate::protocol::native::encode::encode_native_fragment_bundle(&distributed, &prepared)
-            .expect("tokenized coalesce plan must lower to native fragments");
+    let native = crate::protocol::native::encode::encode_native_fragment_bundle(
+        crate::protocol::native::encode::NativeFragmentEncodingSource::unsealed(
+            &distributed,
+            &prepared,
+        ),
+    )
+    .expect("tokenized coalesce plan must lower to native fragments");
     assert_eq!(
         native.fragment_ids().count(),
         distributed.fragments().len(),

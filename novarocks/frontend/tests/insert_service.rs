@@ -250,6 +250,24 @@ impl InsertEngine for FakeInsertEngine {
         })
     }
 
+    fn iceberg_write_native_encoding<'a>(
+        &self,
+        _prepared: &'a dyn IcebergPreparedInsert,
+    ) -> Result<
+        novarocks::query_execution::dml::insert::PreparedIcebergWriteNativeEncoding<'a>,
+        String,
+    > {
+        novarocks::query_execution::dml::insert::PreparedIcebergWriteNativeEncoding::test_fixture()
+    }
+
+    fn run_iceberg_write_with_native_bundle(
+        &self,
+        prepared: &dyn IcebergPreparedInsert,
+        _native_bundle: novarocks::protocol::native::encode::NativeFragmentBundle,
+    ) -> Result<IcebergWriteReport, String> {
+        self.run_iceberg_write(prepared)
+    }
+
     fn commit_iceberg_write_terminal(
         &self,
         _prepared: &dyn IcebergPreparedInsert,

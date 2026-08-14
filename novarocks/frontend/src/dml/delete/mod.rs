@@ -73,8 +73,18 @@ impl WriteExecutor for DeleteWriteExecutor<'_> {
         &self,
         _spec: &WriteTransactionSpec,
     ) -> Result<CoordinatedWriteReport<Self::CommitHandle>, String> {
+        let encoding = self
+            .engine
+            .delete_native_encoding(self.prepared.handle.as_ref())?;
+        let input = encoding.input()?;
+        let native_bundle =
+            novarocks::protocol::native::encode::encode_native_fragment_bundle(input.source())?;
+        drop(encoding);
         Ok(
-            match self.engine.run_delete(self.prepared.handle.as_ref())? {
+            match self
+                .engine
+                .run_delete_with_native_bundle(self.prepared.handle.as_ref(), native_bundle)?
+            {
                 DeleteWriteReport::Aborted { reason, .. } => {
                     CoordinatedWriteReport::Aborted { reason }
                 }

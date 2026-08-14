@@ -31,9 +31,9 @@ use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use boundary::validate_and_group_boundary_contracts;
 use cte::sealed_cte_projection;
 
+pub use projection::PreparedFragmentSet;
 pub(crate) use projection::{
-    PreparedFragment, PreparedFragmentRole, PreparedFragmentSchedulingView, PreparedFragmentSet,
-    PreparedOutputColumn,
+    PreparedFragment, PreparedFragmentRole, PreparedFragmentSchedulingView, PreparedOutputColumn,
 };
 pub(crate) use scan_preparation::ScanPreparationOptions;
 use scan_preparation::prepare_scan_bindings;
@@ -244,7 +244,6 @@ pub(crate) fn prepare_fragments(
     ))
 }
 
-#[cfg(test)]
 pub(crate) fn prepared_fragment_set_for_native_encode_test(
     plan: &crate::sql::planner::distributed::DistributedPlan,
 ) -> Result<PreparedFragmentSet, String> {

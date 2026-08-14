@@ -367,9 +367,13 @@ pub(crate) fn build_statistics_collection_request(
         ),
     )
     .map_err(contract_violation)?;
-    let native_bundle =
-        crate::protocol::native::encode::encode_native_fragment_bundle(&distributed, &prepared)
-            .map_err(contract_violation)?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        crate::protocol::native::encode::NativeFragmentEncodingSource::unsealed(
+            &distributed,
+            &prepared,
+        ),
+    )
+    .map_err(contract_violation)?;
     Ok(build_statistics_query_request_with_execution(
         prepared,
         native_bundle,

@@ -40,7 +40,8 @@ pub use completion::{
     PreparedQueryCompletion, PreparedQueryOperation, StatementResult,
 };
 pub use outcome::{ConnectorWriteCompletion, ConnectorWriteStagingSummary, WriteExecutionOutcome};
-pub(crate) mod preparation;
+/// Sealed preparation carriers consumed by the native Frontend encoder.
+pub mod preparation;
 pub use preparation::runtime_filter_view::{
     RuntimeFilterApplyPoint, RuntimeFilterArtifactCapability, RuntimeFilterBindingFacts,
     RuntimeFilterBindingFactsView, RuntimeFilterBindingFragmentFactsView,

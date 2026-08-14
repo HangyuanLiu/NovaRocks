@@ -1155,6 +1155,7 @@ fn prepared_write_operation_id(
 pub(crate) fn stage_prepared_update_mutation(
     state: &DmlExecutionKernel,
     prepared: PreparedUpdateMutation,
+    native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
 ) -> Result<MutationStagedWrite, String> {
     let PreparedUpdateMutation {
         stmt,
@@ -1194,6 +1195,7 @@ pub(crate) fn stage_prepared_update_mutation(
                 &match_target_schema,
                 &execution,
                 &connector_context,
+                native_encoder,
             )?;
             let selection = cow_selection_from_query_result(
                 matched,
@@ -1228,7 +1230,7 @@ pub(crate) fn stage_prepared_update_mutation(
                 execution,
                 &connector_context,
             )?;
-            let result = match execution_handle.stage() {
+            let result = match execution_handle.run_stage(native_encoder) {
                 Ok(result) => result,
                 Err(reason) => {
                     return Ok(MutationStagedWrite::AbortRequired {
@@ -1305,7 +1307,7 @@ pub(crate) fn stage_prepared_update_mutation(
                 activated_sealed,
                 operation_session: Mutex::new(None),
             });
-            let result = match execution_handle.stage() {
+            let result = match execution_handle.run_stage(native_encoder) {
                 Ok(result) => result,
                 Err(reason) => {
                     if execution_handle.needs_abort_on_stage_error() {
@@ -2217,7 +2219,10 @@ impl MorUpdateChangeStreamExecutor {
             .map_err(|error| format!("terminalize MOR UPDATE known-empty session: {error}"))
     }
 
-    fn run_stage(&self) -> Result<QueryExecutionResult, String> {
+    fn run_stage(
+        &self,
+        native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
+    ) -> Result<QueryExecutionResult, String> {
         if let Some(error) = &self.registration_error {
             return Err(error.clone());
         }
@@ -2231,8 +2236,7 @@ impl MorUpdateChangeStreamExecutor {
             .take()
             .ok_or_else(|| "MOR UPDATE change-stream plan was already consumed".to_string())?;
         let crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
-            prepared,
-            native_bundle,
+            encoding,
             topology,
             ..
         } = planned;
@@ -2247,6 +2251,13 @@ impl MorUpdateChangeStreamExecutor {
             .iter()
             .map(|route| (route.writer_fragment_id, route.cohort_id))
             .collect::<Vec<_>>();
+        let native_bundle = native_encoder.encode(&encoding)?;
+        if !encoding.matches_native_bundle(&native_bundle) {
+            return Err(
+                "native fragment bundle does not match the sealed MOR UPDATE encoding input".into(),
+            );
+        }
+        let (_, prepared) = encoding.into_parts();
         let session = self
             .state
             .query_execution()
@@ -2282,7 +2293,7 @@ impl MorUpdateChangeStreamExecutor {
 
 impl MutationExecution for MorUpdateChangeStreamExecutor {
     fn stage(&self) -> Result<QueryExecutionResult, String> {
-        self.run_stage()
+        Err("MOR UPDATE staging requires the Frontend native fragment encoder".to_string())
     }
 
     fn needs_abort_on_stage_error(&self) -> bool {
@@ -2340,7 +2351,10 @@ impl MorMergeChangeStreamExecutor {
             .map_err(|error| format!("terminalize MOR MERGE known-empty session: {error}"))
     }
 
-    fn run_stage(&self) -> Result<QueryExecutionResult, String> {
+    fn run_stage(
+        &self,
+        native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
+    ) -> Result<QueryExecutionResult, String> {
         if let Some(error) = &self.registration_error {
             return Err(error.clone());
         }
@@ -2354,8 +2368,7 @@ impl MorMergeChangeStreamExecutor {
             .take()
             .ok_or_else(|| "MOR MERGE change-stream plan was already consumed".to_string())?;
         let crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
-            prepared,
-            native_bundle,
+            encoding,
             topology,
             ..
         } = planned;
@@ -2370,6 +2383,13 @@ impl MorMergeChangeStreamExecutor {
             .iter()
             .map(|route| (route.writer_fragment_id, route.cohort_id))
             .collect::<Vec<_>>();
+        let native_bundle = native_encoder.encode(&encoding)?;
+        if !encoding.matches_native_bundle(&native_bundle) {
+            return Err(
+                "native fragment bundle does not match the sealed MOR MERGE encoding input".into(),
+            );
+        }
+        let (_, prepared) = encoding.into_parts();
         let session = self
             .state
             .query_execution()
@@ -2405,7 +2425,7 @@ impl MorMergeChangeStreamExecutor {
 
 impl MutationExecution for MorMergeChangeStreamExecutor {
     fn stage(&self) -> Result<QueryExecutionResult, String> {
-        self.run_stage()
+        Err("MOR MERGE staging requires the Frontend native fragment encoder".to_string())
     }
 
     fn needs_abort_on_stage_error(&self) -> bool {
@@ -2893,7 +2913,10 @@ struct DistributedCowUpdateExecutor {
 }
 
 impl DistributedCowUpdateExecutor {
-    fn run_stage(&self) -> Result<QueryExecutionResult, String> {
+    fn run_stage(
+        &self,
+        native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
+    ) -> Result<QueryExecutionResult, String> {
         let write = self
             .write
             .lock()
@@ -2907,13 +2930,14 @@ impl DistributedCowUpdateExecutor {
             &self.operation_session,
             &self.execution,
             &self.connector_context,
+            native_encoder,
         )
     }
 }
 
 impl MutationExecution for DistributedCowUpdateExecutor {
     fn stage(&self) -> Result<QueryExecutionResult, String> {
-        self.run_stage()
+        Err("COW staging requires the Frontend native fragment encoder".to_string())
     }
 
     fn needs_abort_on_stage_error(&self) -> bool {
@@ -2946,6 +2970,7 @@ fn run_cow_cohort_writes(
     operation_session: &crate::query_execution::write_operation::ConnectorWriteOperationSession,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
 ) -> Result<QueryExecutionResult, String> {
     let planning_lease = write.planning_lease;
     let mut final_result = None;
@@ -2964,6 +2989,7 @@ fn run_cow_cohort_writes(
             registration,
             execution,
             connector_context,
+            native_encoder,
         )?;
         if result.connector_completion.is_none() {
             return Err("COW cohort completed without a connector completion".to_string());
@@ -2981,6 +3007,7 @@ fn run_one_cow_cohort(
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
 ) -> Result<QueryExecutionResult, String> {
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let target_binding = admit_prepared_connector_write_target(
@@ -3009,7 +3036,7 @@ fn run_one_cow_cohort(
         crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
         None,
     )?;
-    let result = match plan.frozen_read {
+    let assembly = match plan.frozen_read {
         Some(frozen) => {
             let binding =
                 crate::query_execution::frozen_connector_read::admit_frozen_connector_scan_binding(
@@ -3028,7 +3055,7 @@ fn run_one_cow_cohort(
                     frozen.identity,
                     frozen.read,
                 );
-            crate::query_execution::compiler::execute_query_as_iceberg_write_in_operation_with_query_local_overlays(
+            crate::query_execution::compiler::prepare_query_as_iceberg_write_in_operation_with_query_local_overlays(
                 state,
                 Some(&target.catalog),
                 &target.namespace,
@@ -3044,7 +3071,7 @@ fn run_one_cow_cohort(
                 std::slice::from_ref(&overlay),
             )?
         }
-        None => crate::query_execution::compiler::execute_query_as_iceberg_write_in_operation_with_connector_context(
+        None => crate::query_execution::compiler::prepare_query_as_iceberg_write_in_operation_with_connector_context(
             state,
             Some(&target.catalog),
             &target.namespace,
@@ -3058,6 +3085,8 @@ fn run_one_cow_cohort(
             connector_write,
         )?,
     };
+    let native_bundle = native_encoder.encode(assembly.encoding())?;
+    let result = assembly.finish(native_bundle)?;
     if let Some(abort) = &result.write_abort {
         return Err(format!("COW cohort aborted: {}", abort.reason));
     }
@@ -3407,6 +3436,7 @@ fn execute_exact_cow_match_query(
     target_schema: &arrow::datatypes::SchemaRef,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
 ) -> Result<QueryResult, String> {
     let identity = crate::sql::planner::table::SqlTableIdentity {
         catalog: target.catalog.clone(),
@@ -3493,10 +3523,17 @@ fn execute_exact_cow_match_query(
             execution,
         )?,
     )?;
-    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
-        &compiled.distributed_plan,
-        &prepared,
-    )?;
+    let encoding = crate::query_execution::compiler::NativeFragmentEncodingInput::new(
+        compiled.distributed_plan,
+        prepared,
+    );
+    let native_bundle = native_encoder.encode(&encoding)?;
+    if !encoding.matches_native_bundle(&native_bundle) {
+        return Err(
+            "native fragment bundle does not match the sealed mutation read encoding input".into(),
+        );
+    }
+    let (_, prepared) = encoding.into_parts();
     let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
@@ -3831,6 +3868,7 @@ const MERGE_ACTION_NOT_MATCHED_INSERT: i32 = 3;
 pub(crate) fn stage_prepared_merge_mutation(
     state: &DmlExecutionKernel,
     prepared: PreparedMergeMutation,
+    native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
 ) -> Result<MutationStagedWrite, String> {
     let PreparedMergeMutation {
         stmt,
@@ -3912,7 +3950,7 @@ pub(crate) fn stage_prepared_merge_mutation(
             activated_sealed,
             operation_session: Mutex::new(None),
         });
-        let result = match execution_handle.stage() {
+        let result = match execution_handle.run_stage(native_encoder) {
             Ok(result) => result,
             Err(reason) => {
                 if execution_handle.needs_abort_on_stage_error() {
@@ -3989,6 +4027,7 @@ pub(crate) fn stage_prepared_merge_mutation(
         &match_target_schema,
         &execution,
         &connector_context,
+        native_encoder,
     )?;
     let selection = cow_selection_from_query_result(
         matched,
@@ -4023,7 +4062,7 @@ pub(crate) fn stage_prepared_merge_mutation(
         execution,
         &connector_context,
     )?;
-    let result = match execution_handle.stage() {
+    let result = match execution_handle.run_stage(native_encoder) {
         Ok(result) => result,
         Err(reason) => {
             return Ok(MutationStagedWrite::AbortRequired {

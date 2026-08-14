@@ -37,7 +37,7 @@ pub(crate) enum ExplainLevel {
     Costs,
     /// Produce node-level output identical to Verbose; the
     /// Planning/Execution/Rows header is added by
-    /// `explain_analyze_query` in `src/engine/mod.rs`.
+    /// the frontend query-admission adapter.
     Analyze,
 }
 

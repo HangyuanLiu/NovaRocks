@@ -17,11 +17,11 @@ use novarocks_spi::connector::{
 
 use crate::mv::application::{
     MvRefreshCommittedFacts, MvRefreshProviderActivation, MvRefreshPublicationIntent,
-    MvRefreshPublicationTechnique, PreparedMvFirstRefreshWrite, PreparedMvRefreshWrite,
+    MvRefreshPublicationTechnique, PreparedMvFirstRefreshWrite, PreparedMvNativeWriteAssembly,
+    PreparedMvRefreshWrite,
 };
 use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::kernels::QueryPreparationKernel;
-use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::request_context::QueryExecutionContext;
 
 /// Core-side provider adapter installed into the frontend composition.
@@ -50,7 +50,7 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
         planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
         exact_lease: &ConnectorWriteLease,
         execution: &QueryExecutionContext,
-    ) -> Result<PreparedDistributedWriteRequest, String> {
+    ) -> Result<PreparedMvNativeWriteAssembly, String> {
         match prepared {
             PreparedMvRefreshWrite::FirstRefresh(prepared) => {
                 crate::mv::first_refresh_staging::bind_prepared_mv_first_refresh_staging(

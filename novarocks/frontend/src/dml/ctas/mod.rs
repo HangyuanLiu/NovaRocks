@@ -472,6 +472,65 @@ fn execute_foreground_write(
             );
         }
     };
+    let native_bundle = match prepared.handle.native_encoding() {
+        Ok(encoding) => match encoding.input() {
+            Ok(input) => match novarocks::protocol::native::encode::encode_native_fragment_bundle(
+                input.source(),
+            ) {
+                Ok(bundle) => bundle,
+                Err(message) => {
+                    let failure = CtasFailure {
+                        kind: CtasFailureKind::Internal,
+                        message,
+                    };
+                    return abort_foreground(
+                        engine,
+                        active,
+                        recovery,
+                        &target,
+                        &authority,
+                        failure_fact(&failure),
+                        format_failure("CTAS native write assembly failed", &failure),
+                    );
+                }
+            },
+            Err(failure) => {
+                return abort_foreground(
+                    engine,
+                    active,
+                    recovery,
+                    &target,
+                    &authority,
+                    failure_fact(&failure),
+                    format_failure("CTAS native write assembly failed", &failure),
+                );
+            }
+        },
+        Err(failure) => {
+            return abort_foreground(
+                engine,
+                active,
+                recovery,
+                &target,
+                &authority,
+                failure_fact(&failure),
+                format_failure("CTAS native write assembly failed", &failure),
+            );
+        }
+    };
+    if let Err(failure) =
+        engine.bind_ctas_write_native_bundle(prepared.handle.as_ref(), native_bundle)
+    {
+        return abort_foreground(
+            engine,
+            active,
+            recovery,
+            &target,
+            &authority,
+            failure_fact(&failure),
+            format_failure("CTAS native write assembly failed", &failure),
+        );
+    }
     validate_prepared_write(&active.stored, &source, &target, &prepared)?;
     let mut saga = ctas_record(&active.stored)?;
     saga.write_cohort_set_digest = Some(hex::encode(prepared.cohort_set_digest));

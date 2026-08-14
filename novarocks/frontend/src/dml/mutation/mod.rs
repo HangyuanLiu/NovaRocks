@@ -21,8 +21,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks::query_execution::dml::mutation::{
-    MutationAbort, MutationCommit, MutationEngine, MutationStageOutcome, MutationStatementKind,
-    PrepareMutationRequest, PreparedMutation, parse_merge_statement, parse_update_statement,
+    MutationAbort, MutationCommit, MutationEngine, MutationNativeFragmentEncoder,
+    MutationStageOutcome, MutationStatementKind, PrepareMutationRequest, PreparedMutation,
+    parse_merge_statement, parse_update_statement,
 };
 use novarocks::query_execution::request_context::RequestContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
@@ -38,6 +39,20 @@ use crate::dml::service::DmlService;
 struct MutationWriteExecutor<'a> {
     engine: &'a dyn MutationEngine,
     prepared: &'a PreparedMutation,
+}
+
+/// The Frontend application is the native FE-to-BE encoder caller for durable
+/// row-mutation staging. Core supplies only the exact sealed plan/preparation
+/// input and receives the resulting bundle for neutral request construction.
+struct FrontendMutationNativeFragmentEncoder;
+
+impl MutationNativeFragmentEncoder for FrontendMutationNativeFragmentEncoder {
+    fn encode(
+        &self,
+        input: &novarocks::query_execution::compiler::NativeFragmentEncodingInput,
+    ) -> Result<novarocks::protocol::native::encode::NativeFragmentBundle, String> {
+        novarocks::protocol::native::encode::encode_native_fragment_bundle(input.source())
+    }
 }
 
 impl WriteExecutor for MutationWriteExecutor<'_> {
@@ -75,7 +90,11 @@ impl WriteExecutor for MutationWriteExecutor<'_> {
         &self,
         _spec: &WriteTransactionSpec,
     ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, String> {
-        match self.engine.stage_mutation(self.prepared.handle.as_ref())? {
+        let native_encoder = FrontendMutationNativeFragmentEncoder;
+        match self
+            .engine
+            .stage_mutation_with_native_encoder(self.prepared.handle.as_ref(), &native_encoder)?
+        {
             MutationStageOutcome::NoOp => Ok(CoordinatedWriteReport::NoOp),
             MutationStageOutcome::AbortRequired { reason, handle } => {
                 Ok(CoordinatedWriteReport::AbortRequired { reason, handle })

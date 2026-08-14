@@ -9444,9 +9444,9 @@ fn deletion_route_write_effect(
 
 /// Bind an already prepared IMV change-stream plan to the frontend's admitted
 /// execution and retained exact lease. Unlike the legacy executor above, this
-/// function has no query submission, provider commit, catalog publication, or
-/// MV repository transition. It is the Core-side activation half of a
-/// frontend-owned incremental refresh attempt.
+/// function has no query submission, native assembly, provider commit, catalog
+/// publication, or MV repository transition. It is the Core-side activation
+/// half of a frontend-owned incremental refresh attempt.
 #[allow(clippy::too_many_arguments)]
 fn prepare_imv_change_stream_writer(
     query_kernel: &crate::query_execution::kernels::QueryPreparationKernel,
@@ -9456,7 +9456,7 @@ fn prepare_imv_change_stream_writer(
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
-) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
+) -> Result<crate::mv::application::PreparedMvNativeWriteAssembly, String> {
     let (refresh_plan, effect_output_ordinal) = ensure_imv_change_stream_effect(refresh_plan)?;
     crate::connector::validate_request_context(connector_context)?;
     let table_bindings = refresh_plan.table_bindings.as_deref().ok_or_else(|| {
@@ -9469,7 +9469,7 @@ fn prepare_imv_change_stream_writer(
         effect_output_ordinal,
         provider_routes,
     )?;
-    let planned = crate::query_execution::compiler::build_physical_plan_as_iceberg_change_stream_write_with_execution(
+    let planned = crate::query_execution::compiler::build_physical_plan_as_iceberg_change_stream_write_native_assembly(
         query_kernel.connector_control().as_ref(),
         execution,
         &refresh_plan.optimized_tree,
@@ -9479,17 +9479,15 @@ fn prepare_imv_change_stream_writer(
         connector_context,
     )?;
     crate::query_execution::compiler::prepare_planned_iceberg_change_stream_write(
-        planned.prepared,
-        planned.native_bundle,
+        planned.encoding,
         None,
-        execution,
         Some(crate::query_execution::compiler::DistributedConnectorWrite::Begin(connector_write)),
     )
 }
 
 /// Activate a value-only incremental refresh artifact after frontend intent
 /// persistence and exact-lease admission. Core rebuilds only provider-private
-/// scan and writer facts here; it returns a prepared result-free request and
+/// scan and writer facts here; it returns a sealed native-assembly carrier and
 /// never advances MV metadata or executes an external commit.
 pub(crate) fn bind_prepared_mv_incremental_staging(
     query_kernel: &crate::query_execution::kernels::QueryPreparationKernel,
@@ -9498,7 +9496,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
-) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
+) -> Result<crate::mv::application::PreparedMvNativeWriteAssembly, String> {
     let (request, facts, mode, evidence, execution_artifact, publication_intent) =
         prepared.into_parts();
     if request.observed_binding != *exact_lease.binding_key() {

@@ -102,6 +102,27 @@ pub enum DeleteWriteReport {
     CommitRequired(Arc<dyn DeleteCommit>),
 }
 
+/// Borrowed native encoder input for a Core-sealed DELETE request. Holding the
+/// guard keeps the exact request carrier unavailable for replacement or
+/// execution until Frontend has produced the corresponding bundle.
+pub struct DeleteNativeEncoding<'a> {
+    assembly: std::sync::MutexGuard<
+        'a,
+        Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>,
+    >,
+}
+
+impl DeleteNativeEncoding<'_> {
+    pub fn input(
+        &self,
+    ) -> Result<&crate::query_execution::compiler::NativeFragmentEncodingInput, String> {
+        self.assembly
+            .as_ref()
+            .map(crate::query_execution::compiler::PreparedDmlWriteAssembly::encoding)
+            .ok_or_else(|| "prepared DELETE native assembly was already consumed".to_string())
+    }
+}
+
 pub(crate) trait PreparedDeleteExecution: Send + Sync {
     /// Expose the exact write authority this preparation activated, so the
     /// coordinator can fence it before anything is dispatched.
@@ -121,7 +142,11 @@ pub(crate) trait PreparedDeleteExecution: Send + Sync {
         )
     }
 
-    fn run(&self) -> Result<crate::query_execution::outcome::QueryExecutionResult, String>;
+    fn native_encoding(&self) -> Result<DeleteNativeEncoding<'_>, String>;
+    fn run_with_native_bundle(
+        &self,
+        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String>;
     fn commit_terminal(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -160,6 +185,19 @@ pub trait DeleteEngine: Send + Sync {
     }
 
     fn run_delete(&self, prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String>;
+    fn delete_native_encoding<'a>(
+        &self,
+        _prepared: &'a dyn DeletePrepared,
+    ) -> Result<DeleteNativeEncoding<'a>, String> {
+        Err("DELETE engine does not expose native encoding input".to_string())
+    }
+    fn run_delete_with_native_bundle(
+        &self,
+        _prepared: &dyn DeletePrepared,
+        _native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    ) -> Result<DeleteWriteReport, String> {
+        Err("DELETE engine requires Frontend native fragment assembly".to_string())
+    }
     fn commit_delete_terminal(
         &self,
         _prepared: &dyn DeletePrepared,
@@ -232,36 +270,25 @@ impl DeleteEngine for DmlExecutionKernel {
     }
 
     fn run_delete(&self, prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String> {
+        let _ = prepared;
+        return Err("DELETE requires Frontend native fragment assembly".to_string());
+    }
+
+    fn delete_native_encoding<'a>(
+        &self,
+        prepared: &'a dyn DeletePrepared,
+    ) -> Result<DeleteNativeEncoding<'a>, String> {
+        downcast_prepared(prepared)?.execution.native_encoding()
+    }
+
+    fn run_delete_with_native_bundle(
+        &self,
+        prepared: &dyn DeletePrepared,
+        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    ) -> Result<DeleteWriteReport, String> {
         let prepared = downcast_prepared(prepared)?;
-        let result = prepared.execution.run()?;
-        if let Some(abort) = result.write_abort {
-            let has_staged_files = abort
-                .completed_writer_outputs
-                .iter()
-                .any(|writer| !writer.connector_staged_report_frames.is_empty());
-            return Ok(DeleteWriteReport::Aborted {
-                reason: abort.reason,
-                has_staged_files,
-            });
-        }
-        let Some(completion) = result.connector_completion else {
-            return Ok(DeleteWriteReport::NoOp);
-        };
-        let has_staged_output = completion
-            .input()
-            .map_err(|error| error.to_string())?
-            .reports()
-            .iter()
-            .any(|report| report.summary().artifact_count > 0);
-        if !has_staged_output {
-            completion
-                .finish_known_empty_noop()
-                .map_err(|error| error.to_string())?;
-            return Ok(DeleteWriteReport::NoOp);
-        }
-        Ok(DeleteWriteReport::CommitRequired(Arc::new(
-            CoreDeleteCommit { completion },
-        )))
+        let result = prepared.execution.run_with_native_bundle(native_bundle)?;
+        delete_write_report_from_result(result)
     }
 
     fn commit_delete_terminal(
@@ -285,6 +312,39 @@ impl DeleteEngine for DmlExecutionKernel {
     fn finalize_delete(&self, prepared: &dyn DeletePrepared) -> Result<(), String> {
         downcast_prepared(prepared)?.execution.finalize()
     }
+}
+
+fn delete_write_report_from_result(
+    result: crate::query_execution::outcome::QueryExecutionResult,
+) -> Result<DeleteWriteReport, String> {
+    if let Some(abort) = result.write_abort {
+        let has_staged_files = abort
+            .completed_writer_outputs
+            .iter()
+            .any(|writer| !writer.connector_staged_report_frames.is_empty());
+        return Ok(DeleteWriteReport::Aborted {
+            reason: abort.reason,
+            has_staged_files,
+        });
+    }
+    let Some(completion) = result.connector_completion else {
+        return Ok(DeleteWriteReport::NoOp);
+    };
+    let has_staged_output = completion
+        .input()
+        .map_err(|error| error.to_string())?
+        .reports()
+        .iter()
+        .any(|report| report.summary().artifact_count > 0);
+    if !has_staged_output {
+        completion
+            .finish_known_empty_noop()
+            .map_err(|error| error.to_string())?;
+        return Ok(DeleteWriteReport::NoOp);
+    }
+    Ok(DeleteWriteReport::CommitRequired(Arc::new(
+        CoreDeleteCommit { completion },
+    )))
 }
 
 struct CorePreparedDelete {

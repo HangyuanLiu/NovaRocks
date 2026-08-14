@@ -54,7 +54,10 @@ pub struct PreparedDistributedQuery {
 }
 
 impl PreparedDistributedQuery {
-    pub(crate) fn new(
+    /// Pair the Core-validated request with its exact completion formatter.
+    /// Only Frontend native assembly receives both values from the same
+    /// sealed query preparation.
+    pub fn new(
         request: crate::query_execution::contract::DistributedQueryRequest,
         completion: PreparedQueryCompletion,
     ) -> Self {

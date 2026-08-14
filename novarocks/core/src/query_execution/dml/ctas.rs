@@ -172,6 +172,27 @@ pub struct CtasTargetStageResult {
 pub trait CtasPreparedWrite: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn execution_identity(&self) -> [u8; 32];
+    fn native_encoding(&self) -> Result<CtasNativeEncoding<'_>, CtasFailure>;
+}
+
+/// Borrowed access to the exact Core-retained encoding input. Frontend may
+/// inspect it only for the native encoder call; Core consumes the same input
+/// when the resulting bundle is bound for dispatch.
+pub struct CtasNativeEncoding<'a> {
+    encoding: std::sync::MutexGuard<
+        'a,
+        Option<crate::query_execution::compiler::NativeFragmentEncodingInput>,
+    >,
+}
+
+impl CtasNativeEncoding<'_> {
+    pub fn input(
+        &self,
+    ) -> Result<&crate::query_execution::compiler::NativeFragmentEncodingInput, CtasFailure> {
+        self.encoding
+            .as_ref()
+            .ok_or_else(|| internal_failure("CTAS native encoding input was already consumed"))
+    }
 }
 
 pub struct PreparedCtasWrite {
@@ -260,6 +281,15 @@ pub trait CtasEngine: Send + Sync {
         target: &dyn CtasPreparedTarget,
         write_operation_id: ConnectorWriteOperationId,
     ) -> Result<PreparedCtasWrite, CtasFailure>;
+
+    /// Bind the one Frontend-encoded native bundle to the retained CTAS
+    /// writer. Core validates the write registration and creates the neutral
+    /// distributed request; it never encodes native bytes for this flow.
+    fn bind_ctas_write_native_bundle(
+        &self,
+        prepared: &dyn CtasPreparedWrite,
+        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    ) -> Result<(), CtasFailure>;
 
     /// Consume the prepared source exactly once and return the sealed generic
     /// writer aggregate. It never publishes the target table.
@@ -418,7 +448,13 @@ fn prepare_planned_ctas_connector_write(
     query_options: Option<QueryOptions>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     template: crate::query_execution::contract::ConnectorWritePlanningTemplate,
-) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
+) -> Result<
+    (
+        crate::query_execution::compiler::NativeFragmentEncodingInput,
+        PendingCtasDistributedWrite,
+    ),
+    String,
+> {
     let physical =
         crate::sql::planner::optimizer_bridge::to_physical_plan(&planned.optimized_tree)?;
     let distributed = crate::sql::planner::pipeline::build_connector_write_distributed_plan(
@@ -444,19 +480,20 @@ fn prepare_planned_ctas_connector_write(
             None,
         ),
     )?;
-    let native_bundle =
-        crate::protocol::native::encode::encode_native_fragment_bundle(&distributed, &prepared)?;
     let cohort_id = template.cohort_id();
     let exact_lease = template.lease();
-    crate::query_execution::prepared_write::PreparedDistributedWriteRequest::new(
-        prepared,
-        native_bundle,
-        query_options,
-        crate::query_execution::contract::ConnectorWriteOperationRegistration::single(template),
-        cohort_id,
-        exact_lease,
-    )
-    .map_err(|error| error.to_string())
+    Ok((
+        crate::query_execution::compiler::NativeFragmentEncodingInput::new(distributed, prepared),
+        PendingCtasDistributedWrite {
+            query_options,
+            registration:
+                crate::query_execution::contract::ConnectorWriteOperationRegistration::single(
+                    template,
+                ),
+            cohort_id,
+            lease: exact_lease,
+        },
+    ))
 }
 
 #[derive(Clone)]
@@ -963,6 +1000,8 @@ struct CorePreparedCtasWrite {
     state: DmlExecutionKernel,
     gate: Arc<CtasSourceExecutionGate>,
     target: Arc<CoreCtasTargetSession>,
+    native_encoding: Mutex<Option<crate::query_execution::compiler::NativeFragmentEncodingInput>>,
+    pending: Mutex<Option<PendingCtasDistributedWrite>>,
     prepared:
         Mutex<Option<crate::query_execution::prepared_write::PreparedDistributedWriteRequest>>,
     completion: Mutex<Option<crate::query_execution::ConnectorWriteCompletion>>,
@@ -972,6 +1011,16 @@ struct CorePreparedCtasWrite {
     execution_identity: [u8; 32],
 }
 
+/// Core-retained write facts that are not part of the Frontend-owned native
+/// encoding step. They are consumed exactly once when Frontend returns the
+/// native bundle for the sealed plan/preparation pair.
+struct PendingCtasDistributedWrite {
+    query_options: Option<QueryOptions>,
+    registration: crate::query_execution::contract::ConnectorWriteOperationRegistration,
+    cohort_id: novarocks_spi::connector::ConnectorWriteCohortId,
+    lease: ConnectorWriteLease,
+}
+
 impl CtasPreparedWrite for CorePreparedCtasWrite {
     fn as_any(&self) -> &dyn Any {
         self
@@ -979,6 +1028,19 @@ impl CtasPreparedWrite for CorePreparedCtasWrite {
 
     fn execution_identity(&self) -> [u8; 32] {
         self.execution_identity
+    }
+
+    fn native_encoding(&self) -> Result<CtasNativeEncoding<'_>, CtasFailure> {
+        let encoding = self
+            .native_encoding
+            .lock()
+            .map_err(|error| internal_failure(format!("CTAS native encoding lock: {error}")))?;
+        if encoding.is_none() {
+            return Err(internal_failure(
+                "CTAS native encoding input was already consumed",
+            ));
+        }
+        Ok(CtasNativeEncoding { encoding })
     }
 }
 
@@ -1666,7 +1728,7 @@ impl CtasEngine for DmlExecutionKernel {
             .source_artifact()
             .downcast_ref::<PlannedCtasSourceQuery>()
             .ok_or_else(|| internal_failure("CTAS retained source artifact type mismatch"))?;
-        let prepared = prepare_planned_ctas_connector_write(
+        let (native_encoding, pending) = prepare_planned_ctas_connector_write(
             self,
             planned,
             Arc::clone(&source.output_schema),
@@ -1675,8 +1737,9 @@ impl CtasEngine for DmlExecutionKernel {
             template,
         )
         .map_err(internal_failure)?;
-        let cohort_set_digest = prepared
-            .registration()
+        let cohort_set_digest = pending
+            .registration
+            .clone()
             .sealed_cohorts()
             .map_err(connector_failure)?
             .digest();
@@ -1692,13 +1755,56 @@ impl CtasEngine for DmlExecutionKernel {
                 state: self.clone(),
                 gate: Arc::clone(&source.gate),
                 target,
-                prepared: Mutex::new(Some(prepared)),
+                native_encoding: Mutex::new(Some(native_encoding)),
+                pending: Mutex::new(Some(pending)),
+                prepared: Mutex::new(None),
                 completion: Mutex::new(None),
                 write_session: Mutex::new(None),
                 write_unknown: Mutex::new(None),
                 execution_identity: identity,
             }),
         })
+    }
+
+    fn bind_ctas_write_native_bundle(
+        &self,
+        prepared: &dyn CtasPreparedWrite,
+        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    ) -> Result<(), CtasFailure> {
+        let prepared = downcast_write(prepared)?;
+        let pending = prepared
+            .pending
+            .lock()
+            .map_err(|error| internal_failure(format!("CTAS pending write lock: {error}")))?
+            .take()
+            .ok_or_else(|| internal_failure("CTAS native bundle was already bound"))?;
+        let encoding = prepared
+            .native_encoding
+            .lock()
+            .map_err(|error| internal_failure(format!("CTAS native encoding lock: {error}")))?
+            .take()
+            .ok_or_else(|| internal_failure("CTAS native encoding input was already consumed"))?;
+        if !encoding.matches_native_bundle(&native_bundle) {
+            return Err(internal_failure(
+                "native fragment bundle does not match the sealed CTAS encoding input",
+            ));
+        }
+        let (_, prepared_fragments) = encoding.into_parts();
+        let request = crate::query_execution::prepared_write::PreparedDistributedWriteRequest::new(
+            prepared_fragments,
+            native_bundle,
+            pending.query_options,
+            pending.registration,
+            pending.cohort_id,
+            pending.lease,
+        )
+        .map_err(|error| internal_failure(error.to_string()))?;
+        *prepared
+            .prepared
+            .lock()
+            .map_err(|error| internal_failure(format!("CTAS prepared write lock: {error}")))? =
+            Some(request);
+        Ok(())
     }
 
     fn execute_ctas_write(&self, prepared: &dyn CtasPreparedWrite) -> CtasWriteOutcome {

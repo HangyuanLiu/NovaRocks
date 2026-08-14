@@ -17,6 +17,7 @@
 // under the License.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
 use arrow::array::{ArrayRef, StringArray};
@@ -27,11 +28,7 @@ use tokio::runtime::Handle;
 use crate::mv::refresh::execution_context::MvRefreshPruningLimits;
 use crate::novarocks_config;
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
-use crate::query_execution::{
-    PreparedImmediateQuery, PreparedQueryCompletion,
-    PreparedQueryDistributedOperation as PreparedDistributedQuery, PreparedQueryOperation,
-    StatementResult,
-};
+use crate::query_execution::{PreparedImmediateQuery, PreparedQueryCompletion, StatementResult};
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::query_result::{
     QueryResult, QueryResultColumn, build_string_query_result, record_batch_to_chunk,
@@ -1017,6 +1014,128 @@ pub(crate) fn test_mv_repository() -> Arc<dyn MvRepository> {
     Arc::new(crate::mv::test_repository::InMemoryMvRepository::default())
 }
 
+/// Exact plan/preparation pair frozen by Core for one Frontend-owned native
+/// assembly step. It has no constructor and exposes only immutable encoder
+/// inputs, so callers cannot replace bindings or acquire a newer generation.
+pub struct NativeFragmentEncodingInput {
+    distributed_plan: crate::sql::plan_read::DistributedPlan,
+    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    provenance: u64,
+}
+
+impl NativeFragmentEncodingInput {
+    pub(crate) fn new(
+        distributed_plan: crate::sql::plan_read::DistributedPlan,
+        prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    ) -> Self {
+        Self {
+            distributed_plan,
+            prepared,
+            provenance: next_native_encoding_provenance(),
+        }
+    }
+
+    pub fn distributed_plan(&self) -> &crate::sql::plan_read::DistributedPlan {
+        &self.distributed_plan
+    }
+
+    pub fn prepared(&self) -> &crate::query_execution::preparation::PreparedFragmentSet {
+        &self.prepared
+    }
+
+    pub fn source(&self) -> crate::protocol::native::encode::NativeFragmentEncodingSource<'_> {
+        crate::protocol::native::encode::NativeFragmentEncodingSource::sealed(
+            &self.distributed_plan,
+            &self.prepared,
+            self.provenance,
+        )
+    }
+
+    pub(crate) fn matches_native_bundle(
+        &self,
+        native_bundle: &crate::protocol::native::encode::NativeFragmentBundle,
+    ) -> bool {
+        native_bundle.matches_provenance(self.provenance)
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::sql::plan_read::DistributedPlan,
+        crate::query_execution::preparation::PreparedFragmentSet,
+    ) {
+        (self.distributed_plan, self.prepared)
+    }
+}
+
+fn next_native_encoding_provenance() -> u64 {
+    static NEXT_PROVENANCE: AtomicU64 = AtomicU64::new(1);
+    loop {
+        let provenance = NEXT_PROVENANCE.fetch_add(1, Ordering::Relaxed);
+        if provenance != 0 {
+            return provenance;
+        }
+    }
+}
+
+/// Core-owned request finalizer for one Frontend-encoded distributed query.
+/// Frontend supplies the only native bundle after reading the exact sealed
+/// pair; Core retains lifecycle request construction and completion pairing.
+pub struct PreparedDistributedQueryAssembly {
+    encoding: NativeFragmentEncodingInput,
+    query_options: Option<QueryOptions>,
+    intent: crate::query_execution::contract::DistributedQueryIntent,
+    execution: crate::query_execution::request_context::QueryExecutionContext,
+}
+
+impl PreparedDistributedQueryAssembly {
+    fn new(
+        encoding: NativeFragmentEncodingInput,
+        query_options: Option<QueryOptions>,
+        intent: crate::query_execution::contract::DistributedQueryIntent,
+        execution: crate::query_execution::request_context::QueryExecutionContext,
+    ) -> Self {
+        Self {
+            encoding,
+            query_options,
+            intent,
+            execution,
+        }
+    }
+
+    pub fn encoding(&self) -> &NativeFragmentEncodingInput {
+        &self.encoding
+    }
+
+    pub fn finish(
+        self,
+        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    ) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
+        if !self.encoding.matches_native_bundle(&native_bundle) {
+            return Err(
+                "native fragment bundle does not match the sealed query encoding input".into(),
+            );
+        }
+        let (_, prepared) = self.encoding.into_parts();
+        crate::query_execution::contract::build_distributed_query_request_with_execution(
+            prepared,
+            native_bundle,
+            self.query_options,
+            self.intent,
+            &self.execution,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+pub enum CorePreparedQueryOperation {
+    Immediate(PreparedImmediateQuery),
+    Distributed {
+        assembly: PreparedDistributedQueryAssembly,
+        completion: PreparedQueryCompletion,
+    },
+}
+
 /// Narrow core compiler kernel consumed by frontend QueryService.
 ///
 /// It deliberately exposes neither a composition aggregate nor connector internals.
@@ -1052,7 +1171,7 @@ impl CoreQueryCompiler {
         sql: &str,
         context: &crate::query_execution::request_context::RequestContext,
         query_opts: Option<QueryOptions>,
-    ) -> Result<PreparedQueryOperation, String> {
+    ) -> Result<CorePreparedQueryOperation, String> {
         let connector_context = crate::connector::connector_request_context_for_query(
             query_opts.as_ref(),
             context.execution().cancellation().clone(),
@@ -1066,7 +1185,7 @@ impl CoreQueryCompiler {
         request_context: &crate::query_execution::request_context::RequestContext,
         query_opts: Option<QueryOptions>,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<PreparedQueryOperation, String> {
+    ) -> Result<CorePreparedQueryOperation, String> {
         if !is_query_sql(sql) {
             return Err(
                 "non-query statements must be executed through a typed command capability".into(),
@@ -1131,7 +1250,7 @@ impl CoreQueryCompiler {
                     level,
                     force_logical_explain,
                 )?;
-                Ok(PreparedQueryOperation::Immediate(
+                Ok(CorePreparedQueryOperation::Immediate(
                     PreparedImmediateQuery::new(StatementResult::Query(result)),
                 ))
             }
@@ -1159,7 +1278,7 @@ impl CoreQueryCompiler {
                         query,
                     )?
                 {
-                    return Ok(PreparedQueryOperation::Immediate(
+                    return Ok(CorePreparedQueryOperation::Immediate(
                         PreparedImmediateQuery::new(result),
                     ));
                 }
@@ -1195,7 +1314,7 @@ impl CoreQueryCompiler {
                     TableLookupMode::SchemaOnly,
                     self.query.catalog_application().map(Arc::as_ref),
                 );
-                let (request, _, _) = prepare_query_with_sql_compiler_kernel_with_ports(
+                let (assembly, _, _) = prepare_query_with_sql_compiler_kernel_with_ports(
                     &prepared,
                     &analyzer_provider,
                     current_catalog,
@@ -1209,9 +1328,10 @@ impl CoreQueryCompiler {
                     crate::sql::compiler::SqlCompileIntent::Query,
                     true,
                 )?;
-                Ok(PreparedQueryOperation::Distributed(
-                    PreparedDistributedQuery::new(request, PreparedQueryCompletion::result()),
-                ))
+                Ok(CorePreparedQueryOperation::Distributed {
+                    assembly,
+                    completion: PreparedQueryCompletion::result(),
+                })
             }
             _ => Err("query compiler only supports SELECT and EXPLAIN statements".to_string()),
         }
@@ -1225,7 +1345,7 @@ impl CoreQueryCompiler {
         query_opts: Option<QueryOptions>,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &crate::query_execution::request_context::QueryExecutionContext,
-    ) -> Result<PreparedQueryOperation, String> {
+    ) -> Result<CorePreparedQueryOperation, String> {
         let query = prepare_explain_query_with_ports(
             &self.query,
             &self.view,
@@ -1244,7 +1364,7 @@ impl CoreQueryCompiler {
             self.query.catalog_application().map(Arc::as_ref),
         );
         let planning_start = std::time::Instant::now();
-        let (request, distributed_plan, connector_static_planning) =
+        let (assembly, distributed_plan, connector_static_planning) =
             prepare_query_with_sql_compiler_kernel_with_ports(
                 &query,
                 &analyzer_provider,
@@ -1262,17 +1382,15 @@ impl CoreQueryCompiler {
                 },
                 true,
             )?;
-        Ok(PreparedQueryOperation::Distributed(
-            PreparedDistributedQuery::new(
-                request,
-                PreparedQueryCompletion::profile(
-                    distributed_plan,
-                    planning_start.elapsed(),
-                    std::time::Instant::now(),
-                    connector_static_planning,
-                ),
+        Ok(CorePreparedQueryOperation::Distributed {
+            assembly,
+            completion: PreparedQueryCompletion::profile(
+                distributed_plan,
+                planning_start.elapsed(),
+                std::time::Instant::now(),
+                connector_static_planning,
             ),
-        ))
+        })
     }
 }
 
@@ -1886,7 +2004,7 @@ pub(crate) fn iceberg_write_shuffle_by_output_index(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_query_as_iceberg_write(
+pub(crate) fn prepare_query_as_iceberg_write(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -1896,14 +2014,14 @@ pub(crate) fn execute_query_as_iceberg_write(
     query_opts: Option<QueryOptions>,
     root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
-) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+) -> Result<PreparedDmlWriteAssembly, String> {
     // This public write helper is also used by non-session transaction executors,
     // so it owns an operation-scoped context when no request signal is available.
     let connector_context = crate::connector::connector_request_context(
         query_opts.as_ref(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )?;
-    execute_query_as_iceberg_write_with_connector_context(
+    prepare_query_as_iceberg_write_with_connector_context(
         state,
         current_catalog,
         current_database,
@@ -1919,7 +2037,7 @@ pub(crate) fn execute_query_as_iceberg_write(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
+pub(crate) fn prepare_query_as_iceberg_write_with_connector_context(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -1931,8 +2049,8 @@ pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: Option<crate::query_execution::contract::ConnectorWritePlanningTemplate>,
-) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-    execute_query_as_iceberg_write_with_connector_binding(
+) -> Result<PreparedDmlWriteAssembly, String> {
+    prepare_query_as_iceberg_write_with_connector_binding(
         state,
         current_catalog,
         current_database,
@@ -1950,7 +2068,7 @@ pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_query_as_iceberg_write_in_operation_with_connector_context(
+pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_connector_context(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -1962,8 +2080,8 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_connector_context
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
-) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-    execute_query_as_iceberg_write_with_connector_binding(
+) -> Result<PreparedDmlWriteAssembly, String> {
+    prepare_query_as_iceberg_write_with_connector_binding(
         state,
         current_catalog,
         current_database,
@@ -1985,7 +2103,7 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_connector_context
 /// catalog table.  The overlay is consumed by the application materializer
 /// and is never registered in the shared local catalog.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_query_as_iceberg_write_in_operation_with_query_local_overlays(
+pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_query_local_overlays(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -1999,8 +2117,8 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_query_local_overl
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
     scan_resolver: &dyn crate::query_execution::preparation::scan::ScanBindingResolver,
     overlays: &[crate::query_execution::planning::catalog_materializer::QueryLocalTableOverlay],
-) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-    execute_query_as_iceberg_write_with_connector_binding(
+) -> Result<PreparedDmlWriteAssembly, String> {
+    prepare_query_as_iceberg_write_with_connector_binding(
         state,
         current_catalog,
         current_database,
@@ -2036,7 +2154,7 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
-) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
+) -> Result<crate::mv::application::PreparedMvNativeWriteAssembly, String> {
     crate::connector::validate_request_context(connector_context)?;
     let optimizer_settings = optimizer_settings_for_execution(Some(execution));
     let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
@@ -2092,96 +2210,17 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
         Some(&scan_resolver),
         scan_preparation_options(&optimizer_settings, execution)?,
     )?;
-    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
-        &distributed_plan,
-        &prepared,
-    )?;
-    prepare_distributed_write_request_with_execution(
-        prepared,
-        native_bundle,
+    let cohort_id = connector_write.cohort_id();
+    let exact_lease = connector_write.lease();
+    Ok(crate::mv::application::PreparedMvNativeWriteAssembly::new(
+        NativeFragmentEncodingInput::new(distributed_plan, prepared),
         None,
-        execution,
-        Some(DistributedConnectorWrite::Begin(connector_write)),
-    )
-}
-
-/// Execute one provider-frozen rewrite source through the ordinary C1 sink.
-/// The physical source is deliberately `ConnectorPinned`: its one-shot
-/// resolver supplies opaque splits already planned by the exact composite
-/// rewrite lease, so this path cannot reopen a current catalog binding.
-pub(crate) fn execute_frozen_rewrite_physical_plan_as_iceberg_staging_with_ports(
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    query_execution: &crate::query_execution::service::QueryExecutionService,
-    physical_plan: crate::sql::planner::physical::PhysicalPlanNode,
-    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
-    execution: &crate::query_execution::request_context::QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    table_bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
-    scan_resolver: &dyn crate::query_execution::preparation::scan::ScanBindingResolver,
-    connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
-) -> Result<
-    (
-        crate::query_execution::ConnectorWriteCompletion,
-        crate::query_execution::ConnectorWriteStagingSummary,
-    ),
-    String,
-> {
-    crate::connector::validate_request_context(connector_context)?;
-    let optimizer_settings = optimizer_settings_for_execution(Some(execution));
-    let distributed_plan =
-        crate::sql::planner::pipeline::build_sql_write_distributed_plan_with_settings(
-            physical_plan,
-            sink,
-            &optimizer_settings,
-        )?;
-    let prepared = crate::query_execution::preparation::prepare_fragments(
-        &distributed_plan,
-        connector_control,
-        connector_context,
-        Some(table_bindings),
-        Some(scan_resolver),
-        scan_preparation_options(&optimizer_settings, execution)?,
-    )?;
-    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
-        &distributed_plan,
-        &prepared,
-    )?;
-    let result = execute_distributed_write_with_execution(
-        query_execution,
-        prepared,
-        native_bundle,
-        None,
-        execution,
-        Some(DistributedConnectorWrite::Sealed(connector_write)),
-    )?;
-    connector_staging_completion_from_result(result)
-}
-
-fn connector_staging_completion_from_result(
-    result: crate::query_execution::outcome::QueryExecutionResult,
-) -> Result<
-    (
-        crate::query_execution::ConnectorWriteCompletion,
-        crate::query_execution::ConnectorWriteStagingSummary,
-    ),
-    String,
-> {
-    if !result.query_result.columns.is_empty() || !result.query_result.chunks.is_empty() {
-        return Err("connector staging terminal returned a result payload".to_string());
-    }
-    if let Some(abort) = result.write_abort {
-        return Err(format!(
-            "connector staging terminal aborted: {}",
-            abort.reason
-        ));
-    }
-    let completion = result.connector_completion.ok_or_else(|| {
-        "connector staging terminal has no accepted connector completion".to_string()
-    })?;
-    let summary = completion
-        .staging_summary()
-        .map_err(|error| error.to_string())?;
-    Ok((completion, summary))
+        crate::query_execution::contract::ConnectorWriteOperationRegistration::single(
+            connector_write,
+        ),
+        cohort_id,
+        exact_lease,
+    ))
 }
 
 pub(crate) enum DistributedConnectorWrite {
@@ -2189,8 +2228,63 @@ pub(crate) enum DistributedConnectorWrite {
     Sealed(crate::query_execution::contract::ConnectorWriteExecutionRegistration),
 }
 
+/// Core-sealed one-shot DML request awaiting Frontend native wire assembly.
+///
+/// The encoder can only borrow the frozen input. Once Frontend returns its
+/// bundle, `finish` consumes that same input to construct and execute the
+/// request, so no caller can substitute another plan/preparation pair.
+pub(crate) struct PreparedDmlWriteAssembly {
+    encoding: NativeFragmentEncodingInput,
+    query_options: Option<QueryOptions>,
+    execution: crate::query_execution::request_context::QueryExecutionContext,
+    query_execution: crate::query_execution::service::QueryExecutionService,
+    connector_write: Option<DistributedConnectorWrite>,
+}
+
+impl PreparedDmlWriteAssembly {
+    fn new(
+        encoding: NativeFragmentEncodingInput,
+        query_options: Option<QueryOptions>,
+        execution: crate::query_execution::request_context::QueryExecutionContext,
+        query_execution: crate::query_execution::service::QueryExecutionService,
+        connector_write: Option<DistributedConnectorWrite>,
+    ) -> Self {
+        Self {
+            encoding,
+            query_options,
+            execution,
+            query_execution,
+            connector_write,
+        }
+    }
+
+    pub(crate) fn encoding(&self) -> &NativeFragmentEncodingInput {
+        &self.encoding
+    }
+
+    pub(crate) fn finish(
+        self,
+        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+        if !self.encoding.matches_native_bundle(&native_bundle) {
+            return Err(
+                "native fragment bundle does not match the sealed DML encoding input".into(),
+            );
+        }
+        let (_, prepared) = self.encoding.into_parts();
+        execute_distributed_write_with_execution(
+            &self.query_execution,
+            prepared,
+            native_bundle,
+            self.query_options,
+            &self.execution,
+            self.connector_write,
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn execute_query_as_iceberg_write_with_connector_binding(
+fn prepare_query_as_iceberg_write_with_connector_binding(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -2204,7 +2298,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
     connector_write: Option<DistributedConnectorWrite>,
     scan_resolver: Option<&dyn crate::query_execution::preparation::scan::ScanBindingResolver>,
     query_local_overlays: &[crate::query_execution::planning::catalog_materializer::QueryLocalTableOverlay],
-) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+) -> Result<PreparedDmlWriteAssembly, String> {
     let maintenance_execution;
     let execution = match execution {
         Some(execution) => execution,
@@ -2301,24 +2395,20 @@ fn execute_query_as_iceberg_write_with_connector_binding(
         scan_resolver,
         scan_preparation_options(&optimizer_settings, execution)?,
     )?;
-    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
-        &distributed_plan,
-        &prepared,
-    )?;
-    execute_distributed_write_with_execution(
-        state.query_execution(),
-        prepared,
-        native_bundle,
+    Ok(PreparedDmlWriteAssembly::new(
+        NativeFragmentEncodingInput::new(distributed_plan, prepared),
         query_opts,
-        execution,
+        execution.clone(),
+        state.query_execution().clone(),
         connector_write,
-    )
+    ))
 }
 
-/// Freeze a native connector-write request without starting a writer. The
-/// application owner later seals it through the exact retained write lease.
+/// Freeze an MV first-refresh write before Frontend-owned native assembly.
+/// The exact plan/preparation pair remains sealed in the returned carrier;
+/// Core never encodes it on this path.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
+pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding_native_assembly(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -2330,7 +2420,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
-) -> Result<PreparedDistributedWriteRequest, String> {
+) -> Result<crate::mv::application::PreparedMvNativeWriteAssembly, String> {
     let optimizer_settings = optimizer_settings_for_execution(Some(execution));
     let mut prepared_query = query.clone();
     if has_time_travel_refs(&prepared_query) {
@@ -2412,23 +2502,17 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
         None,
         scan_preparation_options(&optimizer_settings, execution)?,
     )?;
-    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
-        &distributed_plan,
-        &prepared,
-    )?;
     let cohort_id = connector_write.cohort_id();
     let exact_lease = connector_write.lease();
-    PreparedDistributedWriteRequest::new(
-        prepared,
-        native_bundle,
+    Ok(crate::mv::application::PreparedMvNativeWriteAssembly::new(
+        NativeFragmentEncodingInput::new(distributed_plan, prepared),
         query_opts,
         crate::query_execution::contract::ConnectorWriteOperationRegistration::single(
             connector_write,
         ),
         cohort_id,
         exact_lease,
-    )
-    .map_err(|error| error.to_string())
+    ))
 }
 
 #[cfg(test)]
@@ -2542,8 +2626,16 @@ pub(crate) fn observe_change_stream_write_build_for_test(
 }
 
 pub(crate) struct PlannedIcebergChangeStreamWrite {
-    pub(crate) prepared: crate::query_execution::preparation::PreparedFragmentSet,
-    pub(crate) native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    pub(crate) encoding: NativeFragmentEncodingInput,
+    pub(crate) topology:
+        crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
+}
+
+/// MV-only change-stream facts held before Frontend native fragment assembly.
+/// It deliberately retains the exact prepared fragments paired with their
+/// distributed plan and exposes no mutable planning or connector state.
+pub(crate) struct PlannedMvIcebergChangeStreamWrite {
+    pub(crate) encoding: NativeFragmentEncodingInput,
     pub(crate) topology:
         crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
 }
@@ -2559,6 +2651,35 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_execution(
     pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
+    let planned = build_physical_plan_as_iceberg_change_stream_write_native_assembly(
+        connector_control,
+        execution,
+        optimized_tree,
+        query_table_bindings,
+        dag,
+        pre_expand_keyed_assert,
+        connector_context,
+    )?;
+    Ok(PlannedIcebergChangeStreamWrite {
+        encoding: planned.encoding,
+        topology: planned.topology,
+    })
+}
+
+/// Build MV change-stream fragments without encoding their native bundle.
+/// Frontend owns that final FE-to-BE wire assembly after Core has frozen the
+/// exact plan/preparation pair.
+pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_native_assembly(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
+    query_table_bindings: Option<
+        &crate::query_execution::planning::bindings::QueryTableBindingStore,
+    >,
+    dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
+    pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<PlannedMvIcebergChangeStreamWrite, String> {
     crate::connector::validate_request_context(connector_context)?;
     let optimizer_settings = change_stream_write_optimizer_settings();
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(optimized_tree)?;
@@ -2584,35 +2705,32 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_execution(
         scan_binding_resolver,
         scan_preparation_options(&optimizer_settings, execution)?,
     )?;
-    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
-        &distributed_plan,
-        &prepared,
-    )?;
-    Ok(PlannedIcebergChangeStreamWrite {
-        prepared,
-        native_bundle,
+    Ok(PlannedMvIcebergChangeStreamWrite {
+        encoding: NativeFragmentEncodingInput::new(distributed_plan, prepared),
         topology,
     })
 }
 
-/// Convert an already planned change-stream writer into SQL's inert native
-/// write handoff.  The caller supplies the admitted execution context and
-/// retains responsibility for binding the exact connector write lease before
-/// submitting the request.
+/// Convert an already planned MV change-stream writer into an inert native
+/// assembly handoff. The caller retains responsibility for the exact connector
+/// write lease and Frontend later encodes the sealed pair before submission.
 pub(crate) fn prepare_planned_iceberg_change_stream_write(
-    prepared: crate::query_execution::preparation::PreparedFragmentSet,
-    native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    encoding: NativeFragmentEncodingInput,
     query_opts: Option<QueryOptions>,
-    execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_write: Option<DistributedConnectorWrite>,
-) -> Result<PreparedDistributedWriteRequest, String> {
-    prepare_distributed_write_request_with_execution(
-        prepared,
-        native_bundle,
+) -> Result<crate::mv::application::PreparedMvNativeWriteAssembly, String> {
+    let Some(DistributedConnectorWrite::Begin(template)) = connector_write else {
+        return Err("prepared connector write requires an unsealed write template".to_string());
+    };
+    let cohort_id = template.cohort_id();
+    let exact_lease = template.lease();
+    Ok(crate::mv::application::PreparedMvNativeWriteAssembly::new(
+        encoding,
         query_opts,
-        execution,
-        connector_write,
-    )
+        crate::query_execution::contract::ConnectorWriteOperationRegistration::single(template),
+        cohort_id,
+        exact_lease,
+    ))
 }
 
 fn prepare_distributed_write_request_with_execution(
@@ -2845,7 +2963,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     allow_mv_rewrite_candidates: bool,
 ) -> Result<
     (
-        crate::query_execution::contract::DistributedQueryRequest,
+        PreparedDistributedQueryAssembly,
         crate::sql::planner::distributed::DistributedPlan,
         crate::query_execution::profile::ConnectorStaticPlanningMetrics,
     ),
@@ -2925,21 +3043,15 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         None,
         scan_preparation_options(execution.optimizer_settings(), execution)?,
     )?;
-    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
-        &compiled.distributed_plan,
-        &prepared,
-    )?;
     let connector_static_planning = connector_static_planning_metrics(&prepared)?;
-    let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
-        prepared,
-        native_bundle,
+    let assembly = PreparedDistributedQueryAssembly::new(
+        NativeFragmentEncodingInput::new(compiled.distributed_plan.clone(), prepared),
         query_opts,
         distributed_intent,
-        execution,
-    )
-    .map_err(|error| error.to_string())?;
+        execution.clone(),
+    );
     Ok((
-        request,
+        assembly,
         compiled.distributed_plan,
         connector_static_planning,
     ))

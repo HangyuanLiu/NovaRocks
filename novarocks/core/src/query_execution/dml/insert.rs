@@ -39,6 +39,8 @@ use crate::sql::parser::ast::{Literal, ObjectName};
 use crate::statistics::StatisticsEngine;
 use novarocks_execution::runtime::query_options::QueryOptions;
 
+pub use crate::query_execution::dml::iceberg_writer::PreparedIcebergWriteNativeEncoding;
+
 /// Parse one statement through NovaRocks' StarRocks normalizer and return its
 /// raw INSERT AST.
 ///
@@ -232,6 +234,26 @@ pub trait InsertEngine: StatisticsEngine + Send + Sync {
         prepared: &dyn IcebergPreparedInsert,
     ) -> Result<IcebergWriteReport, String>;
 
+    /// Borrow the exact Core-sealed plan/preparation pair for Frontend native
+    /// wire assembly. Implementations that do not own a real DML plan fail
+    /// closed rather than falling back to Core-side encoding.
+    fn iceberg_write_native_encoding<'a>(
+        &self,
+        _prepared: &'a dyn IcebergPreparedInsert,
+    ) -> Result<PreparedIcebergWriteNativeEncoding<'a>, String> {
+        Err("Iceberg INSERT engine does not expose native encoding input".to_string())
+    }
+
+    /// Execute the request finalized from the exact pair previously borrowed
+    /// through [`Self::iceberg_write_native_encoding`].
+    fn run_iceberg_write_with_native_bundle(
+        &self,
+        _prepared: &dyn IcebergPreparedInsert,
+        _native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    ) -> Result<IcebergWriteReport, String> {
+        Err("Iceberg INSERT engine requires Frontend native fragment assembly".to_string())
+    }
+
     fn commit_iceberg_write_terminal(
         &self,
         _prepared: &dyn IcebergPreparedInsert,
@@ -382,11 +404,28 @@ impl InsertEngine for DmlExecutionKernel {
 
     fn run_iceberg_write(
         &self,
+        _prepared: &dyn IcebergPreparedInsert,
+    ) -> Result<IcebergWriteReport, String> {
+        Err("Iceberg INSERT requires Frontend native fragment assembly".to_string())
+    }
+
+    fn iceberg_write_native_encoding<'a>(
+        &self,
+        prepared: &'a dyn IcebergPreparedInsert,
+    ) -> Result<PreparedIcebergWriteNativeEncoding<'a>, String> {
+        downcast_prepared(prepared)?.prepared.native_encoding()
+    }
+
+    fn run_iceberg_write_with_native_bundle(
+        &self,
         prepared: &dyn IcebergPreparedInsert,
+        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     ) -> Result<IcebergWriteReport, String> {
         let prepared = downcast_prepared(prepared)?;
         Ok(iceberg_write_report_from_result(
-            prepared.prepared.run_coordinated_write()?,
+            prepared
+                .prepared
+                .run_coordinated_write_with_native_bundle(native_bundle)?,
         ))
     }
 

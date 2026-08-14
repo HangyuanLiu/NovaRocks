@@ -122,6 +122,16 @@ pub enum MutationStageOutcome {
     CommitRequired(Arc<dyn MutationCommit>),
 }
 
+/// Frontend-owned native encoder for one Core-sealed mutation plan. Core never
+/// acquires a second binding or fabricates native bytes; it accepts only the
+/// bundle produced from this immutable input.
+pub trait MutationNativeFragmentEncoder: Send + Sync {
+    fn encode(
+        &self,
+        input: &crate::query_execution::compiler::NativeFragmentEncodingInput,
+    ) -> Result<crate::protocol::native::encode::NativeFragmentBundle, String>;
+}
+
 /// One-to-one capability consumed only by the frontend DML application owner.
 // Design: ADR-0033 (docs/adr/ADR-0033-frontend-update-merge-application-owner.md)
 pub trait MutationEngine: Send + Sync {
@@ -134,6 +144,16 @@ pub trait MutationEngine: Send + Sync {
         &self,
         prepared: &dyn MutationPrepared,
     ) -> Result<MutationStageOutcome, String>;
+
+    /// Stage through the Frontend-owned native encoding boundary. The default
+    /// preserves narrow test doubles that never materialize a Core plan.
+    fn stage_mutation_with_native_encoder(
+        &self,
+        prepared: &dyn MutationPrepared,
+        _encoder: &dyn MutationNativeFragmentEncoder,
+    ) -> Result<MutationStageOutcome, String> {
+        self.stage_mutation(prepared)
+    }
 
     fn abort_mutation_terminal(
         &self,
@@ -363,7 +383,15 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
 
     fn stage_mutation(
         &self,
+        _prepared: &dyn MutationPrepared,
+    ) -> Result<MutationStageOutcome, String> {
+        Err("mutation staging requires the Frontend native fragment encoder".to_string())
+    }
+
+    fn stage_mutation_with_native_encoder(
+        &self,
         prepared: &dyn MutationPrepared,
+        encoder: &dyn MutationNativeFragmentEncoder,
     ) -> Result<MutationStageOutcome, String> {
         let prepared = prepared_handle(prepared)?;
         if prepared
@@ -383,7 +411,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
             .ok_or_else(|| "mutation prepared handle has no pending kernel".to_string())?;
         match kernel {
             PreparedKernel::Update(kernel) => {
-                match crate::query_execution::dml::mutation_flow::stage_prepared_update_mutation(self, kernel)? {
+                match crate::query_execution::dml::mutation_flow::stage_prepared_update_mutation(self, kernel, encoder)? {
                     crate::query_execution::dml::mutation_flow::MutationStagedWrite::NoOp => {
                         prepared.state.store(TERMINAL, Ordering::Release);
                         Ok(MutationStageOutcome::NoOp)
@@ -414,7 +442,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                 }
             }
             PreparedKernel::Merge(kernel) => {
-                match crate::query_execution::dml::mutation_flow::stage_prepared_merge_mutation(self, kernel)? {
+                match crate::query_execution::dml::mutation_flow::stage_prepared_merge_mutation(self, kernel, encoder)? {
                     crate::query_execution::dml::mutation_flow::MutationStagedWrite::NoOp => {
                         prepared.state.store(TERMINAL, Ordering::Release);
                         Ok(MutationStageOutcome::NoOp)

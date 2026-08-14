@@ -10,6 +10,7 @@ use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLeas
 
 use crate::mv::application::{
     MvFirstRefreshExecutionArtifact, MvFirstRefreshLogicalContext, PreparedMvFirstRefreshWrite,
+    PreparedMvNativeWriteAssembly,
 };
 use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::compiler::iceberg_write_shuffle_by_output_name;
@@ -18,7 +19,6 @@ use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::planning::write_sink::{
     admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
 };
-use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::mv_refresh::first_refresh::{
     SqlMvFirstRefreshArtifact, SqlMvFirstRefreshArtifactInput, SqlMvFirstRefreshPlanner,
@@ -55,9 +55,9 @@ pub(crate) fn frozen_logical_context_from_rewrite(
 /// artifact preparation remains side-effect free.
 /// Bind an SQL-shaped first-refresh artifact only after the frontend has
 /// retained its exact write lease and admitted an immutable query execution.
-/// The result is the same generic result-free writer request used by all
-/// other frontend-owned write lifecycles; it deliberately does not submit a
-/// query, commit a provider mutation, or expose row payloads.
+/// The result retains the exact native-assembly input for the Frontend; it
+/// deliberately does not encode or submit a query, commit a provider mutation,
+/// or expose row payloads.
 pub(crate) fn bind_prepared_mv_first_refresh_staging(
     query_kernel: &QueryPreparationKernel,
     ports: &IcebergMvCorePorts,
@@ -65,7 +65,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     planning_lease: &ConnectorControlPlanningLease,
     exact_lease: &ConnectorWriteLease,
     execution: &QueryExecutionContext,
-) -> Result<PreparedDistributedWriteRequest, String> {
+) -> Result<PreparedMvNativeWriteAssembly, String> {
     let operation_id = prepared.operation_id();
     let cohort_id = prepared.primary_cohort();
     let expected_target_snapshot_id = prepared.expected_target_snapshot_id();
@@ -123,7 +123,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 return Err("MV first-refresh SQL activation expected a SQL artifact".to_string());
             };
             let query = parse_query_from_sql(physical_sql.sql())?;
-            crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_binding(
+            crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_binding_native_assembly(
                 query_kernel,
                 current_catalog.as_deref(),
                 &current_database,

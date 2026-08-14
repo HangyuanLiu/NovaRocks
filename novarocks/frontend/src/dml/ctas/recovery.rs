@@ -1980,6 +1980,14 @@ mod tests {
             unreachable!("recovery never prepares writers")
         }
 
+        fn bind_ctas_write_native_bundle(
+            &self,
+            _prepared: &dyn novarocks::query_execution::dml::ctas::CtasPreparedWrite,
+            _native_bundle: novarocks::protocol::native::encode::NativeFragmentBundle,
+        ) -> Result<(), CtasFailure> {
+            unreachable!("recovery never assembles native writers")
+        }
+
         fn execute_ctas_write(&self, _prepared: &dyn CtasPreparedWrite) -> CtasWriteOutcome {
             unreachable!("recovery never executes writers")
         }

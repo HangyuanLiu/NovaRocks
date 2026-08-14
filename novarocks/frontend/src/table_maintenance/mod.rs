@@ -739,8 +739,23 @@ impl FrontendTableMaintenanceService {
                 format!("distributed rewrite staging authority lost: {failure}")
             })?;
             let completion =
-                match engine.stage_distributed_rewrite_cohort(&session, cohort.cohort_id()) {
-                    Ok(completion) => completion,
+                match engine.prepare_distributed_rewrite_cohort(&session, cohort.cohort_id()) {
+                    Ok(prepared) => {
+                        match novarocks::protocol::native::encode::encode_native_fragment_bundle(
+                            prepared.encoding().source(),
+                        )
+                        .map_err(|error| format!("encode distributed rewrite fragments: {error}"))
+                        .and_then(|bundle| prepared.finish(bundle))
+                        {
+                            Ok(completion) => completion,
+                            Err(error) => {
+                                return self.abort_failed_distributed_rewrite(
+                                    engine, repository, durable_id, &session, error, &authority,
+                                    &validator,
+                                );
+                            }
+                        }
+                    }
                     Err(error) => {
                         return self.abort_failed_distributed_rewrite(
                             engine, repository, durable_id, &session, error, &authority, &validator,

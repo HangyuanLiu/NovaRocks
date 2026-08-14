@@ -17,7 +17,7 @@
 
 #[cfg(test)]
 pub(crate) mod decode;
-pub(crate) mod encode;
+pub mod encode;
 pub(crate) mod query_options_contract;
 #[cfg(test)]
 pub(crate) mod test_assembly;
