@@ -1,5 +1,5 @@
 ---
-id: ADR-0072
+id: ADR-0073
 title: "SQL compilation freezes statistics after analysis"
 domain: [sql-compiler, distributed-query-lifecycle, provider-spi]
 status: active

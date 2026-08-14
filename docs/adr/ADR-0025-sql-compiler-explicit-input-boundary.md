@@ -4,7 +4,7 @@ title: "Explicit SQL compiler input boundary"
 domain: [sql-compiler, distributed-query-lifecycle, provider-spi]
 status: superseded
 supersedes: []
-superseded-by: ADR-0072
+superseded-by: ADR-0073
 date: 2026-08-02
 provenance:
   - "discussion: 2026-08-01 explicit SQL compiler input boundary"
