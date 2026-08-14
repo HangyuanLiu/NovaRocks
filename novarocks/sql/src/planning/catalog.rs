@@ -21,6 +21,8 @@
 //! catalog materialization and typed view-analysis facts; it does not expose a
 //! parser or planner implementation tree.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::planner::table::TableDef;
 use novarocks_catalog::memory::MemoryCatalogEntry;
 
@@ -31,6 +33,211 @@ pub use crate::catalog::{
 /// This is a value-only DTO; it carries neither a table definition nor a
 /// provider handle.
 pub use crate::planner::table::SqlMetadataTableKind as MetadataTableKind;
+
+/// The kind of a named Iceberg snapshot reference copied from an admitted
+/// connector metadata observation.  This stays a value fact: it carries no
+/// provider object, catalog handle, or metadata lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlTimeTravelReferenceKind {
+    Branch,
+    Tag,
+}
+
+/// One immutable snapshot-log entry copied from an admitted connector
+/// metadata observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlTimeTravelSnapshotLogFacts {
+    snapshot_id: i64,
+    timestamp_millis: i64,
+}
+
+impl SqlTimeTravelSnapshotLogFacts {
+    pub fn new(snapshot_id: i64, timestamp_millis: i64) -> Self {
+        Self {
+            snapshot_id,
+            timestamp_millis,
+        }
+    }
+}
+
+/// One immutable named-reference fact copied from an admitted connector
+/// metadata observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlTimeTravelNamedReferenceFacts {
+    name: String,
+    kind: SqlTimeTravelReferenceKind,
+    snapshot_id: i64,
+}
+
+impl SqlTimeTravelNamedReferenceFacts {
+    pub fn try_new(
+        name: String,
+        kind: SqlTimeTravelReferenceKind,
+        snapshot_id: i64,
+    ) -> Result<Self, String> {
+        if name.is_empty() {
+            return Err("iceberg time travel: named reference cannot be empty".to_string());
+        }
+        Ok(Self {
+            name,
+            kind,
+            snapshot_id,
+        })
+    }
+}
+
+/// Validated immutable snapshot-reference facts consumed by the SQL
+/// time-travel resolver.  Applications can only copy already-admitted
+/// metadata into this value; SQL keeps its internal metadata representation
+/// private.
+pub struct SqlTimeTravelReferenceMetadataFacts {
+    snapshot_ids: BTreeSet<i64>,
+    snapshot_log: Vec<SqlTimeTravelSnapshotLogFacts>,
+    named_references: Vec<SqlTimeTravelNamedReferenceFacts>,
+    current_snapshot_id: Option<i64>,
+}
+
+impl SqlTimeTravelReferenceMetadataFacts {
+    pub fn try_new(
+        snapshot_ids: Vec<i64>,
+        snapshot_log: Vec<SqlTimeTravelSnapshotLogFacts>,
+        named_references: Vec<SqlTimeTravelNamedReferenceFacts>,
+        current_snapshot_id: Option<i64>,
+    ) -> Result<Self, String> {
+        let mut unique_snapshot_ids = BTreeSet::new();
+        for snapshot_id in snapshot_ids {
+            if !unique_snapshot_ids.insert(snapshot_id) {
+                return Err(
+                    "iceberg time travel: snapshot facts contain duplicate snapshot IDs"
+                        .to_string(),
+                );
+            }
+        }
+
+        Self::from_parts(
+            unique_snapshot_ids,
+            snapshot_log,
+            named_references,
+            current_snapshot_id,
+        )
+    }
+
+    fn from_parts(
+        snapshot_ids: BTreeSet<i64>,
+        snapshot_log: Vec<SqlTimeTravelSnapshotLogFacts>,
+        named_references: Vec<SqlTimeTravelNamedReferenceFacts>,
+        current_snapshot_id: Option<i64>,
+    ) -> Result<Self, String> {
+        if current_snapshot_id.is_some_and(|snapshot_id| !snapshot_ids.contains(&snapshot_id)) {
+            return Err(
+                "iceberg time travel: current snapshot is not listed in snapshot facts".to_string(),
+            );
+        }
+
+        let mut seen_log_entries = BTreeSet::new();
+        for entry in &snapshot_log {
+            if !snapshot_ids.contains(&entry.snapshot_id) {
+                return Err(
+                    "iceberg time travel: snapshot log references an unknown snapshot".to_string(),
+                );
+            }
+            if !seen_log_entries.insert((entry.timestamp_millis, entry.snapshot_id)) {
+                return Err(
+                    "iceberg time travel: snapshot facts contain duplicate snapshot-log entries"
+                        .to_string(),
+                );
+            }
+        }
+
+        let mut seen_reference_names = BTreeSet::new();
+        for reference in &named_references {
+            if !snapshot_ids.contains(&reference.snapshot_id) {
+                return Err(
+                    "iceberg time travel: named reference points to an unknown snapshot"
+                        .to_string(),
+                );
+            }
+            if !seen_reference_names.insert(reference.name.as_str()) {
+                return Err(
+                    "iceberg time travel: snapshot facts contain duplicate named references"
+                        .to_string(),
+                );
+            }
+        }
+
+        Ok(Self {
+            snapshot_ids,
+            snapshot_log,
+            named_references,
+            current_snapshot_id,
+        })
+    }
+
+    fn as_iceberg_ref_metadata(&self) -> crate::analyzer::iceberg_ref::SqlIcebergRefMetadata {
+        use crate::analyzer::iceberg_ref::{
+            IcebergRefKind, SqlIcebergNamedRef, SqlIcebergSnapshotLog,
+        };
+
+        crate::analyzer::iceberg_ref::SqlIcebergRefMetadata::new(
+            self.snapshot_ids.iter().copied(),
+            self.snapshot_log
+                .iter()
+                .map(|entry| SqlIcebergSnapshotLog {
+                    snapshot_id: entry.snapshot_id,
+                    timestamp_ms: entry.timestamp_millis,
+                })
+                .collect(),
+            self.named_references
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.name.clone(),
+                        SqlIcebergNamedRef {
+                            snapshot_id: entry.snapshot_id,
+                            kind: match entry.kind {
+                                SqlTimeTravelReferenceKind::Branch => IcebergRefKind::Branch,
+                                SqlTimeTravelReferenceKind::Tag => IcebergRefKind::Tag,
+                            },
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+            self.current_snapshot_id,
+        )
+    }
+}
+
+/// Sealed result of resolving one parsed time-travel clause against validated
+/// immutable snapshot facts.  SQL exposes only the frozen snapshot identity
+/// needed for query-local rewrite; ref metadata remains internal.
+pub struct SqlTimeTravelSnapshotBindingFacts {
+    snapshot_id: i64,
+}
+
+impl SqlTimeTravelSnapshotBindingFacts {
+    pub const fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
+}
+
+/// Resolve a parsed `FOR VERSION/TIMESTAMP AS OF` clause from copied,
+/// validated snapshot-reference facts.  Unknown requested snapshots and refs
+/// fail closed in SQL before Core creates a synthetic table identity.
+pub fn resolve_time_travel_snapshot_binding(
+    version: &sqlparser::ast::TableVersion,
+    metadata: &SqlTimeTravelReferenceMetadataFacts,
+    fully_qualified_name: &str,
+) -> Result<SqlTimeTravelSnapshotBindingFacts, String> {
+    let metadata = metadata.as_iceberg_ref_metadata();
+    let binding = crate::analyzer::iceberg_ref::resolve_read_binding(
+        version,
+        &metadata,
+        fully_qualified_name,
+    )?;
+    Ok(SqlTimeTravelSnapshotBindingFacts {
+        snapshot_id: binding.snapshot_id,
+    })
+}
 
 /// Immutable provider-neutral facts for one connector read admitted by the
 /// application boundary.  This contains no connector handle or lease: those
@@ -77,6 +284,18 @@ pub struct SqlCatalogIdentityFacts {
 }
 
 impl SqlCatalogIdentityFacts {
+    pub fn catalog(&self) -> &str {
+        &self.catalog
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
     pub fn fqn(&self) -> String {
         format!("{}.{}.{}", self.catalog, self.namespace, self.table)
     }
@@ -377,6 +596,52 @@ pub fn register_test_connector_read_table(
     )
 }
 
+/// Test-only sealed local table facts for Core behavior tests that validate
+/// catalog-visible schema changes. The planner table and scan source remain
+/// private to SQL; callers cannot construct or inspect either raw type.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct SqlTestDeltaTableFacts(TableDef);
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_delta_table_facts(
+    columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    iceberg_row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+) -> SqlTestDeltaTableFacts {
+    SqlTestDeltaTableFacts(TableDef {
+        name: "test_delta_table".to_string(),
+        columns,
+        iceberg_row_lineage_metadata_columns,
+        source: crate::planner::table::test_sql_scan_source(
+            crate::planner::table::SqlScanKind::FrozenInputSet {
+                version: crate::planner::table::SqlTableVersionSelector::Snapshot(1),
+            },
+        ),
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl SqlTestDeltaTableFacts {
+    #[doc(hidden)]
+    pub fn columns(&self) -> &[novarocks_catalog::schema::ColumnDef] {
+        &self.0.columns
+    }
+
+    #[doc(hidden)]
+    pub fn iceberg_row_lineage_metadata_columns(&self) -> &[novarocks_catalog::schema::ColumnDef] {
+        &self.0.iceberg_row_lineage_metadata_columns
+    }
+
+    #[doc(hidden)]
+    pub fn push_iceberg_row_lineage_metadata_column(
+        &mut self,
+        column: novarocks_catalog::schema::ColumnDef,
+    ) {
+        self.0.iceberg_row_lineage_metadata_columns.push(column);
+    }
+}
+
 /// One visible output column of a validated external view definition.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ViewOutputColumn {
@@ -446,6 +711,47 @@ mod tests {
         .into_resolved_table()
     }
 
+    fn parsed_time_travel_clause(sql: &str) -> sqlparser::ast::TableVersion {
+        let statement = crate::syntax::parse_sql_raw(sql).expect("parse time travel");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query statement");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select query");
+        };
+        let Some(table_with_joins) = select.from.first() else {
+            panic!("expected FROM relation");
+        };
+        let sqlparser::ast::TableFactor::Table {
+            version: Some(version),
+            ..
+        } = &table_with_joins.relation
+        else {
+            panic!("expected table version clause");
+        };
+        version.clone()
+    }
+
+    fn time_travel_metadata() -> SqlTimeTravelReferenceMetadataFacts {
+        SqlTimeTravelReferenceMetadataFacts::try_new(
+            vec![10, 20],
+            vec![
+                SqlTimeTravelSnapshotLogFacts::new(10, 1_700_000_000_000),
+                SqlTimeTravelSnapshotLogFacts::new(20, 1_700_000_001_000),
+            ],
+            vec![
+                SqlTimeTravelNamedReferenceFacts::try_new(
+                    "dev".to_string(),
+                    SqlTimeTravelReferenceKind::Branch,
+                    20,
+                )
+                .expect("valid named reference"),
+            ],
+            Some(20),
+        )
+        .expect("valid snapshot facts")
+    }
+
     #[test]
     fn test_catalog_fixture_registers_only_catalog_visible_schema_facts() {
         let mut catalog = PlannerMemoryCatalog::default();
@@ -500,5 +806,86 @@ mod tests {
         assert_eq!(facts.label(), "ice.analytics.orders");
         assert_eq!(facts.columns().len(), 1);
         assert_eq!(facts.columns()[0].name, "order_id");
+    }
+
+    #[test]
+    fn time_travel_binding_resolves_parsed_snapshot_and_named_ref() {
+        let metadata = time_travel_metadata();
+
+        let snapshot = resolve_time_travel_snapshot_binding(
+            &parsed_time_travel_clause("SELECT id FROM t VERSION AS OF 10"),
+            &metadata,
+            "ice.analytics.t",
+        )
+        .expect("known snapshot resolves");
+        assert_eq!(snapshot.snapshot_id(), 10);
+
+        let named_ref = resolve_time_travel_snapshot_binding(
+            &parsed_time_travel_clause("SELECT id FROM t FOR VERSION AS OF 'dev'"),
+            &metadata,
+            "ice.analytics.t",
+        )
+        .expect("known named reference resolves");
+        assert_eq!(named_ref.snapshot_id(), 20);
+
+        let timestamp = resolve_time_travel_snapshot_binding(
+            &parsed_time_travel_clause("SELECT id FROM t FOR SYSTEM_TIME AS OF 1700000000500"),
+            &metadata,
+            "ice.analytics.t",
+        )
+        .expect("snapshot log resolves timestamp");
+        assert_eq!(timestamp.snapshot_id(), 10);
+    }
+
+    #[test]
+    fn time_travel_facts_reject_duplicate_and_unknown_snapshot_links() {
+        let Err(duplicate) = SqlTimeTravelReferenceMetadataFacts::try_new(
+            vec![10, 10],
+            Vec::new(),
+            Vec::new(),
+            None,
+        ) else {
+            panic!("duplicate snapshots must fail closed");
+        };
+        assert!(duplicate.contains("duplicate snapshot IDs"));
+
+        let Err(unknown_reference) = SqlTimeTravelReferenceMetadataFacts::try_new(
+            vec![10],
+            Vec::new(),
+            vec![
+                SqlTimeTravelNamedReferenceFacts::try_new(
+                    "dev".to_string(),
+                    SqlTimeTravelReferenceKind::Branch,
+                    11,
+                )
+                .expect("nonempty reference name"),
+            ],
+            None,
+        ) else {
+            panic!("unknown named-reference snapshot must fail closed");
+        };
+        assert!(unknown_reference.contains("unknown snapshot"));
+
+        let Err(unknown_current) = SqlTimeTravelReferenceMetadataFacts::try_new(
+            vec![10],
+            Vec::new(),
+            Vec::new(),
+            Some(11),
+        ) else {
+            panic!("unknown current snapshot must fail closed");
+        };
+        assert!(unknown_current.contains("current snapshot is not listed"));
+    }
+
+    #[test]
+    fn time_travel_binding_rejects_unknown_requested_snapshot() {
+        let Err(err) = resolve_time_travel_snapshot_binding(
+            &parsed_time_travel_clause("SELECT id FROM t VERSION AS OF 999"),
+            &time_travel_metadata(),
+            "ice.analytics.t",
+        ) else {
+            panic!("unknown requested snapshot must fail closed");
+        };
+        assert!(err.contains("snapshot 999 not found"));
     }
 }
