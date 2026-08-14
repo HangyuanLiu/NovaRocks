@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use arrow::datatypes::{DataType, TimeUnit};
-use novarocks::engine::insert_engine::InsertValue;
+use novarocks::query_execution::dml::insert::InsertValue;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::schema::{ColumnDef, ColumnDefault, validate_column_default};
 

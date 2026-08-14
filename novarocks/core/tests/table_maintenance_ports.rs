@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use novarocks::engine::table_maintenance::{
+use novarocks::maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeJobState,
 };
 

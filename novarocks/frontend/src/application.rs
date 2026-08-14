@@ -20,7 +20,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use novarocks::engine::ctas_engine::CtasEngine;
+use novarocks::query_execution::dml::ctas::CtasEngine;
 use novarocks::query_execution::service::QueryExecutionService;
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
@@ -122,9 +122,8 @@ pub struct FrontendApplicationHost {
     statistics_application_port: Option<Arc<FrontendStatisticsApplicationPort>>,
     catalog_application_port: Option<Arc<FrontendCatalogApplicationPort>>,
     catalog_controller: Option<Arc<FrontendCatalogController>>,
-    view_service: Option<Arc<dyn novarocks::engine::view::ViewService>>,
-    table_maintenance_service:
-        Option<Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService>>,
+    view_service: Option<Arc<dyn novarocks::view::ViewService>>,
+    table_maintenance_service: Option<Arc<dyn novarocks::maintenance::TableMaintenanceService>>,
     mv_repository: Option<Arc<dyn novarocks::mv::repository::MvRepository>>,
     mv_application_service: Option<Arc<dyn novarocks::mv::application::MvApplicationService>>,
     mv_service: Option<Arc<FrontendMvService>>,
@@ -694,7 +693,7 @@ impl FrontendApplicationHost {
         Ok(host)
     }
 
-    pub fn view_service(&self) -> Arc<dyn novarocks::engine::view::ViewService> {
+    pub fn view_service(&self) -> Arc<dyn novarocks::view::ViewService> {
         Arc::clone(
             self.view_service
                 .as_ref()
@@ -702,7 +701,7 @@ impl FrontendApplicationHost {
         )
     }
 
-    pub fn statistics_service(&self) -> Arc<dyn novarocks::engine::statistics::StatisticsService> {
+    pub fn statistics_service(&self) -> Arc<dyn novarocks::statistics::StatisticsService> {
         self.statistics_service
             .as_ref()
             .expect("frontend statistics service is installed before host open returns")
@@ -768,7 +767,7 @@ impl FrontendApplicationHost {
 
     pub fn table_maintenance_service(
         &self,
-    ) -> Arc<dyn novarocks::engine::table_maintenance::TableMaintenanceService> {
+    ) -> Arc<dyn novarocks::maintenance::TableMaintenanceService> {
         Arc::clone(
             self.table_maintenance_service
                 .as_ref()

@@ -17,7 +17,7 @@
 
 use arrow::array::{Array, StringArray};
 use arrow::datatypes::DataType;
-use novarocks::engine::system_catalog::{SystemCatalog, SystemCatalogInputs};
+use novarocks::catalog_application::system_catalog::{SystemCatalog, SystemCatalogInputs};
 use novarocks_frontend::SystemCatalogService;
 
 fn inputs<'a>(catalog_name: &'a str, schema_names: &'a [String]) -> SystemCatalogInputs<'a> {

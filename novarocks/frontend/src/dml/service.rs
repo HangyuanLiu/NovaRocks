@@ -17,8 +17,8 @@
 
 use std::sync::{Arc, RwLock};
 
-use novarocks::engine::ctas_engine::CtasEngine;
-use novarocks::engine::statistics::{EmptyStatisticsService, StatisticsService};
+use novarocks::query_execution::dml::ctas::CtasEngine;
+use novarocks::statistics::{EmptyStatisticsService, StatisticsService};
 use tokio::runtime::Handle;
 
 use crate::coordination::FrontendCoordinationRuntime;

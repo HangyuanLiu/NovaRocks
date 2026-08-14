@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
-use novarocks::engine::statistics_application as core_application;
+use novarocks::statistics::application as core_application;
 
 use super::model::{
     StatisticsJob, StatisticsJobCreate, StatisticsJobTablePin, StatisticsJobTarget,

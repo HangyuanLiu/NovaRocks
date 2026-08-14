@@ -21,7 +21,7 @@
 //! ownership.  The opaque core handle owns exactly one admitted connector
 //! session; it is never recreated after a durable plan or evidence barrier.
 
-use novarocks::engine::add_files_engine::{
+use novarocks::query_execution::dml::add_files::{
     AddFilesCommand, AddFilesDispatchState, AddFilesEffect, AddFilesEngine, AddFilesEvidence,
     AddFilesFailure, AddFilesFailureKind, AddFilesFinalization, AddFilesOutcome, AddFilesPlanError,
     AddFilesPlanFacts, AddFilesReceipt, PlanAddFilesRequest, PreparedAddFiles,
@@ -1029,9 +1029,9 @@ mod tests {
 
     use bytes::Bytes;
     use novarocks::common::app_config::ClusterRole;
-    use novarocks::engine::add_files_engine::{AddFilesCommand, AddFilesPrepared};
     use novarocks::query_execution::backend::BackendTopologySnapshot;
     use novarocks::query_execution::cancellation::QueryCancellationSource;
+    use novarocks::query_execution::dml::add_files::{AddFilesCommand, AddFilesPrepared};
     use novarocks::query_execution::request_context::{RequestAdmission, RequestContext};
     use novarocks_spi::connector::{
         ConnectorDataMutationPlanSummary, ConnectorDataMutationReceipt,
@@ -1102,7 +1102,7 @@ mod tests {
         /// the journalled receipt around it.
         fn establish_add_files_external_fence(
             &self,
-            _prepared: &dyn novarocks::engine::add_files_engine::AddFilesPrepared,
+            _prepared: &dyn novarocks::query_execution::dml::add_files::AddFilesPrepared,
             fence: novarocks_spi::connector::ConnectorExternalOperationFence,
         ) -> Result<
             novarocks_spi::connector::ConnectorExternalFenceReceipt,
@@ -1177,7 +1177,7 @@ mod tests {
             request_digest: [0x22; 32],
             plan_digest: [0x33; 32],
             state_digest: [0x44; 32],
-            summary: novarocks::engine::add_files_engine::AddFilesPlanSummary {
+            summary: novarocks::query_execution::dml::add_files::AddFilesPlanSummary {
                 file_count: 3,
                 row_count: 7,
                 total_bytes: 101,
@@ -1577,7 +1577,7 @@ mod tests {
         (
             DmlService::compose_with_coordination(
                 Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
-                Arc::new(novarocks::engine::statistics::EmptyStatisticsService),
+                Arc::new(novarocks::statistics::EmptyStatisticsService),
                 coordination(),
                 shared_runtime().handle().clone(),
             ),

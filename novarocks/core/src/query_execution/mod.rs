@@ -18,20 +18,30 @@
 pub mod artifact;
 pub(crate) mod assembly;
 pub mod backend;
+pub mod backend_command;
 pub mod cancellation;
+pub mod completion;
 mod connector_binding;
 pub(crate) mod connector_write_transaction;
 pub mod contract;
 pub mod control;
 pub mod distributed_rewrite;
+pub mod dml;
 pub mod fragment_transport;
 pub(crate) mod frozen_connector_read;
 #[cfg(test)]
 pub(crate) mod in_process_test;
+pub mod kernels;
 pub mod lifecycle;
 pub(crate) mod outcome;
+pub(crate) mod planning;
+pub use completion::{
+    PreparedDistributedQuery as PreparedQueryDistributedOperation, PreparedImmediateQuery,
+    PreparedQueryCompletion, PreparedQueryOperation, StatementResult,
+};
 pub use outcome::{ConnectorWriteCompletion, ConnectorWriteStagingSummary, WriteExecutionOutcome};
-pub(crate) mod preparation;
+/// Sealed preparation carriers consumed by the native Frontend encoder.
+pub mod preparation;
 pub use preparation::runtime_filter_view::{
     RuntimeFilterApplyPoint, RuntimeFilterArtifactCapability, RuntimeFilterBindingFacts,
     RuntimeFilterBindingFactsView, RuntimeFilterBindingFragmentFactsView,
@@ -51,6 +61,7 @@ pub mod prepared_write;
 pub(crate) mod profile;
 pub mod read_session;
 pub mod request_context;
+pub(crate) mod row_mutation;
 pub(crate) mod schedule;
 pub mod service;
 pub mod session;
@@ -58,6 +69,8 @@ pub mod statistics;
 pub mod write;
 pub mod write_operation;
 pub mod write_plan;
+pub(crate) mod write_transaction;
 
+pub mod compiler;
 #[cfg(test)]
 mod tests;

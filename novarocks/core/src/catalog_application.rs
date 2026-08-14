@@ -29,6 +29,15 @@ use std::sync::{Arc, Mutex};
 use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
 use uuid::Uuid;
 
+pub mod command;
+pub mod iceberg_ref_command;
+pub mod information_schema;
+pub mod query_catalog;
+pub(crate) mod resolver;
+pub(crate) mod statement;
+pub mod system_catalog;
+pub mod virtual_table;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogCreateCommand {
     pub instance_id: ConnectorInstanceId,
@@ -164,14 +173,14 @@ pub trait CatalogRuntimePublisherSink: Send + Sync {
 /// registry arrives later and any observation published in the meantime is
 /// replayed under the same lock that guards the publication set.
 struct QueryCatalogBinding {
-    service: Arc<crate::engine::query_planning::catalog_runtime::QueryCatalogService>,
+    service: Arc<crate::catalog_application::query_catalog::QueryCatalogService>,
     controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
 }
 
 impl QueryCatalogBinding {
     fn register(&self, observation: &CatalogRuntimeObservation) {
         self.service.register_catalog(
-            crate::engine::query_planning::catalog_runtime::build_connector_catalog(
+            crate::catalog_application::query_catalog::build_connector_catalog(
                 observation.instance_id.as_str(),
                 Arc::clone(&self.controls),
             ),
@@ -208,7 +217,7 @@ impl CatalogRuntimeProjection {
     /// second bind is rejected so two engines cannot share one publication set.
     pub fn bind_query_catalog(
         &self,
-        service: Arc<crate::engine::query_planning::catalog_runtime::QueryCatalogService>,
+        service: Arc<crate::catalog_application::query_catalog::QueryCatalogService>,
         controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
     ) -> Result<(), CatalogApplicationError> {
         let published = self.published.lock().map_err(|_| {
@@ -529,7 +538,7 @@ mod tests {
     }
 
     fn test_controls() -> Arc<dyn novarocks_spi::connector::ConnectorControlResolver> {
-        Arc::new(crate::engine::TestConnectorControlRegistry::default())
+        Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default())
             as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>
     }
 
@@ -542,7 +551,7 @@ mod tests {
             .expect("publish before the engine exists");
 
         let service =
-            Arc::new(crate::engine::query_planning::catalog_runtime::new_query_catalog_service());
+            Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
         projection
             .bind_query_catalog(Arc::clone(&service), test_controls())
             .expect("bind the engine query catalog");

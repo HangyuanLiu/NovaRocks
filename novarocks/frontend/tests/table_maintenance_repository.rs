@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use novarocks::engine::table_maintenance::{MaintenanceTarget, OptimizeJobState};
+use novarocks::maintenance::{MaintenanceTarget, OptimizeJobState};
 use novarocks_frontend::table_maintenance::coordination::{
     MaintenanceAuthorityFailure, MaintenanceFenceValidator,
 };

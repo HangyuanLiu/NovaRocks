@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::engine::StatementResult;
+use crate::query_execution::StatementResult;
 use crate::query_execution::cancellation::QueryCancellationReason;
 use novarocks_execution::runtime::query_options::QueryOptions;
 

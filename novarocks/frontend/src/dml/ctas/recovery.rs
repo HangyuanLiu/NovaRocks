@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks::engine::ctas_engine::CtasEngine;
+use novarocks::query_execution::dml::ctas::CtasEngine;
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorCtasActionId, ConnectorCtasAdvanceFenceRequest,
     ConnectorCtasFailure, ConnectorCtasOperationId, ConnectorCtasProofPurpose,
@@ -1640,7 +1640,7 @@ mod tests {
 
     use super::*;
     use async_trait::async_trait;
-    use novarocks::engine::ctas_engine::*;
+    use novarocks::query_execution::dml::ctas::*;
     use novarocks_spi::connector::{
         ConnectorClusterIdentity, ConnectorCtasAbortResult, ConnectorCtasPublishResult,
         ConnectorCtasStagedLocator, ConnectorError, ConnectorErrorKind,
@@ -1978,6 +1978,14 @@ mod tests {
             _write_operation_id: ConnectorWriteOperationId,
         ) -> Result<PreparedCtasWrite, CtasFailure> {
             unreachable!("recovery never prepares writers")
+        }
+
+        fn bind_ctas_write_native_bundle(
+            &self,
+            _prepared: &dyn novarocks::query_execution::dml::ctas::CtasPreparedWrite,
+            _native_bundle: novarocks::protocol::native::encode::NativeFragmentBundle,
+        ) -> Result<(), CtasFailure> {
+            unreachable!("recovery never assembles native writers")
         }
 
         fn execute_ctas_write(&self, _prepared: &dyn CtasPreparedWrite) -> CtasWriteOutcome {

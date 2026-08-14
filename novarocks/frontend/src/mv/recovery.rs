@@ -1107,10 +1107,7 @@ mod tests {
             _planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
             _exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
             _execution: &novarocks::query_execution::request_context::QueryExecutionContext,
-        ) -> Result<
-            novarocks::query_execution::prepared_write::PreparedDistributedWriteRequest,
-            String,
-        > {
+        ) -> Result<novarocks::mv::application::PreparedMvNativeWriteAssembly, String> {
             unreachable!("recovery never activates a writer")
         }
 

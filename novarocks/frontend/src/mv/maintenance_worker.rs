@@ -33,7 +33,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use novarocks::engine::table_maintenance::{
+use novarocks::maintenance::{
     AutomaticMaintenanceContext, MaintenanceActionOutcome, MaintenanceActionRequest,
     MaintenanceTarget, OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
 };

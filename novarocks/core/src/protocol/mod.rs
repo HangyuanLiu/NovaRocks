@@ -16,7 +16,10 @@
 // under the License.
 
 pub mod common;
-pub(crate) mod native;
+/// Native FE-to-BE wire encoding. Frontend application owners assemble their
+/// admitted requests through this boundary; backend-only decoding remains
+/// private to the protocol implementation.
+pub mod native;
 
 pub use common::error::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 

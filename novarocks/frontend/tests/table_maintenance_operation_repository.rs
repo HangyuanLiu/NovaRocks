@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks::engine::table_maintenance::MaintenanceTarget;
+use novarocks::maintenance::MaintenanceTarget;
 use novarocks_frontend::table_maintenance::coordination::MaintenanceFenceValidator;
 use novarocks_frontend::table_maintenance::model::{
     CleanupBatchCheckpoint, CleanupOperationCreate, CleanupOperationState, CleanupPlanPayload,

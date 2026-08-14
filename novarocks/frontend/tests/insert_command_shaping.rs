@@ -18,7 +18,9 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
-use novarocks::engine::insert_engine::{InsertOverwriteMode, InsertValue, parse_insert_statement};
+use novarocks::query_execution::dml::insert::{
+    InsertOverwriteMode, InsertValue, parse_insert_statement,
+};
 use novarocks_catalog::schema::{ColumnDef, ColumnDefault};
 use novarocks_frontend::dml::{InsertCommandSource, convert_insert_command, reorder_insert_rows};
 
@@ -111,8 +113,9 @@ fn parse_json_values_fold_to_packed_variant_literal() {
         "packed variant must preserve every byte through the Latin-1 bridge"
     );
     let unpacked = packed.chars().map(|ch| ch as u8).collect::<Vec<_>>();
-    let expected = novarocks::engine::insert_engine::encode_insert_variant_json(r#"{"a":1}"#)
-        .expect("encode expected variant");
+    let expected =
+        novarocks::query_execution::dml::insert::encode_insert_variant_json(r#"{"a":1}"#)
+            .expect("encode expected variant");
     assert_eq!(unpacked, expected);
 }
 

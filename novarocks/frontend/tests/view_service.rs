@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use arrow::array::{Array, StringArray};
 use bytes::Bytes;
-use novarocks::engine::view::{
+use novarocks::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
     ViewEngine, ViewRequestContext, ViewService, ViewSqlDialect, ViewStatementResult, ViewTarget,
 };

@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks::engine::table_maintenance::MaintenanceTarget;
+use novarocks::maintenance::MaintenanceTarget;
 use novarocks_frontend::table_maintenance::coordination::{
     MaintenanceAcquireOutcome, MaintenanceCoordination, MaintenanceLeaseAttempt,
     new_maintenance_holder_id,

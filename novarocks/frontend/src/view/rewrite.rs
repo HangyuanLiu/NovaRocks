@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use novarocks::engine::view::{
+use novarocks::view::{
     ExternalViewResolution, ResolvedExternalView, ViewEngine, ViewRequestContext, ViewSqlDialect,
     ViewTarget,
 };

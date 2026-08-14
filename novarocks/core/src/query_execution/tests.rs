@@ -227,9 +227,10 @@ fn real_execution_artifacts() -> (
         crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),
     )
     .expect("prepare production execution artifact");
-    let native_bundle =
-        crate::protocol::native::encode::encode_native_fragment_bundle(&plan, &prepared)
-            .expect("encode production execution artifact");
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        crate::protocol::native::encode::NativeFragmentEncodingSource::unsealed(&plan, &prepared),
+    )
+    .expect("encode production execution artifact");
     (prepared, native_bundle)
 }
 

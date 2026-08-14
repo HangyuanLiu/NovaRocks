@@ -71,7 +71,7 @@ pub struct RequestSessionContext {
 }
 
 impl RequestSessionContext {
-    pub(crate) fn new(
+    pub fn new(
         current_catalog: Option<String>,
         current_database: String,
         optimizer_settings: SessionOptimizerSettings,
@@ -108,7 +108,7 @@ pub struct QueryExecutionContext {
 }
 
 impl QueryExecutionContext {
-    pub(crate) fn new(
+    pub fn new(
         role: ClusterRole,
         topology: BackendTopologySnapshot,
         deadline: Option<Instant>,
@@ -156,7 +156,7 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
-    pub(crate) fn new(session: RequestSessionContext, execution: QueryExecutionContext) -> Self {
+    pub fn new(session: RequestSessionContext, execution: QueryExecutionContext) -> Self {
         Self { session, execution }
     }
 

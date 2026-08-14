@@ -25,20 +25,20 @@ use arrow::datatypes::DataType;
 use bytes::Bytes;
 use common::coordination_fixture::JournalInspect;
 use novarocks::common::app_config::ClusterRole;
-use novarocks::engine::insert_engine::{
+use novarocks::query_execution::backend::BackendTopologySnapshot;
+use novarocks::query_execution::cancellation::QueryCancellationSource;
+use novarocks::query_execution::dml::insert::{
     IcebergInsertCommit, IcebergInsertOperation, IcebergInsertSource, IcebergPreparedInsert,
     IcebergWriteReport, InsertEngine, InsertOverwriteMode, InsertValue, PrepareIcebergInsert,
     PreparedIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
 };
-use novarocks::engine::statistics::{
+use novarocks::query_execution::request_context::{RequestAdmission, RequestContext};
+use novarocks::runtime::query_result::QueryResult;
+use novarocks::statistics::{
     CatalogTableStatistics, CollectedColumnStatistics, StatisticsColumn, StatisticsEngine,
     StatisticsInsertObservation, StatisticsRequestContext, StatisticsService,
     StatisticsStatementResult, StatisticsTableTarget,
 };
-use novarocks::query_execution::backend::BackendTopologySnapshot;
-use novarocks::query_execution::cancellation::QueryCancellationSource;
-use novarocks::query_execution::request_context::{RequestAdmission, RequestContext};
-use novarocks::runtime::query_result::QueryResult;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_frontend::dml::model::DML_OPERATION_SCHEMA_VERSION;
 use novarocks_frontend::dml::{
@@ -176,8 +176,8 @@ impl InsertEngine for FakeInsertEngine {
     /// engine must expose a real write authority to fence against.
     fn establish_iceberg_write_external_fence(
         &self,
-        _prepared: &dyn novarocks::engine::insert_engine::IcebergPreparedInsert,
-        proposal: &dyn novarocks::engine::external_write_fence::ExternalWriteFenceProposal,
+        _prepared: &dyn novarocks::query_execution::dml::insert::IcebergPreparedInsert,
+        proposal: &dyn novarocks::query_execution::dml::external_write_fence::ExternalWriteFenceProposal,
     ) -> Result<
         novarocks_spi::connector::ConnectorEstablishedWriteFence,
         novarocks_spi::connector::ConnectorError,
@@ -248,6 +248,24 @@ impl InsertEngine for FakeInsertEngine {
                 has_staged_files: true,
             },
         })
+    }
+
+    fn iceberg_write_native_encoding<'a>(
+        &self,
+        _prepared: &'a dyn IcebergPreparedInsert,
+    ) -> Result<
+        novarocks::query_execution::dml::insert::PreparedIcebergWriteNativeEncoding<'a>,
+        String,
+    > {
+        novarocks::query_execution::dml::insert::PreparedIcebergWriteNativeEncoding::test_fixture()
+    }
+
+    fn run_iceberg_write_with_native_bundle(
+        &self,
+        prepared: &dyn IcebergPreparedInsert,
+        _native_bundle: novarocks::protocol::native::encode::NativeFragmentBundle,
+    ) -> Result<IcebergWriteReport, String> {
+        self.run_iceberg_write(prepared)
     }
 
     fn commit_iceberg_write_terminal(

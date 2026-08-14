@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
-use novarocks::engine::table_maintenance::MaintenanceRequestContext;
+use novarocks::maintenance::MaintenanceRequestContext;
 use novarocks_catalog::identifier::normalize_identifier;
 use sqlparser::ast::{ObjectName, ObjectNamePart};
 use sqlparser::keywords::Keyword;

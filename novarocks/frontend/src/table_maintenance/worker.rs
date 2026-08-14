@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use novarocks::engine::table_maintenance::{MaintenanceActionOutcome, TableMaintenanceEngine};
+use novarocks::maintenance::{MaintenanceActionOutcome, TableMaintenanceEngine};
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;

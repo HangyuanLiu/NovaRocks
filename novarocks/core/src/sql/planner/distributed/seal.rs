@@ -280,6 +280,50 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
     })
 }
 
+/// Minimal sealed plan used only to exercise Frontend native-encoding test
+/// doubles. It is constructed and sealed through the production planner path.
+pub(crate) fn native_encoder_test_fixture_plan() -> Result<DistributedPlan, String> {
+    let draft = DistributedPlanDraft {
+        fragments: vec![PlanFragment {
+            fragment_id: 7,
+            root: super::node::DistributedNode {
+                node_id: 70,
+                fragment_id: 7,
+                tuple_ids: Vec::new(),
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                runtime_filter_binding_ids: Vec::new(),
+                children: Vec::new(),
+                stats: crate::sql::planner::physical::PhysicalPlanStats {
+                    output_row_count: 0.0,
+                    row_count_confidence:
+                        crate::sql::planner::physical::PlannerConfidence::Fallback,
+                    column_statistics: Default::default(),
+                    cost_estimate: None,
+                    broadcast_decision: None,
+                },
+                payload: super::node::DistributedNodeKind::Values(
+                    crate::sql::planner::payload::PlanValuesNode {
+                        rows: Vec::new(),
+                        columns: Vec::new(),
+                    },
+                ),
+            },
+            data_partition: super::fragment::DataPartition::unpartitioned(),
+            output_partition: super::fragment::DataPartition::unpartitioned(),
+            sink: super::fragment::DataSink::Result,
+            output_exprs: None,
+            output_columns: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        }],
+        root_fragment_id: Some(7),
+        edges: Vec::new(),
+        runtime_filter_graph: Default::default(),
+    };
+    seal_draft(draft).map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 pub(super) mod test_support {
     use crate::sql::planner::distributed::activation_decision::DraftRuntimeFilterGraph;

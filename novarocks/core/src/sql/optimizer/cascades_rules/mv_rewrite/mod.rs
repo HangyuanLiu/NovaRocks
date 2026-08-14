@@ -34,7 +34,7 @@ use descriptor::SpjgDescriptor;
 pub(crate) const RULE_NAME: &str = "MvRewrite";
 
 /// One usable MV candidate, fully prepared by the engine layer
-/// (`src/engine/mv_rewrite_prep.rs`). Everything the optimizer rule needs;
+/// (`src/mv/rewrite_prep.rs`). Everything the optimizer rule needs;
 /// no engine/catalog handles cross this boundary.
 #[derive(Clone, Debug)]
 pub(crate) struct MvRewriteCandidate {

@@ -137,7 +137,7 @@ fn collect_coalesce_scan_tables(
 fn coalesce_materialization(
     table: &crate::sql::planner::table::TableDef,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-) -> crate::engine::query_planning::bindings::QueryScanMaterialization {
+) -> crate::query_execution::planning::bindings::QueryScanMaterialization {
     let metadata = planning_lease
         .binding()
         .metadata()
@@ -151,7 +151,7 @@ fn coalesce_materialization(
             context: crate::connector::test_request_context(),
         })
         .expect("fixture read admission");
-    crate::engine::query_planning::bindings::QueryScanMaterialization {
+    crate::query_execution::planning::bindings::QueryScanMaterialization {
         table: metadata.table,
         schema: metadata.schema,
         selector: ConnectorReadSelector::Current,
@@ -162,14 +162,14 @@ fn coalesce_materialization(
 
 fn coalesce_binding(
     table: crate::sql::planner::table::TableDef,
-    materialization: crate::engine::query_planning::bindings::QueryScanMaterialization,
+    materialization: crate::query_execution::planning::bindings::QueryScanMaterialization,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     frozen_snapshot_ids: &std::collections::BTreeSet<i64>,
-) -> crate::engine::query_planning::bindings::QueryTableBinding {
+) -> crate::query_execution::planning::bindings::QueryTableBinding {
     let mv_target_read = match &table.source {
         ScanSource::Sql(source) => match &source.kind {
             crate::sql::planner::table::SqlScanKind::MvTargetState { facts } => Some(
-                crate::engine::query_planning::bindings::MvTargetReadAdmission {
+                crate::query_execution::planning::bindings::MvTargetReadAdmission {
                     full: materialization.clone(),
                     affected_partitions: materialization.clone(),
                     target_table_uuid: facts.target_table_uuid.clone(),
@@ -177,7 +177,7 @@ fn coalesce_binding(
                 },
             ),
             crate::sql::planner::table::SqlScanKind::MvTargetLocator { facts } => Some(
-                crate::engine::query_planning::bindings::MvTargetReadAdmission {
+                crate::query_execution::planning::bindings::MvTargetReadAdmission {
                     full: materialization.clone(),
                     affected_partitions: materialization.clone(),
                     target_table_uuid: facts.target_table_uuid.clone(),
@@ -196,14 +196,14 @@ fn coalesce_binding(
             (*snapshot_id, frozen)
         })
         .collect();
-    crate::engine::query_planning::bindings::QueryTableBinding {
+    crate::query_execution::planning::bindings::QueryTableBinding {
         resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
             Some("ice"),
             "db",
             table,
         ),
         statistics_pin: None,
-        admission: crate::engine::query_planning::bindings::QueryTableBindingAdmission::Exact(
+        admission: crate::query_execution::planning::bindings::QueryTableBindingAdmission::Exact(
             planning_lease,
         ),
         scan_materialization: Some(materialization),
@@ -218,7 +218,7 @@ fn coalesce_binding(
 fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() {
     use std::num::NonZeroU64;
 
-    use crate::engine::query_planning::bindings::{
+    use crate::query_execution::planning::bindings::{
         QueryScanMaterialization, QueryTableBindingKey, QueryTableBindingStore,
     };
     use crate::sql::planner::table::SqlScanKind;
@@ -319,9 +319,13 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
             "prepared binding missing coalesce scan node {node_id}"
         );
     }
-    let native =
-        crate::protocol::native::encode::encode_native_fragment_bundle(&distributed, &prepared)
-            .expect("tokenized coalesce plan must lower to native fragments");
+    let native = crate::protocol::native::encode::encode_native_fragment_bundle(
+        crate::protocol::native::encode::NativeFragmentEncodingSource::unsealed(
+            &distributed,
+            &prepared,
+        ),
+    )
+    .expect("tokenized coalesce plan must lower to native fragments");
     assert_eq!(
         native.fragment_ids().count(),
         distributed.fragments().len(),
@@ -408,11 +412,11 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
             &ConnectorInstanceId::parse(&table.catalog).expect("fixture catalog instance"),
         )
         .expect("fixture planning lease");
-    let bindings = crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
+    let bindings = crate::query_execution::planning::bindings::QueryTableBindingStore::try_new()
         .expect("binding store");
     let binding_id = bindings
         .resolve_or_insert_with_id(
-            crate::engine::query_planning::bindings::QueryTableBindingKey::strict_base(
+            crate::query_execution::planning::bindings::QueryTableBindingKey::strict_base(
                 &table.catalog,
                 &table.namespace,
                 &table.table,
@@ -444,7 +448,7 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
                         context: crate::connector::test_request_context(),
                     })
                     .expect("fixture read admission");
-                let binding = crate::engine::query_planning::bindings::QueryTableBinding {
+                let binding = crate::query_execution::planning::bindings::QueryTableBinding {
                     resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                         Some(&table.catalog),
                         "default",
@@ -452,11 +456,11 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
                     ),
                     statistics_pin: None,
                     admission:
-                        crate::engine::query_planning::bindings::QueryTableBindingAdmission::Exact(
+                        crate::query_execution::planning::bindings::QueryTableBindingAdmission::Exact(
                             lease.clone(),
                         ),
                     scan_materialization: Some(
-                        crate::engine::query_planning::bindings::QueryScanMaterialization {
+                        crate::query_execution::planning::bindings::QueryScanMaterialization {
                             table: metadata.table,
                             schema: metadata.schema,
                             selector: ConnectorReadSelector::Current,
@@ -521,7 +525,7 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
 fn sqlx1_preparation_rejects_unbound_binding_instead_of_reacquiring_current() {
     let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
     let controls = crate::connector::FixtureControlResolver::new(registry);
-    let bindings = crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
+    let bindings = crate::query_execution::planning::bindings::QueryTableBindingStore::try_new()
         .expect("binding store");
     let error = match super::super::prepare_scan_bindings(
         &plan(scan_node(10)),

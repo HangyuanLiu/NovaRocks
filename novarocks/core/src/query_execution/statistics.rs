@@ -337,7 +337,7 @@ pub(crate) fn build_statistics_collection_request(
         context.clone(),
     )?;
     let table_bindings = Arc::new(
-        crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
+        crate::query_execution::planning::bindings::QueryTableBindingStore::try_new()
             .map_err(contract_violation)?,
     );
     let source_binding = admit_statistics_scan_binding(table_bindings.as_ref(), &program)?;
@@ -367,9 +367,13 @@ pub(crate) fn build_statistics_collection_request(
         ),
     )
     .map_err(contract_violation)?;
-    let native_bundle =
-        crate::protocol::native::encode::encode_native_fragment_bundle(&distributed, &prepared)
-            .map_err(contract_violation)?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        crate::protocol::native::encode::NativeFragmentEncodingSource::unsealed(
+            &distributed,
+            &prepared,
+        ),
+    )
+    .map_err(contract_violation)?;
     Ok(build_statistics_query_request_with_execution(
         prepared,
         native_bundle,
@@ -452,10 +456,10 @@ fn statistics_scan_physical_plan(
 /// statistics lease; the binding store keeps the synthetic compiler source
 /// scoped to this one submission and prevents a fallback catalog acquire.
 fn admit_statistics_scan_binding(
-    bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
+    bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
     program: &StatisticsCollectionProgram,
 ) -> Result<crate::sql::binding::SqlTableBindingId, DistributedQueryError> {
-    use crate::engine::query_planning::bindings::{QueryTableBinding, QueryTableBindingKey};
+    use crate::query_execution::planning::bindings::{QueryTableBinding, QueryTableBindingKey};
     use crate::sql::catalog::ResolvedAnalyzerTable;
     use crate::sql::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
@@ -505,7 +509,7 @@ fn admit_statistics_scan_binding(
                     ),
                     statistics_pin: None,
                     admission:
-                        crate::engine::query_planning::bindings::QueryTableBindingAdmission::Local,
+                        crate::query_execution::planning::bindings::QueryTableBindingAdmission::Local,
                     scan_materialization: None,
                     mv_target_read: None,
                     write_target_admission: None,

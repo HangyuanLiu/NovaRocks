@@ -43,7 +43,7 @@ use crate::novarocks_config::NovaRocksConfig;
 use crate::version;
 
 use self::encoding::write_query_result;
-use crate::engine::StatementResult;
+use crate::query_execution::StatementResult;
 use crate::query_execution::cancellation::QueryCancellationReason;
 use crate::query_execution::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,

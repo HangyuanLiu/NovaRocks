@@ -16,7 +16,7 @@
 // under the License.
 
 use bytes::Bytes;
-use novarocks::engine::table_maintenance::{MaintenanceTarget, OptimizeJobState};
+use novarocks::maintenance::{MaintenanceTarget, OptimizeJobState};
 use novarocks_spi::connector::ConnectorWriteExecutionId;
 use novarocks_state_store::coordination::FencingToken;
 use serde::{Deserialize, Serialize};

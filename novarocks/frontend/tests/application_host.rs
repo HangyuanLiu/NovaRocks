@@ -16,11 +16,11 @@
 // under the License.
 
 use bytes::Bytes;
-use novarocks::engine::table_maintenance::{
+use novarocks::maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
     MaintenanceTarget, TableMaintenanceEngine,
 };
-use novarocks::engine::view::{
+use novarocks::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
     ViewEngine, ViewRequestContext, ViewSqlDialect, ViewTarget,
 };
