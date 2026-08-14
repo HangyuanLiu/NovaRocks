@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -60,10 +60,41 @@ struct RetainedTerminalIngress {
 
 struct ActiveQuery {
     scheduled_backends: BTreeMap<usize, u64>,
+    /// The user-visible failure is the lexical minimum of all reported
+    /// failures.  This deliberately makes concurrent failure reporting
+    /// independent of arrival order until T9 introduces the richer typed
+    /// ordering.
     first_failure: Option<String>,
+    /// Keep every losing distinct failure for the later structured
+    /// convergence snapshot instead of discarding it at the first latch.
+    secondary_failures: BTreeSet<String>,
     cancellation_requested: bool,
     cancellation_dispatched: bool,
     active_attempt: Option<Arc<dyn ActiveQueryAttemptControl>>,
+}
+
+impl ActiveQuery {
+    /// Records a failure using a commutative, idempotent minimum fold.
+    ///
+    /// `first_failure` remains the compatibility-facing name for the primary
+    /// textual error while callers migrate to the typed T9 cause model.
+    fn record_failure(&mut self, message: String) -> String {
+        match self.first_failure.as_mut() {
+            None => self.first_failure = Some(message),
+            Some(primary) if message < *primary => {
+                let displaced = std::mem::replace(primary, message.clone());
+                self.secondary_failures.remove(&message);
+                self.secondary_failures.insert(displaced);
+            }
+            Some(primary) if message != *primary => {
+                self.secondary_failures.insert(message);
+            }
+            Some(_) => {}
+        }
+        self.first_failure
+            .clone()
+            .expect("recorded failure has a primary value")
+    }
 }
 
 #[derive(Default)]
@@ -116,6 +147,7 @@ impl FrontendQueryRegistry {
                 entry.insert(ActiveQuery {
                     scheduled_backends: BTreeMap::new(),
                     first_failure: None,
+                    secondary_failures: BTreeSet::new(),
                     cancellation_requested: false,
                     cancellation_dispatched: false,
                     active_attempt: None,
@@ -360,11 +392,9 @@ impl FrontendQueryRegistry {
             active
                 .values_mut()
                 .filter_map(|query| {
-                    query.first_failure.get_or_insert_with(|| {
-                        format!(
-                            "backend topology revision changed from {previous_revision} to {revision}"
-                        )
-                    });
+                    query.record_failure(format!(
+                        "backend topology revision changed from {previous_revision} to {revision}"
+                    ));
                     Some(request_cancellation(query))
                 })
                 .collect::<Vec<_>>()
@@ -417,11 +447,7 @@ impl FrontendQueryRegistry {
         let query = active
             .get_mut(&query_key(query_id))
             .ok_or_else(|| inactive_query(query_id))?;
-        match query.first_failure.as_mut() {
-            Some(primary) if message.starts_with(primary.as_str()) => *primary = message,
-            Some(_) => {}
-            None => query.first_failure = Some(message),
-        }
+        query.record_failure(message);
         Ok(())
     }
 
@@ -435,10 +461,7 @@ impl FrontendQueryRegistry {
             let query = active
                 .get_mut(&query_key(query_id))
                 .ok_or_else(|| inactive_query(query_id))?;
-            let message = query
-                .first_failure
-                .get_or_insert_with(|| message.into())
-                .clone();
+            let message = query.record_failure(message.into());
             (message, request_cancellation(query))
         };
         dispatch_cancellation(Some(cancellation));
@@ -455,8 +478,10 @@ impl FrontendQueryRegistry {
                     continue;
                 }
                 if query.first_failure.is_none() {
-                    query.first_failure = Some(message.clone());
+                    query.record_failure(message.clone());
                     affected.push(QueryId::new(high, low));
+                } else {
+                    query.record_failure(message.clone());
                 }
                 cancellations.push(request_cancellation(query));
             }
@@ -484,8 +509,10 @@ impl FrontendQueryRegistry {
                     continue;
                 }
                 if query.first_failure.is_none() {
-                    query.first_failure = Some(message.clone());
+                    query.record_failure(message.clone());
                     affected.push(QueryId::new(high, low));
+                } else {
+                    query.record_failure(message.clone());
                 }
                 cancellations.push(request_cancellation(query));
             }
@@ -746,5 +773,54 @@ mod tests {
                 .expect("retained ingress accepts duplicate terminal delivery")
         );
         assert_eq!(control.reports.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failure_primary_is_stable_when_reports_arrive_in_different_orders() {
+        fn record_in_order(messages: &[&str]) -> (String, Vec<String>) {
+            let registry = Arc::new(FrontendQueryRegistry::default());
+            let query_id = QueryId::new(71, 72);
+            registry
+                .active
+                .lock()
+                .expect("frontend query registry lock")
+                .insert(
+                    query_key(query_id),
+                    ActiveQuery {
+                        scheduled_backends: BTreeMap::new(),
+                        first_failure: None,
+                        secondary_failures: BTreeSet::new(),
+                        cancellation_requested: false,
+                        cancellation_dispatched: false,
+                        active_attempt: None,
+                    },
+                );
+            for message in messages {
+                registry
+                    .latch_failure_and_cancel(query_id, (*message).to_string())
+                    .expect("latch failure");
+            }
+            let active = registry
+                .active
+                .lock()
+                .expect("frontend query registry lock");
+            let query = active
+                .get(&query_key(query_id))
+                .expect("registered query remains active");
+            (
+                query.first_failure.clone().expect("primary failure"),
+                query.secondary_failures.iter().cloned().collect(),
+            )
+        }
+
+        let forward = record_in_order(&["zeta failure", "alpha failure", "middle failure"]);
+        let reverse = record_in_order(&["middle failure", "alpha failure", "zeta failure"]);
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.0, "alpha failure");
+        assert_eq!(
+            forward.1,
+            vec!["middle failure".to_string(), "zeta failure".to_string()]
+        );
     }
 }

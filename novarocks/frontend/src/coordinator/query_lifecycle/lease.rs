@@ -1041,7 +1041,7 @@ impl AttemptControl {
 
     fn wait_for_all_outcomes(&self, timeout: Duration) -> Result<QueryTerminalSet, String> {
         let expected = self.admitted_len().map_err(|error| error.to_string())?;
-        self.wait_terminal_event(timeout, |terminal| {
+        let result = self.wait_terminal_event(timeout, |terminal| {
             if let Some(error) = &terminal.reader_failure {
                 return Some(Err(error.clone()));
             }
@@ -1062,8 +1062,40 @@ impl AttemptControl {
             Some(snapshots.and_then(|snapshots| {
                 QueryTerminalSet::new(snapshots).map_err(|error| error.to_string())
             }))
-        })
-        .ok_or_else(|| "query lifecycle timed out waiting for all terminal outcomes".to_string())?
+        });
+        result.unwrap_or_else(|| Err(self.no_outcome_error()))
+    }
+
+    fn no_outcome_error(&self) -> String {
+        let admitted = self
+            .admitted
+            .lock()
+            .expect("admitted participant set")
+            .clone();
+        let terminal = self.terminal.0.lock().expect("query terminal state");
+        let Some(admitted) = admitted else {
+            return "query lifecycle NoOutcome: admitted participant set was never frozen"
+                .to_string();
+        };
+        let missing = admitted
+            .iter()
+            .filter(|(backend_idx, _)| !terminal.outcomes.contains_key(backend_idx))
+            .map(|(backend_idx, participant)| {
+                format!(
+                    "backend={backend_idx} start_epoch={} digest={}",
+                    participant.target.start_epoch(),
+                    hex::encode(participant.digest.as_bytes())
+                )
+            })
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            "query lifecycle NoOutcome: terminal outcome convergence did not complete".to_string()
+        } else {
+            format!(
+                "query lifecycle NoOutcome missing admitted participants: {}",
+                missing.join(", ")
+            )
+        }
     }
 
     fn wait_terminal_event<T>(

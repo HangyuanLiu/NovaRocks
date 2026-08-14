@@ -1549,6 +1549,44 @@ fn frontend_query_lifecycle_finalize_keeps_heartbeats_until_all_participants_dra
 }
 
 #[test]
+fn frontend_query_lifecycle_finalization_reports_stable_no_outcome_participants() {
+    let plan = query_init_plan(None);
+    let (transport, sessions) = RecordingTransport::ready(&plan);
+    let (registry, _query) = registry_for(&plan);
+    let finalize_config = config()
+        .with_terminal_timeouts(Duration::from_millis(20), Duration::from_millis(20))
+        .expect("terminal timeouts");
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport), registry, finalize_config);
+    let lease = barrier
+        .initialize_all(plan)
+        .expect("all participants ready");
+    for session in sessions.values() {
+        session.suppress_terminal_snapshot_on_finalize();
+    }
+
+    let error = lease
+        .finalize()
+        .expect_err("missing terminal outcomes must fail");
+    let message = error.message();
+    assert!(
+        message.contains("NoOutcome missing admitted participants"),
+        "{message}"
+    );
+    for backend_idx in [0, 1, 2] {
+        assert!(
+            message.contains(&format!("backend={backend_idx}")),
+            "{message}"
+        );
+    }
+    assert!(
+        message.find("backend=0") < message.find("backend=1")
+            && message.find("backend=1") < message.find("backend=2"),
+        "missing participants must be stable-sorted: {message}"
+    );
+}
+
+#[test]
 fn frontend_query_lifecycle_lease_duplicate_abort_is_idempotent() {
     let plan = query_init_plan(None);
     let query_id = plan.execution_id().query_id();
