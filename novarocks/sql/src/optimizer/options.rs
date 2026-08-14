@@ -148,7 +148,12 @@ impl SessionOptimizerSettings {
         self.enable_materialized_view_rewrite.unwrap_or(true)
     }
 
-    pub(crate) fn connector_static_predicate_pushdown_enabled(&self) -> bool {
+    /// Return the frozen connector static-predicate admission policy.
+    ///
+    /// This controls only whether application scan preparation offers static
+    /// predicates to a connector; SQL and Core always retain residual
+    /// predicate evaluation.
+    pub fn connector_static_predicate_pushdown_enabled(&self) -> bool {
         self.enable_connector_static_predicate_pushdown
             .unwrap_or(true)
     }

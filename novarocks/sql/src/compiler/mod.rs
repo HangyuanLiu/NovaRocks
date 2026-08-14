@@ -1219,6 +1219,19 @@ mod tests {
     }
 
     #[test]
+    fn compiler_session_settings_expose_static_predicate_pushdown_policy() {
+        assert!(SessionOptimizerSettings::default().connector_static_predicate_pushdown_enabled());
+
+        let mut disabled = SessionOptimizerSettings::default();
+        disabled.enable_connector_static_predicate_pushdown = Some(false);
+        assert!(!disabled.connector_static_predicate_pushdown_enabled());
+
+        let mut enabled = SessionOptimizerSettings::default();
+        enabled.enable_connector_static_predicate_pushdown = Some(true);
+        assert!(enabled.connector_static_predicate_pushdown_enabled());
+    }
+
+    #[test]
     fn explain_output_terminal_rejects_the_wrong_output_shape() {
         let error = SqlCompileOutput::ImmediateExplain(vec!["EXPLAIN".to_string()])
             .into_explain_lines(ExplainLevel::Normal, true)
