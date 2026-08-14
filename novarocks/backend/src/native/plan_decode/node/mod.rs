@@ -1600,9 +1600,567 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::datatypes::DataType;
-    use novarocks_execution::runtime_filter as execution;
 
     use super::*;
+    use crate::native::type_decode::encode_type;
+    use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_execution::exec::node::assert::{AssertNumRowsMode, Assertion};
+    use novarocks_execution::exec::node::set_op::SetOpKind;
+    use novarocks_execution::runtime_filter as execution;
+    use novarocks_protocol::{common, expr, plan};
+    use novarocks_types::SlotId;
+
+    struct DummyScanOp;
+
+    impl novarocks_execution::exec::node::scan::ScanOp for DummyScanOp {
+        fn execute_iter(
+            &self,
+            _morsel: novarocks_execution::exec::node::scan::ScanMorsel,
+            _profile: Option<novarocks_execution::runtime::profile::RuntimeProfile>,
+            _runtime_filters: Option<&novarocks_execution::exec::node::scan::RuntimeFilterContext>,
+        ) -> Result<novarocks_execution::exec::node::BoxedExecIter, String> {
+            Ok(Box::new(std::iter::empty()))
+        }
+
+        fn build_morsels(
+            &self,
+        ) -> Result<novarocks_execution::exec::node::scan::ScanMorsels, String> {
+            Ok(novarocks_execution::exec::node::scan::ScanMorsels::default())
+        }
+    }
+
+    pub(super) fn type_desc(data_type: &DataType) -> common::TypeDesc {
+        encode_type(data_type).expect("encode type")
+    }
+
+    pub(super) fn output_column_with_nullable(
+        column_id: u32,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> common::OutputColumn {
+        common::OutputColumn {
+            column_id,
+            name: name.to_string(),
+            r#type: Some(type_desc(&data_type)),
+            nullable,
+            is_internal: false,
+        }
+    }
+
+    pub(super) fn output_column(
+        column_id: u32,
+        name: &str,
+        data_type: DataType,
+    ) -> common::OutputColumn {
+        output_column_with_nullable(column_id, name, data_type, true)
+    }
+
+    fn int_literal(value: i64) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&DataType::Int64)),
+            nullable: false,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::IntValue(value)),
+                }),
+            })),
+        }
+    }
+
+    pub(super) fn string_literal(value: &str) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&DataType::Utf8)),
+            nullable: false,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::StringValue(value.to_string())),
+                }),
+            })),
+        }
+    }
+
+    pub(super) fn bool_literal(value: bool) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&DataType::Boolean)),
+            nullable: false,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::BoolValue(value)),
+                }),
+            })),
+        }
+    }
+
+    fn null_literal(data_type: DataType) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&data_type)),
+            nullable: true,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::NullValue(true)),
+                }),
+            })),
+        }
+    }
+
+    pub(super) fn column_ref(column_id: u32, data_type: DataType) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&data_type)),
+            nullable: true,
+            kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
+                column_id,
+                qualifier: None,
+                column: None,
+            })),
+        }
+    }
+
+    pub(super) fn sort_item(column_id: u32) -> expr::SortItem {
+        expr::SortItem {
+            expr: Some(column_ref(column_id, DataType::Int64)),
+            asc: true,
+            nulls_first: false,
+        }
+    }
+
+    pub(super) fn physical_node(
+        node_id: i32,
+        kind: plan::plan_node::Kind,
+        output_columns: Vec<common::OutputColumn>,
+        children: Vec<plan::DistributedNode>,
+    ) -> plan::DistributedNode {
+        plan::DistributedNode {
+            node_id,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children,
+            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                output_columns,
+                kind: Some(kind),
+            })),
+        }
+    }
+
+    pub(super) fn values_node(node_id: i32) -> plan::DistributedNode {
+        let columns = vec![
+            output_column(1, "id", DataType::Int64),
+            output_column(2, "name", DataType::Utf8),
+        ];
+        physical_node(
+            node_id,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![
+                    plan::ExprList {
+                        values: vec![int_literal(10), string_literal("alice")],
+                    },
+                    plan::ExprList {
+                        values: vec![int_literal(20), string_literal("bob")],
+                    },
+                ],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        )
+    }
+
+    pub(super) fn one_col_values_node(node_id: i32) -> plan::DistributedNode {
+        one_col_values_node_with(node_id, 1, "id", 10)
+    }
+
+    pub(super) fn one_col_values_node_with(
+        node_id: i32,
+        column_id: u32,
+        name: &str,
+        value: i64,
+    ) -> plan::DistributedNode {
+        one_col_values_node_with_nullable(node_id, column_id, name, value, true)
+    }
+
+    pub(super) fn one_col_values_node_with_nullable(
+        node_id: i32,
+        column_id: u32,
+        name: &str,
+        value: i64,
+        nullable: bool,
+    ) -> plan::DistributedNode {
+        let columns = vec![output_column_with_nullable(
+            column_id,
+            name,
+            DataType::Int64,
+            nullable,
+        )];
+        physical_node(
+            node_id,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![plan::ExprList {
+                    values: vec![int_literal(value)],
+                }],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        )
+    }
+
+    fn one_col_values_node_typed(
+        node_id: i32,
+        column_id: u32,
+        name: &str,
+        value: i64,
+        data_type: DataType,
+    ) -> plan::DistributedNode {
+        let columns = vec![output_column(column_id, name, data_type)];
+        physical_node(
+            node_id,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![plan::ExprList {
+                    values: vec![int_literal(value)],
+                }],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        )
+    }
+
+    pub(super) fn two_col_values_node(node_id: i32) -> plan::DistributedNode {
+        let columns = vec![
+            output_column(1, "a", DataType::Int64),
+            output_column(2, "b", DataType::Int64),
+        ];
+        physical_node(
+            node_id,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![plan::ExprList {
+                    values: vec![int_literal(10), int_literal(20)],
+                }],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        )
+    }
+
+    pub(super) fn three_col_values_node(node_id: i32) -> plan::DistributedNode {
+        let columns = vec![
+            output_column(1, "a", DataType::Int64),
+            output_column(2, "b", DataType::Int64),
+            output_column(3, "c", DataType::Int64),
+        ];
+        physical_node(
+            node_id,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![plan::ExprList {
+                    values: vec![int_literal(10), int_literal(20), int_literal(30)],
+                }],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        )
+    }
+
+    pub(super) fn lower(node: &plan::DistributedNode) -> super::DecodedNode {
+        let mut arena = ExprArena::default();
+        decode_node(node, &mut arena, &NativePlanDecodeContext::default()).expect("lower node")
+    }
+
+    fn decode_error(
+        node: &plan::DistributedNode,
+    ) -> crate::native::plan_decode::error::NativeFragmentDecodeError {
+        decode_node(
+            node,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+        )
+        .expect_err("invalid node must fail")
+    }
+
+    fn assert_children_error(node: &plan::DistributedNode) {
+        let error = decode_error(node);
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(protocol.path().to_string(), "plan_fragment.root.children");
+        assert_eq!(
+            protocol.kind(),
+            novarocks::protocol::common::error::ProtocolErrorKind::InconsistentFields
+        );
+    }
+
+    #[test]
+    fn rejects_scan_without_context_and_union_distinct() {
+        let scan = physical_node(
+            50,
+            plan::plan_node::Kind::Scan(plan::ScanNode::default()),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut arena = ExprArena::default();
+        let err = decode_node(&scan, &mut arena, &NativePlanDecodeContext::default()).unwrap_err();
+        assert!(err.contains("Scan"));
+        assert!(err.contains("table missing"));
+
+        let union_distinct = physical_node(
+            60,
+            plan::plan_node::Kind::SetOp(plan::SetOpNode {
+                kind: plan::PlanSetOpKind::UnionDistinct as i32,
+                output_columns: vec![output_column(1, "id", DataType::Int64)],
+                child_output_columns: Vec::new(),
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10), one_col_values_node(11)],
+        );
+        let err = decode_node(
+            &union_distinct,
+            &mut arena,
+            &NativePlanDecodeContext::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("UnionDistinct"));
+        assert!(err.contains("not implemented"));
+    }
+
+    #[test]
+    fn lowers_union_all_intersect_except_and_assert_one_row() {
+        let output_columns = vec![output_column(1, "id", DataType::Int64)];
+        let union_all = physical_node(
+            60,
+            plan::plan_node::Kind::SetOp(plan::SetOpNode {
+                kind: plan::PlanSetOpKind::UnionAll as i32,
+                output_columns: output_columns.clone(),
+                child_output_columns: Vec::new(),
+            }),
+            output_columns.clone(),
+            vec![one_col_values_node(10), one_col_values_node(11)],
+        );
+        let lowered = lower(&union_all);
+        assert!(matches!(lowered.node.kind, ExecNodeKind::UnionAll(_)));
+
+        for (kind, expected) in [
+            (plan::PlanSetOpKind::Intersect, SetOpKind::Intersect),
+            (plan::PlanSetOpKind::Except, SetOpKind::Except),
+        ] {
+            let set_op = physical_node(
+                61,
+                plan::plan_node::Kind::SetOp(plan::SetOpNode {
+                    kind: kind as i32,
+                    output_columns: output_columns.clone(),
+                    child_output_columns: Vec::new(),
+                }),
+                output_columns.clone(),
+                vec![one_col_values_node(10), one_col_values_node(11)],
+            );
+            let lowered = lower(&set_op);
+            let ExecNodeKind::SetOp(set_op) = lowered.node.kind else {
+                panic!("expected SetOp");
+            };
+            assert_eq!(
+                std::mem::discriminant(&set_op.kind),
+                std::mem::discriminant(&expected)
+            );
+            assert_eq!(set_op.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+        }
+
+        let assert_one_row = physical_node(
+            70,
+            plan::plan_node::Kind::AssertOneRow(plan::AssertOneRowNode {
+                subquery_text: "select id from t".to_string(),
+                desired_num_rows: Some(1),
+                assertion: plan::RowCountAssertion::Le as i32,
+                group_key_column_ids: Vec::new(),
+                group_key_labels: Vec::new(),
+                keyed_message_prefix: None,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let lowered = lower(&assert_one_row);
+        let ExecNodeKind::AssertNumRows(assert) = lowered.node.kind else {
+            panic!("expected AssertNumRows");
+        };
+        match assert.mode {
+            AssertNumRowsMode::Global {
+                desired_num_rows,
+                assertion,
+                subquery_string,
+            } => {
+                assert_eq!(desired_num_rows, Some(1));
+                assert!(matches!(assertion, Assertion::Le));
+                assert_eq!(subquery_string.as_deref(), Some("select id from t"));
+            }
+            AssertNumRowsMode::PerKeyAtMostOne { .. } => panic!("expected global assert"),
+        }
+    }
+
+    #[test]
+    fn lowers_hash_aggregate_and_join_shapes() {
+        let output_columns = vec![
+            output_column(1, "id", DataType::Int64),
+            output_column(2, "cnt", DataType::Int64),
+        ];
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Single as i32,
+                group_by: vec![column_ref(1, DataType::Int64)],
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "count".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Int64)),
+                    order_by: Vec::new(),
+                    output_column_id: 2,
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: vec![output_columns[0].clone()],
+                    aggregate_columns: vec![output_columns[1].clone()],
+                }),
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+        let lowered = lower(&aggregate);
+        let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
+            panic!("expected Aggregate");
+        };
+        assert_eq!(aggregate.node_id, 20);
+        assert_eq!(aggregate.group_by.len(), 1);
+        assert_eq!(aggregate.functions.len(), 1);
+        assert!(aggregate.need_finalize);
+        assert_eq!(
+            aggregate.output_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+
+        let join = physical_node(
+            30,
+            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                join_type: plan::JoinKind::Inner as i32,
+                eq_conditions: vec![plan::HashJoinEqCondition {
+                    left: Some(column_ref(1, DataType::Int64)),
+                    right: Some(column_ref(2, DataType::Int64)),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: plan::JoinDistribution::Broadcast as i32,
+                execution_mode: None,
+            }),
+            Vec::new(),
+            vec![
+                one_col_values_node_with(10, 1, "lhs", 10),
+                one_col_values_node_with(11, 2, "rhs", 10),
+            ],
+        );
+        let lowered = lower(&join);
+        let ExecNodeKind::Join(join) = lowered.node.kind else {
+            panic!("expected Join");
+        };
+        assert_eq!(join.probe_keys.len(), 1);
+        assert_eq!(join.build_keys.len(), 1);
+        assert_eq!(join.eq_null_safe, vec![false]);
+        assert_eq!(
+            join.join_scope_chunk_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(2)]
+        );
+        assert!(matches!(
+            join.join_type,
+            novarocks_execution::exec::node::join::JoinType::Inner
+        ));
+    }
+
+    #[test]
+    fn lowers_repeat_change_event_and_redistribute_shapes() {
+        let repeat = physical_node(
+            20,
+            plan::plan_node::Kind::Repeat(plan::RepeatNode {
+                repeat_column_ref_list: Vec::new(),
+                repeat_column_ref_ids: vec![
+                    plan::UInt32List { values: vec![1] },
+                    plan::UInt32List { values: Vec::new() },
+                ],
+                grouping_ids: vec![0, 1],
+                all_rollup_columns: vec!["id".to_string()],
+                all_rollup_column_ids: vec![1],
+                grouping_key_aliases: Vec::new(),
+                grouping_fn_args: Vec::new(),
+                grouping_fn_arg_ids: vec![plan::UInt32List { values: vec![1] }],
+                grouping_fn_ids: vec![plan::NamedUInt32 {
+                    name: "__grouping_fn_0".to_string(),
+                    value: 9,
+                }],
+                virtual_tuple_id: Some(7),
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let lowered = lower(&repeat);
+        let ExecNodeKind::Repeat(repeat) = lowered.node.kind else {
+            panic!("expected Repeat");
+        };
+        assert_eq!(repeat.repeat_times, 2);
+        assert_eq!(repeat.null_slot_ids, vec![vec![], vec![SlotId::new(1)]]);
+        assert_eq!(repeat.grouping_slot_ids, vec![SlotId::new(9)]);
+        assert_eq!(repeat.grouping_list, vec![vec![0, 1]]);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1), SlotId::new(9)]);
+        assert_eq!(
+            lowered.output_schema.slot_ids(),
+            &[SlotId::new(1), SlotId::new(9)]
+        );
+
+        let change_event = physical_node(
+            30,
+            plan::plan_node::Kind::ChangeEventExpand(plan::ChangeEventExpandNode {
+                events: vec![plan::DistributedChangeEventSpec {
+                    predicate: None,
+                    effect: plan::RowMutationEffect::Delete as i32,
+                    assignments: vec![plan::DistributedChangeEventOutputExpr {
+                        output_column_id: 2,
+                        expr: None,
+                    }],
+                }],
+                output_columns: vec![
+                    output_column(1, "id", DataType::Int64),
+                    output_column(2, "op", DataType::Int8),
+                ],
+                effect_column_id: 2,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let lowered = lower(&change_event);
+        let ExecNodeKind::ChangeEventExpand(change_event) = lowered.node.kind else {
+            panic!("expected ChangeEventExpand");
+        };
+        assert_eq!(
+            change_event.output_slot_ids,
+            vec![SlotId::new(1), SlotId::new(2)]
+        );
+        assert_eq!(change_event.effect_slot_id, SlotId::new(2));
+        assert_eq!(change_event.events.len(), 1);
+
+        let redistribute = physical_node(
+            40,
+            plan::plan_node::Kind::Redistribute(plan::RedistributeNode {
+                mode: Some(plan::RedistributeMode {
+                    mode: Some(plan::redistribute_mode::Mode::Gather(true)),
+                }),
+                partition_exprs: Vec::new(),
+                output_columns: vec![output_column(1, "id", DataType::Int64)],
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let lowered = lower(&redistribute);
+        assert!(matches!(lowered.node.kind, ExecNodeKind::Values(_)));
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+    }
 
     #[test]
     fn execution_contract_retains_ordered_key_semantics() {

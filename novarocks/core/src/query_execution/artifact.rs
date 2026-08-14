@@ -23,8 +23,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::datatypes::Field;
-#[cfg(test)]
-use novarocks_spi::connector::ConnectorExecutionDeclaration;
 use novarocks_spi::connector::ConnectorWriteCohortId;
 use sha2::{Digest, Sha256};
 
@@ -296,6 +294,30 @@ impl<'a> RuntimeFilterBindingEncodingView<'a> {
             tables: by_fragment,
         })
     }
+
+    /// Seal the only valid empty binding attachment.  Callers cannot use this
+    /// to discard bindings: any fragment that requires one is rejected before
+    /// the attachment is created.
+    pub(crate) fn seal_empty(
+        self,
+    ) -> Result<RuntimeFilterBindingAttachment, DistributedQueryError> {
+        let tables = self
+            .facts
+            .fragments()
+            .map(|fragment| {
+                if fragment.bindings().len() != 0 {
+                    return Err(contract_error(
+                        "empty runtime-filter binding attachment cannot discard fragment bindings",
+                    ));
+                }
+                Ok(RuntimeFilterBindingTable {
+                    fragment_id: fragment.fragment_id(),
+                    bindings: Vec::new(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.seal(tables)
+    }
 }
 
 /// A core artifact bound to one validated schedule. Query initialization/control
@@ -425,61 +447,6 @@ impl ScheduleBoundDistributedQuery {
         attachment: ConnectorWritePlanAttachment,
     ) -> Result<Self, DistributedQueryError> {
         self.attach_connector_write_plans(std::iter::once(attachment))
-    }
-
-    /// Assemble the sealed request for the core-only semantic test runtime.
-    ///
-    /// This deliberately bypasses lifecycle transport only under `cfg(test)`;
-    /// frontend production tests continue to exercise the full Init/Stage/Start
-    /// protocol and all-in-one production never calls this path.
-    #[cfg(test)]
-    pub(crate) fn assemble_for_in_process_test(
-        self,
-        query_id: QueryId,
-        options: &ResolvedQueryOptions,
-        _live_backends: &[LiveBackendTarget],
-    ) -> Result<InProcessTestArtifact, DistributedQueryError> {
-        let connector_write_plans = self.connector_write_plans;
-        // `in_process_test::bind_empty_runtime_filter_tables_for_test` rejects
-        // RF-bound plans before this assembly seam.  Keep this core-only test
-        // runtime carrier-neutral: it never compiles or installs RF semantics.
-        let runtime_filters = Vec::new();
-        let install_plan = crate::query_execution::connector_binding::compile_install_plan(
-            &self.prepared,
-            &self.schedule.inner,
-            &connector_write_plans,
-        )?;
-        let declarations = install_plan
-            .backends()
-            .iter()
-            .flat_map(|backend| backend.declarations().iter().cloned())
-            .collect::<Vec<_>>();
-        let assembled = assemble_native_execution(
-            self.prepared,
-            self.native_bundle,
-            self.schedule.inner,
-            self.schedule.execution_id,
-            NativeSubmissionContext {
-                query_id,
-                options: options.runtime_options().clone(),
-            },
-            &connector_write_plans,
-        )?;
-        Ok(InProcessTestArtifact {
-            submissions: assembled
-                .submissions
-                .into_iter()
-                .map(|submission| InProcessTestSubmission {
-                    plan: submission.plan,
-                    instance_params: submission.instance_params,
-                })
-                .collect(),
-            root_fetch: assembled.root_fetch,
-            writer_registrations: assembled.writer_registrations,
-            expected_output: assembled.expected_output,
-            declarations,
-            runtime_filters,
-        })
     }
 }
 
@@ -1640,22 +1607,6 @@ struct AssembledNativeExecution {
     root_fetch: RootFetchMetadata,
     writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
-}
-
-#[cfg(test)]
-pub(crate) struct InProcessTestSubmission {
-    pub(crate) plan: novarocks_protocol::plan::PlanFragment,
-    pub(crate) instance_params: novarocks_protocol::novarocks::InstanceParams,
-}
-
-#[cfg(test)]
-pub(crate) struct InProcessTestArtifact {
-    pub(crate) submissions: Vec<InProcessTestSubmission>,
-    pub(crate) root_fetch: RootFetchMetadata,
-    pub(crate) writer_registrations: WriterRegistrationSet,
-    pub(crate) expected_output: ExpectedOutputSchema,
-    pub(crate) declarations: Vec<ConnectorExecutionDeclaration>,
-    pub(crate) runtime_filters: Vec<RuntimeFilterContribution>,
 }
 
 impl StagePreparedDistributedQuery {

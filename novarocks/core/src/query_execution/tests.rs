@@ -324,10 +324,14 @@ fn query_control_typestate_initializes_before_native_assembly() {
     )
     .expect("valid init options");
 
-    let scheduled =
-        crate::query_execution::in_process_test::bind_empty_runtime_filter_tables_for_test(
-            parts.artifacts,
-        )
+    let attachment = parts
+        .artifacts
+        .runtime_filter_binding_view()
+        .seal_empty()
+        .expect("seal explicit empty runtime-filter bindings");
+    let scheduled = parts
+        .artifacts
+        .attach_runtime_filter_bindings(attachment)
         .expect("bind explicit empty runtime-filter tables")
         .bind_schedule(schedule)
         .expect("bind schedule");

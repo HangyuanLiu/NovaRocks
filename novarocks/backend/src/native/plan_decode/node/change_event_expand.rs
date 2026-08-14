@@ -164,3 +164,62 @@ fn change_event_effect(
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+
+    use super::super::tests::{one_col_values_node, output_column, physical_node};
+    use super::super::{NativePlanDecodeContext, decode_node};
+    use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_protocol::plan;
+
+    #[test]
+    fn change_event_rejects_invalid_effect_slot() {
+        let missing_slot = physical_node(
+            30,
+            plan::plan_node::Kind::ChangeEventExpand(plan::ChangeEventExpandNode {
+                events: vec![plan::DistributedChangeEventSpec {
+                    predicate: None,
+                    effect: plan::RowMutationEffect::Replace as i32,
+                    assignments: Vec::new(),
+                }],
+                output_columns: vec![output_column(2, "effect", DataType::Int8)],
+                effect_column_id: 3,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let mut arena = ExprArena::default();
+        let err = decode_node(
+            &missing_slot,
+            &mut arena,
+            &NativePlanDecodeContext::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("is not in outputs"));
+
+        let non_integer = physical_node(
+            31,
+            plan::plan_node::Kind::ChangeEventExpand(plan::ChangeEventExpandNode {
+                events: vec![plan::DistributedChangeEventSpec {
+                    predicate: None,
+                    effect: plan::RowMutationEffect::Replace as i32,
+                    assignments: Vec::new(),
+                }],
+                output_columns: vec![output_column(2, "effect", DataType::Utf8)],
+                effect_column_id: 2,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        let mut arena = ExprArena::default();
+        let err = decode_node(
+            &non_integer,
+            &mut arena,
+            &NativePlanDecodeContext::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("must be Int8"));
+    }
+}

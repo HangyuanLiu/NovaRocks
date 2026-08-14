@@ -1078,14 +1078,16 @@ mod tests {
     use arrow::array::{Array, BinaryArray, LargeBinaryArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks::protocol::ProtocolErrorKind;
     use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
     use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
-    use novarocks_protocol::{expr, novarocks as proto, plan};
+    use novarocks_protocol::{common, expr, novarocks as proto, plan};
     use novarocks_spi::connector::ConnectorRowMutationEffect;
     use novarocks_types::SlotId;
 
     use super::{
         decode_connector_write_output_expressions, decode_fragment_sink_assignment,
+        decode_fragment_sink_program, decode_fragment_sink_program_with_context,
         decode_row_mutation_effect,
     };
     use crate::native::plan_decode::context::NativePlanDecodeContext;
@@ -1219,6 +1221,289 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "native protocol error at instance_params.destinations[0].finst_id (missing field): native Destination requires finst_id"
+        );
+    }
+
+    fn plan_destination(id: i64) -> plan::StreamDestination {
+        plan::StreamDestination {
+            finst_id: Some(common::UniqueId { hi: 1, lo: id }),
+            endpoint: "127.0.0.1:8060".to_string(),
+        }
+    }
+
+    fn instance_destination(id: i64) -> proto::Destination {
+        proto::Destination {
+            finst_id: Some(common::UniqueId { hi: 2, lo: id }),
+            endpoint: "127.0.0.1:8061".to_string(),
+        }
+    }
+
+    fn assert_single_destination_group(assignment: FragmentSinkAssignment, expected_lo: i64) {
+        let FragmentSinkAssignment::DestinationGroups { groups, sender_id } = assignment else {
+            panic!("expected destination groups");
+        };
+        assert_eq!(sender_id, None);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 1);
+        assert_eq!(groups[0][0].finst_id().low(), expected_lo);
+    }
+
+    #[test]
+    fn multicast_assignment_ignores_redundant_flat_instance_destinations() {
+        let sink = plan::DataSink {
+            kind: Some(plan::data_sink::Kind::MultiCastDataStream(
+                plan::MultiCastDataStreamSink {
+                    sinks: Vec::new(),
+                    destinations: vec![plan::StreamDestinationList {
+                        destinations: vec![plan_destination(11)],
+                    }],
+                },
+            )),
+        };
+        let instance = proto::InstanceParams {
+            destinations: vec![instance_destination(99)],
+            ..Default::default()
+        };
+
+        let assignment = decode_fragment_sink_assignment(&sink, &instance)
+            .expect("redundant flat destinations must remain wire compatible");
+
+        assert_single_destination_group(assignment, 11);
+    }
+
+    #[test]
+    fn data_stream_missing_partition_uses_exact_sink_branch_path() {
+        let fragment = plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::DataStream(
+                    plan::DataStreamSink::default(),
+                )),
+            }),
+            ..Default::default()
+        };
+
+        let error = decode_fragment_sink_program(&fragment, &Layout::default())
+            .expect_err("missing stream partition must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.data_stream.output_partition"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn data_stream_invalid_output_column_uses_exact_indexed_path_and_kind() {
+        let fragment = plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
+                    output_partition: Some(plan::DataPartition {
+                        kind: plan::PartitionKind::Unpartitioned as i32,
+                        ..Default::default()
+                    }),
+                    output_columns: vec![1, -1],
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        };
+
+        let error = decode_fragment_sink_program(&fragment, &Layout::default())
+            .expect_err("invalid output column must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.data_stream.output_columns[1]"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn data_stream_duplicate_output_column_uses_exact_indexed_path_and_kind() {
+        let fragment = plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
+                    output_partition: Some(plan::DataPartition {
+                        kind: plan::PartitionKind::Unpartitioned as i32,
+                        ..Default::default()
+                    }),
+                    output_columns: vec![1, 1],
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        };
+
+        let error = decode_fragment_sink_program(&fragment, &Layout::default())
+            .expect_err("duplicate output column must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.data_stream.output_columns[1]"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InconsistentFields);
+    }
+
+    #[test]
+    fn connector_write_missing_handle_fails_closed() {
+        let fragment = plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::ConnectorWrite(
+                    plan::ConnectorWriteFragmentSink::default(),
+                )),
+            }),
+            ..Default::default()
+        };
+
+        let error = decode_fragment_sink_program_with_context(
+            &fragment,
+            &Layout::default(),
+            Some(&NativePlanDecodeContext::default()),
+        )
+        .expect_err("connector carrier must require a bounded writer handle");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.connector_write.handle"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    fn router_fragment(route: plan::ChangeStreamBranchRoute) -> plan::PlanFragment {
+        plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::ChangeStreamRouter(
+                    plan::ChangeStreamRouterSink {
+                        routes: vec![route],
+                        ..Default::default()
+                    },
+                )),
+            }),
+            output_columns: vec![common::OutputColumn {
+                column_id: 1,
+                name: "effect".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn router_effect_uses_exact_indexed_path() {
+        let error = decode_fragment_sink_program(
+            &router_fragment(plan::ChangeStreamBranchRoute {
+                route_id: vec![1; 32],
+                accepted_effects: vec![plan::RowMutationEffect::Unspecified as i32],
+                input_ordinals: vec![0],
+                ..Default::default()
+            }),
+            &Layout::default(),
+        )
+        .expect_err("unspecified branch effect must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.change_stream_router.routes[0].accepted_effects[0]"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidEnum);
+        assert_eq!(protocol.detail(), "native RowMutationEffect is unspecified");
+    }
+
+    #[test]
+    fn router_output_ordinal_uses_exact_indexed_path() {
+        let error = decode_fragment_sink_program(
+            &router_fragment(plan::ChangeStreamBranchRoute {
+                route_id: vec![1; 32],
+                accepted_effects: vec![plan::RowMutationEffect::Insert as i32],
+                input_ordinals: vec![1],
+                ..Default::default()
+            }),
+            &Layout::default(),
+        )
+        .expect_err("out-of-range branch output ordinal must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.change_stream_router.routes[0].input_ordinals[0]"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+        assert_eq!(
+            protocol.detail(),
+            "native router output ordinal 1 is out of range"
+        );
+    }
+
+    #[test]
+    fn router_partition_ordinal_uses_exact_indexed_path() {
+        let error = decode_fragment_sink_program(
+            &router_fragment(plan::ChangeStreamBranchRoute {
+                route_id: vec![1; 32],
+                accepted_effects: vec![plan::RowMutationEffect::Insert as i32],
+                input_ordinals: vec![0],
+                output_partition_ordinals: vec![1],
+                ..Default::default()
+            }),
+            &Layout::default(),
+        )
+        .expect_err("out-of-range partition ordinal must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.change_stream_router.routes[0].output_partition_ordinals[0]"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+        assert_eq!(
+            protocol.detail(),
+            "native CHANGE_STREAM_ROUTER_SINK partition ordinal 1 is out of range"
+        );
+    }
+
+    #[test]
+    fn router_assignment_ignores_redundant_flat_instance_destinations() {
+        let sink = plan::DataSink {
+            kind: Some(plan::data_sink::Kind::ChangeStreamRouter(
+                plan::ChangeStreamRouterSink {
+                    routes: vec![plan::ChangeStreamBranchRoute {
+                        destinations: Some(plan::StreamDestinationList {
+                            destinations: vec![plan_destination(12)],
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )),
+        };
+        let instance = proto::InstanceParams {
+            destinations: vec![instance_destination(98)],
+            ..Default::default()
+        };
+
+        let assignment = decode_fragment_sink_assignment(&sink, &instance)
+            .expect("redundant flat destinations must remain wire compatible");
+        assert_single_destination_group(assignment, 12);
+    }
+
+    #[test]
+    fn router_branch_rejects_duplicate_output_slots() {
+        let error = decode_fragment_sink_program(
+            &router_fragment(plan::ChangeStreamBranchRoute {
+                route_id: vec![1; 32],
+                accepted_effects: vec![plan::RowMutationEffect::Insert as i32],
+                input_ordinals: vec![0, 0],
+                ..Default::default()
+            }),
+            &Layout::default(),
+        )
+        .expect_err("duplicate router output slots must be rejected during decode");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.change_stream_router.routes[0].input_ordinals[1]"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InconsistentFields);
+        assert_eq!(
+            protocol.detail(),
+            "native ICEBERG_CHANGE_STREAM_ROUTER_SINK duplicate output slot id: 1"
         );
     }
 }

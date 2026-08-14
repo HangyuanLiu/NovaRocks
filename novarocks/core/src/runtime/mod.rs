@@ -18,10 +18,6 @@ pub mod backend_id;
 pub mod descriptor_snapshot;
 pub(crate) mod fragment_exec_params;
 pub(crate) mod fragment_output;
-#[cfg(test)]
-pub(crate) mod fragment_test_io_exchange;
-#[cfg(test)]
-pub(crate) mod fragment_test_io_result;
 pub mod lookup;
 pub mod native_fragment_query;
 pub(crate) mod profile_codec;

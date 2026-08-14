@@ -70,3 +70,82 @@ pub(super) fn lower_limit_node(
         output_schema: child.output_schema,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{one_col_values_node, physical_node};
+    use novarocks::protocol::common::error::ProtocolErrorKind;
+    use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_protocol::plan;
+
+    fn limit_node(payload_limit: Option<i64>, offset: Option<i64>) -> plan::DistributedNode {
+        physical_node(
+            20,
+            plan::plan_node::Kind::Limit(plan::LimitNode {
+                limit: payload_limit,
+                offset,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        )
+    }
+
+    fn decode_error(
+        node: &plan::DistributedNode,
+    ) -> crate::native::plan_decode::error::NativeFragmentDecodeError {
+        let mut arena = ExprArena::default();
+        super::super::decode_node(
+            node,
+            &mut arena,
+            &super::super::NativePlanDecodeContext::default(),
+        )
+        .expect_err("invalid Limit node must fail")
+    }
+
+    #[test]
+    fn negative_payload_limit_uses_exact_path_and_kind() {
+        let error = decode_error(&limit_node(Some(-2), None));
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.limit.limit"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+    }
+
+    #[test]
+    fn negative_outer_limit_uses_exact_node_path_and_kind() {
+        let mut node = limit_node(None, None);
+        node.limit = -2;
+
+        let error = decode_error(&node);
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(protocol.path().to_string(), "plan_fragment.root.limit");
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+    }
+
+    #[test]
+    fn conflicting_limits_use_payload_limit_path_and_kind() {
+        let mut node = limit_node(Some(2), None);
+        node.limit = 3;
+
+        let error = decode_error(&node);
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.limit.limit"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InconsistentFields);
+    }
+
+    #[test]
+    fn negative_offset_uses_exact_path_and_kind() {
+        let error = decode_error(&limit_node(None, Some(-1)));
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.limit.offset"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+    }
+}

@@ -922,14 +922,11 @@ impl novarocks_spi::connector::ConnectorControlFactoryResolver for TestConnector
 }
 
 #[cfg(test)]
-struct TestDistributedQueryCoordinator {
-    connector_control:
-        Option<std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>>,
-}
+struct RejectingTestDistributedQueryCoordinator;
 
 #[cfg(test)]
 impl crate::query_execution::contract::DistributedQueryCoordinator
-    for TestDistributedQueryCoordinator
+    for RejectingTestDistributedQueryCoordinator
 {
     fn begin_write_operation(
         &self,
@@ -958,32 +955,24 @@ impl crate::query_execution::contract::DistributedQueryCoordinator
         crate::query_execution::contract::DistributedQueryOutcome,
         crate::query_execution::contract::DistributedQueryError,
     > {
-        if request.intent() == crate::query_execution::contract::DistributedQueryIntent::Statistics
-        {
-            return Err(
-                crate::query_execution::contract::DistributedQueryError::new(
-                    crate::query_execution::contract::DistributedQueryErrorKind::Rejected,
-                    "test query coordinator does not provide a statistics collection sink",
+        let intent = request.intent();
+        Err(
+            crate::query_execution::contract::DistributedQueryError::new(
+                crate::query_execution::contract::DistributedQueryErrorKind::Rejected,
+                format!(
+                    "core unit-test query coordinator does not execute native {intent:?} fragments; \
+                 assert request shaping locally or use Backend/all-in-one integration coverage"
                 ),
-            );
-        }
-        crate::query_execution::in_process_test::execute(request)
+            ),
+        )
     }
 }
 
 #[cfg(test)]
-fn test_query_execution_service() -> crate::query_execution::service::QueryExecutionService {
-    test_query_execution_service_with_connector_control(None)
-}
-
-#[cfg(test)]
-pub(crate) fn test_query_execution_service_with_connector_control(
-    connector_control: Option<
-        std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
-    >,
-) -> crate::query_execution::service::QueryExecutionService {
+pub(crate) fn test_query_execution_service()
+-> crate::query_execution::service::QueryExecutionService {
     crate::query_execution::service::QueryExecutionService::new(std::sync::Arc::new(
-        TestDistributedQueryCoordinator { connector_control },
+        RejectingTestDistributedQueryCoordinator,
     ))
 }
 

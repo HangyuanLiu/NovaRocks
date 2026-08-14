@@ -209,19 +209,26 @@ impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_native_query_execution_id;
-    use novarocks_protocol::{common, novarocks};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use novarocks::connector::ConnectorRegistry;
+    use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
+    use novarocks_protocol::{common, novarocks as proto, plan};
+    use novarocks_types::QueryId;
+
+    use super::{NativeFragmentRequest, decode_native_query_execution_id};
 
     #[test]
     fn execution_identity_decode_preserves_native_error_contract() {
-        let missing = decode_native_query_execution_id(&novarocks::QueryExecutionId::default())
+        let missing = decode_native_query_execution_id(&proto::QueryExecutionId::default())
             .expect_err("query id is required");
         assert_eq!(
             missing.to_string(),
             "native protocol error at execution_id.query_id (missing field): native fragment execution_id requires query_id"
         );
 
-        let zero_attempt = decode_native_query_execution_id(&novarocks::QueryExecutionId {
+        let zero_attempt = decode_native_query_execution_id(&proto::QueryExecutionId {
             query_id: Some(common::UniqueId { hi: 7, lo: 8 }),
             attempt_id: 0,
         })
@@ -230,5 +237,59 @@ mod tests {
             zero_attempt.to_string(),
             "native protocol error at execution_id.attempt_id (invalid value): InvalidManifest: attempt id must be nonzero"
         );
+    }
+
+    #[test]
+    fn values_node_decodes_from_backend_production_ingress() {
+        let query_id = QueryId::new(41, 42);
+        let request = NativeFragmentRequest::try_decode(
+            QueryExecutionId::new(query_id, AttemptId::new(1).expect("nonzero attempt"))
+                .expect("valid execution id"),
+            plan::PlanFragment {
+                fragment_id: 7,
+                root: Some(plan::DistributedNode {
+                    node_id: 10,
+                    fragment_id: 7,
+                    limit: -1,
+                    payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                        output_columns: Vec::new(),
+                        kind: Some(plan::plan_node::Kind::Values(plan::ValuesNode {
+                            rows: Vec::new(),
+                            columns: Vec::new(),
+                        })),
+                    })),
+                    ..Default::default()
+                }),
+                sink: Some(plan::DataSink {
+                    kind: Some(plan::data_sink::Kind::Noop(true)),
+                }),
+                runtime_filter_bindings: Some(plan::RuntimeFilterBindingTable {
+                    fragment_id: 7,
+                    bindings: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            proto::InstanceParams {
+                query_id: Some(common::UniqueId { hi: 41, lo: 42 }),
+                fragment_instance_id: Some(common::UniqueId { hi: 51, lo: 52 }),
+                backend_num: 3,
+                query_options: Some(proto::QueryOptions {
+                    pipeline_dop: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Arc::new(ConnectorRegistry::new()),
+            Duration::from_secs(1),
+        )
+        .expect("decode values request through backend ingress");
+
+        assert_eq!(request.query_id(), query_id);
+        assert_eq!(
+            request.fragment_instance_id(),
+            novarocks_types::UniqueId::new(51, 52)
+        );
+        assert_eq!(request.backend_num(), 3);
+        assert_eq!(request.root_plan_node_id(), 10);
     }
 }
