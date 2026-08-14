@@ -33,7 +33,10 @@ pub use contract::{
     QueryTerminalFallbackTransport, QueryTerminalIngress, QueryTerminalReportAck,
     QueryTerminalReportOutcome, QueryTerminationAck, QueryTerminationReason,
 };
-pub use contract::{decode_query_terminal_snapshot, encode_query_terminal_snapshot};
+pub use contract::{
+    decode_participant_terminal_outcome, decode_query_terminal_snapshot,
+    encode_participant_terminal_outcome, encode_query_terminal_snapshot,
+};
 pub use identity::{AttemptId, QueryExecutionId};
 pub(crate) use init_plan::QueryInitPlanHeader;
 pub use init_plan::{
@@ -52,6 +55,7 @@ pub use stage::{
 };
 pub use terminal::{
     FragmentTerminalOutcome, FragmentTerminalSnapshot, ImmutableQueryTerminalRecord,
+    NegativeAttestation, NegativeAttestationReason, ParticipantTerminalOutcome,
     QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1, QUERY_TERMINAL_SNAPSHOT_VERSION_V1,
     QueryTerminalProfileContributionV1, QueryTerminalRuntimeFilterChannelInstallStateV1,
     QueryTerminalRuntimeFilterChannelKeyV1, QueryTerminalRuntimeFilterChannelTerminalStateV1,
@@ -60,5 +64,7 @@ pub use terminal::{
     QueryTerminalRuntimeFilterProducerStreamV1, QueryTerminalRuntimeFilterScanNotEvaluatedV1,
     QueryTerminalRuntimeFilterSubscriptionTerminalV1,
     QueryTerminalRuntimeFilterTransportRouteKeyV1, QueryTerminalRuntimeFilterTransportRouteV1,
-    QueryTerminalSet, QueryTerminalSnapshot, QueryTerminalSnapshotDigest,
+    QueryTerminalSet, QueryTerminalSnapshot, QueryTerminalSnapshotDigest, TerminalTelemetry,
+    TerminalTelemetryUnavailable, TerminalizationProof, TerminalizationProofFragment,
+    p0_max_encoded_len,
 };

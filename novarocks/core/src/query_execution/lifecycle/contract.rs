@@ -30,7 +30,12 @@ use super::stage::{
     QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
     QueryStartRequest, StageDigest, StageDigestVersion, StageFragment,
 };
-use super::terminal::{QueryTerminalSnapshot, QueryTerminalSnapshotDigest};
+use super::terminal::{
+    FragmentTerminalOutcome, NegativeAttestation, NegativeAttestationReason,
+    ParticipantTerminalOutcome, QueryTerminalSnapshot, QueryTerminalSnapshotDigest,
+    TerminalTelemetry, TerminalTelemetryUnavailable, TerminalizationProof,
+    TerminalizationProofFragment,
+};
 use crate::common::types::UniqueId;
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
 use novarocks_protocol::{common, filter, novarocks};
@@ -1153,20 +1158,35 @@ pub fn encode_query_terminal_snapshot(
         .fragments()
         .iter()
         .map(|fragment| {
-            let (outcome, error_code, error_detail) = match fragment.outcome() {
-                super::terminal::FragmentTerminalOutcome::Succeeded => {
-                    (1, String::new(), String::new())
-                }
-                super::terminal::FragmentTerminalOutcome::Failed { code, detail } => {
-                    (2, code.clone(), detail.clone())
-                }
-                super::terminal::FragmentTerminalOutcome::Cancelled { detail } => {
-                    (3, "CANCELLED".to_string(), detail.clone())
-                }
-                super::terminal::FragmentTerminalOutcome::IncompleteDrain { detail } => {
-                    (4, "INCOMPLETE_DRAIN".to_string(), detail.clone())
-                }
-            };
+            let (outcome, error_code, error_detail, error_detail_truncated) =
+                match fragment.outcome() {
+                    super::terminal::FragmentTerminalOutcome::Succeeded => {
+                        (1, String::new(), String::new(), false)
+                    }
+                    super::terminal::FragmentTerminalOutcome::Failed {
+                        code,
+                        detail,
+                        detail_truncated,
+                    } => (2, code.clone(), detail.clone(), *detail_truncated),
+                    super::terminal::FragmentTerminalOutcome::Cancelled {
+                        detail,
+                        detail_truncated,
+                    } => (
+                        3,
+                        "CANCELLED".to_string(),
+                        detail.clone(),
+                        *detail_truncated,
+                    ),
+                    super::terminal::FragmentTerminalOutcome::IncompleteDrain {
+                        detail,
+                        detail_truncated,
+                    } => (
+                        4,
+                        "INCOMPLETE_DRAIN".to_string(),
+                        detail.clone(),
+                        *detail_truncated,
+                    ),
+                };
             novarocks::QueryTerminalFragmentSnapshot {
                 fragment_instance_id: Some(common::UniqueId {
                     hi: fragment.fragment_instance_id().high(),
@@ -1176,6 +1196,7 @@ pub fn encode_query_terminal_snapshot(
                 outcome,
                 error_code,
                 error_detail,
+                error_detail_truncated,
                 connector_staged_report_frames: fragment
                     .sink()
                     .connector_staged_report_frames
@@ -1205,9 +1226,9 @@ pub fn encode_query_terminal_snapshot(
                     loaded_bytes: fragment.sink().load_stats.loaded_bytes,
                     filtered_rows: fragment.sink().load_stats.filtered_rows,
                 }),
-                profile: fragment
-                    .profile()
-                    .map(crate::runtime::profile_codec::encode_runtime_profile_tree),
+                profile: Some(encode_fragment_terminal_profile_telemetry(
+                    fragment.profile_telemetry(),
+                )),
                 statistics_payload: fragment.statistics_payload().to_vec(),
             }
         })
@@ -1219,9 +1240,102 @@ pub fn encode_query_terminal_snapshot(
         init_digest: snapshot.init_digest().as_bytes().to_vec(),
         digest: snapshot.digest().as_bytes().to_vec(),
         fragments,
-        profile_contribution: Some(encode_query_terminal_profile_contribution(
-            snapshot.profile_contribution(),
+        profile_contribution: Some(encode_query_terminal_profile_contribution_telemetry(
+            snapshot.profile_contribution_telemetry(),
         )),
+    }
+}
+
+fn encode_terminal_telemetry_unavailable(
+    reason: &TerminalTelemetryUnavailable,
+) -> novarocks::TerminalTelemetryUnavailable {
+    novarocks::TerminalTelemetryUnavailable {
+        stage: reason.stage().to_string(),
+        code: reason.code().to_string(),
+    }
+}
+
+fn decode_terminal_telemetry_unavailable(
+    value: &novarocks::TerminalTelemetryUnavailable,
+) -> Result<TerminalTelemetryUnavailable, QueryLifecycleError> {
+    TerminalTelemetryUnavailable::new(value.stage.clone(), value.code.clone())
+}
+
+fn encode_fragment_terminal_profile_telemetry(
+    telemetry: &TerminalTelemetry<RuntimeProfileTree>,
+) -> novarocks::FragmentTerminalProfileTelemetry {
+    use novarocks::fragment_terminal_profile_telemetry::Telemetry;
+
+    let telemetry = match telemetry {
+        TerminalTelemetry::Available(profile) => Telemetry::Available(
+            crate::runtime::profile_codec::encode_runtime_profile_tree(profile),
+        ),
+        TerminalTelemetry::Unavailable(reason) => {
+            Telemetry::Unavailable(encode_terminal_telemetry_unavailable(reason))
+        }
+    };
+    novarocks::FragmentTerminalProfileTelemetry {
+        telemetry: Some(telemetry),
+    }
+}
+
+fn decode_fragment_terminal_profile_telemetry(
+    value: &novarocks::FragmentTerminalProfileTelemetry,
+) -> Result<TerminalTelemetry<RuntimeProfileTree>, QueryLifecycleError> {
+    use novarocks::fragment_terminal_profile_telemetry::Telemetry;
+
+    match value.telemetry.as_ref().ok_or_else(|| {
+        QueryLifecycleError::invalid_manifest("terminal fragment profile telemetry is required")
+    })? {
+        Telemetry::Available(profile) => {
+            crate::runtime::profile_codec::decode_runtime_profile_tree(profile)
+                .map(TerminalTelemetry::Available)
+                .map_err(QueryLifecycleError::invalid_manifest)
+        }
+        Telemetry::Unavailable(reason) => {
+            decode_terminal_telemetry_unavailable(reason).map(TerminalTelemetry::Unavailable)
+        }
+    }
+}
+
+fn encode_query_terminal_profile_contribution_telemetry(
+    telemetry: &TerminalTelemetry<super::terminal::QueryTerminalProfileContributionV1>,
+) -> novarocks::QueryTerminalProfileContributionTelemetry {
+    use novarocks::query_terminal_profile_contribution_telemetry::Telemetry;
+
+    let telemetry = match telemetry {
+        TerminalTelemetry::Available(contribution) => {
+            Telemetry::Available(encode_query_terminal_profile_contribution(contribution))
+        }
+        TerminalTelemetry::Unavailable(reason) => {
+            Telemetry::Unavailable(encode_terminal_telemetry_unavailable(reason))
+        }
+    };
+    novarocks::QueryTerminalProfileContributionTelemetry {
+        telemetry: Some(telemetry),
+    }
+}
+
+fn decode_query_terminal_profile_contribution_telemetry(
+    value: &novarocks::QueryTerminalProfileContributionTelemetry,
+) -> Result<
+    TerminalTelemetry<super::terminal::QueryTerminalProfileContributionV1>,
+    QueryLifecycleError,
+> {
+    use novarocks::query_terminal_profile_contribution_telemetry::Telemetry;
+
+    match value.telemetry.as_ref().ok_or_else(|| {
+        QueryLifecycleError::invalid_manifest(
+            "query terminal profile contribution telemetry is required",
+        )
+    })? {
+        Telemetry::Available(contribution) => {
+            decode_query_terminal_profile_contribution(contribution)
+                .map(TerminalTelemetry::Available)
+        }
+        Telemetry::Unavailable(reason) => {
+            decode_terminal_telemetry_unavailable(reason).map(TerminalTelemetry::Unavailable)
+        }
     }
 }
 
@@ -1536,13 +1650,16 @@ pub fn decode_query_terminal_snapshot(
                     super::terminal::FragmentTerminalOutcome::Failed {
                         code: fragment.error_code.clone(),
                         detail: fragment.error_detail.clone(),
+                        detail_truncated: fragment.error_detail_truncated,
                     }
                 }
                 3 => super::terminal::FragmentTerminalOutcome::Cancelled {
                     detail: fragment.error_detail.clone(),
+                    detail_truncated: fragment.error_detail_truncated,
                 },
                 4 => super::terminal::FragmentTerminalOutcome::IncompleteDrain {
                     detail: fragment.error_detail.clone(),
+                    detail_truncated: fragment.error_detail_truncated,
                 },
                 _ => {
                     return Err(QueryLifecycleError::invalid_manifest(
@@ -1582,13 +1699,14 @@ pub fn decode_query_terminal_snapshot(
                     filtered_rows: stats.filtered_rows,
                 },
             };
-            let profile = fragment
-                .profile
-                .as_ref()
-                .map(crate::runtime::profile_codec::decode_runtime_profile_tree)
-                .transpose()
-                .map_err(QueryLifecycleError::invalid_manifest)?;
-            super::terminal::FragmentTerminalSnapshot::new(
+            let profile = decode_fragment_terminal_profile_telemetry(
+                fragment.profile.as_ref().ok_or_else(|| {
+                    QueryLifecycleError::invalid_manifest(
+                        "terminal fragment profile telemetry is required",
+                    )
+                })?,
+            )?;
+            super::terminal::FragmentTerminalSnapshot::new_with_profile_telemetry(
                 novarocks_types::UniqueId::new(id.hi, id.lo),
                 fragment.backend_num,
                 outcome,
@@ -1600,12 +1718,14 @@ pub fn decode_query_terminal_snapshot(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let profile_contribution = decode_query_terminal_profile_contribution(
+    let profile_contribution = decode_query_terminal_profile_contribution_telemetry(
         value.profile_contribution.as_ref().ok_or_else(|| {
-            QueryLifecycleError::invalid_manifest("query terminal profile contribution is required")
+            QueryLifecycleError::invalid_manifest(
+                "query terminal profile contribution telemetry is required",
+            )
         })?,
     )?;
-    let snapshot = QueryTerminalSnapshot::new_with_profile_contribution(
+    let snapshot = QueryTerminalSnapshot::new_with_profile_telemetry(
         decode_required_execution_id(value.execution_id.as_ref())?,
         decode_backend_identity(value.backend.as_ref().ok_or_else(|| {
             QueryLifecycleError::invalid_manifest("terminal backend identity is required")
@@ -1623,6 +1743,253 @@ pub fn decode_query_terminal_snapshot(
         ));
     }
     Ok(snapshot)
+}
+
+pub fn encode_participant_terminal_outcome(
+    outcome: &ParticipantTerminalOutcome,
+) -> novarocks::ParticipantTerminalOutcome {
+    match outcome {
+        ParticipantTerminalOutcome::Proof { proof, snapshot } => {
+            novarocks::ParticipantTerminalOutcome {
+                outcome: Some(novarocks::participant_terminal_outcome::Outcome::Proof(
+                    encode_terminalization_proof(proof),
+                )),
+                snapshot: Some(encode_query_terminal_snapshot(snapshot)),
+            }
+        }
+        ParticipantTerminalOutcome::NegativeAttestation(attestation) => {
+            novarocks::ParticipantTerminalOutcome {
+                outcome: Some(
+                    novarocks::participant_terminal_outcome::Outcome::NegativeAttestation(
+                        encode_negative_attestation(attestation),
+                    ),
+                ),
+                snapshot: None,
+            }
+        }
+    }
+}
+
+pub fn decode_participant_terminal_outcome(
+    value: &novarocks::ParticipantTerminalOutcome,
+) -> Result<ParticipantTerminalOutcome, QueryLifecycleError> {
+    let outcome = value.outcome.as_ref().ok_or_else(|| {
+        QueryLifecycleError::invalid_manifest("participant terminal outcome variant is required")
+    })?;
+    let decoded = match outcome {
+        novarocks::participant_terminal_outcome::Outcome::Proof(proof) => {
+            let snapshot =
+                decode_query_terminal_snapshot(value.snapshot.as_ref().ok_or_else(|| {
+                    QueryLifecycleError::invalid_manifest(
+                        "participant terminal proof requires its immutable snapshot",
+                    )
+                })?)?;
+            ParticipantTerminalOutcome::Proof {
+                proof: decode_terminalization_proof(proof)?,
+                snapshot,
+            }
+        }
+        novarocks::participant_terminal_outcome::Outcome::NegativeAttestation(attestation) => {
+            if value.snapshot.is_some() {
+                return Err(QueryLifecycleError::invalid_manifest(
+                    "negative attestation must not carry a terminal snapshot",
+                ));
+            }
+            ParticipantTerminalOutcome::negative_attestation(decode_negative_attestation(
+                attestation,
+            )?)
+        }
+    };
+    decoded.validate()?;
+    Ok(decoded)
+}
+
+fn encode_terminalization_proof(proof: &TerminalizationProof) -> novarocks::TerminalizationProof {
+    novarocks::TerminalizationProof {
+        version: proof.version(),
+        execution_id: Some(encode_execution_id(proof.execution_id())),
+        backend: Some(encode_backend_identity(proof.backend())),
+        init_digest: proof.init_digest().as_bytes().to_vec(),
+        digest: proof.digest().as_bytes().to_vec(),
+        fragments: proof
+            .fragments()
+            .iter()
+            .map(|fragment| {
+                let (outcome, error_code, error_detail, error_detail_truncated) =
+                    encode_fragment_terminal_outcome(fragment.outcome());
+                novarocks::TerminalizationProofFragment {
+                    fragment_instance_id: Some(encode_unique_id(fragment.fragment_instance_id())),
+                    backend_num: fragment.backend_num(),
+                    outcome,
+                    error_code,
+                    error_detail,
+                    error_detail_truncated,
+                }
+            })
+            .collect(),
+    }
+}
+
+fn decode_terminalization_proof(
+    value: &novarocks::TerminalizationProof,
+) -> Result<TerminalizationProof, QueryLifecycleError> {
+    let fragments = value
+        .fragments
+        .iter()
+        .map(|fragment| {
+            TerminalizationProofFragment::new(
+                decode_unique_id(fragment.fragment_instance_id.as_ref().ok_or_else(|| {
+                    QueryLifecycleError::invalid_manifest(
+                        "terminalization proof fragment instance id is required",
+                    )
+                })?)?,
+                fragment.backend_num,
+                decode_fragment_terminal_outcome(
+                    fragment.outcome,
+                    &fragment.error_code,
+                    &fragment.error_detail,
+                    fragment.error_detail_truncated,
+                )?,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let proof = TerminalizationProof::new(
+        decode_required_execution_id(value.execution_id.as_ref())?,
+        decode_backend_identity(value.backend.as_ref().ok_or_else(|| {
+            QueryLifecycleError::invalid_manifest("terminalization proof backend is required")
+        })?)?,
+        ParticipantManifestDigest::try_from_slice(&value.init_digest)?,
+        fragments,
+    )?;
+    if value.version != proof.version()
+        || QueryTerminalSnapshotDigest::try_from_slice(&value.digest)? != proof.digest()
+    {
+        return Err(QueryLifecycleError::new(
+            QueryLifecycleErrorCode::Conflict,
+            "terminalization proof wire content has invalid version or digest",
+        ));
+    }
+    Ok(proof)
+}
+
+fn encode_negative_attestation(
+    attestation: &NegativeAttestation,
+) -> novarocks::NegativeAttestation {
+    novarocks::NegativeAttestation {
+        execution_id: Some(encode_execution_id(attestation.execution_id())),
+        backend: Some(encode_backend_identity(attestation.backend())),
+        init_digest: attestation.init_digest().as_bytes().to_vec(),
+        reason: encode_negative_attestation_reason(attestation.reason()),
+        detail: attestation.detail().to_string(),
+        detail_truncated: attestation.detail_truncated(),
+        digest: attestation.digest().as_bytes().to_vec(),
+    }
+}
+
+fn decode_negative_attestation(
+    value: &novarocks::NegativeAttestation,
+) -> Result<NegativeAttestation, QueryLifecycleError> {
+    let attestation = NegativeAttestation::new(
+        decode_required_execution_id(value.execution_id.as_ref())?,
+        decode_backend_identity(value.backend.as_ref().ok_or_else(|| {
+            QueryLifecycleError::invalid_manifest("negative attestation backend is required")
+        })?)?,
+        ParticipantManifestDigest::try_from_slice(&value.init_digest)?,
+        decode_negative_attestation_reason(value.reason)?,
+        value.detail.clone(),
+    );
+    if value.detail_truncated != attestation.detail_truncated()
+        || QueryTerminalSnapshotDigest::try_from_slice(&value.digest)? != attestation.digest()
+    {
+        return Err(QueryLifecycleError::new(
+            QueryLifecycleErrorCode::Conflict,
+            "negative attestation wire content has invalid detail or digest",
+        ));
+    }
+    Ok(attestation)
+}
+
+fn encode_fragment_terminal_outcome(
+    outcome: &FragmentTerminalOutcome,
+) -> (i32, String, String, bool) {
+    match outcome {
+        FragmentTerminalOutcome::Succeeded => (1, String::new(), String::new(), false),
+        FragmentTerminalOutcome::Failed {
+            code,
+            detail,
+            detail_truncated,
+        } => (2, code.clone(), detail.clone(), *detail_truncated),
+        FragmentTerminalOutcome::Cancelled {
+            detail,
+            detail_truncated,
+        } => (
+            3,
+            "CANCELLED".to_string(),
+            detail.clone(),
+            *detail_truncated,
+        ),
+        FragmentTerminalOutcome::IncompleteDrain {
+            detail,
+            detail_truncated,
+        } => (
+            4,
+            "INCOMPLETE_DRAIN".to_string(),
+            detail.clone(),
+            *detail_truncated,
+        ),
+    }
+}
+
+fn decode_fragment_terminal_outcome(
+    outcome: i32,
+    code: &str,
+    detail: &str,
+    detail_truncated: bool,
+) -> Result<FragmentTerminalOutcome, QueryLifecycleError> {
+    match outcome {
+        1 => Ok(FragmentTerminalOutcome::Succeeded),
+        2 if !code.trim().is_empty() => Ok(FragmentTerminalOutcome::Failed {
+            code: code.to_string(),
+            detail: detail.to_string(),
+            detail_truncated,
+        }),
+        3 => Ok(FragmentTerminalOutcome::Cancelled {
+            detail: detail.to_string(),
+            detail_truncated,
+        }),
+        4 => Ok(FragmentTerminalOutcome::IncompleteDrain {
+            detail: detail.to_string(),
+            detail_truncated,
+        }),
+        _ => Err(QueryLifecycleError::invalid_manifest(
+            "invalid terminalization proof fragment outcome",
+        )),
+    }
+}
+
+fn encode_negative_attestation_reason(reason: NegativeAttestationReason) -> i32 {
+    match reason {
+        NegativeAttestationReason::AttemptAborted => 1,
+        NegativeAttestationReason::AttemptTombstoned => 2,
+        NegativeAttestationReason::TerminalStateInvalid => 3,
+        NegativeAttestationReason::CorrectnessEvidenceEncodingFailed => 4,
+        NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted => 5,
+    }
+}
+
+fn decode_negative_attestation_reason(
+    value: i32,
+) -> Result<NegativeAttestationReason, QueryLifecycleError> {
+    match value {
+        1 => Ok(NegativeAttestationReason::AttemptAborted),
+        2 => Ok(NegativeAttestationReason::AttemptTombstoned),
+        3 => Ok(NegativeAttestationReason::TerminalStateInvalid),
+        4 => Ok(NegativeAttestationReason::CorrectnessEvidenceEncodingFailed),
+        5 => Ok(NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted),
+        _ => Err(QueryLifecycleError::invalid_manifest(
+            "invalid negative attestation reason",
+        )),
+    }
 }
 
 fn encode_participant_manifest(
@@ -1963,9 +2330,10 @@ mod tests {
 
     use super::{
         FragmentLiveObservation, QueryInitRequest, decode_fragment_live_observation,
-        decode_query_control_event, decode_query_init_request, decode_query_stage_request,
-        decode_query_stage_response, decode_query_start_request, decode_query_start_response,
-        decode_query_terminal_snapshot, encode_fragment_live_observation,
+        decode_participant_terminal_outcome, decode_query_control_event, decode_query_init_request,
+        decode_query_stage_request, decode_query_stage_response, decode_query_start_request,
+        decode_query_start_response, decode_query_terminal_snapshot,
+        encode_fragment_live_observation, encode_participant_terminal_outcome,
         encode_query_control_event, encode_query_init_request, encode_query_stage_request,
         encode_query_stage_response, encode_query_start_request, encode_query_start_response,
         encode_query_terminal_snapshot,
@@ -2034,6 +2402,19 @@ mod tests {
             .profile_contribution
             .as_mut()
             .expect("typed contribution")
+            .telemetry
+            .as_mut()
+            .and_then(|telemetry| {
+                match telemetry {
+                novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
+                    contribution,
+                ) => Some(contribution),
+                novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(
+                    _,
+                ) => None,
+            }
+            })
+            .expect("available contribution")
             .channels
             .push(novarocks::QueryTerminalRuntimeFilterChannelV1 {
                 channel_binding_id: 1,
@@ -2047,6 +2428,103 @@ mod tests {
                 cancelled_count: 0,
             });
         assert!(decode_query_terminal_snapshot(&conflict).is_err());
+    }
+
+    #[test]
+    fn participant_terminal_outcome_wire_round_trips_proof_and_attestation() {
+        let fragment = crate::query_execution::lifecycle::FragmentTerminalSnapshot::new(
+            novarocks_types::UniqueId::new(17, 19),
+            3,
+            crate::query_execution::lifecycle::FragmentTerminalOutcome::Succeeded,
+            SinkCommitReportSnapshot::default(),
+            None,
+        )
+        .expect("terminal fragment");
+        let snapshot = crate::query_execution::lifecycle::QueryTerminalSnapshot::new(
+            execution_id(),
+            ParticipantBackendIdentity::new(
+                3,
+                QueryControlEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
+                11,
+            )
+            .expect("backend identity"),
+            crate::query_execution::lifecycle::ParticipantManifestDigest::new([9; 32]),
+            vec![fragment],
+        )
+        .expect("terminal snapshot");
+        let proof =
+            crate::query_execution::lifecycle::ParticipantTerminalOutcome::proof(snapshot.clone())
+                .expect("proof outcome");
+        assert_eq!(
+            decode_participant_terminal_outcome(&encode_participant_terminal_outcome(&proof))
+                .expect("proof round trip"),
+            proof
+        );
+
+        let attestation = crate::query_execution::lifecycle::ParticipantTerminalOutcome::negative_attestation(
+            crate::query_execution::lifecycle::NegativeAttestation::new(
+                snapshot.execution_id(),
+                snapshot.backend().clone(),
+                snapshot.init_digest(),
+                crate::query_execution::lifecycle::NegativeAttestationReason::CorrectnessEvidenceEncodingFailed,
+                "cannot retain complete correctness evidence".to_string(),
+            ),
+        );
+        assert_eq!(
+            decode_participant_terminal_outcome(&encode_participant_terminal_outcome(&attestation))
+                .expect("attestation round trip"),
+            attestation
+        );
+    }
+
+    #[test]
+    fn terminal_snapshot_wire_round_trips_explicit_p2_unavailability() {
+        use crate::query_execution::lifecycle::TerminalTelemetry;
+
+        let fragment = crate::query_execution::lifecycle::FragmentTerminalSnapshot::new_with_profile_telemetry(
+            novarocks_types::UniqueId::new(17, 19),
+            3,
+            crate::query_execution::lifecycle::FragmentTerminalOutcome::Succeeded,
+            SinkCommitReportSnapshot::default(),
+            TerminalTelemetry::unavailable("profile_assembly", "BUDGET_EXHAUSTED")
+                .expect("typed fragment telemetry"),
+        )
+        .expect("terminal fragment");
+        let snapshot =
+            crate::query_execution::lifecycle::QueryTerminalSnapshot::new_with_profile_telemetry(
+                execution_id(),
+                ParticipantBackendIdentity::new(
+                    3,
+                    QueryControlEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
+                    11,
+                )
+                .expect("backend identity"),
+                crate::query_execution::lifecycle::ParticipantManifestDigest::new([9; 32]),
+                vec![fragment],
+                TerminalTelemetry::unavailable("observation_assembly", "BUDGET_EXHAUSTED")
+                    .expect("typed query telemetry"),
+            )
+            .expect("terminal snapshot");
+
+        let decoded = decode_query_terminal_snapshot(&encode_query_terminal_snapshot(&snapshot))
+            .expect("terminal snapshot wire round trip");
+        assert_eq!(decoded.digest(), snapshot.digest());
+        assert_eq!(
+            decoded
+                .profile_contribution_telemetry()
+                .unavailable_reason()
+                .expect("query telemetry reason")
+                .stage(),
+            "observation_assembly"
+        );
+        assert_eq!(
+            decoded.fragments()[0]
+                .profile_telemetry()
+                .unavailable_reason()
+                .expect("fragment telemetry reason")
+                .stage(),
+            "profile_assembly"
+        );
     }
 
     fn observation_backend() -> ParticipantBackendIdentity {

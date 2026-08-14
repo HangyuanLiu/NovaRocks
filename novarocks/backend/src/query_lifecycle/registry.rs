@@ -241,14 +241,7 @@ fn capture_terminal_profile_contribution(
         }
         return Ok(QueryTerminalProfileContributionV1::empty());
     };
-    let snapshot = participant
-        .capture_runtime_filter_observation()
-        .map_err(|error| {
-            QueryLifecycleError::new(
-                QueryLifecycleErrorCode::Internal,
-                format!("failed to capture runtime-filter terminal contribution: {error}"),
-            )
-        })?;
+    let snapshot = participant.capture_runtime_filter_observation();
     terminal_profile_contribution(snapshot)
 }
 
@@ -713,9 +706,11 @@ fn fragment_snapshot_from_outcome(
         FragmentOutcome::Failed(error) => FragmentTerminalOutcome::Failed {
             code: "FRAGMENT_EXECUTION_FAILED".to_string(),
             detail: error.to_string(),
+            detail_truncated: false,
         },
         FragmentOutcome::Cancelled { reason } => FragmentTerminalOutcome::Cancelled {
             detail: reason.detail().to_string(),
+            detail_truncated: false,
         },
     };
     FragmentTerminalSnapshot::new(
@@ -2351,11 +2346,11 @@ impl QueryLifecycleRegistry {
             return;
         }
         let (code, detail) = match outcome {
-            FragmentTerminalOutcome::Failed { code, detail } => (code, detail),
-            FragmentTerminalOutcome::Cancelled { detail } => {
+            FragmentTerminalOutcome::Failed { code, detail, .. } => (code, detail),
+            FragmentTerminalOutcome::Cancelled { detail, .. } => {
                 ("FRAGMENT_CANCELLED".to_string(), detail)
             }
-            FragmentTerminalOutcome::IncompleteDrain { detail } => {
+            FragmentTerminalOutcome::IncompleteDrain { detail, .. } => {
                 ("INCOMPLETE_DRAIN".to_string(), detail)
             }
             FragmentTerminalOutcome::Succeeded => return,
@@ -2418,7 +2413,10 @@ impl QueryLifecycleRegistry {
                     let snapshot = match FragmentTerminalSnapshot::new(
                         *fragment_instance_id,
                         backend_num,
-                        FragmentTerminalOutcome::IncompleteDrain { detail },
+                        FragmentTerminalOutcome::IncompleteDrain {
+                            detail,
+                            detail_truncated: false,
+                        },
                         SinkCommitReportSnapshot::default(),
                         None,
                     ) {

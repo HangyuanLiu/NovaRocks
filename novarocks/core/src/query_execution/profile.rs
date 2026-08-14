@@ -55,26 +55,30 @@ impl ProfileTerminalBuilder {
         &mut self,
         snapshot: &QueryTerminalSnapshot,
     ) -> Result<(), DistributedQueryError> {
-        let contribution = snapshot.profile_contribution();
+        let Some(contribution) = snapshot.profile_contribution() else {
+            return Ok(());
+        };
         if contribution.is_empty() {
             return Ok(());
         }
 
-        let participant_totals = RuntimeFilterProfileTotals::from_snapshot(snapshot)?;
+        let participant_totals = RuntimeFilterProfileTotals::from_contribution(contribution)?;
         let execution_totals = self
             .runtime_filter_totals
             .checked_merged(participant_totals)?;
         execution_totals.validate_profile_range()?;
 
-        self.profiles
-            .push(runtime_filter_profile_tree(snapshot, participant_totals)?);
+        self.profiles.push(runtime_filter_profile_tree(
+            snapshot,
+            contribution,
+            participant_totals,
+        )?);
         self.runtime_filter_totals = execution_totals;
         Ok(())
     }
 
-    /// Profiles are a terminal contribution when profiling is enabled.  A
-    /// missing contribution is therefore an explicit lifecycle failure rather
-    /// than an empty best-effort profile result.
+    /// P2 profile telemetry is allowed to be unavailable without changing the
+    /// query result or fabricating an empty profile tree.
     pub fn apply_terminal(
         &mut self,
         fragment: &FragmentTerminalSnapshot,
@@ -85,13 +89,9 @@ impl ProfileTerminalBuilder {
                 "fragment terminal snapshot reports a non-successful outcome",
             ));
         }
-        let profile = fragment.profile().cloned().ok_or_else(|| {
-            DistributedQueryError::new(
-                DistributedQueryErrorKind::Failed,
-                "profile-enabled fragment terminal snapshot is missing its final profile",
-            )
-        })?;
-        self.profiles.push(profile);
+        if let Some(profile) = fragment.profile().cloned() {
+            self.profiles.push(profile);
+        }
         Ok(())
     }
 
@@ -140,9 +140,11 @@ struct RuntimeFilterProfileTotals {
 }
 
 impl RuntimeFilterProfileTotals {
-    fn from_snapshot(snapshot: &QueryTerminalSnapshot) -> Result<Self, DistributedQueryError> {
+    fn from_contribution(
+        contribution: &crate::query_execution::lifecycle::QueryTerminalProfileContributionV1,
+    ) -> Result<Self, DistributedQueryError> {
         let mut totals = Self::default();
-        for consumer in snapshot.profile_contribution().consumers() {
+        for consumer in contribution.consumers() {
             totals.has_row_evaluation |= consumer.row_evaluations() != 0;
             totals.has_scan_evaluation |=
                 consumer.scan_evaluated() != 0 || consumer.scan_not_evaluated() != 0;
@@ -340,6 +342,7 @@ impl RuntimeFilterProfileTotals {
 
 fn runtime_filter_profile_tree(
     snapshot: &QueryTerminalSnapshot,
+    contribution: &crate::query_execution::lifecycle::QueryTerminalProfileContributionV1,
     totals: RuntimeFilterProfileTotals,
 ) -> Result<RuntimeProfileTree, DistributedQueryError> {
     let execution_id = snapshot.execution_id();
@@ -412,7 +415,7 @@ fn runtime_filter_profile_tree(
         }
     }
 
-    for channel in snapshot.profile_contribution().channels() {
+    for channel in contribution.channels() {
         let channel_key = channel.key();
         let channel_profile = participant.child(format!(
             "RuntimeFilterChannel (channel_binding_id={}, channel_id={})",
@@ -425,8 +428,7 @@ fn runtime_filter_profile_tree(
                 .latest_published_logical_version()
                 .map_or_else(|| "none".to_string(), |version| version.to_string()),
         );
-        for consumer in snapshot
-            .profile_contribution()
+        for consumer in contribution
             .consumers()
             .iter()
             .filter(|consumer| consumer.key().channel() == channel_key)

@@ -387,6 +387,7 @@ fn release_report_query_terminal_request() -> novarocks::ReportQueryTerminalRequ
                 outcome: novarocks::QueryTerminalFragmentOutcome::Succeeded as i32,
                 error_code: String::new(),
                 error_detail: String::new(),
+                error_detail_truncated: false,
                 connector_staged_report_frames: vec![],
                 tablet_commit_infos: vec![novarocks::QueryTerminalTabletInfo {
                     tablet_id: 100,
@@ -398,26 +399,38 @@ fn release_report_query_terminal_request() -> novarocks::ReportQueryTerminalRequ
                     loaded_bytes: 90,
                     filtered_rows: 1,
                 }),
-                profile: Some(novarocks::RuntimeProfileTree {
-                    root: Some(novarocks::ProfileNode {
-                        name: "TerminalFragment".to_string(),
-                        node_id: 9,
-                        counters: vec![],
-                        info_strings: HashMap::from([(
-                            "source".to_string(),
-                            "terminal-fixture".to_string(),
-                        )]),
-                        children: vec![],
-                    }),
+                profile: Some(novarocks::FragmentTerminalProfileTelemetry {
+                    telemetry: Some(
+                        novarocks::fragment_terminal_profile_telemetry::Telemetry::Available(
+                            novarocks::RuntimeProfileTree {
+                                root: Some(novarocks::ProfileNode {
+                                    name: "TerminalFragment".to_string(),
+                                    node_id: 9,
+                                    counters: vec![],
+                                    info_strings: HashMap::from([(
+                                        "source".to_string(),
+                                        "terminal-fixture".to_string(),
+                                    )]),
+                                    children: vec![],
+                                }),
+                            },
+                        ),
+                    ),
                 }),
                 statistics_payload: Vec::new(),
             }],
-            profile_contribution: Some(novarocks::QueryTerminalProfileContributionV1 {
-                version: 1,
-                channels: Vec::new(),
-                producer_streams: Vec::new(),
-                transport_routes: Vec::new(),
-                consumers: Vec::new(),
+            profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
+                telemetry: Some(
+                    novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
+                        novarocks::QueryTerminalProfileContributionV1 {
+                            version: 1,
+                            channels: Vec::new(),
+                            producer_streams: Vec::new(),
+                            transport_routes: Vec::new(),
+                            consumers: Vec::new(),
+                        },
+                    ),
+                ),
             }),
         }),
     }
@@ -697,6 +710,15 @@ fn release_report_query_terminal_request_fixture_decodes() {
         .profile_contribution
         .as_ref()
         .expect("ReportQueryTerminalRequest fixture profile contribution");
+    let novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
+        profile_contribution,
+    ) = profile_contribution
+        .telemetry
+        .as_ref()
+        .expect("typed telemetry")
+    else {
+        panic!("fixture profile contribution must be available");
+    };
     assert_eq!(profile_contribution.version, 1);
     assert!(profile_contribution.channels.is_empty());
     let fragment = &snapshot.fragments[0];
@@ -718,7 +740,13 @@ fn release_report_query_terminal_request_fixture_decodes() {
         fragment
             .profile
             .as_ref()
-            .and_then(|profile| profile.root.as_ref())
+            .and_then(|profile| profile.telemetry.as_ref())
+            .and_then(|telemetry| match telemetry {
+                novarocks::fragment_terminal_profile_telemetry::Telemetry::Available(profile) => {
+                    profile.root.as_ref()
+                }
+                novarocks::fragment_terminal_profile_telemetry::Telemetry::Unavailable(_) => None,
+            })
             .expect("ReportQueryTerminalRequest fixture profile")
             .info_strings
             .get("source")

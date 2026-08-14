@@ -1424,23 +1424,24 @@ fn conflicting_terminal_snapshot(
     let first = fragments.first().cloned().ok_or_else(|| {
         "terminal snapshot conflict fault requires a fragment participant".to_string()
     })?;
-    fragments[0] = FragmentTerminalSnapshot::new(
+    fragments[0] = FragmentTerminalSnapshot::new_with_profile_telemetry(
         first.fragment_instance_id(),
         first.backend_num(),
         FragmentTerminalOutcome::Failed {
             code: "RUNNER_INJECTED_TERMINAL_CONFLICT".to_string(),
             detail: "same participant produced a conflicting terminal snapshot".to_string(),
+            detail_truncated: false,
         },
         first.sink().clone(),
-        first.profile().cloned(),
+        first.profile_telemetry().clone(),
     )
     .map_err(|error| error.to_string())?;
-    QueryTerminalSnapshot::new_with_profile_contribution(
+    QueryTerminalSnapshot::new_with_profile_telemetry(
         snapshot.execution_id(),
         snapshot.backend().clone(),
         snapshot.init_digest(),
         fragments,
-        snapshot.profile_contribution().clone(),
+        snapshot.profile_contribution_telemetry().clone(),
     )
     .map_err(|error| error.to_string())
 }

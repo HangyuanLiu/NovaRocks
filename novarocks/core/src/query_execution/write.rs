@@ -327,13 +327,13 @@ impl WriteTerminalBuilder {
         if !matches!(fragment.outcome(), FragmentTerminalOutcome::Succeeded) {
             self.failure
                 .get_or_insert_with(|| match fragment.outcome() {
-                    FragmentTerminalOutcome::Failed { code, detail } => {
+                    FragmentTerminalOutcome::Failed { code, detail, .. } => {
                         format!("native writer failed with {code}: {detail}")
                     }
-                    FragmentTerminalOutcome::Cancelled { detail } => {
+                    FragmentTerminalOutcome::Cancelled { detail, .. } => {
                         format!("native writer cancelled: {detail}")
                     }
-                    FragmentTerminalOutcome::IncompleteDrain { detail } => {
+                    FragmentTerminalOutcome::IncompleteDrain { detail, .. } => {
                         format!("native writer drain was incomplete: {detail}")
                     }
                     FragmentTerminalOutcome::Succeeded => unreachable!(),
