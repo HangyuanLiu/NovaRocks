@@ -448,6 +448,185 @@ pub fn compile_join_incremental_refresh_change_stream(
     )
 }
 
+/// Immutable inputs for the canonical incremental-MV change-stream terminal.
+/// The rewrite snapshot remains sealed inside [`SqlImvPlanningInput`], while
+/// provider-signed route facts are bound only after SQL has produced the
+/// complete change-stream producer.
+pub struct SqlMvIncrementalRefreshCompileContext<'a> {
+    pub canonical_query: Box<sqlparser::ast::Query>,
+    pub imv_rewrite: crate::compiler::SqlImvPlanningInput,
+    pub write_mode: SqlMvIncrementalWriteMode,
+    pub routes: Vec<crate::planning::dml::DmlChangeStreamRoute>,
+    pub current_catalog: Option<String>,
+    pub current_database: String,
+    pub environment: crate::compiler::SqlPlanningEnvironment,
+    pub catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
+    pub statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
+    pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    pub control: crate::compiler::SqlCompileControl,
+}
+
+/// Compile a canonical incremental MV query all the way to a sealed
+/// change-stream plan. The canonical request keeps its former sealed
+/// `ChangeStreamWrite` rewrite semantics: the SQL compiler consumes the IMV
+/// input directly, then this terminal installs the provider effect projection
+/// and writer topology before returning only a sealed distributed plan.
+pub fn compile_mv_incremental_refresh_change_stream(
+    context: SqlMvIncrementalRefreshCompileContext<'_>,
+) -> Result<crate::planning::dml::DmlChangeStreamPlan, String> {
+    validate_join_incremental_routes(&context.routes)?;
+    let mut query = *context.canonical_query;
+    if matches!(
+        context.imv_rewrite.validation,
+        crate::compiler::SqlImvRewriteValidation::Aggregate
+            | crate::compiler::SqlImvRewriteValidation::JoinAggregate
+    ) {
+        alias_incremental_aggregate_group_key_projection(
+            &mut query,
+            context.imv_rewrite.snapshot(),
+        )?;
+    }
+    crate::planning::mv::strip_catalog_from_three_part_names(&mut query);
+    let request = canonical_incremental_change_stream_request(
+        query,
+        &context.imv_rewrite,
+        context.current_catalog,
+        context.current_database,
+        context.environment,
+        context.catalog,
+        context.statistics,
+        context.functions,
+        context.control,
+    );
+    let crate::compiler::SqlCompileOutput::Optimized(compiled) =
+        crate::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
+    else {
+        return Err(
+            "canonical incremental MV intent did not produce an optimized SQL plan".to_string(),
+        );
+    };
+    let producer = add_join_incremental_change_stream_effect(
+        compiled.optimized_tree,
+        &compiled.change_stream,
+        context.write_mode,
+    )?;
+    crate::planning::dml::seal_change_stream_producer_with_effect_column(
+        producer,
+        context.routes,
+        JOIN_INCREMENTAL_EFFECT_COLUMN,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canonical_incremental_change_stream_request<'a>(
+    query: sqlparser::ast::Query,
+    imv_rewrite: &'a crate::compiler::SqlImvPlanningInput,
+    current_catalog: Option<String>,
+    current_database: String,
+    environment: crate::compiler::SqlPlanningEnvironment,
+    catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
+    statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
+    functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    control: crate::compiler::SqlCompileControl,
+) -> crate::compiler::SqlCompileRequest<'a> {
+    crate::compiler::SqlCompileRequest::new(
+        crate::compiler::SqlStatementInput::ParsedQuery(Box::new(query)),
+        crate::compiler::SqlCompileIntent::ChangeStreamWrite,
+        crate::compiler::SqlSessionContext {
+            current_catalog,
+            current_database,
+            optimizer_settings: crate::planning::dml::dml_change_stream_optimizer_settings(),
+        },
+        environment,
+        catalog,
+        statistics,
+        functions,
+        None,
+        control,
+    )
+    .with_imv_rewrite(imv_rewrite)
+}
+
+fn alias_incremental_aggregate_group_key_projection(
+    query: &mut sqlparser::ast::Query,
+    snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
+) -> Result<(), String> {
+    let (calls, layout) = snapshot.aggregate_shape_and_layout_for_execution()?;
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+        return Err("aggregate MV incremental refresh SELECT body is required".to_string());
+    };
+    for (projection_index, output) in calls.visible_outputs.iter().enumerate() {
+        let crate::mv_refresh::VisibleAggregateOutput::GroupKey(group_key_index) = output else {
+            continue;
+        };
+        let visible_source_index = layout
+            .group_key_source_indexes
+            .get(*group_key_index)
+            .ok_or_else(|| {
+                format!("aggregate MV group key projection index {group_key_index} out of range")
+            })?;
+        let expected_name = &layout
+            .visible_columns
+            .get(*visible_source_index)
+            .ok_or_else(|| {
+                format!(
+                    "aggregate MV group key visible source index {visible_source_index} out of range"
+                )
+            })?
+            .name;
+        let item = select.projection.get_mut(projection_index).ok_or_else(|| {
+            format!("aggregate MV group key projection position {projection_index} is missing")
+        })?;
+        alias_incremental_select_projection_item(item, expected_name)?;
+        if let sqlparser::ast::GroupByExpr::Expressions(expressions, _) = &mut select.group_by
+            && let Some(group_expr) = expressions.get_mut(*group_key_index)
+        {
+            *group_expr = sqlparser::ast::Expr::Identifier(incremental_alias_ident(expected_name));
+        }
+    }
+    Ok(())
+}
+
+fn alias_incremental_select_projection_item(
+    item: &mut sqlparser::ast::SelectItem,
+    alias: &str,
+) -> Result<(), String> {
+    use sqlparser::ast::SelectItem;
+
+    let alias = incremental_alias_ident(alias);
+    match item {
+        SelectItem::UnnamedExpr(expr) => {
+            let expr = expr.clone();
+            *item = SelectItem::ExprWithAlias { expr, alias };
+            Ok(())
+        }
+        SelectItem::ExprWithAlias {
+            alias: existing, ..
+        } => {
+            *existing = alias;
+            Ok(())
+        }
+        SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {
+            Err("aggregate MV group key projection cannot be a wildcard".to_string())
+        }
+    }
+}
+
+fn incremental_alias_ident(alias: &str) -> sqlparser::ast::Ident {
+    let mut chars = alias.chars();
+    let is_plain = chars
+        .next()
+        .map(|first| first.is_ascii_alphabetic() || first == '_')
+        .unwrap_or(false)
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+    if is_plain {
+        sqlparser::ast::Ident::new(alias)
+    } else {
+        sqlparser::ast::Ident::with_quote('`', alias)
+    }
+}
+
 fn validate_join_incremental_routes(
     routes: &[crate::planning::dml::DmlChangeStreamRoute],
 ) -> Result<(), String> {
@@ -829,11 +1008,9 @@ fn join_incremental_effect_scalar(
 
     let route_value = match mode {
         JoinIncrementalEffectMode::Constant(value) => arena.intern(
-            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(match value {
-                JOIN_INCREMENTAL_EFFECT_EXISTING => 2,
-                JOIN_INCREMENTAL_EFFECT_APPENDED => 3,
-                _ => 1,
-            }))),
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(
+                incremental_route_effect_code(value),
+            ))),
             arrow::datatypes::DataType::Int8,
             false,
         ),
@@ -911,6 +1088,14 @@ fn join_incremental_effect_scalar(
         arrow::datatypes::DataType::Int8,
         false,
     ))
+}
+
+const fn incremental_route_effect_code(route: i32) -> i64 {
+    match route {
+        JOIN_INCREMENTAL_EFFECT_EXISTING => 2,
+        JOIN_INCREMENTAL_EFFECT_APPENDED => 3,
+        _ => 1,
+    }
 }
 
 /// Deliberately builds a plain `LogicalOnly` request.  The sealed rewrite
@@ -2282,6 +2467,82 @@ mod tests {
             SqlMvJoinIncrementalRefreshCompileContext<'_>,
         ) -> Result<crate::planning::dml::DmlChangeStreamPlan, String> =
             compile_join_incremental_refresh_change_stream;
+    }
+
+    #[test]
+    fn canonical_incremental_terminal_enables_only_sealed_imv_rewrite() {
+        let statement =
+            crate::parser::parse_normalized_sql_raw("SELECT 1").expect("parse canonical query");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("fixture must be a query");
+        };
+        let input = crate::compiler::SqlImvPlanningInput::new(
+            crate::compiler::mv_rewrite::test_incremental_snapshot_handle(),
+            crate::compiler::SqlImvRewriteValidation::None,
+        );
+        let catalog = CanonicalCatalog;
+        let statistics = crate::planning::dml::DmlStatisticsSnapshot::empty();
+        let functions = CanonicalFunctions;
+        let request = canonical_incremental_change_stream_request(
+            *query,
+            &input,
+            None,
+            "db".to_string(),
+            crate::compiler::SqlPlanningEnvironment::Distributed {
+                backend_count: NonZeroUsize::new(1).expect("non-zero"),
+            },
+            &catalog,
+            &statistics,
+            &functions,
+            crate::compiler::SqlCompileControl::unbounded(),
+        );
+        assert!(request.imv_rewrite.is_some());
+        assert_eq!(
+            request
+                .session
+                .optimizer_settings
+                .enable_global_runtime_filter,
+            Some(false)
+        );
+        let _: fn(
+            SqlMvIncrementalRefreshCompileContext<'_>,
+        ) -> Result<crate::planning::dml::DmlChangeStreamPlan, String> =
+            compile_mv_incremental_refresh_change_stream;
+    }
+
+    #[test]
+    fn canonical_incremental_terminal_aliases_aggregate_group_keys_inside_sql() {
+        let statement =
+            crate::parser::parse_normalized_sql_raw("SELECT k, sum(v) FROM b GROUP BY k")
+                .expect("parse aggregate query");
+        let sqlparser::ast::Statement::Query(mut query) = statement else {
+            panic!("fixture must be a query");
+        };
+        let snapshot = crate::compiler::mv_rewrite::test_aggregate_snapshot(Vec::new(), None, None);
+        alias_incremental_aggregate_group_key_projection(&mut query, &snapshot)
+            .expect("sealed aggregate snapshot aliases the canonical query");
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("fixture must retain SELECT body");
+        };
+        let sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } = &select.projection[0] else {
+            panic!("group key must have SQL-owned alias");
+        };
+        assert_eq!(alias.value, "k");
+    }
+
+    #[test]
+    fn canonical_incremental_terminal_preserves_provider_effect_codes() {
+        assert_eq!(incremental_route_effect_code(0), 1, "delete");
+        assert_eq!(
+            incremental_route_effect_code(JOIN_INCREMENTAL_EFFECT_EXISTING),
+            2,
+            "reuse"
+        );
+        assert_eq!(
+            incremental_route_effect_code(JOIN_INCREMENTAL_EFFECT_APPENDED),
+            3,
+            "fresh"
+        );
     }
 
     #[test]

@@ -89,7 +89,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
             let bindings = Arc::new(QueryTableBindingStore::try_new()?);
             let target_binding = admit_prepared_connector_write_target(
                 bindings.as_ref(),
-                novarocks_sql::plan_read::table::SqlTableIdentity::try_new(
+                novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::try_new(
                     target_catalog.clone(),
                     target_namespace.clone(),
                     target_name.clone(),
@@ -180,7 +180,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 )?;
             let write_target_binding = admit_prepared_connector_write_target(
                 bindings.as_ref(),
-                novarocks_sql::plan_read::table::SqlTableIdentity::try_new(
+                novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::try_new(
                     target_catalog.clone(),
                     target_namespace.clone(),
                     target_name.clone(),

@@ -106,6 +106,19 @@ pub struct FrozenConnectorScanIdentity {
 }
 
 impl FrozenConnectorScanIdentity {
+    pub fn try_new(
+        catalog: impl Into<String>,
+        namespace: impl Into<String>,
+        table: impl Into<String>,
+    ) -> Result<Self, String> {
+        let identity = Self::new(catalog, namespace, table);
+        if identity.catalog.is_empty() || identity.namespace.is_empty() || identity.table.is_empty()
+        {
+            return Err("SQL table identity is incomplete".to_string());
+        }
+        Ok(identity)
+    }
+
     pub fn new(
         catalog: impl Into<String>,
         namespace: impl Into<String>,
@@ -198,6 +211,38 @@ pub fn frozen_connector_resolved_analyzer_table(
                     binding,
                     planner_identity,
                     crate::planner::table::SqlScanKind::ConnectorRead,
+                ),
+            ),
+        },
+    )
+}
+
+/// Build the SQL-owned analyzer materialization for an admitted terminal write
+/// target.  The application retains the provider preparation and exact lease;
+/// SQL receives only copied identity, Arrow schema, and a request-scoped
+/// binding token.  This is deliberately distinct from a read materialization
+/// so a write target cannot be reinterpreted as a connector scan.
+pub fn frozen_connector_write_target_resolved_analyzer_table(
+    identity: &FrozenConnectorScanIdentity,
+    input_schema: SchemaRef,
+    binding: SqlTableBindingId,
+) -> ResolvedAnalyzerTable {
+    let columns = column_defs(&input_schema);
+    let planner_identity = identity.planner_identity();
+    ResolvedAnalyzerTable::from_planner(
+        Some(identity.catalog()),
+        identity.namespace(),
+        crate::planner::table::TableDef {
+            name: identity.table().to_string(),
+            columns,
+            iceberg_row_lineage_metadata_columns: Vec::new(),
+            source: crate::planner::table::ScanSource::Sql(
+                crate::planner::table::SqlScanSource::new(
+                    binding,
+                    planner_identity,
+                    crate::planner::table::SqlScanKind::Data {
+                        version: crate::planner::table::SqlTableVersionSelector::Current,
+                    },
                 ),
             ),
         },
@@ -601,6 +646,13 @@ mod tests {
 
     fn binding() -> SqlTableBindingId {
         SqlTableBindingId::new_for_test(7)
+    }
+
+    #[test]
+    fn frozen_identity_rejects_incomplete_write_target_facts() {
+        let error = FrozenConnectorScanIdentity::try_new("ice", "analytics", "")
+            .expect_err("terminal write identity must be complete");
+        assert!(error.contains("incomplete"));
     }
 
     #[test]

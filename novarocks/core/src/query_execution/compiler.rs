@@ -2416,60 +2416,6 @@ pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     ))
 }
 
-/// MV-only change-stream facts held before Frontend native fragment assembly.
-/// It deliberately retains the exact prepared fragments paired with their
-/// distributed plan and exposes no mutable planning or connector state.
-pub(crate) struct PlannedMvIcebergChangeStreamWrite {
-    pub(crate) encoding: NativeFragmentEncodingInput,
-    pub(crate) topology:
-        novarocks_sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
-}
-
-/// Build MV change-stream fragments without encoding their native bundle.
-/// Frontend owns that final FE-to-BE wire assembly after Core has frozen the
-/// exact plan/preparation pair.
-pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_native_assembly(
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    execution: &crate::query_execution::request_context::QueryExecutionContext,
-    optimized_tree: &novarocks_sql::optimizer::OptimizedOperatorNode,
-    query_table_bindings: Option<
-        &crate::query_execution::planning::bindings::QueryTableBindingStore,
-    >,
-    dag: &mut novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
-    pre_expand_keyed_assert: Option<novarocks_sql::planner::physical::PreExpandKeyedAssertSpec>,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PlannedMvIcebergChangeStreamWrite, String> {
-    crate::connector::validate_request_context(connector_context)?;
-    let optimizer_settings = change_stream_write_optimizer_settings();
-    let physical_plan = novarocks_sql::planner::optimizer_bridge::to_physical_plan(optimized_tree)?;
-    let planned_dp =
-        novarocks_sql::planner::pipeline::build_sql_change_stream_distributed_plan_with_settings(
-            physical_plan,
-            dag.clone(),
-            pre_expand_keyed_assert,
-            &optimizer_settings,
-        )?;
-    let distributed_plan = planned_dp.distributed_plan;
-    let topology = planned_dp.topology;
-    let scan_resolver = query_table_bindings
-        .map(crate::query_execution::planning::delta_scan::QueryTableBindingScanResolver::new);
-    let scan_binding_resolver = scan_resolver.as_ref().map(|resolver| {
-        resolver as &dyn crate::query_execution::preparation::scan::ScanBindingResolver
-    });
-    let prepared = crate::query_execution::preparation::prepare_fragments(
-        &distributed_plan,
-        connector_control,
-        connector_context,
-        query_table_bindings,
-        scan_binding_resolver,
-        scan_preparation_options(&optimizer_settings, execution)?,
-    )?;
-    Ok(PlannedMvIcebergChangeStreamWrite {
-        encoding: NativeFragmentEncodingInput::new(distributed_plan, prepared),
-        topology,
-    })
-}
-
 /// Convert an already planned MV change-stream writer into an inert native
 /// assembly handoff. The caller retains responsibility for the exact connector
 /// write lease and Frontend later encodes the sealed pair before submission.
@@ -2598,71 +2544,6 @@ fn change_stream_write_optimizer_settings() -> novarocks_sql::compiler::SessionO
     // its explicit predicates and connector pruning remain enabled.
     settings.enable_global_runtime_filter = Some(false);
     settings
-}
-
-pub(crate) struct PlannedIcebergChangeStreamRefreshQuery {
-    pub(crate) optimized_tree: novarocks_sql::optimizer::OptimizedOperatorNode,
-    pub(crate) output_columns: Vec<novarocks_sql::analysis::OutputColumn>,
-    pub(crate) change_stream:
-        novarocks_sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
-    pub(crate) table_bindings:
-        Option<Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>>,
-}
-
-pub(crate) fn plan_query_for_iceberg_change_stream_refresh_with_statistics(
-    statistics_resolver: &impl crate::query_execution::planning::statistics::QueryStatisticsResolver,
-    query: &sqlparser::ast::Query,
-    analyzer_catalog: &dyn novarocks_sql::catalog::PlannerTableProvider,
-    current_database: &str,
-    imv_rewrite: Option<&novarocks_sql::compiler::SqlImvPlanningInput>,
-    table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
-    execution: &crate::query_execution::request_context::QueryExecutionContext,
-) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
-    let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
-        .ok_or_else(|| {
-            "distributed SQL compilation requires a frozen non-zero backend count".to_string()
-        })?;
-    let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
-    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-        statistics_resolver,
-        Arc::clone(&table_bindings),
-    );
-    let request = novarocks_sql::compiler::SqlCompileRequest::new(
-        novarocks_sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
-        novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
-        novarocks_sql::compiler::SqlSessionContext {
-            current_catalog: None,
-            current_database: current_database.to_string(),
-            optimizer_settings: change_stream_write_optimizer_settings(),
-        },
-        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
-        &catalog,
-        &statistics,
-        novarocks_sql::compiler::builtin_sql_function_catalog(),
-        None,
-        novarocks_sql::compiler::SqlCompileControl::new(
-            execution.deadline(),
-            crate::query_execution::planning::sql_cancellation_observation(
-                execution.cancellation().clone(),
-            ),
-        ),
-    );
-    let request = match imv_rewrite {
-        Some(input) => request.with_imv_rewrite(input),
-        None => request,
-    };
-    let novarocks_sql::compiler::SqlCompileOutput::Optimized(compiled) =
-        novarocks_sql::compiler::SqlCompiler::compile(request)
-            .map_err(|error| error.to_string())?
-    else {
-        return Err("change-stream intent did not produce an optimized SQL plan".to_string());
-    };
-    Ok(PlannedIcebergChangeStreamRefreshQuery {
-        output_columns: compiled.optimized_tree.output_columns.clone(),
-        optimized_tree: compiled.optimized_tree,
-        change_stream: compiled.change_stream,
-        table_bindings: Some(table_bindings),
-    })
 }
 
 /// Application-owned post-compile assembly for the canonical SQL kernel.

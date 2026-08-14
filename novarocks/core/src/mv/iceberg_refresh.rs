@@ -4533,7 +4533,10 @@ mod tests {
 
     #[test]
     fn imv_change_stream_effect_set_can_include_zero_row_route() {
-        let effects = build_imv_change_stream_branches_for_test(ImvBranchShape::DeleteAndReuse);
+        let effects = [
+            novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
+            novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
+        ];
         assert!(
             effects
                 .iter()
@@ -7056,95 +7059,6 @@ fn mv_definition_fingerprint(select_sql: &str) -> String {
     hex::encode(Sha256::digest(select_sql.as_bytes()))
 }
 
-fn alias_aggregate_refresh_group_key_projection_from_rewrite(
-    query: &mut sqlparser::ast::Query,
-    rewrite: &crate::mv::rewrite::context::IcebergMvRewriteContext,
-) -> Result<(), String> {
-    let (calls, layout) = rewrite.aggregate_shape_and_layout_for_execution()?;
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
-        return Err("aggregate MV incremental refresh SELECT body is required".to_string());
-    };
-    for (projection_index, output) in calls.visible_outputs.iter().enumerate() {
-        match output {
-            novarocks_sql::mv_refresh::VisibleAggregateOutput::GroupKey(group_key_index) => {
-                let visible_source_index = layout
-                    .group_key_source_indexes
-                    .get(*group_key_index)
-                    .ok_or_else(|| {
-                        format!(
-                            "aggregate MV group key projection index {group_key_index} out of range"
-                        )
-                    })?;
-                let expected_name = layout
-                    .visible_columns
-                    .get(*visible_source_index)
-                    .ok_or_else(|| {
-                        format!(
-                            "aggregate MV group key visible source index {visible_source_index} out of range"
-                        )
-                    })?
-                    .name
-                    .clone();
-                let item = select.projection.get_mut(projection_index).ok_or_else(|| {
-                    format!(
-                        "aggregate MV group key projection position {projection_index} is missing"
-                    )
-                })?;
-                alias_select_projection_item(item, &expected_name)?;
-                if let sqlparser::ast::GroupByExpr::Expressions(expressions, _) =
-                    &mut select.group_by
-                    && let Some(group_expr) = expressions.get_mut(*group_key_index)
-                {
-                    *group_expr = sqlparser::ast::Expr::Identifier(aggregate_refresh_alias_ident(
-                        &expected_name,
-                    ));
-                }
-            }
-            novarocks_sql::mv_refresh::VisibleAggregateOutput::Aggregate(_) => {}
-        }
-    }
-    Ok(())
-}
-
-fn alias_select_projection_item(
-    item: &mut sqlparser::ast::SelectItem,
-    alias: &str,
-) -> Result<(), String> {
-    use sqlparser::ast::SelectItem;
-
-    let alias = aggregate_refresh_alias_ident(alias);
-    match item {
-        SelectItem::UnnamedExpr(expr) => {
-            let expr = expr.clone();
-            *item = SelectItem::ExprWithAlias { expr, alias };
-            Ok(())
-        }
-        SelectItem::ExprWithAlias {
-            alias: existing, ..
-        } => {
-            *existing = alias;
-            Ok(())
-        }
-        SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {
-            Err("aggregate MV group key projection cannot be a wildcard".to_string())
-        }
-    }
-}
-
-fn aggregate_refresh_alias_ident(alias: &str) -> sqlparser::ast::Ident {
-    let mut chars = alias.chars();
-    let is_plain = chars
-        .next()
-        .map(|first| first.is_ascii_alphabetic() || first == '_')
-        .unwrap_or(false)
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
-    if is_plain {
-        sqlparser::ast::Ident::new(alias)
-    } else {
-        sqlparser::ast::Ident::with_quote('`', alias)
-    }
-}
-
 fn build_aggregate_layout_for_refresh_select_sql(
     source: &dyn IcebergMvRefreshSource,
     current_catalog: Option<&str>,
@@ -8805,91 +8719,6 @@ pub(crate) enum RewriteMergeRefreshEvidence {
     BranchUnionAggregate,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImvChangeStreamProducerRoute {
-    Deletion,
-    ExistingData,
-    AppendedData,
-}
-
-const IMV_CHANGE_STREAM_EFFECT_COLUMN: &str = "__imv_change_stream_effect";
-const IMV_CHANGE_STREAM_EFFECT_EXISTING: i32 = 1;
-const IMV_CHANGE_STREAM_EFFECT_APPENDED: i32 = 2;
-
-struct ImvRefreshPlannedChangeStream {
-    optimized_tree: novarocks_sql::optimizer::OptimizedOperatorNode,
-    table_bindings:
-        Option<std::sync::Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>>,
-    output_columns: Vec<OutputColumn>,
-    change_stream: novarocks_sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
-    producer_branches: Vec<ImvChangeStreamProducerRoute>,
-    snapshot_properties: BTreeMap<String, String>,
-    connector_operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-}
-
-/// A change stream that carries any deletion route retracts previously
-/// materialized rows; otherwise the refresh only adds rows.
-///
-/// Both change-stream entrypoints derived this independently before SPI-5I,
-/// so a future producer route added to one and not the other would have
-/// silently changed only half the refresh paths.
-fn deletion_route_write_effect(
-    refresh_plan: &ImvRefreshPlannedChangeStream,
-) -> MvTargetWriteEffect {
-    if refresh_plan
-        .producer_branches
-        .iter()
-        .any(|route| matches!(route, ImvChangeStreamProducerRoute::Deletion))
-    {
-        MvTargetWriteEffect::DeltaRetractingStagedFiles
-    } else {
-        MvTargetWriteEffect::Append
-    }
-}
-
-/// Bind an already prepared IMV change-stream plan to the frontend's admitted
-/// execution and retained exact lease. Unlike the legacy executor above, this
-/// function has no query submission, native assembly, provider commit, catalog
-/// publication, or MV repository transition. It is the Core-side activation
-/// half of a frontend-owned incremental refresh attempt.
-#[allow(clippy::too_many_arguments)]
-fn prepare_imv_change_stream_writer(
-    query_kernel: &crate::query_execution::kernels::QueryPreparationKernel,
-    target: &crate::catalog_application::resolver::TargetBackend,
-    refresh_plan: ImvRefreshPlannedChangeStream,
-    provider_routes: &[novarocks_spi::connector::ConnectorRowMutationRoute],
-    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    execution: &crate::query_execution::request_context::QueryExecutionContext,
-) -> Result<crate::mv::application::PreparedMvNativeWriteAssembly, String> {
-    let (refresh_plan, effect_output_ordinal) = ensure_imv_change_stream_effect(refresh_plan)?;
-    crate::connector::validate_request_context(connector_context)?;
-    let table_bindings = refresh_plan.table_bindings.as_deref().ok_or_else(|| {
-        "Iceberg MV change-stream write is missing admission-frozen query table bindings"
-            .to_string()
-    })?;
-    let mut dag = provider_change_stream_write_dag_for_imv_refresh(
-        target,
-        &refresh_plan,
-        effect_output_ordinal,
-        provider_routes,
-    )?;
-    let planned = crate::query_execution::compiler::build_physical_plan_as_iceberg_change_stream_write_native_assembly(
-        query_kernel.connector_control().as_ref(),
-        execution,
-        &refresh_plan.optimized_tree,
-        Some(table_bindings),
-        &mut dag,
-        None,
-        connector_context,
-    )?;
-    crate::query_execution::compiler::prepare_planned_iceberg_change_stream_write(
-        planned.encoding,
-        None,
-        Some(crate::query_execution::compiler::DistributedConnectorWrite::Begin(connector_write)),
-    )
-}
-
 /// Activate a value-only incremental refresh artifact after frontend intent
 /// persistence and exact-lease admission. Core rebuilds only provider-private
 /// scan and writer facts here; it returns a sealed native-assembly carrier and
@@ -8995,7 +8824,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         .map(|route| {
             let target_binding = crate::query_execution::planning::write_sink::admit_prepared_connector_write_target(
                 target_bindings.as_ref(),
-                novarocks_sql::plan_read::table::SqlTableIdentity::try_new(
+                novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::try_new(
                     target.catalog.clone(),
                     target.namespace.clone(),
                     target.table.clone(),
@@ -9085,18 +8914,8 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             RewriteMergeRefreshEvidence::BranchUnionAggregate
         }
     };
-    let planned_query = match execution_artifact {
+    match execution_artifact {
         crate::mv::application::MvIncrementalExecutionArtifact::CanonicalQuery => {
-            let mut query = (*refresh_rewrite.canonical_select_query).clone();
-            if rewrite_evidence != RewriteMergeRefreshEvidence::None
-                && rewrite_evidence != RewriteMergeRefreshEvidence::BranchUnionAggregate
-            {
-                alias_aggregate_refresh_group_key_projection_from_rewrite(
-                    &mut query,
-                    &refresh_rewrite,
-                )?;
-            }
-            novarocks_sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
             let imv_rewrite_input = sql_imv_planning_input_from_rewrite(
                 &refresh_rewrite,
                 target_binding,
@@ -9121,15 +8940,69 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 ),
                 base_overlays,
             );
-            crate::query_execution::compiler::plan_query_for_iceberg_change_stream_refresh_with_statistics(
+            let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
+                .ok_or_else(|| {
+                "IMV incremental refresh requires a non-empty admitted backend topology".to_string()
+            })?;
+            let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
+            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
                 query_kernel,
-                &query,
-                &analyzer_catalog,
-                &refresh_rewrite.current_database,
-                Some(&imv_rewrite_input),
-                Arc::clone(&target_bindings),
-                execution,
-            )?
+                analyzer_catalog.query_table_bindings(),
+            );
+            let write_mode = match mode {
+                crate::mv::application::MvIncrementalWriteMode::FastAppend => {
+                    novarocks_sql::mv_refresh::first_refresh::SqlMvIncrementalWriteMode::FastAppend
+                }
+                crate::mv::application::MvIncrementalWriteMode::RowDelta => {
+                    novarocks_sql::mv_refresh::first_refresh::SqlMvIncrementalWriteMode::RowDelta
+                }
+            };
+            let sealed = novarocks_sql::mv_refresh::first_refresh::compile_mv_incremental_refresh_change_stream(
+                novarocks_sql::mv_refresh::first_refresh::SqlMvIncrementalRefreshCompileContext {
+                    canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
+                    imv_rewrite: imv_rewrite_input,
+                    write_mode,
+                    routes: sealed_change_stream_routes,
+                    current_catalog: None,
+                    current_database: refresh_rewrite.current_database.clone(),
+                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed {
+                        backend_count,
+                    },
+                    catalog: &catalog,
+                    statistics: &statistics,
+                    functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
+                    control: novarocks_sql::compiler::SqlCompileControl::new(
+                        execution.deadline(),
+                        crate::query_execution::planning::sql_cancellation_observation(
+                            execution.cancellation().clone(),
+                        ),
+                    ),
+                },
+            )?;
+            let planned =
+                crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(
+                    query_kernel.connector_control().as_ref(),
+                    execution,
+                    sealed,
+                    target_bindings.as_ref(),
+                    &connector_context,
+                )?;
+            let distributed =
+                crate::query_execution::compiler::prepare_planned_iceberg_change_stream_write(
+                    planned.encoding,
+                    None,
+                    Some(
+                        crate::query_execution::compiler::DistributedConnectorWrite::Begin(
+                            connector_write,
+                        ),
+                    ),
+                )?;
+            if distributed.write_operation_id() != request.operation_id
+                || distributed.write_cohort_id() != selected_cohort
+            {
+                return Err("MV incremental distributed artifact identity mismatch".to_string());
+            }
+            return Ok(distributed);
         }
         crate::mv::application::MvIncrementalExecutionArtifact::JoinLogical {
             mode: join_execution_mode,
@@ -9228,760 +9101,6 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             }
             return Ok(distributed);
         }
-    };
-    let producer_branches = match mode {
-        crate::mv::application::MvIncrementalWriteMode::FastAppend => {
-            vec![ImvChangeStreamProducerRoute::AppendedData]
-        }
-        crate::mv::application::MvIncrementalWriteMode::RowDelta => vec![
-            ImvChangeStreamProducerRoute::Deletion,
-            ImvChangeStreamProducerRoute::ExistingData,
-            ImvChangeStreamProducerRoute::AppendedData,
-        ],
-    };
-    let operation_id = request.operation_id;
-    let distributed = prepare_imv_change_stream_writer(
-        query_kernel,
-        &target,
-        ImvRefreshPlannedChangeStream {
-            optimized_tree: planned_query.optimized_tree,
-            table_bindings: planned_query.table_bindings,
-            output_columns: planned_query.output_columns,
-            change_stream: planned_query.change_stream,
-            producer_branches,
-            snapshot_properties: BTreeMap::new(),
-            connector_operation_id: operation_id,
-        },
-        &provider_routes,
-        connector_write,
-        &connector_context,
-        execution,
-    )?;
-    if distributed.write_operation_id() != operation_id
-        || distributed.write_cohort_id() != selected_cohort
-    {
-        return Err("MV incremental distributed artifact identity mismatch".to_string());
-    }
-    Ok(distributed)
-}
-
-fn ensure_imv_change_stream_effect(
-    mut refresh_plan: ImvRefreshPlannedChangeStream,
-) -> Result<(ImvRefreshPlannedChangeStream, Option<usize>), String> {
-    let route_mode = imv_change_stream_effect_mode(&refresh_plan.producer_branches)?
-        .unwrap_or(ImvChangeStreamEffectMode::Constant(0));
-
-    let has_delete_branch = refresh_plan
-        .producer_branches
-        .iter()
-        .any(|route| matches!(route, ImvChangeStreamProducerRoute::Deletion));
-    let action_output = if has_delete_branch {
-        let action_ordinal = imv_change_op_output_ordinal(&refresh_plan)?;
-        Some(refresh_plan.output_columns[action_ordinal].clone())
-    } else {
-        None
-    };
-    let row_lineage_output = match route_mode {
-        ImvChangeStreamEffectMode::Constant(_) => None,
-        // A row reuses a target row exactly when it carries that row's
-        // locator. Row lineage cannot decide this: an aggregate refresh
-        // assigns `_row_id` to a brand-new group as well, and a row routed to
-        // the delete half without a locator has nothing to delete.
-        ImvChangeStreamEffectMode::ByRowLineage => Some(
-            output_column_by_name(
-                &refresh_plan.output_columns,
-                novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
-                "reuse/fresh route target locator column",
-            )?
-            .clone(),
-        ),
-    };
-
-    let route_output = imv_change_stream_effect_output_column(&refresh_plan.output_columns);
-    let route_output_ordinal = refresh_plan.output_columns.len();
-    let optimized_tree = add_imv_change_stream_effect_project(
-        refresh_plan.optimized_tree,
-        &refresh_plan.output_columns,
-        action_output.as_ref(),
-        row_lineage_output.as_ref(),
-        route_mode,
-        route_output.clone(),
-    )?;
-    refresh_plan.optimized_tree = optimized_tree;
-    refresh_plan.output_columns.push(route_output);
-
-    Ok((refresh_plan, Some(route_output_ordinal)))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImvChangeStreamEffectMode {
-    Constant(i32),
-    ByRowLineage,
-}
-
-fn imv_change_stream_effect_mode(
-    producer_branches: &[ImvChangeStreamProducerRoute],
-) -> Result<Option<ImvChangeStreamEffectMode>, String> {
-    let has_reuse = producer_branches
-        .iter()
-        .any(|route| matches!(route, ImvChangeStreamProducerRoute::ExistingData));
-    let has_fresh = producer_branches
-        .iter()
-        .any(|route| matches!(route, ImvChangeStreamProducerRoute::AppendedData));
-    Ok(match (has_reuse, has_fresh) {
-        (false, false) => None,
-        (true, false) => Some(ImvChangeStreamEffectMode::Constant(
-            IMV_CHANGE_STREAM_EFFECT_EXISTING,
-        )),
-        (false, true) => Some(ImvChangeStreamEffectMode::Constant(
-            IMV_CHANGE_STREAM_EFFECT_APPENDED,
-        )),
-        (true, true) => Some(ImvChangeStreamEffectMode::ByRowLineage),
-    })
-}
-
-fn imv_change_stream_effect_output_column(existing: &[OutputColumn]) -> OutputColumn {
-    OutputColumn {
-        column_id: ColumnId(
-            existing
-                .iter()
-                .map(|column| column.column_id.0)
-                .max()
-                .unwrap_or(0)
-                + 1,
-        ),
-        name: IMV_CHANGE_STREAM_EFFECT_COLUMN.to_string(),
-        data_type: DataType::Int8,
-        nullable: false,
-        is_internal: true,
-    }
-}
-
-fn add_imv_change_stream_effect_project(
-    child: novarocks_sql::optimizer::OptimizedOperatorNode,
-    child_output_columns: &[OutputColumn],
-    action_output: Option<&OutputColumn>,
-    row_lineage_output: Option<&OutputColumn>,
-    route_mode: ImvChangeStreamEffectMode,
-    route_output: OutputColumn,
-) -> Result<novarocks_sql::optimizer::OptimizedOperatorNode, String> {
-    use novarocks_sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
-    use novarocks_sql::optimizer::optimized_tree::{PlanExecutionProps, attach_scalar_arena};
-    use novarocks_sql::optimizer::scalar::ScalarNode;
-
-    let existing_arena =
-        child.execution_props.scalar_arena.as_ref().ok_or_else(|| {
-            "IMV change-stream route projection requires a scalar arena".to_string()
-        })?;
-    let mut arena = (**existing_arena).clone();
-    let mut items = Vec::with_capacity(child_output_columns.len() + 1);
-    for column in child_output_columns {
-        arena.remember_source_column_display(column.column_id, None, column.name.clone());
-        let expr = arena.intern(
-            ScalarNode::ColumnRef(column.column_id),
-            column.data_type.clone(),
-            column.nullable,
-        );
-        items.push(ScalarProjectItem {
-            expr,
-            output_name: column.name.clone(),
-            output_column_id: column.column_id,
-            expr_display: None,
-        });
-    }
-
-    let route_expr =
-        imv_change_stream_effect_scalar(&mut arena, action_output, row_lineage_output, route_mode)?;
-    arena.remember_project_output_display(route_output.column_id, None, route_output.name.clone());
-    items.push(ScalarProjectItem {
-        expr: route_expr,
-        output_name: route_output.name.clone(),
-        output_column_id: route_output.column_id,
-        expr_display: None,
-    });
-
-    let output_property = child.execution_props.output_property.clone();
-    let stats = child.stats.clone();
-    let mut output_columns = child_output_columns.to_vec();
-    output_columns.push(route_output);
-    let arena = Arc::new(arena);
-    let mut plan = novarocks_sql::optimizer::OptimizedOperatorNode {
-        op: Operator::PhysicalProject(ProjectOp {
-            items,
-            output_qualifier: None,
-        }),
-        children: vec![child],
-        stats,
-        explain_stats: novarocks_sql::optimizer::optimized_tree::OptimizerExplainStats::default(),
-        output_columns,
-        execution_props: PlanExecutionProps {
-            output_property: output_property.clone(),
-            child_output_properties: vec![output_property],
-            join_distribution: None,
-            scalar_arena: Some(Arc::clone(&arena)),
-        },
-    };
-    attach_scalar_arena(&mut plan, arena);
-    Ok(plan)
-}
-
-fn imv_change_stream_effect_scalar(
-    arena: &mut novarocks_sql::optimizer::scalar::ScalarArena,
-    action_output: Option<&OutputColumn>,
-    row_lineage_output: Option<&OutputColumn>,
-    route_mode: ImvChangeStreamEffectMode,
-) -> Result<novarocks_sql::optimizer::scalar::ScalarId, String> {
-    use novarocks_sql::common::{BinOp, CHANGE_OP_DELETE, LiteralValue};
-    use novarocks_sql::optimizer::scalar::{HashableLiteral, ScalarNode};
-
-    let route_value_expr = match route_mode {
-        ImvChangeStreamEffectMode::Constant(route_value) => arena.intern(
-            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(match route_value {
-                IMV_CHANGE_STREAM_EFFECT_EXISTING => 2,
-                IMV_CHANGE_STREAM_EFFECT_APPENDED => 3,
-                _ => 1,
-            }))),
-            DataType::Int8,
-            false,
-        ),
-        ImvChangeStreamEffectMode::ByRowLineage => {
-            let row_lineage_output = row_lineage_output.ok_or_else(|| {
-                "IMV reuse/fresh route requires preserved row-lineage output".to_string()
-            })?;
-            let row_lineage_ref = arena.intern(
-                ScalarNode::ColumnRef(row_lineage_output.column_id),
-                row_lineage_output.data_type.clone(),
-                row_lineage_output.nullable,
-            );
-            let is_fresh = arena.intern(
-                ScalarNode::IsNull {
-                    child: row_lineage_ref,
-                    negated: false,
-                },
-                DataType::Boolean,
-                false,
-            );
-            let fresh_route = arena.intern(
-                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(3))),
-                DataType::Int8,
-                false,
-            );
-            let reuse_route = arena.intern(
-                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(2))),
-                DataType::Int8,
-                false,
-            );
-            arena.intern(
-                ScalarNode::Case {
-                    operand: None,
-                    when_then: vec![(is_fresh, fresh_route)],
-                    else_expr: Some(reuse_route),
-                },
-                DataType::Int8,
-                false,
-            )
-        }
-    };
-    let Some(action_output) = action_output else {
-        return Ok(route_value_expr);
-    };
-
-    let action_ref = arena.intern(
-        ScalarNode::ColumnRef(action_output.column_id),
-        action_output.data_type.clone(),
-        action_output.nullable,
-    );
-    let delete_literal = arena.intern(
-        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(CHANGE_OP_DELETE as i64))),
-        action_output.data_type.clone(),
-        false,
-    );
-    let is_delete = arena.intern(
-        ScalarNode::BinaryOp {
-            op: BinOp::Eq,
-            left: action_ref,
-            right: delete_literal,
-        },
-        DataType::Boolean,
-        action_output.nullable,
-    );
-    let delete_effect = arena.intern(
-        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
-        DataType::Int8,
-        false,
-    );
-    Ok(arena.intern(
-        ScalarNode::Case {
-            operand: None,
-            when_then: vec![(is_delete, delete_effect)],
-            else_expr: Some(route_value_expr),
-        },
-        DataType::Int8,
-        false,
-    ))
-}
-
-fn iceberg_mv_target_backend(
-    target: &IcebergMvTarget,
-) -> crate::catalog_application::resolver::TargetBackend {
-    crate::catalog_application::resolver::TargetBackend {
-        backend_name: "iceberg",
-        catalog: target.catalog.clone(),
-        namespace: target.namespace.clone(),
-        table: target.table.clone(),
-    }
-}
-
-fn iceberg_change_stream_write_dag_for_imv_refresh(
-    target: &crate::catalog_application::resolver::TargetBackend,
-    refresh_plan: &ImvRefreshPlannedChangeStream,
-    effect_output_ordinal: Option<usize>,
-) -> Result<
-    novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
-    String,
-> {
-    let bindings = refresh_plan.table_bindings.as_deref().ok_or_else(|| {
-        "IMV change-stream write is missing admission-frozen query table bindings".to_string()
-    })?;
-    let routes = build_imv_change_stream_routes(
-        target,
-        bindings,
-        &refresh_plan.output_columns,
-        &refresh_plan.producer_branches,
-    )?;
-    Ok(
-        novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec {
-            effect_output_ordinal: effect_output_ordinal.ok_or_else(|| {
-                "IMV change-stream plan did not install its dedicated effect column".to_string()
-            })?,
-            routes,
-        },
-    )
-}
-
-fn provider_change_stream_write_dag_for_imv_refresh(
-    target: &crate::catalog_application::resolver::TargetBackend,
-    refresh_plan: &ImvRefreshPlannedChangeStream,
-    effect_output_ordinal: Option<usize>,
-    provider_routes: &[novarocks_spi::connector::ConnectorRowMutationRoute],
-) -> Result<
-    novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
-    String,
-> {
-    let bindings = refresh_plan.table_bindings.as_deref().ok_or_else(|| {
-        "IMV change-stream write is missing admission-frozen query table bindings".to_string()
-    })?;
-    let routes = build_provider_imv_change_stream_routes(
-        target,
-        bindings,
-        &refresh_plan.output_columns,
-        provider_routes,
-    )?;
-    Ok(
-        novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec {
-            effect_output_ordinal: effect_output_ordinal.ok_or_else(|| {
-                "IMV change-stream plan did not install its dedicated effect column".to_string()
-            })?,
-            routes,
-        },
-    )
-}
-
-fn imv_change_op_output_ordinal(
-    refresh_plan: &ImvRefreshPlannedChangeStream,
-) -> Result<usize, String> {
-    if let Some(aggregate) = refresh_plan.change_stream.aggregate() {
-        return output_ordinal_by_column_id(
-            &refresh_plan.output_columns,
-            aggregate.action_column_id,
-            "aggregate change-stream action column",
-        );
-    }
-    if let Some(join_refresh) = refresh_plan.change_stream.join_refresh.as_ref() {
-        return output_ordinal_by_column_id(
-            &refresh_plan.output_columns,
-            join_refresh.action_column.column_id,
-            "join change-stream action column",
-        );
-    }
-    refresh_plan
-        .output_columns
-        .iter()
-        .position(is_imv_change_op_output_column)
-        .ok_or_else(|| {
-            let outputs = refresh_plan
-                .output_columns
-                .iter()
-                .enumerate()
-                .map(|(idx, column)| {
-                    format!(
-                        "#{idx}:{}:{:?}:internal={}",
-                        column.name, column.column_id, column.is_internal
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "IMV change-stream write requires __change_op output column; outputs=[{outputs}]"
-            )
-        })
-}
-
-fn is_imv_change_op_output_column(column: &OutputColumn) -> bool {
-    column
-        .name
-        .eq_ignore_ascii_case(novarocks_execution::exec::change_op::CHANGE_OP_COLUMN)
-        && column.data_type == DataType::Int8
-        && !column.nullable
-}
-
-fn build_imv_change_stream_routes(
-    target: &crate::catalog_application::resolver::TargetBackend,
-    bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
-    output_columns: &[OutputColumn],
-    producer_branches: &[ImvChangeStreamProducerRoute],
-) -> Result<
-    Vec<novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec>,
-    String,
-> {
-    use crate::query_execution::planning::write_sink::sql_write_plan_input_for_admitted_target;
-    use novarocks_spi::connector::{
-        ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteCohortId,
-        ConnectorWriteRouteId,
-    };
-    use novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec;
-    use novarocks_sql::planner::distributed::write::contract::{
-        ConnectorWriteInputBinding, SqlWriteSinkMode,
-    };
-
-    producer_branches
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(idx, producer_branch)| {
-            let (sink, partition_ordinals) = match producer_branch {
-                ImvChangeStreamProducerRoute::Deletion => {
-                    let target_binding = mv_change_stream_write_binding_for_mode(
-                        bindings,
-                        target,
-                        SqlWriteSinkMode::DeletionVectors,
-                    )?;
-                    let sink = sql_write_plan_input_for_admitted_target(
-                        bindings,
-                        target_binding,
-                        SqlWriteSinkMode::DeletionVectors,
-                        ConnectorWriteInputBinding::RootOutputByOrdinal,
-                        None,
-                    )?;
-                    let file_ordinal = output_ordinal_by_name(
-                        output_columns,
-                        novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
-                        "DV file locator",
-                    )?;
-                    (sink, vec![file_ordinal])
-                }
-                ImvChangeStreamProducerRoute::ExistingData => {
-                    let target_binding = mv_change_stream_write_binding_for_mode(
-                        bindings,
-                        target,
-                        SqlWriteSinkMode::RowLineageData,
-                    )?;
-                    let sink = sql_write_plan_input_for_admitted_target(
-                        bindings,
-                        target_binding,
-                        SqlWriteSinkMode::RowLineageData,
-                        ConnectorWriteInputBinding::RootOutputByOrdinal,
-                        None,
-                    )?;
-                    let partition_ordinals =
-                        target_partition_source_ordinals_for_sql_sink(&sink, output_columns)?;
-                    (sink, partition_ordinals)
-                }
-                ImvChangeStreamProducerRoute::AppendedData => {
-                    let target_binding = mv_change_stream_write_binding_for_mode(
-                        bindings,
-                        target,
-                        SqlWriteSinkMode::Data,
-                    )?;
-                    let sink = sql_write_plan_input_for_admitted_target(
-                        bindings,
-                        target_binding,
-                        SqlWriteSinkMode::Data,
-                        ConnectorWriteInputBinding::RootOutputByOrdinal,
-                        None,
-                    )?;
-                    let partition_ordinals =
-                        target_partition_source_ordinals_for_sql_sink(&sink, output_columns)?;
-                    (sink, partition_ordinals)
-                }
-            };
-            let stream_output_ordinals =
-                output_ordinals_for_sink_columns(output_columns, &sink.contract.input_columns)?;
-            let role = match producer_branch {
-                ImvChangeStreamProducerRoute::Deletion => b"delete".as_slice(),
-                ImvChangeStreamProducerRoute::ExistingData => b"replace".as_slice(),
-                ImvChangeStreamProducerRoute::AppendedData => b"insert".as_slice(),
-            };
-            let mut route_hash = Sha256::new();
-            route_hash.update(b"novarocks.imv.change-stream.route.v1\0");
-            route_hash.update(role);
-            route_hash.update((idx as u64).to_be_bytes());
-            let route_id = ConnectorWriteRouteId::from_bytes(route_hash.finalize().into());
-            let mut cohort_hash = Sha256::new();
-            cohort_hash.update(b"novarocks.imv.change-stream.cohort.v1\0");
-            cohort_hash.update(route_id.to_bytes());
-            let cohort_id = ConnectorWriteCohortId::from_bytes(cohort_hash.finalize().into());
-            let input_ordinals = sink
-                .contract
-                .target
-                .fields
-                .iter()
-                .zip(stream_output_ordinals.iter().copied())
-                .map(|(field, ordinal)| {
-                    ConnectorMutationRouteInput::new(field.token, ordinal as u32)
-                })
-                .collect::<Vec<_>>();
-            if input_ordinals.is_empty() {
-                return Err("IMV change-stream route has no token-bound inputs".to_string());
-            }
-            let accepted_effects = match producer_branch {
-                ImvChangeStreamProducerRoute::Deletion => vec![ConnectorRowMutationEffect::Delete],
-                ImvChangeStreamProducerRoute::ExistingData => {
-                    vec![ConnectorRowMutationEffect::Replace]
-                }
-                ImvChangeStreamProducerRoute::AppendedData => {
-                    vec![ConnectorRowMutationEffect::Insert]
-                }
-            };
-            Ok(ChangeStreamWriteRouteSpec {
-                route_id,
-                cohort_id,
-                accepted_effects,
-                input_ordinals,
-                output_partition_ordinals: partition_ordinals,
-                sink,
-            })
-        })
-        .collect()
-}
-
-fn build_provider_imv_change_stream_routes(
-    target: &crate::catalog_application::resolver::TargetBackend,
-    bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
-    output_columns: &[OutputColumn],
-    provider_routes: &[novarocks_spi::connector::ConnectorRowMutationRoute],
-) -> Result<
-    Vec<novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec>,
-    String,
-> {
-    use crate::query_execution::planning::write_sink::sql_write_plan_input_for_admitted_target;
-    use novarocks_spi::connector::{ConnectorMutationRouteInput, ConnectorWriteInputShape};
-    use novarocks_sql::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec;
-    use novarocks_sql::planner::distributed::write::contract::{
-        ConnectorWriteInputBinding, SqlWriteSinkMode,
-    };
-
-    let mut provider_routes = provider_routes.to_vec();
-    provider_routes.sort_by_key(|route| route.cohort_id());
-    provider_routes
-        .into_iter()
-        .map(|route| {
-            let target_binding = bindings.admitted_iceberg_write_binding_id_for_preparation(
-                &target.catalog,
-                &target.namespace,
-                &target.table,
-                route.preparation(),
-            )?;
-            let mode = match route.input() {
-                ConnectorWriteInputShape::Data { .. } => SqlWriteSinkMode::Data,
-                ConnectorWriteInputShape::RowLineage { .. } => SqlWriteSinkMode::RowLineageData,
-                ConnectorWriteInputShape::PositionDelete { .. } => {
-                    SqlWriteSinkMode::PositionDeletes
-                }
-                ConnectorWriteInputShape::DeletionVector { .. } => {
-                    SqlWriteSinkMode::DeletionVectors
-                }
-                ConnectorWriteInputShape::EqualityDelete { .. } => {
-                    SqlWriteSinkMode::EqualityDeletes
-                }
-            };
-            let sink = sql_write_plan_input_for_admitted_target(
-                bindings,
-                target_binding,
-                mode,
-                ConnectorWriteInputBinding::RootOutputByOrdinal,
-                None,
-            )?;
-            let input_ordinals = route
-                .input()
-                .fields()
-                .into_iter()
-                .map(|field| {
-                    output_columns
-                        .iter()
-                        .position(|column| column.name.eq_ignore_ascii_case(field.field().name()))
-                        .ok_or_else(|| {
-                            format!(
-                                "IMV change-stream producer has no output for Provider route field `{}`",
-                                field.field().name()
-                            )
-                        })
-                        .and_then(|ordinal| {
-                            u32::try_from(ordinal).map_err(|_| {
-                                "IMV change-stream producer output ordinal exceeds u32".to_string()
-                            })
-                        })
-                        .map(|ordinal| ConnectorMutationRouteInput::new(field.token(), ordinal))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ChangeStreamWriteRouteSpec {
-                route_id: route.route_id(),
-                cohort_id: route.cohort_id(),
-                accepted_effects: route.accepted_effects().to_vec(),
-                input_ordinals,
-                output_partition_ordinals: Vec::new(),
-                sink,
-            })
-        })
-        .collect()
-}
-
-fn mv_change_stream_write_binding_for_mode(
-    bindings: &crate::query_execution::planning::bindings::QueryTableBindingStore,
-    target: &crate::catalog_application::resolver::TargetBackend,
-    mode: novarocks_sql::planner::distributed::write::contract::SqlWriteSinkMode,
-) -> Result<novarocks_sql::binding::SqlTableBindingId, String> {
-    use novarocks_spi::connector::ConnectorWriteInputShape;
-    use novarocks_sql::planner::distributed::write::contract::SqlWriteSinkMode;
-    use novarocks_sql::planner::table::ScanSource;
-
-    let matches = bindings
-        .captured_bindings()
-        .into_iter()
-        .filter(|(_, binding)| {
-            binding.resolved.catalog.identity.catalog == target.catalog
-                && binding.resolved.catalog.identity.namespace == target.namespace
-                && binding.resolved.catalog.identity.table == target.table
-                && binding
-                    .write_target_admission
-                    .as_ref()
-                    .is_some_and(|admission| {
-                        matches!(
-                            (mode, admission.preparation.input()),
-                            (
-                                SqlWriteSinkMode::Data,
-                                ConnectorWriteInputShape::Data { .. }
-                            ) | (
-                                SqlWriteSinkMode::RowLineageData,
-                                ConnectorWriteInputShape::RowLineage { .. }
-                            ) | (
-                                SqlWriteSinkMode::DeletionVectors,
-                                ConnectorWriteInputShape::DeletionVector { .. }
-                            )
-                        )
-                    })
-        })
-        .collect::<Vec<_>>();
-    let [(_, binding)] = matches.as_slice() else {
-        return Err(format!(
-            "IMV change-stream target {}.{}.{} does not have exactly one Provider preparation for mode {mode:?}",
-            target.catalog, target.namespace, target.table
-        ));
-    };
-    let ScanSource::Sql(source) = &binding.resolved.planner.source;
-    Ok(source.binding)
-}
-
-fn output_ordinals_for_sink_columns(
-    output_columns: &[OutputColumn],
-    sink_columns: &[novarocks_catalog::schema::ColumnDef],
-) -> Result<Vec<usize>, String> {
-    sink_columns
-        .iter()
-        .map(|column| output_ordinal_by_name(output_columns, &column.name, "sink input column"))
-        .collect()
-}
-
-fn output_column_by_name<'a>(
-    output_columns: &'a [OutputColumn],
-    name: &str,
-    label: &str,
-) -> Result<&'a OutputColumn, String> {
-    let ordinal = output_ordinal_by_name(output_columns, name, label)?;
-    Ok(&output_columns[ordinal])
-}
-
-fn target_partition_source_ordinals_for_sql_sink(
-    sink: &novarocks_sql::planner::distributed::write::contract::SqlWritePlanInput,
-    output_columns: &[OutputColumn],
-) -> Result<Vec<usize>, String> {
-    // The provider consumes partition transforms from its sealed preparation;
-    // SQL only preserves the tokenized Arrow input layout.
-    let _ = (sink, output_columns);
-    Ok(Vec::new())
-}
-
-fn output_ordinal_by_column_id(
-    output_columns: &[OutputColumn],
-    column_id: ColumnId,
-    label: &str,
-) -> Result<usize, String> {
-    let mut matches = output_columns
-        .iter()
-        .enumerate()
-        .filter(|(_, column)| column.column_id == column_id)
-        .map(|(idx, _)| idx);
-    let ordinal = matches.next().ok_or_else(|| {
-        format!(
-            "IMV change-stream {label} ColumnId({}) not found",
-            column_id.0
-        )
-    })?;
-    if matches.next().is_some() {
-        return Err(format!(
-            "IMV change-stream {label} ColumnId({}) is ambiguous",
-            column_id.0
-        ));
-    }
-    Ok(ordinal)
-}
-
-fn output_ordinal_by_name(
-    output_columns: &[OutputColumn],
-    name: &str,
-    label: &str,
-) -> Result<usize, String> {
-    let mut matches = output_columns
-        .iter()
-        .enumerate()
-        .filter(|(_, column)| column.name.eq_ignore_ascii_case(name))
-        .map(|(idx, _)| idx);
-    let ordinal = matches
-        .next()
-        .ok_or_else(|| format!("IMV change-stream {label} `{name}` not found in plan output"))?;
-    if matches.next().is_some() {
-        return Err(format!(
-            "IMV change-stream {label} `{name}` is ambiguous in plan output"
-        ));
-    }
-    Ok(ordinal)
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImvBranchShape {
-    DeleteAndReuse,
-}
-
-#[cfg(test)]
-fn build_imv_change_stream_branches_for_test(
-    shape: ImvBranchShape,
-) -> Vec<novarocks_spi::connector::ConnectorRowMutationEffect> {
-    match shape {
-        ImvBranchShape::DeleteAndReuse => vec![
-            novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
-            novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
-        ],
     }
 }
 
