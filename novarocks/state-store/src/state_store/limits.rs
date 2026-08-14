@@ -20,13 +20,10 @@ use novarocks_spi::state_store::{
     DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_RUNNER_ATTEMPTS,
     MAX_TRANSACTION_BYTES, MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
 };
-use serde::Deserialize;
-
 pub(crate) const MYSQL_MAX_KEY_BYTES: usize = 3072;
 pub(crate) const MYSQL_MAX_META_VALUE_BYTES: usize = 4096;
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StateStoreLimitOverrides {
     pub max_key_bytes: Option<usize>,
     pub max_value_bytes: Option<usize>,

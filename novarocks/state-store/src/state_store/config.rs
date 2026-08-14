@@ -21,7 +21,6 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
-use serde::{Deserialize, Deserializer};
 use uuid::Uuid;
 
 use super::host_error::{StateStoreHostError, StateStoreHostErrorKind};
@@ -71,96 +70,6 @@ pub struct StateStoreConfig {
     pub provider: StateStoreProviderConfig,
 }
 
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum StateStoreProviderKind {
-    Sqlite,
-    Foundationdb,
-    Mysql,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StateStoreConfigWire {
-    provider: StateStoreProviderKind,
-    cluster_id: String,
-    path: Option<PathBuf>,
-    deployment_owner: Option<String>,
-    cluster_file: Option<PathBuf>,
-    keyspace_id: Option<Uuid>,
-    database: Option<String>,
-    #[serde(default)]
-    limits: StateStoreLimitOverrides,
-}
-
-fn state_store_config_from_wire<E>(
-    wire: StateStoreConfigWire,
-) -> std::result::Result<StateStoreConfig, E>
-where
-    E: serde::de::Error,
-{
-    let provider = match wire.provider {
-        StateStoreProviderKind::Sqlite => {
-            if wire.cluster_file.is_some() || wire.keyspace_id.is_some() || wire.database.is_some()
-            {
-                return Err(E::custom(
-                    "non-SQLite fields are not valid for the sqlite state store provider",
-                ));
-            }
-            StateStoreProviderConfig::Sqlite {
-                path: wire.path.ok_or_else(|| E::missing_field("path"))?,
-                deployment_owner: wire
-                    .deployment_owner
-                    .ok_or_else(|| E::missing_field("deployment_owner"))?,
-            }
-        }
-        StateStoreProviderKind::Foundationdb => {
-            if wire.path.is_some() || wire.deployment_owner.is_some() || wire.database.is_some() {
-                return Err(E::custom(
-                    "non-FoundationDB fields are not valid for the foundationdb state store provider",
-                ));
-            }
-            StateStoreProviderConfig::Foundationdb {
-                cluster_file: wire
-                    .cluster_file
-                    .ok_or_else(|| E::missing_field("cluster_file"))?,
-                keyspace_id: wire
-                    .keyspace_id
-                    .ok_or_else(|| E::missing_field("keyspace_id"))?,
-            }
-        }
-        StateStoreProviderKind::Mysql => {
-            if wire.path.is_some()
-                || wire.deployment_owner.is_some()
-                || wire.cluster_file.is_some()
-                || wire.keyspace_id.is_some()
-            {
-                return Err(E::custom(
-                    "non-MySQL fields are not valid for the mysql state store provider",
-                ));
-            }
-            StateStoreProviderConfig::Mysql {
-                database: wire.database.ok_or_else(|| E::missing_field("database"))?,
-            }
-        }
-    };
-
-    Ok(StateStoreConfig {
-        cluster_id: wire.cluster_id,
-        limits: wire.limits,
-        provider,
-    })
-}
-
-impl<'de> Deserialize<'de> for StateStoreConfig {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        state_store_config_from_wire(StateStoreConfigWire::deserialize(deserializer)?)
-    }
-}
-
 impl StateStoreConfig {
     pub fn validate(&self) -> Result<()> {
         if self.cluster_id.trim().is_empty() {
@@ -206,16 +115,14 @@ impl StateStoreConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MySqlTlsMode {
     Disabled,
     Required,
     VerifyIdentity,
 }
 
-#[derive(Clone, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct MySqlClientConfig {
     pub host: String,
     pub port: u16,
@@ -356,45 +263,6 @@ pub struct StateStoreAppConfig {
     pub mysql_client: Option<MySqlClientConfig>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StateStoreAppConfigWire {
-    provider: StateStoreProviderKind,
-    cluster_id: String,
-    path: Option<PathBuf>,
-    deployment_owner: Option<String>,
-    cluster_file: Option<PathBuf>,
-    keyspace_id: Option<Uuid>,
-    database: Option<String>,
-    #[serde(default)]
-    limits: StateStoreLimitOverrides,
-    mysql_client: Option<MySqlClientConfig>,
-}
-
-impl<'de> Deserialize<'de> for StateStoreAppConfig {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = StateStoreAppConfigWire::deserialize(deserializer)?;
-        let mysql_client = wire.mysql_client;
-        let store = state_store_config_from_wire(StateStoreConfigWire {
-            provider: wire.provider,
-            cluster_id: wire.cluster_id,
-            path: wire.path,
-            deployment_owner: wire.deployment_owner,
-            cluster_file: wire.cluster_file,
-            keyspace_id: wire.keyspace_id,
-            database: wire.database,
-            limits: wire.limits,
-        })?;
-        Ok(Self {
-            store,
-            mysql_client,
-        })
-    }
-}
-
 impl StateStoreAppConfig {
     pub fn validate(&self) -> Result<()> {
         self.store.validate()?;
@@ -443,8 +311,7 @@ impl StateStoreHostConfig {
     }
 }
 
-#[derive(Clone, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct FoundationDbClientConfig {
     pub disable_multi_version_client: bool,
     pub tls_cert_path: Option<PathBuf>,
@@ -551,61 +418,4 @@ fn validate_readable_file(path: &Path, name: &str) -> Result<()> {
     File::open(path)
         .map_err(|_| anyhow::anyhow!("InvalidStateStoreConfig: {name} must be readable"))?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn state_store_config_rejects_unknown_fields() {
-        let error = toml::from_str::<StateStoreConfig>(
-            r#"
-provider = "sqlite"
-path = "meta/state-store.sqlite"
-cluster_id = "cluster-a"
-deployment_owner = "fe-a"
-fallback_to_metadata = true
-"#,
-        )
-        .expect_err("unknown state store config keys must fail closed");
-
-        assert!(error.to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn state_store_config_rejects_empty_identity_fields() {
-        for (field, input) in [
-            (
-                "path",
-                r#"provider = "sqlite"
-path = ""
-cluster_id = "cluster-a"
-deployment_owner = "fe-a""#,
-            ),
-            (
-                "cluster_id",
-                r#"provider = "sqlite"
-path = "meta/state-store.sqlite"
-cluster_id = " "
-deployment_owner = "fe-a""#,
-            ),
-            (
-                "deployment_owner",
-                r#"provider = "sqlite"
-path = "meta/state-store.sqlite"
-cluster_id = "cluster-a"
-deployment_owner = " ""#,
-            ),
-        ] {
-            let config: StateStoreConfig = toml::from_str(input).expect("parse fixture");
-            let error = config
-                .validate()
-                .expect_err("empty fields must fail closed");
-            assert!(
-                error.to_string().contains(field),
-                "wrong error for {field}: {error}"
-            );
-        }
-    }
 }

@@ -19,8 +19,8 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
+use crate::app_config::NovaRocksConfig;
 use anyhow::Context;
-use novarocks::common::app_config::NovaRocksConfig;
 use novarocks::common::network;
 use novarocks::mv::persistence::descriptor::MvDescriptorV1;
 use novarocks::mv::persistence::schema::{
@@ -853,7 +853,7 @@ mod tests {
     #[test]
     fn frontend_and_backend_compose_distinct_iceberg_role_capabilities() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let config = novarocks::common::app_config::NovaRocksConfig::default();
+        let config = crate::app_config::NovaRocksConfig::default();
         let factories = compose_frontend_control_factories(&config, runtime.handle().clone())
             .expect("frontend factories");
         let installers = compose_backend_execution_installers(&config, runtime.handle().clone())
@@ -877,15 +877,14 @@ mod tests {
     #[test]
     fn frontend_factory_resource_failure_is_reported_before_role_startup() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let mut config = novarocks::common::app_config::NovaRocksConfig::default();
-        config.connector.object_store =
-            Some(novarocks::common::app_config::ConnectorObjectStoreConfig {
-                endpoint: Some("http://minio:9000".to_string()),
-                access_key_id: None,
-                access_key_secret: None,
-                region: None,
-                enable_path_style_access: Some(true),
-            });
+        let mut config = crate::app_config::NovaRocksConfig::default();
+        config.connector.object_store = Some(crate::app_config::ConnectorObjectStoreConfig {
+            endpoint: Some("http://minio:9000".to_string()),
+            access_key_id: None,
+            access_key_secret: None,
+            region: None,
+            enable_path_style_access: Some(true),
+        });
 
         let error = match compose_frontend_control_factories(&config, runtime.handle().clone()) {
             Ok(_) => panic!("incomplete frontend resources must fail before role startup"),

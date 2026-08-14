@@ -32,7 +32,6 @@ pub mod statistics;
 pub mod view;
 pub use novarocks_version as version;
 // StarRocks-BE-like folder layout, with `novarocks_*` convenience aliases.
-pub use common::app_config as novarocks_config;
 pub use common::logging as novarocks_logging;
 pub use connector as novarocks_connectors;
 

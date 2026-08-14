@@ -43,20 +43,6 @@ fn test_unique_id_creation() {
 }
 
 #[test]
-fn test_config_loading() {
-    // Test that test configuration can be loaded
-    let test_config = TestConfig::new().expect("Failed to create test config");
-    test_config.init_logging();
-
-    let config = test_config.load_config().expect("Failed to load config");
-    assert!(
-        !config.server.host.trim().is_empty(),
-        "config host should not be empty"
-    );
-    assert!(config.server.grpc_port > 0);
-}
-
-#[test]
 fn test_cancel_with_invalid_query_id() {
     // Test cancel with a non-existent query ID
     // This should not panic, even if the query doesn't exist

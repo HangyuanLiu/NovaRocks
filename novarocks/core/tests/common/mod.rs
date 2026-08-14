@@ -22,7 +22,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
 
-use novarocks::novarocks_config;
 use novarocks::novarocks_logging;
 use novarocks_types::UniqueId;
 
@@ -71,11 +70,6 @@ parquet_page_cache_ttl_seconds = 3600
     /// Initialize logging for tests.
     pub fn init_logging(&self) {
         novarocks_logging::init_with_level("debug", &Default::default());
-    }
-
-    /// Load the test configuration.
-    pub fn load_config(&self) -> anyhow::Result<novarocks_config::NovaRocksConfig> {
-        novarocks_config::load_from_path(&self.config_path)
     }
 }
 

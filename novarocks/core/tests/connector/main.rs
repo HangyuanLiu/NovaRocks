@@ -44,10 +44,3 @@ fn test_connector_registry_new() {
     let registry = connector::ConnectorRegistry::new();
     let _ = registry;
 }
-
-#[test]
-fn test_connector_config_loading() {
-    let test_config = TestConfig::new().expect("Failed to create test config");
-    let config = test_config.load_config().expect("Failed to load config");
-    assert_eq!(config.server.host, "127.0.0.1");
-}

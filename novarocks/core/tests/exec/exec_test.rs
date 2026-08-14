@@ -47,15 +47,3 @@ fn test_expr_module() {
 fn test_node_module() {
     assert_type_accessible::<novarocks_execution::exec::node::ExecNode>();
 }
-
-#[test]
-fn test_exec_config_loading() {
-    // Test that execution-related configuration can be loaded
-    let test_config = TestConfig::new().expect("Failed to create test config");
-    let config = test_config.load_config().expect("Failed to load config");
-
-    // Verify runtime configuration exists
-    assert!(config.runtime.exchange_wait_ms > 0);
-    assert!(config.runtime.local_exchange_buffer_mem_limit_per_driver > 0);
-    assert!(config.runtime.operator_buffer_chunks > 0);
-}
