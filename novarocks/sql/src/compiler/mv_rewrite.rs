@@ -1966,9 +1966,130 @@ pub(crate) struct SqlMvRewritePreparation {
     pub(crate) diagnostics: Vec<SqlMvRewriteDiagnostic>,
 }
 
-/// One captured base-table identity at statement admission.
+/// One immutable base-table observation frozen by application admission for
+/// optional MV rewrite. This is value-only: it has no provider, lease, or
+/// catalog capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum MvRewriteBaseTableState {
+pub struct SqlMvRewriteBaseTableFacts {
+    state: SqlMvRewriteBaseTableFactsState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SqlMvRewriteBaseTableFactsState {
+    Resolved {
+        snapshot_id: Option<i64>,
+        table_uuid: Option<String>,
+    },
+    Unavailable(String),
+}
+
+impl SqlMvRewriteBaseTableFacts {
+    pub fn resolved(snapshot_id: Option<i64>, table_uuid: Option<String>) -> Self {
+        Self {
+            state: SqlMvRewriteBaseTableFactsState::Resolved {
+                snapshot_id,
+                table_uuid,
+            },
+        }
+    }
+
+    pub fn unavailable(message: String) -> Self {
+        Self {
+            state: SqlMvRewriteBaseTableFactsState::Unavailable(message),
+        }
+    }
+
+    fn into_state(self) -> MvRewriteBaseTableState {
+        match self.state {
+            SqlMvRewriteBaseTableFactsState::Resolved {
+                snapshot_id,
+                table_uuid,
+            } => MvRewriteBaseTableState::Resolved {
+                snapshot_id,
+                table_uuid,
+            },
+            SqlMvRewriteBaseTableFactsState::Unavailable(message) => {
+                MvRewriteBaseTableState::Unavailable(message)
+            }
+        }
+    }
+}
+
+/// Immutable persisted-MV facts frozen by application admission. SQL accepts
+/// copied repository and connector observations only; it keeps candidate
+/// parsing, analysis, and optimizer descriptors private.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlMvRewriteDefinitionFacts {
+    mv_id: i64,
+    select_sql: String,
+    base_table_refs: Vec<String>,
+    storage_engine: String,
+    target_catalog: Option<String>,
+    target_namespace: Option<String>,
+    target_table: Option<String>,
+    last_refresh_snapshots: BTreeMap<String, i64>,
+    last_refresh_table_uuids: BTreeMap<String, String>,
+    base_table_states: BTreeMap<String, SqlMvRewriteBaseTableFacts>,
+}
+
+impl SqlMvRewriteDefinitionFacts {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        mv_id: i64,
+        select_sql: String,
+        base_table_refs: Vec<String>,
+        storage_engine: String,
+        target_catalog: Option<String>,
+        target_namespace: Option<String>,
+        target_table: Option<String>,
+        last_refresh_snapshots: BTreeMap<String, i64>,
+        last_refresh_table_uuids: BTreeMap<String, String>,
+        base_table_states: BTreeMap<String, SqlMvRewriteBaseTableFacts>,
+    ) -> Result<Self, String> {
+        if base_table_states
+            .values()
+            .any(|state| matches!(&state.state, SqlMvRewriteBaseTableFactsState::Unavailable(message) if message.trim().is_empty()))
+        {
+            return Err("MV rewrite unavailable base-table fact cannot be empty".to_string());
+        }
+        Ok(Self {
+            mv_id,
+            select_sql,
+            base_table_refs,
+            storage_engine,
+            target_catalog,
+            target_namespace,
+            target_table,
+            last_refresh_snapshots,
+            last_refresh_table_uuids,
+            base_table_states,
+        })
+    }
+
+    fn into_definition(self) -> MvRewriteDefinition {
+        MvRewriteDefinition {
+            mv_id: self.mv_id,
+            select_sql: self.select_sql,
+            base_table_refs: self.base_table_refs,
+            storage_engine: self.storage_engine,
+            target_catalog: self.target_catalog,
+            target_namespace: self.target_namespace,
+            target_table: self.target_table,
+            last_refresh_snapshots: self.last_refresh_snapshots,
+            last_refresh_table_uuids: self.last_refresh_table_uuids,
+            base_table_states: self
+                .base_table_states
+                .into_iter()
+                .map(|(fqn, state)| (fqn, state.into_state()))
+                .collect(),
+        }
+    }
+}
+
+/// SQL-private state used after the frozen facts have crossed the application
+/// boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MvRewriteBaseTableState {
     Resolved {
         snapshot_id: Option<i64>,
         table_uuid: Option<String>,
@@ -2000,8 +2121,13 @@ pub struct MvRewriteDefinitionIndex {
 }
 
 impl MvRewriteDefinitionIndex {
-    pub(crate) fn new(definitions: Vec<MvRewriteDefinition>) -> Self {
-        Self { definitions }
+    pub fn try_new(definitions: Vec<SqlMvRewriteDefinitionFacts>) -> Result<Self, String> {
+        Ok(Self {
+            definitions: definitions
+                .into_iter()
+                .map(SqlMvRewriteDefinitionFacts::into_definition)
+                .collect(),
+        })
     }
 
     pub(crate) fn definitions(&self) -> &[MvRewriteDefinition] {
@@ -2251,52 +2377,54 @@ fn scan_fqn(source: &ScanSource) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn frozen_definition(state: MvRewriteBaseTableState) -> MvRewriteDefinition {
-        MvRewriteDefinition {
-            mv_id: 1,
-            select_sql: "select 1".to_string(),
-            base_table_refs: vec!["iceberg.db.base".to_string()],
-            storage_engine: "iceberg".to_string(),
-            target_catalog: Some("iceberg".to_string()),
-            target_namespace: Some("db".to_string()),
-            target_table: Some("mv_target".to_string()),
-            last_refresh_snapshots: BTreeMap::from([("iceberg.db.base".to_string(), 42)]),
-            last_refresh_table_uuids: BTreeMap::from([(
-                "iceberg.db.base".to_string(),
-                "original-uuid".to_string(),
-            )]),
-            base_table_states: BTreeMap::from([("iceberg.db.base".to_string(), state)]),
-        }
+    fn frozen_definition(state: SqlMvRewriteBaseTableFacts) -> MvRewriteDefinition {
+        SqlMvRewriteDefinitionFacts::try_new(
+            1,
+            "select 1".to_string(),
+            vec!["iceberg.db.base".to_string()],
+            "iceberg".to_string(),
+            Some("iceberg".to_string()),
+            Some("db".to_string()),
+            Some("mv_target".to_string()),
+            BTreeMap::from([("iceberg.db.base".to_string(), 42)]),
+            BTreeMap::from([("iceberg.db.base".to_string(), "original-uuid".to_string())]),
+            BTreeMap::from([("iceberg.db.base".to_string(), state)]),
+        )
+        .expect("valid frozen definition facts")
+        .into_definition()
     }
 
     #[test]
     fn sqlx1_mv_rewrite_definition_index_preserves_application_order() {
-        let index = MvRewriteDefinitionIndex::new(vec![
-            MvRewriteDefinition {
-                mv_id: 7,
-                select_sql: "select 1".to_string(),
-                base_table_refs: Vec::new(),
-                storage_engine: "iceberg".to_string(),
-                target_catalog: None,
-                target_namespace: None,
-                target_table: None,
-                last_refresh_snapshots: BTreeMap::new(),
-                last_refresh_table_uuids: BTreeMap::new(),
-                base_table_states: BTreeMap::new(),
-            },
-            MvRewriteDefinition {
-                mv_id: 3,
-                select_sql: "select 2".to_string(),
-                base_table_refs: Vec::new(),
-                storage_engine: "iceberg".to_string(),
-                target_catalog: None,
-                target_namespace: None,
-                target_table: None,
-                last_refresh_snapshots: BTreeMap::new(),
-                last_refresh_table_uuids: BTreeMap::new(),
-                base_table_states: BTreeMap::new(),
-            },
-        ]);
+        let index = MvRewriteDefinitionIndex::try_new(vec![
+            SqlMvRewriteDefinitionFacts::try_new(
+                7,
+                "select 1".to_string(),
+                Vec::new(),
+                "iceberg".to_string(),
+                None,
+                None,
+                None,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .expect("valid first frozen definition"),
+            SqlMvRewriteDefinitionFacts::try_new(
+                3,
+                "select 2".to_string(),
+                Vec::new(),
+                "iceberg".to_string(),
+                None,
+                None,
+                None,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .expect("valid second frozen definition"),
+        ])
+        .expect("valid ordered frozen definitions");
 
         assert_eq!(
             index
@@ -2310,18 +2438,18 @@ mod tests {
 
     #[test]
     fn sqlx2_mv_frozen_snapshot_and_uuid_decide_candidate_freshness() {
-        let fresh = frozen_definition(MvRewriteBaseTableState::Resolved {
-            snapshot_id: Some(42),
-            table_uuid: Some("original-uuid".to_string()),
-        });
-        let stale = frozen_definition(MvRewriteBaseTableState::Resolved {
-            snapshot_id: Some(43),
-            table_uuid: Some("original-uuid".to_string()),
-        });
-        let recreated = frozen_definition(MvRewriteBaseTableState::Resolved {
-            snapshot_id: Some(42),
-            table_uuid: Some("replacement-uuid".to_string()),
-        });
+        let fresh = frozen_definition(SqlMvRewriteBaseTableFacts::resolved(
+            Some(42),
+            Some("original-uuid".to_string()),
+        ));
+        let stale = frozen_definition(SqlMvRewriteBaseTableFacts::resolved(
+            Some(43),
+            Some("original-uuid".to_string()),
+        ));
+        let recreated = frozen_definition(SqlMvRewriteBaseTableFacts::resolved(
+            Some(42),
+            Some("replacement-uuid".to_string()),
+        ));
 
         assert_eq!(definition_is_fresh(&fresh), Ok(true));
         assert_eq!(definition_is_fresh(&stale), Ok(false));
@@ -2330,7 +2458,7 @@ mod tests {
 
     #[test]
     fn sqlx2_mv_frozen_read_failure_stays_a_warn_and_skip_input() {
-        let unavailable = frozen_definition(MvRewriteBaseTableState::Unavailable(
+        let unavailable = frozen_definition(SqlMvRewriteBaseTableFacts::unavailable(
             "catalog unavailable".to_string(),
         ));
 
@@ -2343,6 +2471,26 @@ mod tests {
     #[test]
     fn sqlx2_mv_candidate_limit_is_sixteen_successes() {
         assert_eq!(MAX_SUCCESSFUL_MV_REWRITE_CANDIDATES, 16);
+    }
+
+    #[test]
+    fn frozen_mv_rewrite_facts_reject_empty_unavailable_observation() {
+        let invalid = SqlMvRewriteDefinitionFacts::try_new(
+            1,
+            "select 1".to_string(),
+            Vec::new(),
+            "iceberg".to_string(),
+            None,
+            None,
+            None,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::from([(
+                "iceberg.db.base".to_string(),
+                SqlMvRewriteBaseTableFacts::unavailable(String::new()),
+            )]),
+        );
+        assert!(invalid.is_err());
     }
 
     #[test]

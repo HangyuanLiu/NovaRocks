@@ -42,6 +42,7 @@ pub use mv_rewrite::{
     SqlImvPartitionTransformFacts, SqlImvQualifiedFieldFacts, SqlImvRefreshHistoryFacts,
     SqlImvRewriteSnapshotBuilder, SqlImvRewriteSnapshotHandle, SqlImvSchemaContractFacts,
     SqlImvTargetColumnsFacts, SqlImvTargetContractFacts, SqlImvTargetVisibleColumnFacts,
+    SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts,
 };
 
 /// SQL's read-only observation of statement cancellation.
@@ -457,6 +458,30 @@ pub struct SqlImvRefreshExplainContext<'a> {
     pub functions: &'a dyn SqlFunctionCatalog,
     pub control: SqlCompileControl,
     pub level: ExplainLevel,
+}
+
+/// Immutable input for SQL-owned MV query analysis. The application may copy
+/// parsed syntax and its frozen catalog snapshot in, but receives only the
+/// opaque analyzed-MV carrier back.
+pub struct SqlMvRefreshAnalysisContext<'a> {
+    pub query: Box<sqlparser::ast::Query>,
+    pub current_database: String,
+    pub catalog: &'a dyn SqlCatalogSnapshot,
+}
+
+/// Analyze a prepared MV query without exposing analyzer nodes, CTE state, or
+/// the column-id factory to application code.
+pub fn analyze_mv_refresh_input(
+    context: SqlMvRefreshAnalysisContext<'_>,
+) -> Result<crate::planning::mv::SqlResolvedMvRefreshInput, String> {
+    let SqlMvRefreshAnalysisContext {
+        query,
+        current_database,
+        catalog,
+    } = context;
+    let (resolved, _, _) =
+        crate::analyzer::analyze(&query, catalog.planner_table_provider(), &current_database)?;
+    Ok(crate::planning::mv::SqlResolvedMvRefreshInput::from_analysis(resolved))
 }
 
 /// Compile and render an IMV refresh EXPLAIN request without exposing its
@@ -1408,6 +1433,79 @@ mod tests {
         assert!(request.imv_rewrite.is_some());
         let _: fn(SqlImvRefreshExplainContext<'_>) -> Result<Vec<String>, SqlCompileError> =
             compile_imv_refresh_explain_lines;
+    }
+
+    fn mv_analysis_query(sql: &str) -> Box<sqlparser::ast::Query> {
+        let statement = crate::parser::parse_sql_raw(sql).expect("MV analysis query parses");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected MV analysis query");
+        };
+        query
+    }
+
+    #[test]
+    fn mv_refresh_analysis_terminal_returns_only_opaque_analysis_input() {
+        use novarocks_catalog::provider::CatalogProvider as _;
+
+        let mut catalog = crate::catalog::local::PlannerMemoryCatalog::default();
+        catalog
+            .create_database("db")
+            .expect("create MV analysis database");
+        catalog
+            .register(
+                "db",
+                crate::planner::table::TableDef {
+                    name: "orders".to_string(),
+                    columns: vec![novarocks_catalog::schema::ColumnDef {
+                        name: "order_id".to_string(),
+                        data_type: arrow::datatypes::DataType::Int64,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    }],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: crate::planner::table::test_sql_scan_source(
+                        crate::planner::table::SqlScanKind::ConnectorRead,
+                    ),
+                },
+            )
+            .expect("register catalog-visible MV table");
+        let catalog = SqlPlannerTableSnapshot::new(&catalog);
+        let input = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
+            query: mv_analysis_query("SELECT order_id FROM orders"),
+            current_database: "db".to_string(),
+            catalog: &catalog,
+        })
+        .expect("analyze MV query through opaque terminal");
+
+        let facts = input.analysis_facts();
+        assert_eq!(facts.output_columns.len(), 1);
+        assert_eq!(facts.output_columns[0].name, "order_id");
+        let _: fn(
+            SqlMvRefreshAnalysisContext<'_>,
+        ) -> Result<crate::planning::mv::SqlResolvedMvRefreshInput, String> =
+            analyze_mv_refresh_input;
+    }
+
+    #[test]
+    fn mv_refresh_analysis_terminal_fails_closed_for_missing_table() {
+        use novarocks_catalog::provider::CatalogProvider as _;
+
+        let mut catalog = crate::catalog::local::PlannerMemoryCatalog::default();
+        catalog
+            .create_database("db")
+            .expect("create MV analysis database");
+        let catalog = SqlPlannerTableSnapshot::new(&catalog);
+        let error = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
+            query: mv_analysis_query("SELECT order_id FROM missing_orders"),
+            current_database: "db".to_string(),
+            catalog: &catalog,
+        })
+        .expect_err("unregistered MV table must not analyze");
+        assert!(
+            error.contains("missing_orders"),
+            "missing-table error must retain SQL analyzer context: {error}"
+        );
     }
 
     fn explain_operator_facts(node_id: i32) -> SqlExplainAnalyzeOperatorFacts {

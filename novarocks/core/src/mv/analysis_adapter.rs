@@ -26,7 +26,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::catalog_application::CatalogApplicationPort;
 use crate::catalog_application::query_catalog::QueryCatalogService;
-use crate::mv::analysis::{MvAnalysis, finish_mv_analysis, prepare_mv_select_for_catalog_provider};
+use crate::mv::analysis::{MvAnalysis, prepare_mv_select_for_catalog_provider};
 use crate::mv::lifecycle::MvListRow;
 use crate::mv::model::MvStorageEngine;
 use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
@@ -292,12 +292,20 @@ pub(crate) fn analyze_mv_select_with_ports(
         novarocks_sql::catalog::TableLookupMode::SchemaOnly,
         catalog_application,
     );
-    let (resolved, _, _) = novarocks_sql::analyzer::analyze(
-        prepared.query_for_analysis(),
-        &provider,
-        current_database,
+    let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&provider);
+    let refresh_input = novarocks_sql::compiler::analyze_mv_refresh_input(
+        novarocks_sql::compiler::SqlMvRefreshAnalysisContext {
+            query: Box::new(prepared.query_for_analysis().clone()),
+            current_database: current_database.to_string(),
+            catalog: &catalog,
+        },
     )?;
-    Ok(finish_mv_analysis(prepared, resolved))
+    let output_columns = refresh_input.analysis_facts().output_columns;
+    Ok(MvAnalysis {
+        resolved_refs: prepared.resolved_refs().to_vec(),
+        output_columns,
+        refresh_input,
+    })
 }
 
 pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, String> {
