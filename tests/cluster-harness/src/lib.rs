@@ -76,6 +76,32 @@ pub enum QueryLifecyclePhase {
     TerminalRetained,
 }
 
+/// Structured lifecycle facts exposed by a runner-owned cross-process
+/// cluster. T4 owns this test boundary; T7/T9 supply query-scoped values once
+/// their outcome and convergence contracts are implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryLifecycleErrorSource {
+    BackendAttestation,
+    FrontendLiveness,
+    NoOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParticipantTerminalOutcomeKind {
+    Proof,
+    Attestation { reason: String },
+    NoOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryLifecycleStructuredSnapshot {
+    /// The immutable execution identity used to correlate all values below.
+    pub execution_id: Option<String>,
+    pub error_source: Option<QueryLifecycleErrorSource>,
+    pub participant_outcomes: Vec<ParticipantTerminalOutcomeKind>,
+    pub metrics: BTreeMap<String, i64>,
+}
+
 impl QueryLifecyclePhase {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
@@ -590,6 +616,15 @@ pub trait ServerHandle: Send {
     fn clear_query_lifecycle_faults(&mut self) -> Result<()> {
         Ok(())
     }
+    /// Returns query-scoped outcome/source/metric facts for a structured SQL
+    /// assertion. `None` means the selected server mode does not expose the
+    /// RFO-8R2 contract yet; the runner rejects an assertion rather than
+    /// falling back to diagnostic text.
+    fn query_lifecycle_structured_snapshot(
+        &mut self,
+    ) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
+        Ok(None)
+    }
     fn release_query_lifecycle_phase_fault(
         &mut self,
         phase: QueryLifecyclePhase,
@@ -641,6 +676,13 @@ pub trait ServerHandle: Send {
     }
     fn arm_terminal_snapshot_conflict(&mut self, index: usize) -> Result<()> {
         bail!("TerminalSnapshot conflict is unsupported by this server mode (index={index})")
+    }
+    /// Arms one stable RFO-8R2 owner-local lifecycle fault. The harness owns
+    /// token publication and cleanup; application code alone claims the arm.
+    fn arm_query_lifecycle_fault(&mut self, index: usize, kind: &'static str) -> Result<()> {
+        bail!(
+            "query lifecycle fault is unsupported by this server mode (index={index}, kind={kind})"
+        )
     }
     fn arm_kill_query_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
         bail!(
@@ -941,6 +983,11 @@ impl QueryLifecycleFaultFiles {
         self.be_path(index, "heartbeat-stop-after-stage")
     }
 
+    fn rfo_8r2_fault_path(&self, index: usize, kind: &'static str) -> Result<PathBuf> {
+        validate_rfo_8r2_fault_kind(kind)?;
+        self.be_path(index, kind)
+    }
+
     fn fe_crash_path(&self) -> PathBuf {
         self.root.join("fe-crash-after-control-ready.trigger")
     }
@@ -1005,6 +1052,10 @@ impl QueryLifecycleFaultFiles {
 
     fn publish_heartbeat_stop_after_stage(&self, index: usize) -> Result<String> {
         self.publish(self.heartbeat_stop_after_stage_path(index)?, index, None)
+    }
+
+    fn publish_rfo_8r2_fault(&self, index: usize, kind: &'static str) -> Result<String> {
+        self.publish(self.rfo_8r2_fault_path(index, kind)?, index, None)
     }
 
     fn publish_fe_crash(&self, count: usize) -> Result<String> {
@@ -1106,6 +1157,26 @@ impl QueryLifecycleFaultFiles {
 impl Drop for QueryLifecycleFaultFiles {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn validate_rfo_8r2_fault_kind(kind: &str) -> Result<()> {
+    const KINDS: &[&str] = &[
+        "observation-p2-assembly-failure",
+        "observation-p2-budget-pressure",
+        "terminal-p0-retained-slot-exhausted",
+        "terminal-p0-bytes-exhausted",
+        "terminal-p0-delivery-permit-exhausted",
+        "terminal-p1-encode-failure",
+        "terminal-p1-retention-exhausted",
+        "terminal-proof-stream-drop",
+        "terminal-attestation-stream-drop",
+        "terminal-outcome-suppress",
+    ];
+    if KINDS.contains(&kind) {
+        Ok(())
+    } else {
+        bail!("unsupported RFO-8R2 query lifecycle fault kind {kind}")
     }
 }
 
@@ -1760,6 +1831,22 @@ impl ServerHandle for CrossProcessServerHandle {
             "armed TerminalSnapshot conflict for cross-process BE[{index}] token={token} trigger={}",
             self.query_lifecycle_fault_files
                 .terminal_snapshot_conflict_path(index)?
+                .display()
+        );
+        Ok(())
+    }
+
+    fn arm_query_lifecycle_fault(&mut self, index: usize, kind: &'static str) -> Result<()> {
+        self.ensure_be_index(index)?;
+        let token = self
+            .query_lifecycle_fault_files
+            .publish_rfo_8r2_fault(index, kind)?;
+        self.query_lifecycle_fault_tokens
+            .insert((index, kind), token.clone());
+        println!(
+            "armed RFO-8R2 query lifecycle fault kind={kind} for cross-process BE[{index}] token={token} trigger={}",
+            self.query_lifecycle_fault_files
+                .rfo_8r2_fault_path(index, kind)?
                 .display()
         );
         Ok(())
@@ -2891,6 +2978,38 @@ mod tests {
             !trigger_dir.exists(),
             "dropping the runner-owned fault scope must remove every trigger"
         );
+        fs::remove_dir(&root).expect("remove empty temp root");
+    }
+
+    #[test]
+    fn rfo_8r2_fault_arm_uses_the_same_tokenized_scope_and_rejects_unknown_kinds() {
+        let root = std::env::temp_dir().join(format!(
+            "novarocks-rfo-8r2-fault-test-{}",
+            next_fragment_failure_token(99)
+        ));
+        fs::create_dir_all(&root).expect("create temp root");
+        let trigger_dir = root.join("query-lifecycle-faults");
+        let paths = QueryLifecycleFaultFiles::new(&trigger_dir, 3).expect("create fault paths");
+        let token = paths
+            .publish_rfo_8r2_fault(2, "terminal-outcome-suppress")
+            .expect("publish RFO-8R2 arm");
+        assert_eq!(
+            fs::read_to_string(
+                paths
+                    .rfo_8r2_fault_path(2, "terminal-outcome-suppress")
+                    .expect("fault path"),
+            )
+            .expect("read fault arm"),
+            format!("token={token}\nbackend_index=2\n")
+        );
+        let error = paths
+            .publish_rfo_8r2_fault(0, "not-a-rfo-8r2-fault")
+            .expect_err("unknown fault kind must not publish a file");
+        assert!(
+            format!("{error:#}").contains("unsupported RFO-8R2 query lifecycle fault kind"),
+            "unexpected error: {error:#}"
+        );
+        drop(paths);
         fs::remove_dir(&root).expect("remove empty temp root");
     }
 

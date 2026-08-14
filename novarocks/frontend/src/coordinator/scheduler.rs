@@ -307,6 +307,16 @@ fn bind_query_lifecycle_fault_scopes(
             QueryLifecycleFaultKind::TerminalAckDrop,
             QueryLifecycleFaultKind::TerminalSnapshotStreamDrop,
             QueryLifecycleFaultKind::TerminalSnapshotConflict,
+            QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
+            QueryLifecycleFaultKind::ObservationP2BudgetPressure,
+            QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
+            QueryLifecycleFaultKind::TerminalP0BytesExhausted,
+            QueryLifecycleFaultKind::TerminalP0DeliveryPermitExhausted,
+            QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+            QueryLifecycleFaultKind::TerminalP1RetentionExhausted,
+            QueryLifecycleFaultKind::TerminalProofStreamDrop,
+            QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
+            QueryLifecycleFaultKind::TerminalOutcomeSuppress,
         ] {
             if let Some(scope) = bind_armed_fault(
                 &root,

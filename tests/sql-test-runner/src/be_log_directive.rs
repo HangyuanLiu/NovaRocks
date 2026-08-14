@@ -103,6 +103,7 @@ fn is_query_lifecycle_step(meta: &QueryMeta) -> bool {
         || meta.kill_query_after_control_ready_count.is_some()
         || meta.kill_query_after_be_log_contains.is_some()
         || meta.query_control_fragment_backend_limit.is_some()
+        || meta.query_lifecycle_fault.is_some()
 }
 
 pub(crate) fn snapshot_with_deadline(
@@ -173,6 +174,10 @@ pub(crate) fn snapshot_with_deadline(
         .or_else(|| {
             meta.restart_be_after_init_ack_index
                 .map(|index| (index, "restart-after-init-ack"))
+        })
+        .or_else(|| {
+            meta.query_lifecycle_fault
+                .map(|fault| (fault.be_index, fault.kind.as_str()))
         });
     let lifecycle_token = lifecycle_fault
         .map(|(index, kind)| {
@@ -271,6 +276,13 @@ fn lifecycle_evidence(
 ) -> Result<Option<LogEvidenceCheck>> {
     let lifecycle_step = is_query_lifecycle_step(&step.meta);
     if !lifecycle_step {
+        return Ok(None);
+    }
+    // T4 deliberately creates the arm/bind/token contract before T5/T7/T9
+    // add owner markers and structured snapshot producers. Do not turn this
+    // temporary absence into a log-text assertion; T10 consumes the typed
+    // structured assertion contract instead.
+    if step.meta.query_lifecycle_fault.is_some() {
         return Ok(None);
     }
     if endpoint_count != 3 {

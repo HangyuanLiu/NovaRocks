@@ -146,6 +146,7 @@ pub(crate) fn query_lifecycle_fault_step_guard(
         || meta.drop_next_terminal_ack_be_index.is_some()
         || meta.drop_terminal_snapshot_stream_be_index.is_some()
         || meta.terminal_snapshot_conflict_be_index.is_some()
+        || meta.query_lifecycle_fault.is_some()
         || meta.kill_query_at_lifecycle_phase.is_some()
         || meta.kill_fe_at_lifecycle_phase.is_some()
         || meta
@@ -194,6 +195,7 @@ pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
         || meta.drop_next_terminal_ack_be_index.is_some()
         || meta.drop_terminal_snapshot_stream_be_index.is_some()
         || meta.terminal_snapshot_conflict_be_index.is_some()
+        || meta.query_lifecycle_fault.is_some()
         || meta.kill_query_at_lifecycle_phase.is_some()
         || meta.kill_fe_at_lifecycle_phase.is_some()
         || meta
@@ -242,6 +244,7 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         meta.drop_next_terminal_ack_be_index.is_some(),
         meta.drop_terminal_snapshot_stream_be_index.is_some(),
         meta.terminal_snapshot_conflict_be_index.is_some(),
+        meta.query_lifecycle_fault.is_some(),
         meta.kill_query_at_lifecycle_phase.is_some(),
         meta.kill_fe_at_lifecycle_phase.is_some(),
         meta.stop_query_control_heartbeat_after_stage_be_index
@@ -344,6 +347,15 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     {
         bail!("query_control_fragment_backend_limit must be between 1 and {be_count}, got {limit}");
     }
+    if let Some(fault) = meta.query_lifecycle_fault
+        && fault.be_index >= be_count
+    {
+        bail!(
+            "query_lifecycle_fault {} BE index {} is out of bounds for {be_count} BE(s)",
+            fault.kind.as_str(),
+            fault.be_index
+        );
+    }
 
     if let Some(index) = meta.drop_next_init_ack_be_index {
         server.arm_init_ack_drop(index)?;
@@ -377,6 +389,9 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     }
     if let Some(index) = meta.terminal_snapshot_conflict_be_index {
         server.arm_terminal_snapshot_conflict(index)?;
+    }
+    if let Some(fault) = meta.query_lifecycle_fault {
+        server.arm_query_lifecycle_fault(fault.be_index, fault.kind.as_str())?;
     }
     if let Some(phase) = meta.kill_query_at_lifecycle_phase {
         server.arm_kill_query_at_lifecycle_phase(phase)?;
