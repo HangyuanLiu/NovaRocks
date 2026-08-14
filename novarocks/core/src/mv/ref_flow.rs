@@ -23,13 +23,13 @@
 use std::sync::Arc;
 
 use crate::query_execution::StatementResult;
-use crate::sql::parser::ast::{
-    AlterIcebergRefAction, AlterIcebergRefStmt, ObjectName, SnapshotAnchor,
-};
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorInstanceId, ConnectorRefAction, ConnectorRefKind,
     ConnectorTableIdentity, ConnectorTableResolution, CreateOrReplacePolicy, DropPolicy,
     ExternalMutationFinalization,
+};
+use novarocks_sql::syntax::{
+    AlterIcebergRefAction, AlterIcebergRefStmt, ObjectName, SnapshotAnchor,
 };
 
 /// Execute an Iceberg ref mutation using only the explicit MV kernel ports

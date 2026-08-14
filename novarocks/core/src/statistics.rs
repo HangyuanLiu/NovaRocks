@@ -23,7 +23,7 @@ use arrow::datatypes::DataType;
 use crate::query_execution::compiler::CatalogServiceSource;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::runtime::query_result::QueryResult;
-use crate::sql::parser::ast::ObjectName;
+use novarocks_sql::syntax::ObjectName;
 
 pub mod application;
 pub mod command;
@@ -338,7 +338,7 @@ fn table_columns_from_local_catalog(
         .local()
         .read()
         .expect("standalone catalog read lock");
-    let table = catalog.get(database, table)?;
+    let table = novarocks_sql::planning::catalog::local_catalog_table(&catalog, database, table)?;
     Ok(table
         .columns
         .iter()
@@ -467,25 +467,19 @@ mod tests {
             catalog
                 .create_database("other_db")
                 .expect("create database");
-            catalog
-                .register(
-                    "other_db",
-                    crate::sql::planner::table::TableDef {
-                        name: "t".to_string(),
-                        columns: vec![ColumnDef {
-                            name: "k".to_string(),
-                            data_type: DataType::Int64,
-                            nullable: false,
-                            write_default: None,
-                            logical_type: None,
-                        }],
-                        iceberg_row_lineage_metadata_columns: Vec::new(),
-                        source: crate::sql::planner::table::test_sql_scan_source(
-                            crate::sql::planner::table::SqlScanKind::ConnectorRead,
-                        ),
-                    },
-                )
-                .expect("register table");
+            novarocks_sql::planning::catalog::register_test_connector_read_table(
+                &mut catalog,
+                "other_db",
+                "t",
+                vec![ColumnDef {
+                    name: "k".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                }],
+            )
+            .expect("register table");
         }
 
         for name_parts in [

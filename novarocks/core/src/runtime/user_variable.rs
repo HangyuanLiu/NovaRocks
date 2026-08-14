@@ -19,7 +19,7 @@ use arrow::array::{Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringAr
 use arrow::datatypes::DataType;
 
 use crate::runtime::query_result::QueryResult;
-use crate::sql::parser::ast::Literal;
+use novarocks_sql::syntax::Literal;
 
 /// Convert a scalar query result into SQL that can be substituted for a user variable.
 pub fn query_result_to_user_variable_literal(result: &QueryResult) -> Result<String, String> {
@@ -64,7 +64,7 @@ fn query_result_cell_to_user_variable_sql(
     if let Some(text) = arrow_text_cell(column, row_idx) {
         return user_variable_text_to_sql(&text?, declared_type);
     }
-    let literal = crate::sql::literal::literal_from_batch(column, row_idx)?;
+    let literal = novarocks_sql::syntax::literal_from_batch(column, row_idx)?;
     user_variable_literal_to_sql(&literal)
 }
 

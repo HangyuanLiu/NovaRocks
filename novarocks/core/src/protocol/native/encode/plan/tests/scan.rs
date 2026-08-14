@@ -32,14 +32,15 @@ use crate::query_execution::preparation::scan::{
     ResolvedReadColumn, ResolvedReadReason, ResolvedScanBinding, ResolvedScanColumn,
     ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
 };
-use crate::sql::analysis::OutputColumn;
-use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::DataPartition;
-use crate::sql::planner::table as table_model;
+use novarocks_sql::plan_read::ColumnId;
+use novarocks_sql::test_support::{NativeScanFixture, native_scan_plan};
 
 #[test]
 fn iceberg_delta_table_encoder_requires_prepared_connector_read() {
-    let plan = iceberg_delta_distributed_plan_for_test();
+    let plan = novarocks_sql::test_support::native_scan_plan(
+        novarocks_sql::test_support::NativeScanFixture::DeltaWithStaleUnprojectedColumn,
+    )
+    .expect("sealed delta scan fixture");
     let source_column = novarocks_catalog::schema::ColumnDef {
         name: "physical_order_id".to_string(),
         data_type: DataType::Int64,
@@ -47,19 +48,6 @@ fn iceberg_delta_table_encoder_requires_prepared_connector_read() {
         write_default: None,
         logical_type: None,
     };
-    let mut plan = crate::sql::planner::distributed::test_support::draft_builder_from_plan(
-        &plan,
-        Default::default(),
-    );
-    root_scan_for_test(&mut plan)
-        .table
-        .columns
-        .push(column_def_for_test(
-            "stale_unprojected",
-            DataType::Utf8,
-            true,
-        ));
-    let plan = plan.seal().expect("seal prepared delta fixture");
     let hidden_equality_column = column_def_for_test("tenant_id", DataType::Int64, false);
     let mut bindings = ScanExecutionBindings::default();
     bindings
@@ -75,7 +63,7 @@ fn iceberg_delta_table_encoder_requires_prepared_connector_read() {
             }],
             required_reads: vec![
                 ResolvedReadColumn {
-                    planner_column_id: Some(ColumnId::new_for_test(1)),
+                    planner_column_id: Some(ColumnId(1)),
                     source: source_column,
                     reason: ResolvedReadReason::PlannerRequiredOrOutput,
                 },
@@ -185,22 +173,8 @@ fn planned_connector_read_for_test()
 
 #[test]
 fn ordinary_iceberg_binding_preserves_existing_encoding() {
-    let plan = iceberg_delta_distributed_plan_for_test();
-    let mut plan = crate::sql::planner::distributed::test_support::draft_builder_from_plan(
-        &plan,
-        Default::default(),
-    );
-    let scan = root_scan_for_test(&mut plan);
-    scan.table.columns.push(column_def_for_test(
-        "unprojected_payload",
-        DataType::Utf8,
-        true,
-    ));
-    scan.table.source = table_model::test_sql_scan_source(table_model::SqlScanKind::Data {
-        version: table_model::SqlTableVersionSelector::Current,
-    });
-    scan.required_columns = Some(vec!["order_id".to_string()]);
-    let plan = plan.seal().expect("seal ordinary Iceberg fixture");
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergWithUnprojectedPayload)
+        .expect("sealed ordinary Iceberg fixture");
 
     let missing = encode_distributed_plan(&plan, empty_scan_bindings())
         .expect_err("tokenized SQL scans require a prepared binding");
@@ -247,55 +221,12 @@ fn ordinary_iceberg_binding_preserves_existing_encoding() {
 
 #[test]
 fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
-    let refresh_sources = [
-        table_model::test_sql_scan_source(table_model::SqlScanKind::Data {
-            version: table_model::SqlTableVersionSelector::Snapshot(1),
-        }),
-        table_model::test_sql_scan_source(table_model::SqlScanKind::MvTargetLocator {
-            facts: table_model::SqlMvTargetLocatorScan {
-                target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
-                target_snapshot_id: Some(1),
-                apply_key_column: "bound_order_id".to_string(),
-                branch_id_column: None,
-            },
-        }),
-        table_model::test_sql_scan_source(table_model::SqlScanKind::MvTargetState {
-            facts: table_model::SqlMvTargetStateScan {
-                target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
-                target_snapshot_id: Some(1),
-                aggregate_state_layout_version: 1,
-                columns: Vec::new(),
-                group_key_names: vec!["bound_order_id".to_string()],
-                aggregate_state_names: Vec::new(),
-                physical_column_names: vec!["bound_order_id".to_string()],
-                row_id_column_name: "bound_order_id".to_string(),
-                row_filter: table_model::SqlMvTargetStateRowFilter::DeltaInputRowIds {
-                    row_id_column_name: "bound_order_id".to_string(),
-                    branch_scope: None,
-                },
-                partition_constraint:
-                    table_model::SqlMvTargetStatePartitionConstraint::Unpartitioned,
-            },
-        }),
-    ];
-
-    for source in refresh_sources {
-        let plan = iceberg_delta_distributed_plan_for_test();
-        let mut plan = crate::sql::planner::distributed::test_support::draft_builder_from_plan(
-            &plan,
-            Default::default(),
-        );
-        let scan = root_scan_for_test(&mut plan);
-        scan.table.source = source;
-        scan.table.columns = vec![
-            column_def_for_test("stale", DataType::Utf8, true),
-            column_def_for_test("stale_unprojected", DataType::Utf8, true),
-        ];
-        scan.columns = vec![
-            output_column(1, "stale", DataType::Utf8),
-            output_column(2, "stale_meta", DataType::Int64),
-        ];
-        let plan = plan.seal().expect("seal refresh-source fixture");
+    for fixture in [
+        NativeScanFixture::RefreshSnapshot,
+        NativeScanFixture::RefreshMvTargetLocator,
+        NativeScanFixture::RefreshMvTargetState,
+    ] {
+        let plan = native_scan_plan(fixture).expect("sealed refresh-source fixture");
 
         let mut bindings = ScanExecutionBindings::default();
         bindings
@@ -384,49 +315,11 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
 
 #[test]
 fn mv_target_sources_require_prepared_connector_reads() {
-    let sources = [
-        (
-            "SqlMvTargetLocator",
-            table_model::test_sql_scan_source(table_model::SqlScanKind::MvTargetLocator {
-                facts: table_model::SqlMvTargetLocatorScan {
-                    target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
-                    target_snapshot_id: Some(1),
-                    apply_key_column: "order_id".to_string(),
-                    branch_id_column: None,
-                },
-            }),
-        ),
-        (
-            "SqlMvTargetState",
-            table_model::test_sql_scan_source(table_model::SqlScanKind::MvTargetState {
-                facts: table_model::SqlMvTargetStateScan {
-                    target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
-                    target_snapshot_id: Some(1),
-                    aggregate_state_layout_version: 1,
-                    columns: Vec::new(),
-                    group_key_names: vec!["order_id".to_string()],
-                    aggregate_state_names: Vec::new(),
-                    physical_column_names: vec!["order_id".to_string()],
-                    row_id_column_name: "order_id".to_string(),
-                    row_filter: table_model::SqlMvTargetStateRowFilter::DeltaInputRowIds {
-                        row_id_column_name: "order_id".to_string(),
-                        branch_scope: None,
-                    },
-                    partition_constraint:
-                        table_model::SqlMvTargetStatePartitionConstraint::Unpartitioned,
-                },
-            }),
-        ),
-    ];
-
-    for (source_name, source) in sources {
-        let plan = iceberg_delta_distributed_plan_for_test();
-        let mut plan = crate::sql::planner::distributed::test_support::draft_builder_from_plan(
-            &plan,
-            Default::default(),
-        );
-        root_scan_for_test(&mut plan).table.source = source;
-        let plan = plan.seal().expect("seal MV target source fixture");
+    for (source_name, fixture) in [
+        ("SqlMvTargetLocator", NativeScanFixture::MvTargetLocator),
+        ("SqlMvTargetState", NativeScanFixture::MvTargetState),
+    ] {
+        let plan = native_scan_plan(fixture).expect("sealed MV target source fixture");
 
         let error = encode_distributed_plan(&plan, empty_scan_bindings())
             .expect_err("unprepared MV target source must fail native submission");
@@ -436,7 +329,8 @@ fn mv_target_sources_require_prepared_connector_reads() {
 
 #[test]
 fn required_bindings_reject_missing_node_and_execution_variant_mismatch() {
-    let plan = iceberg_delta_distributed_plan_for_test();
+    let plan = native_scan_plan(NativeScanFixture::DeltaWithStaleUnprojectedColumn)
+        .expect("sealed delta scan fixture");
     let missing = encode_distributed_plan_with_context(
         &plan,
         NativePlanEncodeContext {
@@ -497,37 +391,8 @@ fn required_bindings_reject_missing_node_and_execution_variant_mismatch() {
 
 #[test]
 fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
-    let plan = iceberg_delta_distributed_plan_for_test();
-    let mut plan = crate::sql::planner::distributed::test_support::draft_builder_from_plan(
-        &plan,
-        Default::default(),
-    );
-    let scan = root_scan_for_test(&mut plan);
-    scan.table.columns = vec![column_def_for_test("v", DataType::LargeBinary, false)];
-    scan.table.source = table_model::test_sql_scan_source(table_model::SqlScanKind::Data {
-        version: table_model::SqlTableVersionSelector::Current,
-    });
-    scan.columns = vec![
-        output_column(1, "v", DataType::LargeBinary),
-        OutputColumn {
-            column_id: ColumnId::new_for_test(2),
-            name: "__nr_var_v_0".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            is_internal: true,
-        },
-    ];
-    scan.required_columns = Some(vec!["__nr_var_v_0".to_string()]);
-    scan.variant_columns = vec![crate::sql::common::ScanVariantColumn {
-        source_column_id: ColumnId::new_for_test(1),
-        source_column: "v".to_string(),
-        synthetic_column_id: ColumnId::new_for_test(2),
-        synthetic_column: "__nr_var_v_0".to_string(),
-        canonical_path: "$.a.b".to_string(),
-        requested_type: DataType::Int64,
-        strict: true,
-    }];
-    let plan = plan.seal().expect("seal variant fixture");
+    let plan = native_scan_plan(NativeScanFixture::VariantProjection)
+        .expect("sealed VARIANT projection fixture");
     let mut bindings = ScanExecutionBindings::default();
     bindings
         .insert_binding(file_binding_for_test(
@@ -573,15 +438,6 @@ fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
         panic!("variant binding must encode as ConnectorReadSource");
     };
     assert_eq!(connector.instance_id, "ice");
-}
-
-fn root_scan_for_test(
-    plan: &mut crate::sql::planner::distributed::test_support::DistributedPlanDraftBuilder,
-) -> &mut crate::sql::planner::payload::PlanScanNode {
-    let DistributedNodeKind::Scan(scan) = &mut plan.fragments_mut()[0].root.payload else {
-        panic!("expected root scan");
-    };
-    scan
 }
 
 fn encoded_root_scan_for_test(plan: &plan::DistributedPlan) -> &plan::ScanNode {
@@ -641,7 +497,7 @@ fn bound_column_for_test(
 
 fn bound_read_for_test(planner_id: Option<u32>, source_name: &str) -> ResolvedReadColumn {
     ResolvedReadColumn {
-        planner_column_id: planner_id.map(ColumnId::new_for_test),
+        planner_column_id: planner_id.map(ColumnId),
         source: column_def_for_test(source_name, DataType::Int64, false),
         reason: if planner_id.is_some() {
             ResolvedReadReason::PlannerRequiredOrOutput
@@ -662,64 +518,5 @@ fn column_def_for_test(
         nullable,
         write_default: None,
         logical_type: None,
-    }
-}
-
-fn iceberg_delta_distributed_plan_for_test() -> DistributedPlan {
-    let output_columns = vec![output_column(1, "order_id", DataType::Int64)];
-    crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
-        fragments: vec![PlanFragment {
-            fragment_id: 0,
-            root: DistributedNode {
-                node_id: 10,
-                fragment_id: 0,
-                tuple_ids: vec![10],
-                nullable_tuple_ids: Vec::new(),
-                limit: -1,
-        runtime_filter_binding_ids: Vec::new(),
-                children: Vec::new(),
-                stats: stats(),
-                payload: DistributedNodeKind::Scan(
-                    crate::sql::planner::payload::PlanScanNode {
-                        database: "db".to_string(),
-                        table: iceberg_delta_table_for_test(),
-                        alias: None,
-                        columns: output_columns.clone(),
-                        predicates: Vec::new(),
-                        required_columns: None,
-                        variant_columns: Vec::new(),
-                        mv_rewritten_from: None,
-                    },
-                ),
-            },
-            data_partition: DataPartition::unpartitioned(),
-            output_partition: DataPartition::unpartitioned(),
-            sink: DataSink::Result,
-            output_exprs: None,
-            output_columns,
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        }],
-        root_fragment_id: 0,
-        runtime_filter_graph: Default::default(),
-        edges: Vec::new(),
-    }
-}
-
-fn iceberg_delta_table_for_test() -> table_model::TableDef {
-    table_model::TableDef {
-        name: "orders".to_string(),
-        columns: vec![novarocks_catalog::schema::ColumnDef {
-            name: "order_id".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            write_default: None,
-            logical_type: None,
-        }],
-        iceberg_row_lineage_metadata_columns: Vec::new(),
-        source: table_model::test_sql_scan_source(table_model::SqlScanKind::Delta {
-            from_snapshot_id: 1,
-            to_snapshot_id: 2,
-        }),
     }
 }

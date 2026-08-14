@@ -44,9 +44,9 @@ pub(crate) fn rewrite_select_sql_for_rebind(
     if rebound_columns.is_empty() {
         return Ok(stored_sql.to_string());
     }
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(stored_sql)
+    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(stored_sql)
         .map_err(|e| format!("rebind rewrite: normalize_for_raw_parse: {e}"))?;
-    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+    let mut stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
         .map_err(|e| format!("rebind rewrite: parse: {e}"))?;
     let sqlparser::ast::Statement::Query(query) = &mut stmt else {
         return Err("rebind rewrite: expected SELECT query".to_string());

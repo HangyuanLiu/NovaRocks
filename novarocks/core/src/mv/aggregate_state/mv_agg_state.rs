@@ -31,16 +31,12 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls;
-use crate::mv::aggregate_state::mv_shape::{AggregateInput, AggregateMvShape};
 use crate::mv::aggregate_state::physical_column::{
     StarRocksPhysicalColumn, starrocks_physical_column,
 };
 use crate::mv::aggregate_state::sql_type::arrow_data_type_to_sql_type;
 use crate::mv::model::AggregateStateRole;
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
-use crate::sql::analysis::OutputColumn;
-use crate::sql::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
 use novarocks_catalog::schema::SqlType;
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_execution::exec::expr::agg::{
@@ -57,6 +53,12 @@ use novarocks_execution::exec::expr::function::mv_state::{
 use novarocks_execution::exec::mv::state_codec::{
     KeyValue, decode_avg_decimal128, decode_avg_int64, decode_count_state, decode_sum_decimal128,
     decode_sum_int64,
+};
+use novarocks_sql::plan_read::OutputColumn;
+use novarocks_sql::planning::mv::{AggregateFunctionKind, VisibleAggregateOutput};
+use novarocks_sql::planning::mv::{
+    AggregateInput, AggregateMvShape, SqlMvAggregateCalls as AggregateSqlCalls,
+    SqlMvAggregateLayoutFacts,
 };
 
 pub(crate) const ROW_ID_COLUMN: &str = "__row_id__";
@@ -160,6 +162,59 @@ pub(crate) struct AggregateMergeResult {
     pub(crate) row_delta: i64,
 }
 
+/// Core's value-only aggregate layout input. It is intentionally narrower
+/// than SQL's analyzed `OutputColumn`: the aggregate-state mapper only needs
+/// the visible target name, Arrow type, and nullability.
+#[derive(Clone, Debug)]
+struct AggregateLayoutOutputColumnFacts {
+    name: String,
+    data_type: DataType,
+    nullable: bool,
+}
+
+/// Execution-owned aggregate facts. SQL derives this value-only projection
+/// from its parsed/analyzed input; Core never receives an expression tree.
+#[derive(Clone, Debug)]
+struct AggregateLayoutCallFacts {
+    output_name: String,
+    function: AggregateFunctionKind,
+    count_star: bool,
+    visible_source_index: usize,
+}
+
+/// Map SQL's one-shot immutable aggregate facts into the execution-owned
+/// aggregate-state layout. No analyzer query, output-column ID, or expression
+/// graph crosses this boundary.
+pub(crate) fn build_aggregate_mv_layout_from_sql_facts(
+    facts: &SqlMvAggregateLayoutFacts,
+) -> Result<AggregateMvLayout, String> {
+    let output_columns = facts
+        .output_columns()
+        .iter()
+        .map(|column| AggregateLayoutOutputColumnFacts {
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+        })
+        .collect::<Vec<_>>();
+    let calls = facts
+        .calls()
+        .iter()
+        .map(|call| AggregateLayoutCallFacts {
+            output_name: call.output_name().to_string(),
+            function: call.function(),
+            count_star: call.count_star(),
+            visible_source_index: call.visible_source_index(),
+        })
+        .collect::<Vec<_>>();
+    build_aggregate_mv_layout_from_value_facts(
+        &calls,
+        &output_columns,
+        facts.aggregate_input_types(),
+        facts.group_key_source_indexes(),
+    )
+}
+
 pub(crate) fn build_aggregate_mv_layout(
     shape: &AggregateMvShape,
     output_columns: &[OutputColumn],
@@ -174,18 +229,47 @@ pub(crate) fn build_aggregate_mv_layout_with_input_types(
     output_columns: &[OutputColumn],
     aggregate_input_types: &[Option<DataType>],
 ) -> Result<AggregateMvLayout, String> {
-    if aggregate_input_types.len() != calls.aggregates.len() {
+    let output_columns = output_columns
+        .iter()
+        .map(|column| AggregateLayoutOutputColumnFacts {
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+        })
+        .collect::<Vec<_>>();
+    let call_facts = calls
+        .aggregates
+        .iter()
+        .enumerate()
+        .map(|(aggregate_index, aggregate)| {
+            Ok(AggregateLayoutCallFacts {
+                output_name: aggregate.output_name.clone(),
+                function: aggregate.function,
+                count_star: matches!(aggregate.input, AggregateInput::Star),
+                visible_source_index: aggregate_visible_source_index(calls, aggregate_index)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let group_key_source_indexes = group_key_source_indexes(calls)?;
+    build_aggregate_mv_layout_from_value_facts(
+        &call_facts,
+        &output_columns,
+        aggregate_input_types,
+        &group_key_source_indexes,
+    )
+}
+
+fn build_aggregate_mv_layout_from_value_facts(
+    calls: &[AggregateLayoutCallFacts],
+    output_columns: &[AggregateLayoutOutputColumnFacts],
+    aggregate_input_types: &[Option<DataType>],
+    group_key_source_indexes: &[usize],
+) -> Result<AggregateMvLayout, String> {
+    if aggregate_input_types.len() != calls.len() {
         return Err(format!(
             "aggregate MV input type metadata count mismatch: inputs={} aggregates={}",
             aggregate_input_types.len(),
-            calls.aggregates.len()
-        ));
-    }
-    if output_columns.len() != calls.visible_outputs.len() {
-        return Err(format!(
-            "aggregate MV output count mismatch: shape_outputs={} analyzed_outputs={}",
-            calls.visible_outputs.len(),
-            output_columns.len()
+            calls.len()
         ));
     }
 
@@ -197,7 +281,14 @@ pub(crate) fn build_aggregate_mv_layout_with_input_types(
         true,
     );
     let mut physical_columns = vec![row_id_column.clone()];
-    let group_key_source_indexes = group_key_source_indexes(calls)?;
+    for (group_key_index, source_index) in group_key_source_indexes.iter().enumerate() {
+        if *source_index >= output_columns.len() {
+            return Err(format!(
+                "aggregate MV group key visible source index out of range: group_key_index={group_key_index} source_index={source_index} outputs={}",
+                output_columns.len()
+            ));
+        }
+    }
 
     let visible_columns = output_columns
         .iter()
@@ -222,8 +313,8 @@ pub(crate) fn build_aggregate_mv_layout_with_input_types(
         .collect::<Result<Vec<_>, String>>()?;
 
     let mut state_columns = Vec::new();
-    for (aggregate_index, aggregate) in calls.aggregates.iter().enumerate() {
-        let visible_source_index = aggregate_visible_source_index(calls, aggregate_index)?;
+    for (aggregate_index, aggregate) in calls.iter().enumerate() {
+        let visible_source_index = aggregate.visible_source_index;
         let visible = output_columns.get(visible_source_index).ok_or_else(|| {
             format!(
                 "aggregate MV visible source index out of range: aggregate_index={aggregate_index} source_index={visible_source_index}"
@@ -238,7 +329,7 @@ pub(crate) fn build_aggregate_mv_layout_with_input_types(
             &aggregate.output_name,
         )?;
         let sanitized = sanitize_state_column_name(&aggregate.output_name);
-        let count_star = matches!(aggregate.input, AggregateInput::Star);
+        let count_star = aggregate.count_star;
 
         let state_name = format!("{}{}", AGG_STATE_PREFIX, sanitized);
         let state_data_type = DataType::LargeBinary;
@@ -268,7 +359,10 @@ pub(crate) fn build_aggregate_mv_layout_with_input_types(
         });
     }
 
-    if aggregate_shape_needs_retraction_count_state(calls) {
+    if !calls
+        .iter()
+        .any(|aggregate| aggregate.function == AggregateFunctionKind::Count && aggregate.count_star)
+    {
         validate_state_column_type(
             AggregateFunctionKind::Count,
             AggregateStateRole::RetractionCount,
@@ -288,7 +382,7 @@ pub(crate) fn build_aggregate_mv_layout_with_input_types(
             sql_type: SqlType::BigInt,
             nullable: false,
             visible_source_index: 0,
-            aggregate_index: calls.aggregates.len(),
+            aggregate_index: calls.len(),
             function: AggregateFunctionKind::Count,
             state_role: AggregateStateRole::RetractionCount,
             count_star: true,
@@ -300,45 +394,9 @@ pub(crate) fn build_aggregate_mv_layout_with_input_types(
         visible_columns,
         state_columns,
         aggregate_input_types: aggregate_input_types.to_vec(),
-        group_key_source_indexes,
+        group_key_source_indexes: group_key_source_indexes.to_vec(),
         physical_columns,
     })
-}
-
-pub(crate) fn aggregate_input_types_from_resolved_query(
-    calls: &AggregateSqlCalls,
-    resolved: &crate::sql::analysis::ResolvedQuery,
-) -> Result<Vec<Option<DataType>>, String> {
-    let crate::sql::analysis::QueryBody::Select(select) = &resolved.body else {
-        return Err("aggregate MV input type metadata requires SELECT analysis".to_string());
-    };
-    if select.projection.len() != calls.visible_outputs.len() {
-        return Err(format!(
-            "aggregate MV input type projection count mismatch: analyzed_projection={} shape_outputs={}",
-            select.projection.len(),
-            calls.visible_outputs.len()
-        ));
-    }
-
-    let mut input_types = vec![None; calls.aggregates.len()];
-    for (projection_index, visible_output) in calls.visible_outputs.iter().enumerate() {
-        let VisibleAggregateOutput::Aggregate(aggregate_index) = visible_output else {
-            continue;
-        };
-        let projection = &select.projection[projection_index];
-        let crate::sql::analysis::ExprKind::AggregateCall { args, .. } = &projection.expr.kind
-        else {
-            return Err(format!(
-                "aggregate MV analyzed projection `{}` is not an aggregate expression",
-                projection.output_name
-            ));
-        };
-        let slot = input_types.get_mut(*aggregate_index).ok_or_else(|| {
-            format!("aggregate MV aggregate index out of range: aggregate_index={aggregate_index}")
-        })?;
-        *slot = args.first().map(|arg| arg.data_type.clone());
-    }
-    Ok(input_types)
 }
 
 pub(crate) fn aggregate_shape_needs_retraction_count_state(calls: &AggregateSqlCalls) -> bool {
@@ -1589,14 +1647,14 @@ fn key_value_to_agg_scalar(value: KeyValue) -> AggScalarValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::aggregate_state::mv_shape::{IncrementalMvShape, classify_incremental_mv_query};
-    use crate::sql::column_id::ColumnId;
     use arrow::array::{
         Array, BinaryBuilder, Int64Array, LargeBinaryArray, LargeBinaryBuilder, StringArray,
     };
     use novarocks_execution::exec::mv::state_codec::{
         encode_count_state, encode_sum_decimal128, encode_sum_int64,
     };
+    use novarocks_sql::plan_read::ColumnId;
+    use novarocks_sql::planning::mv::{IncrementalMvShape, classify_incremental_mv_query};
 
     fn test_shape() -> AggregateMvShape {
         let shape = classify_incremental_mv_query(&parse_query(
@@ -1643,9 +1701,8 @@ mod tests {
     }
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
-        let normalized =
-            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
+        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize");
+        let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("not a query: {stmt:?}");
         };
@@ -2778,10 +2835,10 @@ mod tests {
 
     #[test]
     fn build_layout_avg_produces_state_columns_with_hidden_retraction_count() {
-        use crate::mv::aggregate_state::mv_shape::{
+        use novarocks_sql::planning::mv::VisibleAggregateOutput;
+        use novarocks_sql::planning::mv::{
             AggregateCallShape, AggregateInput, AggregateMvShape, GroupKeyShape,
         };
-        use crate::sql::mv_refresh::VisibleAggregateOutput;
         use sqlparser::ast::ObjectName;
 
         let shape = AggregateMvShape {
@@ -2957,9 +3014,9 @@ mod tests {
     // ---- AVG materialize test (state-shaped input) ----
 
     fn avg_state_shape() -> AggregateMvShape {
-        let shape = crate::mv::aggregate_state::mv_shape::classify_incremental_mv_query(
-            &parse_query("select k1, avg(v2) as a from ice.ns.orders group by k1"),
-        )
+        let shape = novarocks_sql::planning::mv::classify_incremental_mv_query(&parse_query(
+            "select k1, avg(v2) as a from ice.ns.orders group by k1",
+        ))
         .expect("classify");
         let IncrementalMvShape::Aggregate(shape) = shape else {
             panic!("expected aggregate shape");
@@ -3155,9 +3212,9 @@ mod tests {
 
     #[test]
     fn avg_decimal128_layout_rejects_missing_input_scale_metadata() {
-        let shape = crate::mv::aggregate_state::mv_shape::classify_incremental_mv_query(
-            &parse_query("select k1, avg(d) as a from ice.ns.orders group by k1"),
-        )
+        let shape = novarocks_sql::planning::mv::classify_incremental_mv_query(&parse_query(
+            "select k1, avg(d) as a from ice.ns.orders group by k1",
+        ))
         .expect("classify");
         let IncrementalMvShape::Aggregate(shape) = shape else {
             panic!("expected aggregate shape");

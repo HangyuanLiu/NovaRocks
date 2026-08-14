@@ -137,6 +137,21 @@ impl DeleteEngine for FakeDeleteEngine {
         })
     }
 
+    fn delete_native_encoding<'a>(
+        &self,
+        _prepared: &'a dyn DeletePrepared,
+    ) -> Result<novarocks::query_execution::dml::delete::DeleteNativeEncoding<'a>, String> {
+        novarocks::query_execution::dml::delete::DeleteNativeEncoding::test_fixture()
+    }
+
+    fn run_delete_with_native_bundle(
+        &self,
+        prepared: &dyn DeletePrepared,
+        _native_bundle: novarocks::protocol::native::encode::NativeFragmentBundle,
+    ) -> Result<DeleteWriteReport, String> {
+        self.run_delete(prepared)
+    }
+
     fn commit_delete_terminal(
         &self,
         _prepared: &dyn DeletePrepared,

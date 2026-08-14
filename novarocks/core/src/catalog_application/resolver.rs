@@ -28,8 +28,8 @@ use crate::query_execution::kernels::{
     CatalogCommandKernel, DmlExecutionKernel, MaintenanceExecutionKernel, MvExecutionKernel,
     QueryPreparationKernel, ViewExecutionKernel,
 };
-use crate::sql::parser::ast::ObjectName;
 use novarocks_catalog::identifier::{resolve_catalog_namespace_name, resolve_catalog_table_name};
+use novarocks_sql::syntax::ObjectName;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TargetBackend {

@@ -27,15 +27,17 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
-use crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls;
 use crate::mv::aggregate_state::mv_agg_state::{
     AggregateMvLayout, materialize_aggregate_result_chunks,
 };
 use crate::mv::model::AggregateStateRole;
 use crate::mv::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_of};
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
-use crate::sql::mv_refresh::VisibleAggregateOutput;
 use novarocks_execution::exec::chunk::Chunk;
+use novarocks_sql::planning::mv::VisibleAggregateOutput;
+use novarocks_sql::planning::mv::{
+    MV_BRANCH_ID_COLUMN_NAME, SqlMvAggregateCalls as AggregateSqlCalls, extract_aggregate_sql_calls,
+};
 
 pub(crate) struct AggregateStateRead {
     pub(crate) result: QueryResult,
@@ -76,8 +78,7 @@ fn read_aggregate_state<F>(
 where
     F: FnMut(&str, &AggregateSqlCalls, sqlparser::ast::Query) -> Result<AggregateStateRead, String>,
 {
-    let state_sql =
-        crate::mv::aggregate_state::mv_shape::rewrite_select_sql_for_state(select_sql, calls)?;
+    let state_sql = novarocks_sql::planning::mv::rewrite_select_sql_for_state(select_sql, calls)?;
     let mut state_query = parse_stored_select_query(&state_sql)?;
     inject_pin_as_for_version_as_of(
         &mut state_query,
@@ -101,8 +102,7 @@ pub(crate) fn prepare_aggregate_first_refresh_state_sql(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<String, String> {
-    let state_sql =
-        crate::mv::aggregate_state::mv_shape::rewrite_select_sql_for_state(select_sql, calls)?;
+    let state_sql = novarocks_sql::planning::mv::rewrite_select_sql_for_state(select_sql, calls)?;
     let mut state_query = parse_stored_select_query(&state_sql)?;
     inject_pin_as_for_version_as_of(
         &mut state_query,
@@ -129,10 +129,7 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_state_sqls(
         .into_iter()
         .enumerate()
         .map(|(branch_index, (branch_query, branch_sql))| {
-            let branch_calls =
-                crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
-                    &branch_query,
-                )?;
+            let branch_calls = extract_aggregate_sql_calls(&branch_query)?;
             if branch_index == 0 && &branch_calls != first_branch_calls {
                 return Err(
                     "branch UNION ALL aggregate first branch calls drifted from the validated contract"
@@ -172,10 +169,7 @@ where
                 "iceberg branch UNION ALL aggregate first refresh branch index {branch_index} exceeds Int32"
             )
         })?;
-        let branch_calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
-                &branch_query,
-            )?;
+        let branch_calls = extract_aggregate_sql_calls(&branch_query)?;
         if branch_index == 0 && &branch_calls != first_branch_calls {
             return Err(
                 "branch UNION ALL aggregate first branch calls drifted from the validated contract"
@@ -288,7 +282,7 @@ fn append_branch_id_to_chunk(chunk: Chunk, branch_id: i32) -> Result<Chunk, Stri
         .cloned()
         .collect::<Vec<_>>();
     fields.push(Arc::new(arrow::datatypes::Field::new(
-        crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME,
+        MV_BRANCH_ID_COLUMN_NAME,
         arrow::datatypes::DataType::Int32,
         false,
     )));
@@ -309,9 +303,9 @@ fn append_branch_id_to_chunk(chunk: Chunk, branch_id: i32) -> Result<Chunk, Stri
 }
 
 fn parse_stored_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)
+    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)
         .map_err(|error| format!("stored MV SELECT normalize error: {error}"))?;
-    let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+    let statement = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
         .map_err(|error| format!("sql parser error: {error}"))?;
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("stored MV SQL must be a SELECT query".to_string());
@@ -436,11 +430,11 @@ fn validate_aggregate_layout_compatibility(
         let input_kind_matches = matches!(
             (&source.input, &target.input),
             (
-                crate::mv::aggregate_state::mv_shape::AggregateInput::Star,
-                crate::mv::aggregate_state::mv_shape::AggregateInput::Star
+                novarocks_sql::planning::mv::AggregateInput::Star,
+                novarocks_sql::planning::mv::AggregateInput::Star
             ) | (
-                crate::mv::aggregate_state::mv_shape::AggregateInput::Expr(_),
-                crate::mv::aggregate_state::mv_shape::AggregateInput::Expr(_)
+                novarocks_sql::planning::mv::AggregateInput::Expr(_),
+                novarocks_sql::planning::mv::AggregateInput::Expr(_)
             )
         );
         if !input_kind_matches {
@@ -696,20 +690,19 @@ mod tests {
     use crate::mv::aggregate_state::physical_column::starrocks_physical_column;
     use crate::mv::model::AggregateStateRole;
     use crate::runtime::query_result::{QueryResultColumn, record_batch_to_chunk};
-    use crate::sql::mv_refresh::AggregateFunctionKind;
     use novarocks_catalog::schema::SqlType;
     use novarocks_execution::exec::mv::state_codec::encode_count_state;
+    use novarocks_sql::planning::mv::AggregateFunctionKind;
 
     fn parse_calls(sql: &str) -> AggregateSqlCalls {
-        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)
+        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)
             .expect("normalize aggregate select");
-        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
             .expect("parse aggregate select");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected query");
         };
-        crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
-            .expect("extract aggregate calls")
+        extract_aggregate_sql_calls(&query).expect("extract aggregate calls")
     }
 
     fn count_layout(group_key: &str) -> AggregateMvLayout {
@@ -809,9 +802,10 @@ mod tests {
     }
 
     fn first_branch_calls(select_sql: &str) -> AggregateSqlCalls {
-        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
-            .expect("normalize union");
-        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse union");
+        let normalized =
+            novarocks_sql::syntax::normalize_for_raw_parse(select_sql).expect("normalize union");
+        let stmt =
+            novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse union");
         let sqlparser::ast::Statement::Query(query) = stmt else {
             panic!("expected union query");
         };
@@ -820,8 +814,7 @@ mod tests {
         };
         let mut first_query = query.as_ref().clone();
         first_query.body = left.clone();
-        crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&first_query)
-            .expect("first calls")
+        extract_aggregate_sql_calls(&first_query).expect("first calls")
     }
 
     fn branch_pin() -> RefreshSnapshotPin {

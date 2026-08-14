@@ -35,6 +35,7 @@ use crate::connector::scan_model::{
     planned_split_required_physical_columns_for_test as fixture_split_required_columns,
     register_planned_files_fixture,
 };
+use novarocks_sql::test_support::{NativeScanFixture, native_scan_plan};
 
 /// Provider-private bytes the fixture attaches to every read unit. Core has no
 /// vocabulary for them, so it must return them untouched.
@@ -83,43 +84,6 @@ fn fixture_registry(files: Vec<FixtureScanFile>) -> ConnectorRegistry {
     let registry = ConnectorRegistry::new();
     register_planned_files_fixture(&registry, "test_catalog", files, None);
     registry
-}
-
-fn set_scan_predicates(plan: DistributedPlan, predicates: Vec<TypedExpr>) -> DistributedPlan {
-    crate::sql::planner::distributed::test_support::rebuild_test_plan(
-        plan,
-        Default::default(),
-        |draft| {
-            let DistributedNodeKind::Scan(scan) = &mut draft.fragments_mut()[0].root.payload else {
-                panic!("root must be scan");
-            };
-            scan.predicates = predicates;
-        },
-    )
-}
-
-fn id_eq_literal(value: i64) -> TypedExpr {
-    TypedExpr {
-        kind: ExprKind::BinaryOp {
-            left: Box::new(TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: ColumnId::new_for_test(1),
-                    qualifier: Some("ice_t".to_string()),
-                    column: "id".to_string(),
-                },
-                data_type: DataType::Int32,
-                nullable: false,
-            }),
-            op: crate::sql::analysis::BinOp::Eq,
-            right: Box::new(TypedExpr {
-                kind: ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(value)),
-                data_type: DataType::Int32,
-                nullable: false,
-            }),
-        },
-        data_type: DataType::Boolean,
-        nullable: false,
-    }
 }
 
 fn native_root_scan(
@@ -199,17 +163,13 @@ fn native_planned_paths(
 /// must survive the round trip untouched.
 #[test]
 fn equality_delete_field_ids_remain_provider_owned() {
-    let plan = iceberg_scan_plan(Some(vec!["id"]));
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+        .expect("sealed scan fixture");
     let file = fixture_file(vec![equality_delete(&[], &[3])]);
     let registry = fixture_registry(vec![file.clone()]);
 
-    let result = build_for_test(TestBuildRequest::result(
-        &plan,
-        &EmptyCatalog,
-        &registry,
-        None,
-    ))
-    .expect("build native connector scan");
+    let result = build_for_test(TestBuildRequest::result(&plan, &registry, None))
+        .expect("build native connector scan");
 
     assert_eq!(native_root_scan(&result).required_columns, vec!["id"]);
     assert_eq!(
@@ -223,17 +183,13 @@ fn equality_delete_field_ids_remain_provider_owned() {
 /// the provider still owns it, and the SQL projection is unchanged.
 #[test]
 fn equality_delete_column_names_remain_provider_owned() {
-    let plan = iceberg_scan_plan(Some(vec!["id"]));
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+        .expect("sealed scan fixture");
     let file = fixture_file(vec![equality_delete(&["category"], &[])]);
     let registry = fixture_registry(vec![file.clone()]);
 
-    let result = build_for_test(TestBuildRequest::result(
-        &plan,
-        &EmptyCatalog,
-        &registry,
-        None,
-    ))
-    .expect("build native connector scan");
+    let result = build_for_test(TestBuildRequest::result(&plan, &registry, None))
+        .expect("build native connector scan");
 
     assert_eq!(native_root_scan(&result).required_columns, vec!["id"]);
     assert_eq!(
@@ -248,19 +204,15 @@ fn equality_delete_column_names_remain_provider_owned() {
 /// neither the native scan's required columns nor its query outputs.
 #[test]
 fn equality_delete_key_from_planned_splits_is_hidden_from_query_projection() {
-    let plan = iceberg_scan_plan(Some(vec!["id"]));
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+        .expect("sealed scan fixture");
     let registry = fixture_registry(vec![fixture_file(vec![equality_delete(
         &["category"],
         &[2],
     )])]);
 
-    let result = build_for_test(TestBuildRequest::result(
-        &plan,
-        &EmptyCatalog,
-        &registry,
-        None,
-    ))
-    .expect("build native connector scan");
+    let result = build_for_test(TestBuildRequest::result(&plan, &registry, None))
+        .expect("build native connector scan");
     let scan = native_root_scan(&result);
 
     assert_eq!(scan.required_columns, vec!["id"]);
@@ -284,15 +236,11 @@ fn equality_delete_with_non_key_projection_rejects_unbound_hidden_key() {
     // A sealed SQL scan may not introduce a connector-only physical key
     // without a planner ColumnId. The enclosing planner must model that key
     // explicitly before the native encoder receives the artifact.
-    let plan = iceberg_scan_plan_with_outputs(Some(vec!["id", "category"]), &["id"]);
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergWithRequiredPayload)
+        .expect("sealed scan fixture");
     let registry = fixture_registry(vec![fixture_file(vec![equality_delete(&[], &[3])])]);
 
-    let error = match build_for_test(TestBuildRequest::result(
-        &plan,
-        &EmptyCatalog,
-        &registry,
-        None,
-    )) {
+    let error = match build_for_test(TestBuildRequest::result(&plan, &registry, None)) {
         Ok(_) => panic!("unbound hidden equality key must fail before encoding"),
         Err(error) => error,
     };
@@ -306,16 +254,12 @@ fn equality_delete_with_non_key_projection_rejects_unbound_hidden_key() {
 
 #[test]
 fn equality_delete_with_unrestricted_select_all_preserves_all_query_outputs() {
-    let plan = iceberg_scan_plan_with_outputs(None, &["id", "category"]);
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergAllColumns)
+        .expect("sealed scan fixture");
     let registry = fixture_registry(vec![fixture_file(vec![equality_delete(&[], &[3])])]);
 
-    let result = build_for_test(TestBuildRequest::result(
-        &plan,
-        &EmptyCatalog,
-        &registry,
-        None,
-    ))
-    .expect("build unrestricted SELECT * connector scan");
+    let result = build_for_test(TestBuildRequest::result(&plan, &registry, None))
+        .expect("build unrestricted SELECT * connector scan");
     let scan = native_root_scan(&result);
 
     assert_eq!(scan.required_columns, vec!["id", "category"]);
@@ -332,18 +276,14 @@ fn equality_delete_with_unrestricted_select_all_preserves_all_query_outputs() {
 /// unit stays whole and its size becomes the split's byte estimate.
 #[test]
 fn native_scan_keeps_large_file_in_provider_owned_split() {
-    let plan = iceberg_scan_plan(None);
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergUnrestricted)
+        .expect("sealed scan fixture");
     let mut file = FixtureScanFile::new("s3://bucket/large.parquet");
     file.size = 300 * 1024 * 1024;
     let registry = fixture_registry(vec![file.clone()]);
 
-    let result = build_for_test(TestBuildRequest::result(
-        &plan,
-        &EmptyCatalog,
-        &registry,
-        None,
-    ))
-    .expect("build native connector scan");
+    let result = build_for_test(TestBuildRequest::result(&plan, &registry, None))
+        .expect("build native connector scan");
     let splits = native_connector_splits(&result);
 
     assert_eq!(splits.len(), 1);
@@ -359,31 +299,15 @@ fn native_scan_keeps_large_file_in_provider_owned_split() {
 /// scan node so execution still filters.
 #[test]
 fn native_scan_unsupported_predicate_does_not_guess_pruning() {
-    let plan = set_scan_predicates(
-        iceberg_scan_plan(None),
-        vec![TypedExpr {
-            kind: ExprKind::FunctionCall {
-                name: "abs".to_string(),
-                args: vec![id_eq_literal(12)],
-                distinct: false,
-                volatility: crate::sql::functions::FunctionVolatility::Immutable,
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        }],
-    );
+    let plan = native_scan_plan(NativeScanFixture::UnsupportedPredicate)
+        .expect("sealed unsupported-predicate fixture");
     let registry = fixture_registry(vec![
         i32_stats_file("s3://bucket/id-1-5.parquet", 1, 5),
         i32_stats_file("s3://bucket/id-10-20.parquet", 10, 20),
     ]);
 
-    let result = build_for_test(TestBuildRequest::result(
-        &plan,
-        &EmptyCatalog,
-        &registry,
-        None,
-    ))
-    .expect("unsupported pruning predicate must preserve scan semantics");
+    let result = build_for_test(TestBuildRequest::result(&plan, &registry, None))
+        .expect("unsupported pruning predicate must preserve scan semantics");
 
     assert_eq!(
         native_planned_paths(&result),

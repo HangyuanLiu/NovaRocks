@@ -30,14 +30,13 @@ use crate::connector::backend::ResolvedTable;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
-    admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
+    admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::write_transaction::{
     IcebergWriteCommitPolicy, IcebergWriteSource, IcebergWriteTransactionSpec,
     IcebergWriteValidationPolicy,
 };
-use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::ColumnDefault;
 use novarocks_catalog::schema::SqlType;
@@ -47,6 +46,11 @@ use novarocks_spi::connector::{
     ConnectorWriteFieldRequest, ConnectorWriteInputRequest, ConnectorWriteIntent,
     ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
     ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+};
+use novarocks_sql::planning::dml::DmlWriteSinkMode;
+use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
+use novarocks_sql::syntax::{
+    Literal, bytes_to_latin1_string, column_default_to_literal, latin1_string_to_bytes,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -245,22 +249,21 @@ fn prepare_iceberg_distributed_write(
     )?;
     let table_bindings =
         Arc::new(crate::query_execution::planning::bindings::QueryTableBindingStore::try_new()?);
-    let target_binding = admit_prepared_connector_write_target(
+    let target_binding = admit_prepared_frozen_connector_write_target(
         table_bindings.as_ref(),
-        crate::sql::planner::table::SqlTableIdentity {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-        },
+        FrozenConnectorScanIdentity::new(
+            target.catalog.clone(),
+            target.namespace.clone(),
+            target.table.clone(),
+        ),
         preparation.clone(),
         write_target.lease().clone(),
     )?;
-    let sql_write_input = sql_write_plan_input_for_admitted_target(
+    let sql_write_input = dml_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),
         target_binding,
-        crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::Data,
-        crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
-        None,
+        DmlWriteSinkMode::Data,
+        novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
     )?;
 
     let connector_operation_id = options.operation_id;
@@ -462,7 +465,7 @@ impl PreparedIcebergWriteNativeEncoding<'_> {
         static INPUT: OnceLock<crate::query_execution::compiler::NativeFragmentEncodingInput> =
             OnceLock::new();
         let input = INPUT.get_or_init(|| {
-            let plan = crate::sql::planner::distributed::native_encoder_test_fixture_plan()
+            let plan = novarocks_sql::planning::dml::native_encoder_test_fixture_plan()
                 .expect("test native INSERT fixture plan must seal");
             let prepared =
                 crate::query_execution::preparation::prepared_fragment_set_for_native_encode_test(
@@ -529,7 +532,7 @@ impl PreparedIcebergWrite {
             self.executor.sql_write_input.clone(),
             Arc::clone(&self.executor.table_bindings),
             None,
-            crate::sql::compiler::RootDistributionRequirement::Any,
+            novarocks_sql::compiler::RootDistributionRequirement::Any,
             self.executor.execution.as_ref(),
             &self.executor.connector_context,
             Some(self.executor.connector_write.clone()),
@@ -599,7 +602,7 @@ struct PreparedIcebergWriteExecutor {
     state: DmlExecutionKernel,
     target: TargetBackend,
     query: sqlparser::ast::Query,
-    sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    sql_write_input: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
     execution: Option<QueryExecutionContext>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -933,7 +936,7 @@ fn omitted_column_expr_sql(column: &ColumnDef) -> Result<String, String> {
         return Ok("NULL".to_string());
     };
     let sql_type = arrow_data_type_to_sql_type(&column.data_type)?;
-    let literal = crate::sql::literal::column_default_to_ast_literal(write_default, &sql_type)?;
+    let literal = column_default_to_literal(write_default, &sql_type)?;
     literal_to_sql_for_arrow_type(&literal, &column.data_type)
 }
 
@@ -952,7 +955,7 @@ pub(crate) fn target_cast_expr_sql(expr_sql: &str, column: &ColumnDef) -> Result
 }
 
 fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Query, String> {
-    match crate::sql::parser::parse_sql_raw(sql)? {
+    match novarocks_sql::planning::dml::parse_raw_statement(sql)? {
         sqlparser::ast::Statement::Query(query) => Ok(*query),
         other => Err(format!("{context}: generated non-query statement: {other}")),
     }
@@ -1020,7 +1023,7 @@ pub(crate) fn literal_to_sql_for_arrow_type(
             Literal::String(value) | Literal::Date(value),
             DataType::Binary | DataType::LargeBinary,
         ) => {
-            let bytes = crate::sql::literal::latin1_string_to_bytes(value)?;
+            let bytes = latin1_string_to_bytes(value)?;
             Ok(format!("X'{}'", hex::encode_upper(bytes)))
         }
         (Literal::Array(items), DataType::List(item_field)) => {
@@ -1204,7 +1207,7 @@ mod tests {
     }
 
     fn parse_query(sql: &str) -> sqlast::Query {
-        let stmt = crate::sql::parser::parse_sql_raw(sql).expect("parse query");
+        let stmt = novarocks_sql::planning::dml::parse_raw_statement(sql).expect("parse query");
         let sqlast::Statement::Query(query) = stmt else {
             panic!("expected query statement");
         };
@@ -1256,10 +1259,7 @@ mod tests {
             test_column("b", DataType::Int32, Some(ColumnDefault::Int32(5))),
             test_column("c", DataType::Int32, None),
         ];
-        let source = IcebergWriteInput::Rows(vec![vec![
-            crate::sql::parser::ast::Literal::Int(30),
-            crate::sql::parser::ast::Literal::Int(10),
-        ]]);
+        let source = IcebergWriteInput::Rows(vec![vec![Literal::Int(30), Literal::Int(10)]]);
 
         let query = append_source_to_query(
             &source,
@@ -1411,14 +1411,14 @@ mod tests {
         ];
         let source = IcebergWriteInput::Rows(vec![
             vec![
-                crate::sql::parser::ast::Literal::Int(1),
-                crate::sql::parser::ast::Literal::String("us".to_string()),
-                crate::sql::parser::ast::Literal::Float(10.5),
+                Literal::Int(1),
+                Literal::String("us".to_string()),
+                Literal::Float(10.5),
             ],
             vec![
-                crate::sql::parser::ast::Literal::Int(2),
-                crate::sql::parser::ast::Literal::String("eu".to_string()),
-                crate::sql::parser::ast::Literal::Float(20.0),
+                Literal::Int(2),
+                Literal::String("eu".to_string()),
+                Literal::Float(20.0),
             ],
         ]);
 
@@ -1459,10 +1459,7 @@ mod tests {
             test_column("category", DataType::Utf8, None),
             test_column("amount", DataType::Int32, None),
         ];
-        let source = IcebergWriteInput::Rows(vec![vec![
-            crate::sql::parser::ast::Literal::Int(1),
-            crate::sql::parser::ast::Literal::Int(10),
-        ]]);
+        let source = IcebergWriteInput::Rows(vec![vec![Literal::Int(1), Literal::Int(10)]]);
 
         let query = append_source_to_query_for_write(&source, &[], &source_columns, &write_columns)
             .expect("append source query");
@@ -1503,9 +1500,7 @@ mod tests {
     #[test]
     fn append_source_to_query_values_preserves_backslash_string_literals() {
         let target_columns = vec![test_column("region", DataType::Utf8, None)];
-        let source = IcebergWriteInput::Rows(vec![vec![crate::sql::parser::ast::Literal::String(
-            r"e\f".to_string(),
-        )]]);
+        let source = IcebergWriteInput::Rows(vec![vec![Literal::String(r"e\f".to_string())]]);
 
         let query =
             append_source_to_query(&source, &[], &target_columns).expect("append source query");
@@ -1528,9 +1523,8 @@ mod tests {
     #[test]
     fn append_source_to_query_values_renders_binary_literals_as_hex() {
         let target_columns = vec![test_column("payload", DataType::Binary, None)];
-        let packed = crate::sql::literal::bytes_to_latin1_string(&[0xab, 0x01]);
-        let source =
-            IcebergWriteInput::Rows(vec![vec![crate::sql::parser::ast::Literal::String(packed)]]);
+        let packed = bytes_to_latin1_string(&[0xab, 0x01]);
+        let source = IcebergWriteInput::Rows(vec![vec![Literal::String(packed)]]);
 
         let query =
             append_source_to_query(&source, &[], &target_columns).expect("append source query");
@@ -1565,10 +1559,7 @@ mod tests {
             test_column("a", DataType::Int32, None),
             test_column("b", DataType::Int32, None),
         ];
-        let source = IcebergWriteInput::Rows(vec![vec![
-            crate::sql::parser::ast::Literal::Int(1),
-            crate::sql::parser::ast::Literal::Int(2),
-        ]]);
+        let source = IcebergWriteInput::Rows(vec![vec![Literal::Int(1), Literal::Int(2)]]);
 
         let err = append_source_to_query(&source, &["a".to_string()], &target_columns)
             .expect_err("extra value must be rejected");

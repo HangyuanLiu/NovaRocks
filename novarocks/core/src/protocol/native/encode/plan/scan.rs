@@ -28,15 +28,14 @@ use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::preparation::scan::{
     ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution,
 };
-use crate::sql::plan_read::table as table_model;
-use crate::sql::plan_read::{
-    ColumnId, ExchangeFlavor, ExchangeReceiver, OutputColumn as AnalysisOutputColumn, PlanScanNode,
-    ScanVariantColumn,
-};
 use novarocks_protocol::{common, plan};
+use novarocks_sql::plan_read::{
+    ColumnId, ExchangeFlavor, ExchangeReceiver, OutputColumn as AnalysisOutputColumn,
+    ScanVariantColumn, SqlPlanScanNodeRead, SqlScanSourceRead, SqlTableDefRead,
+};
 
 pub(super) fn encode_scan_node(
-    src: &PlanScanNode,
+    src: &SqlPlanScanNodeRead,
     node_id: i32,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanNode, String> {
@@ -93,7 +92,7 @@ pub(super) fn encode_scan_node(
 }
 
 fn encode_bound_scan_output_columns(
-    src: &PlanScanNode,
+    src: &SqlPlanScanNodeRead,
     binding: &ResolvedScanBinding,
 ) -> Result<Vec<common::OutputColumn>, String> {
     let physical_by_planner_id = binding
@@ -124,7 +123,10 @@ fn encode_bound_scan_output_columns(
     Ok(encoded)
 }
 
-fn encode_bound_required_columns(src: &PlanScanNode, binding: &ResolvedScanBinding) -> Vec<String> {
+fn encode_bound_required_columns(
+    src: &SqlPlanScanNodeRead,
+    binding: &ResolvedScanBinding,
+) -> Vec<String> {
     let mut required = binding
         .required_reads
         .iter()
@@ -217,7 +219,7 @@ fn encode_exchange_flavor(src: &ExchangeFlavor) -> Result<plan::ExchangeFlavor, 
 }
 
 pub(super) fn encode_table_def_with_context(
-    src: &table_model::TableDef,
+    src: &SqlTableDefRead,
     scan_node_id: Option<i32>,
     scan_columns: Option<&[AnalysisOutputColumn]>,
     scan_output_columns: Option<&[common::OutputColumn]>,
@@ -259,8 +261,8 @@ pub(super) fn encode_table_def_with_context(
     })
 }
 
-fn scan_source_requires_resolved_binding(source: &table_model::ScanSource) -> bool {
-    matches!(source, table_model::ScanSource::Sql(_))
+fn scan_source_requires_resolved_binding(_: &SqlScanSourceRead) -> bool {
+    true
 }
 
 fn resolved_binding_table_columns(
@@ -294,7 +296,7 @@ fn resolved_binding_table_columns(
 }
 
 fn merged_bound_table_columns(
-    src: &table_model::TableDef,
+    src: &SqlTableDefRead,
     scan_columns: &[AnalysisOutputColumn],
     binding: &ResolvedScanBinding,
 ) -> (
@@ -378,7 +380,7 @@ pub(super) fn encode_column_def(
 
 fn scan_binding_for_source<'a>(
     node_id: i32,
-    source: &table_model::ScanSource,
+    source: &SqlScanSourceRead,
     ctx: &'a NativePlanEncodeContext<'_>,
 ) -> Result<Option<&'a ResolvedScanBinding>, String> {
     let binding =
@@ -386,15 +388,10 @@ fn scan_binding_for_source<'a>(
     let required = scan_source_requires_resolved_binding(source);
     if required && binding.is_none() {
         return Err(match source {
-            table_model::ScanSource::Sql(table_model::SqlScanSource {
-                kind:
-                    table_model::SqlScanKind::Delta {
-                        from_snapshot_id,
-                        to_snapshot_id,
-                        ..
-                    },
-                ..
-            }) => format!(
+            SqlScanSourceRead::Delta {
+                from_snapshot_id,
+                to_snapshot_id,
+            } => format!(
                 "native scan encoder missing prepared binding for node_id={node_id} source={} from_snapshot_id={from_snapshot_id} to_snapshot_id={to_snapshot_id}",
                 scan_source_kind(source)
             ),
@@ -414,32 +411,25 @@ fn scan_binding_for_source<'a>(
         ));
     }
     let valid_execution = match source {
-        table_model::ScanSource::Sql(source) => match source.kind {
-            table_model::SqlScanKind::ConnectorRead => {
-                matches!(binding.execution, ResolvedScanExecution::ConnectorRead)
-            }
-            table_model::SqlScanKind::Delta { .. } => {
-                matches!(
-                    binding.execution,
-                    ResolvedScanExecution::SealedConnectorScan(_)
-                )
-            }
-            table_model::SqlScanKind::Data { .. }
-            | table_model::SqlScanKind::FrozenInputSet { .. }
-            | table_model::SqlScanKind::MvTargetState { .. }
-            | table_model::SqlScanKind::MvTargetLocator { .. } => {
-                matches!(
-                    binding.execution,
-                    ResolvedScanExecution::AdmittedConnectorRead(_)
-                )
-            }
-            table_model::SqlScanKind::Metadata { .. } => {
-                matches!(
-                    binding.execution,
-                    ResolvedScanExecution::AdmittedConnectorRead(_)
-                )
-            }
-        },
+        SqlScanSourceRead::ConnectorRead => {
+            matches!(binding.execution, ResolvedScanExecution::ConnectorRead)
+        }
+        SqlScanSourceRead::Delta { .. } => {
+            matches!(
+                binding.execution,
+                ResolvedScanExecution::SealedConnectorScan(_)
+            )
+        }
+        SqlScanSourceRead::Data
+        | SqlScanSourceRead::FrozenInputSet
+        | SqlScanSourceRead::MvTargetState
+        | SqlScanSourceRead::MvTargetLocator
+        | SqlScanSourceRead::Metadata => {
+            matches!(
+                binding.execution,
+                ResolvedScanExecution::AdmittedConnectorRead(_)
+            )
+        }
     };
     if !valid_execution {
         return Err(format!(
@@ -451,17 +441,15 @@ fn scan_binding_for_source<'a>(
     Ok(Some(binding))
 }
 
-fn scan_source_kind(source: &table_model::ScanSource) -> &'static str {
+fn scan_source_kind(source: &SqlScanSourceRead) -> &'static str {
     match source {
-        table_model::ScanSource::Sql(source) => match source.kind {
-            table_model::SqlScanKind::ConnectorRead => "SqlConnectorRead",
-            table_model::SqlScanKind::Data { .. } => "SqlData",
-            table_model::SqlScanKind::FrozenInputSet { .. } => "SqlFrozenInputSet",
-            table_model::SqlScanKind::Metadata { .. } => "SqlMetadata",
-            table_model::SqlScanKind::Delta { .. } => "SqlDelta",
-            table_model::SqlScanKind::MvTargetState { .. } => "SqlMvTargetState",
-            table_model::SqlScanKind::MvTargetLocator { .. } => "SqlMvTargetLocator",
-        },
+        SqlScanSourceRead::ConnectorRead => "SqlConnectorRead",
+        SqlScanSourceRead::Data => "SqlData",
+        SqlScanSourceRead::FrozenInputSet => "SqlFrozenInputSet",
+        SqlScanSourceRead::Metadata => "SqlMetadata",
+        SqlScanSourceRead::Delta { .. } => "SqlDelta",
+        SqlScanSourceRead::MvTargetState => "SqlMvTargetState",
+        SqlScanSourceRead::MvTargetLocator => "SqlMvTargetLocator",
     }
 }
 
@@ -474,7 +462,7 @@ fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
 }
 
 fn encode_scan_source(
-    src: &table_model::ScanSource,
+    src: &SqlScanSourceRead,
     scan_node_id: Option<i32>,
     scan_analysis_columns: Option<&[AnalysisOutputColumn]>,
     scan_output_columns: Option<&[common::OutputColumn]>,
@@ -651,9 +639,8 @@ mod tests {
 
     use super::{encode_bound_scan_output_column, encode_connector_expected_schema_ipc};
     use crate::query_execution::preparation::scan::{ResolvedScanColumn, ResolvedScanColumnKind};
-    use crate::sql::analysis::OutputColumn;
-    use crate::sql::column_id::ColumnId;
     use novarocks_protocol::common;
+    use novarocks_sql::plan_read::{ColumnId, OutputColumn};
 
     #[test]
     fn connector_expected_schema_uses_domain_columns_not_encoded_type_desc() {

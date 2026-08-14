@@ -39,7 +39,6 @@ use novarocks::mv::repository::MvRepository;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
 use novarocks::query_execution::backend::BackendTopologyService;
 use novarocks::query_execution::backend_command;
-use novarocks::query_execution::compiler::CoreQueryCompiler;
 use novarocks::query_execution::dml::{add_files, ctas, delete, insert, mutation, truncate};
 use novarocks::query_execution::kernels as domain;
 use novarocks::query_execution::service::QueryExecutionService;
@@ -48,6 +47,8 @@ use novarocks::statistics::application::StatisticsApplicationPort;
 use novarocks::statistics::command as statistics_command;
 use novarocks::view::ViewService;
 use novarocks::view::view_command;
+
+use crate::query::compiler::FrontendQueryCompiler;
 
 /// Leaf ports used by SQL query preparation.
 ///
@@ -100,7 +101,7 @@ impl QueryCompilerPorts {
 }
 
 /// Build the closed query-preparation capability from query-domain leaf ports.
-pub fn query_compiler(ports: QueryCompilerPorts) -> CoreQueryCompiler {
+pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler {
     let query = domain::QueryPreparationKernel::new(
         Arc::clone(&ports.catalog_service),
         ports.catalog_application.clone(),
@@ -122,7 +123,7 @@ pub fn query_compiler(ports: QueryCompilerPorts) -> CoreQueryCompiler {
         ports.system_catalog,
         Arc::clone(&ports.mv_repository),
     );
-    CoreQueryCompiler::from_domain_kernels(
+    FrontendQueryCompiler::new(
         query,
         view,
         system_tables,

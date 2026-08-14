@@ -13,16 +13,19 @@ use crate::mv::application::{
     PreparedMvNativeWriteAssembly,
 };
 use crate::mv::iceberg_refresh::IcebergMvCorePorts;
-use crate::query_execution::compiler::iceberg_write_shuffle_by_output_name;
+use crate::query_execution::compiler::{
+    catalog_service_snapshot, prepare_sealed_iceberg_write_native_assembly,
+};
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::planning::write_sink::{
-    admit_prepared_connector_write_target, sql_write_plan_input_for_admitted_target,
+    admit_prepared_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::sql::mv_refresh::first_refresh::{
-    SqlMvFirstRefreshArtifact, SqlMvFirstRefreshArtifactInput, SqlMvFirstRefreshPlanner,
-    SqlMvFirstRefreshPlannerInput,
+use novarocks_sql::planning::mv::first_refresh::{
+    SqlMvFirstRefreshAnalyzeContext, SqlMvJoinFirstRefreshAnalyzeContext,
+    analyze_join_first_refresh_connector_write, analyze_mv_first_refresh_connector_write,
+    compile_join_first_refresh_connector_write, compile_mv_first_refresh_connector_write,
 };
 
 pub(crate) fn frozen_logical_context_from_rewrite(
@@ -36,7 +39,7 @@ pub(crate) fn frozen_logical_context_from_rewrite(
         mv_definition: (*rewrite.mv_definition).clone(),
         canonical_select_query: (*rewrite.canonical_select_query).clone(),
         base_refs: rewrite.base_refs.to_vec(),
-        pin: crate::sql::mv_refresh::first_refresh::SqlMvSnapshotPin::try_from_maps(
+        pin: novarocks_sql::planning::mv::first_refresh::SqlMvSnapshotPin::try_from_maps(
             rewrite.pin.to_snapshot_map(),
             rewrite.pin.to_table_uuid_map(),
         )?,
@@ -74,12 +77,9 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     let target_name = prepared.target_name().to_string();
     let current_catalog = prepared.current_catalog().map(str::to_string);
     let current_database = prepared.current_database().to_string();
-    let shape = prepared.shape();
-    let target_contract = prepared.target_contract().clone();
     let connector_context =
         crate::connector::connector_request_context_for_execution(None, execution)?;
     let root_hash_column = prepared.root_hash_column().to_string();
-    let root_distribution = iceberg_write_shuffle_by_output_name(root_hash_column.clone());
     let template = crate::mv::iceberg_activation::activate_first_refresh_connector_write(
         &prepared,
         connector_context.clone(),
@@ -90,49 +90,66 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
             let bindings = Arc::new(QueryTableBindingStore::try_new()?);
             let target_binding = admit_prepared_connector_write_target(
                 bindings.as_ref(),
-                crate::sql::planner::table::SqlTableIdentity {
-                    catalog: target_catalog.clone(),
-                    namespace: target_namespace.clone(),
-                    table: target_name.clone(),
-                },
+                novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::try_new(
+                    target_catalog.clone(),
+                    target_namespace.clone(),
+                    target_name.clone(),
+                )?,
                 template.preparation().clone(),
                 planning_lease.clone(),
             )?;
-            let sink = sql_write_plan_input_for_admitted_target(
+            let sink = dml_write_plan_input_for_admitted_target(
                 bindings.as_ref(),
                 target_binding,
-                crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::Data,
-                crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
-                None,
+                novarocks_sql::planning::dml::DmlWriteSinkMode::Data,
+                novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
             )?;
-            let first_refresh = SqlMvFirstRefreshPlanner::plan(SqlMvFirstRefreshPlannerInput {
-                shape,
-                target_contract,
-                target_binding,
-                root_distribution,
-                artifact: SqlMvFirstRefreshArtifactInput::Sql(physical_sql),
-            })?;
-            if first_refresh.target_binding() != target_binding {
-                return Err(
-                    "MV first-refresh SQL plan target binding drifted during activation"
-                        .to_string(),
-                );
-            }
-            let root_distribution = first_refresh.root_distribution().clone();
-            let SqlMvFirstRefreshArtifact::Sql(physical_sql) = first_refresh.into_artifact() else {
-                return Err("MV first-refresh SQL activation expected a SQL artifact".to_string());
-            };
-            let query = parse_query_from_sql(physical_sql.sql())?;
-            crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_binding_native_assembly(
-                query_kernel,
-                current_catalog.as_deref(),
-                &current_database,
-                &query,
-                sink,
-                bindings,
+            let catalog_service_snapshot = catalog_service_snapshot(query_kernel);
+            let materializer = crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer::new(
                 None,
-                Some(root_distribution),
+                &catalog_service_snapshot,
+                Arc::clone(&bindings),
+                crate::query_execution::planning::statistics::iceberg_table_binding_loader(
+                    query_kernel.connector_control().as_ref(),
+                    connector_context.clone(),
+                ),
+            );
+            let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
+                .ok_or_else(|| {
+                "MV first-refresh write requires a non-empty admitted backend topology".to_string()
+            })?;
+            let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
+            let analyzed = analyze_mv_first_refresh_connector_write(
+                physical_sql,
+                SqlMvFirstRefreshAnalyzeContext {
+                    current_catalog: current_catalog.clone(),
+                    current_database: current_database.clone(),
+                    optimizer_settings: execution.optimizer_settings().clone(),
+                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed {
+                        backend_count,
+                    },
+                    catalog: &catalog,
+                    functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
+                    control: novarocks_sql::compiler::SqlCompileControl::new(
+                        execution.deadline(),
+                        crate::query_execution::planning::sql_cancellation_observation(
+                            execution.cancellation().clone(),
+                        ),
+                    ),
+                    sink,
+                },
+            )?;
+            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+                query_kernel,
+                Arc::clone(&bindings),
+                &connector_context,
+            )?;
+            let distributed_plan = compile_mv_first_refresh_connector_write(analyzed, &statistics)?;
+            prepare_sealed_iceberg_write_native_assembly(
+                query_kernel.connector_control().as_ref(),
                 execution,
+                distributed_plan,
+                bindings.as_ref(),
                 &connector_context,
                 template,
             )?
@@ -156,7 +173,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 &connector_context,
             )?;
             let bindings = Arc::new(QueryTableBindingStore::try_new()?);
-            let _target_binding =
+            let target_binding =
                 crate::mv::iceberg_refresh::bind_imv_target_query_table_in_store_from_rewrite(
                     &refresh_rewrite,
                     &bindings,
@@ -165,82 +182,70 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 )?;
             let write_target_binding = admit_prepared_connector_write_target(
                 bindings.as_ref(),
-                crate::sql::planner::table::SqlTableIdentity {
-                    catalog: target_catalog.clone(),
-                    namespace: target_namespace.clone(),
-                    table: target_name.clone(),
-                },
+                novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::try_new(
+                    target_catalog.clone(),
+                    target_namespace.clone(),
+                    target_name.clone(),
+                )?,
                 template.preparation().clone(),
                 planning_lease.clone(),
             )?;
-            let sink = sql_write_plan_input_for_admitted_target(
+            let sink = dml_write_plan_input_for_admitted_target(
                 bindings.as_ref(),
                 write_target_binding,
-                crate::sql::planner::distributed::write::contract::SqlWriteSinkMode::Data,
-                crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                novarocks_sql::planning::dml::DmlWriteSinkMode::Data,
+                novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
+            )?;
+            let catalog_service_snapshot = catalog_service_snapshot(query_kernel);
+            let materializer = crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
                 None,
-            )?;
-            let (plan, factory) =
-                crate::mv::iceberg_refresh::compile_canonical_select_for_imv_with_frozen_rewrite(
-                    query_kernel,
-                    &refresh_rewrite,
-                    &connector_context,
-                    Arc::clone(&bindings),
-                    execution,
-                    frozen_base_overlays,
-                )
-                .map_err(|error| error.message)?;
-            let schema_contract = refresh_rewrite.schema_contract.as_ref();
-            let (left_ref, right_ref) =
-                crate::mv::iceberg_refresh::join_base_refs_for_schema_contract(
-                    schema_contract,
-                    &refresh_rewrite.base_refs,
-                )?;
-            let append = crate::mv::refresh::join_first_refresh::build_join_first_refresh_append_logical_plan(
-                &refresh_rewrite,
-                left_ref,
-                right_ref,
-                crate::mv::refresh::join_first_refresh::JoinFirstRefreshLogicalInput {
-                    plan,
-                    factory,
-                },
-            )?;
-            let first_refresh = SqlMvFirstRefreshPlanner::plan(SqlMvFirstRefreshPlannerInput {
-                shape,
-                target_contract,
-                target_binding: write_target_binding,
-                root_distribution,
-                artifact: SqlMvFirstRefreshArtifactInput::Logical {
-                    plan: append.plan,
-                    factory: append.factory,
-                    root_hash_column: root_hash_column.clone(),
-                },
+                &catalog_service_snapshot,
+                Arc::clone(&bindings),
+                crate::query_execution::planning::statistics::iceberg_table_binding_loader(
+                    query_kernel.connector_control().as_ref(),
+                    connector_context.clone(),
+                ),
+                frozen_base_overlays,
+            );
+            let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
+                .ok_or_else(|| {
+                "MV first-refresh write requires a non-empty admitted backend topology".to_string()
             })?;
-            if first_refresh.target_binding() != write_target_binding {
-                return Err(
-                    "MV first-refresh SQL plan target binding drifted during activation"
-                        .to_string(),
-                );
-            }
-            let root_distribution = first_refresh.root_distribution().clone();
-            let SqlMvFirstRefreshArtifact::Logical { plan, factory } =
-                first_refresh.into_artifact()
-            else {
-                return Err(
-                    "MV first-refresh join activation expected a logical SQL artifact".to_string(),
-                );
-            };
-            crate::query_execution::compiler::prepare_logical_plan_as_iceberg_write_with_connector_binding(
+            let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
+            let analyzed =
+                analyze_join_first_refresh_connector_write(SqlMvJoinFirstRefreshAnalyzeContext {
+                    canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
+                    rewrite_snapshot: refresh_rewrite.to_sql_rewrite_snapshot(target_binding)?,
+                    expected_root_hash_column: root_hash_column,
+                    current_catalog: current_catalog.clone(),
+                    current_database: current_database.clone(),
+                    optimizer_settings: execution.optimizer_settings().clone(),
+                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed {
+                        backend_count,
+                    },
+                    catalog: &catalog,
+                    functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
+                    control: novarocks_sql::compiler::SqlCompileControl::new(
+                        execution.deadline(),
+                        crate::query_execution::planning::sql_cancellation_observation(
+                            execution.cancellation().clone(),
+                        ),
+                    ),
+                    sink,
+                })?;
+            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
                 query_kernel,
-                current_catalog.as_deref(),
-                &current_database,
-                plan,
-                factory,
-                sink,
-                root_distribution,
-                execution,
+                materializer.query_table_bindings(),
                 &connector_context,
-                bindings,
+            )?;
+            let distributed_plan =
+                compile_join_first_refresh_connector_write(analyzed, &statistics)?;
+            prepare_sealed_iceberg_write_native_assembly(
+                query_kernel.connector_control().as_ref(),
+                execution,
+                distributed_plan,
+                bindings.as_ref(),
+                &connector_context,
                 template,
             )?
         }
@@ -371,8 +376,8 @@ fn validate_frozen_join_base_facts(facts: &MvFirstRefreshLogicalContext) -> Resu
 }
 
 fn parse_query_from_sql(sql: &str) -> Result<sqlparser::ast::Query, String> {
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
-    let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)?;
+    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
+    let statement = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)?;
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("MV first-refresh physical artifact is not a SELECT query".to_string());
     };

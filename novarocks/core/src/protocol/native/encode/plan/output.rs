@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use crate::sql::plan_read::OutputColumn;
+use novarocks_sql::plan_read::OutputColumn;
 
 pub(super) fn encode_fragment_output_contract(
     src: &PlanFragment,
@@ -28,10 +28,7 @@ pub(super) fn encode_fragment_output_contract(
     ),
     String,
 > {
-    if matches!(
-        src.sink,
-        DataSink::ConnectorWrite(ref sink) if sink.output_contract.is_some()
-    ) {
+    if matches!(&src.sink, DataSink::ConnectorWrite(sink) if sink.has_output_contract()) {
         // The planner finalized the connector writer output expressions and target output
         // schema at seal (CGO-9C Task 3). The encoder maps them 1:1 instead of
         // synthesizing the target schema or falling back to the fragment's output

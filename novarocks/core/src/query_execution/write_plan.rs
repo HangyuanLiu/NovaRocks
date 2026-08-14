@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 use crate::common::types::UniqueId;
 use crate::query_execution::lifecycle::QueryExecutionId;
 use crate::query_execution::schedule::SchedulingPlan;
-use crate::sql::planner::distributed::FragmentId;
+use novarocks_sql::plan_read::FragmentId;
 
 /// One exact, placement-frozen writer manifest.  C1 gives each terminal sink
 /// one logical writer, so `sink_ordinal` is zero until a physical fragment can

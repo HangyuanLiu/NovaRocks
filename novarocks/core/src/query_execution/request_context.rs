@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::cancellation::QueryCancellationView;
-pub use crate::sql::optimizer::options::SessionOptimizerSettings;
+pub use novarocks_sql::compiler::SessionOptimizerSettings;
 use novarocks_types::ClusterRole;
 
 /// All inputs accepted at the frontend statement-admission boundary.
@@ -91,7 +91,7 @@ impl RequestSessionContext {
         &self.current_database
     }
 
-    pub(crate) fn optimizer_settings(&self) -> &SessionOptimizerSettings {
+    pub fn optimizer_settings(&self) -> &SessionOptimizerSettings {
         &self.optimizer_settings
     }
 }
@@ -142,7 +142,7 @@ impl QueryExecutionContext {
 
     /// Settings frozen with the request so DML and coordinator-adjacent plan
     /// construction never consult process- or thread-local session state.
-    pub(crate) fn optimizer_settings(&self) -> &SessionOptimizerSettings {
+    pub fn optimizer_settings(&self) -> &SessionOptimizerSettings {
         &self.optimizer_settings
     }
 }

@@ -23,9 +23,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::sql::planner::vocabulary::{
-    ApplyKeySource, BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-    HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
+use novarocks_sql::planning::mv::{
+    ApplyKeySource, MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
+    MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+    MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
+    MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -676,6 +678,9 @@ fn qualified_field_known(bases: &[&BaseContract], field: &QualifiedFieldLineage)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_sql::planning::mv::{
+        SqlMvApplyKeySourceFacts, SqlMvPersistedApplyKeySourceFacts,
+    };
 
     #[test]
     fn persisted_target_vocabulary_is_stable() {
@@ -703,9 +708,9 @@ mod tests {
         }
 
         let apply_key_sources = [
-            (ApplyKeySource::BaseRowId, "base._row_id"),
-            (ApplyKeySource::JoinRowKey, "JoinRowKey"),
-            (ApplyKeySource::GroupRowId, "GroupRowId"),
+            (SqlMvApplyKeySourceFacts::BaseRowId, "base._row_id"),
+            (SqlMvApplyKeySourceFacts::JoinRowKey, "JoinRowKey"),
+            (SqlMvApplyKeySourceFacts::GroupRowId, "GroupRowId"),
         ];
         for (source, expected) in apply_key_sources {
             assert_eq!(source.table_property_value(), expected);
@@ -756,7 +761,7 @@ mod tests {
                 hidden_apply_key: HiddenApplyKeyContract {
                     column_name: "__nova_base_row_id".to_string(),
                     target_field_id: 2,
-                    source: ApplyKeySource::BaseRowId,
+                    source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
                 },
                 partition: Some(MvPartitionContract {
                     target_spec_id: 0,
@@ -789,7 +794,7 @@ mod tests {
         contract.target.hidden_apply_key = HiddenApplyKeyContract {
             column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
             target_field_id: 1,
-            source: ApplyKeySource::GroupRowId,
+            source: SqlMvApplyKeySourceFacts::GroupRowId.into(),
         };
         contract
     }
@@ -803,7 +808,7 @@ mod tests {
                 target_field_id: 4242,
             },
             branch_count: 2,
-            inner_apply_key_source: ApplyKeySource::GroupRowId,
+            inner_apply_key_source: SqlMvApplyKeySourceFacts::GroupRowId.into(),
         });
         contract
             .ensure_self_consistent()
@@ -833,7 +838,7 @@ mod tests {
                 target_field_id: 4242,
             },
             branch_count: 2,
-            inner_apply_key_source: ApplyKeySource::BaseRowId,
+            inner_apply_key_source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
         });
 
         let err = contract
@@ -858,7 +863,7 @@ mod tests {
                 target_field_id: 4242,
             },
             branch_count: 2,
-            inner_apply_key_source: ApplyKeySource::BaseRowId,
+            inner_apply_key_source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
         });
 
         assert!(matches!(
@@ -877,7 +882,7 @@ mod tests {
                 target_field_id: 4242,
             },
             branch_count: 2,
-            inner_apply_key_source: ApplyKeySource::BaseRowId,
+            inner_apply_key_source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
         });
 
         assert!(matches!(
@@ -1061,8 +1066,12 @@ mod tests {
         assert_eq!(contract.contract_version, 2);
         assert_eq!(contract.bases.len(), 2);
         assert_eq!(
-            contract.target.hidden_apply_key.source,
-            ApplyKeySource::JoinRowKey
+            contract
+                .target
+                .hidden_apply_key
+                .source
+                .sql_mv_apply_key_source_facts(),
+            SqlMvApplyKeySourceFacts::JoinRowKey
         );
     }
 
@@ -1104,7 +1113,7 @@ mod tests {
         contract.target.hidden_apply_key = HiddenApplyKeyContract {
             column_name: "__row_id__".to_string(),
             target_field_id: 1,
-            source: ApplyKeySource::GroupRowId,
+            source: SqlMvApplyKeySourceFacts::GroupRowId.into(),
         };
 
         contract.ensure_self_consistent().expect("self check");
@@ -1117,7 +1126,7 @@ mod tests {
         contract.target.hidden_apply_key = HiddenApplyKeyContract {
             column_name: "__row_id__".to_string(),
             target_field_id: 1,
-            source: ApplyKeySource::GroupRowId,
+            source: SqlMvApplyKeySourceFacts::GroupRowId.into(),
         };
 
         let err = contract.ensure_self_consistent().expect_err("rejected");
@@ -1142,7 +1151,7 @@ mod tests {
         contract.target.hidden_apply_key = HiddenApplyKeyContract {
             column_name: "__row_id__".to_string(),
             target_field_id: 1,
-            source: ApplyKeySource::GroupRowId,
+            source: SqlMvApplyKeySourceFacts::GroupRowId.into(),
         };
 
         let err = contract.ensure_self_consistent().expect_err("rejected");
@@ -1167,7 +1176,7 @@ mod tests {
         contract.target.hidden_apply_key = HiddenApplyKeyContract {
             column_name: "__row_id__".to_string(),
             target_field_id: 1,
-            source: ApplyKeySource::GroupRowId,
+            source: SqlMvApplyKeySourceFacts::GroupRowId.into(),
         };
 
         let err = contract.ensure_self_consistent().expect_err("rejected");
@@ -1186,7 +1195,7 @@ mod tests {
         contract.target.hidden_apply_key = HiddenApplyKeyContract {
             column_name: "__row_id__".to_string(),
             target_field_id: 1,
-            source: ApplyKeySource::GroupRowId,
+            source: SqlMvApplyKeySourceFacts::GroupRowId.into(),
         };
 
         let err = contract.ensure_self_consistent().expect_err("rejected");
@@ -1313,7 +1322,7 @@ mod tests {
     fn contract_v2_rejects_base_row_id_with_join_contract() {
         let mut contract = sample_join_contract();
         contract.target.hidden_apply_key.column_name = HIDDEN_APPLY_KEY_COLUMN_NAME.to_string();
-        contract.target.hidden_apply_key.source = ApplyKeySource::BaseRowId;
+        contract.target.hidden_apply_key.source = SqlMvApplyKeySourceFacts::BaseRowId.into();
         assert!(matches!(
             contract.ensure_self_consistent(),
             Err(ContractSelfCheckError::BaseRowIdRejectsJoinContract)
@@ -1404,7 +1413,7 @@ mod tests {
                 hidden_apply_key: HiddenApplyKeyContract {
                     column_name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
                     target_field_id: 2,
-                    source: ApplyKeySource::JoinRowKey,
+                    source: SqlMvApplyKeySourceFacts::JoinRowKey.into(),
                 },
                 partition: None,
             },

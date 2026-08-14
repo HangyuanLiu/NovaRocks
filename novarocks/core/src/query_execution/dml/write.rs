@@ -78,7 +78,7 @@ pub(crate) fn execute_bound_distributed_write_request(
 }
 
 pub(crate) fn scan_preparation_options(
-    settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
+    settings: &novarocks_sql::compiler::SessionOptimizerSettings,
     execution: &QueryExecutionContext,
 ) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
     let target_parallelism = std::num::NonZeroUsize::new(execution.topology().targets().len())

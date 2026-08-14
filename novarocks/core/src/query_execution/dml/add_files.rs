@@ -38,10 +38,11 @@ use crate::connector::data_mutation::{
 };
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::sql::parser::dialect::add_files::classify_add_files;
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_sql::planning::dml::classify_add_files;
+use novarocks_sql::syntax::ObjectName;
 
-pub use crate::sql::parser::dialect::add_files::AddFilesCommand;
+pub use novarocks_sql::planning::dml::AddFilesCommand;
 
 pub struct PlanAddFilesRequest {
     pub command: AddFilesCommand,
@@ -267,7 +268,7 @@ impl AddFilesEngine for DmlExecutionKernel {
     ) -> Result<PreparedAddFiles, AddFilesPlanError> {
         let target = crate::catalog_application::resolver::resolve_existing_table_target(
             self,
-            &crate::sql::parser::ast::ObjectName {
+            &ObjectName {
                 parts: request.command.table_parts,
             },
             request.current_catalog.as_deref(),

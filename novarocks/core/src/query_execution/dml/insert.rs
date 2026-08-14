@@ -35,9 +35,10 @@ use crate::query_execution::dml::external_write_fence::{
 use crate::query_execution::dml::iceberg_writer;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::request_context::{QueryExecutionContext, RequestContext};
-use crate::sql::parser::ast::{Literal, ObjectName};
 use crate::statistics::StatisticsEngine;
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_sql::planning::dml::parse_raw_statement;
+use novarocks_sql::syntax::{Literal, ObjectName};
 
 pub use crate::query_execution::dml::iceberg_writer::PreparedIcebergWriteNativeEncoding;
 
@@ -56,7 +57,7 @@ pub fn parse_insert_statement(sql: &str) -> Result<Option<sqlparser::ast::Insert
     if !sql[..keyword_end].eq_ignore_ascii_case("insert") {
         return Ok(None);
     }
-    match crate::sql::parser::parse_sql_raw(sql)? {
+    match parse_raw_statement(sql)? {
         sqlparser::ast::Statement::Insert(insert) => Ok(Some(insert)),
         _ => Ok(None),
     }
@@ -587,7 +588,7 @@ mod tests {
         WriteAbortInput, WriteCommitInput, WriterCommitInput, WriterKey,
     };
     use crate::runtime::query_result::QueryResult;
-    use crate::sql::optimizer::options::SessionOptimizerSettings;
+    use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::ClusterRole;
 
     fn cancelled_execution() -> QueryExecutionContext {

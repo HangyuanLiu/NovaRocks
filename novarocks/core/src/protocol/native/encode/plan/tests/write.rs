@@ -15,22 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::DataType;
 use prost::Message;
 
 use super::super::write::encode_change_stream_router_sink;
 use super::*;
-use crate::sql::planner::distributed::write::change_stream::{
-    ChangeStreamRoute, ChangeStreamRouterSink,
-};
-use novarocks_spi::connector::{
-    ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteCohortId,
-    ConnectorWriteFieldToken, ConnectorWriteRouteId,
-};
+use novarocks_sql::test_support::{NativeEncoderPlanFixture, native_encoder_plan};
+
+fn change_stream_router_plan() -> DistributedPlan {
+    native_encoder_plan(NativeEncoderPlanFixture::ChangeStreamRouter)
+        .expect("change-stream router fixture must seal")
+}
 
 #[test]
 fn change_stream_router_encoder_materializes_partition_exprs() {
-    let plan = single_fragment_router_plan_for_test();
+    let plan = change_stream_router_plan();
     let fragment = plan.fragments().first().expect("router fragment");
     let DataSink::ChangeStreamRouter(sink) = &fragment.sink else {
         panic!("expected Iceberg change-stream router sink");
@@ -74,7 +72,7 @@ fn change_stream_router_encoder_materializes_partition_exprs() {
 
 #[test]
 fn change_stream_router_encoder_preserves_wire_bytes() {
-    let plan = single_fragment_router_plan_for_test();
+    let plan = change_stream_router_plan();
     let fragment = plan.fragments().first().expect("router fragment");
     let DataSink::ChangeStreamRouter(sink) = &fragment.sink else {
         panic!("expected Iceberg change-stream router sink");
@@ -100,80 +98,4 @@ fn change_stream_router_encoder_preserves_wire_bytes() {
         decoded.routes[0].accepted_effects,
         router.routes[0].accepted_effects
     );
-}
-
-fn single_fragment_router_plan_for_test() -> DistributedPlan {
-    let output_columns = vec![
-        output_column(1, "__row_mutation_effect", DataType::Int8),
-        output_column(3, "bucket", DataType::Int32),
-    ];
-    crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
-        fragments: vec![PlanFragment {
-            fragment_id: 0,
-            root: DistributedNode {
-                node_id: 10,
-                fragment_id: 0,
-                tuple_ids: vec![10],
-                nullable_tuple_ids: Vec::new(),
-                limit: -1,
-                runtime_filter_binding_ids: Vec::new(),
-                children: Vec::new(),
-                stats: stats(),
-                payload: DistributedNodeKind::Values(
-                    crate::sql::planner::payload::PlanValuesNode {
-                        rows: Vec::new(),
-                        columns: output_columns.clone(),
-                    },
-                ),
-            },
-            data_partition: DataPartition::unpartitioned(),
-            output_partition: DataPartition::unpartitioned(),
-            sink: DataSink::ChangeStreamRouter(ChangeStreamRouterSink {
-                group_id: 0,
-                effect_output_ordinal: 0,
-                routes: vec![ChangeStreamRoute {
-                    route_id: ConnectorWriteRouteId::from_bytes([7; 32]),
-                    cohort_id: ConnectorWriteCohortId::from_bytes([8; 32]),
-                    accepted_effects: vec![ConnectorRowMutationEffect::Delete],
-                    input_ordinals: vec![ConnectorMutationRouteInput::new(
-                        ConnectorWriteFieldToken::from_bytes([9; 32]),
-                        1,
-                    )],
-                    target_fragment_id: 1,
-                    target_exchange_node_id: 20,
-                    output_partition_ordinals: vec![1],
-                }],
-            }),
-            output_exprs: None,
-            output_columns,
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        }],
-        root_fragment_id: 0,
-        runtime_filter_graph: Default::default(),
-        edges: Vec::new(),
-    }
-}
-
-fn values_distributed_node(
-    fragment_id: crate::sql::planner::distributed::FragmentId,
-    node_id: i32,
-    output: Vec<crate::sql::analysis::OutputColumn>,
-) -> crate::sql::planner::distributed::DistributedNode {
-    crate::sql::planner::distributed::DistributedNode {
-        node_id,
-        fragment_id,
-        tuple_ids: vec![node_id],
-        nullable_tuple_ids: Vec::new(),
-        limit: -1,
-        runtime_filter_binding_ids: Vec::new(),
-        children: Vec::new(),
-        stats: stats(),
-        payload: crate::sql::planner::distributed::DistributedNodeKind::Values(
-            crate::sql::planner::payload::PlanValuesNode {
-                rows: Vec::new(),
-                columns: output,
-            },
-        ),
-    }
 }

@@ -22,10 +22,9 @@ use novarocks_spi::connector::{
 };
 
 use crate::query_execution::planning::bindings::QueryScanMaterialization;
-use crate::query_execution::preparation::scan::{PlannedConnectorRead, ResolvedScanExecution};
-use crate::sql::analysis::TypedExpr;
-use crate::sql::planner::payload::PlanScanNode;
-use crate::sql::planner::table::ScanSource;
+use crate::query_execution::preparation::scan::PlannedConnectorRead;
+use novarocks_sql::plan_read::PlanScanNode;
+use novarocks_sql::plan_read::TypedExpr;
 
 use super::projection::effective_scan_column_names;
 
@@ -38,6 +37,7 @@ pub(super) fn plan_connector_read(
     context: novarocks_spi::connector::ConnectorRequestContext,
     scan: &PlanScanNode,
     materialization: &QueryScanMaterialization,
+    purpose: ConnectorReadPurpose,
     static_predicates: Vec<ConnectorStaticPredicate>,
     target_parallelism: std::num::NonZeroUsize,
     max_split_bytes: Option<std::num::NonZeroU64>,
@@ -48,12 +48,7 @@ pub(super) fn plan_connector_read(
         selector,
         planning_lease,
         ..
-    } = materialization
-    else {
-        return Err(
-            "generic connector planning requires a connector-read materialization".to_string(),
-        );
-    };
+    } = materialization;
     let projection_names = effective_scan_column_names(scan);
     let mut projection = Vec::with_capacity(projection_names.len());
     for name in projection_names {
@@ -98,7 +93,7 @@ pub(super) fn plan_connector_read(
                 projection: projection.clone(),
                 static_predicates: static_predicates.clone(),
                 selection: novarocks_spi::connector::ConnectorScanSelection::Snapshot(*selector),
-                purpose: connector_read_purpose(scan),
+                purpose,
                 limit: None,
                 batch,
                 context: context.clone(),
@@ -168,19 +163,6 @@ pub(super) fn plan_connector_read(
         planning_lease: planning_lease.clone(),
         read_session: split_result.session,
     })
-}
-
-fn connector_read_purpose(scan: &PlanScanNode) -> ConnectorReadPurpose {
-    let ScanSource::Sql(source) = &scan.table.source;
-    match source.kind {
-        crate::sql::planner::table::SqlScanKind::MvTargetState { .. } => {
-            ConnectorReadPurpose::MvTargetState
-        }
-        crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => {
-            ConnectorReadPurpose::MvTargetLocator
-        }
-        _ => ConnectorReadPurpose::Query,
-    }
 }
 
 /// Plans a provider-sealed scan through the same opaque split contract used by
@@ -275,41 +257,33 @@ fn residual_predicates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, LiteralValue};
-    use arrow::datatypes::DataType;
     use novarocks_spi::connector::{ConnectorPredicateDisposition, ConnectorStaticPredicateId};
-
-    fn predicate(value: bool) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::Bool(value)),
-            data_type: DataType::Boolean,
-            nullable: false,
-        }
-    }
+    use novarocks_sql::plan_read::DistributedNodeKind;
+    use novarocks_sql::test_support::{NativeScanFixture, native_scan_plan};
 
     #[test]
     fn only_exact_dispositions_remove_ordered_core_residuals() {
-        let predicates = vec![predicate(false), predicate(true), predicate(false)];
-        let dispositions = vec![
-            ConnectorPredicateDisposition {
-                predicate_id: ConnectorStaticPredicateId(0),
-                kind: ConnectorPredicateDispositionKind::Exact,
-            },
-            ConnectorPredicateDisposition {
-                predicate_id: ConnectorStaticPredicateId(1),
-                kind: ConnectorPredicateDispositionKind::PruningOnly,
-            },
-            ConnectorPredicateDisposition {
-                predicate_id: ConnectorStaticPredicateId(2),
-                kind: ConnectorPredicateDispositionKind::Exact,
-            },
-        ];
-
-        let residual = residual_predicates(&predicates, &dispositions).unwrap();
+        let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergWithIdEqualityPredicate)
+            .expect("sealed predicate fixture");
+        let DistributedNodeKind::Scan(scan) = &plan.fragments()[0].root.payload else {
+            panic!("sealed predicate fixture root");
+        };
+        let predicates = scan.predicates.clone();
+        let pruning_only = vec![ConnectorPredicateDisposition {
+            predicate_id: ConnectorStaticPredicateId(0),
+            kind: ConnectorPredicateDispositionKind::PruningOnly,
+        }];
+        let residual = residual_predicates(&predicates, &pruning_only).unwrap();
         assert_eq!(residual.len(), 1);
-        assert!(matches!(
-            &residual[0].kind,
-            ExprKind::Literal(LiteralValue::Bool(true))
-        ));
+        assert_eq!(format!("{:?}", residual), format!("{:?}", predicates));
+        let exact = vec![ConnectorPredicateDisposition {
+            predicate_id: ConnectorStaticPredicateId(0),
+            kind: ConnectorPredicateDispositionKind::Exact,
+        }];
+        assert!(
+            residual_predicates(&predicates, &exact)
+                .expect("exact predicate disposition")
+                .is_empty()
+        );
     }
 }

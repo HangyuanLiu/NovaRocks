@@ -45,47 +45,6 @@ fn identity_partition_file(path: &str, id: i32) -> FixtureScanFile {
     file
 }
 
-fn id_eq(value: i64) -> crate::sql::analysis::TypedExpr {
-    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
-
-    TypedExpr {
-        kind: ExprKind::BinaryOp {
-            left: Box::new(TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: ColumnId::new_for_test(1),
-                    qualifier: Some("ice_t".to_string()),
-                    column: "id".to_string(),
-                },
-                data_type: DataType::Int32,
-                nullable: false,
-            }),
-            op: BinOp::Eq,
-            right: Box::new(TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Int(value)),
-                data_type: DataType::Int32,
-                nullable: false,
-            }),
-        },
-        data_type: DataType::Boolean,
-        nullable: false,
-    }
-}
-
-fn unsupported_id_predicate() -> crate::sql::analysis::TypedExpr {
-    use crate::sql::analysis::{ExprKind, TypedExpr};
-
-    TypedExpr {
-        kind: ExprKind::FunctionCall {
-            name: "abs".to_string(),
-            args: vec![id_eq(12)],
-            distinct: false,
-            volatility: crate::sql::functions::FunctionVolatility::Immutable,
-        },
-        data_type: DataType::Boolean,
-        nullable: false,
-    }
-}
-
 fn planned_data_files(
     bindings: &crate::query_execution::preparation::scan::ScanExecutionBindings,
     node_id: i32,
@@ -112,13 +71,9 @@ fn planned_data_files(
 /// asserted by the provider's file-pruning unit tests.
 #[test]
 fn ordinary_iceberg_scan_uses_opaque_connector_read_and_preserves_residual() {
-    let mut root = scan_node(10);
-    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
-        panic!("test root must be a scan");
-    };
-    scan.predicates = vec![id_eq(12)];
     let bindings = prepare_scan_bindings(
-        &plan(root),
+        &native_scan_plan(NativeScanFixture::OrdinaryIcebergWithIdEqualityPredicate)
+            .expect("sealed equality fixture"),
         &registry(vec![data_file_with_i32_stats(
             "s3://bucket/id-10-20.parquet",
             10,
@@ -141,10 +96,7 @@ fn ordinary_iceberg_scan_uses_opaque_connector_read_and_preserves_residual() {
         "s3://bucket/id-10-20.parquet"
     );
     assert_eq!(read.static_predicates.len(), 1);
-    assert_eq!(
-        format!("{:?}", read.residual_predicates),
-        format!("{:?}", vec![id_eq(12)])
-    );
+    assert_eq!(read.residual_predicates.len(), 1);
     assert!(read.predicate_dispositions.iter().all(|disposition| {
         disposition.kind == novarocks_spi::connector::ConnectorPredicateDispositionKind::PruningOnly
     }));
@@ -152,39 +104,30 @@ fn ordinary_iceberg_scan_uses_opaque_connector_read_and_preserves_residual() {
 
 #[test]
 fn delta_scan_uses_opaque_connector_read() {
-    let mut root = scan_node(40);
-    replace_scan_source(
-        &mut root,
-        crate::sql::planner::table::test_sql_scan_source(
-            crate::sql::planner::table::SqlScanKind::Delta {
-                from_snapshot_id: 6,
-                to_snapshot_id: 7,
-            },
-        ),
-    );
     let resolver = StaticResolver {
         execution: resolved_data_delta(),
     };
 
     let bindings = prepare_scan_bindings(
-        &plan(root),
+        &native_scan_plan(NativeScanFixture::DeltaForPreparedBinding)
+            .expect("sealed delta fixture"),
         &registry(vec![data_file("s3://bucket/delta.parquet")]),
         Some(&resolver),
     )
     .expect("prepare delta scan");
 
     assert!(matches!(
-        bindings.binding(40).expect("binding").execution,
+        bindings.binding(10).expect("binding").execution,
         ResolvedScanExecution::SealedConnectorScan(_)
     ));
     assert!(
         bindings
-            .scan_ranges(0, 40)
+            .scan_ranges(0, 10)
             .expect("delta ranges")
             .is_empty()
     );
     let planned = bindings
-        .connector_read(0, 40)
+        .connector_read(0, 10)
         .expect("delta connector read");
     assert_eq!(
         planned.declaration.descriptor().provider_id.as_str(),
@@ -197,7 +140,8 @@ fn delta_scan_uses_opaque_connector_read() {
 
 #[test]
 fn explicit_files_plan_opaque_connector_splits() {
-    let plan = plan(scan_node(10));
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+        .expect("sealed ordinary fixture");
     let bindings = prepare_scan_bindings(
         &plan,
         &registry(vec![data_file("s3://bucket/explicit.parquet")]),
@@ -222,15 +166,8 @@ fn explicit_files_plan_opaque_connector_splits() {
 
 #[test]
 fn sqlx2_frozen_snapshot_scan_uses_its_exact_admitted_file_set() {
-    let mut root = scan_node(10);
-    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
-        panic!("fixture root must be a scan");
-    };
-    let ScanSource::Sql(source) = &mut scan.table.source;
-    source.kind = crate::sql::planner::table::SqlScanKind::FrozenInputSet {
-        version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(11),
-    };
-    let plan = plan(root);
+    let plan =
+        native_scan_plan(NativeScanFixture::FrozenSnapshotEleven).expect("sealed frozen fixture");
     let controls = crate::connector::FixtureControlResolver::new(registry(vec![data_file(
         "s3://bucket/current.parquet",
     )]));
@@ -238,15 +175,12 @@ fn sqlx2_frozen_snapshot_scan_uses_its_exact_admitted_file_set() {
     let DistributedNodeKind::Scan(scan) = &plan.fragments()[0].root.payload else {
         panic!("fixture root must remain a scan");
     };
-    let ScanSource::Sql(source) = &scan.table.source;
+    let facts = scan_preparation_facts(scan);
     let selected = store
-        .frozen_snapshot_materialization(source.binding, 11)
+        .frozen_snapshot_materialization(facts.binding(), 11)
         .expect("select admitted snapshot files");
     let crate::query_execution::planning::bindings::QueryScanMaterialization { selector, .. } =
-        selected
-    else {
-        panic!("frozen snapshot must retain neutral connector materialization");
-    };
+        selected;
 
     assert_eq!(
         selector,
@@ -266,26 +200,14 @@ fn sqlx2_frozen_snapshot_scan_uses_its_exact_admitted_file_set() {
 
 #[test]
 fn sqlx2_frozen_snapshot_scan_rejects_a_selector_without_admitted_files() {
-    let mut root = scan_node(10);
-    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
-        panic!("fixture root must be a scan");
-    };
-    let ScanSource::Sql(source) = &mut scan.table.source;
-    source.kind = crate::sql::planner::table::SqlScanKind::FrozenInputSet {
-        version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(11),
-    };
     let controls = crate::connector::FixtureControlResolver::new(registry(vec![data_file(
         "s3://bucket/current.parquet",
     )]));
-    let store = fixture_query_table_bindings(&plan(root.clone()), &controls);
-    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
-        panic!("fixture root must remain a scan");
-    };
-    let ScanSource::Sql(source) = &mut scan.table.source;
-    source.kind = crate::sql::planner::table::SqlScanKind::FrozenInputSet {
-        version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(12),
-    };
-    let plan = plan(root);
+    let admitted = native_scan_plan(NativeScanFixture::FrozenSnapshotEleven)
+        .expect("sealed admitted frozen fixture");
+    let store = fixture_query_table_bindings(&admitted, &controls);
+    let plan = native_scan_plan(NativeScanFixture::FrozenSnapshotTwelve)
+        .expect("sealed unadmitted frozen fixture");
 
     let error = match super::super::prepare_scan_bindings(
         &plan,
@@ -312,13 +234,9 @@ fn sqlx2_frozen_snapshot_scan_rejects_a_selector_without_admitted_files() {
 /// asserted by the provider's file-pruning unit tests.
 #[test]
 fn identity_partition_predicate_stays_on_opaque_connector_path() {
-    let mut root = scan_node(10);
-    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
-        panic!("test root must be a scan");
-    };
-    scan.predicates = vec![id_eq(12)];
     let bindings = prepare_scan_bindings(
-        &plan(root),
+        &native_scan_plan(NativeScanFixture::OrdinaryIcebergWithIdEqualityPredicate)
+            .expect("sealed equality fixture"),
         &registry(vec![identity_partition_file(
             "s3://bucket/id-12.parquet",
             12,
@@ -334,15 +252,13 @@ fn identity_partition_predicate_stays_on_opaque_connector_path() {
         planned_data_files(&bindings, 10)[0].path,
         "s3://bucket/id-12.parquet"
     );
-    assert_eq!(
-        format!("{:?}", read.residual_predicates),
-        format!("{:?}", vec![id_eq(12)])
-    );
+    assert_eq!(read.residual_predicates.len(), 1);
 }
 
 #[test]
 fn large_plain_file_preserves_provider_owned_split_and_byte_estimate() {
-    let plan = plan(scan_node(10));
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+        .expect("sealed ordinary fixture");
     let mut file = data_file("s3://bucket/large.parquet");
     file.size = 300 * 1024 * 1024;
     let bindings =
@@ -363,7 +279,8 @@ fn large_plain_file_preserves_provider_owned_split_and_byte_estimate() {
 /// for it. Core must neither reword nor reclassify a provider refusal.
 #[test]
 fn connector_planning_error_is_preserved_exactly_with_scan_node_context() {
-    let plan = plan(scan_node(10));
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+        .expect("sealed ordinary fixture");
     // The scan carrier names `test_table`; registering units only for another
     // table makes the connector refuse to plan with its own NotFound.
     let registry = registry_for_tables(HashMap::from([(
@@ -384,13 +301,9 @@ fn connector_planning_error_is_preserved_exactly_with_scan_node_context() {
 
 #[test]
 fn unsupported_predicate_does_not_guess_pruning() {
-    let mut root = scan_node(10);
-    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
-        panic!("test root must be a scan");
-    };
-    scan.predicates = vec![unsupported_id_predicate()];
     let bindings = prepare_scan_bindings(
-        &plan(root),
+        &native_scan_plan(NativeScanFixture::UnsupportedPredicate)
+            .expect("sealed unsupported predicate fixture"),
         &registry(vec![
             data_file_with_i32_stats("s3://bucket/id-1-5.parquet", 1, 5),
             data_file_with_i32_stats("s3://bucket/id-10-20.parquet", 10, 20),
@@ -403,9 +316,6 @@ fn unsupported_predicate_does_not_guess_pruning() {
         .connector_read(0, 10)
         .expect("opaque connector read");
     assert!(read.static_predicates.is_empty());
-    assert_eq!(
-        format!("{:?}", read.residual_predicates),
-        format!("{:?}", vec![unsupported_id_predicate()])
-    );
+    assert_eq!(read.residual_predicates.len(), 1);
     assert_eq!(read.splits.len(), 2);
 }

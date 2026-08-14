@@ -50,7 +50,7 @@ pub fn parse_update_statement(sql: &str) -> Result<Option<()>, String> {
     if !sql[..keyword_end].eq_ignore_ascii_case("update") {
         return Ok(None);
     }
-    match crate::sql::parser::parse_sql_raw(sql)? {
+    match novarocks_sql::planning::dml::parse_raw_statement(sql)? {
         sqlparser::ast::Statement::Update { .. } => Ok(Some(())),
         _ => Ok(None),
     }
@@ -66,7 +66,7 @@ pub fn parse_merge_statement(sql: &str) -> Result<Option<()>, String> {
     if !sql[..keyword_end].eq_ignore_ascii_case("merge") {
         return Ok(None);
     }
-    match crate::sql::parser::parse_sql_raw(sql)? {
+    match novarocks_sql::planning::dml::parse_raw_statement(sql)? {
         sqlparser::ast::Statement::Merge(_) => Ok(Some(())),
         _ => Ok(None),
     }
@@ -301,7 +301,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
         &self,
         request: PrepareMutationRequest<'_>,
     ) -> Result<PreparedMutation, String> {
-        let raw = crate::sql::parser::parse_sql_raw(request.sql)?;
+        let raw = novarocks_sql::planning::dml::parse_raw_statement(request.sql)?;
         let connector_context = crate::connector::connector_request_context_for_execution(
             request.query_options.as_ref(),
             &request.execution,

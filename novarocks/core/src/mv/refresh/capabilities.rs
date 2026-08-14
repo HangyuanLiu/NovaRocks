@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::sql::planner::vocabulary::ApplyKeySource;
+use novarocks_sql::planning::mv::ApplyKeySource;
 
 use crate::mv::persistence::schema::MvSchemaContract;
 use crate::mv::refresh::apply_key::ApplyKeyValueType;
@@ -126,12 +126,12 @@ mod tests {
         BranchUnionContract, HiddenApplyKeyContract, JoinContract, JoinContractKind,
         OutputContract, TargetContract,
     };
-    use crate::sql::planner::vocabulary::{
-        GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
-        JOIN_APPLY_KEY_COLUMN_NAME,
+    use novarocks_sql::planning::mv::{
+        MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+        SqlMvApplyKeySourceFacts,
     };
 
-    fn schema_contract(source: ApplyKeySource) -> MvSchemaContract {
+    fn schema_contract(source: SqlMvApplyKeySourceFacts) -> MvSchemaContract {
         MvSchemaContract {
             contract_version: 2,
             base: BaseContract {
@@ -155,14 +155,9 @@ mod tests {
                 schema_id_at_create: 1,
                 visible_columns: vec![],
                 hidden_apply_key: HiddenApplyKeyContract {
-                    column_name: match source {
-                        ApplyKeySource::BaseRowId => HIDDEN_APPLY_KEY_COLUMN_NAME,
-                        ApplyKeySource::JoinRowKey => JOIN_APPLY_KEY_COLUMN_NAME,
-                        ApplyKeySource::GroupRowId => GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-                    }
-                    .to_string(),
+                    column_name: source.column_name().to_string(),
                     target_field_id: 1,
-                    source,
+                    source: source.into(),
                 },
                 partition: None,
             },
@@ -172,30 +167,30 @@ mod tests {
     #[test]
     fn apply_key_sources_map_to_runtime_identities() {
         assert_eq!(
-            apply_key_source_to_refresh_identity(ApplyKeySource::BaseRowId),
+            apply_key_source_to_refresh_identity(SqlMvApplyKeySourceFacts::BaseRowId.into()),
             RefreshIdentity::BaseRowId
         );
         assert_eq!(
-            apply_key_source_to_refresh_identity(ApplyKeySource::JoinRowKey),
+            apply_key_source_to_refresh_identity(SqlMvApplyKeySourceFacts::JoinRowKey.into()),
             RefreshIdentity::JoinRowKey
         );
         assert_eq!(
-            apply_key_source_to_refresh_identity(ApplyKeySource::GroupRowId),
+            apply_key_source_to_refresh_identity(SqlMvApplyKeySourceFacts::GroupRowId.into()),
             RefreshIdentity::GroupRowId
         );
     }
 
     #[test]
     fn schema_shapes_reconstruct_refresh_capabilities() {
-        let projection = schema_contract(ApplyKeySource::BaseRowId);
+        let projection = schema_contract(SqlMvApplyKeySourceFacts::BaseRowId);
 
-        let mut join = schema_contract(ApplyKeySource::JoinRowKey);
+        let mut join = schema_contract(SqlMvApplyKeySourceFacts::JoinRowKey);
         join.join = Some(JoinContract {
             kind: JoinContractKind::InnerEquiJoin,
             predicates: vec![],
         });
 
-        let mut branch_aggregate = schema_contract(ApplyKeySource::GroupRowId);
+        let mut branch_aggregate = schema_contract(SqlMvApplyKeySourceFacts::GroupRowId);
         branch_aggregate.aggregate = Some(AggregateStateContract {
             state_layout_version: 1,
             row_id_column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
@@ -207,7 +202,7 @@ mod tests {
                 target_field_id: 2,
             },
             branch_count: 2,
-            inner_apply_key_source: ApplyKeySource::GroupRowId,
+            inner_apply_key_source: SqlMvApplyKeySourceFacts::GroupRowId.into(),
         });
 
         let cases = [
@@ -254,7 +249,7 @@ mod tests {
 
     #[test]
     fn unsupported_join_branch_shape_fails_fast() {
-        let mut contract = schema_contract(ApplyKeySource::BaseRowId);
+        let mut contract = schema_contract(SqlMvApplyKeySourceFacts::BaseRowId);
         contract.join = Some(JoinContract {
             kind: JoinContractKind::InnerEquiJoin,
             predicates: vec![],
@@ -265,7 +260,7 @@ mod tests {
                 target_field_id: 2,
             },
             branch_count: 2,
-            inner_apply_key_source: ApplyKeySource::BaseRowId,
+            inner_apply_key_source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
         });
 
         let error = RefreshCapabilities::from_schema_contract(&contract)

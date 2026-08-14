@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(test)]
-use crate::sql::planner::vocabulary::ApplyKeySource;
-
 use crate::mv::persistence::schema::MvSchemaContract;
 use crate::mv::storage_observation::MvPublishedBaseFact;
 
@@ -82,7 +79,9 @@ mod tests {
         HiddenApplyKeyContract, OutputColumnLineage, OutputContract, TargetContract,
         TargetVisibleColumn,
     };
-    use crate::sql::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME;
+    use novarocks_sql::planning::mv::{
+        MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME, SqlMvApplyKeySourceFacts,
+    };
 
     fn minimal_base_row_id_contract() -> MvSchemaContract {
         MvSchemaContract {
@@ -128,7 +127,7 @@ mod tests {
                 hidden_apply_key: HiddenApplyKeyContract {
                     column_name: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
                     target_field_id: 2,
-                    source: ApplyKeySource::BaseRowId,
+                    source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
                 },
                 partition: None,
             },

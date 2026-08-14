@@ -23,8 +23,10 @@
 
 use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::preparation::scan::{ResolvedScanExecution, ScanBindingResolver};
-use crate::sql::planner::payload::PlanScanNode;
-use crate::sql::planner::table::{ScanSource, SqlScanKind};
+use novarocks_sql::plan_read::PlanScanNode;
+use novarocks_sql::planning::query_execution::{
+    SqlScanPreparationCategory, scan_preparation_facts,
+};
 
 /// Exact query-local delta lookup.  It intentionally accepts neither a
 /// refresh context nor a catalog/registry, so it cannot reacquire metadata or
@@ -45,15 +47,19 @@ impl ScanBindingResolver for QueryTableBindingScanResolver<'_> {
         _node_id: i32,
         scan: &PlanScanNode,
     ) -> Result<Option<ResolvedScanExecution>, String> {
-        let ScanSource::Sql(source) = &scan.table.source;
-        let SqlScanKind::Delta {
-            from_snapshot_id,
-            to_snapshot_id,
-        } = source.kind
-        else {
+        let facts = scan_preparation_facts(scan);
+        if facts.category() != SqlScanPreparationCategory::Delta {
             return Ok(None);
-        };
-        let binding = self.bindings.binding(source.binding)?;
+        }
+        let window = facts.delta_window().ok_or_else(|| {
+            format!(
+                "SQL delta scan facts for '{}' are missing a sealed change window",
+                facts.identity().fqn()
+            )
+        })?;
+        let from_snapshot_id = window.from_snapshot_id();
+        let to_snapshot_id = window.to_snapshot_id();
+        let binding = self.bindings.binding(facts.binding())?;
         let admitted_scan = binding
             .admitted_change_scans
             .get(&(from_snapshot_id, to_snapshot_id))
@@ -61,7 +67,9 @@ impl ScanBindingResolver for QueryTableBindingScanResolver<'_> {
             .ok_or_else(|| {
                 format!(
                     "SQL delta scan binding for '{}.{}.{}' has no sealed change-window admission from_snapshot_id={from_snapshot_id} to_snapshot_id={to_snapshot_id}",
-                    source.table.catalog, source.table.namespace, source.table.table
+                    facts.identity().catalog(),
+                    facts.identity().namespace(),
+                    facts.identity().table()
                 )
             })?;
         Ok(Some(ResolvedScanExecution::SealedConnectorScan(
@@ -72,7 +80,7 @@ impl ScanBindingResolver for QueryTableBindingScanResolver<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::num::NonZeroU64;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -87,14 +95,11 @@ mod tests {
 
     use super::{QueryTableBindingScanResolver, ScanBindingResolver};
     use crate::query_execution::planning::bindings::{
-        QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
+        QueryTableBindingKey, QueryTableBindingStore, admitted_change_window_binding_for_test,
     };
     use crate::query_execution::preparation::scan::ResolvedScanExecution;
-    use crate::sql::catalog::ResolvedAnalyzerTable;
-    use crate::sql::planner::payload::PlanScanNode;
-    use crate::sql::planner::table::{
-        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
-    };
+    use novarocks_sql::plan_read::{DistributedNodeKind, PlanScanNode};
+    use novarocks_sql::test_support::{NativeScanFixture, native_scan_plan};
 
     struct NeverCancelled;
 
@@ -104,7 +109,7 @@ mod tests {
         }
     }
 
-    fn admitted_scan() -> ConnectorScan {
+    fn admitted_scan(from_snapshot_id: i64, to_snapshot_id: i64) -> ConnectorScan {
         let owner = ConnectorExecutionBindingKey {
             instance_id: ConnectorInstanceId::parse("ice").expect("instance ID"),
             incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
@@ -118,7 +123,7 @@ mod tests {
         .expect("request context");
         ConnectorScan::try_new_change_window(
             owner.clone(),
-            ConnectorChangeWindow::new(10, 20),
+            ConnectorChangeWindow::new(from_snapshot_id, to_snapshot_id),
             ConnectorChangeWindowAdmission::MetadataOnly,
             ConnectorScanHandle::try_new(owner.instance_id, Bytes::from_static(b"change-v1"))
                 .expect("scan handle"),
@@ -129,88 +134,44 @@ mod tests {
         .expect("sealed scan")
     }
 
-    fn delta_scan(
-        binding: crate::sql::binding::SqlTableBindingId,
-        from_snapshot_id: i64,
-        to_snapshot_id: i64,
-    ) -> PlanScanNode {
-        let source = ScanSource::Sql(SqlScanSource::new(
-            binding,
-            SqlTableIdentity {
-                catalog: "ice".to_string(),
-                namespace: "sales".to_string(),
-                table: "orders".to_string(),
-            },
-            SqlScanKind::Delta {
-                from_snapshot_id,
-                to_snapshot_id,
-            },
-        ));
-        PlanScanNode {
-            database: "sales".to_string(),
-            table: TableDef {
-                name: "orders".to_string(),
-                columns: vec![],
-                iceberg_row_lineage_metadata_columns: vec![],
-                source,
-            },
-            alias: None,
-            columns: vec![],
-            predicates: vec![],
-            required_columns: None,
-            variant_columns: vec![],
-            mv_rewritten_from: None,
-        }
+    fn delta_scan(fixture: NativeScanFixture) -> PlanScanNode {
+        let plan = native_scan_plan(fixture).expect("sealed delta scan fixture");
+        plan.fragments()
+            .iter()
+            .find_map(|fragment| match &fragment.root.payload {
+                DistributedNodeKind::Scan(scan) => Some(scan.clone()),
+                _ => None,
+            })
+            .expect("sealed delta fixture has one scan")
     }
 
-    fn binding_with_delta(binding: crate::sql::binding::SqlTableBindingId) -> QueryTableBinding {
-        let source = ScanSource::Sql(SqlScanSource::new(
-            binding,
-            SqlTableIdentity {
-                catalog: "ice".to_string(),
-                namespace: "sales".to_string(),
-                table: "orders".to_string(),
-            },
-            SqlScanKind::Delta {
-                from_snapshot_id: 10,
-                to_snapshot_id: 20,
-            },
-        ));
-        QueryTableBinding {
-            resolved: ResolvedAnalyzerTable::from_planner(
-                Some("ice"),
-                "sales",
-                TableDef {
-                    name: "orders".to_string(),
-                    columns: vec![],
-                    iceberg_row_lineage_metadata_columns: vec![],
-                    source,
-                },
-            ),
-            statistics_pin: None,
-            admission:
-                crate::query_execution::planning::bindings::QueryTableBindingAdmission::Local,
-            scan_materialization: None,
-            write_target_admission: None,
-            mv_target_read: None,
-            frozen_snapshot_materializations: BTreeMap::new(),
-            admitted_change_scans: BTreeMap::from([((10, 20), admitted_scan())]),
-        }
+    fn test_store() -> QueryTableBindingStore {
+        QueryTableBindingStore::try_new_with_scope_for_test(
+            NonZeroU64::new(1).expect("fixture binding scope"),
+        )
     }
 
     #[test]
     fn sqlx2_preparation_delta_resolves_only_its_admitted_window() {
-        let bindings = QueryTableBindingStore::try_new().expect("binding store");
-        let binding = bindings
+        let bindings = test_store();
+        bindings
             .resolve_or_insert_with_id(
-                QueryTableBindingKey::snapshot("ice", "sales", "orders", 20),
-                |binding| Ok(binding_with_delta(binding)),
+                QueryTableBindingKey::snapshot("test_catalog", "test_db", "test_table", 7),
+                |binding| {
+                    Ok(admitted_change_window_binding_for_test(
+                        binding,
+                        6,
+                        7,
+                        admitted_scan(6, 7),
+                    ))
+                },
             )
             .expect("admit binding");
         let resolver = QueryTableBindingScanResolver::new(&bindings);
+        let scan = delta_scan(NativeScanFixture::DeltaForPreparedBinding);
 
         let resolved = resolver
-            .resolve_scan(7, &delta_scan(binding, 10, 20))
+            .resolve_scan(7, &scan)
             .expect("resolve admitted delta")
             .expect("delta scan execution");
         let ResolvedScanExecution::SealedConnectorScan(scan) = resolved else {
@@ -219,12 +180,13 @@ mod tests {
         assert_eq!(
             scan.selection(),
             novarocks_spi::connector::ConnectorScanSelection::ChangeWindow(
-                ConnectorChangeWindow::new(10, 20)
+                ConnectorChangeWindow::new(6, 7)
             )
         );
 
+        let unadmitted = delta_scan(NativeScanFixture::DeltaWithStaleUnprojectedColumn);
         let error = resolver
-            .resolve_scan(7, &delta_scan(binding, 9, 20))
+            .resolve_scan(7, &unadmitted)
             .expect_err("unadmitted window must fail before submission");
         assert!(
             error.contains("no sealed change-window admission"),
@@ -235,16 +197,24 @@ mod tests {
     #[test]
     fn sqlx2_preparation_delta_rejects_cross_request_token() {
         let first = QueryTableBindingStore::try_new().expect("first binding store");
-        let second = QueryTableBindingStore::try_new().expect("second binding store");
-        let binding = second
+        let second = test_store();
+        second
             .resolve_or_insert_with_id(
-                QueryTableBindingKey::snapshot("ice", "sales", "orders", 20),
-                |binding| Ok(binding_with_delta(binding)),
+                QueryTableBindingKey::snapshot("test_catalog", "test_db", "test_table", 7),
+                |binding| {
+                    Ok(admitted_change_window_binding_for_test(
+                        binding,
+                        6,
+                        7,
+                        admitted_scan(6, 7),
+                    ))
+                },
             )
             .expect("admit second binding");
+        let scan = delta_scan(NativeScanFixture::DeltaForPreparedBinding);
 
         let error = QueryTableBindingScanResolver::new(&first)
-            .resolve_scan(8, &delta_scan(binding, 10, 20))
+            .resolve_scan(8, &scan)
             .expect_err("cross-request token must fail before connector preparation");
         assert!(error.contains("different request"), "error={error}");
     }

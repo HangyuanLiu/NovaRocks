@@ -164,9 +164,14 @@ impl UnifiedStatisticsResolver {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use bytes::Bytes;
-    use novarocks_spi::connector::{StatisticsEvidenceRevision, StatisticsProvenance};
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorProviderId, StatisticsEvidenceRevision, StatisticsProvenance, StatisticsReader,
+    };
 
     use super::*;
 
@@ -184,6 +189,76 @@ mod tests {
         }
     }
 
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    struct TestStatistics {
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ConnectorInstanceIncarnation,
+        evidence: StatisticsEvidence,
+    }
+
+    impl StatisticsReader for TestStatistics {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+
+        fn incarnation(&self) -> ConnectorInstanceIncarnation {
+            self.incarnation
+        }
+
+        fn read_statistics(
+            &self,
+            _request: StatisticsReadRequest,
+        ) -> Result<StatisticsEvidence, ConnectorError> {
+            Ok(self.evidence.clone())
+        }
+    }
+
+    impl ConnectorStatistics for TestStatistics {}
+
+    fn descriptor(instance: &str) -> ConnectorInstanceDescriptor {
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider id"),
+            instance_id: ConnectorInstanceId::parse(instance).expect("instance id"),
+        }
+    }
+
+    fn request_context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            1,
+            1,
+        )
+        .expect("request context")
+    }
+
+    fn metric_request() -> StatisticsMetricRequest {
+        StatisticsMetricRequest::try_new(vec![StatisticsMetric::RowCount]).expect("metric request")
+    }
+
+    fn resolved_table(
+        instance: &str,
+        incarnation: ConnectorInstanceIncarnation,
+    ) -> ResolvedStatisticsTable {
+        ResolvedStatisticsTable {
+            table: ConnectorTableHandle::try_new(
+                ConnectorInstanceId::parse(instance).expect("instance id"),
+                Bytes::from_static(b"table"),
+            )
+            .expect("table handle"),
+            data_version: StatisticsDataVersion::try_new(Bytes::from_static(b"data-v1"))
+                .expect("data version"),
+            incarnation,
+        }
+    }
+
     #[test]
     fn subset_or_approximate_evidence_cannot_upgrade_optimizer_input() {
         assert!(!UnifiedStatisticsResolver::optimizer_usable(&evidence(
@@ -198,5 +273,56 @@ mod tests {
             StatisticsCoverage::Full,
             StatisticsAccuracy::Exact,
         )));
+    }
+
+    #[test]
+    fn resolver_fails_closed_for_owner_incarnation_and_data_version_mismatch() {
+        let resolver = UnifiedStatisticsResolver::default();
+        let incarnation = ConnectorInstanceIncarnation::from_bytes([1; 16]);
+        let table = resolved_table("ice.main", incarnation);
+
+        let owner_mismatch = TestStatistics {
+            descriptor: descriptor("ice.foreign"),
+            incarnation,
+            evidence: evidence(StatisticsCoverage::Full, StatisticsAccuracy::Exact),
+        };
+        assert_eq!(
+            resolver.resolve(&table, &owner_mismatch, metric_request(), request_context(),),
+            Err(StatisticsResolutionFailure::OwnerMismatch)
+        );
+
+        let incarnation_mismatch = TestStatistics {
+            descriptor: descriptor("ice.main"),
+            incarnation: ConnectorInstanceIncarnation::from_bytes([2; 16]),
+            evidence: evidence(StatisticsCoverage::Full, StatisticsAccuracy::Exact),
+        };
+        assert_eq!(
+            resolver.resolve(
+                &table,
+                &incarnation_mismatch,
+                metric_request(),
+                request_context(),
+            ),
+            Err(StatisticsResolutionFailure::IncarnationMismatch)
+        );
+
+        let mut foreign_evidence = evidence(StatisticsCoverage::Full, StatisticsAccuracy::Exact);
+        foreign_evidence.data_version =
+            StatisticsDataVersion::try_new(Bytes::from_static(b"data-v2"))
+                .expect("foreign data version");
+        let data_version_mismatch = TestStatistics {
+            descriptor: descriptor("ice.main"),
+            incarnation,
+            evidence: foreign_evidence,
+        };
+        assert_eq!(
+            resolver.resolve(
+                &table,
+                &data_version_mismatch,
+                metric_request(),
+                request_context(),
+            ),
+            Err(StatisticsResolutionFailure::DataVersionMismatch)
+        );
     }
 }

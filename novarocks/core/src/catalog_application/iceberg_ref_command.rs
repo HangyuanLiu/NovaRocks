@@ -47,17 +47,11 @@ impl IcebergRefCommandExecutor {
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Option<StatementResult>, String> {
-        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
-        let mut statements = match crate::sql::parser::parse_sql(&normalized) {
-            Ok(statements) => statements,
+        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
+        let Some(statement) = (match novarocks_sql::syntax::parse_alter_iceberg_ref(&normalized) {
+            Ok(statement) => statement,
             Err(_) => return Ok(None),
-        };
-        if statements.len() != 1 {
-            return Err("Iceberg ref command accepts exactly one statement".to_string());
-        }
-        let crate::sql::parser::ast::Statement::AlterIcebergRef(statement) =
-            statements.pop().expect("one checked statement")
-        else {
+        }) else {
             return Ok(None);
         };
         crate::mv::ref_flow::execute_with_ports(

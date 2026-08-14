@@ -29,8 +29,7 @@ use novarocks_catalog::schema_cache::SchemaCache;
 use novarocks_catalog::service::CatalogService;
 use novarocks_catalog::table::CatalogTable;
 
-use crate::sql::catalog::local::PlannerMemoryCatalog;
-use crate::sql::planner::table::TableDef;
+use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
 
 #[derive(Clone, Debug)]
 pub struct CatalogRuntimeMetadata {
@@ -38,17 +37,13 @@ pub struct CatalogRuntimeMetadata {
 }
 
 impl CatalogRuntimeMetadata {
-    fn from_table_def(identity: TableIdentity, table_def: &TableDef) -> Self {
+    fn from_local_catalog_table(identity: TableIdentity, table: CatalogTable) -> Self {
         // Registry cache entries describe only durable SQL catalog facts.
         // They intentionally retain neither a scan source nor a connector
         // descriptor: every query receives fresh provider authority through
         // the query-local materialization envelope and binding store.
         Self {
-            table: CatalogTable {
-                identity,
-                columns: table_def.columns.clone(),
-                hidden_columns: table_def.iceberg_row_lineage_metadata_columns.clone(),
-            },
+            table: CatalogTable { identity, ..table },
         }
     }
 
@@ -71,7 +66,8 @@ impl CatalogRuntimeMetadata {
 /// The registry keeps durable SQL catalog facts only. Provider authority is
 /// supplied separately through the exact Connector control lease captured for
 /// each request.
-pub type QueryCatalogService = CatalogService<TableDef, CatalogRuntimeMetadata>;
+pub type QueryCatalogService =
+    CatalogService<novarocks_sql::planning::catalog::SqlLocalCatalogEntry, CatalogRuntimeMetadata>;
 
 struct InternalCatalog {
     name: String,
@@ -97,14 +93,12 @@ impl Catalog<CatalogRuntimeMetadata> for InternalCatalog {
         namespace: &str,
         table: &str,
     ) -> Result<CatalogRuntimeMetadata, String> {
-        let table_def = self
-            .local
-            .read()
-            .expect("internal catalog read lock")
-            .get(namespace, table)?;
-        Ok(CatalogRuntimeMetadata::from_table_def(
+        let local = self.local.read().expect("internal catalog read lock");
+        let catalog_table =
+            novarocks_sql::planning::catalog::local_catalog_table(&local, namespace, table)?;
+        Ok(CatalogRuntimeMetadata::from_local_catalog_table(
             TableIdentity::new(&self.name, namespace, table),
-            &table_def,
+            catalog_table,
         ))
     }
 }
@@ -185,38 +179,4 @@ pub(crate) fn build_connector_catalog(
     controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
 ) -> Arc<dyn Catalog<CatalogRuntimeMetadata>> {
     Arc::new(ConnectorCatalog::new(name, controls))
-}
-
-#[cfg(test)]
-mod tests {
-    use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
-
-    use super::CatalogRuntimeMetadata;
-    use crate::sql::planner::table::TableDef;
-    use novarocks_catalog::identifier::TableIdentity;
-
-    #[test]
-    fn sqlx2_catalog_runtime_keeps_only_schema_facts() {
-        let table = TableDef {
-            name: "orders".to_string(),
-            columns: vec![ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            }],
-            iceberg_row_lineage_metadata_columns: vec![],
-            source: crate::sql::planner::table::test_sql_scan_source(
-                crate::sql::planner::table::SqlScanKind::ConnectorRead,
-            ),
-        };
-        let metadata = CatalogRuntimeMetadata::from_table_def(
-            TableIdentity::new("default_catalog", "db", "orders"),
-            &table,
-        );
-        assert_eq!(metadata.table.identity.fqn(), "default_catalog.db.orders");
-        assert_eq!(metadata.table.columns, table.columns);
-    }
 }

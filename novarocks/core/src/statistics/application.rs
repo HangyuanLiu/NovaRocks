@@ -602,7 +602,7 @@ impl StatisticsAttemptExecutor for ConnectorStatisticsAttemptExecutor {
             topology,
             Some(Instant::now() + program.policy().attempt_timeout()),
             cancellation.view(),
-            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_sql::compiler::SessionOptimizerSettings::default(),
         );
         let connectors = self
             .ports

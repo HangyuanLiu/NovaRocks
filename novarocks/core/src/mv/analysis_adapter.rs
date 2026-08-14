@@ -26,15 +26,15 @@ use arrow::record_batch::RecordBatch;
 
 use crate::catalog_application::CatalogApplicationPort;
 use crate::catalog_application::query_catalog::QueryCatalogService;
-use crate::mv::analysis::{MvAnalysis, finish_mv_analysis, prepare_mv_select_for_catalog_provider};
+use crate::mv::analysis::{MvAnalysis, prepare_mv_select_for_catalog_provider};
 use crate::mv::lifecycle::MvListRow;
 use crate::mv::model::MvStorageEngine;
 use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::mv::persistence::refresh::MvRefreshState;
 use crate::mv::repository::MvRepository;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
-use crate::sql::parser::ast::ShowMaterializedViewsStmt;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
+use novarocks_sql::syntax::ShowMaterializedViewsStmt;
 
 /// Lightweight projection of the iceberg base table that
 /// `validate_ivm_primary_key` needs. Built once at the top of `create_mv`
@@ -289,12 +289,23 @@ pub(crate) fn analyze_mv_select_with_ports(
         catalog_service,
         connector_control,
         connector_context.clone(),
-        crate::sql::catalog::TableLookupMode::SchemaOnly,
+        novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
         catalog_application,
     );
-    let (resolved, _, _) =
-        crate::sql::analyzer::analyze(prepared.query_for_analysis(), &provider, current_database)?;
-    Ok(finish_mv_analysis(prepared, resolved))
+    let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&provider);
+    let refresh_input = novarocks_sql::compiler::analyze_mv_refresh_input(
+        novarocks_sql::compiler::SqlMvRefreshAnalysisContext {
+            query: Box::new(prepared.query_for_analysis().clone()),
+            current_database: current_database.to_string(),
+            catalog: &catalog,
+        },
+    )?;
+    let output_columns = refresh_input.analysis_facts().output_columns;
+    Ok(MvAnalysis {
+        resolved_refs: prepared.resolved_refs().to_vec(),
+        output_columns,
+        refresh_input,
+    })
 }
 
 pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, String> {

@@ -40,13 +40,9 @@ use crate::query_execution::statistics::{
     StatisticsExecutionMode, StatisticsExecutionPolicy, ThetaSketchPartial,
 };
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
-use crate::sql::planner::distributed::{
-    DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
-};
-use crate::sql::planner::payload::PlanValuesNode;
-use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 use bytes::Bytes;
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -56,7 +52,7 @@ fn test_execution(cancellation: QueryCancellationView) -> QueryExecutionContext 
         BackendTopologySnapshot::empty(0),
         None,
         cancellation,
-        crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        novarocks_sql::compiler::SessionOptimizerSettings::default(),
     )
 }
 
@@ -180,42 +176,8 @@ fn real_execution_artifacts() -> (
     crate::query_execution::preparation::PreparedFragmentSet,
     crate::protocol::native::encode::NativeFragmentBundle,
 ) {
-    let fragment = PlanFragment {
-        fragment_id: 7,
-        root: DistributedNode {
-            node_id: 70,
-            fragment_id: 7,
-            tuple_ids: vec![70],
-            nullable_tuple_ids: Vec::new(),
-            limit: -1,
-            runtime_filter_binding_ids: Vec::new(),
-            children: Vec::new(),
-            stats: PhysicalPlanStats {
-                output_row_count: 0.0,
-                row_count_confidence: PlannerConfidence::Fallback,
-                column_statistics: Default::default(),
-                cost_estimate: None,
-                broadcast_decision: None,
-            },
-            payload: DistributedNodeKind::Values(PlanValuesNode {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            }),
-        },
-        data_partition: DataPartition::unpartitioned(),
-        output_partition: DataPartition::unpartitioned(),
-        sink: DataSink::Result,
-        output_exprs: None,
-        output_columns: Vec::new(),
-        cte_id: None,
-        cte_exchange_nodes: Vec::new(),
-    };
-    let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
-        fragments: vec![fragment],
-        root_fragment_id: 7,
-        edges: Vec::new(),
-        runtime_filter_graph: Default::default(),
-    };
+    let plan = native_preparation_plan(NativePreparationFixture::ResultOutput)
+        .expect("sealed result execution fixture");
     let registry = crate::connector::ConnectorRegistry::new();
     let controls = crate::connector::FixtureControlResolver::new(registry.clone());
     let prepared = crate::query_execution::preparation::prepare_fragments(

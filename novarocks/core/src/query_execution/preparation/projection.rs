@@ -19,14 +19,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use arrow::datatypes::DataType;
 
-use super::runtime_filter_binding::RuntimeFilterBindingTable;
 use super::scan::ScanExecutionBindings;
 use crate::runtime::scan_range::ScanRangeParams;
-use crate::sql::analysis::cte::CteId;
-use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::{BoundaryContract, FragmentEdge, FragmentId};
-use crate::sql::planner::runtime_filter::graph::RuntimeFilterGraph;
-use crate::sql::planner::runtime_filter::sealed::SealedRuntimeFilterPlan;
+use novarocks_sql::plan_read::{BoundaryContract, ColumnId, CteId, FragmentEdge, FragmentId};
+use novarocks_sql::planning::query_execution::{
+    SqlPreparedRuntimeFilterFacts, SqlRuntimeFilterBindingFacts,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedOutputColumn {
@@ -86,7 +84,7 @@ impl PreparedBoundaryProjection {
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedFragment {
     fragment_id: FragmentId,
-    runtime_filter_bindings: RuntimeFilterBindingTable,
+    runtime_filter_bindings: Vec<SqlRuntimeFilterBindingFacts>,
     scan_node_ids: Vec<i32>,
     execution_role: PreparedFragmentRole,
     boundary_projection: PreparedBoundaryProjection,
@@ -97,7 +95,7 @@ impl PreparedFragment {
         self.fragment_id
     }
 
-    pub(crate) fn runtime_filter_bindings(&self) -> &RuntimeFilterBindingTable {
+    pub(crate) fn runtime_filter_bindings(&self) -> &[SqlRuntimeFilterBindingFacts] {
         &self.runtime_filter_bindings
     }
 
@@ -134,7 +132,7 @@ pub struct PreparedFragmentSet {
     projection: PreparedPlanProjection,
     // The SQL-owned sealed facts are shared with DistributedPlan. This carrier
     // cannot mutate or reconstruct the query-global graph.
-    runtime_filter_plan: SealedRuntimeFilterPlan,
+    runtime_filter_facts: SqlPreparedRuntimeFilterFacts,
 }
 
 impl PreparedFragmentSet {
@@ -144,7 +142,7 @@ impl PreparedFragmentSet {
         topological_fragment_order: Vec<FragmentId>,
         execution_anchor_fragment_id: FragmentId,
         edges: Vec<FragmentEdge>,
-        runtime_filter_plan: SealedRuntimeFilterPlan,
+        runtime_filter_facts: SqlPreparedRuntimeFilterFacts,
     ) -> Self {
         Self {
             by_fragment,
@@ -154,7 +152,7 @@ impl PreparedFragmentSet {
                 execution_anchor_fragment_id,
                 edges,
             },
-            runtime_filter_plan,
+            runtime_filter_facts,
         }
     }
 
@@ -178,14 +176,8 @@ impl PreparedFragmentSet {
         self.by_fragment.get(&fragment_id)
     }
 
-    pub(crate) fn runtime_filter_graph(&self) -> &RuntimeFilterGraph {
-        self.runtime_filter_plan.graph()
-    }
-
-    pub(crate) fn runtime_filter_join_progress(
-        &self,
-    ) -> &crate::sql::planner::runtime_filter::progress::JoinBuildProgressCatalog {
-        self.runtime_filter_plan.join_progress()
+    pub(crate) fn runtime_filter_facts(&self) -> &SqlPreparedRuntimeFilterFacts {
+        &self.runtime_filter_facts
     }
 }
 
@@ -248,7 +240,7 @@ impl<'a> PreparedFragmentSchedulingView<'a> {
 
 pub(super) fn prepared_fragment(
     fragment_id: FragmentId,
-    runtime_filter_bindings: RuntimeFilterBindingTable,
+    runtime_filter_bindings: Vec<SqlRuntimeFilterBindingFacts>,
     scan_node_ids: Vec<i32>,
     execution_role: PreparedFragmentRole,
     output_columns: Vec<PreparedOutputColumn>,
@@ -268,81 +260,4 @@ pub(super) fn prepared_fragment(
             contracts,
         },
     }
-}
-
-#[cfg(any(test, feature = "query-execution-contract-test-support"))]
-pub(crate) fn prepared_fragment_set_for_test(
-    fragments: Vec<(
-        FragmentId,
-        PreparedFragmentRole,
-        Vec<(i32, Vec<ScanRangeParams>)>,
-    )>,
-    topological_fragment_order: Vec<FragmentId>,
-    execution_anchor_fragment_id: FragmentId,
-    edges: Vec<FragmentEdge>,
-) -> PreparedFragmentSet {
-    let mut by_fragment = BTreeMap::new();
-    let mut scan_bindings = ScanExecutionBindings::default();
-    for (fragment_id, role, scan_nodes) in fragments {
-        let mut scan_node_ids = Vec::new();
-        for (node_id, ranges) in scan_nodes {
-            scan_node_ids.push(node_id);
-            scan_bindings
-                .insert_scan_ranges(fragment_id, node_id, ranges)
-                .expect("unique test scan range key");
-        }
-        scan_node_ids.sort_unstable();
-        by_fragment.insert(
-            fragment_id,
-            prepared_fragment(
-                fragment_id,
-                RuntimeFilterBindingTable::empty(fragment_id),
-                scan_node_ids,
-                role,
-                Vec::new(),
-                None,
-                Vec::new(),
-                Vec::new(),
-            ),
-        );
-    }
-    PreparedFragmentSet::new(
-        by_fragment,
-        scan_bindings,
-        topological_fragment_order,
-        execution_anchor_fragment_id,
-        edges,
-        SealedRuntimeFilterPlan::new(
-            RuntimeFilterGraph::default(),
-            Default::default(),
-            Default::default(),
-        ),
-    )
-}
-
-#[cfg(any(test, feature = "query-execution-contract-test-support"))]
-pub(crate) fn prepared_fragment_set_with_runtime_filter_for_test(
-    fragments: Vec<(
-        FragmentId,
-        PreparedFragmentRole,
-        Vec<(i32, Vec<ScanRangeParams>)>,
-    )>,
-    topological_fragment_order: Vec<FragmentId>,
-    execution_anchor_fragment_id: FragmentId,
-    edges: Vec<FragmentEdge>,
-    runtime_filter_graph: RuntimeFilterGraph,
-    runtime_filter_join_progress: crate::sql::planner::runtime_filter::progress::JoinBuildProgressCatalog,
-) -> PreparedFragmentSet {
-    let mut prepared = prepared_fragment_set_for_test(
-        fragments,
-        topological_fragment_order,
-        execution_anchor_fragment_id,
-        edges,
-    );
-    prepared.runtime_filter_plan = SealedRuntimeFilterPlan::new(
-        runtime_filter_graph,
-        Default::default(),
-        runtime_filter_join_progress,
-    );
-    prepared
 }

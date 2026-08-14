@@ -41,7 +41,6 @@ use novarocks::query_execution::ConnectorWriteCompletion;
 use novarocks::query_execution::contract::ConnectorWriteExecutionRegistration;
 use novarocks::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use novarocks::query_execution::service::QueryExecutionService;
-use novarocks::sql::mv_refresh::MvRefreshFinalizeFacts;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt, ConnectorControlRegistry,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorMutationOperationId,
@@ -49,6 +48,7 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorWriteReceipt, CreateOrReplacePolicy,
     DropPolicy, ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
 };
+use novarocks_sql::planning::mv::MvRefreshFinalizeFacts;
 use sha2::{Digest, Sha256};
 
 /// Dependencies retained by the frontend composition root.  They have no

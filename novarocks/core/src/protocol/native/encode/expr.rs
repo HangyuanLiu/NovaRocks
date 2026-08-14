@@ -21,26 +21,27 @@ use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 
 use crate::protocol::native::type_mapping::encode_type;
-use crate::sql::plan_read::{
-    BinOp, ExprKind, LiteralValue, SortItem, TypedExpr, UnOp, WindowBound, WindowFrame,
-    WindowFrameType,
-};
 use novarocks_protocol::{common, expr};
+use novarocks_sql::plan_read::{
+    BinOp, LiteralValue, SortItem, SqlExpressionRead, SqlExpressionReadKind, TypedExpr, UnOp,
+    WindowBound, WindowFrame, WindowFrameType, expression_read,
+};
 use novarocks_types::largeint;
 
 pub(crate) fn encode_expr(e: &TypedExpr) -> Result<expr::Expr, String> {
+    let read = expression_read(e);
     Ok(expr::Expr {
-        r#type: Some(encode_type(&e.data_type)?),
-        nullable: e.nullable,
-        kind: Some(encode_expr_kind(e)?),
+        r#type: Some(encode_type(&read.data_type)?),
+        nullable: read.nullable,
+        kind: Some(encode_expr_kind(&read)?),
     })
 }
 
-fn encode_expr_kind(e: &TypedExpr) -> Result<expr::expr::Kind, String> {
+fn encode_expr_kind(e: &SqlExpressionRead) -> Result<expr::expr::Kind, String> {
     use expr::expr::Kind;
 
     Ok(match &e.kind {
-        ExprKind::ColumnRef {
+        SqlExpressionReadKind::ColumnRef {
             column_id,
             qualifier,
             column,
@@ -49,47 +50,54 @@ fn encode_expr_kind(e: &TypedExpr) -> Result<expr::expr::Kind, String> {
             qualifier: qualifier.clone(),
             column: Some(column.clone()),
         }),
-        ExprKind::LambdaParamRef { name, slot_id } => Kind::LambdaParamRef(expr::LambdaParamRef {
-            slot_id: *slot_id,
-            name: Some(name.clone()),
-        }),
-        ExprKind::Literal(value) => Kind::Literal(expr::LiteralExpr {
+        SqlExpressionReadKind::LambdaParamRef { name, slot_id } => {
+            Kind::LambdaParamRef(expr::LambdaParamRef {
+                slot_id: *slot_id,
+                name: Some(name.clone()),
+            })
+        }
+        SqlExpressionReadKind::Literal(value) => Kind::Literal(expr::LiteralExpr {
             value: Some(encode_literal(value, &e.data_type)?),
         }),
-        ExprKind::BinaryOp { left, op, right } => Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
-            op: encode_bin_op(*op) as i32,
-            left: Some(Box::new(encode_expr(left)?)),
-            right: Some(Box::new(encode_expr(right)?)),
-        })),
-        ExprKind::UnaryOp { op, expr: inner } => Kind::UnaryOp(Box::new(expr::UnaryOpExpr {
-            op: encode_un_op(*op) as i32,
-            operand: Some(Box::new(encode_expr(inner)?)),
-        })),
-        ExprKind::FunctionCall {
+        SqlExpressionReadKind::BinaryOp { left, op, right } => {
+            Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                op: encode_bin_op(*op) as i32,
+                left: Some(Box::new(encode_expr(left)?)),
+                right: Some(Box::new(encode_expr(right)?)),
+            }))
+        }
+        SqlExpressionReadKind::UnaryOp { op, expr: inner } => {
+            Kind::UnaryOp(Box::new(expr::UnaryOpExpr {
+                op: encode_un_op(*op) as i32,
+                operand: Some(Box::new(encode_expr(inner)?)),
+            }))
+        }
+        SqlExpressionReadKind::FunctionCall {
             name,
             args,
             distinct,
-            ..
         } => Kind::FunctionCall(expr::FunctionCall {
             function_name: name.clone(),
             args: encode_exprs(args)?,
             distinct: *distinct,
         }),
-        ExprKind::LambdaFunction { params, body } => Kind::Lambda(Box::new(expr::LambdaExpr {
-            params: params
-                .iter()
-                .map(|param| {
-                    Ok(expr::LambdaParam {
-                        slot_id: param.slot_id,
-                        name: Some(param.name.clone()),
-                        r#type: Some(encode_type(&param.data_type)?),
-                        nullable: param.nullable,
+        SqlExpressionReadKind::LambdaFunction { params, body } => {
+            Kind::Lambda(Box::new(expr::LambdaExpr {
+                params: params
+                    .iter()
+                    .map(|param| {
+                        Ok(expr::LambdaParam {
+                            slot_id: param.slot_id,
+                            name: Some(param.name.clone()),
+                            r#type: Some(encode_type(&param.data_type)?),
+                            nullable: param.nullable,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, String>>()?,
-            body: Some(Box::new(encode_expr(body)?)),
-        })),
-        ExprKind::AggregateCall {
+                    .collect::<Result<Vec<_>, String>>()?,
+                body: Some(Box::new(encode_expr(body)?)),
+            }))
+        }
+        SqlExpressionReadKind::AggregateCall {
             name,
             args,
             distinct,
@@ -100,21 +108,21 @@ fn encode_expr_kind(e: &TypedExpr) -> Result<expr::expr::Kind, String> {
             distinct: *distinct,
             order_by: encode_sort_items(order_by)?,
         }),
-        ExprKind::Cast {
+        SqlExpressionReadKind::Cast {
             expr: inner,
             target,
         } => Kind::Cast(Box::new(expr::CastExpr {
             operand: Some(Box::new(encode_expr(inner)?)),
             target: Some(encode_type(target)?),
         })),
-        ExprKind::IsNull {
+        SqlExpressionReadKind::IsNull {
             expr: inner,
             negated,
         } => Kind::IsNull(Box::new(expr::IsNullExpr {
             operand: Some(Box::new(encode_expr(inner)?)),
             negated: *negated,
         })),
-        ExprKind::InList {
+        SqlExpressionReadKind::InList {
             expr: inner,
             list,
             negated,
@@ -123,7 +131,7 @@ fn encode_expr_kind(e: &TypedExpr) -> Result<expr::expr::Kind, String> {
             list: encode_exprs(list)?,
             negated: *negated,
         })),
-        ExprKind::Between {
+        SqlExpressionReadKind::Between {
             expr: inner,
             low,
             high,
@@ -134,7 +142,7 @@ fn encode_expr_kind(e: &TypedExpr) -> Result<expr::expr::Kind, String> {
             high: Some(Box::new(encode_expr(high)?)),
             negated: *negated,
         })),
-        ExprKind::Like {
+        SqlExpressionReadKind::Like {
             expr: inner,
             pattern,
             negated,
@@ -143,7 +151,7 @@ fn encode_expr_kind(e: &TypedExpr) -> Result<expr::expr::Kind, String> {
             pattern: Some(Box::new(encode_expr(pattern)?)),
             negated: *negated,
         })),
-        ExprKind::Case {
+        SqlExpressionReadKind::Case {
             operand,
             when_then,
             else_expr,
@@ -166,7 +174,7 @@ fn encode_expr_kind(e: &TypedExpr) -> Result<expr::expr::Kind, String> {
                 .map(|else_expr| encode_expr(else_expr).map(Box::new))
                 .transpose()?,
         })),
-        ExprKind::IsTruthValue {
+        SqlExpressionReadKind::IsTruthValue {
             expr: inner,
             value,
             negated,
@@ -175,10 +183,10 @@ fn encode_expr_kind(e: &TypedExpr) -> Result<expr::expr::Kind, String> {
             value: *value,
             negated: *negated,
         })),
-        ExprKind::Nested(inner) => Kind::Nested(Box::new(expr::NestedExpr {
+        SqlExpressionReadKind::Nested(inner) => Kind::Nested(Box::new(expr::NestedExpr {
             inner: Some(Box::new(encode_expr(inner)?)),
         })),
-        ExprKind::WindowCall {
+        SqlExpressionReadKind::WindowCall {
             name,
             args,
             distinct,
@@ -195,14 +203,14 @@ fn encode_expr_kind(e: &TypedExpr) -> Result<expr::expr::Kind, String> {
             frame: window_frame.as_ref().map(encode_window_frame).transpose()?,
             ignore_nulls: *ignore_nulls,
         }),
-        ExprKind::SubqueryPlaceholder { id, .. } => {
+        SqlExpressionReadKind::SubqueryPlaceholder { id } => {
             return Err(format!(
                 "unexpected SubqueryPlaceholder (id={id}) in FE proto expression encoder"
             ));
         }
-        ExprKind::Lambda { .. } => {
+        SqlExpressionReadKind::Lambda => {
             return Err(
-                "ExprKind::Lambda cannot be encoded as native proto without parameter slot/type bindings; use LambdaFunction"
+                "SQL lambda expression cannot be encoded as native proto without parameter slot/type bindings; use LambdaFunction"
                     .to_string(),
             );
         }

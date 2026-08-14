@@ -17,12 +17,12 @@
 
 //! Read-only projection of the planner's sealed boundary catalog.
 //!
-//! The planner (`crate::sql::planner::distributed::boundary`) is the sole owner
+//! The SQL planner's sealed [`novarocks_sql::plan_read`] contract is the sole owner
 //! of boundary membership, occurrence identity, and column provenance:
 //! `build_boundary_catalog` derives every boundary seam and numbers each column
 //! occurrence with an [`ExecutionColumnId`]. This module does **not** discover
 //! or re-select any boundary's logical schema. It only *projects* each sealed
-//! [`BoundaryContract`] into the diagnostic [`BoundarySchemaReport`]. Today the
+//! immutable SQL boundary facts into the diagnostic [`BoundarySchemaReport`]. Today the
 //! sole coordinator consumer (`validate_fragment_schedule_payloads`) reads only
 //! each report's `fragment_id`; the projection still copies the planner's column
 //! order (ExecutionColumnId occurrence order) and [`ColumnId`] provenance verbatim
@@ -30,14 +30,13 @@
 
 use arrow::datatypes::DataType;
 
-use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::{
-    BoundaryColumn, BoundaryContract, BoundaryKind as PlannerBoundaryKind, DistributedPlan,
-    ExecutionColumnId,
+use novarocks_sql::plan_read::{
+    ColumnId, DistributedPlan, ExecutionColumnId, SqlBoundaryColumnRead, SqlBoundaryContractRead,
+    SqlBoundaryKindRead, boundary_contract_reads,
 };
 
 /// The kind of boundary seam a [`BoundarySchemaReport`] describes. Every variant
-/// is the projection of a planner [`PlannerBoundaryKind`]; codegen never invents
+/// is the projection of an SQL boundary kind; codegen never invents
 /// a boundary kind of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BoundaryKind {
@@ -49,15 +48,15 @@ pub(crate) enum BoundaryKind {
 }
 
 impl BoundaryKind {
-    /// Project the planner boundary kind. This is a total, 1:1 mapping so the
+    /// Project the SQL boundary kind. This is a total, 1:1 mapping so the
     /// projection is honest: every sealed boundary kind has a codegen variant.
-    pub(crate) fn from_planner(kind: PlannerBoundaryKind) -> Self {
+    pub(crate) fn from_sql(kind: SqlBoundaryKindRead) -> Self {
         match kind {
-            PlannerBoundaryKind::ResultOutput => BoundaryKind::ResultRoot,
-            PlannerBoundaryKind::ExchangeSend => BoundaryKind::ExchangeSender,
-            PlannerBoundaryKind::ExchangeReceive => BoundaryKind::ExchangeReceiver,
-            PlannerBoundaryKind::IcebergWriteInput => BoundaryKind::IcebergWriteInput,
-            PlannerBoundaryKind::ChangeStreamRouterInput => BoundaryKind::ChangeStreamRouterInput,
+            SqlBoundaryKindRead::ResultOutput => BoundaryKind::ResultRoot,
+            SqlBoundaryKindRead::ExchangeSend => BoundaryKind::ExchangeSender,
+            SqlBoundaryKindRead::ExchangeReceive => BoundaryKind::ExchangeReceiver,
+            SqlBoundaryKindRead::IcebergWriteInput => BoundaryKind::IcebergWriteInput,
+            SqlBoundaryKindRead::ChangeStreamRouterInput => BoundaryKind::ChangeStreamRouterInput,
         }
     }
 }
@@ -96,8 +95,8 @@ pub(crate) struct BoundarySchemaColumn {
     pub nullable: bool,
 }
 
-/// A diagnostic report for one boundary seam, projected from a planner
-/// [`BoundaryContract`]. `node_id` mirrors the contract: `Some(exchange_node_id)`
+/// A diagnostic report for one boundary seam, projected from immutable SQL
+/// boundary facts. `node_id` mirrors the contract: `Some(exchange_node_id)`
 /// for Exchange send/receive seams, `None` for fragment-level sink seams (result,
 /// Iceberg write input, change-stream router input).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,20 +113,19 @@ pub(crate) struct BoundarySchemaReport {
 ///
 /// This is a pure, read-only projection: codegen never discovers boundary
 /// membership, re-selects columns, or re-numbers occurrences. Every field is
-/// copied from a [`BoundaryContract`] / [`BoundaryColumn`].
+/// copied from SQL-owned boundary facts.
 pub(crate) fn project_boundary_reports(plan: &DistributedPlan) -> Vec<BoundarySchemaReport> {
-    plan.boundaries()
-        .contracts()
+    boundary_contract_reads(plan)
         .iter()
         .map(project_boundary_report)
         .collect()
 }
 
-fn project_boundary_report(contract: &BoundaryContract) -> BoundarySchemaReport {
+fn project_boundary_report(contract: &SqlBoundaryContractRead) -> BoundarySchemaReport {
     BoundarySchemaReport {
         fragment_id: Some(contract.fragment_id as i32),
         node_id: contract.node_id,
-        boundary_kind: BoundaryKind::from_planner(contract.kind),
+        boundary_kind: BoundaryKind::from_sql(contract.kind),
         columns: contract
             .columns
             .iter()
@@ -136,7 +134,7 @@ fn project_boundary_report(contract: &BoundaryContract) -> BoundarySchemaReport 
     }
 }
 
-fn project_boundary_column(column: &BoundaryColumn) -> BoundarySchemaColumn {
+fn project_boundary_column(column: &SqlBoundaryColumnRead) -> BoundarySchemaColumn {
     BoundarySchemaColumn {
         // Preserve the historical 1-based per-boundary slot numbering derived
         // from the planner's within-boundary occurrence position.
@@ -152,30 +150,30 @@ fn project_boundary_column(column: &BoundaryColumn) -> BoundarySchemaColumn {
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::distributed::BoundaryKind as PlannerBoundaryKind;
+    use novarocks_sql::plan_read::SqlBoundaryKindRead;
 
     use super::BoundaryKind;
 
     #[test]
     fn planner_boundary_kinds_project_to_codegen_kinds() {
         assert_eq!(
-            BoundaryKind::from_planner(PlannerBoundaryKind::ResultOutput),
+            BoundaryKind::from_sql(SqlBoundaryKindRead::ResultOutput),
             BoundaryKind::ResultRoot
         );
         assert_eq!(
-            BoundaryKind::from_planner(PlannerBoundaryKind::ExchangeSend),
+            BoundaryKind::from_sql(SqlBoundaryKindRead::ExchangeSend),
             BoundaryKind::ExchangeSender
         );
         assert_eq!(
-            BoundaryKind::from_planner(PlannerBoundaryKind::ExchangeReceive),
+            BoundaryKind::from_sql(SqlBoundaryKindRead::ExchangeReceive),
             BoundaryKind::ExchangeReceiver
         );
         assert_eq!(
-            BoundaryKind::from_planner(PlannerBoundaryKind::IcebergWriteInput),
+            BoundaryKind::from_sql(SqlBoundaryKindRead::IcebergWriteInput),
             BoundaryKind::IcebergWriteInput
         );
         assert_eq!(
-            BoundaryKind::from_planner(PlannerBoundaryKind::ChangeStreamRouterInput),
+            BoundaryKind::from_sql(SqlBoundaryKindRead::ChangeStreamRouterInput),
             BoundaryKind::ChangeStreamRouterInput
         );
     }

@@ -360,10 +360,9 @@ pub(crate) struct CtasSourceExecutionGate {
 /// scan bindings produced by analysis so target preparation cannot trigger a
 /// second SQL compilation or a current-generation metadata lookup.
 pub(crate) struct PlannedCtasSourceQuery {
-    optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
-    output_columns: Vec<crate::sql::analysis::OutputColumn>,
+    source: novarocks_sql::planning::dml::DmlCtasSourcePlan,
     table_bindings: Arc<crate::query_execution::planning::bindings::QueryTableBindingStore>,
-    optimizer_settings: crate::sql::optimizer::options::SessionOptimizerSettings,
+    optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings,
     connector_target_parallelism: std::num::NonZeroUsize,
 }
 
@@ -393,48 +392,50 @@ fn plan_query_for_ctas_source(
         &catalog_service_snapshot,
         state.connector_control().as_ref(),
         connector_context.clone(),
-        crate::sql::catalog::TableLookupMode::SchemaOnly,
+        novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
         state.catalog_application().map(Arc::as_ref),
     );
     let table_bindings = analyzer_provider.query_table_bindings();
-    let statistics =
-        crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-            state,
-            Arc::clone(&table_bindings),
-        );
-    let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
+    let catalog_snapshot =
+        novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| "CTAS requires a frozen non-empty backend topology".to_string())?;
-    let request = crate::sql::compiler::SqlCompileRequest::new(
-        crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query)),
-        crate::sql::compiler::SqlCompileIntent::IcebergWrite {
-            root_distribution: crate::sql::compiler::RootDistributionRequirement::Any,
+    let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
+        novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
+        novarocks_sql::compiler::SqlCompileIntent::IcebergWrite {
+            root_distribution: novarocks_sql::compiler::RootDistributionRequirement::Any,
         },
-        crate::sql::compiler::SqlSessionContext {
+        novarocks_sql::compiler::SqlSessionContext {
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
             optimizer_settings: execution.optimizer_settings().clone(),
         },
-        crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
-        &statistics,
-        crate::sql::functions::builtin_sql_function_catalog(),
+        novarocks_sql::compiler::builtin_sql_function_catalog(),
         None,
-        crate::sql::compiler::SqlCompileControl::new(
+        novarocks_sql::compiler::SqlCompileControl::new(
             execution.deadline(),
             crate::query_execution::planning::sql_cancellation_observation(
                 execution.cancellation().clone(),
             ),
         ),
     );
-    let crate::sql::compiler::SqlCompileOutput::Optimized(compiled) =
-        crate::sql::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
-    else {
-        return Err("CTAS source did not produce optimized SQL facts".to_string());
-    };
+    let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
+        .map_err(|error| error.to_string())?
+        .into_pending()
+        .map_err(|error| error.to_string())?;
+    let statistics =
+        crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+            state,
+            Arc::clone(&table_bindings),
+            connector_context,
+        )?;
+    let source = novarocks_sql::planning::dml::compile_ctas_source(
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics),
+    )?;
     Ok(PlannedCtasSourceQuery {
-        output_columns: compiled.optimized_tree.output_columns.clone(),
-        optimized_tree: compiled.optimized_tree,
+        source,
         table_bindings,
         optimizer_settings: execution.optimizer_settings().clone(),
         connector_target_parallelism: backend_count,
@@ -455,15 +456,9 @@ fn prepare_planned_ctas_connector_write(
     ),
     String,
 > {
-    let physical =
-        crate::sql::planner::optimizer_bridge::to_physical_plan(&planned.optimized_tree)?;
-    let distributed = crate::sql::planner::pipeline::build_connector_write_distributed_plan(
-        physical,
-        crate::sql::planner::distributed::write::sink::ConnectorWritePlanInput {
-            target_schema: input_schema,
-            input: crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
-            root_output_exprs: None,
-        },
+    let distributed = novarocks_sql::planning::dml::build_ctas_connector_write_distributed_plan(
+        &planned.source,
+        input_schema,
         &planned.optimizer_settings,
     )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
@@ -1233,17 +1228,6 @@ fn sha256(parts: &[&[u8]]) -> [u8; 32] {
     digest.finalize().into()
 }
 
-fn optimized_capture_fingerprint(node: &crate::sql::optimizer::OptimizedOperatorNode) -> [u8; 32] {
-    // This is a versioned capture fingerprint of the exact in-memory optimized
-    // artifact, not a cross-release canonical serialization or replay format.
-    // The complete Debug payload is intentional here: it includes every
-    // operator field, scalar-arena node and execution property retained by the
-    // optimizer. Hashing only variant/tree shape would allow different
-    // predicates, join keys or distributions to share a CTAS plan identity.
-    let material = format!("{node:#?}");
-    sha256(&[b"novarocks.ctas-optimized-capture.v1", material.as_bytes()])
-}
-
 fn write_staging_evidence(
     session: &crate::query_execution::write_operation::ConnectorWriteOperationSession,
 ) -> ExternalMutationEvidence {
@@ -1306,9 +1290,9 @@ fn write_commit_unknown(
 
 impl CtasEngine for DmlExecutionKernel {
     fn classify_ctas(&self, sql: &str) -> Result<Option<CtasCommand>, String> {
-        use crate::sql::parser::ast::CreateTableKind;
-        use crate::sql::parser::dialect::{
-            StarRocksDialect, create_table::parse_create_table_statement, looks_like_create_table,
+        use novarocks_sql::syntax::{
+            CreateTableKind, StarRocksDialect, looks_like_create_table,
+            parse_create_table_statement,
         };
         use sqlparser::keywords::Keyword;
         use sqlparser::tokenizer::Token;
@@ -1381,7 +1365,7 @@ impl CtasEngine for DmlExecutionKernel {
     ) -> Result<CtasTargetPreflightOutcome, CtasFailure> {
         let target = crate::catalog_application::resolver::resolve_table_target(
             self,
-            &crate::sql::parser::ast::ObjectName {
+            &novarocks_sql::syntax::ObjectName {
                 parts: command.target_parts.clone(),
             },
             current_catalog,
@@ -1448,7 +1432,7 @@ impl CtasEngine for DmlExecutionKernel {
         let preflight = downcast_preflight(preflight)?;
         let target = crate::catalog_application::resolver::resolve_table_target(
             self,
-            &crate::sql::parser::ast::ObjectName {
+            &novarocks_sql::syntax::ObjectName {
                 parts: request.command.target_parts.clone(),
             },
             request.current_catalog.as_deref(),
@@ -1461,7 +1445,7 @@ impl CtasEngine for DmlExecutionKernel {
                 message: "CTAS source target does not match its exact preflight".to_string(),
             });
         }
-        let dialect = crate::sql::parser::dialect::StarRocksDialect;
+        let dialect = novarocks_sql::syntax::StarRocksDialect;
         let mut parser = sqlparser::parser::Parser::new(&dialect)
             .try_with_sql(&request.command.source_sql)
             .map_err(|error| internal_failure(error.to_string()))?;
@@ -1482,15 +1466,15 @@ impl CtasEngine for DmlExecutionKernel {
             &connector_context,
         )
         .map_err(internal_failure)?;
-        if planned.output_columns.is_empty() {
+        let source_columns = planned.source.output_columns();
+        if source_columns.is_empty() {
             return Err(CtasFailure {
                 kind: CtasFailureKind::InvalidRequest,
                 message: "CTAS source has no output columns".to_string(),
             });
         }
         let output_schema = Arc::new(arrow::datatypes::Schema::new(
-            planned
-                .output_columns
+            source_columns
                 .iter()
                 .map(|column| {
                     arrow::datatypes::Field::new(
@@ -1512,8 +1496,11 @@ impl CtasEngine for DmlExecutionKernel {
             .collect::<Result<Vec<_>, _>>()
             .map_err(internal_failure)?;
         let schema_text = format!("{output_schema:?}");
-        let optimized_fingerprint = optimized_capture_fingerprint(&planned.optimized_tree);
-        let settings_material = planned.optimizer_settings.stable_digest_material();
+        let optimized_fingerprint = planned.source.capture_fingerprint();
+        let settings_material =
+            novarocks_sql::planning::dml::optimizer_settings_stable_digest_material(
+                &planned.optimizer_settings,
+            );
         let binding_material = planned.table_bindings.stable_digest_material();
         let execution_nonce = uuid::Uuid::now_v7();
         let execution_identity =
@@ -2187,9 +2174,9 @@ mod tests {
     use crate::query_execution::backend::BackendTopologySnapshot;
     use crate::query_execution::backend::LiveBackendTarget;
     use crate::query_execution::cancellation::QueryCancellationSource;
-    use crate::sql::optimizer::options::SessionOptimizerSettings;
     use bytes::Bytes;
     use novarocks_spi::connector::*;
+    use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::ClusterRole;
 
     struct NeverCancelled;
@@ -2270,7 +2257,7 @@ mod tests {
     }
 
     fn planned_source(sql: &str) -> PlannedCtasSourceQuery {
-        let dialect = crate::sql::parser::dialect::StarRocksDialect;
+        let dialect = novarocks_sql::syntax::StarRocksDialect;
         let query = sqlparser::parser::Parser::new(&dialect)
             .try_with_sql(sql)
             .expect("parser init")
@@ -2334,47 +2321,13 @@ mod tests {
         assert!(command.is_none());
     }
 
-    fn same_operator_shape(
-        left: &crate::sql::optimizer::OptimizedOperatorNode,
-        right: &crate::sql::optimizer::OptimizedOperatorNode,
-    ) -> bool {
-        std::mem::discriminant(&left.op) == std::mem::discriminant(&right.op)
-            && left.children.len() == right.children.len()
-            && left
-                .children
-                .iter()
-                .zip(&right.children)
-                .all(|(left, right)| same_operator_shape(left, right))
-    }
-
-    fn set_first_join_distribution(
-        node: &mut crate::sql::optimizer::OptimizedOperatorNode,
-        distribution: crate::sql::optimizer::optimized_tree::JoinExecutionDistribution,
-    ) -> bool {
-        if matches!(
-            node.op,
-            crate::sql::optimizer::Operator::PhysicalHashJoin(_)
-                | crate::sql::optimizer::Operator::PhysicalNestLoopJoin(_)
-        ) {
-            node.execution_props.join_distribution = Some(distribution);
-            return true;
-        }
-        node.children
-            .iter_mut()
-            .any(|child| set_first_join_distribution(child, distribution))
-    }
-
     #[test]
-    fn optimized_capture_fingerprint_distinguishes_same_shape_predicates_and_join_keys() {
+    fn opaque_ctas_source_fingerprint_distinguishes_predicates_and_join_keys() {
         let predicate_left = planned_source("SELECT x FROM (VALUES (1), (2)) AS v(x) WHERE x > 0");
         let predicate_right = planned_source("SELECT x FROM (VALUES (1), (2)) AS v(x) WHERE x > 1");
-        assert!(same_operator_shape(
-            &predicate_left.optimized_tree,
-            &predicate_right.optimized_tree
-        ));
         assert_ne!(
-            optimized_capture_fingerprint(&predicate_left.optimized_tree),
-            optimized_capture_fingerprint(&predicate_right.optimized_tree),
+            predicate_left.source.capture_fingerprint(),
+            predicate_right.source.capture_fingerprint(),
             "same-shape predicates must not share a CTAS plan fingerprint"
         );
 
@@ -2384,39 +2337,10 @@ mod tests {
         let join_right = planned_source(
             "SELECT a.x FROM (VALUES (1, 2)) AS a(x, y) JOIN (VALUES (1, 2)) AS b(x, y) ON a.y = b.y",
         );
-        assert!(same_operator_shape(
-            &join_left.optimized_tree,
-            &join_right.optimized_tree
-        ));
         assert_ne!(
-            optimized_capture_fingerprint(&join_left.optimized_tree),
-            optimized_capture_fingerprint(&join_right.optimized_tree),
+            join_left.source.capture_fingerprint(),
+            join_right.source.capture_fingerprint(),
             "same-shape join keys must not share a CTAS plan fingerprint"
-        );
-    }
-
-    #[test]
-    fn optimized_capture_fingerprint_includes_join_distribution() {
-        use crate::sql::optimizer::optimized_tree::JoinExecutionDistribution;
-
-        let planned = planned_source(
-            "SELECT a.x FROM (VALUES (1)) AS a(x) JOIN (VALUES (1)) AS b(x) ON a.x = b.x",
-        );
-        let mut broadcast = planned.optimized_tree.clone();
-        let mut partitioned = planned.optimized_tree;
-        assert!(set_first_join_distribution(
-            &mut broadcast,
-            JoinExecutionDistribution::Broadcast
-        ));
-        assert!(set_first_join_distribution(
-            &mut partitioned,
-            JoinExecutionDistribution::Partitioned
-        ));
-        assert!(same_operator_shape(&broadcast, &partitioned));
-        assert_ne!(
-            optimized_capture_fingerprint(&broadcast),
-            optimized_capture_fingerprint(&partitioned),
-            "join distribution must participate in the CTAS plan fingerprint"
         );
     }
 

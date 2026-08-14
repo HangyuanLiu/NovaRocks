@@ -41,7 +41,7 @@ impl ViewCommandExecutor {
         current_database: &str,
         connector_context: &ConnectorRequestContext,
     ) -> Result<Option<StatementResult>, String> {
-        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
         self.kernel
             .view_service()
             .try_handle_statement(

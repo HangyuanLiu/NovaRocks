@@ -16,8 +16,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::sql::optimizer::stats_input::{BaseTableStatistics, StatsMissingReason};
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ScanSourceIdentity {
     IcebergTable {
@@ -54,11 +52,22 @@ pub(crate) enum StatsProviderError {
     Metadata(String),
 }
 
+/// Provider-side failure classification retained before SQL projects a
+/// request-local statistics fact.  The SQL optimizer's internal missing-reason
+/// representation is intentionally not part of the connector boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StatsProviderMissingReason {
+    ConnectorUnsupported(String),
+    CatalogLoadError(String),
+}
+
 impl StatsProviderError {
-    pub(crate) fn into_missing_reason(self) -> StatsMissingReason {
+    pub(crate) fn into_missing_reason(self) -> StatsProviderMissingReason {
         match self {
-            Self::Unsupported(reason) => StatsMissingReason::ConnectorUnsupported(reason),
-            Self::Catalog(err) | Self::Metadata(err) => StatsMissingReason::CatalogLoadError(err),
+            Self::Unsupported(reason) => StatsProviderMissingReason::ConnectorUnsupported(reason),
+            Self::Catalog(err) | Self::Metadata(err) => {
+                StatsProviderMissingReason::CatalogLoadError(err)
+            }
         }
     }
 }
@@ -66,21 +75,20 @@ impl StatsProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::optimizer::stats_input::StatsMissingReason;
 
     #[test]
     fn provider_error_converts_to_missing_reason() {
         assert_eq!(
             StatsProviderError::Unsupported("jdbc".to_string()).into_missing_reason(),
-            StatsMissingReason::ConnectorUnsupported("jdbc".to_string())
+            StatsProviderMissingReason::ConnectorUnsupported("jdbc".to_string())
         );
         assert_eq!(
             StatsProviderError::Catalog("missing catalog".to_string()).into_missing_reason(),
-            StatsMissingReason::CatalogLoadError("missing catalog".to_string())
+            StatsProviderMissingReason::CatalogLoadError("missing catalog".to_string())
         );
         assert_eq!(
             StatsProviderError::Metadata("bad metadata".to_string()).into_missing_reason(),
-            StatsMissingReason::CatalogLoadError("bad metadata".to_string())
+            StatsProviderMissingReason::CatalogLoadError("bad metadata".to_string())
         );
     }
 }

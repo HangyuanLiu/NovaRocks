@@ -34,9 +34,10 @@ use crate::protocol::native::encode::NativeFragmentBundle;
 use crate::query_execution::compiler::NativeFragmentEncodingInput;
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::runtime::query_result::QueryResult;
-use crate::sql::mv_refresh::{MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget};
-use crate::sql::parser::ast::{
-    CreateMaterializedViewStmt, IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy, Statement,
+use novarocks_sql::planning::mv::{MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget};
+use novarocks_sql::syntax::{
+    CreateMaterializedViewStmt, IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy,
+    MvAdmittedStatement,
 };
 
 pub(crate) use refresh_artifact::{
@@ -394,12 +395,12 @@ pub enum MvApplicationStatement {
     Unhandled,
 }
 
-pub(crate) fn project_statement(statement: &Statement) -> MvApplicationStatement {
+pub(crate) fn project_statement(statement: &MvAdmittedStatement) -> MvApplicationStatement {
     match statement {
-        Statement::CreateMaterializedView(statement) => {
+        MvAdmittedStatement::Create(statement) => {
             MvApplicationStatement::Create(MvCreateStatement::from(statement))
         }
-        Statement::RefreshMaterializedView(statement) => {
+        MvAdmittedStatement::Refresh(statement) => {
             MvApplicationStatement::Refresh(MvRefreshStatement::from(statement))
         }
         _ => MvApplicationStatement::Unhandled,

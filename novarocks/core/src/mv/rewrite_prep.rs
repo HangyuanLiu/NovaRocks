@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use crate::mv::repository::MvRepository;
 use crate::mv::storage_observation::MvStorageObservationPort;
-use crate::sql::compiler::mv_rewrite::{
-    MvRewriteBaseTableState, MvRewriteDefinition, MvRewriteDefinitionIndex,
+use novarocks_sql::compiler::{
+    MvRewriteDefinitionIndex, SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts,
 };
 
 /// Freeze rewrite candidates through the explicit MV kernel.  The frozen
@@ -41,7 +41,7 @@ pub(crate) fn freeze_mv_rewrite_definition_index_with_kernel(
     )
 }
 
-pub(crate) fn freeze_mv_rewrite_definition_index_with_ports(
+pub fn freeze_mv_rewrite_definition_index_with_ports(
     repository: &dyn MvRepository,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
@@ -50,49 +50,49 @@ pub(crate) fn freeze_mv_rewrite_definition_index_with_ports(
         .list_definitions()
         .map_err(|error| format!("list mv definitions: {error}"))?;
 
-    Ok(MvRewriteDefinitionIndex::new(
+    MvRewriteDefinitionIndex::try_new(
         definitions
             .into_iter()
             .map(|definition| {
                 freeze_mv_rewrite_definition(connector_control, storage_observation, definition)
             })
-            .collect(),
-    ))
+            .collect::<Result<Vec<_>, _>>()?,
+    )
 }
 
 fn freeze_mv_rewrite_definition(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
     definition: crate::mv::persistence::definition::StoredMvDefinition,
-) -> MvRewriteDefinition {
+) -> Result<SqlMvRewriteDefinitionFacts, String> {
     let mut base_table_states = std::collections::BTreeMap::new();
     if definition.storage_engine == "iceberg" {
         for fqn in &definition.base_table_refs {
             let state = freeze_base_table_state(connector_control, storage_observation, fqn)
-                .unwrap_or_else(MvRewriteBaseTableState::Unavailable);
+                .unwrap_or_else(SqlMvRewriteBaseTableFacts::unavailable);
             base_table_states.insert(fqn.clone(), state);
         }
     }
 
-    MvRewriteDefinition {
-        mv_id: definition.mv_id,
-        select_sql: definition.select_sql,
-        base_table_refs: definition.base_table_refs,
-        storage_engine: definition.storage_engine,
-        target_catalog: definition.target_catalog,
-        target_namespace: definition.target_namespace,
-        target_table: definition.target_table,
-        last_refresh_snapshots: definition.last_refresh_snapshots,
-        last_refresh_table_uuids: definition.last_refresh_table_uuids,
+    SqlMvRewriteDefinitionFacts::try_new(
+        definition.mv_id,
+        definition.select_sql,
+        definition.base_table_refs,
+        definition.storage_engine,
+        definition.target_catalog,
+        definition.target_namespace,
+        definition.target_table,
+        definition.last_refresh_snapshots,
+        definition.last_refresh_table_uuids,
         base_table_states,
-    }
+    )
 }
 
 fn freeze_base_table_state(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
     fqn: &str,
-) -> Result<MvRewriteBaseTableState, String> {
+) -> Result<SqlMvRewriteBaseTableFacts, String> {
     let table_ref = crate::mv::refresh_io::parse_iceberg_table_refs(&[fqn.to_string()])?
         .into_iter()
         .next()
@@ -119,8 +119,8 @@ fn freeze_base_table_state(
         &table_ref.namespace,
         &table_ref.table,
     )?;
-    Ok(MvRewriteBaseTableState::Resolved {
-        snapshot_id: reference_facts.current_snapshot_id(),
-        table_uuid: Some(schema_observation.table_uuid().to_string()),
-    })
+    Ok(SqlMvRewriteBaseTableFacts::resolved(
+        reference_facts.current_snapshot_id(),
+        Some(schema_observation.table_uuid().to_string()),
+    ))
 }

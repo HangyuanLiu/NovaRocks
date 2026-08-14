@@ -17,16 +17,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::sql::planner::distributed::{
-    BoundaryContract, BoundaryKind, FragmentEdgeKind, FragmentId,
-};
+use novarocks_sql::plan_read::{BoundaryContract, BoundaryKind, FragmentEdgeKind, FragmentId};
 
 type BoundaryKey = (FragmentId, Option<i32>, BoundaryKind);
 
 pub(super) fn validate_and_group_boundary_contracts(
     result_fragment_id: Option<FragmentId>,
     write_contract_fragment_ids: &BTreeSet<FragmentId>,
-    edges: &[crate::sql::planner::distributed::FragmentEdge],
+    edges: &[novarocks_sql::plan_read::FragmentEdge],
     contracts: &[BoundaryContract],
     sealed_ids: &BTreeSet<FragmentId>,
 ) -> Result<BTreeMap<FragmentId, Vec<BoundaryContract>>, String> {
@@ -141,14 +139,16 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::validate_and_group_boundary_contracts;
-    use crate::sql::planner::distributed::{BoundaryContract, FragmentId};
+    use novarocks_sql::plan_read::{BoundaryContract, FragmentId};
 
     fn validate_contracts(
-        plan: &crate::sql::planner::distributed::DistributedPlan,
+        plan: &novarocks_sql::plan_read::DistributedPlan,
         contracts: &[BoundaryContract],
     ) -> Result<BTreeMap<FragmentId, Vec<BoundaryContract>>, String> {
+        let facts =
+            novarocks_sql::planning::query_execution::project_execution_preparation_facts(plan);
         validate_and_group_boundary_contracts(
-            plan.topology().result_fragment_id(),
+            facts.result_fragment_id(),
             &BTreeSet::new(),
             plan.edges(),
             contracts,
@@ -163,7 +163,9 @@ mod tests {
     #[test]
     fn malformed_boundary_groups_and_occurrences_use_production_validation() {
         let plan = super::super::test_support::result_plan();
-        let valid = plan.boundaries().contracts();
+        let facts =
+            novarocks_sql::planning::query_execution::project_execution_preparation_facts(&plan);
+        let valid = facts.boundary_contracts();
         validate_contracts(&plan, valid).expect("sealed boundary catalog");
 
         let missing = validate_contracts(&plan, &[]).expect_err("missing group must fail");

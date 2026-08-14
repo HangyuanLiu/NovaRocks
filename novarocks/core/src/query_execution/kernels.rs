@@ -265,7 +265,7 @@ impl CatalogCommandKernel {
         &self.mv_storage_observation
     }
 
-    pub(crate) fn view_service(&self) -> &Arc<dyn ViewService> {
+    pub fn view_service(&self) -> &Arc<dyn ViewService> {
         &self.view_service
     }
 }
@@ -442,7 +442,7 @@ impl ViewExecutionKernel {
         &self.connector_control
     }
 
-    pub(crate) fn view_service(&self) -> &Arc<dyn ViewService> {
+    pub fn view_service(&self) -> &Arc<dyn ViewService> {
         &self.view_service
     }
 }
@@ -627,7 +627,7 @@ impl PreparedCommand {
 /// Pure statement-family classifier.  It performs no catalog lookup, config
 /// read, topology snapshot, or recovery action.
 pub(crate) fn classify_command(sql: &str) -> Result<PreparedCommand, String> {
-    let normalized_sql = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let normalized_sql = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
     let upper = normalized_sql.trim_start().to_ascii_uppercase();
     let domain = if is_query_prefix(&upper) {
         CommandDomain::Query

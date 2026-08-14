@@ -11,6 +11,7 @@
 //! `sql/**`.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use novarocks_spi::connector::{
     ConnectorCommittedPartitioning, ConnectorCommittedVersion, ConnectorExecutionBindingKey,
@@ -18,10 +19,8 @@ use novarocks_spi::connector::{
     ConnectorWriteOperationId, ConnectorWriteReceipt,
 };
 
-use crate::sql::mv_refresh::first_refresh::{
-    MvFirstRefreshPhysicalSql, MvFirstRefreshShape, MvFirstRefreshTargetContract, SqlMvSnapshotPin,
-};
-use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
+use novarocks_sql::planning::mv::MV_JOIN_APPLY_KEY_COLUMN_NAME;
+use novarocks_sql::planning::mv::first_refresh::{SqlMvFirstRefreshArtifact, SqlMvSnapshotPin};
 
 /// The application commit semantics selected after first-refresh SQL planning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -320,12 +319,12 @@ impl MvFirstRefreshLogicalArtifact {
     }
 
     pub(crate) const fn root_hash_column(&self) -> &str {
-        JOIN_APPLY_KEY_COLUMN_NAME
+        MV_JOIN_APPLY_KEY_COLUMN_NAME
     }
 }
 
 pub(crate) enum MvFirstRefreshExecutionArtifact {
-    Sql(MvFirstRefreshPhysicalSql),
+    Sql(SqlMvFirstRefreshArtifact),
     Logical(MvFirstRefreshLogicalArtifact),
 }
 
@@ -341,8 +340,6 @@ impl MvFirstRefreshExecutionArtifact {
 /// Application handoff before a first-refresh writer is admitted.
 #[derive(Clone)]
 pub(crate) struct MvFirstRefreshWriteRequest {
-    canonical_select_sql: String,
-    shape: MvFirstRefreshShape,
     target_catalog: String,
     target_namespace: String,
     target_name: String,
@@ -351,7 +348,7 @@ pub(crate) struct MvFirstRefreshWriteRequest {
     current_database: String,
     expected_target_snapshot_id: Option<i64>,
     target_table: ConnectorTableHandle,
-    target_contract: MvFirstRefreshTargetContract,
+    write_input_fields: Arc<[arrow::datatypes::Field]>,
     observed_binding: ConnectorExecutionBindingKey,
     operation_id: ConnectorWriteOperationId,
 }
@@ -359,8 +356,6 @@ pub(crate) struct MvFirstRefreshWriteRequest {
 impl MvFirstRefreshWriteRequest {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
-        canonical_select_sql: String,
-        shape: MvFirstRefreshShape,
         target_catalog: String,
         target_namespace: String,
         target_name: String,
@@ -369,23 +364,21 @@ impl MvFirstRefreshWriteRequest {
         current_database: String,
         expected_target_snapshot_id: Option<i64>,
         target_table: ConnectorTableHandle,
-        target_contract: MvFirstRefreshTargetContract,
+        write_input_fields: Arc<[arrow::datatypes::Field]>,
         observed_binding: ConnectorExecutionBindingKey,
         operation_id: ConnectorWriteOperationId,
     ) -> Result<Self, String> {
-        if canonical_select_sql.trim().is_empty()
-            || target_catalog.is_empty()
+        if target_catalog.is_empty()
             || target_namespace.is_empty()
             || target_name.is_empty()
             || staging_branch.is_empty()
             || current_database.is_empty()
+            || write_input_fields.is_empty()
             || target_table.owner() != &observed_binding.instance_id
         {
             return Err("invalid MV first-refresh write request identity".to_string());
         }
         Ok(Self {
-            canonical_select_sql,
-            shape,
             target_catalog,
             target_namespace,
             target_name,
@@ -394,18 +387,10 @@ impl MvFirstRefreshWriteRequest {
             current_database,
             expected_target_snapshot_id,
             target_table,
-            target_contract,
+            write_input_fields,
             observed_binding,
             operation_id,
         })
-    }
-
-    pub(crate) fn canonical_select_sql(&self) -> &str {
-        &self.canonical_select_sql
-    }
-
-    pub(crate) const fn shape(&self) -> MvFirstRefreshShape {
-        self.shape
     }
 
     pub(crate) fn target_catalog(&self) -> &str {
@@ -440,8 +425,10 @@ impl MvFirstRefreshWriteRequest {
         &self.target_table
     }
 
-    pub(crate) fn target_contract(&self) -> &MvFirstRefreshTargetContract {
-        &self.target_contract
+    /// Immutable Arrow field facts copied from the validated target before
+    /// write admission. This contains no SQL planner or provider handle.
+    pub(crate) fn write_input_fields(&self) -> &[arrow::datatypes::Field] {
+        &self.write_input_fields
     }
 
     pub(crate) fn observed_binding(&self) -> &ConnectorExecutionBindingKey {
@@ -479,12 +466,8 @@ impl PreparedMvFirstRefreshWrite {
         self.request.target_table()
     }
 
-    pub(crate) fn target_contract(&self) -> &MvFirstRefreshTargetContract {
-        self.request.target_contract()
-    }
-
-    pub(crate) const fn shape(&self) -> MvFirstRefreshShape {
-        self.request.shape()
+    pub(crate) fn write_input_fields(&self) -> &[arrow::datatypes::Field] {
+        self.request.write_input_fields()
     }
 
     pub(crate) fn root_hash_column(&self) -> &str {
@@ -543,13 +526,6 @@ impl PreparedMvFirstRefreshWrite {
     pub(crate) fn into_execution_artifact(self) -> MvFirstRefreshExecutionArtifact {
         self.artifact
     }
-
-    pub(crate) fn physical_sql(&self) -> Option<&str> {
-        match &self.artifact {
-            MvFirstRefreshExecutionArtifact::Sql(sql) => Some(sql.sql()),
-            MvFirstRefreshExecutionArtifact::Logical(_) => None,
-        }
-    }
 }
 
 pub(crate) struct MvFirstRefreshWritePreparer;
@@ -557,12 +533,12 @@ pub(crate) struct MvFirstRefreshWritePreparer;
 impl MvFirstRefreshWritePreparer {
     pub(crate) fn prepare(
         request: MvFirstRefreshWriteRequest,
-        physical_sql: MvFirstRefreshPhysicalSql,
+        artifact: SqlMvFirstRefreshArtifact,
         publication_intent: MvRefreshPublicationIntent,
     ) -> Result<PreparedMvFirstRefreshWrite, String> {
         Self::prepare_artifact(
             request,
-            MvFirstRefreshExecutionArtifact::Sql(physical_sql),
+            MvFirstRefreshExecutionArtifact::Sql(artifact),
             MvStagedRefreshWriteMode::Append,
             publication_intent,
         )
@@ -570,12 +546,12 @@ impl MvFirstRefreshWritePreparer {
 
     pub(crate) fn prepare_full_overwrite(
         request: MvFirstRefreshWriteRequest,
-        physical_sql: MvFirstRefreshPhysicalSql,
+        artifact: SqlMvFirstRefreshArtifact,
         publication_intent: MvRefreshPublicationIntent,
     ) -> Result<PreparedMvFirstRefreshWrite, String> {
         Self::prepare_artifact(
             request,
-            MvFirstRefreshExecutionArtifact::Sql(physical_sql),
+            MvFirstRefreshExecutionArtifact::Sql(artifact),
             MvStagedRefreshWriteMode::FullOverwrite,
             publication_intent,
         )
@@ -609,21 +585,6 @@ impl MvFirstRefreshWritePreparer {
         {
             return Err(
                 "MV first-refresh publication intent does not match write target".to_string(),
-            );
-        }
-        if artifact.root_hash_column() != request.target_contract().hidden_hash_key() {
-            return Err(
-                "MV first-refresh root distribution does not match the target hidden hash key"
-                    .to_string(),
-            );
-        }
-        if matches!(&artifact, MvFirstRefreshExecutionArtifact::Sql(physical_sql)
-            if physical_sql.sql().contains("QueryResult")
-                || physical_sql.sql().contains("RecordBatch")
-                || physical_sql.sql().contains("Chunk"))
-        {
-            return Err(
-                "MV first-refresh SQL artifact contains a frontend row carrier".to_string(),
             );
         }
         let operation_id = request.operation_id();

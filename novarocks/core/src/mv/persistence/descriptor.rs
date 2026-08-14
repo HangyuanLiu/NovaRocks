@@ -16,7 +16,7 @@
 // under the License.
 
 #[cfg(test)]
-use crate::sql::planner::vocabulary::ApplyKeySource;
+use novarocks_sql::planning::mv::ApplyKeySource;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

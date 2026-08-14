@@ -36,7 +36,7 @@ use crate::query_execution::StatementResult;
 use crate::query_execution::compiler::build_iceberg_create_table_ddl;
 use crate::query_execution::kernels::CatalogCommandKernel;
 use crate::runtime::query_result::QueryResultColumn;
-use crate::sql::parser::dialect::{
+use novarocks_sql::syntax::{
     StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
     looks_like_create_table, looks_like_drop_statement,
 };
@@ -65,7 +65,7 @@ impl CatalogCommandExecutor {
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Option<StatementResult>, String> {
-        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
         if let Some((target, source)) =
             crate::query_execution::compiler::parse_create_table_like(&normalized)?
         {
@@ -127,10 +127,7 @@ impl CatalogCommandExecutor {
             .map_err(|error| error.to_string())?;
 
         if looks_like_create_table(&parser) {
-            let statement =
-                crate::sql::parser::dialect::create_table::parse_create_table_statement(
-                    &mut parser,
-                )?;
+            let statement = novarocks_sql::syntax::parse_create_table_statement(&mut parser)?;
             require_statement_end(&mut parser)?;
             return execute_create_table_statement(
                 &self.kernel,
@@ -142,16 +139,13 @@ impl CatalogCommandExecutor {
             .map(Some);
         }
         if looks_like_create_catalog(&parser) {
-            let statement =
-                crate::sql::parser::dialect::create_catalog::parse_create_catalog_statement(
-                    &mut parser,
-                )?;
+            let statement = novarocks_sql::syntax::parse_create_catalog_statement(&mut parser)?;
             require_statement_end(&mut parser)?;
             return self.execute_create_catalog(statement).map(Some);
         }
         if looks_like_create_database(&parser) {
             let (name, if_not_exists) =
-                crate::sql::parser::dialect::parse_create_database_name(&mut parser)?;
+                novarocks_sql::syntax::parse_create_database_name(&mut parser)?;
             require_statement_end(&mut parser)?;
             return execute_create_database_statement(
                 &self.kernel,
@@ -163,17 +157,17 @@ impl CatalogCommandExecutor {
             .map(Some);
         }
         if looks_like_drop_statement(&parser) {
-            let statement = crate::sql::parser::dialect::drop::parse_drop_statement(&mut parser)?;
+            let statement = novarocks_sql::syntax::parse_drop_statement(&mut parser)?;
             require_statement_end(&mut parser)?;
-            use crate::sql::parser::dialect::drop::DropResult;
+            use novarocks_sql::syntax::DropStatement;
             return match statement {
-                DropResult::Catalog(statement) => execute_drop_catalog_statement(
+                DropStatement::Catalog(statement) => execute_drop_catalog_statement(
                     &self.kernel,
                     &statement.name,
                     statement.if_exists,
                 )
                 .map(Some),
-                DropResult::Database(statement) => {
+                DropStatement::Database(statement) => {
                     if current_catalog.is_none() && statement.name.parts.len() == 1 {
                         Err("DROP DATABASE in default_catalog must be routed through the view command capability".to_string())
                     } else {
@@ -188,7 +182,7 @@ impl CatalogCommandExecutor {
                         .map(Some)
                     }
                 }
-                DropResult::Table(statement) => execute_drop_table_statement(
+                DropStatement::Table(statement) => execute_drop_table_statement(
                     &self.kernel,
                     &statement.name,
                     current_catalog,
@@ -205,7 +199,7 @@ impl CatalogCommandExecutor {
 
     fn execute_create_catalog(
         &self,
-        statement: crate::sql::parser::ast::CreateCatalogStmt,
+        statement: novarocks_sql::syntax::CreateCatalogStmt,
     ) -> Result<StatementResult, String> {
         let normalized_catalog = normalize_identifier(&statement.name)?;
         let application = self.kernel.catalog_application().ok_or_else(|| {
@@ -330,7 +324,7 @@ fn execute_alter_iceberg_schema(
             default,
             position,
         } => {
-            let column = crate::sql::parser::ast::TableColumnDef {
+            let column = novarocks_sql::syntax::TableColumnDef {
                 name,
                 data_type,
                 nullable: true,
@@ -408,19 +402,17 @@ fn execute_alter_iceberg_schema(
 
 fn execute_alter_partition_spec(
     kernel: &CatalogCommandKernel,
-    statement: crate::sql::parser::ast::AlterIcebergPartitionSpecStmt,
+    statement: novarocks_sql::syntax::AlterIcebergPartitionSpecStmt,
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let table_name = match &statement {
-        crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
-            table,
-            ..
+        novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+            table, ..
         }
-        | crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
-            table,
-            ..
+        | novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
+            table, ..
         } => table,
     };
     let target = crate::catalog_application::resolver::resolve_table_target(
@@ -443,16 +435,14 @@ fn execute_alter_partition_spec(
     )?;
     let adding = matches!(
         &statement,
-        crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn { .. }
+        novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::AddPartitionColumn { .. }
     );
     let partition_field = match &statement {
-        crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
-            field,
-            ..
+        novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+            field, ..
         }
-        | crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
-            field,
-            ..
+        | novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
+            field, ..
         } => field,
     };
     let transform =
@@ -483,8 +473,8 @@ fn execute_alter_partition_spec(
 
 fn execute_create_table_like(
     kernel: &CatalogCommandKernel,
-    target: crate::sql::parser::ast::ObjectName,
-    source: crate::sql::parser::ast::ObjectName,
+    target: novarocks_sql::syntax::ObjectName,
+    source: novarocks_sql::syntax::ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -508,7 +498,7 @@ fn execute_create_table_like(
         .columns
         .iter()
         .map(|column| {
-            Ok(crate::sql::parser::ast::TableColumnDef {
+            Ok(novarocks_sql::syntax::TableColumnDef {
                 name: column.name.clone(),
                 data_type: crate::query_execution::dml::iceberg_ctas::arrow_data_type_to_sql_type(
                     &column.data_type,
@@ -521,9 +511,9 @@ fn execute_create_table_like(
         .collect::<Result<Vec<_>, String>>()?;
     execute_create_table_statement(
         kernel,
-        crate::sql::parser::ast::CreateTableStmt {
+        novarocks_sql::syntax::CreateTableStmt {
             name: target,
-            kind: crate::sql::parser::ast::CreateTableKind::Iceberg {
+            kind: novarocks_sql::syntax::CreateTableKind::Iceberg {
                 columns,
                 key_desc: None,
                 bucket_count: None,
@@ -642,7 +632,7 @@ mod tests {
         // parser gate must reject it before any kernel port is read.
         let sql = "SELECT 'CREATE TABLE t AS SELECT 1'";
         let normalized =
-            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize query");
+            novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize query");
         assert!(normalized.starts_with("SELECT"));
         let _ = std::any::type_name::<CatalogCommandExecutor>();
     }

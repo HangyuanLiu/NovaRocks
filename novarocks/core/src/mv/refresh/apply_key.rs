@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::sql::planner::vocabulary::{
-    GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
+use novarocks_sql::planning::mv::{
+    MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, MV_HIDDEN_APPLY_KEY_COLUMN_NAME,
+    MV_JOIN_APPLY_KEY_COLUMN_NAME,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,7 +47,7 @@ pub(crate) struct ApplyKeyContract {
 impl ApplyKeyContract {
     pub(crate) fn projection_filter() -> Self {
         Self {
-            column_name: HIDDEN_APPLY_KEY_COLUMN_NAME,
+            column_name: MV_HIDDEN_APPLY_KEY_COLUMN_NAME,
             value_type: ApplyKeyValueType::Int64,
             rewrite_evidence: RewriteEvidence::None,
             allow_full_rebuild_on_policy_full_refresh: true,
@@ -56,7 +57,7 @@ impl ApplyKeyContract {
 
     pub(crate) fn union_projection_filter() -> Self {
         Self {
-            column_name: HIDDEN_APPLY_KEY_COLUMN_NAME,
+            column_name: MV_HIDDEN_APPLY_KEY_COLUMN_NAME,
             value_type: ApplyKeyValueType::BranchInt64,
             rewrite_evidence: RewriteEvidence::None,
             allow_full_rebuild_on_policy_full_refresh: false,
@@ -66,7 +67,7 @@ impl ApplyKeyContract {
 
     pub(crate) fn join_projection_filter() -> Self {
         Self {
-            column_name: JOIN_APPLY_KEY_COLUMN_NAME,
+            column_name: MV_JOIN_APPLY_KEY_COLUMN_NAME,
             value_type: ApplyKeyValueType::Utf8,
             rewrite_evidence: RewriteEvidence::None,
             allow_full_rebuild_on_policy_full_refresh: false,
@@ -76,7 +77,7 @@ impl ApplyKeyContract {
 
     pub(crate) fn aggregate_group_row() -> Self {
         Self {
-            column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+            column_name: MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
             value_type: ApplyKeyValueType::Utf8,
             rewrite_evidence: RewriteEvidence::Aggregate,
             allow_full_rebuild_on_policy_full_refresh: false,
@@ -86,7 +87,7 @@ impl ApplyKeyContract {
 
     pub(crate) fn join_aggregate_group_row() -> Self {
         Self {
-            column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+            column_name: MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
             value_type: ApplyKeyValueType::Utf8,
             rewrite_evidence: RewriteEvidence::JoinAggregate,
             allow_full_rebuild_on_policy_full_refresh: false,
@@ -96,7 +97,7 @@ impl ApplyKeyContract {
 
     pub(crate) fn branch_union_aggregate_group_row() -> Self {
         Self {
-            column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+            column_name: MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
             value_type: ApplyKeyValueType::BranchUtf8,
             rewrite_evidence: RewriteEvidence::Aggregate,
             allow_full_rebuild_on_policy_full_refresh: false,
@@ -114,7 +115,7 @@ mod tests {
         let cases = [
             (
                 ApplyKeyContract::projection_filter(),
-                HIDDEN_APPLY_KEY_COLUMN_NAME,
+                MV_HIDDEN_APPLY_KEY_COLUMN_NAME,
                 ApplyKeyValueType::Int64,
                 RewriteEvidence::None,
                 true,
@@ -122,7 +123,7 @@ mod tests {
             ),
             (
                 ApplyKeyContract::union_projection_filter(),
-                HIDDEN_APPLY_KEY_COLUMN_NAME,
+                MV_HIDDEN_APPLY_KEY_COLUMN_NAME,
                 ApplyKeyValueType::BranchInt64,
                 RewriteEvidence::None,
                 false,
@@ -130,7 +131,7 @@ mod tests {
             ),
             (
                 ApplyKeyContract::join_projection_filter(),
-                JOIN_APPLY_KEY_COLUMN_NAME,
+                MV_JOIN_APPLY_KEY_COLUMN_NAME,
                 ApplyKeyValueType::Utf8,
                 RewriteEvidence::None,
                 false,
@@ -138,7 +139,7 @@ mod tests {
             ),
             (
                 ApplyKeyContract::aggregate_group_row(),
-                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
                 ApplyKeyValueType::Utf8,
                 RewriteEvidence::Aggregate,
                 false,
@@ -146,7 +147,7 @@ mod tests {
             ),
             (
                 ApplyKeyContract::join_aggregate_group_row(),
-                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
                 ApplyKeyValueType::Utf8,
                 RewriteEvidence::JoinAggregate,
                 false,
@@ -154,7 +155,7 @@ mod tests {
             ),
             (
                 ApplyKeyContract::branch_union_aggregate_group_row(),
-                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
                 ApplyKeyValueType::BranchUtf8,
                 RewriteEvidence::Aggregate,
                 false,

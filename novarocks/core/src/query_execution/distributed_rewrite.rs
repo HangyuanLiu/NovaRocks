@@ -34,8 +34,10 @@ use crate::query_execution::outcome::ConnectorWriteCompletion;
 use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use crate::query_execution::preparation::scan::PlannedConnectorRead;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
-use crate::sql::binding::SqlTableBindingId;
-use crate::sql::planner::table::SqlTableIdentity;
+use novarocks_sql::binding::SqlTableBindingId;
+use novarocks_sql::planning::query_execution::{
+    FrozenConnectorScanIdentity, FrozenConnectorScanPlan,
+};
 
 /// Plan one frozen source through the scan-planning capability retained by a
 /// composite rewrite lease.  The plan is opaque to this module: it has no
@@ -83,7 +85,7 @@ pub(crate) fn admit_frozen_rewrite_scan_binding(
 pub(crate) fn frozen_rewrite_scan_physical_plan(
     input_schema: &arrow::datatypes::SchemaRef,
     binding: SqlTableBindingId,
-) -> crate::sql::planner::physical::PhysicalPlanNode {
+) -> FrozenConnectorScanPlan {
     crate::query_execution::frozen_connector_read::frozen_connector_scan_physical_plan(
         &frozen_rewrite_identity(),
         input_schema,
@@ -104,12 +106,12 @@ pub(crate) fn frozen_rewrite_read_resolver(
     FrozenRewriteReadResolver::new(binding, frozen_rewrite_identity(), read)
 }
 
-fn frozen_rewrite_identity() -> SqlTableIdentity {
-    SqlTableIdentity {
-        catalog: "__distributed_rewrite".to_string(),
-        namespace: "__distributed_rewrite".to_string(),
-        table: "__connector_frozen_rewrite".to_string(),
-    }
+fn frozen_rewrite_identity() -> FrozenConnectorScanIdentity {
+    FrozenConnectorScanIdentity::new(
+        "__distributed_rewrite",
+        "__distributed_rewrite",
+        "__connector_frozen_rewrite",
+    )
 }
 
 /// One frozen rewrite operation.  A non-empty plan is sealed into C1 before

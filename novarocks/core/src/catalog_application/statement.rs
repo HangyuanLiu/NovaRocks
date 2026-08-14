@@ -25,8 +25,6 @@ use std::sync::Arc;
 
 use crate::query_execution::StatementResult;
 use crate::query_execution::kernels::CatalogCommandKernel;
-use crate::sql::parser::ast::{CreateTableKind, DefaultLiteral, Literal, ObjectName};
-use crate::sql::parser::dialect::StarRocksDialect;
 use bytes::Bytes;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::identifier::resolve_local_table_name;
@@ -39,11 +37,13 @@ use novarocks_spi::connector::{
     ConnectorPartitionTransform, ConnectorTableIdentity, ConnectorTableKey, ConnectorTableKeyKind,
     ConnectorViewIdentity, ConnectorViewRequest, CreatePolicy, DropPolicy,
 };
+use novarocks_sql::syntax::StarRocksDialect;
+use novarocks_sql::syntax::{CreateTableKind, DefaultLiteral, Literal, ObjectName};
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
-use crate::sql::literal::sqlparser_expr_to_literal;
+use novarocks_sql::syntax::sqlparser_expr_to_literal;
 
 /// Exact dependencies needed by catalog-drop statements.
 ///
@@ -94,7 +94,7 @@ impl CatalogDropContext for CatalogCommandKernel {
 /// - `LIMIT` and `ORDER BY` are rejected.
 pub(crate) fn convert_sqlparser_delete_to_custom(
     delete: &sqlparser::ast::Delete,
-) -> Result<crate::sql::parser::ast::DeleteStmt, String> {
+) -> Result<novarocks_sql::syntax::DeleteStmt, String> {
     use sqlparser::ast as sqlast;
 
     let tables = match &delete.from {
@@ -112,7 +112,7 @@ pub(crate) fn convert_sqlparser_delete_to_custom(
     }
     let table = match &tables[0].relation {
         sqlast::TableFactor::Table { name, .. } => {
-            crate::sql::parser::dialect::convert_object_name(name.clone())?
+            novarocks_sql::syntax::convert_object_name(name.clone())?
         }
         other => {
             return Err(format!(
@@ -134,7 +134,7 @@ pub(crate) fn convert_sqlparser_delete_to_custom(
          INSERT OVERWRITE t SELECT * FROM t WHERE FALSE"
             .to_string()
     })?;
-    Ok(crate::sql::parser::ast::DeleteStmt {
+    Ok(novarocks_sql::syntax::DeleteStmt {
         table,
         where_clause,
     })
@@ -142,8 +142,8 @@ pub(crate) fn convert_sqlparser_delete_to_custom(
 
 pub(crate) fn convert_sqlparser_update_to_custom(
     statement: &sqlparser::ast::Statement,
-) -> Result<crate::sql::parser::ast::UpdateStmt, String> {
-    use crate::sql::parser::ast::{UpdateAssignment, UpdateStmt};
+) -> Result<novarocks_sql::syntax::UpdateStmt, String> {
+    use novarocks_sql::syntax::{UpdateAssignment, UpdateStmt};
     use sqlparser::ast as sqlast;
 
     let sqlast::Statement::Update(update) = statement else {
@@ -205,7 +205,7 @@ pub(crate) fn convert_sqlparser_update_to_custom(
                 "UPDATE target",
             )?;
             (
-                crate::sql::parser::dialect::convert_object_name(name.clone())?,
+                novarocks_sql::syntax::convert_object_name(name.clone())?,
                 update_alias_name(alias, "UPDATE target")?,
             )
         }
@@ -220,7 +220,7 @@ pub(crate) fn convert_sqlparser_update_to_custom(
         let sqlast::AssignmentTarget::ColumnName(column_name) = &assignment.target else {
             return Err("only single-column UPDATE assignments are supported".to_string());
         };
-        let column = crate::sql::parser::dialect::convert_object_name(column_name.clone())?;
+        let column = novarocks_sql::syntax::convert_object_name(column_name.clone())?;
         if column.parts.len() != 1 {
             return Err(format!(
                 "UPDATE assignment must reference an unqualified target column, got `{column_name}`"
@@ -247,8 +247,8 @@ pub(crate) fn convert_sqlparser_update_to_custom(
 
 pub(crate) fn convert_sqlparser_merge_to_custom(
     statement: &sqlparser::ast::Statement,
-) -> Result<crate::sql::parser::ast::MergeStmt, String> {
-    use crate::sql::parser::ast::{
+) -> Result<novarocks_sql::syntax::MergeStmt, String> {
+    use novarocks_sql::syntax::{
         MergeMatchedAction, MergeNotMatchedAction, MergeStmt, MergeWhenClause, MutationSource,
         UpdateAssignment,
     };
@@ -300,7 +300,7 @@ pub(crate) fn convert_sqlparser_merge_to_custom(
                 "MERGE target",
             )?;
             (
-                crate::sql::parser::dialect::convert_object_name(name.clone())?,
+                novarocks_sql::syntax::convert_object_name(name.clone())?,
                 update_alias_name(alias, "MERGE target")?,
             )
         }
@@ -335,7 +335,7 @@ pub(crate) fn convert_sqlparser_merge_to_custom(
                 "MERGE source",
             )?;
             MutationSource::Table {
-                name: crate::sql::parser::dialect::convert_object_name(name.clone())?,
+                name: novarocks_sql::syntax::convert_object_name(name.clone())?,
                 alias: update_alias_name(alias, "MERGE source")?,
             }
         }
@@ -405,9 +405,8 @@ pub(crate) fn convert_sqlparser_merge_to_custom(
                                         .to_string(),
                                 );
                             };
-                            let column = crate::sql::parser::dialect::convert_object_name(
-                                column_name.clone(),
-                            )?;
+                            let column =
+                                novarocks_sql::syntax::convert_object_name(column_name.clone())?;
                             if column.parts.len() != 1 {
                                 return Err(format!(
                                     "MERGE UPDATE assignment must reference an unqualified target column, got `{column_name}`"
@@ -466,7 +465,7 @@ pub(crate) fn convert_sqlparser_merge_to_custom(
                             .iter()
                             .map(|name| {
                                 let parts =
-                                    crate::sql::parser::dialect::convert_object_name(name.clone())?;
+                                    novarocks_sql::syntax::convert_object_name(name.clone())?;
                                 if parts.parts.len() != 1 {
                                     return Err(format!(
                                         "MERGE INSERT column must be unqualified, got `{name}`"
@@ -539,8 +538,8 @@ pub(crate) fn convert_sqlparser_merge_to_custom(
 
 fn convert_update_from_source(
     from: &Option<sqlparser::ast::UpdateTableFromKind>,
-) -> Result<Option<crate::sql::parser::ast::MutationSource>, String> {
-    use crate::sql::parser::ast::MutationSource;
+) -> Result<Option<novarocks_sql::syntax::MutationSource>, String> {
+    use novarocks_sql::syntax::MutationSource;
     use sqlparser::ast as sqlast;
 
     let Some(from) = from else {
@@ -584,7 +583,7 @@ fn convert_update_from_source(
                 "UPDATE ... FROM source",
             )?;
             Ok(Some(MutationSource::Table {
-                name: crate::sql::parser::dialect::convert_object_name(name.clone())?,
+                name: novarocks_sql::syntax::convert_object_name(name.clone())?,
                 alias: update_alias_name(alias, "UPDATE ... FROM source")?,
             }))
         }
@@ -719,7 +718,7 @@ pub(crate) fn execute_create_database_statement(
 
 pub(crate) fn execute_create_table_statement(
     context: &impl CatalogMutationContext,
-    stmt: crate::sql::parser::ast::CreateTableStmt,
+    stmt: novarocks_sql::syntax::CreateTableStmt,
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -764,18 +763,16 @@ pub(crate) fn execute_create_table_statement(
             // error independent of catalog state.
             for partition_field in &partition_fields {
                 let source_column = match partition_field {
-                    crate::sql::parser::ast::IcebergPartitionFieldExpr::Identity { column }
-                    | crate::sql::parser::ast::IcebergPartitionFieldExpr::Year { column }
-                    | crate::sql::parser::ast::IcebergPartitionFieldExpr::Month { column }
-                    | crate::sql::parser::ast::IcebergPartitionFieldExpr::Day { column }
-                    | crate::sql::parser::ast::IcebergPartitionFieldExpr::Hour { column }
-                    | crate::sql::parser::ast::IcebergPartitionFieldExpr::Bucket {
+                    novarocks_sql::syntax::IcebergPartitionFieldExpr::Identity { column }
+                    | novarocks_sql::syntax::IcebergPartitionFieldExpr::Year { column }
+                    | novarocks_sql::syntax::IcebergPartitionFieldExpr::Month { column }
+                    | novarocks_sql::syntax::IcebergPartitionFieldExpr::Day { column }
+                    | novarocks_sql::syntax::IcebergPartitionFieldExpr::Hour { column }
+                    | novarocks_sql::syntax::IcebergPartitionFieldExpr::Bucket { column, .. }
+                    | novarocks_sql::syntax::IcebergPartitionFieldExpr::Truncate {
                         column, ..
                     }
-                    | crate::sql::parser::ast::IcebergPartitionFieldExpr::Truncate {
-                        column, ..
-                    }
-                    | crate::sql::parser::ast::IcebergPartitionFieldExpr::Void { column } => column,
+                    | novarocks_sql::syntax::IcebergPartitionFieldExpr::Void { column } => column,
                 };
                 if let Some(column) = columns
                     .iter()
@@ -841,7 +838,7 @@ fn mutation_instance_id(catalog: &str) -> Result<ConnectorInstanceId, String> {
 }
 
 pub(crate) fn connector_column(
-    column: &crate::sql::parser::ast::TableColumnDef,
+    column: &novarocks_sql::syntax::TableColumnDef,
 ) -> Result<ConnectorColumnDefinition, String> {
     Ok(ConnectorColumnDefinition {
         name: Arc::from(column.name.as_str()),
@@ -919,34 +916,30 @@ fn connector_default(value: &DefaultLiteral) -> Result<ConnectorDefaultValue, St
 }
 
 fn connector_column_aggregation(
-    aggregation: crate::sql::parser::ast::ColumnAggregation,
+    aggregation: novarocks_sql::syntax::ColumnAggregation,
 ) -> ConnectorColumnAggregation {
     match aggregation {
-        crate::sql::parser::ast::ColumnAggregation::Sum => ConnectorColumnAggregation::Sum,
-        crate::sql::parser::ast::ColumnAggregation::Min => ConnectorColumnAggregation::Min,
-        crate::sql::parser::ast::ColumnAggregation::Max => ConnectorColumnAggregation::Max,
-        crate::sql::parser::ast::ColumnAggregation::Replace => ConnectorColumnAggregation::Replace,
-        crate::sql::parser::ast::ColumnAggregation::ReplaceIfNotNull => {
+        novarocks_sql::syntax::ColumnAggregation::Sum => ConnectorColumnAggregation::Sum,
+        novarocks_sql::syntax::ColumnAggregation::Min => ConnectorColumnAggregation::Min,
+        novarocks_sql::syntax::ColumnAggregation::Max => ConnectorColumnAggregation::Max,
+        novarocks_sql::syntax::ColumnAggregation::Replace => ConnectorColumnAggregation::Replace,
+        novarocks_sql::syntax::ColumnAggregation::ReplaceIfNotNull => {
             ConnectorColumnAggregation::ReplaceIfNotNull
         }
-        crate::sql::parser::ast::ColumnAggregation::BitmapUnion => {
+        novarocks_sql::syntax::ColumnAggregation::BitmapUnion => {
             ConnectorColumnAggregation::BitmapUnion
         }
-        crate::sql::parser::ast::ColumnAggregation::HllUnion => {
-            ConnectorColumnAggregation::HllUnion
-        }
+        novarocks_sql::syntax::ColumnAggregation::HllUnion => ConnectorColumnAggregation::HllUnion,
     }
 }
 
-pub(crate) fn connector_table_key(
-    key: &crate::sql::parser::ast::TableKeyDesc,
-) -> ConnectorTableKey {
+pub(crate) fn connector_table_key(key: &novarocks_sql::syntax::TableKeyDesc) -> ConnectorTableKey {
     ConnectorTableKey {
         kind: match key.kind {
-            crate::sql::parser::ast::TableKeyKind::Duplicate => ConnectorTableKeyKind::Duplicate,
-            crate::sql::parser::ast::TableKeyKind::Unique => ConnectorTableKeyKind::Unique,
-            crate::sql::parser::ast::TableKeyKind::Aggregate => ConnectorTableKeyKind::Aggregate,
-            crate::sql::parser::ast::TableKeyKind::Primary => ConnectorTableKeyKind::Primary,
+            novarocks_sql::syntax::TableKeyKind::Duplicate => ConnectorTableKeyKind::Duplicate,
+            novarocks_sql::syntax::TableKeyKind::Unique => ConnectorTableKeyKind::Unique,
+            novarocks_sql::syntax::TableKeyKind::Aggregate => ConnectorTableKeyKind::Aggregate,
+            novarocks_sql::syntax::TableKeyKind::Primary => ConnectorTableKeyKind::Primary,
         },
         columns: key
             .columns
@@ -957,9 +950,9 @@ pub(crate) fn connector_table_key(
 }
 
 pub(crate) fn connector_partition_transform(
-    field: &crate::sql::parser::ast::IcebergPartitionFieldExpr,
+    field: &novarocks_sql::syntax::IcebergPartitionFieldExpr,
 ) -> ConnectorPartitionTransform {
-    use crate::sql::parser::ast::IcebergPartitionFieldExpr;
+    use novarocks_sql::syntax::IcebergPartitionFieldExpr;
     match field {
         IcebergPartitionFieldExpr::Identity { column } => ConnectorPartitionTransform::Identity {
             column: Arc::from(column.as_str()),
@@ -1579,9 +1572,9 @@ pub(crate) fn looks_like_show_create_table(sql: &str) -> bool {
 /// `ObjectName`.  Returns `Err` if parsing fails.
 pub(crate) fn parse_show_create_table(
     sql: &str,
-) -> Result<crate::sql::parser::ast::ObjectName, String> {
+) -> Result<novarocks_sql::syntax::ObjectName, String> {
     use sqlparser::keywords::Keyword;
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
     let mut parser = Parser::new(&StarRocksDialect)
         .try_with_sql(&normalized)
         .map_err(|e| format!("parse SHOW CREATE TABLE: {e}"))?;
@@ -1597,11 +1590,11 @@ pub(crate) fn parse_show_create_table(
     let obj = parser
         .parse_object_name(false)
         .map_err(|e| format!("parse SHOW CREATE TABLE table name: {e}"))?;
-    crate::sql::parser::dialect::convert_object_name(obj)
+    novarocks_sql::syntax::convert_object_name(obj)
 }
 
 pub(crate) fn looks_like_show_alter_table_optimize(sql: &str) -> bool {
-    let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
+    let Ok(normalized) = novarocks_sql::syntax::normalize_for_raw_parse(sql) else {
         return false;
     };
     let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
@@ -1614,7 +1607,7 @@ pub(crate) fn looks_like_show_alter_table_optimize(sql: &str) -> bool {
 }
 
 pub(crate) fn looks_like_alter_iceberg_schema(sql: &str) -> bool {
-    let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
+    let Ok(normalized) = novarocks_sql::syntax::normalize_for_raw_parse(sql) else {
         return false;
     };
     let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
@@ -1637,7 +1630,7 @@ pub(crate) fn looks_like_alter_iceberg_schema(sql: &str) -> bool {
     if parser.parse_keyword(Keyword::RENAME) {
         return parser.parse_keyword(Keyword::COLUMN);
     }
-    if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "MODIFY") {
+    if novarocks_sql::syntax::peek_word_eq(&parser, 0, "MODIFY") {
         parser.next_token();
         return parser.parse_keyword(Keyword::COLUMN);
     }
@@ -1648,7 +1641,7 @@ pub(crate) fn looks_like_alter_iceberg_schema(sql: &str) -> bool {
 }
 
 pub(crate) fn looks_like_alter_iceberg_properties(sql: &str) -> bool {
-    let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
+    let Ok(normalized) = novarocks_sql::syntax::normalize_for_raw_parse(sql) else {
         return false;
     };
     let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
@@ -1661,8 +1654,8 @@ pub(crate) fn looks_like_alter_iceberg_properties(sql: &str) -> bool {
         return false;
     }
     // Use peek_word_eq for both SET and UNSET so no tokens are consumed before the check.
-    if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "SET") {
-        if crate::sql::parser::dialect::peek_word_eq(&parser, 1, "TBLPROPERTIES") {
+    if novarocks_sql::syntax::peek_word_eq(&parser, 0, "SET") {
+        if novarocks_sql::syntax::peek_word_eq(&parser, 1, "TBLPROPERTIES") {
             return true;
         }
         parser.next_token();
@@ -1670,8 +1663,8 @@ pub(crate) fn looks_like_alter_iceberg_properties(sql: &str) -> bool {
             return true;
         }
     }
-    if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "UNSET")
-        && crate::sql::parser::dialect::peek_word_eq(&parser, 1, "TBLPROPERTIES")
+    if novarocks_sql::syntax::peek_word_eq(&parser, 0, "UNSET")
+        && novarocks_sql::syntax::peek_word_eq(&parser, 1, "TBLPROPERTIES")
     {
         return true;
     }
@@ -1685,7 +1678,7 @@ pub(crate) fn looks_like_alter_iceberg_properties(sql: &str) -> bool {
 pub(crate) fn parse_alter_iceberg_properties_sql(
     sql: &str,
 ) -> Result<AlterIcebergPropertiesStmt, String> {
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
     let mut parser = Parser::new(&StarRocksDialect)
         .try_with_sql(&normalized)
         .map_err(|e| format!("parse ALTER TABLE TBLPROPERTIES DDL: {e}"))?;
@@ -1696,12 +1689,12 @@ pub(crate) fn parse_alter_iceberg_properties_sql(
     parser
         .expect_keyword(Keyword::TABLE)
         .map_err(|e| e.to_string())?;
-    let table = crate::sql::parser::dialect::convert_object_name(
+    let table = novarocks_sql::syntax::convert_object_name(
         parser.parse_object_name(false).map_err(|e| e.to_string())?,
     )?;
 
     let op = if parser.parse_keyword(Keyword::SET) {
-        if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "TBLPROPERTIES") {
+        if novarocks_sql::syntax::peek_word_eq(&parser, 0, "TBLPROPERTIES") {
             parser.next_token(); // consume TBLPROPERTIES
         } else if parser.peek_token_ref().token != Token::LParen {
             return Err("expected TBLPROPERTIES or property list after SET".to_string());
@@ -1709,7 +1702,7 @@ pub(crate) fn parse_alter_iceberg_properties_sql(
         let entries = parse_property_entries(&mut parser)?;
         PropertiesOp::Set { entries }
     } else if parser.parse_keyword(Keyword::UNSET) {
-        if !crate::sql::parser::dialect::peek_word_eq(&parser, 0, "TBLPROPERTIES") {
+        if !novarocks_sql::syntax::peek_word_eq(&parser, 0, "TBLPROPERTIES") {
             return Err("expected TBLPROPERTIES after UNSET".to_string());
         }
         parser.next_token(); // consume TBLPROPERTIES
@@ -1821,7 +1814,7 @@ fn parse_column_path(parser: &mut Parser<'_>) -> Result<ColumnPath, String> {
 }
 
 pub(crate) fn parse_alter_iceberg_schema_sql(sql: &str) -> Result<AlterIcebergSchemaStmt, String> {
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
     let mut parser = Parser::new(&StarRocksDialect)
         .try_with_sql(&normalized)
         .map_err(|e| format!("parse ALTER TABLE schema DDL: {e}"))?;
@@ -1832,7 +1825,7 @@ pub(crate) fn parse_alter_iceberg_schema_sql(sql: &str) -> Result<AlterIcebergSc
     parser
         .expect_keyword(Keyword::TABLE)
         .map_err(|e| e.to_string())?;
-    let table = crate::sql::parser::dialect::convert_object_name(
+    let table = novarocks_sql::syntax::convert_object_name(
         parser.parse_object_name(false).map_err(|e| e.to_string())?,
     )?;
 
@@ -1870,18 +1863,17 @@ pub(crate) fn parse_alter_iceberg_schema_sql(sql: &str) -> Result<AlterIcebergSc
             path,
             new_name: new_segments.last().unwrap().clone(),
         }
-    } else if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "MODIFY") {
+    } else if novarocks_sql::syntax::peek_word_eq(&parser, 0, "MODIFY") {
         parser.next_token();
         parser
             .expect_keyword(Keyword::COLUMN)
             .map_err(|e| e.to_string())?;
         let path = parse_column_path(&mut parser)?;
         // Use parse_sql_type_definition so that MAP<K,V>/ARRAY<T> work without normalize.
-        let new_type =
-            crate::sql::parser::dialect::create_table::parse_sql_type_definition(&mut parser)?;
+        let new_type = novarocks_sql::syntax::parse_sql_type_definition(&mut parser)?;
         if parser.parse_keyword(Keyword::FIRST)
             || parser.parse_keyword(Keyword::AFTER)
-            || crate::sql::parser::dialect::peek_word_eq(&parser, 0, "BEFORE")
+            || novarocks_sql::syntax::peek_word_eq(&parser, 0, "BEFORE")
         {
             return Err(
                 "MODIFY COLUMN cannot combine type change with FIRST/AFTER/BEFORE; use a separate ALTER COLUMN statement".to_string(),
@@ -1909,7 +1901,7 @@ pub(crate) fn parse_alter_iceberg_schema_sql(sql: &str) -> Result<AlterIcebergSc
                 path,
                 position: AddPosition::After(last),
             }
-        } else if crate::sql::parser::dialect::peek_word_eq(&parser, 0, "BEFORE") {
+        } else if novarocks_sql::syntax::peek_word_eq(&parser, 0, "BEFORE") {
             parser.next_token();
             let target_path = parse_column_path(&mut parser)?;
             let last = target_path
@@ -1970,7 +1962,7 @@ fn parse_add_column_change(parser: &mut Parser<'_>) -> Result<IcebergSchemaChang
     // Use parse_sql_type_definition (not parser.parse_data_type + convert_sql_type) so that
     // collection types like MAP<K,V> and ARRAY<T> are parsed via native angle-bracket syntax
     // rather than going through normalize_for_raw_parse which only rewrites MAP<> inside CAST.
-    let data_type = crate::sql::parser::dialect::create_table::parse_sql_type_definition(parser)?;
+    let data_type = novarocks_sql::syntax::parse_sql_type_definition(parser)?;
     let mut default: Option<DefaultLiteral> = None;
     let mut seen_null = false;
     let mut seen_default = false;
@@ -1999,11 +1991,9 @@ fn parse_add_column_change(parser: &mut Parser<'_>) -> Result<IcebergSchemaChang
                 default = Some(DefaultLiteral::Null);
                 continue;
             }
-            default = Some(
-                crate::sql::parser::dialect::create_table::parse_default_literal(
-                    parser, &data_type,
-                )?,
-            );
+            default = Some(novarocks_sql::syntax::parse_default_literal(
+                parser, &data_type,
+            )?);
             continue;
         }
         if parser.parse_keyword(Keyword::FIRST) {
@@ -2023,7 +2013,7 @@ fn parse_add_column_change(parser: &mut Parser<'_>) -> Result<IcebergSchemaChang
             position = AddPosition::After(target);
             continue;
         }
-        if crate::sql::parser::dialect::peek_word_eq(parser, 0, "BEFORE") {
+        if novarocks_sql::syntax::peek_word_eq(parser, 0, "BEFORE") {
             if seen_position {
                 return Err("duplicate column position clause in ADD COLUMN".to_string());
             }
@@ -2063,7 +2053,7 @@ pub(crate) fn looks_like_alter_partition_column(sql: &str) -> bool {
 
 pub(crate) fn parse_alter_partition_column_sql(
     sql: &str,
-) -> Result<crate::sql::parser::ast::AlterIcebergPartitionSpecStmt, String> {
+) -> Result<novarocks_sql::syntax::AlterIcebergPartitionSpecStmt, String> {
     let mut parser = Parser::new(&StarRocksDialect)
         .try_with_sql(sql)
         .map_err(|e| format!("parse ALTER TABLE partition column: {e}"))?;
@@ -2074,7 +2064,7 @@ pub(crate) fn parse_alter_partition_column_sql(
         .expect_keyword(Keyword::TABLE)
         .map_err(|e| format!("expected TABLE after ALTER: {e}"))?;
 
-    let mut table = crate::sql::parser::dialect::convert_object_name(
+    let mut table = novarocks_sql::syntax::convert_object_name(
         parser
             .parse_object_name(false)
             .map_err(|e| format!("parse ALTER TABLE name: {e}"))?,
@@ -2097,20 +2087,20 @@ pub(crate) fn parse_alter_partition_column_sql(
         .map_err(|e| format!("expected PARTITION after ADD/DROP: {e}"))?;
     expect_word(&mut parser, "COLUMN")?;
 
-    let field = crate::sql::parser::dialect::create_table::parse_partition_field_expr(&mut parser)?;
+    let field = novarocks_sql::syntax::parse_partition_field_expr(&mut parser)?;
     consume_optional_final_semicolon(&mut parser)?;
     expect_parser_eof(&parser)?;
 
     if is_add {
         Ok(
-            crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+            novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
                 table,
                 field,
             },
         )
     } else {
         Ok(
-            crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
+            novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
                 table,
                 field,
             },
@@ -2202,7 +2192,7 @@ pub(crate) fn parse_add_equality_delete_sql(sql: &str) -> Result<AddEqualityDele
         "INSERT INTO __eq_delete ({}) VALUES {values_part}",
         columns.join(", ")
     );
-    let stmt = crate::sql::parser::parse_normalized_sql_raw(&fake_sql)
+    let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&fake_sql)
         .map_err(|e| format!("parse ADD EQUALITY DELETE VALUES: {e}"))?;
     let insert = match stmt {
         sqlparser::ast::Statement::Insert(insert) => insert,
@@ -2260,11 +2250,11 @@ mod drop_table_if_exists_tests {
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::parser::ast::Literal;
+    use novarocks_sql::syntax::Literal;
 
     #[test]
     fn convert_update_from_table_source() {
-        let stmt = crate::sql::parser::parse_sql_raw(
+        let stmt = novarocks_sql::syntax::parse_sql_raw(
             "update ice.db1.t as t set v = s.v from staging.src as s where t.id = s.id",
         )
         .expect("parse");
@@ -2276,7 +2266,7 @@ mod tests {
         assert_eq!(update.alias.as_deref(), Some("t"));
         assert_eq!(update.assignments.len(), 1);
         assert_eq!(update.assignments[0].column, "v");
-        let Some(crate::sql::parser::ast::MutationSource::Table { name, alias }) = &update.source
+        let Some(novarocks_sql::syntax::MutationSource::Table { name, alias }) = &update.source
         else {
             panic!("expected table source: {:?}", update.source);
         };
@@ -2287,7 +2277,7 @@ mod tests {
 
     #[test]
     fn convert_update_rejects_multi_column_assignment() {
-        let stmt = crate::sql::parser::parse_sql_raw(
+        let stmt = novarocks_sql::syntax::parse_sql_raw(
             "update ice.db1.t set (v1, v2) = (1, 2) where id = 1",
         )
         .expect("parse");
@@ -2297,7 +2287,7 @@ mod tests {
 
     #[test]
     fn convert_update_rejects_target_join() {
-        let stmt = crate::sql::parser::parse_sql_raw(
+        let stmt = novarocks_sql::syntax::parse_sql_raw(
             "update ice.db1.t as t join staging.src as s on t.id = s.id set v = s.v",
         )
         .expect("parse");
@@ -2310,7 +2300,7 @@ mod tests {
 
     #[test]
     fn convert_update_rejects_conflict_clause() {
-        let stmt = crate::sql::parser::parse_sql_raw("update or ignore ice.db1.t set v = 1")
+        let stmt = novarocks_sql::syntax::parse_sql_raw("update or ignore ice.db1.t set v = 1")
             .expect("parse");
         let err = super::convert_sqlparser_update_to_custom(&stmt).expect_err("must fail");
         assert!(
@@ -2321,8 +2311,8 @@ mod tests {
 
     #[test]
     fn convert_update_rejects_target_alias_column_list() {
-        let stmt =
-            crate::sql::parser::parse_sql_raw("update ice.db1.t as t(c) set v = 1").expect("parse");
+        let stmt = novarocks_sql::syntax::parse_sql_raw("update ice.db1.t as t(c) set v = 1")
+            .expect("parse");
         let err = super::convert_sqlparser_update_to_custom(&stmt).expect_err("must fail");
         assert!(
             err.contains("UPDATE target alias column lists are not supported"),
@@ -2332,7 +2322,7 @@ mod tests {
 
     #[test]
     fn convert_update_rejects_source_alias_column_list() {
-        let stmt = crate::sql::parser::parse_sql_raw(
+        let stmt = novarocks_sql::syntax::parse_sql_raw(
             "update ice.db1.t set v = s.v from staging.src as s(id)",
         )
         .expect("parse");
@@ -2536,7 +2526,7 @@ mod tests {
 
     #[test]
     fn parse_alter_partition_column_statement() {
-        use crate::sql::parser::ast::{
+        use novarocks_sql::syntax::{
             AlterIcebergPartitionSpecStmt, IcebergPartitionFieldExpr, ObjectName,
         };
 
@@ -2594,7 +2584,7 @@ mod tests {
 
     #[test]
     fn parse_alter_partition_column_accepts_flexible_whitespace() {
-        use crate::sql::parser::ast::{AlterIcebergPartitionSpecStmt, IcebergPartitionFieldExpr};
+        use novarocks_sql::syntax::{AlterIcebergPartitionSpecStmt, IcebergPartitionFieldExpr};
 
         assert!(super::looks_like_alter_partition_column(
             "ALTER TABLE ice.db.orders\nADD   PARTITION\tCOLUMN bucket(user_id, 32)"
@@ -2607,7 +2597,7 @@ mod tests {
         assert_eq!(
             add,
             AlterIcebergPartitionSpecStmt::AddPartitionColumn {
-                table: crate::sql::parser::ast::ObjectName {
+                table: novarocks_sql::syntax::ObjectName {
                     parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()]
                 },
                 field: IcebergPartitionFieldExpr::Bucket {
@@ -2624,7 +2614,7 @@ mod tests {
         assert_eq!(
             drop,
             AlterIcebergPartitionSpecStmt::DropPartitionColumn {
-                table: crate::sql::parser::ast::ObjectName {
+                table: novarocks_sql::syntax::ObjectName {
                     parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()]
                 },
                 field: IcebergPartitionFieldExpr::Month {

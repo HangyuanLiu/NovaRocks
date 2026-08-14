@@ -230,7 +230,7 @@ pub fn build_frontend_query_session_factory(
         }
     }
 
-    let query_compiler = crate::query::compiler::FrontendQueryCompiler::new(
+    let query_compiler =
         core_capabilities::query_compiler(core_capabilities::QueryCompilerPorts::new(
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
@@ -243,8 +243,7 @@ pub fn build_frontend_query_session_factory(
             system_catalog,
             Arc::clone(&mv_repository),
             Arc::clone(&mv_storage_observation),
-        )),
-    );
+        ));
     let session_catalog_resolver =
         core_capabilities::session_catalog_resolver(core_capabilities::SessionCatalogPorts::new(
             Arc::clone(&catalog_service),

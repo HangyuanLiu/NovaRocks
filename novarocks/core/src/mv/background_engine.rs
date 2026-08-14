@@ -33,8 +33,8 @@ use crate::mv::dependency::model::iceberg_mv_dependency_ref;
 use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::model::{MvStorageEngine, MvTarget};
 use crate::mv::refresh_io::{observe_current_refresh_base_with_ports, parse_iceberg_table_refs};
-use crate::sql::mv_refresh::MvRefreshStatement;
 use novarocks_spi::connector::ConnectorRequestContext;
+use novarocks_sql::planning::mv::MvRefreshStatement;
 
 #[derive(Clone)]
 pub struct StandaloneMvBackgroundEngine {
@@ -132,8 +132,8 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
             name_parts: vec![step.target.name.clone()],
             full: false,
         };
-        let ast_statement = crate::sql::parser::ast::RefreshMaterializedViewStmt {
-            name: crate::sql::parser::ast::ObjectName {
+        let ast_statement = novarocks_sql::syntax::RefreshMaterializedViewStmt {
+            name: novarocks_sql::syntax::ObjectName {
                 parts: vec![step.target.name.clone()],
             },
             full: false,

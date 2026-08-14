@@ -21,9 +21,6 @@
 //! pins, schemas, and derived aggregate layout. Concrete catalogs, tables,
 //! scan binding, and refresh execution state remain in the engine adapter.
 
-#[cfg(test)]
-use crate::sql::planner::vocabulary::ApplyKeySource;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -32,20 +29,24 @@ use arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
 use crate::mv::persistence::definition::StoredMvDefinition;
 use crate::mv::persistence::schema as mv_schema;
 use crate::mv::refresh::pin::RefreshSnapshotPin;
-use crate::sql::binding::SqlTableBindingId;
-use crate::sql::compiler::mv_rewrite::{
-    SqlImvAggregateContract, SqlImvAggregateExecutionLayout, SqlImvAggregateLayout,
-    SqlImvAggregateShape, SqlImvAggregateStateColumn, SqlImvAggregateStateColumnContract,
-    SqlImvAggregateStateRole, SqlImvAggregateStateRoleContract, SqlImvAggregateVisibleColumn,
-    SqlImvBaseContract, SqlImvBaseField, SqlImvBaseSnapshot, SqlImvBranchContract,
-    SqlImvExpressionKind, SqlImvExpressionLineage, SqlImvHiddenApplyKey, SqlImvJoinContract,
-    SqlImvJoinContractKind, SqlImvJoinPredicateLineage, SqlImvOutputColumnLineage,
-    SqlImvPartitionContract, SqlImvPartitionField, SqlImvPartitionTransform,
-    SqlImvQualifiedFieldLineage, SqlImvRewriteSnapshot, SqlImvSchemaContract, SqlImvTargetContract,
-    SqlImvTargetVisibleColumn,
-};
 use mv_schema::MvSchemaContract;
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_sql::binding::SqlTableBindingId;
+use novarocks_sql::compiler::{
+    SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
+    SqlImvAggregateExecutionStateColumnFacts, SqlImvAggregateStateColumnFacts,
+    SqlImvAggregateStateRoleFacts, SqlImvAggregateVisibleColumnFacts, SqlImvApplyKeySourceFacts,
+    SqlImvBaseContractFacts, SqlImvBaseFieldFacts, SqlImvBaseSnapshotFacts,
+    SqlImvBranchContractFacts, SqlImvExpressionFacts, SqlImvExpressionKindFacts,
+    SqlImvJoinContractFacts, SqlImvJoinKindFacts, SqlImvJoinPredicateFacts,
+    SqlImvOutputColumnFacts, SqlImvPartitionFacts, SqlImvPartitionFieldFacts,
+    SqlImvPartitionTransformFacts, SqlImvQualifiedFieldFacts, SqlImvRefreshHistoryFacts,
+    SqlImvRewriteSnapshotBuilder, SqlImvRewriteSnapshotHandle, SqlImvSchemaContractFacts,
+    SqlImvTargetColumnsFacts, SqlImvTargetContractFacts, SqlImvTargetVisibleColumnFacts,
+};
+use novarocks_sql::planning::mv::{
+    SqlMvAggregateCalls as AggregateSqlCalls, extract_aggregate_sql_calls,
+};
 
 /// Read-only metadata that drives Iceberg MV refresh rewrite.
 ///
@@ -315,7 +316,7 @@ impl IcebergMvRewriteContext {
         &self,
     ) -> Result<
         (
-            crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+            AggregateSqlCalls,
             crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
         ),
         String,
@@ -335,10 +336,7 @@ impl IcebergMvRewriteContext {
         } else {
             query.clone()
         };
-        let aggregate_calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
-                &aggregate_query,
-            )
+        let aggregate_calls = extract_aggregate_sql_calls(&aggregate_query)
             .map_err(|e| format!("extract aggregate calls for execution layout: {e}"))?;
 
         let arrow_schema = self.target_arrow_schema.as_ref();
@@ -356,8 +354,8 @@ impl IcebergMvRewriteContext {
                     )
                 })?;
             let arrow_field = arrow_schema.field(field_idx);
-            output_columns.push(crate::sql::analysis::OutputColumn {
-                column_id: crate::sql::column_id::ColumnId::UNSET,
+            output_columns.push(novarocks_sql::plan_read::OutputColumn {
+                column_id: novarocks_sql::plan_read::ColumnId::UNSET,
                 name: visible.output_name.clone(),
                 data_type: arrow_field.data_type().clone(),
                 nullable: visible.nullable,
@@ -383,33 +381,38 @@ impl IcebergMvRewriteContext {
     pub(crate) fn to_sql_rewrite_snapshot(
         &self,
         target_binding: SqlTableBindingId,
-    ) -> Result<Arc<SqlImvRewriteSnapshot>, String> {
-        let schema_contract = Arc::new(sql_schema_contract(self.schema_contract.as_ref())?);
-        let base_snapshots = Arc::from(
-            self.base_refs
-                .iter()
-                .map(|table| {
-                    let snapshot_id = self.pin.get(table).ok_or_else(|| {
-                        format!(
-                            "IMV rewrite snapshot missing pinned snapshot for base {}",
-                            table.fqn()
-                        )
-                    })?;
-                    let table_uuid = self.pin.uuid(table).ok_or_else(|| {
-                        format!(
-                            "IMV rewrite snapshot missing pinned table UUID for base {}",
-                            table.fqn()
-                        )
-                    })?;
-                    Ok(SqlImvBaseSnapshot {
-                        table: table.clone(),
-                        snapshot_id,
-                        table_uuid: table_uuid.to_string(),
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()?,
-        );
-        let target_columns = sql_target_columns(self.target_arrow_schema.as_ref());
+    ) -> Result<SqlImvRewriteSnapshotHandle, String> {
+        let mut builder =
+            SqlImvRewriteSnapshotBuilder::try_new(self.target.clone(), target_binding, self.mv_id)?;
+        for table in self.base_refs.iter() {
+            let snapshot_id = self.pin.get(table).ok_or_else(|| {
+                format!(
+                    "IMV rewrite snapshot missing pinned snapshot for base {}",
+                    table.fqn()
+                )
+            })?;
+            let table_uuid = self.pin.uuid(table).ok_or_else(|| {
+                format!(
+                    "IMV rewrite snapshot missing pinned table UUID for base {}",
+                    table.fqn()
+                )
+            })?;
+            builder.add_base_snapshot(SqlImvBaseSnapshotFacts::try_new(
+                table.clone(),
+                snapshot_id,
+                table_uuid.to_string(),
+            )?)?;
+        }
+        builder.set_target_columns(SqlImvTargetColumnsFacts::try_new(sql_target_columns(
+            self.target_arrow_schema.as_ref(),
+        ))?)?;
+        builder.set_refresh_history(SqlImvRefreshHistoryFacts::try_new(
+            self.previous_snapshot_ids.clone(),
+            self.previous_table_uuids.clone(),
+            self.target_snapshot_id,
+            self.target_table_uuid.clone(),
+        )?)?;
+        builder.set_schema_contract(sql_schema_contract(self.schema_contract.as_ref())?)?;
         let aggregate_execution =
             if self.schema_contract.aggregate.is_some() {
                 let (calls, layout) = self.aggregate_shape_and_layout_for_execution().map_err(|e| {
@@ -418,127 +421,117 @@ impl IcebergMvRewriteContext {
                     self.target.fqn()
                 )
             })?;
-                Some(SqlImvAggregateExecutionLayout {
-                    shape: SqlImvAggregateShape {
-                        group_key_count: calls.group_keys.len(),
-                        visible_outputs: calls.visible_outputs,
-                    },
-                    layout: SqlImvAggregateLayout {
-                        row_id_column_name: layout.row_id_column.column.name.clone(),
-                        visible_columns: layout
-                            .visible_columns
-                            .into_iter()
-                            .map(|column| SqlImvAggregateVisibleColumn {
-                                name: column.name,
-                                data_type: column.data_type,
-                                nullable: column.nullable,
-                            })
-                            .collect(),
-                        state_columns: layout
-                            .state_columns
-                            .into_iter()
-                            .map(|column| {
-                                Ok(SqlImvAggregateStateColumn {
-                                    name: column.name,
-                                    data_type: column.data_type,
-                                    nullable: column.nullable,
-                                    visible_source_index: column.visible_source_index,
-                                    aggregate_index: column.aggregate_index,
-                                    function: column.function,
-                                    state_role: match column.state_role {
-                                        crate::mv::model::AggregateStateRole::Single => {
-                                            SqlImvAggregateStateRole::Single
-                                        }
-                                        crate::mv::model::AggregateStateRole::RetractionCount => {
-                                            SqlImvAggregateStateRole::RetractionCount
-                                        }
-                                    },
-                                    count_star: column.count_star,
-                                })
-                            })
-                            .collect::<Result<Vec<_>, String>>()?,
-                        group_key_source_indexes: layout.group_key_source_indexes,
-                        physical_column_names: layout
-                            .physical_columns
-                            .into_iter()
-                            .map(|column| column.column.name)
-                            .collect(),
-                        aggregate_input_types: layout.aggregate_input_types,
-                    },
-                })
+                Some(SqlImvAggregateExecutionFacts::try_new(
+                    calls.group_keys.len(),
+                    calls.visible_outputs,
+                    layout.row_id_column.column.name.clone(),
+                    layout
+                        .visible_columns
+                        .into_iter()
+                        .map(|column| {
+                            SqlImvAggregateVisibleColumnFacts::try_new(
+                                column.name,
+                                column.data_type,
+                                column.nullable,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, String>>()?,
+                    layout
+                        .state_columns
+                        .into_iter()
+                        .map(|column| {
+                            SqlImvAggregateExecutionStateColumnFacts::try_new(
+                                column.name,
+                                column.data_type,
+                                column.nullable,
+                                column.visible_source_index,
+                                column.aggregate_index,
+                                column.function,
+                                match column.state_role {
+                                    crate::mv::model::AggregateStateRole::Single => {
+                                        SqlImvAggregateStateRoleFacts::Single
+                                    }
+                                    crate::mv::model::AggregateStateRole::RetractionCount => {
+                                        SqlImvAggregateStateRoleFacts::RetractionCount
+                                    }
+                                },
+                                column.count_star,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, String>>()?,
+                    layout.group_key_source_indexes,
+                    layout
+                        .physical_columns
+                        .into_iter()
+                        .map(|column| column.column.name)
+                        .collect(),
+                    layout.aggregate_input_types,
+                )?)
             } else {
                 None
             };
-
-        Ok(Arc::new(SqlImvRewriteSnapshot::from_frozen_parts(
-            self.target.clone(),
-            target_binding,
-            self.mv_id,
-            base_snapshots,
-            self.previous_snapshot_ids.clone(),
-            self.previous_table_uuids.clone(),
-            self.target_snapshot_id,
-            self.target_table_uuid.clone(),
-            target_columns,
-            schema_contract,
-            aggregate_execution,
-        )?))
+        if let Some(aggregate_execution) = aggregate_execution {
+            builder.set_aggregate_execution(aggregate_execution)?;
+        }
+        builder.build()
     }
 }
 
 fn sql_target_columns(
     target_schema: &arrow::datatypes::Schema,
-) -> Arc<[novarocks_catalog::schema::ColumnDef]> {
-    Arc::from(
-        target_schema
-            .fields()
-            .iter()
-            .map(|field| novarocks_catalog::schema::ColumnDef {
-                name: field.name().clone(),
-                data_type: field.data_type().clone(),
-                nullable: field.is_nullable(),
-                write_default: None,
-                logical_type: None,
-            })
-            .collect::<Vec<_>>(),
-    )
+) -> Vec<novarocks_catalog::schema::ColumnDef> {
+    target_schema
+        .fields()
+        .iter()
+        .map(|field| novarocks_catalog::schema::ColumnDef {
+            name: field.name().clone(),
+            data_type: field.data_type().clone(),
+            nullable: field.is_nullable(),
+            write_default: None,
+            logical_type: None,
+        })
+        .collect()
 }
 
-fn sql_schema_contract(contract: &MvSchemaContract) -> Result<SqlImvSchemaContract, String> {
-    fn expression_kind(value: mv_schema::ExpressionKind) -> SqlImvExpressionKind {
+fn sql_schema_contract(contract: &MvSchemaContract) -> Result<SqlImvSchemaContractFacts, String> {
+    fn expression_kind(value: mv_schema::ExpressionKind) -> SqlImvExpressionKindFacts {
         match value {
-            mv_schema::ExpressionKind::Column => SqlImvExpressionKind::Column,
-            mv_schema::ExpressionKind::Cast => SqlImvExpressionKind::Cast,
-            mv_schema::ExpressionKind::Func => SqlImvExpressionKind::Func,
-            mv_schema::ExpressionKind::Literal => SqlImvExpressionKind::Literal,
-            mv_schema::ExpressionKind::Mixed => SqlImvExpressionKind::Mixed,
+            mv_schema::ExpressionKind::Column => SqlImvExpressionKindFacts::Column,
+            mv_schema::ExpressionKind::Cast => SqlImvExpressionKindFacts::Cast,
+            mv_schema::ExpressionKind::Func => SqlImvExpressionKindFacts::Func,
+            mv_schema::ExpressionKind::Literal => SqlImvExpressionKindFacts::Literal,
+            mv_schema::ExpressionKind::Mixed => SqlImvExpressionKindFacts::Mixed,
         }
     }
 
-    fn lineage(value: &mv_schema::QualifiedFieldLineage) -> SqlImvQualifiedFieldLineage {
-        SqlImvQualifiedFieldLineage {
-            table_fqn: value.table_fqn.clone(),
-            qualifier_at_create: value.qualifier_at_create.clone(),
-            field_id: value.field_id,
-        }
+    fn lineage(
+        value: &mv_schema::QualifiedFieldLineage,
+    ) -> Result<SqlImvQualifiedFieldFacts, String> {
+        SqlImvQualifiedFieldFacts::try_new(
+            value.table_fqn.clone(),
+            value.qualifier_at_create.clone(),
+            value.field_id,
+        )
     }
 
-    fn transform(value: &mv_schema::MvPartitionTransformContract) -> SqlImvPartitionTransform {
+    fn transform(value: &mv_schema::MvPartitionTransformContract) -> SqlImvPartitionTransformFacts {
         match value {
-            mv_schema::MvPartitionTransformContract::Identity => SqlImvPartitionTransform::Identity,
-            mv_schema::MvPartitionTransformContract::Year => SqlImvPartitionTransform::Year,
-            mv_schema::MvPartitionTransformContract::Month => SqlImvPartitionTransform::Month,
-            mv_schema::MvPartitionTransformContract::Day => SqlImvPartitionTransform::Day,
-            mv_schema::MvPartitionTransformContract::Hour => SqlImvPartitionTransform::Hour,
+            mv_schema::MvPartitionTransformContract::Identity => {
+                SqlImvPartitionTransformFacts::Identity
+            }
+            mv_schema::MvPartitionTransformContract::Year => SqlImvPartitionTransformFacts::Year,
+            mv_schema::MvPartitionTransformContract::Month => SqlImvPartitionTransformFacts::Month,
+            mv_schema::MvPartitionTransformContract::Day => SqlImvPartitionTransformFacts::Day,
+            mv_schema::MvPartitionTransformContract::Hour => SqlImvPartitionTransformFacts::Hour,
             mv_schema::MvPartitionTransformContract::Bucket { num_buckets } => {
-                SqlImvPartitionTransform::Bucket {
+                SqlImvPartitionTransformFacts::Bucket {
                     num_buckets: *num_buckets,
                 }
             }
             mv_schema::MvPartitionTransformContract::Truncate { width } => {
-                SqlImvPartitionTransform::Truncate { width: *width }
+                SqlImvPartitionTransformFacts::Truncate { width: *width }
             }
-            mv_schema::MvPartitionTransformContract::Void => SqlImvPartitionTransform::Void,
+            mv_schema::MvPartitionTransformContract::Void => SqlImvPartitionTransformFacts::Void,
         }
     }
 
@@ -552,10 +545,10 @@ fn sql_schema_contract(contract: &MvSchemaContract) -> Result<SqlImvSchemaContra
                 .map(|column| {
                     let role = match column.role {
                         mv_schema::AggregateStateRoleContract::Single => {
-                            SqlImvAggregateStateRoleContract::Single
+                            SqlImvAggregateStateRoleFacts::Single
                         }
                         mv_schema::AggregateStateRoleContract::RetractionCount => {
-                            SqlImvAggregateStateRoleContract::RetractionCount
+                            SqlImvAggregateStateRoleFacts::RetractionCount
                         }
                         unsupported => {
                             return Err(format!(
@@ -563,103 +556,125 @@ fn sql_schema_contract(contract: &MvSchemaContract) -> Result<SqlImvSchemaContra
                             ));
                         }
                     };
-                    Ok(SqlImvAggregateStateColumnContract {
-                        column_name: column.column_name.clone(),
-                        type_signature: column.type_signature.clone(),
+                    SqlImvAggregateStateColumnFacts::try_new(
+                        column.column_name.clone(),
+                        column.type_signature.clone(),
                         role,
-                    })
+                    )
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            Ok::<SqlImvAggregateContract, String>(SqlImvAggregateContract {
-                state_layout_version: aggregate.state_layout_version,
-                row_id_column_name: aggregate.row_id_column_name.clone(),
+            SqlImvAggregateContractFacts::try_new(
+                aggregate.state_layout_version,
+                aggregate.row_id_column_name.clone(),
                 state_columns,
-            })
+            )
         })
         .transpose()?;
 
-    Ok(SqlImvSchemaContract {
-        bases: contract
-            .bases
-            .iter()
-            .map(|base| SqlImvBaseContract {
-                table_fqn: base.table_fqn.clone(),
-                alias_at_create: base.alias_at_create.clone(),
-                fields: base
-                    .schema_at_create
+    let bases = base_contracts(contract)
+        .into_iter()
+        .map(|base| {
+            SqlImvBaseContractFacts::try_new(
+                base.table_fqn.clone(),
+                base.alias_at_create.clone(),
+                base.schema_at_create
                     .fields
                     .iter()
-                    .map(|field| SqlImvBaseField {
-                        field_id: field.field_id,
-                        name_at_create: field.name_at_create.clone(),
+                    .map(|field| {
+                        SqlImvBaseFieldFacts::try_new(field.field_id, field.name_at_create.clone())
                     })
-                    .collect(),
-            })
-            .collect(),
-        output_columns: contract
-            .output
-            .columns
-            .iter()
-            .map(|output| SqlImvOutputColumnLineage {
-                expression: SqlImvExpressionLineage {
-                    kind: expression_kind(output.expression.kind),
-                    referenced_base_field_ids: output.expression.referenced_base_field_ids.clone(),
-                    referenced_base_fields: output
+                    .collect::<Result<Vec<_>, String>>()?,
+            )
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let output_columns = contract
+        .output
+        .columns
+        .iter()
+        .map(|output| {
+            Ok(SqlImvOutputColumnFacts::new(
+                SqlImvExpressionFacts::try_new(
+                    expression_kind(output.expression.kind),
+                    output.expression.referenced_base_field_ids.clone(),
+                    output
                         .expression
                         .referenced_base_fields
                         .iter()
                         .map(lineage)
-                        .collect(),
+                        .collect::<Result<Vec<_>, String>>()?,
+                )?,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let join = contract
+        .join
+        .as_ref()
+        .map(|join| {
+            SqlImvJoinContractFacts::try_new(
+                match join.kind {
+                    mv_schema::JoinContractKind::InnerEquiJoin => {
+                        SqlImvJoinKindFacts::InnerEquiJoin
+                    }
                 },
+                join.predicates
+                    .iter()
+                    .map(|predicate| {
+                        SqlImvJoinPredicateFacts::try_new(
+                            lineage(&predicate.left)?,
+                            lineage(&predicate.right)?,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            )
+        })
+        .transpose()?;
+    let branch = contract
+        .branch
+        .as_ref()
+        .map(|branch| {
+            SqlImvBranchContractFacts::try_new(branch.branch_id_column.column_name.clone())
+        })
+        .transpose()?;
+    let target = SqlImvTargetContractFacts::try_new(
+        contract
+            .target
+            .visible_columns
+            .iter()
+            .map(|column| {
+                SqlImvTargetVisibleColumnFacts::try_new(
+                    column.output_name.clone(),
+                    column.target_field_id,
+                )
             })
-            .collect(),
-        join: contract.join.as_ref().map(|join| SqlImvJoinContract {
-            kind: match join.kind {
-                mv_schema::JoinContractKind::InnerEquiJoin => SqlImvJoinContractKind::InnerEquiJoin,
-            },
-            predicates: join
-                .predicates
-                .iter()
-                .map(|predicate| SqlImvJoinPredicateLineage {
-                    left: lineage(&predicate.left),
-                    right: lineage(&predicate.right),
-                })
-                .collect(),
-        }),
-        aggregate,
-        branch: contract.branch.as_ref().map(|branch| SqlImvBranchContract {
-            branch_id_column_name: branch.branch_id_column.column_name.clone(),
-        }),
-        target: SqlImvTargetContract {
-            visible_columns: contract
-                .target
-                .visible_columns
-                .iter()
-                .map(|column| SqlImvTargetVisibleColumn {
-                    output_name: column.output_name.clone(),
-                    target_field_id: column.target_field_id,
-                })
-                .collect(),
-            hidden_apply_key: SqlImvHiddenApplyKey {
-                column_name: contract.target.hidden_apply_key.column_name.clone(),
-                source: contract.target.hidden_apply_key.source,
-            },
-            partition: contract.target.partition.as_ref().map(|partition| {
-                SqlImvPartitionContract {
-                    target_spec_id: partition.target_spec_id,
-                    fields: partition
+            .collect::<Result<Vec<_>, String>>()?,
+        contract.target.hidden_apply_key.column_name.clone(),
+        SqlImvApplyKeySourceFacts::try_from_persisted_label(&format!(
+            "{:?}",
+            contract.target.hidden_apply_key.source
+        ))?,
+        contract
+            .target
+            .partition
+            .as_ref()
+            .map(|partition| {
+                SqlImvPartitionFacts::try_new(
+                    partition.target_spec_id,
+                    partition
                         .fields
                         .iter()
-                        .map(|field| SqlImvPartitionField {
-                            partition_field_name: field.partition_field_name.clone(),
-                            source_target_field_id: field.source_target_field_id,
-                            transform: transform(&field.transform),
+                        .map(|field| {
+                            SqlImvPartitionFieldFacts::try_new(
+                                field.partition_field_name.clone(),
+                                field.source_target_field_id,
+                                transform(&field.transform),
+                            )
                         })
-                        .collect(),
-                }
-            }),
-        },
-    })
+                        .collect::<Result<Vec<_>, String>>()?,
+                )
+            })
+            .transpose()?,
+    )?;
+    SqlImvSchemaContractFacts::try_new(bases, output_columns, join, aggregate, branch, target)
 }
 
 /// Whether `query`'s body is a UNION ALL set operation (possibly nested), used
@@ -696,11 +711,11 @@ pub(crate) fn first_union_branch_query(
 }
 
 fn aggregate_input_types_from_schema_contract(
-    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &AggregateSqlCalls,
     contract: &MvSchemaContract,
 ) -> Result<Vec<Option<DataType>>, String> {
-    use crate::mv::aggregate_state::mv_shape::AggregateInput;
-    use crate::sql::mv_refresh::VisibleAggregateOutput;
+    use novarocks_sql::planning::mv::AggregateInput;
+    use novarocks_sql::planning::mv::VisibleAggregateOutput;
 
     let mut input_types = vec![None; calls.aggregates.len()];
     for (aggregate_index, aggregate) in calls.aggregates.iter().enumerate() {
@@ -735,9 +750,9 @@ fn aggregate_input_types_from_schema_contract(
 }
 
 fn aggregate_input_cast_type(
-    input: &crate::mv::aggregate_state::mv_shape::AggregateInput,
+    input: &novarocks_sql::planning::mv::AggregateInput,
 ) -> Result<Option<DataType>, String> {
-    let crate::mv::aggregate_state::mv_shape::AggregateInput::Expr(expr) = input else {
+    let novarocks_sql::planning::mv::AggregateInput::Expr(expr) = input else {
         return Ok(None);
     };
     explicit_cast_type(expr)
@@ -900,7 +915,6 @@ pub(crate) mod tests_support {
 
     use crate::mv::persistence::definition::StoredMvDefinition;
     use crate::mv::refresh::pin::RefreshSnapshotPin;
-    use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
     use mv_schema::{
         BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
         HiddenApplyKeyContract, JoinContract, JoinContractKind, JoinPredicateLineage,
@@ -908,6 +922,9 @@ pub(crate) mod tests_support {
         TargetContract, TargetVisibleColumn,
     };
     use novarocks_catalog::identifier::TableIdentity;
+    use novarocks_sql::planning::mv::{
+        MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME, SqlMvApplyKeySourceFacts,
+    };
 
     use super::*;
 
@@ -1004,7 +1021,7 @@ pub(crate) mod tests_support {
                 hidden_apply_key: HiddenApplyKeyContract {
                     column_name: "k".to_string(),
                     target_field_id: 100,
-                    source: ApplyKeySource::BaseRowId,
+                    source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
                 },
                 partition: None,
             },
@@ -1112,7 +1129,7 @@ pub(crate) mod tests_support {
         contract.target.visible_columns[1].output_name = "v".to_string();
         contract.target.hidden_apply_key.column_name = JOIN_APPLY_KEY_COLUMN_NAME.to_string();
         contract.target.hidden_apply_key.target_field_id = 999;
-        contract.target.hidden_apply_key.source = ApplyKeySource::JoinRowKey;
+        contract.target.hidden_apply_key.source = SqlMvApplyKeySourceFacts::JoinRowKey.into();
         contract.bases = vec![
             join_base_contract("ice.db.l", "uuid-l", "l"),
             join_base_contract("ice.db.r", "uuid-r", "r"),
@@ -1208,12 +1225,14 @@ mod tests {
     use std::sync::Arc;
 
     use crate::mv::refresh::pin::RefreshSnapshotPin;
-    use crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
     use mv_schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         BranchIdColumnContract, BranchUnionContract,
     };
     use novarocks_catalog::identifier::TableIdentity;
+    use novarocks_sql::planning::mv::SqlMvApplyKeySourceFacts;
+
+    const BRANCH_ID_COLUMN_NAME: &str = "__branch_id__";
 
     use super::tests_support::*;
     use super::*;
@@ -1704,7 +1723,7 @@ mod tests {
                 target_field_id: 4242,
             },
             branch_count: 2,
-            inner_apply_key_source: ApplyKeySource::BaseRowId,
+            inner_apply_key_source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
         });
         let contract = Arc::new(contract);
 
@@ -1750,7 +1769,7 @@ mod tests {
         let mut contract = make_schema_contract();
         contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
         contract.target.hidden_apply_key.target_field_id = 999;
-        contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
+        contract.target.hidden_apply_key.source = SqlMvApplyKeySourceFacts::GroupRowId.into();
         contract.aggregate = Some(AggregateStateContract {
             state_layout_version: 1,
             row_id_column_name: "__row_id__".to_string(),

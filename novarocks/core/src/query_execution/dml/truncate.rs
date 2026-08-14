@@ -36,8 +36,8 @@ use crate::connector::data_mutation::{
 };
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::sql::parser::ast::{ObjectName, Statement};
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_sql::syntax::ObjectName;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TruncateCommand {
@@ -48,25 +48,12 @@ pub struct TruncateCommand {
 /// Recognize and validate the syntax of one `TRUNCATE TABLE` command without
 /// resolving its catalog or performing any connector operation.
 pub fn parse_truncate_command(sql: &str) -> Result<Option<TruncateCommand>, String> {
-    let trimmed = sql.trim_start();
-    let keyword_end = trimmed
-        .char_indices()
-        .find_map(|(index, ch)| (!ch.is_ascii_alphabetic()).then_some(index))
-        .unwrap_or(trimmed.len());
-    if !trimmed[..keyword_end].eq_ignore_ascii_case("truncate") {
-        return Ok(None);
-    }
-    let mut statements = crate::sql::parser::parse_sql(trimmed)?;
-    if statements.len() != 1 {
-        return Err("TRUNCATE request must contain exactly one statement".to_string());
-    }
-    match statements.remove(0) {
-        Statement::Truncate { name, target_ref } => Ok(Some(TruncateCommand {
-            target_parts: name.parts,
-            target_ref,
-        })),
-        _ => Ok(None),
-    }
+    novarocks_sql::planning::dml::parse_truncate_command(sql).map(|command| {
+        command.map(|command| TruncateCommand {
+            target_parts: command.target_parts,
+            target_ref: command.target_ref,
+        })
+    })
 }
 
 pub struct PlanTruncateRequest {

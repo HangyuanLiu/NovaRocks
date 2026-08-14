@@ -22,12 +22,10 @@ use super::boundary_schema::{BoundarySchemaReport, project_boundary_reports};
 use crate::connector::ConnectorRegistry;
 use crate::query_execution::preparation::scan::ScanBindingResolver;
 use crate::query_execution::preparation::{PreparedFragmentSet, prepare_fragments};
-use crate::sql::catalog::PlannerTableProvider;
-use crate::sql::planner::distributed::DistributedPlan;
+use novarocks_sql::plan_read::DistributedPlan;
 
 struct TestBuildRequest<'a> {
     distributed_plan: &'a DistributedPlan,
-    catalog: &'a dyn PlannerTableProvider,
     connectors: &'a ConnectorRegistry,
     scan_binding_resolver: Option<&'a dyn ScanBindingResolver>,
 }
@@ -35,13 +33,11 @@ struct TestBuildRequest<'a> {
 impl<'a> TestBuildRequest<'a> {
     fn result(
         distributed_plan: &'a DistributedPlan,
-        catalog: &'a dyn PlannerTableProvider,
         connectors: &'a ConnectorRegistry,
         scan_binding_resolver: Option<&'a dyn ScanBindingResolver>,
     ) -> Self {
         Self {
             distributed_plan,
-            catalog,
             connectors,
             scan_binding_resolver,
         }
@@ -58,7 +54,6 @@ fn build_for_test(
     ),
     String,
 > {
-    let _ = request.catalog;
     let controls = crate::connector::FixtureControlResolver::new(request.connectors.clone());
     let query_table_bindings =
         tests::fixture_query_table_bindings(request.distributed_plan, &controls);

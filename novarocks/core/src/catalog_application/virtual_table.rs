@@ -58,7 +58,7 @@ pub(crate) const INFORMATION_SCHEMA_DB: &str = "information_schema";
 
 /// Walk a query AST and replace virtual-table references with VALUES-backed
 /// derived tables. Returns `Ok(())` even when no virtual tables are matched.
-pub(crate) fn rewrite_query(
+pub fn rewrite_query(
     kernel: &SystemTableQueryKernel,
     query: &mut sqlast::Query,
 ) -> Result<(), String> {
@@ -454,7 +454,6 @@ mod tests {
     use crate::mv::repository::UnavailableMvRepository;
     use crate::query_execution::compiler::TestConnectorControlRegistry;
     use crate::query_execution::kernels::SystemTableQueryKernel;
-    use crate::sql::parser::dialect::StarRocksDialect;
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -465,6 +464,7 @@ mod tests {
         ConnectorMetadata, ConnectorNamespaceIdentity, ConnectorNamespaceRequest,
         ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
     };
+    use novarocks_sql::syntax::StarRocksDialect;
     use sqlparser::parser::Parser;
 
     #[derive(Default)]

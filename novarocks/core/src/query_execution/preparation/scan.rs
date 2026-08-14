@@ -25,12 +25,12 @@ use novarocks_spi::connector::{
 
 use crate::query_execution::planning::bindings::QueryScanMaterialization;
 use crate::runtime::scan_range::ScanRangeParams;
-use crate::sql::analysis::OutputColumn;
-use crate::sql::analysis::TypedExpr;
-use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::FragmentId;
-use crate::sql::planner::payload::PlanScanNode;
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_sql::plan_read::ColumnId;
+use novarocks_sql::plan_read::FragmentId;
+use novarocks_sql::plan_read::OutputColumn;
+use novarocks_sql::plan_read::PlanScanNode;
+use novarocks_sql::plan_read::TypedExpr;
 
 pub(crate) trait ScanBindingResolver: Send + Sync {
     fn resolve_scan(
@@ -462,7 +462,7 @@ mod tests {
 
     fn planner_column(id: u32, name: &str, data_type: DataType, nullable: bool) -> OutputColumn {
         OutputColumn {
-            column_id: ColumnId::new_for_test(id),
+            column_id: ColumnId(id),
             name: name.to_string(),
             data_type,
             nullable,
@@ -521,7 +521,7 @@ mod tests {
             .expect("valid binding");
 
         let resolved = &bindings.binding(41).expect("binding").physical_columns[0];
-        assert_eq!(resolved.planner.column_id, ColumnId::new_for_test(17));
+        assert_eq!(resolved.planner.column_id, ColumnId(17));
         assert_eq!(resolved.planner.data_type, DataType::LargeBinary);
         assert!(resolved.planner.nullable);
         assert_eq!(resolved.source.logical_type, Some(SqlType::Json));
@@ -564,7 +564,7 @@ mod tests {
                 44,
                 Vec::new(),
                 vec![ResolvedReadColumn {
-                    planner_column_id: Some(ColumnId::new_for_test(9)),
+                    planner_column_id: Some(ColumnId(9)),
                     source: hidden,
                     reason: ResolvedReadReason::EqualityDeleteKey,
                 }],

@@ -22,6 +22,7 @@ novarocks-catalog = { path = "../catalog" }
 novarocks-execution = { path = "../execution" }
 novarocks-protocol = { path = "../protocol" }
 novarocks-spi = { path = "../spi" }
+novarocks-sql = { path = "../sql" }
 novarocks-state-store = { path = "../state-store" }
 novarocks-types = { path = "../types" }
 prost = "0.13"

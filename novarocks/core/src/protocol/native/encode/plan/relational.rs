@@ -25,8 +25,10 @@ use super::type_mapping::{
 };
 use super::{NativePlanEncodeContext, encode_exprs};
 use crate::protocol::native::type_mapping::encode_type;
-use crate::sql::plan_read::{PhysicalPlanKind, PlanRowCountAssertion};
 use novarocks_protocol::plan;
+use novarocks_sql::plan_read::{
+    PhysicalPlanKind, PlanRowCountAssertion, SqlPhysicalPlanRead, physical_plan_read,
+};
 
 #[cfg(test)]
 pub(super) fn encoded_physical_variant_names_for_test() -> &'static [&'static str] {
@@ -62,18 +64,18 @@ pub(super) fn encode_physical_node(
 ) -> Result<plan::PlanNode, String> {
     use plan::plan_node::Kind;
 
-    let (output_columns, kind) = match src {
-        PhysicalPlanKind::Scan(node) => (
+    let (output_columns, kind) = match physical_plan_read(src) {
+        SqlPhysicalPlanRead::Scan(node) => (
             encode_output_columns(&node.columns)?,
-            Kind::Scan(encode_scan_node(node, node_id, ctx)?),
+            Kind::Scan(encode_scan_node(&node, node_id, ctx)?),
         ),
-        PhysicalPlanKind::Filter(node) => (
+        SqlPhysicalPlanRead::Filter { predicate } => (
             Vec::new(),
             Kind::Filter(plan::FilterNode {
-                predicate: Some(encode_expr(&node.predicate)?),
+                predicate: Some(encode_expr(&predicate)?),
             }),
         ),
-        PhysicalPlanKind::Project(node) => (
+        SqlPhysicalPlanRead::Project(node) => (
             Vec::new(),
             Kind::Project(plan::ProjectNode {
                 items: node
@@ -90,7 +92,7 @@ pub(super) fn encode_physical_node(
                 output_qualifier: node.output_qualifier.clone(),
             }),
         ),
-        PhysicalPlanKind::Sort(node) => (
+        SqlPhysicalPlanRead::Sort(node) => (
             encode_output_columns(&node.output_columns)?,
             Kind::Sort(plan::SortNode {
                 items: encode_sort_items(&node.items)?,
@@ -101,14 +103,10 @@ pub(super) fn encode_physical_node(
                 topn_type: node.topn_type.map(encode_sort_topn_type),
             }),
         ),
-        PhysicalPlanKind::Limit(node) => (
-            Vec::new(),
-            Kind::Limit(plan::LimitNode {
-                limit: node.limit,
-                offset: node.offset,
-            }),
-        ),
-        PhysicalPlanKind::Values(node) => (
+        SqlPhysicalPlanRead::Limit { limit, offset } => {
+            (Vec::new(), Kind::Limit(plan::LimitNode { limit, offset }))
+        }
+        SqlPhysicalPlanRead::Values(node) => (
             encode_output_columns(&node.columns)?,
             Kind::Values(plan::ValuesNode {
                 rows: node
@@ -123,7 +121,7 @@ pub(super) fn encode_physical_node(
                 columns: encode_output_columns(&node.columns)?,
             }),
         ),
-        PhysicalPlanKind::Repeat(node) => (
+        SqlPhysicalPlanRead::Repeat(node) => (
             Vec::new(),
             Kind::Repeat(plan::RepeatNode {
                 repeat_column_ref_list: node
@@ -177,7 +175,7 @@ pub(super) fn encode_physical_node(
                 virtual_tuple_id: node.virtual_tuple_id,
             }),
         ),
-        PhysicalPlanKind::Window(node) => (
+        SqlPhysicalPlanRead::Window(node) => (
             encode_output_columns(&node.output_columns)?,
             Kind::Window(plan::WindowNode {
                 window_exprs: node
@@ -205,7 +203,7 @@ pub(super) fn encode_physical_node(
                 output_columns: encode_output_columns(&node.output_columns)?,
             }),
         ),
-        PhysicalPlanKind::GenerateSeries(node) => (
+        SqlPhysicalPlanRead::GenerateSeries(node) => (
             Vec::new(),
             Kind::GenerateSeries(plan::GenerateSeriesNode {
                 start: node.start,
@@ -216,7 +214,7 @@ pub(super) fn encode_physical_node(
                 output_column_id: node.output_column_id.0,
             }),
         ),
-        PhysicalPlanKind::TableFunction(node) => (
+        SqlPhysicalPlanRead::TableFunction(node) => (
             encode_output_columns(&node.output_columns)?,
             Kind::TableFunction(plan::TableFunctionNode {
                 function_name: node.function_name.clone(),
@@ -226,7 +224,7 @@ pub(super) fn encode_physical_node(
                 is_left_join: node.is_left_join,
             }),
         ),
-        PhysicalPlanKind::AssertOneRow(node) => (
+        SqlPhysicalPlanRead::AssertOneRow(node) => (
             Vec::new(),
             Kind::AssertOneRow(plan::AssertOneRowNode {
                 subquery_text: node.subquery_text.clone(),
@@ -241,7 +239,7 @@ pub(super) fn encode_physical_node(
                 keyed_message_prefix: node.keyed_message_prefix.clone(),
             }),
         ),
-        PhysicalPlanKind::TopN(node) => (
+        SqlPhysicalPlanRead::TopN(node) => (
             Vec::new(),
             Kind::Topn(plan::TopNNode {
                 items: encode_sort_items(&node.items)?,
@@ -251,7 +249,7 @@ pub(super) fn encode_physical_node(
                 is_split: node.is_split,
             }),
         ),
-        PhysicalPlanKind::HashAggregate(node) => {
+        SqlPhysicalPlanRead::HashAggregate(node) => {
             // Baseline raw layout/output columns straight from the physical payload.
             // In a sealed plan `apply_sealed_node_output_columns` overwrites both the
             // node output columns and this `output_layout`/`output_columns` from the
@@ -260,7 +258,12 @@ pub(super) fn encode_physical_node(
             // encoder unit tests that have no sealed plan; the intermediate-type
             // determination is owned by the planner (`finalize_hash_aggregate_wire`).
             let raw_output_columns = if node.output_columns.is_empty() {
-                node.output_layout.full_output_columns()
+                node.output_layout
+                    .group_key_columns
+                    .iter()
+                    .chain(node.output_layout.aggregate_columns.iter())
+                    .cloned()
+                    .collect()
             } else {
                 node.output_columns.clone()
             };
@@ -296,7 +299,7 @@ pub(super) fn encode_physical_node(
                 }),
             )
         }
-        PhysicalPlanKind::HashJoin(node) => (
+        SqlPhysicalPlanRead::HashJoin(node) => (
             encode_output_columns(&node.output_columns)?,
             Kind::HashJoin(plan::HashJoinNode {
                 join_type: encode_join_kind(node.join_type),
@@ -316,14 +319,14 @@ pub(super) fn encode_physical_node(
                 execution_mode: node.execution_mode.map(encode_join_execution_mode),
             }),
         ),
-        PhysicalPlanKind::NestLoopJoin(node) => (
+        SqlPhysicalPlanRead::NestLoopJoin(node) => (
             encode_output_columns(&node.output_columns)?,
             Kind::NestLoopJoin(plan::NestLoopJoinNode {
                 join_type: encode_join_kind(node.join_type),
                 condition: node.condition.as_ref().map(encode_expr).transpose()?,
             }),
         ),
-        PhysicalPlanKind::SetOp(node) => (
+        SqlPhysicalPlanRead::SetOp(node) => (
             encode_output_columns(&node.output_columns)?,
             Kind::SetOp(plan::SetOpNode {
                 kind: encode_set_op_kind(node.kind),
@@ -339,7 +342,7 @@ pub(super) fn encode_physical_node(
                     .collect::<Result<Vec<_>, String>>()?,
             }),
         ),
-        PhysicalPlanKind::ChangeEventExpand(node) => (
+        SqlPhysicalPlanRead::ChangeEventExpand(node) => (
             encode_output_columns(&node.output_columns)?,
             Kind::ChangeEventExpand(plan::ChangeEventExpandNode {
                 events: node
@@ -370,20 +373,17 @@ pub(super) fn encode_physical_node(
                 effect_column_id: node.effect_column_id.0,
             }),
         ),
-        PhysicalPlanKind::CTEAnchor(node) => (
-            Vec::new(),
-            Kind::CteAnchor(plan::CteAnchorNode {
-                cte_id: node.cte_id,
-            }),
-        ),
-        PhysicalPlanKind::CTEProduce(node) => (
+        SqlPhysicalPlanRead::CTEAnchor { cte_id } => {
+            (Vec::new(), Kind::CteAnchor(plan::CteAnchorNode { cte_id }))
+        }
+        SqlPhysicalPlanRead::CTEProduce(node) => (
             encode_output_columns(&node.output_columns)?,
             Kind::CteProduce(plan::CteProduceNode {
                 cte_id: node.cte_id,
                 output_columns: encode_output_columns(&node.output_columns)?,
             }),
         ),
-        PhysicalPlanKind::CTEConsume(node) => (
+        SqlPhysicalPlanRead::CTEConsume(node) => (
             encode_output_columns(&node.output_columns)?,
             Kind::CteConsume(plan::CteConsumeNode {
                 cte_id: node.cte_id,
@@ -392,7 +392,7 @@ pub(super) fn encode_physical_node(
                 producer_column_ids: node.producer_column_ids.iter().map(|id| id.0).collect(),
             }),
         ),
-        PhysicalPlanKind::Redistribute(node) => (
+        SqlPhysicalPlanRead::Redistribute(node) => (
             encode_output_columns(&node.output_columns)?,
             Kind::Redistribute(plan::RedistributeNode {
                 mode: Some(encode_redistribute_mode(&node.mode)),

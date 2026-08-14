@@ -24,15 +24,16 @@ use crate::query_execution::compiler::CatalogServiceSource;
 use crate::query_execution::kernels::{
     DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
 };
-use crate::sql::analyzer::iceberg_ref::{
-    IcebergRefKind, SqlIcebergNamedRef, SqlIcebergRefMetadata, SqlIcebergSnapshotLog,
-    resolve_read_binding,
-};
-use crate::sql::parser::ast::ObjectName;
-#[cfg(test)]
-use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::{ConnectorReadReferenceFacts, ConnectorReadReferenceKind};
+#[cfg(test)]
+use novarocks_sql::planning::catalog::SqlTestDeltaTableFacts;
+use novarocks_sql::planning::catalog::{
+    SqlTimeTravelNamedReferenceFacts, SqlTimeTravelReferenceKind,
+    SqlTimeTravelReferenceMetadataFacts, SqlTimeTravelSnapshotLogFacts,
+    resolve_time_travel_snapshot_binding,
+};
+use novarocks_sql::syntax::ObjectName;
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
@@ -71,32 +72,31 @@ pub(crate) fn delete_temp_iceberg_file_for_query(
 /// Project provider metadata into the immutable facts required by SQL
 /// time-travel analysis.  This conversion is intentionally application-owned:
 /// the compiler never receives an Iceberg `TableMetadata` object.
-fn project_iceberg_ref_metadata(facts: &ConnectorReadReferenceFacts) -> SqlIcebergRefMetadata {
+fn project_iceberg_ref_metadata(
+    facts: &ConnectorReadReferenceFacts,
+) -> Result<SqlTimeTravelReferenceMetadataFacts, String> {
     let refs = facts
         .named_references()
         .iter()
         .map(|reference| {
             let kind = match reference.kind {
-                ConnectorReadReferenceKind::Branch => IcebergRefKind::Branch,
-                ConnectorReadReferenceKind::Tag => IcebergRefKind::Tag,
+                ConnectorReadReferenceKind::Branch => SqlTimeTravelReferenceKind::Branch,
+                ConnectorReadReferenceKind::Tag => SqlTimeTravelReferenceKind::Tag,
             };
-            (
+            SqlTimeTravelNamedReferenceFacts::try_new(
                 reference.name.to_string(),
-                SqlIcebergNamedRef {
-                    snapshot_id: reference.snapshot_id,
-                    kind,
-                },
+                kind,
+                reference.snapshot_id,
             )
         })
-        .collect();
-    SqlIcebergRefMetadata::new(
-        facts.snapshot_ids().iter().copied(),
+        .collect::<Result<Vec<_>, _>>()?;
+    SqlTimeTravelReferenceMetadataFacts::try_new(
+        facts.snapshot_ids().to_vec(),
         facts
             .snapshot_log()
             .iter()
-            .map(|entry| SqlIcebergSnapshotLog {
-                snapshot_id: entry.snapshot_id,
-                timestamp_ms: entry.timestamp_millis,
+            .map(|entry| {
+                SqlTimeTravelSnapshotLogFacts::new(entry.snapshot_id, entry.timestamp_millis)
             })
             .collect(),
         refs,
@@ -110,7 +110,7 @@ fn project_iceberg_ref_metadata(facts: &ConnectorReadReferenceFacts) -> SqlIcebe
 
 /// Returns true if the query contains any `TableFactor::Table` node with a
 /// `version: Some(...)` clause. Used as a cheap pre-check before cloning.
-pub(crate) fn has_time_travel_refs(query: &sqlparser::ast::Query) -> bool {
+pub fn has_time_travel_refs(query: &sqlparser::ast::Query) -> bool {
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             if has_time_travel_in_set_expr(cte.query.body.as_ref()) {
@@ -192,7 +192,7 @@ impl_kernel_time_travel_resolver!(MvExecutionKernel);
 ///      so that `SELECT t.col FROM t FOR VERSION AS OF ...` resolves `t.col`.
 ///
 /// Tables without a version clause are left untouched.
-pub(crate) fn rewrite_time_travel_refs(
+pub fn rewrite_time_travel_refs(
     resolver: &impl TimeTravelResolver,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -330,7 +330,7 @@ fn rewrite_time_travel_in_factor(
             if target.backend_name != "iceberg" {
                 return Err(format!(
                     "iceberg time travel: table '{}' is not an Iceberg table; time travel is only supported for Iceberg",
-                    our_name.leaf()
+                    our_name.parts.last().expect("checked nonempty table name")
                 ));
             }
 
@@ -348,9 +348,9 @@ fn rewrite_time_travel_in_factor(
                 &target.namespace,
                 &target.table,
             )?;
-            let metadata = project_iceberg_ref_metadata(&facts);
-            let binding = resolve_read_binding(&version_clause, &metadata, &fqn)?;
-            let snapshot_id = binding.snapshot_id;
+            let metadata = project_iceberg_ref_metadata(&facts)?;
+            let binding = resolve_time_travel_snapshot_binding(&version_clause, &metadata, &fqn)?;
+            let snapshot_id = binding.snapshot_id();
 
             // A time-travel identity is query-local.  The synthetic name is
             // only an analyzer key; its exact snapshot table and planning
@@ -364,7 +364,11 @@ fn rewrite_time_travel_in_factor(
             // - version is already cleared (we took it above)
             if alias.is_none() {
                 // Infer the original table alias from the last non-catalog part of the name
-                let original_leaf = our_name.leaf().to_string();
+                let original_leaf = our_name
+                    .parts
+                    .last()
+                    .expect("checked nonempty table name")
+                    .to_string();
                 *alias = Some(sqlparser::ast::TableAlias {
                     name: sqlparser::ast::Ident::new(original_leaf),
                     columns: vec![],
@@ -513,11 +517,11 @@ struct FrozenFileChangeOp {
 
 #[cfg(test)]
 fn stamp_delta_table_def_change_ops(
-    table_def: &mut TableDef,
+    table_facts: &mut SqlTestDeltaTableFacts,
     files: &mut [FrozenFileChangeOp],
     change_ops: &[i8],
 ) -> Result<(), String> {
-    if table_def.columns.iter().any(|col| {
+    if table_facts.columns().iter().any(|col| {
         col.name
             .eq_ignore_ascii_case(novarocks_execution::exec::change_op::CHANGE_OP_COLUMN)
     }) {
@@ -526,8 +530,8 @@ fn stamp_delta_table_def_change_ops(
             novarocks_execution::exec::change_op::CHANGE_OP_COLUMN
         ));
     }
-    if table_def
-        .iceberg_row_lineage_metadata_columns
+    if table_facts
+        .iceberg_row_lineage_metadata_columns()
         .iter()
         .any(|col| {
             col.name
@@ -541,15 +545,13 @@ fn stamp_delta_table_def_change_ops(
     }
 
     let field = novarocks_execution::exec::change_op::change_op_field();
-    table_def
-        .iceberg_row_lineage_metadata_columns
-        .push(ColumnDef {
-            name: field.name().clone(),
-            data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
-            write_default: None,
-            logical_type: None,
-        });
+    table_facts.push_iceberg_row_lineage_metadata_column(ColumnDef {
+        name: field.name().clone(),
+        data_type: field.data_type().clone(),
+        nullable: field.is_nullable(),
+        write_default: None,
+        logical_type: None,
+    });
 
     if files.len() != change_ops.len() {
         return Err(format!(
@@ -567,28 +569,12 @@ fn stamp_delta_table_def_change_ops(
 #[cfg(test)]
 mod tests {
     use crate::query_execution::planning::time_travel::IcebergFileForQuery;
-    use crate::sql::planner::table::{ScanSource, TableDef};
-
-    fn test_sql_source() -> ScanSource {
-        crate::sql::planner::table::test_sql_scan_source(
-            crate::sql::planner::table::SqlScanKind::FrozenInputSet {
-                version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(1),
-            },
-        )
-    }
+    use novarocks_sql::planning::catalog::test_delta_table_facts;
 
     fn test_data_file() -> super::FrozenFileChangeOp {
         super::FrozenFileChangeOp {
             ivm_change_op: None,
         }
-    }
-
-    fn parse_query_for_table_names(sql: &str) -> sqlparser::ast::Query {
-        let stmt = crate::sql::parser::parse_sql_raw(sql).expect("parse sql");
-        let sqlparser::ast::Statement::Query(query) = stmt else {
-            panic!("expected query statement");
-        };
-        *query
     }
 
     fn file(change_op: Option<i8>) -> IcebergFileForQuery {
@@ -625,19 +611,14 @@ mod tests {
 
     #[test]
     fn delta_table_builder_stamps_s3_files_and_adds_virtual_column() {
-        let mut table_def = TableDef {
-            name: "t".to_string(),
-            columns: vec![],
-            iceberg_row_lineage_metadata_columns: vec![],
-            source: test_sql_source(),
-        };
+        let mut table_facts = test_delta_table_facts(vec![], vec![]);
         let mut files = vec![test_data_file()];
 
-        super::stamp_delta_table_def_change_ops(&mut table_def, &mut files, &[1]).expect("stamp");
+        super::stamp_delta_table_def_change_ops(&mut table_facts, &mut files, &[1]).expect("stamp");
 
         assert_eq!(
-            table_def
-                .iceberg_row_lineage_metadata_columns
+            table_facts
+                .iceberg_row_lineage_metadata_columns()
                 .iter()
                 .map(|col| (col.name.as_str(), &col.data_type, col.nullable))
                 .collect::<Vec<_>>(),
@@ -648,10 +629,9 @@ mod tests {
 
     #[test]
     fn delta_table_builder_preserves_row_lineage_metadata_and_adds_change_op() {
-        let mut table_def = TableDef {
-            name: "t".to_string(),
-            columns: vec![],
-            iceberg_row_lineage_metadata_columns: vec![
+        let mut table_facts = test_delta_table_facts(
+            vec![],
+            vec![
                 novarocks_catalog::schema::ColumnDef {
                     name: "_file".to_string(),
                     data_type: arrow::datatypes::DataType::Utf8,
@@ -681,15 +661,15 @@ mod tests {
                     logical_type: None,
                 },
             ],
-            source: test_sql_source(),
-        };
+        );
         let mut files = vec![test_data_file()];
 
-        super::stamp_delta_table_def_change_ops(&mut table_def, &mut files, &[-1]).expect("stamp");
+        super::stamp_delta_table_def_change_ops(&mut table_facts, &mut files, &[-1])
+            .expect("stamp");
 
         assert_eq!(
-            table_def
-                .iceberg_row_lineage_metadata_columns
+            table_facts
+                .iceberg_row_lineage_metadata_columns()
                 .iter()
                 .map(|col| (col.name.as_str(), &col.data_type, col.nullable))
                 .collect::<Vec<_>>(),
@@ -716,20 +696,15 @@ mod tests {
         // connector read whose split plan is empty;
         // ensure that path round-trips correctly when stamping with an
         // empty change-op slice.
-        let mut table_def = TableDef {
-            name: "t".to_string(),
-            columns: vec![],
-            iceberg_row_lineage_metadata_columns: vec![],
-            source: test_sql_source(),
-        };
+        let mut table_facts = test_delta_table_facts(vec![], vec![]);
         let mut files = Vec::new();
 
-        super::stamp_delta_table_def_change_ops(&mut table_def, &mut files, &[])
+        super::stamp_delta_table_def_change_ops(&mut table_facts, &mut files, &[])
             .expect("stamp empty delta over empty iceberg storage");
 
         assert_eq!(
-            table_def
-                .iceberg_row_lineage_metadata_columns
+            table_facts
+                .iceberg_row_lineage_metadata_columns()
                 .iter()
                 .map(|col| (col.name.as_str(), &col.data_type, col.nullable))
                 .collect::<Vec<_>>(),

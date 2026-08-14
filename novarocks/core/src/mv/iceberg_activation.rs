@@ -165,13 +165,9 @@ pub(crate) fn activate_first_refresh_connector_write(
     };
     let input = ConnectorWriteInputRequest::Data {
         fields: prepared
-            .target_contract()
-            .schema()
-            .fields()
+            .write_input_fields()
             .iter()
-            .map(|field| {
-                novarocks_spi::connector::ConnectorWriteFieldRequest::new(field.as_ref().clone())
-            })
+            .map(|field| novarocks_spi::connector::ConnectorWriteFieldRequest::new(field.clone()))
             .collect(),
     };
     let purpose = novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh;

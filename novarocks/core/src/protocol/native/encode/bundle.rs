@@ -18,8 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 
 use crate::query_execution::preparation::PreparedFragmentSet;
-use crate::sql::plan_read::{DistributedPlan, FragmentId};
 use novarocks_protocol::plan::PlanFragment as NativePlanFragment;
+use novarocks_sql::plan_read::{DistributedPlan, FragmentId};
 
 /// Immutable encoder borrow for either a Core-sealed application assembly or
 /// a Core-internal neutral execution flow. Only the sealed constructor carries
