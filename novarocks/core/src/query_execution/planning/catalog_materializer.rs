@@ -34,8 +34,8 @@ use crate::query_execution::planning::bindings::{
     QueryTableBindingStore,
 };
 use novarocks_sql::binding::SqlTableBindingId;
-use novarocks_sql::catalog::{IcebergMetadataTableProvider, PlannerTableProvider};
 use novarocks_sql::planning::catalog::ResolvedAnalyzerTable;
+use novarocks_sql::planning::catalog::{IcebergMetadataTableProvider, PlannerTableProvider};
 
 /// Provider-neutral table facts admitted for one request.  Core projects the
 /// typed SPI metadata into SQL facts, preserves the opaque scan authority, and
@@ -670,7 +670,7 @@ mod tests {
 
     use super::*;
     use novarocks_sql::binding::SqlTableBindingAllocator;
-    use novarocks_sql::catalog::PlannerTableProvider;
+    use novarocks_sql::planning::catalog::PlannerTableProvider;
 
     fn binding_id(scope: u64, ordinal: u32) -> SqlTableBindingId {
         let ordinal = NonZeroU32::new(ordinal).expect("non-zero ordinal");

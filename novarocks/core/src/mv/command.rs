@@ -199,7 +199,7 @@ impl MvCommandExecutor {
             .prepare_and_execute_refresh(
                 &preparation,
                 crate::mv::application::MvApplicationStatement::Refresh(
-                    novarocks_sql::mv_refresh::MvRefreshStatement::from(&refresh_statement),
+                    novarocks_sql::planning::mv::MvRefreshStatement::from(&refresh_statement),
                 ),
                 target,
                 connector_context.clone(),
@@ -217,7 +217,7 @@ impl MvCommandExecutor {
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &QueryExecutionContext,
     ) -> Result<StatementResult, String> {
-        let refresh_statement = novarocks_sql::mv_refresh::MvRefreshStatement::from(statement);
+        let refresh_statement = novarocks_sql::planning::mv::MvRefreshStatement::from(statement);
         refresh_statement.validate_supported()?;
         let target = crate::mv::iceberg_refresh::resolve_refresh_target(
             current_catalog,
@@ -266,7 +266,7 @@ impl MvCommandExecutor {
                     .prepare_and_execute_refresh(
                         &preparation,
                         crate::mv::application::MvApplicationStatement::Refresh(
-                            novarocks_sql::mv_refresh::MvRefreshStatement::from(&step_statement),
+                            novarocks_sql::planning::mv::MvRefreshStatement::from(&step_statement),
                         ),
                         target,
                         connector_context.clone(),

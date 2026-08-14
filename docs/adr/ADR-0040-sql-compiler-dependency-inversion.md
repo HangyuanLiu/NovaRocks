@@ -9,8 +9,8 @@ date: 2026-08-03
 provenance:
   - "discussion: 2026-08-02 SQL compiler dependency inversion"
 code-anchors:
-  - "novarocks/core/src/sql/compiler/mod.rs (SqlCompiler::compile)"
-  - "novarocks/core/src/engine/query_planning/mod.rs (QueryPlanningInputs)"
+  - "novarocks/sql/src/compiler/mod.rs (SqlCompiler::analyze and SqlCompiler::optimize)"
+  - "novarocks/core/src/query_execution/planning/mod.rs (QueryPlanningInputs)"
 ---
 
 ## 问题
@@ -19,7 +19,7 @@ code-anchors:
 
 ## 背景与执行事实
 
-`SqlCompiler::compile` 是 statement admission 后唯一的 canonical compiler kernel。它需要 catalog、statistics、函数、MV rewrite、deadline 和 cancellation 等冻结事实，但不应知道 Frontend session、repository、Connector registry、native encoder、query lifecycle 或执行 profile 的 concrete type。
+`SqlCompiler::analyze` 与 `SqlCompiler::optimize` 是 statement admission 后唯一的 canonical two-phase compiler kernel。前者接收 catalog、函数、MV rewrite、deadline 和 cancellation 等分析事实，后者只接收不透明 analyzed handle 与冻结 statistics；两者都不应知道 Frontend session、repository、Connector registry、native encoder、query lifecycle 或执行 profile 的 concrete type。
 
 一次 query 对外部表的解析、统计和 scan preparation 必须使用同一个 exact Connector generation。把 provider handle、lease 或 files 放入 SQL plan，会让 compiler 反向依赖 concrete Connector；每个 consumer 重新获取 current binding，则会在 metadata 解析与 fragment submission 之间破坏 generation fence。
 

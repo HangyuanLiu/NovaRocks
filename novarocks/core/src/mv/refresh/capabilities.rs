@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_sql::planner::vocabulary::ApplyKeySource;
+use novarocks_sql::planning::mv::ApplyKeySource;
 
 use crate::mv::persistence::schema::MvSchemaContract;
 use crate::mv::refresh::apply_key::ApplyKeyValueType;

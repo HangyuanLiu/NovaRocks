@@ -474,11 +474,11 @@ pub fn build_frozen_connector_write_distributed_plan(
 /// opaque terminal sink; optimizer and physical planner artifacts do not
 /// cross this boundary.
 pub fn compile_connector_write_distributed_plan(
-    request: crate::compiler::SqlCompileRequest<'_>,
+    request: crate::compiler::SqlOptimizeRequest<'_>,
     sink: DmlWritePlanInput,
     settings: &crate::compiler::SessionOptimizerSettings,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
-    let compiled = crate::compiler::SqlCompiler::compile(request)
+    let compiled = crate::compiler::SqlCompiler::optimize(request)
         .map_err(|error| error.to_string())?
         .into_optimized_output()
         .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
@@ -492,9 +492,9 @@ pub fn compile_connector_write_distributed_plan(
 /// plan. This is the read-side counterpart to the DML write entrypoints and
 /// keeps optimized/scalar graphs inside SQL.
 pub fn compile_query_distributed_plan(
-    request: crate::compiler::SqlCompileRequest<'_>,
+    request: crate::compiler::SqlOptimizeRequest<'_>,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
-    crate::compiler::SqlCompiler::compile(request)
+    crate::compiler::SqlCompiler::optimize(request)
         .map_err(|error| error.to_string())?
         .into_distributed_plan()
         .map_err(|error| error.to_string())
@@ -551,9 +551,9 @@ impl DmlCtasSourcePlan {
 /// optimized, but no distributed sink is selected until the application has
 /// completed target admission.
 pub fn compile_ctas_source(
-    request: crate::compiler::SqlCompileRequest<'_>,
+    request: crate::compiler::SqlOptimizeRequest<'_>,
 ) -> Result<DmlCtasSourcePlan, String> {
-    let compiled = crate::compiler::SqlCompiler::compile(request)
+    let compiled = crate::compiler::SqlCompiler::optimize(request)
         .map_err(|error| error.to_string())?
         .into_optimized_output()
         .map_err(|_| "CTAS source did not produce optimized SQL facts".to_string())?;
@@ -636,7 +636,7 @@ pub struct DmlPreExpandKeyedAssert {
 /// A request that consumes one immutable compile input and a fully admitted,
 /// provider-signed SQL write route set.
 pub struct DmlChangeStreamCompileRequest<'a> {
-    pub compile_request: crate::compiler::SqlCompileRequest<'a>,
+    pub optimize_request: crate::compiler::SqlOptimizeRequest<'a>,
     pub kind: DmlChangeStreamKind,
     pub routes: Vec<DmlChangeStreamRoute>,
     pub pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
@@ -701,7 +701,7 @@ impl DmlChangeStreamPlan {
 pub fn compile_dml_change_stream(
     request: DmlChangeStreamCompileRequest<'_>,
 ) -> Result<DmlChangeStreamPlan, String> {
-    let compiled = crate::compiler::SqlCompiler::compile(request.compile_request)
+    let compiled = crate::compiler::SqlCompiler::optimize(request.optimize_request)
         .map_err(|error| error.to_string())?
         .into_optimized_output()
         .map_err(|_| "change-stream intent did not produce an optimized SQL plan".to_string())?;

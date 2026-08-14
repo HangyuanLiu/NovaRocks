@@ -47,7 +47,7 @@ use crate::mv::repository::UnavailableMvRepository;
 use novarocks_catalog::identifier::normalize_identifier;
 #[cfg(test)]
 use novarocks_catalog::memory::DEFAULT_DATABASE;
-pub use novarocks_sql::catalog::TableLookupMode;
+pub use novarocks_sql::planning::catalog::TableLookupMode;
 
 use crate::catalog_application::resolver as backend_resolver;
 use crate::catalog_application::statement::{
@@ -150,10 +150,12 @@ pub fn freeze_query_mv_rewrite_definition_index(
 pub fn query_statistics_snapshot(
     query_kernel: &domain::QueryPreparationKernel,
     analyzer_catalog: &crate::query_execution::planning::catalog_materializer::CatalogServiceMaterializer<'_>,
-) -> crate::query_execution::planning::statistics::QueryStatisticsContext {
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<crate::query_execution::planning::statistics::QueryStatisticsContext, String> {
     crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
         query_kernel,
         analyzer_catalog.query_table_bindings(),
+        connector_context,
     )
 }
 
@@ -2176,17 +2178,13 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
             "SQL write catalog materializer replaced the admitted binding store".to_string(),
         );
     }
-    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-        state,
-        Arc::clone(&table_bindings),
-    );
     let catalog_snapshot =
         novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| {
             "Iceberg write requires a non-empty admitted backend topology".to_string()
         })?;
-    let compiler_request = novarocks_sql::compiler::SqlCompileRequest::new(
+    let analyze_request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(prepared)),
         novarocks_sql::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
         novarocks_sql::compiler::SqlSessionContext {
@@ -2196,7 +2194,6 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         },
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
-        &statistics,
         novarocks_sql::compiler::builtin_sql_function_catalog(),
         None,
         novarocks_sql::compiler::SqlCompileControl::new(
@@ -2206,8 +2203,17 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
             ),
         ),
     );
+    let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(analyze_request)
+        .map_err(|error| error.to_string())?
+        .into_pending()
+        .map_err(|error| error.to_string())?;
+    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+        state,
+        Arc::clone(&table_bindings),
+        connector_context,
+    )?;
     let distributed_plan = novarocks_sql::planning::dml::compile_connector_write_distributed_plan(
-        compiler_request,
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics),
         sink,
         &optimizer_settings,
     )?;
@@ -2578,10 +2584,6 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
             "SQL compilation requires a non-empty admitted backend topology".to_string()
         })?;
     let table_bindings = analyzer_catalog.query_table_bindings();
-    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-        query_kernel,
-        table_bindings.clone(),
-    );
     let catalog_snapshot = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     // MV rewrite is an optional SQL optimization. An application composition
     // without an MV repository supplies no snapshot; a repository that is
@@ -2604,7 +2606,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         }
         _ => crate::query_execution::contract::DistributedQueryIntent::Result,
     };
-    let compiler_request = novarocks_sql::compiler::SqlCompileRequest::new(
+    let analyze_request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
         intent,
         novarocks_sql::compiler::SqlSessionContext {
@@ -2614,7 +2616,6 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         },
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
-        &statistics,
         novarocks_sql::compiler::builtin_sql_function_catalog(),
         mv_definitions.as_ref(),
         novarocks_sql::compiler::SqlCompileControl::new(
@@ -2625,18 +2626,28 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         ),
     );
     let planning_inputs = crate::query_execution::planning::QueryPlanningInputs {
-        compile_request: compiler_request,
+        analyze_request,
         post_compile: crate::query_execution::planning::PostCompilePlanningContext {
             table_bindings,
             connector_controls: query_kernel.connector_control().as_ref(),
             connector_context,
         },
     };
-    let distributed_plan =
-        novarocks_sql::compiler::SqlCompiler::compile(planning_inputs.compile_request)
-            .map_err(|error| error.to_string())?
-            .into_distributed_plan()
-            .map_err(|error| error.to_string())?;
+    let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(planning_inputs.analyze_request)
+        .map_err(|error| error.to_string())?
+        .into_pending()
+        .map_err(|error| error.to_string())?;
+    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+        query_kernel,
+        planning_inputs.post_compile.table_bindings.clone(),
+        connector_context,
+    )?;
+    let distributed_plan = novarocks_sql::compiler::SqlCompiler::optimize(
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics),
+    )
+    .map_err(|error| error.to_string())?
+    .into_distributed_plan()
+    .map_err(|error| error.to_string())?;
     ensure_mainline_distributed_execution(false, query_kernel.exchange_port())?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
@@ -2676,10 +2687,6 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
             "SQL compilation requires a non-empty admitted backend topology".to_string()
         })?;
     let table_bindings = analyzer_catalog.query_table_bindings();
-    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-        query_kernel,
-        table_bindings.clone(),
-    );
     let catalog_snapshot = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     let mv_definitions = crate::mv::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
         mv_repository,
@@ -2695,7 +2702,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
         }
     };
     let planning_inputs = crate::query_execution::planning::QueryPlanningInputs {
-        compile_request: novarocks_sql::compiler::SqlCompileRequest::new(
+        analyze_request: novarocks_sql::compiler::SqlAnalyzeRequest::new(
             novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
             intent,
             novarocks_sql::compiler::SqlSessionContext {
@@ -2705,7 +2712,6 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
             },
             novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
             &catalog_snapshot,
-            &statistics,
             novarocks_sql::compiler::builtin_sql_function_catalog(),
             Some(&mv_definitions),
             novarocks_sql::compiler::SqlCompileControl::new(
@@ -2721,8 +2727,24 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
             connector_context,
         },
     };
-    let compiled = novarocks_sql::compiler::SqlCompiler::compile(planning_inputs.compile_request)
+    let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(planning_inputs.analyze_request)
         .map_err(|error| error.to_string())?;
+    let compiled = if logical {
+        analyzed
+            .into_complete()
+            .map_err(|error| error.to_string())?
+    } else {
+        let analyzed = analyzed.into_pending().map_err(|error| error.to_string())?;
+        let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+            query_kernel,
+            planning_inputs.post_compile.table_bindings.clone(),
+            connector_context,
+        )?;
+        novarocks_sql::compiler::SqlCompiler::optimize(
+            novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics),
+        )
+        .map_err(|error| error.to_string())?
+    };
     let lines = compiled
         .into_explain_lines(level, logical)
         .map_err(|error| error.to_string())?;

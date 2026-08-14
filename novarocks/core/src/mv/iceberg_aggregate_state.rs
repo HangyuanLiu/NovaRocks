@@ -435,7 +435,7 @@ mod tests {
     use crate::mv::model::AggregateStateRole;
     use novarocks_catalog::schema::SqlType;
     use novarocks_execution::exec::mv::state_codec::encode_count_state;
-    use novarocks_sql::mv_refresh::AggregateFunctionKind;
+    use novarocks_sql::planning::mv::AggregateFunctionKind;
 
     fn chunk(batch: RecordBatch) -> novarocks_execution::exec::chunk::Chunk {
         record_batch_to_chunk(batch).expect("chunk")

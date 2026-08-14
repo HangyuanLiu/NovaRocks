@@ -16,16 +16,16 @@
 // under the License.
 
 pub(crate) mod agg_mergeability;
-pub mod common;
+pub(crate) mod common;
 
 pub(crate) mod analysis;
 pub mod binding;
-pub mod catalog;
+pub(crate) mod catalog;
 pub(crate) mod column_id;
 pub mod compiler;
 pub(crate) mod functions;
 pub(crate) mod literal;
-pub mod mv_refresh;
+pub(crate) mod mv_refresh;
 pub(crate) mod parser;
 pub mod plan_read;
 pub mod planning;
@@ -38,7 +38,7 @@ pub(crate) mod optimizer;
 
 pub(crate) mod analyzer;
 pub(crate) mod explain;
-pub mod planner;
+pub(crate) mod planner;
 
 pub(crate) use parser::ast::{
     ColumnAggregation, Literal, TableColumnDef, TableKeyDesc, TableKeyKind,

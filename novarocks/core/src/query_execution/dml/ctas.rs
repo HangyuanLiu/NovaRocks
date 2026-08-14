@@ -396,16 +396,11 @@ fn plan_query_for_ctas_source(
         state.catalog_application().map(Arc::as_ref),
     );
     let table_bindings = analyzer_provider.query_table_bindings();
-    let statistics =
-        crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-            state,
-            Arc::clone(&table_bindings),
-        );
     let catalog_snapshot =
         novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| "CTAS requires a frozen non-empty backend topology".to_string())?;
-    let request = novarocks_sql::compiler::SqlCompileRequest::new(
+    let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlCompileIntent::IcebergWrite {
             root_distribution: novarocks_sql::compiler::RootDistributionRequirement::Any,
@@ -417,7 +412,6 @@ fn plan_query_for_ctas_source(
         },
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
-        &statistics,
         novarocks_sql::compiler::builtin_sql_function_catalog(),
         None,
         novarocks_sql::compiler::SqlCompileControl::new(
@@ -427,7 +421,19 @@ fn plan_query_for_ctas_source(
             ),
         ),
     );
-    let source = novarocks_sql::planning::dml::compile_ctas_source(request)?;
+    let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
+        .map_err(|error| error.to_string())?
+        .into_pending()
+        .map_err(|error| error.to_string())?;
+    let statistics =
+        crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+            state,
+            Arc::clone(&table_bindings),
+            connector_context,
+        )?;
+    let source = novarocks_sql::planning::dml::compile_ctas_source(
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics),
+    )?;
     Ok(PlannedCtasSourceQuery {
         source,
         table_bindings,

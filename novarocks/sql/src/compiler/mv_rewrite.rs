@@ -2135,56 +2135,73 @@ impl MvRewriteDefinitionIndex {
     }
 }
 
-struct PreparedMvRewriteCandidate {
+struct AnalyzedMvRewriteCandidate {
     mv_name: String,
     mv: SpjgDescriptor,
     mv_scalars: crate::optimizer::scalar::ScalarArena,
     target_database: String,
     target_table: crate::planner::table::TableDef,
+    factory_after_analysis: ColumnRefFactory,
+}
+
+enum SqlMvRewriteAnalysisEntry {
+    Candidate(AnalyzedMvRewriteCandidate),
+    Diagnostic(SqlMvRewriteDiagnostic),
+    Ignored,
+}
+
+pub(crate) struct SqlMvRewriteAnalysis {
+    entries: Vec<SqlMvRewriteAnalysisEntry>,
+}
+
+impl SqlMvRewriteAnalysis {
+    pub(crate) fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
 }
 
 /// Prepare optional MV rewrite candidates from one immutable, repository-order
 /// definition index. This is deliberately SQL-owned: application admission
 /// freezes definitions and base-table observations, while parse/analyze,
-/// descriptor construction, statistics, and warn-and-skip selection happen in
-/// the canonical compiler kernel.
-pub(crate) fn prepare_candidates(
+/// descriptor construction and catalog materialization happen before the
+/// application freezes request-local statistics. Statistics attachment and
+/// warn-and-skip selection are deliberately deferred to the seal phase.
+pub(crate) fn analyze_candidates(
     definitions: &MvRewriteDefinitionIndex,
     analyzer_catalog: &dyn PlannerTableProvider,
     current_database: &str,
     logical: &LogicalPlanNode,
-    factory: &mut ColumnRefFactory,
+    factory: &ColumnRefFactory,
     functions: &dyn SqlFunctionCatalog,
-    statistics_context: &dyn SqlStatisticsSnapshot,
-    query_stats: &mut SqlStatisticsPlan,
     optimizer_settings: &crate::optimizer::options::SessionOptimizerSettings,
-) -> SqlMvRewritePreparation {
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<SqlMvRewriteAnalysis, crate::compiler::SqlCompileError> {
     if !optimizer_settings.mv_rewrite_enabled() {
-        return SqlMvRewritePreparation {
-            candidates: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+        return Ok(SqlMvRewriteAnalysis::empty());
     }
 
     let mut query_fqns = Vec::new();
     collect_iceberg_fqns(logical, &mut query_fqns);
     if query_fqns.is_empty() {
-        return SqlMvRewritePreparation {
-            candidates: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+        return Ok(SqlMvRewriteAnalysis::empty());
     }
 
-    let mut candidates = Vec::new();
-    let mut diagnostics = Vec::new();
+    let mut entries = Vec::with_capacity(definitions.definitions().len());
+    let mut candidate_factory = factory.clone();
+    let mut materialized_candidates = 0usize;
     for definition in definitions.definitions() {
-        if candidates.len() >= MAX_SUCCESSFUL_MV_REWRITE_CANDIDATES {
-            diagnostics.push(SqlMvRewriteDiagnostic {
-                mv_id: None,
-                message: format!(
-                    "mv rewrite: candidate cap {MAX_SUCCESSFUL_MV_REWRITE_CANDIDATES} reached, rest skipped"
-                ),
-            });
+        control.check()?;
+        if materialized_candidates >= MAX_SUCCESSFUL_MV_REWRITE_CANDIDATES {
+            entries.push(SqlMvRewriteAnalysisEntry::Diagnostic(
+                SqlMvRewriteDiagnostic {
+                    mv_id: None,
+                    message: format!(
+                        "mv rewrite: candidate cap {MAX_SUCCESSFUL_MV_REWRITE_CANDIDATES} reached, rest skipped"
+                    ),
+                },
+            ));
             break;
         }
         if definition.storage_engine != "iceberg"
@@ -2193,30 +2210,52 @@ pub(crate) fn prepare_candidates(
                 .iter()
                 .any(|base| query_fqns.contains(base))
         {
+            entries.push(SqlMvRewriteAnalysisEntry::Ignored);
             continue;
         }
         match build_candidate(
             analyzer_catalog,
             current_database,
             definition,
-            factory,
+            &candidate_factory,
             functions,
         ) {
             Ok(Some(candidate)) => {
-                let (label, stats) = match statistics_context
-                    .collect_table_statistics(&candidate.target_database, &candidate.target_table)
-                {
-                    Ok(statistics) => statistics,
-                    Err(error) => {
-                        diagnostics.push(SqlMvRewriteDiagnostic {
-                            mv_id: Some(definition.mv_id),
-                            message: format!(
-                                "mv rewrite: skipping candidate with invalid frozen statistics: {error}"
-                            ),
-                        });
-                        continue;
-                    }
-                };
+                candidate_factory = candidate.factory_after_analysis.clone();
+                materialized_candidates += 1;
+                entries.push(SqlMvRewriteAnalysisEntry::Candidate(candidate));
+            }
+            Ok(None) => entries.push(SqlMvRewriteAnalysisEntry::Ignored),
+            Err(error) => entries.push(SqlMvRewriteAnalysisEntry::Diagnostic(
+                SqlMvRewriteDiagnostic {
+                    mv_id: Some(definition.mv_id),
+                    message: format!("mv rewrite: skipping frozen candidate: {error}"),
+                },
+            )),
+        }
+        control.check()?;
+    }
+
+    Ok(SqlMvRewriteAnalysis { entries })
+}
+
+pub(crate) fn attach_candidate_statistics(
+    analysis: SqlMvRewriteAnalysis,
+    statistics_context: &dyn SqlStatisticsSnapshot,
+    query_stats: &mut SqlStatisticsPlan,
+    main_factory: ColumnRefFactory,
+) -> Result<(SqlMvRewritePreparation, ColumnRefFactory), crate::compiler::SqlCompileError> {
+    let mut candidates = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut factory = main_factory;
+    for entry in analysis.entries {
+        match entry {
+            SqlMvRewriteAnalysisEntry::Candidate(candidate) => {
+                factory = candidate.factory_after_analysis;
+                let (label, stats) = statistics_context.collect_table_statistics(
+                    &candidate.target_database,
+                    &candidate.target_table,
+                )?;
                 let target_stats_ref = query_stats.add_stats(label, stats);
                 candidates.push(MvRewriteCandidate {
                     mv_name: candidate.mv_name,
@@ -2227,26 +2266,26 @@ pub(crate) fn prepare_candidates(
                     target_stats_ref,
                 });
             }
-            Ok(None) => {}
-            Err(error) => diagnostics.push(SqlMvRewriteDiagnostic {
-                mv_id: Some(definition.mv_id),
-                message: format!("mv rewrite: skipping frozen candidate: {error}"),
-            }),
+            SqlMvRewriteAnalysisEntry::Diagnostic(diagnostic) => diagnostics.push(diagnostic),
+            SqlMvRewriteAnalysisEntry::Ignored => {}
         }
     }
-    SqlMvRewritePreparation {
-        candidates,
-        diagnostics,
-    }
+    Ok((
+        SqlMvRewritePreparation {
+            candidates,
+            diagnostics,
+        },
+        factory,
+    ))
 }
 
 fn build_candidate(
     analyzer_catalog: &dyn PlannerTableProvider,
     current_database: &str,
     definition: &MvRewriteDefinition,
-    factory: &mut ColumnRefFactory,
+    factory: &ColumnRefFactory,
     functions: &dyn SqlFunctionCatalog,
-) -> Result<Option<PreparedMvRewriteCandidate>, String> {
+) -> Result<Option<AnalyzedMvRewriteCandidate>, String> {
     if definition.last_refresh_snapshots.is_empty() || !definition_is_fresh(definition)? {
         return Ok(None);
     }
@@ -2297,13 +2336,13 @@ fn build_candidate(
     if names.windows(2).any(|pair| pair[0] == pair[1]) {
         return Ok(None);
     }
-    *factory = returned;
-    Ok(Some(PreparedMvRewriteCandidate {
+    Ok(Some(AnalyzedMvRewriteCandidate {
         mv_name: table.to_string(),
         mv,
         mv_scalars,
         target_database: namespace.to_string(),
         target_table,
+        factory_after_analysis: returned,
     }))
 }
 
@@ -2375,7 +2414,105 @@ fn scan_fqn(source: &ScanSource) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    struct CandidateCatalog {
+        resolutions: AtomicUsize,
+    }
+
+    impl CandidateCatalog {
+        fn new() -> Self {
+            Self {
+                resolutions: AtomicUsize::new(0),
+            }
+        }
+
+        fn table(table: &str, binding: u32) -> crate::planner::table::TableDef {
+            crate::planner::table::TableDef {
+                name: table.to_string(),
+                columns: vec![novarocks_catalog::schema::ColumnDef {
+                    name: "k".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                }],
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                source: crate::planner::table::ScanSource::Sql(
+                    crate::planner::table::SqlScanSource::new(
+                        SqlTableBindingId::new_for_test(binding),
+                        crate::planner::table::SqlTableIdentity {
+                            catalog: "iceberg".to_string(),
+                            namespace: "db".to_string(),
+                            table: table.to_string(),
+                        },
+                        crate::planner::table::SqlScanKind::Data {
+                            version: crate::planner::table::SqlTableVersionSelector::Current,
+                        },
+                    ),
+                ),
+            }
+        }
+    }
+
+    impl PlannerTableProvider for CandidateCatalog {
+        fn resolve_table_for_analysis(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+            self.resolutions.fetch_add(1, Ordering::AcqRel);
+            let binding = match table {
+                "base" => 1,
+                "mv_target" => 2,
+                _ => return Err(format!("unknown candidate table `{table}`")),
+            };
+            Ok(crate::catalog::ResolvedAnalyzerTable::from_planner(
+                catalog,
+                database,
+                Self::table(table, binding),
+            ))
+        }
+    }
+
+    fn candidate_index() -> MvRewriteDefinitionIndex {
+        MvRewriteDefinitionIndex::try_new(vec![
+            SqlMvRewriteDefinitionFacts::try_new(
+                1,
+                "select k from iceberg.db.base".to_string(),
+                vec!["iceberg.db.base".to_string()],
+                "iceberg".to_string(),
+                Some("iceberg".to_string()),
+                Some("db".to_string()),
+                Some("mv_target".to_string()),
+                BTreeMap::from([("iceberg.db.base".to_string(), 42)]),
+                BTreeMap::new(),
+                BTreeMap::from([(
+                    "iceberg.db.base".to_string(),
+                    SqlMvRewriteBaseTableFacts::resolved(Some(42), None),
+                )]),
+            )
+            .expect("candidate definition"),
+        ])
+        .expect("candidate index")
+    }
+
+    fn main_candidate_query(catalog: &CandidateCatalog) -> (LogicalPlanNode, ColumnRefFactory) {
+        let query = parse_select_query("select k from iceberg.db.base").expect("main query");
+        let (resolved, ctes, mut factory) = crate::analyzer::analyze_with_function_catalog(
+            &query,
+            catalog,
+            "db",
+            crate::functions::builtin_sql_function_catalog(),
+        )
+        .expect("analyze main query");
+        let logical =
+            crate::planner::plan_query(resolved, ctes, &mut factory).expect("plan main query");
+        (logical, factory)
+    }
 
     fn frozen_definition(state: SqlMvRewriteBaseTableFacts) -> MvRewriteDefinition {
         SqlMvRewriteDefinitionFacts::try_new(
@@ -2471,6 +2608,85 @@ mod tests {
     #[test]
     fn sqlx2_mv_candidate_limit_is_sixteen_successes() {
         assert_eq!(MAX_SUCCESSFUL_MV_REWRITE_CANDIDATES, 16);
+    }
+
+    #[test]
+    fn phase_one_materializes_mv_base_and_target_before_statistics_attachment() {
+        let catalog = CandidateCatalog::new();
+        let (logical, factory) = main_candidate_query(&catalog);
+        let analysis = analyze_candidates(
+            &candidate_index(),
+            &catalog,
+            "db",
+            &logical,
+            &factory,
+            crate::functions::builtin_sql_function_catalog(),
+            &crate::optimizer::options::SessionOptimizerSettings::default(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("analyze candidate before statistics freeze");
+        assert_eq!(
+            catalog.resolutions.load(Ordering::Acquire),
+            3,
+            "main base, candidate base, and candidate target must all materialize in phase one"
+        );
+
+        let statistics = crate::planning::dml::DmlStatisticsSnapshot::from_evidence([
+            crate::planning::dml::DmlStatisticsEvidence::Missing {
+                binding: SqlTableBindingId::new_for_test(1),
+                label: "iceberg.db.base".to_string(),
+                reason: "base statistics unavailable".to_string(),
+            },
+            crate::planning::dml::DmlStatisticsEvidence::Missing {
+                binding: SqlTableBindingId::new_for_test(2),
+                label: "iceberg.db.mv_target".to_string(),
+                reason: "target statistics unavailable".to_string(),
+            },
+        ]);
+        let (prepared, _) = attach_candidate_statistics(
+            analysis,
+            &statistics,
+            &mut SqlStatisticsPlan::empty(),
+            factory.clone(),
+        )
+        .expect("typed Missing target statistics remain conservative");
+        assert_eq!(prepared.candidates.len(), 1);
+        assert_eq!(catalog.resolutions.load(Ordering::Acquire), 3);
+
+        let analysis = analyze_candidates(
+            &candidate_index(),
+            &catalog,
+            "db",
+            &logical,
+            &factory,
+            crate::functions::builtin_sql_function_catalog(),
+            &crate::optimizer::options::SessionOptimizerSettings::default(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("reanalyze candidate for omitted-target check");
+        let base_only = crate::planning::dml::DmlStatisticsSnapshot::from_evidence([
+            crate::planning::dml::DmlStatisticsEvidence::Missing {
+                binding: SqlTableBindingId::new_for_test(1),
+                label: "iceberg.db.base".to_string(),
+                reason: "base statistics unavailable".to_string(),
+            },
+        ]);
+        let resolutions_before_attachment = catalog.resolutions.load(Ordering::Acquire);
+        let error = match attach_candidate_statistics(
+            analysis,
+            &base_only,
+            &mut SqlStatisticsPlan::empty(),
+            factory,
+        ) {
+            Ok(_) => panic!("omitted MV target binding must fail compilation"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("binding is missing"));
+        assert_eq!(
+            catalog.resolutions.load(Ordering::Acquire),
+            resolutions_before_attachment,
+            "statistics attachment must not reenter the catalog"
+        );
     }
 
     #[test]

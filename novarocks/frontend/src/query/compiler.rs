@@ -44,10 +44,10 @@ use novarocks::query_execution::request_context::{QueryExecutionContext, Request
 use novarocks::view::ViewRequestContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_sql::compiler::{
-    ExplainLevel, SqlCompileControl, SqlCompileIntent, SqlCompileRequest, SqlCompiler,
-    SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
+    ExplainLevel, SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent, SqlCompiler,
+    SqlOptimizeRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+    builtin_sql_function_catalog,
 };
-use novarocks_sql::planning::dml::DmlStatisticsSnapshot;
 use novarocks_sql::syntax::{normalize_for_raw_parse, parse_normalized_sql_raw};
 
 #[derive(Clone)]
@@ -131,23 +131,25 @@ impl FrontendQueryCompiler {
                     &self.query,
                     current_catalog,
                     &catalog_service,
-                    connector_context,
+                    connector_context.clone(),
                     TableLookupMode::ExplainStats,
                 );
-                let statistics = query_statistics_snapshot(&self.query, &materializer);
-                let mv_definitions = freeze_query_mv_rewrite_definition_index(
-                    &self.query,
-                    self.mv_repository.as_ref(),
-                    self.mv_storage_observation.as_ref(),
-                )?;
-                let output = SqlCompiler::compile(self.compile_request(
+                let mv_definitions = if force_logical_explain {
+                    None
+                } else {
+                    Some(freeze_query_mv_rewrite_definition_index(
+                        &self.query,
+                        self.mv_repository.as_ref(),
+                        self.mv_storage_observation.as_ref(),
+                    )?)
+                };
+                let analyzed = SqlCompiler::analyze(self.analyze_request(
                     &query,
                     current_catalog,
                     current_database,
                     context.execution(),
                     &materializer,
-                    &statistics,
-                    Some(&mv_definitions),
+                    mv_definitions.as_ref(),
                     if force_logical_explain {
                         SqlCompileIntent::LogicalOnly
                     } else {
@@ -158,6 +160,17 @@ impl FrontendQueryCompiler {
                     },
                 )?)
                 .map_err(|error| error.to_string())?;
+                let output = if force_logical_explain {
+                    analyzed
+                        .into_complete()
+                        .map_err(|error| error.to_string())?
+                } else {
+                    let analyzed = analyzed.into_pending().map_err(|error| error.to_string())?;
+                    let statistics =
+                        query_statistics_snapshot(&self.query, &materializer, &connector_context)?;
+                    SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
+                        .map_err(|error| error.to_string())?
+                };
                 PreparedQueryOperation::explain_lines(
                     output
                         .into_explain_lines(level, force_logical_explain)
@@ -230,7 +243,6 @@ impl FrontendQueryCompiler {
             connector_context.clone(),
             TableLookupMode::SchemaOnly,
         );
-        let statistics = query_statistics_snapshot(&self.query, &materializer);
         let mv_definitions =
             if allow_mv_rewrite_candidates && self.mv_repository.availability().is_available() {
                 Some(freeze_query_mv_rewrite_definition_index(
@@ -241,19 +253,24 @@ impl FrontendQueryCompiler {
             } else {
                 None
             };
-        let distributed_plan = SqlCompiler::compile(self.compile_request(
+        let analyzed = SqlCompiler::analyze(self.analyze_request(
             query,
             current_catalog,
             current_database,
             execution,
             &materializer,
-            &statistics,
             mv_definitions.as_ref(),
             intent,
         )?)
         .map_err(|error| error.to_string())?
-        .into_distributed_plan()
+        .into_pending()
         .map_err(|error| error.to_string())?;
+        let statistics = query_statistics_snapshot(&self.query, &materializer, &connector_context)?;
+        let distributed_plan =
+            SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
+                .map_err(|error| error.to_string())?
+                .into_distributed_plan()
+                .map_err(|error| error.to_string())?;
         let (assembly, completion) = prepare_compiled_distributed_query(
             distributed_plan,
             &self.query,
@@ -268,22 +285,21 @@ impl FrontendQueryCompiler {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn compile_request<'a>(
+    fn analyze_request<'a>(
         &self,
         query: &sqlparser::ast::Query,
         current_catalog: Option<&str>,
         current_database: &str,
         execution: &QueryExecutionContext,
         materializer: &'a dyn novarocks_sql::compiler::SqlCatalogSnapshot,
-        statistics: &'a DmlStatisticsSnapshot,
         mv_definitions: Option<&'a novarocks_sql::compiler::MvRewriteDefinitionIndex>,
         intent: SqlCompileIntent,
-    ) -> Result<SqlCompileRequest<'a>, String> {
+    ) -> Result<SqlAnalyzeRequest<'a>, String> {
         let backend_count =
             NonZeroUsize::new(execution.topology().targets().len()).ok_or_else(|| {
                 "SQL compilation requires a non-empty admitted backend topology".to_string()
             })?;
-        Ok(SqlCompileRequest::new(
+        Ok(SqlAnalyzeRequest::new(
             SqlStatementInput::parsed_query(Box::new(query.clone())),
             intent,
             SqlSessionContext {
@@ -293,7 +309,6 @@ impl FrontendQueryCompiler {
             },
             SqlPlanningEnvironment::Distributed { backend_count },
             materializer,
-            statistics,
             builtin_sql_function_catalog(),
             mv_definitions,
             SqlCompileControl::new(

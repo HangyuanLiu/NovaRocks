@@ -20,7 +20,7 @@
 //! This module deliberately owns only neutral compiler inputs and outputs.
 //! Application admission, connector execution preparation, native encoding,
 //! and query lifecycle orchestration remain outside this boundary.
-// Design: ADR-0025 (docs/adr/ADR-0025-sql-compiler-explicit-input-boundary.md)
+// Design: ADR-0072 (docs/adr/ADR-0072-sql-compilation-freezes-statistics-after-analysis.md)
 // Design: ADR-0036 (docs/adr/ADR-0036-sql-compiler-dependency-inversion.md)
 
 use std::collections::{HashMap, HashSet};
@@ -65,7 +65,7 @@ pub trait SqlCatalogSnapshot {
 
 /// Borrowed adapter over the application-owned query-local table snapshot.
 ///
-/// It exposes only the catalog vocabulary required by `SqlCompileRequest` and
+/// It exposes only the catalog vocabulary required by `SqlAnalyzeRequest` and
 /// cannot construct or mutate planner tables itself.
 pub struct SqlPlannerTableSnapshot<'a> {
     provider: &'a dyn crate::catalog::PlannerTableProvider,
@@ -336,51 +336,22 @@ impl SqlCompileControl {
     }
 }
 
-/// A logical request cannot resolve another table or function.  These values
-/// exist only to keep the request shape uniform; any accidental use is a
-/// compiler contract violation rather than an application fallback.
-struct SqlLogicalInputCatalog;
-
-impl SqlCatalogSnapshot for SqlLogicalInputCatalog {
-    fn planner_table_provider(&self) -> &dyn crate::catalog::PlannerTableProvider {
-        panic!("logical SQL compiler input must not resolve catalog tables")
-    }
-}
-
-struct SqlLogicalInputFunctions;
-
-impl SqlFunctionCatalog for SqlLogicalInputFunctions {
-    fn resolve_scalar_signature(
-        &self,
-        _name: &str,
-        _arg_types: &[arrow::datatypes::DataType],
-    ) -> Result<crate::functions::ResolvedScalarFunction, crate::functions::ResolveError> {
-        panic!("logical SQL compiler input must not resolve functions")
-    }
-
-    fn volatility(&self, _name: &str) -> crate::functions::FunctionVolatility {
-        panic!("logical SQL compiler input must not resolve functions")
-    }
-}
-
-static SQL_LOGICAL_INPUT_CATALOG: SqlLogicalInputCatalog = SqlLogicalInputCatalog;
-static SQL_LOGICAL_INPUT_FUNCTIONS: SqlLogicalInputFunctions = SqlLogicalInputFunctions;
-
-/// Complete immutable input consumed by the pure SQL compiler.
-pub struct SqlCompileRequest<'a> {
+/// Immutable input for the catalog-touching analysis/materialization phase.
+/// Statistics are deliberately absent because exact binding tokens do not
+/// exist until this phase has completed.
+pub struct SqlAnalyzeRequest<'a> {
     pub(crate) statement: SqlStatementInput,
     pub(crate) intent: SqlCompileIntent,
     pub(crate) session: SqlSessionContext,
     pub(crate) environment: SqlPlanningEnvironment,
-    pub(crate) catalog: &'a dyn SqlCatalogSnapshot,
-    pub(crate) statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
-    pub(crate) functions: &'a dyn SqlFunctionCatalog,
+    pub(crate) catalog: Option<&'a dyn SqlCatalogSnapshot>,
+    pub(crate) functions: Option<&'a dyn SqlFunctionCatalog>,
     pub(crate) mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
     pub(crate) imv_rewrite: Option<&'a SqlImvPlanningInput>,
     pub(crate) control: SqlCompileControl,
 }
 
-impl<'a> SqlCompileRequest<'a> {
+impl<'a> SqlAnalyzeRequest<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         statement: SqlStatementInput,
@@ -388,7 +359,6 @@ impl<'a> SqlCompileRequest<'a> {
         session: SqlSessionContext,
         environment: SqlPlanningEnvironment,
         catalog: &'a dyn SqlCatalogSnapshot,
-        statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
         functions: &'a dyn SqlFunctionCatalog,
         mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
         control: SqlCompileControl,
@@ -398,26 +368,23 @@ impl<'a> SqlCompileRequest<'a> {
             intent,
             session,
             environment,
-            catalog,
-            statistics,
-            functions,
+            catalog: Some(catalog),
+            functions: Some(functions),
             mv_rewrite,
             imv_rewrite: None,
             control,
         }
     }
 
-    /// Build a request for an already SQL-owned logical plan.  It deliberately
-    /// has no catalog, function, or MV-candidate callback: the input has
-    /// already crossed analysis and the compiler may only optimize its frozen
-    /// SQL facts.
+    /// Build a phase-one request for an already SQL-owned logical plan. It has
+    /// no catalog, function, or MV-candidate capability and therefore cannot
+    /// materialize another binding.
     pub(crate) fn new_logical(
         plan: crate::planner::logical::LogicalPlanNode,
         factory: crate::column_id::ColumnRefFactory,
         intent: SqlCompileIntent,
         session: SqlSessionContext,
         environment: SqlPlanningEnvironment,
-        statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
         control: SqlCompileControl,
     ) -> Self {
         Self {
@@ -425,9 +392,8 @@ impl<'a> SqlCompileRequest<'a> {
             intent,
             session,
             environment,
-            catalog: &SQL_LOGICAL_INPUT_CATALOG,
-            statistics,
-            functions: &SQL_LOGICAL_INPUT_FUNCTIONS,
+            catalog: None,
+            functions: None,
             mv_rewrite: None,
             imv_rewrite: None,
             control,
@@ -445,6 +411,65 @@ impl<'a> SqlCompileRequest<'a> {
     pub(crate) fn with_imv_rewrite(mut self, input: &'a SqlImvPlanningInput) -> Self {
         self.imv_rewrite = Some(input);
         self
+    }
+}
+
+/// Opaque, move-only compiler state returned after every catalog-touching
+/// analysis path has closed its request-local binding set.
+pub struct SqlAnalyzedQuery {
+    logical_plan: crate::planner::logical::LogicalPlanNode,
+    factory: crate::column_id::ColumnRefFactory,
+    intent: SqlCompileIntent,
+    settings: SessionOptimizerSettings,
+    change_stream: crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
+    mv_rewrite: mv_rewrite::SqlMvRewriteAnalysis,
+    control: SqlCompileControl,
+}
+
+/// Typed phase-one outcome. Analyze-only and logical-only requests terminate
+/// here; every optimizer or distributed terminal returns one opaque handle.
+pub enum SqlAnalyzeOutput {
+    Complete(SqlCompileOutput),
+    Pending(SqlAnalyzedQuery),
+}
+
+impl SqlAnalyzeOutput {
+    pub fn into_complete(self) -> Result<SqlCompileOutput, SqlCompileError> {
+        match self {
+            Self::Complete(output) => Ok(output),
+            Self::Pending(_) => Err(SqlCompileError::InvalidRequest(
+                "SQL analysis requires a frozen statistics snapshot before optimization"
+                    .to_string(),
+            )),
+        }
+    }
+
+    pub fn into_pending(self) -> Result<SqlAnalyzedQuery, SqlCompileError> {
+        match self {
+            Self::Pending(analyzed) => Ok(analyzed),
+            Self::Complete(_) => Err(SqlCompileError::InvalidRequest(
+                "SQL analysis already produced a terminal result".to_string(),
+            )),
+        }
+    }
+}
+
+/// Immutable input for the no-catalog optimize/seal phase. The analyzed
+/// handle is consumed so the same compiler state cannot be sealed twice.
+pub struct SqlOptimizeRequest<'a> {
+    analyzed: SqlAnalyzedQuery,
+    statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
+}
+
+impl<'a> SqlOptimizeRequest<'a> {
+    pub fn new(
+        analyzed: SqlAnalyzedQuery,
+        statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
+    ) -> Self {
+        Self {
+            analyzed,
+            statistics,
+        }
     }
 }
 
@@ -495,7 +520,6 @@ pub struct SqlImvRefreshExplainContext<'a> {
     pub optimizer_settings: SessionOptimizerSettings,
     pub environment: SqlPlanningEnvironment,
     pub catalog: &'a dyn SqlCatalogSnapshot,
-    pub statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
     pub functions: &'a dyn SqlFunctionCatalog,
     pub control: SqlCompileControl,
     pub level: ExplainLevel,
@@ -538,7 +562,6 @@ pub fn compile_imv_refresh_explain_lines(
         optimizer_settings,
         environment,
         catalog,
-        statistics,
         functions,
         control,
         level,
@@ -553,11 +576,11 @@ pub fn compile_imv_refresh_explain_lines(
         optimizer_settings,
         environment,
         catalog,
-        statistics,
         functions,
         control,
     );
-    SqlCompiler::compile(request)?.into_explain_lines(level, true)
+    let output = SqlCompiler::analyze(request)?.into_complete()?;
+    output.into_explain_lines(level, true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -569,11 +592,10 @@ fn imv_refresh_explain_request<'a>(
     optimizer_settings: SessionOptimizerSettings,
     environment: SqlPlanningEnvironment,
     catalog: &'a dyn SqlCatalogSnapshot,
-    statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
     functions: &'a dyn SqlFunctionCatalog,
     control: SqlCompileControl,
-) -> SqlCompileRequest<'a> {
-    SqlCompileRequest::new(
+) -> SqlAnalyzeRequest<'a> {
+    SqlAnalyzeRequest::new(
         SqlStatementInput::parsed_query(Box::new(query)),
         SqlCompileIntent::LogicalOnly,
         SqlSessionContext {
@@ -583,7 +605,6 @@ fn imv_refresh_explain_request<'a>(
         },
         environment,
         catalog,
-        statistics,
         functions,
         None,
         control,
@@ -934,13 +955,13 @@ impl std::fmt::Display for SqlCompileError {
 
 impl std::error::Error for SqlCompileError {}
 
-/// The canonical parse/analyze/logical/optimize/physical/distributed kernel.
-/// It accepts only immutable SQL facts and checks request control at every
-/// externally visible phase boundary.
+/// The canonical two-phase SQL compiler. Catalog materialization belongs only
+/// to [`SqlCompiler::analyze`]; optimization and plan sealing belong only to
+/// [`SqlCompiler::optimize`] after the application freezes statistics.
 pub struct SqlCompiler;
 
 impl SqlCompiler {
-    pub fn compile(request: SqlCompileRequest<'_>) -> Result<SqlCompileOutput, SqlCompileError> {
+    pub fn analyze(request: SqlAnalyzeRequest<'_>) -> Result<SqlAnalyzeOutput, SqlCompileError> {
         request.check_control()?;
         let (mut logical_plan, mut factory, logical_input) = match &request.statement.kind {
             SqlStatementInputKind::LogicalPlan { plan, factory } => {
@@ -948,12 +969,24 @@ impl SqlCompiler {
             }
             _ => {
                 let query = parse_query(&request.statement)?;
-                let catalog = request.catalog.planner_table_provider();
+                let catalog = request
+                    .catalog
+                    .ok_or_else(|| {
+                        SqlCompileError::InvalidRequest(
+                            "SQL analysis requires a catalog snapshot".to_string(),
+                        )
+                    })?
+                    .planner_table_provider();
+                let functions = request.functions.ok_or_else(|| {
+                    SqlCompileError::InvalidRequest(
+                        "SQL analysis requires a function catalog".to_string(),
+                    )
+                })?;
                 let (resolved, ctes, mut factory) = crate::analyzer::analyze_with_function_catalog(
                     &query,
                     catalog,
                     &request.session.current_database,
-                    request.functions,
+                    functions,
                 )
                 .map_err(SqlCompileError::Compilation)?;
                 request.check_control()?;
@@ -965,17 +998,21 @@ impl SqlCompiler {
         request.check_control()?;
 
         if matches!(request.intent, SqlCompileIntent::AnalyzeOnly) {
-            return Ok(SqlCompileOutput::analysis(SqlAnalysisOutput {
-                logical_plan,
-                factory,
-            }));
+            return Ok(SqlAnalyzeOutput::Complete(SqlCompileOutput::analysis(
+                SqlAnalysisOutput {
+                    logical_plan,
+                    factory,
+                },
+            )));
         }
         if matches!(request.intent, SqlCompileIntent::LogicalOnly) && request.imv_rewrite.is_none()
         {
-            return Ok(SqlCompileOutput::logical(SqlAnalysisOutput {
-                logical_plan,
-                factory,
-            }));
+            return Ok(SqlAnalyzeOutput::Complete(SqlCompileOutput::logical(
+                SqlAnalysisOutput {
+                    logical_plan,
+                    factory,
+                },
+            )));
         }
         let mut settings = request.session.optimizer_settings.clone();
         if !matches!(request.intent, SqlCompileIntent::LogicalOnly)
@@ -1030,11 +1067,65 @@ impl SqlCompiler {
             request.check_control()?;
         }
         if matches!(request.intent, SqlCompileIntent::LogicalOnly) {
-            return Ok(SqlCompileOutput::logical(SqlAnalysisOutput {
-                logical_plan,
-                factory,
-            }));
+            return Ok(SqlAnalyzeOutput::Complete(SqlCompileOutput::logical(
+                SqlAnalysisOutput {
+                    logical_plan,
+                    factory,
+                },
+            )));
         }
+
+        let mv_rewrite = if let Some(definitions) = request.mv_rewrite {
+            let catalog = request
+                .catalog
+                .ok_or_else(|| {
+                    SqlCompileError::InvalidRequest(
+                        "MV rewrite analysis requires a catalog snapshot".to_string(),
+                    )
+                })?
+                .planner_table_provider();
+            let functions = request.functions.ok_or_else(|| {
+                SqlCompileError::InvalidRequest(
+                    "MV rewrite analysis requires a function catalog".to_string(),
+                )
+            })?;
+            mv_rewrite::analyze_candidates(
+                definitions,
+                catalog,
+                &request.session.current_database,
+                &logical_plan,
+                &factory,
+                functions,
+                &settings,
+                &request.control,
+            )?
+        } else {
+            mv_rewrite::SqlMvRewriteAnalysis::empty()
+        };
+        request.check_control()?;
+
+        Ok(SqlAnalyzeOutput::Pending(SqlAnalyzedQuery {
+            logical_plan,
+            factory,
+            intent: request.intent,
+            settings,
+            change_stream,
+            mv_rewrite,
+            control: request.control,
+        }))
+    }
+
+    pub fn optimize(request: SqlOptimizeRequest<'_>) -> Result<SqlCompileOutput, SqlCompileError> {
+        let SqlAnalyzedQuery {
+            logical_plan,
+            factory,
+            intent,
+            settings,
+            change_stream,
+            mv_rewrite,
+            control,
+        } = request.analyzed;
+        control.check()?;
         let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
         let mut optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             &logical_plan,
@@ -1042,33 +1133,19 @@ impl SqlCompiler {
         )
         .map_err(SqlCompileError::Compilation)?;
         let mut statistics = collect_statistics(request.statistics, &mut optimizer_expr)?;
-        request.check_control()?;
-        let mv_rewrite = request
-            .mv_rewrite
-            .map(|definitions| {
-                let catalog = request.catalog.planner_table_provider();
-                mv_rewrite::prepare_candidates(
-                    definitions,
-                    catalog,
-                    &request.session.current_database,
-                    &logical_plan,
-                    &mut factory,
-                    request.functions,
-                    request.statistics,
-                    &mut statistics,
-                    &settings,
-                )
-            })
-            .unwrap_or_else(|| mv_rewrite::SqlMvRewritePreparation {
-                candidates: Vec::new(),
-                diagnostics: Vec::new(),
-            });
+        control.check()?;
+        let (mv_rewrite, factory) = mv_rewrite::attach_candidate_statistics(
+            mv_rewrite,
+            request.statistics,
+            &mut statistics,
+            factory,
+        )?;
         let mv_rewrite::SqlMvRewritePreparation {
             candidates: mv_candidates,
             diagnostics: mv_rewrite_diagnostics,
         } = mv_rewrite;
-        request.check_control()?;
-        let root_distribution = match &request.intent {
+        control.check()?;
+        let root_distribution = match &intent {
             SqlCompileIntent::IcebergWrite { root_distribution } => {
                 resolve_root_distribution_requirement(&logical_plan, root_distribution)?
             }
@@ -1093,12 +1170,12 @@ impl SqlCompiler {
             ),
         }
         .map_err(SqlCompileError::Compilation)?;
-        request.check_control()?;
+        control.check()?;
 
         if let SqlCompileIntent::Explain {
             level,
             analyze: false,
-        } = request.intent
+        } = intent
         {
             let mut lines = Vec::new();
             if matches!(level, ExplainLevel::Costs) {
@@ -1117,7 +1194,7 @@ impl SqlCompiler {
         }
 
         if matches!(
-            request.intent,
+            intent,
             SqlCompileIntent::IcebergWrite { .. } | SqlCompileIntent::ChangeStreamWrite
         ) {
             return Ok(SqlCompileOutput::optimized(SqlOptimizedOutput {
@@ -1133,7 +1210,7 @@ impl SqlCompiler {
         let distributed_plan =
             crate::planner::pipeline::build_distributed_plan_with_settings(physical, &settings)
                 .map_err(SqlCompileError::Compilation)?;
-        request.check_control()?;
+        control.check()?;
         Ok(SqlCompileOutput::distributed(SqlDistributedOutput {
             distributed_plan,
             statistics,
@@ -1306,7 +1383,7 @@ fn apply_planning_environment(
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock};
     use std::time::{Duration, Instant};
 
@@ -1339,6 +1416,60 @@ mod tests {
         LazyLock::new(crate::planning::dml::DmlStatisticsSnapshot::empty);
     static FUNCTIONS: Functions = Functions;
 
+    struct CountingTableCatalog {
+        resolutions: AtomicUsize,
+    }
+
+    impl CountingTableCatalog {
+        fn new() -> Self {
+            Self {
+                resolutions: AtomicUsize::new(0),
+            }
+        }
+
+        fn resolution_count(&self) -> usize {
+            self.resolutions.load(Ordering::Acquire)
+        }
+    }
+
+    impl crate::catalog::PlannerTableProvider for CountingTableCatalog {
+        fn resolve_table_for_analysis(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+            self.resolutions.fetch_add(1, Ordering::AcqRel);
+            if table != "orders" {
+                return Err(format!("unknown test table `{table}`"));
+            }
+            Ok(crate::catalog::ResolvedAnalyzerTable::from_planner(
+                catalog,
+                database,
+                crate::planner::table::TableDef {
+                    name: table.to_string(),
+                    columns: vec![novarocks_catalog::schema::ColumnDef {
+                        name: "order_id".to_string(),
+                        data_type: arrow::datatypes::DataType::Int64,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    }],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: crate::planner::table::test_sql_scan_source(
+                        crate::planner::table::SqlScanKind::ConnectorRead,
+                    ),
+                },
+            ))
+        }
+    }
+
+    impl SqlCatalogSnapshot for CountingTableCatalog {
+        fn planner_table_provider(&self) -> &dyn crate::catalog::PlannerTableProvider {
+            self
+        }
+    }
+
     #[derive(Default)]
     struct Cancellation(AtomicBool);
 
@@ -1361,8 +1492,8 @@ mod tests {
         )
     }
 
-    fn request(control: SqlCompileControl) -> SqlCompileRequest<'static> {
-        SqlCompileRequest::new(
+    fn request(control: SqlCompileControl) -> SqlAnalyzeRequest<'static> {
+        SqlAnalyzeRequest::new(
             SqlStatementInput::sql("select 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
@@ -1374,11 +1505,49 @@ mod tests {
                 backend_count: NonZeroUsize::new(3).unwrap(),
             },
             &CATALOG,
-            &STATISTICS,
             &FUNCTIONS,
             None,
             control,
         )
+    }
+
+    fn analyze_then_optimize(
+        request: SqlAnalyzeRequest<'_>,
+    ) -> Result<SqlCompileOutput, SqlCompileError> {
+        let analyzed = SqlCompiler::analyze(request)?.into_pending()?;
+        SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &STATISTICS))
+    }
+
+    fn table_request<'a>(
+        catalog: &'a CountingTableCatalog,
+        control: SqlCompileControl,
+    ) -> SqlAnalyzeRequest<'a> {
+        SqlAnalyzeRequest::new(
+            SqlStatementInput::sql("select order_id from orders"),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                current_catalog: Some("iceberg".to_string()),
+                current_database: "db".to_string(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed {
+                backend_count: NonZeroUsize::new(3).unwrap(),
+            },
+            catalog,
+            &FUNCTIONS,
+            None,
+            control,
+        )
+    }
+
+    fn missing_table_statistics() -> crate::planning::dml::DmlStatisticsSnapshot {
+        crate::planning::dml::DmlStatisticsSnapshot::from_evidence([
+            crate::planning::dml::DmlStatisticsEvidence::Missing {
+                binding: crate::binding::SqlTableBindingId::new_for_test(1),
+                label: "iceberg.db.orders".to_string(),
+                reason: "statistics are not published".to_string(),
+            },
+        ])
     }
 
     fn imv_validation_input(validation: SqlImvRewriteValidation) -> SqlImvPlanningInput {
@@ -1451,7 +1620,7 @@ mod tests {
         let cancellation = Arc::new(Cancellation::default());
         cancellation.request();
         assert!(matches!(
-            SqlCompiler::compile(request(control(None, &cancellation))),
+            analyze_then_optimize(request(control(None, &cancellation))),
             Err(SqlCompileError::Cancelled)
         ));
     }
@@ -1461,7 +1630,126 @@ mod tests {
         let cancellation = Arc::new(Cancellation::default());
         let deadline = Instant::now() - Duration::from_millis(1);
         assert!(matches!(
-            SqlCompiler::compile(request(control(Some(deadline), &cancellation))),
+            analyze_then_optimize(request(control(Some(deadline), &cancellation))),
+            Err(SqlCompileError::DeadlineExceeded)
+        ));
+    }
+
+    #[test]
+    fn two_phase_compiler_uses_typed_missing_without_reentering_catalog() {
+        let catalog = CountingTableCatalog::new();
+        let cancellation = Arc::new(Cancellation::default());
+        let analyzed = SqlCompiler::analyze(table_request(&catalog, control(None, &cancellation)))
+            .expect("phase one analyzes the table")
+            .into_pending()
+            .expect("query requires frozen statistics");
+        assert_eq!(catalog.resolution_count(), 1);
+
+        let statistics = missing_table_statistics();
+        let output = SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
+            .expect("typed Missing is conservative, not fatal");
+        assert!(output.is_distributed());
+        assert_eq!(
+            catalog.resolution_count(),
+            1,
+            "phase two must not resolve catalog tables"
+        );
+    }
+
+    #[test]
+    fn phase_two_fails_closed_when_snapshot_omits_analyzed_binding() {
+        let catalog = CountingTableCatalog::new();
+        let cancellation = Arc::new(Cancellation::default());
+        let analyzed = SqlCompiler::analyze(table_request(&catalog, control(None, &cancellation)))
+            .expect("phase one analyzes the table")
+            .into_pending()
+            .expect("query requires frozen statistics");
+
+        let error = match SqlCompiler::optimize(SqlOptimizeRequest::new(
+            analyzed,
+            &crate::planning::dml::DmlStatisticsSnapshot::empty(),
+        )) {
+            Ok(_) => panic!("an omitted binding token must be fatal"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("binding is missing"),
+            "unexpected missing-binding error: {error}"
+        );
+        assert_eq!(catalog.resolution_count(), 1);
+    }
+
+    #[test]
+    fn phase_two_preserves_all_fatal_statistics_evidence() {
+        use crate::planning::dml::{DmlStatisticsEvidence, DmlStatisticsFailure};
+
+        let failures = [
+            DmlStatisticsFailure::OwnerMismatch,
+            DmlStatisticsFailure::IncarnationMismatch,
+            DmlStatisticsFailure::DataVersionMismatch,
+            DmlStatisticsFailure::CorruptEvidence("invalid bounds".to_string()),
+        ];
+        for failure in failures {
+            let catalog = CountingTableCatalog::new();
+            let cancellation = Arc::new(Cancellation::default());
+            let analyzed =
+                SqlCompiler::analyze(table_request(&catalog, control(None, &cancellation)))
+                    .expect("phase one analyzes the table")
+                    .into_pending()
+                    .expect("query requires frozen statistics");
+            let statistics = crate::planning::dml::DmlStatisticsSnapshot::from_evidence([
+                DmlStatisticsEvidence::Fatal {
+                    binding: crate::binding::SqlTableBindingId::new_for_test(1),
+                    label: "iceberg.db.orders".to_string(),
+                    failure: failure.clone(),
+                },
+            ]);
+
+            let error = match SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
+            {
+                Ok(_) => panic!("fatal statistics evidence must fail compilation: {failure:?}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("invalid"),
+                "fatal evidence must retain an explicit statistics error: {error}"
+            );
+            assert_eq!(catalog.resolution_count(), 1);
+        }
+    }
+
+    #[test]
+    fn phase_two_observes_cancellation_after_analysis() {
+        let catalog = CountingTableCatalog::new();
+        let cancellation = Arc::new(Cancellation::default());
+        let analyzed = SqlCompiler::analyze(table_request(&catalog, control(None, &cancellation)))
+            .expect("phase one completes before cancellation")
+            .into_pending()
+            .expect("query requires frozen statistics");
+        cancellation.request();
+
+        assert!(matches!(
+            SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &STATISTICS)),
+            Err(SqlCompileError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn phase_two_observes_deadline_after_analysis() {
+        let catalog = CountingTableCatalog::new();
+        let cancellation = Arc::new(Cancellation::default());
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let analyzed = SqlCompiler::analyze(table_request(
+            &catalog,
+            control(Some(deadline), &cancellation),
+        ))
+        .expect("phase one completes before the deadline")
+        .into_pending()
+        .expect("query requires frozen statistics");
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+
+        assert!(matches!(
+            SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &STATISTICS)),
             Err(SqlCompileError::DeadlineExceeded)
         ));
     }
@@ -1514,7 +1802,6 @@ mod tests {
             SessionOptimizerSettings::default(),
             SqlPlanningEnvironment::NotApplicable,
             &CATALOG,
-            &STATISTICS,
             &FUNCTIONS,
             control(None, &cancellation),
         );
@@ -1655,7 +1942,7 @@ mod tests {
         let catalog = crate::catalog::local::PlannerMemoryCatalog::default();
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
-        let plan = SqlCompiler::compile(SqlCompileRequest::new(
+        let plan = analyze_then_optimize(SqlAnalyzeRequest::new(
             SqlStatementInput::sql("select 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
@@ -1667,7 +1954,6 @@ mod tests {
                 backend_count: NonZeroUsize::new(3).expect("non-zero fixture topology"),
             },
             &catalog_snapshot,
-            &STATISTICS,
             crate::functions::builtin_sql_function_catalog(),
             None,
             control(None, &cancellation),
@@ -1707,7 +1993,7 @@ mod tests {
         let catalog = crate::catalog::local::PlannerMemoryCatalog::default();
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
-        let request = SqlCompileRequest::new(
+        let request = SqlAnalyzeRequest::new(
             SqlStatementInput::sql("select 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
@@ -1719,14 +2005,13 @@ mod tests {
                 backend_count: NonZeroUsize::new(3).expect("non-zero fixture topology"),
             },
             &catalog_snapshot,
-            &STATISTICS,
             crate::functions::builtin_sql_function_catalog(),
             None,
             control(None, &cancellation),
         );
 
         assert!(
-            SqlCompiler::compile(request)
+            analyze_then_optimize(request)
                 .expect("query compile")
                 .is_distributed()
         );
@@ -1737,7 +2022,7 @@ mod tests {
         let catalog = crate::catalog::local::PlannerMemoryCatalog::default();
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
-        let request = SqlCompileRequest::new(
+        let request = SqlAnalyzeRequest::new(
             SqlStatementInput::sql("select 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
@@ -1749,14 +2034,13 @@ mod tests {
                 backend_count: NonZeroUsize::new(3).expect("non-zero fixture topology"),
             },
             &catalog_snapshot,
-            &STATISTICS,
             crate::functions::builtin_sql_function_catalog(),
             None,
             control(None, &cancellation),
         );
 
         assert!(
-            SqlCompiler::compile(request)
+            analyze_then_optimize(request)
                 .expect("query compile")
                 .is_distributed()
         );
@@ -1782,7 +2066,7 @@ mod tests {
         let catalog = crate::catalog::local::PlannerMemoryCatalog::default();
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
-        let request = SqlCompileRequest::new(
+        let request = SqlAnalyzeRequest::new(
             SqlStatementInput::sql("select 1 as payload"),
             SqlCompileIntent::IcebergWrite {
                 root_distribution: RootDistributionRequirement::ShuffleOutputName(
@@ -1798,13 +2082,12 @@ mod tests {
                 backend_count: NonZeroUsize::new(3).expect("non-zero fixture topology"),
             },
             &catalog_snapshot,
-            &STATISTICS,
             crate::functions::builtin_sql_function_catalog(),
             None,
             control(None, &cancellation),
         );
         assert!(matches!(
-            SqlCompiler::compile(request),
+            analyze_then_optimize(request),
             Err(SqlCompileError::InvalidRequest(error)) if error.contains("output column 'missing' not found")
         ));
     }

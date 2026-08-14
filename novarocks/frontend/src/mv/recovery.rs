@@ -986,7 +986,7 @@ mod tests {
         ExternalMutationEffect, ExternalMutationEvidence,
     };
     use novarocks_spi::state_store::FeDeploymentView;
-    use novarocks_sql::planner::vocabulary::ApplyKeySource;
+    use novarocks_sql::planning::mv::ApplyKeySource;
     use novarocks_state_store::{
         StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
         StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,

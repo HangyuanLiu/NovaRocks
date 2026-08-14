@@ -34,7 +34,7 @@ use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::model::{MvStorageEngine, MvTarget};
 use crate::mv::refresh_io::{observe_current_refresh_base_with_ports, parse_iceberg_table_refs};
 use novarocks_spi::connector::ConnectorRequestContext;
-use novarocks_sql::mv_refresh::MvRefreshStatement;
+use novarocks_sql::planning::mv::MvRefreshStatement;
 
 #[derive(Clone)]
 pub struct StandaloneMvBackgroundEngine {

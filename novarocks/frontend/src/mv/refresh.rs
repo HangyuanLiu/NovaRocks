@@ -48,7 +48,7 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorWriteReceipt, CreateOrReplacePolicy,
     DropPolicy, ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
 };
-use novarocks_sql::mv_refresh::MvRefreshFinalizeFacts;
+use novarocks_sql::planning::mv::MvRefreshFinalizeFacts;
 use sha2::{Digest, Sha256};
 
 /// Dependencies retained by the frontend composition root.  They have no

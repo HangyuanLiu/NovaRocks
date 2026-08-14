@@ -575,7 +575,7 @@ fn refresh_statement_cannot_fall_through_the_generic_statement_handler() {
     let error = service
         .try_handle_statement(
             &engine,
-            &MvApplicationStatement::Refresh(novarocks_sql::mv_refresh::MvRefreshStatement {
+            &MvApplicationStatement::Refresh(novarocks_sql::planning::mv::MvRefreshStatement {
                 name_parts: vec!["orders_mv".to_string()],
                 full: false,
             }),

@@ -404,15 +404,11 @@ fn compile_dml_change_stream_write(
         });
     }
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
-    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-        state,
-        Arc::clone(&table_bindings),
-    );
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| {
             "MOR change-stream write requires a frozen non-empty backend topology".to_string()
         })?;
-    let request = novarocks_sql::compiler::SqlCompileRequest::new(
+    let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
         novarocks_sql::compiler::SqlSessionContext {
@@ -422,7 +418,6 @@ fn compile_dml_change_stream_write(
         },
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog,
-        &statistics,
         novarocks_sql::compiler::builtin_sql_function_catalog(),
         None,
         novarocks_sql::compiler::SqlCompileControl::new(
@@ -432,9 +427,21 @@ fn compile_dml_change_stream_write(
             ),
         ),
     );
+    let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
+        .map_err(|error| error.to_string())?
+        .into_pending()
+        .map_err(|error| error.to_string())?;
+    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+        state,
+        Arc::clone(&table_bindings),
+        connector_context,
+    )?;
     let sealed =
         novarocks_sql::planning::dml::compile_dml_change_stream(DmlChangeStreamCompileRequest {
-            compile_request: request,
+            optimize_request: novarocks_sql::compiler::SqlOptimizeRequest::new(
+                analyzed,
+                &statistics,
+            ),
             kind,
             routes,
             pre_expand_keyed_assert,
@@ -2872,15 +2879,10 @@ fn execute_exact_cow_match_query(
             vec![overlay],
             state.catalog_application().map(Arc::as_ref),
         );
-    let statistics =
-        crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-            state,
-            Arc::clone(&table_bindings),
-        );
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| "COW match execution requires a non-empty admitted topology".to_string())?;
-    let request = novarocks_sql::compiler::SqlCompileRequest::new(
+    let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
         novarocks_sql::compiler::SqlCompileIntent::Query,
         novarocks_sql::compiler::SqlSessionContext {
@@ -2890,7 +2892,6 @@ fn execute_exact_cow_match_query(
         },
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog,
-        &statistics,
         novarocks_sql::compiler::builtin_sql_function_catalog(),
         None,
         novarocks_sql::compiler::SqlCompileControl::new(
@@ -2900,7 +2901,19 @@ fn execute_exact_cow_match_query(
             ),
         ),
     );
-    let distributed = novarocks_sql::planning::dml::compile_query_distributed_plan(request)?;
+    let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
+        .map_err(|error| error.to_string())?
+        .into_pending()
+        .map_err(|error| error.to_string())?;
+    let statistics =
+        crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+            state,
+            Arc::clone(&table_bindings),
+            connector_context,
+        )?;
+    let distributed = novarocks_sql::planning::dml::compile_query_distributed_plan(
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics),
+    )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
         state.connector_control().as_ref(),

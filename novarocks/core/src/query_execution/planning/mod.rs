@@ -29,7 +29,7 @@ pub(crate) mod write_sink;
 use std::sync::Arc;
 
 use crate::query_execution::cancellation::QueryCancellationView;
-use novarocks_sql::compiler::{SqlCancellationObservation, SqlCompileRequest};
+use novarocks_sql::compiler::{SqlAnalyzeRequest, SqlCancellationObservation};
 
 #[derive(Clone)]
 pub(crate) struct QueryCancellationObservation {
@@ -61,6 +61,6 @@ pub(crate) struct PostCompilePlanningContext<'a> {
 }
 
 pub(crate) struct QueryPlanningInputs<'a> {
-    pub(crate) compile_request: SqlCompileRequest<'a>,
+    pub(crate) analyze_request: SqlAnalyzeRequest<'a>,
     pub(crate) post_compile: PostCompilePlanningContext<'a>,
 }

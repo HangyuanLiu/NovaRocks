@@ -23,14 +23,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use novarocks_sql::{
-    planner::vocabulary::ApplyKeySource,
-    planning::mv::{
-        MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
-        MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-        MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
-        MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME,
-    },
+use novarocks_sql::planning::mv::{
+    ApplyKeySource, MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
+    MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+    MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
+    MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

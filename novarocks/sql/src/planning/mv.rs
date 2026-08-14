@@ -15,7 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
+pub use crate::mv_refresh::{
+    AggregateFunctionKind, FULL_REFRESH_DISABLED_MESSAGE, MvRefreshFinalizeFacts,
+    MvRefreshStatement, SqlMvTarget, VisibleAggregateOutput, first_refresh,
+};
+pub use crate::planner::vocabulary::ApplyKeySource;
 
 /// SQL-owned branch marker used by sealed UNION ALL MV refresh layouts.
 /// Application materialization may attach only this immutable column label;

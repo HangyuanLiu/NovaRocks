@@ -289,7 +289,7 @@ pub(crate) fn analyze_mv_select_with_ports(
         catalog_service,
         connector_control,
         connector_context.clone(),
-        novarocks_sql::catalog::TableLookupMode::SchemaOnly,
+        novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
         catalog_application,
     );
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&provider);

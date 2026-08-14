@@ -714,8 +714,8 @@ fn aggregate_input_types_from_schema_contract(
     calls: &AggregateSqlCalls,
     contract: &MvSchemaContract,
 ) -> Result<Vec<Option<DataType>>, String> {
-    use novarocks_sql::mv_refresh::VisibleAggregateOutput;
     use novarocks_sql::planning::mv::AggregateInput;
+    use novarocks_sql::planning::mv::VisibleAggregateOutput;
 
     let mut input_types = vec![None; calls.aggregates.len()];
     for (aggregate_index, aggregate) in calls.aggregates.iter().enumerate() {

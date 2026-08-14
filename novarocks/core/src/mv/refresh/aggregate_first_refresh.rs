@@ -34,7 +34,7 @@ use crate::mv::model::AggregateStateRole;
 use crate::mv::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_of};
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use novarocks_execution::exec::chunk::Chunk;
-use novarocks_sql::mv_refresh::VisibleAggregateOutput;
+use novarocks_sql::planning::mv::VisibleAggregateOutput;
 use novarocks_sql::planning::mv::{
     MV_BRANCH_ID_COLUMN_NAME, SqlMvAggregateCalls as AggregateSqlCalls, extract_aggregate_sql_calls,
 };
@@ -692,7 +692,7 @@ mod tests {
     use crate::runtime::query_result::{QueryResultColumn, record_batch_to_chunk};
     use novarocks_catalog::schema::SqlType;
     use novarocks_execution::exec::mv::state_codec::encode_count_state;
-    use novarocks_sql::mv_refresh::AggregateFunctionKind;
+    use novarocks_sql::planning::mv::AggregateFunctionKind;
 
     fn parse_calls(sql: &str) -> AggregateSqlCalls {
         let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)

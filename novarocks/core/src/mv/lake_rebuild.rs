@@ -335,7 +335,7 @@ mod tests {
         MvPublishedRefreshTechnique,
     };
     use novarocks_spi::connector::{ConnectorInstanceId, ConnectorTableIdentity};
-    use novarocks_sql::planner::vocabulary::ApplyKeySource;
+    use novarocks_sql::planning::mv::ApplyKeySource;
     use std::sync::Arc;
 
     fn sample_contract() -> MvSchemaContract {

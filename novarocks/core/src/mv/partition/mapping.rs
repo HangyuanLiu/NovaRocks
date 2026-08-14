@@ -16,7 +16,7 @@
 // under the License.
 
 #[cfg(test)]
-use novarocks_sql::planner::vocabulary::ApplyKeySource;
+use novarocks_sql::planning::mv::ApplyKeySource;
 
 use crate::mv::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
 use crate::mv::persistence::schema::{

@@ -16,7 +16,7 @@
 // under the License.
 
 #[cfg(test)]
-use novarocks_sql::planner::vocabulary::ApplyKeySource;
+use novarocks_sql::planning::mv::ApplyKeySource;
 
 use crate::mv::model::{AffectedTargetPartitions, MvPartitionKey};
 use crate::mv::partition::mapping::map_connector_partition_to_mv_key;
@@ -102,7 +102,7 @@ mod tests {
         ConnectorChangePartition, ConnectorChangePartitionField, ConnectorChangePartitionTransform,
         ConnectorChangePartitionValue, ConnectorChangeWindowPartitionImpact,
     };
-    use novarocks_sql::planner::vocabulary::ApplyKeySource;
+    use novarocks_sql::planning::mv::ApplyKeySource;
 
     fn contract_with_identity_partition() -> MvSchemaContract {
         MvSchemaContract {

@@ -19,8 +19,8 @@ use novarocks_spi::connector::{
     ConnectorWriteOperationId, ConnectorWriteReceipt,
 };
 
-use novarocks_sql::mv_refresh::first_refresh::{SqlMvFirstRefreshArtifact, SqlMvSnapshotPin};
 use novarocks_sql::planning::mv::MV_JOIN_APPLY_KEY_COLUMN_NAME;
+use novarocks_sql::planning::mv::first_refresh::{SqlMvFirstRefreshArtifact, SqlMvSnapshotPin};
 
 /// The application commit semantics selected after first-refresh SQL planning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -22,8 +22,9 @@ use crate::query_execution::planning::write_sink::{
     admit_prepared_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::request_context::QueryExecutionContext;
-use novarocks_sql::mv_refresh::first_refresh::{
-    SqlMvFirstRefreshCompileContext, SqlMvJoinFirstRefreshCompileContext,
+use novarocks_sql::planning::mv::first_refresh::{
+    SqlMvFirstRefreshAnalyzeContext, SqlMvJoinFirstRefreshAnalyzeContext,
+    analyze_join_first_refresh_connector_write, analyze_mv_first_refresh_connector_write,
     compile_join_first_refresh_connector_write, compile_mv_first_refresh_connector_write,
 };
 
@@ -38,7 +39,7 @@ pub(crate) fn frozen_logical_context_from_rewrite(
         mv_definition: (*rewrite.mv_definition).clone(),
         canonical_select_query: (*rewrite.canonical_select_query).clone(),
         base_refs: rewrite.base_refs.to_vec(),
-        pin: novarocks_sql::mv_refresh::first_refresh::SqlMvSnapshotPin::try_from_maps(
+        pin: novarocks_sql::planning::mv::first_refresh::SqlMvSnapshotPin::try_from_maps(
             rewrite.pin.to_snapshot_map(),
             rewrite.pin.to_table_uuid_map(),
         )?,
@@ -118,13 +119,9 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 "MV first-refresh write requires a non-empty admitted backend topology".to_string()
             })?;
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
-            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-                query_kernel,
-                Arc::clone(&bindings),
-            );
-            let distributed_plan = compile_mv_first_refresh_connector_write(
+            let analyzed = analyze_mv_first_refresh_connector_write(
                 physical_sql,
-                SqlMvFirstRefreshCompileContext {
+                SqlMvFirstRefreshAnalyzeContext {
                     current_catalog: current_catalog.clone(),
                     current_database: current_database.clone(),
                     optimizer_settings: execution.optimizer_settings().clone(),
@@ -132,7 +129,6 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                         backend_count,
                     },
                     catalog: &catalog,
-                    statistics: &statistics,
                     functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
                     control: novarocks_sql::compiler::SqlCompileControl::new(
                         execution.deadline(),
@@ -143,6 +139,12 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                     sink,
                 },
             )?;
+            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+                query_kernel,
+                Arc::clone(&bindings),
+                &connector_context,
+            )?;
+            let distributed_plan = compile_mv_first_refresh_connector_write(analyzed, &statistics)?;
             prepare_sealed_iceberg_write_native_assembly(
                 query_kernel.connector_control().as_ref(),
                 execution,
@@ -210,12 +212,8 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 "MV first-refresh write requires a non-empty admitted backend topology".to_string()
             })?;
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
-            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-                query_kernel,
-                materializer.query_table_bindings(),
-            );
-            let distributed_plan =
-                compile_join_first_refresh_connector_write(SqlMvJoinFirstRefreshCompileContext {
+            let analyzed =
+                analyze_join_first_refresh_connector_write(SqlMvJoinFirstRefreshAnalyzeContext {
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
                     rewrite_snapshot: refresh_rewrite.to_sql_rewrite_snapshot(target_binding)?,
                     expected_root_hash_column: root_hash_column,
@@ -226,7 +224,6 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                         backend_count,
                     },
                     catalog: &catalog,
-                    statistics: &statistics,
                     functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
                     control: novarocks_sql::compiler::SqlCompileControl::new(
                         execution.deadline(),
@@ -236,6 +233,13 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                     ),
                     sink,
                 })?;
+            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+                query_kernel,
+                materializer.query_table_bindings(),
+                &connector_context,
+            )?;
+            let distributed_plan =
+                compile_join_first_refresh_connector_write(analyzed, &statistics)?;
             prepare_sealed_iceberg_write_native_assembly(
                 query_kernel.connector_control().as_ref(),
                 execution,

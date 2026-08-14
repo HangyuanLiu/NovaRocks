@@ -54,8 +54,8 @@ use novarocks_execution::exec::mv::state_codec::{
     KeyValue, decode_avg_decimal128, decode_avg_int64, decode_count_state, decode_sum_decimal128,
     decode_sum_int64,
 };
-use novarocks_sql::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
 use novarocks_sql::plan_read::OutputColumn;
+use novarocks_sql::planning::mv::{AggregateFunctionKind, VisibleAggregateOutput};
 use novarocks_sql::planning::mv::{
     AggregateInput, AggregateMvShape, SqlMvAggregateCalls as AggregateSqlCalls,
     SqlMvAggregateLayoutFacts,
@@ -2835,7 +2835,7 @@ mod tests {
 
     #[test]
     fn build_layout_avg_produces_state_columns_with_hidden_retraction_count() {
-        use novarocks_sql::mv_refresh::VisibleAggregateOutput;
+        use novarocks_sql::planning::mv::VisibleAggregateOutput;
         use novarocks_sql::planning::mv::{
             AggregateCallShape, AggregateInput, AggregateMvShape, GroupKeyShape,
         };

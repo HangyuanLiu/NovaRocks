@@ -104,8 +104,8 @@ use novarocks_spi::connector::{
     ConnectorChangeWindowAdmission, ConnectorControlRegistry, ConnectorExecutionBindingKey,
     ConnectorInstanceId, ConnectorTableIdentity,
 };
-use novarocks_sql::mv_refresh::{FULL_REFRESH_DISABLED_MESSAGE, MvRefreshFinalizeFacts};
 use novarocks_sql::planning::mv::UnionBranchKind;
+use novarocks_sql::planning::mv::{FULL_REFRESH_DISABLED_MESSAGE, MvRefreshFinalizeFacts};
 use novarocks_sql::planning::mv::{
     MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
     MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
@@ -190,7 +190,8 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
         request: MvRefreshPreparationRequest,
     ) -> Result<PreparedMvRefresh, String> {
         request.validate()?;
-        if request.statement != novarocks_sql::mv_refresh::MvRefreshStatement::from(self.statement)
+        if request.statement
+            != novarocks_sql::planning::mv::MvRefreshStatement::from(self.statement)
         {
             return Err(
                 "MV refresh preparation statement does not match the admitted SQL request"
@@ -654,7 +655,7 @@ fn prepare_frontend_first_refresh_write(
         );
     }
     let target_contract =
-        novarocks_sql::mv_refresh::first_refresh::MvFirstRefreshTargetContract::try_new(
+        novarocks_sql::planning::mv::first_refresh::MvFirstRefreshTargetContract::try_new(
             Arc::new(target_arrow_schema),
             target_field_ids,
             partition_spec_id,
@@ -767,7 +768,7 @@ fn prepare_frontend_first_refresh_write(
             prepared
         });
     }
-    let sql_pin = novarocks_sql::mv_refresh::first_refresh::SqlMvSnapshotPin::try_from_maps(
+    let sql_pin = novarocks_sql::planning::mv::first_refresh::SqlMvSnapshotPin::try_from_maps(
         pin.to_snapshot_map(),
         pin.to_table_uuid_map(),
     )?;
@@ -797,30 +798,30 @@ fn prepare_frontend_first_refresh_write(
             &connector_context,
         )?;
         if let Some(branch) = &schema_contract.branch {
-            novarocks_sql::mv_refresh::first_refresh::SqlMvFirstRefreshArtifactShape::BranchUnionAggregate {
+            novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifactShape::BranchUnionAggregate {
                 branch_count: branch.branch_count as usize,
                 calls,
             }
         } else if !schema_contract.bases.is_empty() {
-            novarocks_sql::mv_refresh::first_refresh::SqlMvFirstRefreshArtifactShape::FanInAggregate {
+            novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifactShape::FanInAggregate {
                 calls,
                 aggregate_input_types: aggregate_layout.aggregate_input_types,
             }
         } else {
-            novarocks_sql::mv_refresh::first_refresh::SqlMvFirstRefreshArtifactShape::Aggregate {
+            novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifactShape::Aggregate {
                 calls,
                 aggregate_input_types: aggregate_layout.aggregate_input_types,
             }
         }
     } else if let Some(branch) = &schema_contract.branch {
-        novarocks_sql::mv_refresh::first_refresh::SqlMvFirstRefreshArtifactShape::UnionProjection {
+        novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifactShape::UnionProjection {
             branch_count: branch.branch_count as usize,
         }
     } else {
-        novarocks_sql::mv_refresh::first_refresh::SqlMvFirstRefreshArtifactShape::Projection
+        novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifactShape::Projection
     };
     let physical_sql =
-        novarocks_sql::mv_refresh::first_refresh::SqlMvFirstRefreshArtifactBuilder::try_new(
+        novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifactBuilder::try_new(
             definition.select_sql.clone(),
             sql_pin,
             current_catalog.map(str::to_string),
@@ -5671,7 +5672,7 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
                 &base_refs,
                 branch_count,
                 dispatch_schema_contract,
-                connector_context,
+                &connector_context,
             );
         }
         // Aggregate shapes: single-base, fan-in, branch-union, and join
@@ -5691,7 +5692,7 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
                 &base_refs,
                 &caps,
                 &canonical_select_query,
-                connector_context,
+                &connector_context,
             );
         }
         // Join / single-base projection-filter: fall through to the inline
@@ -7802,7 +7803,7 @@ mod join_delta_append_only_fast_path_tests {
 /// second latest-generation source.
 pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
     source: &IcebergMvCorePorts,
-    statistics_resolver: &impl crate::query_execution::planning::statistics::QueryStatisticsResolver,
+    _statistics_resolver: &impl crate::query_execution::planning::statistics::QueryStatisticsResolver,
     current_catalog: Option<&str>,
     current_database: &str,
     stmt: &RefreshMaterializedViewStmt,
@@ -7887,11 +7888,6 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
         ),
         overlays,
     );
-    let statistics =
-        crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-            statistics_resolver,
-            materializer.query_table_bindings(),
-        );
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
     novarocks_sql::compiler::compile_imv_refresh_explain_lines(
         novarocks_sql::compiler::SqlImvRefreshExplainContext {
@@ -7905,7 +7901,6 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
             optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings::default(),
             environment: novarocks_sql::compiler::SqlPlanningEnvironment::NotApplicable,
             catalog: &catalog,
-            statistics: &statistics,
             functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
             control: novarocks_sql::compiler::SqlCompileControl::new(
                 Some(connector_context.deadline()),
@@ -8214,20 +8209,16 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 "IMV incremental refresh requires a non-empty admitted backend topology".to_string()
             })?;
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
-            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-                query_kernel,
-                analyzer_catalog.query_table_bindings(),
-            );
             let write_mode = match mode {
                 crate::mv::application::MvIncrementalWriteMode::FastAppend => {
-                    novarocks_sql::mv_refresh::first_refresh::SqlMvIncrementalWriteMode::FastAppend
+                    novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::FastAppend
                 }
                 crate::mv::application::MvIncrementalWriteMode::RowDelta => {
-                    novarocks_sql::mv_refresh::first_refresh::SqlMvIncrementalWriteMode::RowDelta
+                    novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::RowDelta
                 }
             };
-            let sealed = novarocks_sql::mv_refresh::first_refresh::compile_mv_incremental_refresh_change_stream(
-                novarocks_sql::mv_refresh::first_refresh::SqlMvIncrementalRefreshCompileContext {
+            let analyzed = novarocks_sql::planning::mv::first_refresh::analyze_mv_incremental_refresh_change_stream(
+                novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalRefreshAnalyzeContext {
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
                     imv_rewrite: imv_rewrite_input,
                     write_mode,
@@ -8238,7 +8229,6 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                         backend_count,
                     },
                     catalog: &catalog,
-                    statistics: &statistics,
                     functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
                     control: novarocks_sql::compiler::SqlCompileControl::new(
                         execution.deadline(),
@@ -8247,6 +8237,15 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                         ),
                     ),
                 },
+            )?;
+            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+                query_kernel,
+                analyzer_catalog.query_table_bindings(),
+                &connector_context,
+            )?;
+            let sealed = novarocks_sql::planning::mv::first_refresh::compile_mv_incremental_refresh_change_stream(
+                analyzed,
+                &statistics,
             )?;
             let planned =
                 crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(
@@ -8278,18 +8277,18 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         } => {
             let join_mode = match join_execution_mode {
                 crate::mv::application::MvIncrementalJoinMode::AppendOnly => {
-                    novarocks_sql::mv_refresh::first_refresh::SqlMvJoinIncrementalRefreshMode::AppendOnly
+                    novarocks_sql::planning::mv::first_refresh::SqlMvJoinIncrementalRefreshMode::AppendOnly
                 }
                 crate::mv::application::MvIncrementalJoinMode::Coalesce => {
-                    novarocks_sql::mv_refresh::first_refresh::SqlMvJoinIncrementalRefreshMode::Coalesce
+                    novarocks_sql::planning::mv::first_refresh::SqlMvJoinIncrementalRefreshMode::Coalesce
                 }
             };
             let write_mode = match mode {
                 crate::mv::application::MvIncrementalWriteMode::FastAppend => {
-                    novarocks_sql::mv_refresh::first_refresh::SqlMvIncrementalWriteMode::FastAppend
+                    novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::FastAppend
                 }
                 crate::mv::application::MvIncrementalWriteMode::RowDelta => {
-                    novarocks_sql::mv_refresh::first_refresh::SqlMvIncrementalWriteMode::RowDelta
+                    novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::RowDelta
                 }
             };
             let base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
@@ -8317,12 +8316,8 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                     .to_string()
             })?;
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
-            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-                query_kernel,
-                analyzer_catalog.query_table_bindings(),
-            );
-            let sealed = novarocks_sql::mv_refresh::first_refresh::compile_join_incremental_refresh_change_stream(
-                novarocks_sql::mv_refresh::first_refresh::SqlMvJoinIncrementalRefreshCompileContext {
+            let analyzed = novarocks_sql::planning::mv::first_refresh::analyze_join_incremental_refresh_change_stream(
+                novarocks_sql::planning::mv::first_refresh::SqlMvJoinIncrementalRefreshAnalyzeContext {
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
                     rewrite_snapshot: refresh_rewrite.to_sql_rewrite_snapshot(target_binding)?,
                     join_mode,
@@ -8335,7 +8330,6 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                         backend_count,
                     },
                     catalog: &catalog,
-                    statistics: &statistics,
                     functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
                     control: novarocks_sql::compiler::SqlCompileControl::new(
                         execution.deadline(),
@@ -8344,6 +8338,15 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                         ),
                     ),
                 },
+            )?;
+            let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
+                query_kernel,
+                analyzer_catalog.query_table_bindings(),
+                &connector_context,
+            )?;
+            let sealed = novarocks_sql::planning::mv::first_refresh::compile_join_incremental_refresh_change_stream(
+                analyzed,
+                &statistics,
             )?;
             let planned =
                 crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(

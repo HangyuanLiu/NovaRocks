@@ -17,13 +17,59 @@
 use std::num::NonZeroUsize;
 
 use novarocks_sql::binding::SqlTableBindingId;
-use novarocks_sql::catalog::{PlannerTableProvider, ResolvedAnalyzerTable};
 use novarocks_sql::compiler::{
-    SessionOptimizerSettings, SqlCatalogSnapshot, SqlCompileControl, SqlCompileIntent,
-    SqlCompileRequest, SqlCompiler, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
-    builtin_sql_function_catalog,
+    SessionOptimizerSettings, SqlAnalyzeRequest, SqlAnalyzedQuery, SqlCatalogSnapshot,
+    SqlCompileControl, SqlCompileIntent, SqlCompiler, SqlFunctionCatalog, SqlOptimizeRequest,
+    SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
 };
+use novarocks_sql::planning::catalog::{PlannerTableProvider, ResolvedAnalyzerTable};
 use novarocks_sql::planning::dml::DmlStatisticsSnapshot;
+
+struct NegativeImplMarker;
+
+trait AmbiguousIfClone<Marker> {
+    const TOKEN: ();
+}
+
+impl<T: ?Sized> AmbiguousIfClone<()> for T {
+    const TOKEN: () = ();
+}
+
+impl<T: ?Sized + Clone> AmbiguousIfClone<NegativeImplMarker> for T {
+    const TOKEN: () = ();
+}
+
+trait AmbiguousIfSerialize<Marker> {
+    const TOKEN: ();
+}
+
+impl<T: ?Sized> AmbiguousIfSerialize<()> for T {
+    const TOKEN: () = ();
+}
+
+impl<T: ?Sized + serde::Serialize> AmbiguousIfSerialize<NegativeImplMarker> for T {
+    const TOKEN: () = ();
+}
+
+trait AmbiguousIfDeserializeOwned<Marker> {
+    const TOKEN: ();
+}
+
+impl<T: ?Sized> AmbiguousIfDeserializeOwned<()> for T {
+    const TOKEN: () = ();
+}
+
+impl<T: ?Sized + serde::de::DeserializeOwned> AmbiguousIfDeserializeOwned<NegativeImplMarker>
+    for T
+{
+    const TOKEN: () = ();
+}
+
+const _: () = {
+    let _ = <SqlAnalyzedQuery as AmbiguousIfClone<_>>::TOKEN;
+    let _ = <SqlAnalyzedQuery as AmbiguousIfSerialize<_>>::TOKEN;
+    let _ = <SqlAnalyzedQuery as AmbiguousIfDeserializeOwned<_>>::TOKEN;
+};
 
 struct EmptyCatalog;
 
@@ -44,30 +90,45 @@ impl SqlCatalogSnapshot for EmptyCatalog {
     }
 }
 
-#[test]
-fn external_sql_contract_compiles_and_reads_a_sealed_plan() {
-    let catalog = EmptyCatalog;
-    let statistics = DmlStatisticsSnapshot::empty();
-    let request = SqlCompileRequest::new(
-        SqlStatementInput::sql("SELECT 1"),
-        SqlCompileIntent::Query,
-        SqlSessionContext {
-            current_catalog: None,
-            current_database: "default".to_string(),
-            optimizer_settings: SessionOptimizerSettings::default(),
-        },
-        SqlPlanningEnvironment::Distributed {
-            backend_count: NonZeroUsize::new(1).expect("one is non-zero"),
-        },
-        &catalog,
-        &statistics,
-        builtin_sql_function_catalog(),
-        None,
-        SqlCompileControl::unbounded(),
-    );
+fn scoped_builtin_functions(scope: &mut ()) -> &dyn SqlFunctionCatalog {
+    let _ = scope;
+    builtin_sql_function_catalog()
+}
 
-    let plan = SqlCompiler::compile(request)
-        .expect("public compiler request compiles")
+#[test]
+fn external_sql_contract_analyzes_freezes_and_reads_a_sealed_plan() {
+    let analyzed = {
+        let catalog = EmptyCatalog;
+        let mut function_scope = ();
+        let functions = scoped_builtin_functions(&mut function_scope);
+        let request = SqlAnalyzeRequest::new(
+            SqlStatementInput::sql("SELECT 1"),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                current_catalog: None,
+                current_database: "default".to_string(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed {
+                backend_count: NonZeroUsize::new(1).expect("one is non-zero"),
+            },
+            &catalog,
+            functions,
+            None,
+            SqlCompileControl::unbounded(),
+        );
+
+        SqlCompiler::analyze(request)
+            .expect("public analysis request materializes")
+            .into_pending()
+            .expect("query analysis waits for frozen statistics")
+    };
+
+    // The catalog and function-capability bindings have left scope. Phase two
+    // can receive only the move-only analyzed handle and immutable statistics.
+    let statistics = DmlStatisticsSnapshot::empty();
+    let plan = SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
+        .expect("public optimize request consumes frozen statistics")
         .into_distributed_plan()
         .expect("query intent produces a sealed distributed plan");
     assert!(!plan.fragments().is_empty());
