@@ -36,6 +36,9 @@ use super::{
 };
 
 pub const QUERY_TERMINAL_SNAPSHOT_VERSION_V1: u32 = 1;
+/// Version carried by terminal delivery acknowledgements for both the proof
+/// and negative-attestation branches of `ParticipantTerminalOutcome`.
+pub const PARTICIPANT_TERMINAL_OUTCOME_VERSION_V1: u32 = 1;
 pub const QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1: u32 = 1;
 pub const QUERY_TERMINAL_FRAGMENT_OUTCOME_CODE_MAX_BYTES: usize = 128;
 pub const QUERY_TERMINAL_FRAGMENT_OUTCOME_DETAIL_MAX_BYTES: usize = 4096;
@@ -432,12 +435,28 @@ pub fn p0_max_encoded_len(manifest: &ParticipantManifest) -> usize {
         + 8
         + QUERY_TERMINAL_FRAGMENT_OUTCOME_DETAIL_MAX_BYTES
         + 1;
-    fixed_header.saturating_add(
+    let proof_max = fixed_header.saturating_add(
         manifest
             .expected_fragment_instance_ids()
             .len()
             .saturating_mul(16 + 4 + max_outcome),
-    )
+    );
+    // An attestation has no fragment list, so a coordinator-only participant
+    // still needs a pre-ready reservation large enough for its bounded detail.
+    let attestation_max = 8
+        + 8
+        + 8
+        + 8
+        + 8
+        + backend.endpoint().host().len()
+        + 2
+        + 8
+        + 32
+        + 1
+        + 8
+        + QUERY_TERMINAL_FRAGMENT_OUTCOME_DETAIL_MAX_BYTES
+        + 1;
+    proof_max.max(attestation_max)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -647,6 +666,13 @@ impl ParticipantTerminalOutcome {
             Self::Proof { proof, .. } => proof.execution_id(),
             Self::NegativeAttestation(attestation) => attestation.execution_id(),
         }
+    }
+
+    /// A negative attestation has no snapshot, so terminal delivery uses this
+    /// outcome-level version rather than the snapshot version in its ACK
+    /// identity. The value is shared by both variants deliberately.
+    pub const fn version(&self) -> u32 {
+        PARTICIPANT_TERMINAL_OUTCOME_VERSION_V1
     }
 
     pub const fn backend(&self) -> &ParticipantBackendIdentity {

@@ -21,8 +21,8 @@ use std::time::Instant;
 
 use novarocks::query_execution::lifecycle::{
     FragmentLiveObservation, FragmentTerminalSnapshot, ImmutableQueryTerminalRecord,
-    ParticipantManifest, ParticipantManifestDigest, QueryControlEvent, QueryInitOutcome,
-    QueryTerminationReason, StageDigest,
+    ParticipantManifest, ParticipantManifestDigest, ParticipantTerminalOutcome, QueryControlEvent,
+    QueryInitOutcome, QueryTerminationReason, StageDigest,
 };
 use novarocks_types::UniqueId;
 
@@ -83,6 +83,9 @@ pub(crate) struct QueryLifecycleEntryState {
     /// record installation. Expensive capture never runs under this lock.
     pub(crate) terminal_freeze_in_flight: bool,
     pub(crate) terminal_record: Option<ImmutableQueryTerminalRecord>,
+    /// The immutable delivery carrier is always retained, including when P1
+    /// snapshot formation failed and only a negative attestation is available.
+    pub(crate) terminal_outcome: Option<ParticipantTerminalOutcome>,
     pub(crate) pre_start_deadline: Option<Instant>,
     pub(crate) last_heartbeat: Option<Instant>,
     pub(crate) frontend_owner_epoch: Option<u64>,
@@ -136,6 +139,7 @@ impl QueryLifecycleEntry {
                 terminal_facts: BTreeMap::new(),
                 terminal_freeze_in_flight: false,
                 terminal_record: None,
+                terminal_outcome: None,
                 pre_start_deadline: None,
                 last_heartbeat: None,
                 frontend_owner_epoch: None,

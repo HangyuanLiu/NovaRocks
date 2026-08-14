@@ -12,7 +12,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use novarocks::query_execution::lifecycle::{
     QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress, QueryTerminalReportOutcome,
-    decode_query_terminal_snapshot,
+    decode_participant_terminal_outcome,
 };
 use novarocks_protocol::{filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -152,13 +152,13 @@ impl NovaRocksGrpc for FrontendReportService {
         &self,
         request: tonic::Request<proto::ReportQueryTerminalRequest>,
     ) -> Result<tonic::Response<proto::ReportQueryTerminalResponse>, tonic::Status> {
-        let snapshot = request.into_inner().snapshot.ok_or_else(|| {
-            tonic::Status::invalid_argument("ReportQueryTerminalRequest missing snapshot")
+        let outcome = request.into_inner().outcome.ok_or_else(|| {
+            tonic::Status::invalid_argument("ReportQueryTerminalRequest missing outcome")
         })?;
-        let snapshot =
-            decode_query_terminal_snapshot(&snapshot).map_err(status_from_lifecycle_error)?;
+        let outcome =
+            decode_participant_terminal_outcome(&outcome).map_err(status_from_lifecycle_error)?;
         let ingress = Arc::clone(&self.ingress);
-        let ack = tokio::task::spawn_blocking(move || ingress.report_query_terminal(snapshot))
+        let ack = tokio::task::spawn_blocking(move || ingress.report_query_terminal(outcome))
             .await
             .map_err(|error| {
                 tonic::Status::internal(format!("query terminal ingress panicked: {error}"))

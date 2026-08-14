@@ -23,7 +23,7 @@ use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
-use novarocks::query_execution::lifecycle::{QueryExecutionId, QueryTerminalSnapshot};
+use novarocks::query_execution::lifecycle::{ParticipantTerminalOutcome, QueryExecutionId};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 
@@ -38,12 +38,12 @@ pub(crate) trait ActiveQueryAttemptControl: Send + Sync {
     /// rather than the legacy execution-report registry.  This keeps the
     /// store-before-ACK identity check in one place for stream and unary
     /// delivery.
-    fn report_terminal_snapshot(
+    fn report_terminal_outcome(
         &self,
-        snapshot: QueryTerminalSnapshot,
+        outcome: ParticipantTerminalOutcome,
     ) -> Result<bool, DistributedQueryError>;
 
-    /// Once every participant snapshot is stored, retain the FE ingress long
+    /// Once every participant outcome is stored, retain the FE ingress long
     /// enough for a BE whose stream ACK was lost to complete unary fallback.
     fn retain_terminal_ingress(&self) -> bool {
         false
@@ -260,9 +260,9 @@ impl FrontendQueryRegistry {
 
     pub(crate) fn report_query_terminal(
         &self,
-        snapshot: QueryTerminalSnapshot,
+        outcome: ParticipantTerminalOutcome,
     ) -> Result<bool, DistributedQueryError> {
-        let query_id = snapshot.execution_id().query_id();
+        let query_id = outcome.execution_id().query_id();
         let active = self
             .active
             .lock()
@@ -270,10 +270,10 @@ impl FrontendQueryRegistry {
             .get(&query_key(query_id))
             .and_then(|query| query.active_attempt.clone());
         let control = match active {
-            Some(control) if control.execution_id() == snapshot.execution_id() => control,
-            Some(_) | None => self.retained_terminal_control(snapshot.execution_id())?,
+            Some(control) if control.execution_id() == outcome.execution_id() => control,
+            Some(_) | None => self.retained_terminal_control(outcome.execution_id())?,
         };
-        control.report_terminal_snapshot(snapshot)
+        control.report_terminal_outcome(outcome)
     }
 
     pub(crate) fn set_scheduled_backend_ownership(
@@ -671,7 +671,8 @@ mod tests {
 
     use novarocks::query_execution::lifecycle::{
         AttemptId, FragmentTerminalOutcome, FragmentTerminalSnapshot, ParticipantBackendIdentity,
-        ParticipantManifestDigest, QueryControlEndpoint, QueryTerminalSnapshot,
+        ParticipantManifestDigest, ParticipantTerminalOutcome, QueryControlEndpoint,
+        QueryTerminalSnapshot,
     };
     use novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
 
@@ -687,9 +688,9 @@ mod tests {
 
         fn request_abort(&self, _reason: String) {}
 
-        fn report_terminal_snapshot(
+        fn report_terminal_outcome(
             &self,
-            _snapshot: QueryTerminalSnapshot,
+            _outcome: ParticipantTerminalOutcome,
         ) -> Result<bool, DistributedQueryError> {
             self.reports.fetch_add(1, Ordering::SeqCst);
             Ok(false)
@@ -738,7 +739,10 @@ mod tests {
 
         assert!(
             !registry
-                .report_query_terminal(terminal_snapshot(execution_id))
+                .report_query_terminal(
+                    ParticipantTerminalOutcome::proof(terminal_snapshot(execution_id))
+                        .expect("terminal proof outcome"),
+                )
                 .expect("retained ingress accepts duplicate terminal delivery")
         );
         assert_eq!(control.reports.load(Ordering::SeqCst), 1);

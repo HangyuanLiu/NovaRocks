@@ -34,8 +34,9 @@ use novarocks::query_execution::lifecycle::contract::{
     encode_query_stage_response, encode_query_start_response,
 };
 use novarocks::query_execution::lifecycle::{
-    AttemptId, BackendQueryControl, FragmentLiveObservation, ParticipantBackendIdentity,
-    ParticipantManifest, ParticipantQueryOptions, ParticipantRole, QueryAbortRequest,
+    AttemptId, BackendQueryControl, FragmentLiveObservation, NegativeAttestation,
+    NegativeAttestationReason, ParticipantBackendIdentity, ParticipantManifest,
+    ParticipantQueryOptions, ParticipantRole, ParticipantTerminalOutcome, QueryAbortRequest,
     QueryControlAttach, QueryControlAttachment, QueryControlCommand, QueryControlEndpoint,
     QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitBarrier, QueryInitOutcome,
     QueryInitPlan, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
@@ -54,12 +55,19 @@ use super::barrier::{
 };
 use super::lease::{
     ActiveSession, AttemptControl, FragmentObservationStoreOutcome, FrontendLifecycleMetrics,
+    TerminalOutcomeStoreOutcome,
 };
 use super::{
     QueryControlSession, QueryLifecycleTarget, QueryLifecycleTransport,
     QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
 };
 use crate::coordinator::query_registry::{ActiveQueryAttemptControl, FrontendQueryRegistry};
+
+fn terminal_outcome(
+    snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot,
+) -> ParticipantTerminalOutcome {
+    ParticipantTerminalOutcome::proof(snapshot).expect("terminal proof outcome")
+}
 
 #[derive(Default)]
 struct NoopFragmentDispatcher;
@@ -201,7 +209,9 @@ impl QueryControlSession for RecordingSession {
         {
             state
                 .events
-                .push_back(Ok(QueryControlEvent::TerminalSnapshot { snapshot }));
+                .push_back(Ok(QueryControlEvent::TerminalOutcome {
+                    outcome: terminal_outcome(snapshot),
+                }));
         }
         if let Some(reason) = terminal {
             state
@@ -674,7 +684,7 @@ fn frontend_terminal_snapshot_fences_later_fragment_observations() {
     )
     .expect("fixture terminal snapshot");
     control
-        .store_terminal_snapshot(terminal)
+        .store_terminal_outcome(terminal_outcome(terminal))
         .expect("terminal snapshot is accepted");
 
     assert_eq!(
@@ -690,6 +700,38 @@ fn frontend_terminal_snapshot_fences_later_fragment_observations() {
         Some(&before_terminal),
         "terminal state must not be overwritten by late telemetry"
     );
+}
+
+#[test]
+fn frontend_negative_attestation_is_deduplicated_and_surfaces_as_terminal_input() {
+    let (control, _session, participant) = observation_control(0);
+    let manifest = participant.request.manifest();
+    let outcome = ParticipantTerminalOutcome::negative_attestation(NegativeAttestation::new(
+        manifest.execution_id(),
+        manifest.backend().clone(),
+        participant.digest,
+        NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted,
+        "terminal evidence retention exhausted".to_string(),
+    ));
+
+    assert_eq!(
+        control
+            .store_terminal_outcome(outcome.clone())
+            .expect("attestation is stored"),
+        TerminalOutcomeStoreOutcome::Accepted
+    );
+    assert_eq!(
+        control
+            .store_terminal_outcome(outcome)
+            .expect("same attestation retry is idempotent"),
+        TerminalOutcomeStoreOutcome::AlreadyAccepted
+    );
+    assert!(matches!(
+        control.terminal_outcomes_for_test().as_slice(),
+        [ParticipantTerminalOutcome::NegativeAttestation(attestation)]
+            if attestation.reason()
+                == NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted
+    ));
 }
 
 #[test]
@@ -857,9 +899,9 @@ impl QueryControlSession for HeartbeatGateSession {
                     .terminal_snapshot
                     .clone()
                     .expect("heartbeat fixture terminal snapshot");
-                state
-                    .events
-                    .push_back(QueryControlEvent::TerminalSnapshot { snapshot });
+                state.events.push_back(QueryControlEvent::TerminalOutcome {
+                    outcome: terminal_outcome(snapshot),
+                });
                 state
                     .events
                     .push_back(QueryControlEvent::TerminationAccepted {
@@ -1444,8 +1486,8 @@ fn frontend_query_lifecycle_finalize_keeps_heartbeats_until_all_participants_dra
         })
     });
     for session in sessions.values() {
-        session.push_event(QueryControlEvent::TerminalSnapshot {
-            snapshot: session.terminal_snapshot(),
+        session.push_event(QueryControlEvent::TerminalOutcome {
+            outcome: terminal_outcome(session.terminal_snapshot()),
         });
     }
     finalize
@@ -1986,12 +2028,12 @@ async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal
     session
         .send(QueryControlCommand::Finalize)
         .expect("send finalize");
-    let snapshot = match session
+    let outcome = match session
         .recv_timeout(Duration::from_secs(2))
-        .expect("TerminalSnapshot")
+        .expect("TerminalOutcome")
     {
-        QueryControlEvent::TerminalSnapshot { snapshot } => snapshot,
-        event => panic!("expected TerminalSnapshot, got {event:?}"),
+        QueryControlEvent::TerminalOutcome { outcome } => outcome,
+        event => panic!("expected TerminalOutcome, got {event:?}"),
     };
     assert_eq!(
         session
@@ -2003,7 +2045,7 @@ async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal
     );
     session
         .send(QueryControlCommand::TerminalAck {
-            ack: QueryTerminalAck::from_snapshot(&snapshot),
+            ack: QueryTerminalAck::from_outcome(&outcome),
         })
         .expect("TerminalAck");
     let close = session
@@ -2594,16 +2636,21 @@ impl BackendQueryControl for LiveBackendControl {
             return Ok(());
         }
         self.events
-            .try_send(QueryControlEvent::TerminalSnapshot {
-                snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
-                    self.execution_id,
-                    self.backend.clone(),
-                    self.digest,
-                    Vec::new(),
-                )
-                .map_err(|error| {
-                    QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error.to_string())
-                })?,
+            .try_send(QueryControlEvent::TerminalOutcome {
+                outcome: terminal_outcome(
+                    novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
+                        self.execution_id,
+                        self.backend.clone(),
+                        self.digest,
+                        Vec::new(),
+                    )
+                    .map_err(|error| {
+                        QueryLifecycleError::new(
+                            QueryLifecycleErrorCode::Internal,
+                            error.to_string(),
+                        )
+                    })?,
+                ),
             })
             .map_err(live_control_error)?;
         self.events
@@ -2620,16 +2667,21 @@ impl BackendQueryControl for LiveBackendControl {
             return Ok(());
         }
         self.events
-            .try_send(QueryControlEvent::TerminalSnapshot {
-                snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
-                    self.execution_id,
-                    self.backend.clone(),
-                    self.digest,
-                    Vec::new(),
-                )
-                .map_err(|error| {
-                    QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error.to_string())
-                })?,
+            .try_send(QueryControlEvent::TerminalOutcome {
+                outcome: terminal_outcome(
+                    novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
+                        self.execution_id,
+                        self.backend.clone(),
+                        self.digest,
+                        Vec::new(),
+                    )
+                    .map_err(|error| {
+                        QueryLifecycleError::new(
+                            QueryLifecycleErrorCode::Internal,
+                            error.to_string(),
+                        )
+                    })?,
+                ),
             })
             .map_err(live_control_error)?;
         self.events

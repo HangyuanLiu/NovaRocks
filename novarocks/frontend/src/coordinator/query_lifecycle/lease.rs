@@ -24,12 +24,16 @@ use std::time::{Duration, Instant};
 use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
-    FragmentLiveObservation, ParticipantManifestDigest, QueryAbortRequest, QueryControlCommand,
-    QueryControlEvent, QueryExecutionId, QueryLifecycleAbortOutcome, QueryLifecycleLease,
-    QueryLifecycleLeaseGuard, QueryTerminalSet, QueryTerminalSnapshot, QueryTerminationReason,
+    FragmentLiveObservation, ParticipantManifestDigest, ParticipantTerminalOutcome,
+    QueryAbortRequest, QueryControlCommand, QueryControlEvent, QueryExecutionId,
+    QueryLifecycleAbortOutcome, QueryLifecycleLease, QueryLifecycleLeaseGuard, QueryTerminalSet,
+    QueryTerminalSnapshot, QueryTerminationReason,
 };
 #[cfg(debug_assertions)]
-use novarocks::query_execution::lifecycle::{FragmentTerminalOutcome, FragmentTerminalSnapshot};
+use novarocks::query_execution::lifecycle::{
+    FragmentTerminalOutcome, FragmentTerminalSnapshot, NegativeAttestation,
+    NegativeAttestationReason,
+};
 
 use super::barrier::FrontendQueryLifecycleConfig;
 use super::manifest::MaterializedParticipant;
@@ -100,7 +104,7 @@ struct TerminalState {
     backend_stream_closed: BTreeSet<usize>,
     locally_drained: BTreeSet<usize>,
     termination_accepted: BTreeMap<usize, QueryTerminationReason>,
-    snapshots: BTreeMap<usize, QueryTerminalSnapshot>,
+    outcomes: BTreeMap<usize, ParticipantTerminalOutcome>,
     reader_failure: Option<String>,
     stop_readers: bool,
 }
@@ -138,11 +142,11 @@ pub(super) struct FragmentObservationSnapshot {
     pub rejected: u64,
 }
 
-/// The result of storing a participant terminal snapshot.  The distinction is
+/// The result of storing a participant terminal outcome. The distinction is
 /// intentionally preserved: both cases must be acknowledged, while only the
 /// first one contributes to the terminal set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TerminalSnapshotStoreOutcome {
+pub(crate) enum TerminalOutcomeStoreOutcome {
     Accepted,
     AlreadyAccepted,
 }
@@ -247,10 +251,10 @@ impl FrontendLifecycleMetrics {
         self.update(|snapshot| snapshot.terminal_locally_drained += 1);
     }
 
-    pub fn terminal_snapshot_stored(&self, outcome: TerminalSnapshotStoreOutcome) {
+    pub fn terminal_snapshot_stored(&self, outcome: TerminalOutcomeStoreOutcome) {
         self.update(|snapshot| match outcome {
-            TerminalSnapshotStoreOutcome::Accepted => snapshot.terminal_snapshots_accepted += 1,
-            TerminalSnapshotStoreOutcome::AlreadyAccepted => {
+            TerminalOutcomeStoreOutcome::Accepted => snapshot.terminal_snapshots_accepted += 1,
+            TerminalOutcomeStoreOutcome::AlreadyAccepted => {
                 snapshot.terminal_snapshots_idempotent += 1
             }
         });
@@ -380,7 +384,7 @@ impl AttemptControl {
                 .record_fragment_observation_outcome(FragmentObservationStoreOutcome::Rejected);
         }
 
-        // A terminal snapshot is the immutable authority for its participant.
+        // A terminal outcome is the immutable authority for its participant.
         // Keep the last live sample for diagnostics, but fence all later
         // updates rather than allowing telemetry to race terminal finalization.
         if self
@@ -388,7 +392,7 @@ impl AttemptControl {
             .0
             .lock()
             .expect("query terminal state")
-            .snapshots
+            .outcomes
             .contains_key(&backend_idx)
         {
             return self
@@ -479,29 +483,29 @@ impl AttemptControl {
             .collect()
     }
 
-    /// Stores a terminal snapshot through the same path used by the stream
-    /// reader and the unary fallback ingress.  It validates the immutable
-    /// snapshot before changing any FE state, then makes same-digest retries
-    /// idempotent and rejects conflicting payloads for the participant.
-    pub(crate) fn store_terminal_snapshot(
+    /// Stores a terminal outcome through the same path used by the stream
+    /// reader and unary fallback ingress. It validates the immutable outcome
+    /// before changing any FE state, then makes same-digest retries idempotent
+    /// and rejects conflicting payloads for the participant.
+    pub(crate) fn store_terminal_outcome(
         &self,
-        snapshot: QueryTerminalSnapshot,
-    ) -> Result<TerminalSnapshotStoreOutcome, DistributedQueryError> {
-        snapshot
+        outcome: ParticipantTerminalOutcome,
+    ) -> Result<TerminalOutcomeStoreOutcome, DistributedQueryError> {
+        outcome
             .validate()
             .map_err(|error| failed(error.to_string()))?;
-        if snapshot.execution_id() != self.execution_id {
+        if outcome.execution_id() != self.execution_id {
             return Err(contract_violation(
-                "query terminal snapshot execution id differs from active lifecycle attempt",
+                "query terminal outcome execution id differs from active lifecycle attempt",
             ));
         }
-        let backend_idx = self.terminal_snapshot_backend_idx(&snapshot)?;
-        self.store_terminal_snapshot_at(backend_idx, snapshot)
+        let backend_idx = self.terminal_outcome_backend_idx(&outcome)?;
+        self.store_terminal_outcome_at(backend_idx, outcome)
     }
 
-    fn terminal_snapshot_backend_idx(
+    fn terminal_outcome_backend_idx(
         &self,
-        snapshot: &QueryTerminalSnapshot,
+        outcome: &ParticipantTerminalOutcome,
     ) -> Result<usize, DistributedQueryError> {
         let (backend_idx, participant) = self
             .attempted
@@ -509,13 +513,13 @@ impl AttemptControl {
             .expect("attempted participant set")
             .iter()
             .find(|(_, participant)| {
-                participant.digest == snapshot.init_digest()
-                    && participant.request.manifest().backend() == snapshot.backend()
+                participant.digest == outcome.init_digest()
+                    && participant.request.manifest().backend() == outcome.backend()
             })
             .map(|(backend_idx, participant)| (*backend_idx, participant.clone()))
             .ok_or_else(|| {
                 contract_violation(
-                    "query terminal snapshot is not owned by an attempted lifecycle participant",
+                    "query terminal outcome is not owned by an attempted lifecycle participant",
                 )
             })?;
         if participant.request.manifest().execution_id() != self.execution_id {
@@ -526,70 +530,70 @@ impl AttemptControl {
         Ok(backend_idx)
     }
 
-    fn store_terminal_snapshot_at(
+    fn store_terminal_outcome_at(
         &self,
         backend_idx: usize,
-        snapshot: QueryTerminalSnapshot,
-    ) -> Result<TerminalSnapshotStoreOutcome, DistributedQueryError> {
+        outcome: ParticipantTerminalOutcome,
+    ) -> Result<TerminalOutcomeStoreOutcome, DistributedQueryError> {
         let mut terminal = self.terminal.0.lock().expect("query terminal store");
         if let Some(reason) = &terminal.reader_failure {
             return Err(contract_violation(format!(
                 "query lifecycle terminal ingress is already failed: {reason}"
             )));
         }
-        let outcome = match terminal.snapshots.get(&backend_idx) {
-            Some(existing) if existing.digest() == snapshot.digest() => {
-                TerminalSnapshotStoreOutcome::AlreadyAccepted
+        let store_outcome = match terminal.outcomes.get(&backend_idx) {
+            Some(existing) if existing.digest() == outcome.digest() => {
+                TerminalOutcomeStoreOutcome::AlreadyAccepted
             }
             Some(_) => {
                 drop(terminal);
                 self.metrics.terminal_snapshot_conflict();
                 return Err(contract_violation(
-                    "query terminal snapshot conflicts with an already stored participant snapshot",
+                    "query terminal outcome conflicts with an already stored participant outcome",
                 ));
             }
             None => {
-                terminal.snapshots.insert(backend_idx, snapshot);
-                TerminalSnapshotStoreOutcome::Accepted
+                terminal.outcomes.insert(backend_idx, outcome);
+                TerminalOutcomeStoreOutcome::Accepted
             }
         };
         drop(terminal);
-        if outcome == TerminalSnapshotStoreOutcome::Accepted {
+        if store_outcome == TerminalOutcomeStoreOutcome::Accepted {
             super::barrier::record_lifecycle_phase_marker_for_execution(
                 "terminal-retained",
                 self.execution_id,
             )?;
         }
         self.terminal.1.notify_all();
-        self.metrics.terminal_snapshot_stored(outcome);
-        Ok(outcome)
+        self.metrics.terminal_snapshot_stored(store_outcome);
+        Ok(store_outcome)
     }
 
     #[cfg(debug_assertions)]
-    fn store_terminal_snapshot_conflict(
+    fn store_terminal_outcome_conflict(
         &self,
-        snapshot: QueryTerminalSnapshot,
-        conflict: QueryTerminalSnapshot,
+        outcome: ParticipantTerminalOutcome,
+        conflict: ParticipantTerminalOutcome,
     ) -> Result<(), DistributedQueryError> {
-        snapshot
+        outcome
             .validate()
             .map_err(|error| failed(error.to_string()))?;
         conflict
             .validate()
             .map_err(|error| failed(error.to_string()))?;
-        let backend_idx = self.terminal_snapshot_backend_idx(&snapshot)?;
-        if self.terminal_snapshot_backend_idx(&conflict)? != backend_idx {
+        let backend_idx = self.terminal_outcome_backend_idx(&outcome)?;
+        if self.terminal_outcome_backend_idx(&conflict)? != backend_idx {
             return Err(contract_violation(
                 "injected query terminal conflict changed the participant identity",
             ));
         }
-        if snapshot.digest() == conflict.digest() {
+        if outcome.digest() == conflict.digest() {
             return Err(contract_violation(
-                "injected query terminal conflict did not change the snapshot digest",
+                "injected query terminal conflict did not change the outcome digest",
             ));
         }
         let mut terminal = self.terminal.0.lock().expect("query terminal store");
-        if terminal.snapshots.contains_key(&backend_idx) {
+        if terminal.outcomes.contains_key(&backend_idx) {
             return Err(contract_violation(
                 "injected query terminal conflict requires an empty participant slot",
             ));
@@ -597,14 +601,13 @@ impl AttemptControl {
         // Store the primary immutable value and the conflicting value while
         // holding the same lock.  No finalizer can observe an apparently
         // complete terminal set between the two admissions.
-        terminal.snapshots.insert(backend_idx, snapshot);
-        let reason =
-            "query terminal snapshot conflicts with an already stored participant snapshot";
+        terminal.outcomes.insert(backend_idx, outcome);
+        let reason = "query terminal outcome conflicts with an already stored participant outcome";
         terminal.reader_failure = Some(reason.to_string());
         drop(terminal);
         self.terminal.1.notify_all();
         self.metrics
-            .terminal_snapshot_stored(TerminalSnapshotStoreOutcome::Accepted);
+            .terminal_snapshot_stored(TerminalOutcomeStoreOutcome::Accepted);
         self.metrics.terminal_snapshot_conflict();
         Err(contract_violation(reason))
     }
@@ -616,14 +619,38 @@ impl AttemptControl {
             .expect("attempted participant set")
             .len();
         let terminal = self.terminal.0.lock().expect("query terminal store");
-        if terminal.snapshots.len() != expected {
+        if terminal.outcomes.len() != expected {
             return Err(failed(format!(
-                "query lifecycle terminal snapshots are incomplete: received {}, expected {expected}",
-                terminal.snapshots.len()
+                "query lifecycle terminal outcomes are incomplete: received {}, expected {expected}",
+                terminal.outcomes.len()
             )));
         }
-        QueryTerminalSet::new(terminal.snapshots.values().cloned().collect())
-            .map_err(|error| failed(error.to_string()))
+        let snapshots = terminal
+            .outcomes
+            .values()
+            .map(|outcome| match outcome {
+                ParticipantTerminalOutcome::Proof { snapshot, .. } => Ok(snapshot.clone()),
+                ParticipantTerminalOutcome::NegativeAttestation(attestation) => {
+                    Err(failed(format!(
+                        "query lifecycle participant returned negative attestation: {:?}",
+                        attestation.reason()
+                    )))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        QueryTerminalSet::new(snapshots).map_err(|error| failed(error.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn terminal_outcomes_for_test(&self) -> Vec<ParticipantTerminalOutcome> {
+        self.terminal
+            .0
+            .lock()
+            .expect("query terminal store")
+            .outcomes
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub fn abort_before_ready(&self, primary_error: String) -> String {
@@ -942,7 +969,7 @@ impl AttemptControl {
             .remove(&backend_idx);
     }
 
-    fn wait_for_all_snapshots(&self, timeout: Duration) -> Result<QueryTerminalSet, String> {
+    fn wait_for_all_outcomes(&self, timeout: Duration) -> Result<QueryTerminalSet, String> {
         let expected = self
             .attempted
             .lock()
@@ -952,15 +979,25 @@ impl AttemptControl {
             if let Some(error) = &terminal.reader_failure {
                 return Some(Err(error.clone()));
             }
-            if terminal.snapshots.len() != expected {
+            if terminal.outcomes.len() != expected {
                 return None;
             }
-            Some(
-                QueryTerminalSet::new(terminal.snapshots.values().cloned().collect())
-                    .map_err(|error| error.to_string()),
-            )
+            let snapshots = terminal
+                .outcomes
+                .values()
+                .map(|outcome| match outcome {
+                    ParticipantTerminalOutcome::Proof { snapshot, .. } => Ok(snapshot.clone()),
+                    ParticipantTerminalOutcome::NegativeAttestation(attestation) => Err(format!(
+                        "query lifecycle participant returned negative attestation: {:?}",
+                        attestation.reason()
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>();
+            Some(snapshots.and_then(|snapshots| {
+                QueryTerminalSet::new(snapshots).map_err(|error| error.to_string())
+            }))
         })
-        .ok_or_else(|| "query lifecycle timed out waiting for all terminal snapshots".to_string())?
+        .ok_or_else(|| "query lifecycle timed out waiting for all terminal outcomes".to_string())?
     }
 
     fn wait_terminal_event<T>(
@@ -1072,7 +1109,7 @@ impl AttemptControl {
         self.metrics.attempt_terminated();
         if errors.is_empty() {
             let terminal_set = match self
-                .wait_for_all_snapshots(self.config.terminal_snapshot_timeout())
+                .wait_for_all_outcomes(self.config.terminal_snapshot_timeout())
             {
                 Ok(terminal_set) => terminal_set,
                 Err(error) => {
@@ -1204,15 +1241,15 @@ fn control_event_reader(control: Weak<AttemptControl>, session: ActiveSession) {
             // leaves the stream.
             continue;
         }
-        let terminal_snapshot = matches!(&event, QueryControlEvent::TerminalSnapshot { .. });
+        let terminal_outcome = matches!(&event, QueryControlEvent::TerminalOutcome { .. });
         if let Err(error) = control.handle_control_event(&session, event) {
             control.record_reader_failure(error);
             return;
         }
-        if terminal_snapshot {
+        if terminal_outcome {
             // Store-before-ACK completed this participant's terminal handoff.
             // Retained terminal ingress only needs the immutable participant
-            // identity and stored snapshot for unary fallback. Release the
+            // identity and stored outcome for unary fallback. Release the
             // live session so successful queries do not retain HTTP/2 control
             // streams for the full ingress TTL.
             control.release_session(session.target.backend_idx());
@@ -1266,33 +1303,33 @@ impl AttemptControl {
                 let _ = self.store_fragment_observation(session, observation);
                 Ok(())
             }
-            QueryControlEvent::TerminalSnapshot { snapshot } => {
-                if let Some(scope) = claim_terminal_snapshot_conflict(session, &snapshot)? {
-                    let conflict = conflicting_terminal_snapshot(&snapshot)?;
+            QueryControlEvent::TerminalOutcome { outcome } => {
+                if let Some(scope) = claim_terminal_snapshot_conflict(session, &outcome)? {
+                    let conflict = conflicting_terminal_outcome(&outcome)?;
                     eprintln!(
                         "NOVAROCKS_QUERY_TERMINAL_SNAPSHOT_CONFLICT_INJECTED execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
-                        snapshot.execution_id().query_id().high(),
-                        snapshot.execution_id().query_id().low(),
-                        snapshot.execution_id().attempt_id().get(),
+                        outcome.execution_id().query_id().high(),
+                        outcome.execution_id().query_id().low(),
+                        outcome.execution_id().attempt_id().get(),
                         scope.backend_index,
                         scope.backend_id,
                         scope.start_epoch,
                         scope.token,
                     );
                     return self
-                        .store_terminal_snapshot_conflict(snapshot, conflict)
+                        .store_terminal_outcome_conflict(outcome, conflict)
                         .map_err(|error| error.to_string());
                 }
-                self.store_terminal_snapshot(snapshot.clone())
+                self.store_terminal_outcome(outcome.clone())
                     .map_err(|error| error.to_string())?;
-                if claim_terminal_ack_drop(session, &snapshot)? {
+                if claim_terminal_ack_drop(session, &outcome)? {
                     return Ok(());
                 }
                 session
                     .session
                     .send(QueryControlCommand::TerminalAck {
-                        ack: novarocks::query_execution::lifecycle::QueryTerminalAck::from_snapshot(
-                            &snapshot,
+                        ack: novarocks::query_execution::lifecycle::QueryTerminalAck::from_outcome(
+                            &outcome,
                         ),
                     })
                     .map_err(|error| {
@@ -1349,7 +1386,7 @@ impl AttemptControl {
 #[cfg(debug_assertions)]
 fn claim_terminal_ack_drop(
     session: &ActiveSession,
-    snapshot: &QueryTerminalSnapshot,
+    outcome: &ParticipantTerminalOutcome,
 ) -> Result<bool, String> {
     use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, claim_matching_fault};
 
@@ -1362,7 +1399,7 @@ fn claim_terminal_ack_drop(
     let Some(scope) = claim_matching_fault(
         &root,
         QueryLifecycleFaultKind::TerminalAckDrop,
-        snapshot.execution_id(),
+        outcome.execution_id(),
         backend_index,
         backend_id,
         session.target.start_epoch(),
@@ -1373,9 +1410,9 @@ fn claim_terminal_ack_drop(
     };
     eprintln!(
         "NOVAROCKS_QUERY_TERMINAL_ACK_DROPPED execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
-        snapshot.execution_id().query_id().high(),
-        snapshot.execution_id().query_id().low(),
-        snapshot.execution_id().attempt_id().get(),
+        outcome.execution_id().query_id().high(),
+        outcome.execution_id().query_id().low(),
+        outcome.execution_id().attempt_id().get(),
         backend_index,
         backend_id,
         session.target.start_epoch(),
@@ -1387,7 +1424,7 @@ fn claim_terminal_ack_drop(
 #[cfg(debug_assertions)]
 fn claim_terminal_snapshot_conflict(
     session: &ActiveSession,
-    snapshot: &QueryTerminalSnapshot,
+    outcome: &ParticipantTerminalOutcome,
 ) -> Result<Option<novarocks::common::query_lifecycle_fault::QueryLifecycleFaultScope>, String> {
     use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, claim_matching_fault};
 
@@ -1400,7 +1437,7 @@ fn claim_terminal_snapshot_conflict(
     claim_matching_fault(
         &root,
         QueryLifecycleFaultKind::TerminalSnapshotConflict,
-        snapshot.execution_id(),
+        outcome.execution_id(),
         backend_index,
         backend_id,
         session.target.start_epoch(),
@@ -1411,15 +1448,26 @@ fn claim_terminal_snapshot_conflict(
 #[cfg(not(debug_assertions))]
 fn claim_terminal_snapshot_conflict(
     _session: &ActiveSession,
-    _snapshot: &QueryTerminalSnapshot,
+    _outcome: &ParticipantTerminalOutcome,
 ) -> Result<Option<novarocks::common::query_lifecycle_fault::QueryLifecycleFaultScope>, String> {
     Ok(None)
 }
 
 #[cfg(debug_assertions)]
-fn conflicting_terminal_snapshot(
-    snapshot: &QueryTerminalSnapshot,
-) -> Result<QueryTerminalSnapshot, String> {
+fn conflicting_terminal_outcome(
+    outcome: &ParticipantTerminalOutcome,
+) -> Result<ParticipantTerminalOutcome, String> {
+    let ParticipantTerminalOutcome::Proof { snapshot, .. } = outcome else {
+        return Ok(ParticipantTerminalOutcome::negative_attestation(
+            NegativeAttestation::new(
+                outcome.execution_id(),
+                outcome.backend().clone(),
+                outcome.init_digest(),
+                NegativeAttestationReason::TerminalStateInvalid,
+                "same participant produced a conflicting terminal outcome".to_string(),
+            ),
+        ));
+    };
     let mut fragments = snapshot.fragments().to_vec();
     let first = fragments.first().cloned().ok_or_else(|| {
         "terminal snapshot conflict fault requires a fragment participant".to_string()
@@ -1436,27 +1484,28 @@ fn conflicting_terminal_snapshot(
         first.profile_telemetry().clone(),
     )
     .map_err(|error| error.to_string())?;
-    QueryTerminalSnapshot::new_with_profile_telemetry(
+    let conflict = QueryTerminalSnapshot::new_with_profile_telemetry(
         snapshot.execution_id(),
         snapshot.backend().clone(),
         snapshot.init_digest(),
         fragments,
         snapshot.profile_contribution_telemetry().clone(),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    ParticipantTerminalOutcome::proof(conflict).map_err(|error| error.to_string())
 }
 
 #[cfg(not(debug_assertions))]
-fn conflicting_terminal_snapshot(
-    _snapshot: &QueryTerminalSnapshot,
-) -> Result<QueryTerminalSnapshot, String> {
-    Err("terminal snapshot conflict injection is disabled in release builds".to_string())
+fn conflicting_terminal_outcome(
+    _outcome: &ParticipantTerminalOutcome,
+) -> Result<ParticipantTerminalOutcome, String> {
+    Err("terminal outcome conflict injection is disabled in release builds".to_string())
 }
 
 #[cfg(not(debug_assertions))]
 fn claim_terminal_ack_drop(
     _session: &ActiveSession,
-    _snapshot: &QueryTerminalSnapshot,
+    _outcome: &ParticipantTerminalOutcome,
 ) -> Result<bool, String> {
     Ok(false)
 }
@@ -1473,12 +1522,12 @@ impl ActiveQueryAttemptControl for AttemptControl {
         }
     }
 
-    fn report_terminal_snapshot(
+    fn report_terminal_outcome(
         &self,
-        snapshot: QueryTerminalSnapshot,
+        outcome: ParticipantTerminalOutcome,
     ) -> Result<bool, DistributedQueryError> {
-        self.store_terminal_snapshot(snapshot)
-            .map(|outcome| outcome == TerminalSnapshotStoreOutcome::Accepted)
+        self.store_terminal_outcome(outcome)
+            .map(|outcome| outcome == TerminalOutcomeStoreOutcome::Accepted)
     }
 
     fn retain_terminal_ingress(&self) -> bool {

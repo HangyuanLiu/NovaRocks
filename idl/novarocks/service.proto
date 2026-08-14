@@ -306,7 +306,7 @@ message QueryControlResponse {
     QueryControlLocalFailure local_failure = 3;
     QueryControlTerminationAccepted termination_accepted = 4;
     QueryControlLocalDrained local_drained = 5;
-    QueryTerminalSnapshot terminal_snapshot = 6;
+    ParticipantTerminalOutcome terminal_outcome = 6;
     FragmentLiveObservation fragment_observation = 7;
   }
 }
@@ -552,7 +552,7 @@ message ParticipantTerminalOutcome {
 }
 
 message ReportQueryTerminalRequest {
-  QueryTerminalSnapshot snapshot = 1;
+  ParticipantTerminalOutcome outcome = 1;
 }
 
 enum ReportQueryTerminalOutcome {

@@ -183,8 +183,8 @@ pub enum QueryControlEvent {
         detail: String,
     },
     LocalDrained,
-    TerminalSnapshot {
-        snapshot: QueryTerminalSnapshot,
+    TerminalOutcome {
+        outcome: ParticipantTerminalOutcome,
     },
     TerminationAccepted {
         reason: QueryTerminationReason,
@@ -234,6 +234,24 @@ impl QueryTerminalAck {
         )
     }
 
+    pub const fn from_outcome(outcome: &ParticipantTerminalOutcome) -> Self {
+        Self::new(
+            outcome.execution_id(),
+            outcome.init_digest(),
+            outcome.version(),
+            outcome.digest(),
+        )
+    }
+
+    /// Checks the full stable terminal-outcome identity. This intentionally
+    /// works for negative attestations, which do not have a snapshot version.
+    pub fn matches_outcome(&self, outcome: &ParticipantTerminalOutcome) -> bool {
+        self.execution_id == outcome.execution_id()
+            && self.init_digest == outcome.init_digest()
+            && self.version == outcome.version()
+            && self.digest == outcome.digest()
+    }
+
     pub const fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
     }
@@ -277,22 +295,22 @@ impl QueryTerminalReportAck {
     }
 }
 
-/// FE-owned ingress for immutable terminal snapshots.  It is intentionally
-/// distinct from FE-to-BE lifecycle RPCs.
+/// FE-owned ingress for immutable participant terminal outcomes. It is
+/// intentionally distinct from FE-to-BE lifecycle RPCs.
 pub trait QueryTerminalIngress: Send + Sync + 'static {
     fn report_query_terminal(
         &self,
-        snapshot: QueryTerminalSnapshot,
+        outcome: ParticipantTerminalOutcome,
     ) -> Result<QueryTerminalReportAck, QueryLifecycleError>;
 }
 
 /// BE-owned fallback transport.  Delivery never reconnects or recreates the
-/// control session; it only reports the already frozen snapshot.
+/// control session; it only reports the already frozen outcome.
 pub trait QueryTerminalFallbackTransport: Send + Sync + 'static {
     fn report_query_terminal(
         &self,
         endpoint: &QueryControlEndpoint,
-        snapshot: QueryTerminalSnapshot,
+        outcome: ParticipantTerminalOutcome,
         timeout: Duration,
     ) -> Result<QueryTerminalReportAck, QueryLifecycleTransportError>;
 }
@@ -1034,9 +1052,9 @@ pub fn encode_query_control_event(event: &QueryControlEvent) -> novarocks::Query
         QueryControlEvent::LocalDrained => novarocks::query_control_response::Event::LocalDrained(
             novarocks::QueryControlLocalDrained {},
         ),
-        QueryControlEvent::TerminalSnapshot { snapshot } => {
-            novarocks::query_control_response::Event::TerminalSnapshot(
-                encode_query_terminal_snapshot(snapshot),
+        QueryControlEvent::TerminalOutcome { outcome } => {
+            novarocks::query_control_response::Event::TerminalOutcome(
+                encode_participant_terminal_outcome(outcome),
             )
         }
         QueryControlEvent::TerminationAccepted { reason } => {
@@ -1083,9 +1101,9 @@ pub fn decode_query_control_event(
         Some(novarocks::query_control_response::Event::LocalDrained(_)) => {
             Ok(QueryControlEvent::LocalDrained)
         }
-        Some(novarocks::query_control_response::Event::TerminalSnapshot(snapshot)) => {
-            Ok(QueryControlEvent::TerminalSnapshot {
-                snapshot: decode_query_terminal_snapshot(snapshot)?,
+        Some(novarocks::query_control_response::Event::TerminalOutcome(outcome)) => {
+            Ok(QueryControlEvent::TerminalOutcome {
+                outcome: decode_participant_terminal_outcome(outcome)?,
             })
         }
         Some(novarocks::query_control_response::Event::FragmentObservation(observation)) => {
@@ -2329,14 +2347,14 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        FragmentLiveObservation, QueryInitRequest, decode_fragment_live_observation,
-        decode_participant_terminal_outcome, decode_query_control_event, decode_query_init_request,
-        decode_query_stage_request, decode_query_stage_response, decode_query_start_request,
-        decode_query_start_response, decode_query_terminal_snapshot,
-        encode_fragment_live_observation, encode_participant_terminal_outcome,
-        encode_query_control_event, encode_query_init_request, encode_query_stage_request,
-        encode_query_stage_response, encode_query_start_request, encode_query_start_response,
-        encode_query_terminal_snapshot,
+        FragmentLiveObservation, QueryControlEvent, QueryInitRequest, QueryTerminalAck,
+        decode_fragment_live_observation, decode_participant_terminal_outcome,
+        decode_query_control_event, decode_query_init_request, decode_query_stage_request,
+        decode_query_stage_response, decode_query_start_request, decode_query_start_response,
+        decode_query_terminal_snapshot, encode_fragment_live_observation,
+        encode_participant_terminal_outcome, encode_query_control_event, encode_query_init_request,
+        encode_query_stage_request, encode_query_stage_response, encode_query_start_request,
+        encode_query_start_response, encode_query_terminal_snapshot,
     };
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::identity::{AttemptId, QueryExecutionId};
@@ -2460,6 +2478,14 @@ mod tests {
                 .expect("proof round trip"),
             proof
         );
+        let proof_event = QueryControlEvent::TerminalOutcome {
+            outcome: proof.clone(),
+        };
+        assert_eq!(
+            decode_query_control_event(&encode_query_control_event(&proof_event))
+                .expect("proof terminal-outcome control-event round trip"),
+            proof_event
+        );
 
         let attestation = crate::query_execution::lifecycle::ParticipantTerminalOutcome::negative_attestation(
             crate::query_execution::lifecycle::NegativeAttestation::new(
@@ -2474,6 +2500,40 @@ mod tests {
             decode_participant_terminal_outcome(&encode_participant_terminal_outcome(&attestation))
                 .expect("attestation round trip"),
             attestation
+        );
+
+        let event = QueryControlEvent::TerminalOutcome {
+            outcome: attestation.clone(),
+        };
+        assert_eq!(
+            decode_query_control_event(&encode_query_control_event(&event))
+                .expect("terminal outcome control-event round trip"),
+            event
+        );
+
+        let acknowledgement = QueryTerminalAck::from_outcome(&attestation);
+        assert_eq!(acknowledgement.execution_id(), attestation.execution_id());
+        assert_eq!(acknowledgement.init_digest(), attestation.init_digest());
+        assert_eq!(acknowledgement.version(), attestation.version());
+        assert_eq!(acknowledgement.digest(), attestation.digest());
+        assert!(acknowledgement.matches_outcome(&attestation));
+        assert!(
+            !QueryTerminalAck::new(
+                acknowledgement.execution_id(),
+                acknowledgement.init_digest(),
+                acknowledgement.version().saturating_add(1),
+                acknowledgement.digest(),
+            )
+            .matches_outcome(&attestation)
+        );
+        assert!(
+            !QueryTerminalAck::new(
+                acknowledgement.execution_id(),
+                acknowledgement.init_digest(),
+                acknowledgement.version(),
+                crate::query_execution::lifecycle::QueryTerminalSnapshotDigest::new([0; 32]),
+            )
+            .matches_outcome(&attestation)
         );
     }
 

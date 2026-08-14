@@ -34,7 +34,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use novarocks::query_execution::lifecycle::{
     QueryLifecycleIngress, QueryTerminalIngress, QueryTerminalReportOutcome,
-    decode_query_terminal_snapshot,
+    decode_participant_terminal_outcome,
 };
 use novarocks::service::native_data_plane::NativeDataPlaneKernel;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
@@ -376,12 +376,12 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
                 detail: "query terminal ingress is not installed for this role".to_string(),
             }));
         };
-        let snapshot = request.into_inner().snapshot.ok_or_else(|| {
-            tonic::Status::invalid_argument("ReportQueryTerminalRequest missing snapshot")
+        let outcome = request.into_inner().outcome.ok_or_else(|| {
+            tonic::Status::invalid_argument("ReportQueryTerminalRequest missing outcome")
         })?;
-        let snapshot =
-            decode_query_terminal_snapshot(&snapshot).map_err(status_from_lifecycle_error)?;
-        let ack = tokio::task::spawn_blocking(move || ingress.report_query_terminal(snapshot))
+        let outcome =
+            decode_participant_terminal_outcome(&outcome).map_err(status_from_lifecycle_error)?;
+        let ack = tokio::task::spawn_blocking(move || ingress.report_query_terminal(outcome))
             .await
             .map_err(|error| {
                 tonic::Status::internal(format!("query terminal ingress panicked: {error}"))

@@ -117,7 +117,7 @@ impl QueryTerminalFallbackTransport for RejectedTerminalFallback {
     fn report_query_terminal(
         &self,
         _endpoint: &QueryControlEndpoint,
-        _snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot,
+        _outcome: novarocks::query_execution::lifecycle::ParticipantTerminalOutcome,
         _timeout: Duration,
     ) -> Result<
         QueryTerminalReportAck,
@@ -136,7 +136,7 @@ impl QueryTerminalFallbackTransport for GoneTerminalFallback {
     fn report_query_terminal(
         &self,
         _endpoint: &QueryControlEndpoint,
-        _snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot,
+        _outcome: novarocks::query_execution::lifecycle::ParticipantTerminalOutcome,
         _timeout: Duration,
     ) -> Result<
         QueryTerminalReportAck,
@@ -553,6 +553,54 @@ fn query_control_attachment_requires_backend_identity_binding() {
 }
 
 #[test]
+fn attach_reserves_p0_before_control_ready_and_releases_on_terminal_cleanup() {
+    let runtime = RecordingLocalRuntime::default();
+    let mut config = registry_config(8);
+    config.terminal_retained_capacity = 1;
+    let registry = registry_with_config(runtime, config);
+    let first = init_request_fixture(9_701, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let second = init_request_fixture(9_702, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    assert_eq!(
+        registry.init_query(first.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    assert_eq!(
+        registry.init_query(second.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+
+    let mut first_attachment = attach_control(&registry, &first);
+    assert!(matches!(
+        first_attachment.events.try_recv(),
+        Ok(QueryControlEvent::ControlReady)
+    ));
+    let error = match registry.attach_control(
+        QueryControlAttach::new(second.manifest().execution_id(), second.digest(), 1)
+            .expect("valid control attach"),
+    ) {
+        Ok(_) => panic!("P0 capacity is consumed before a second ControlReady can be emitted"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), QueryLifecycleErrorCode::Capacity);
+
+    registry
+        .abort_query(
+            QueryAbortRequest::new(
+                first.manifest().execution_id(),
+                first.digest(),
+                "release P0 reservation",
+            )
+            .expect("valid abort"),
+        )
+        .expect("first attached entry aborts");
+    let mut second_attachment = attach_control(&registry, &second);
+    assert!(matches!(
+        second_attachment.events.try_recv(),
+        Ok(QueryControlEvent::ControlReady)
+    ));
+}
+
+#[test]
 fn fresh_unbound_registry_reports_no_restoration_relevant_state_after_binding() {
     let registry = QueryLifecycleRegistry::new_unbound(
         LOCAL_START_EPOCH,
@@ -766,7 +814,16 @@ fn wait_for_terminal_snapshot(attachment: &mut QueryControlAttachment) -> QueryT
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
         match attachment.events.try_recv() {
-            Ok(QueryControlEvent::TerminalSnapshot { snapshot }) => return snapshot,
+            Ok(QueryControlEvent::TerminalOutcome {
+                outcome:
+                    novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::Proof {
+                        snapshot,
+                        ..
+                    },
+            }) => return snapshot,
+            Ok(QueryControlEvent::TerminalOutcome { outcome }) => {
+                panic!("expected terminal proof, got {outcome:?}")
+            }
             Ok(_) => {}
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(1));
@@ -1209,7 +1266,13 @@ fn query_lifecycle_drain_and_snapshot_survive_saturated_heartbeat_queue() {
         .expect("locally drained participant finalizes");
     let snapshot = loop {
         match attachment.events.try_recv() {
-            Ok(QueryControlEvent::TerminalSnapshot { snapshot }) => break snapshot,
+            Ok(QueryControlEvent::TerminalOutcome {
+                outcome:
+                    novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::Proof {
+                        snapshot,
+                        ..
+                    },
+            }) => break snapshot,
             Ok(_) => {}
             Err(error) => {
                 panic!("TerminalSnapshot must use its reserved correctness permit: {error}")
@@ -1218,7 +1281,12 @@ fn query_lifecycle_drain_and_snapshot_survive_saturated_heartbeat_queue() {
     };
     attachment
         .control
-        .terminal_ack(QueryTerminalAck::from_snapshot(&snapshot))
+        .terminal_ack(QueryTerminalAck::from_outcome(
+            &novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::proof(
+                snapshot.clone(),
+            )
+            .expect("terminal snapshot produces proof"),
+        ))
         .expect("terminal snapshot ACK");
 }
 
@@ -1704,7 +1772,13 @@ fn running_fragment_failure_drains_and_freezes_a_failed_terminal_snapshot() {
             Err(error) => panic!("failed terminal snapshot is not delivered after drain: {error}"),
         }
     };
-    let QueryControlEvent::TerminalSnapshot { snapshot } = snapshot else {
+    let QueryControlEvent::TerminalOutcome {
+        outcome:
+            novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::Proof {
+                snapshot, ..
+            },
+    } = snapshot
+    else {
         panic!("expected failed terminal snapshot");
     };
     assert_eq!(snapshot.execution_id(), execution_id);
@@ -1884,7 +1958,12 @@ fn terminal_closeout_preserves_first_wins_termination_reason_metrics() {
     let failed_snapshot = wait_for_terminal_snapshot(&mut failed_attachment);
     failed_attachment
         .control
-        .terminal_ack(QueryTerminalAck::from_snapshot(&failed_snapshot))
+        .terminal_ack(QueryTerminalAck::from_outcome(
+            &novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::proof(
+                failed_snapshot.clone(),
+            )
+            .expect("terminal snapshot produces proof"),
+        ))
         .expect("local-failure terminal snapshot ACK");
     assert_eq!(metrics.last_termination_reasons(), [0, 0, 0, 0, 1, 0]);
 
@@ -1913,7 +1992,12 @@ fn terminal_closeout_preserves_first_wins_termination_reason_metrics() {
     let aborted_snapshot = wait_for_terminal_snapshot(&mut aborted_attachment);
     aborted_attachment
         .control
-        .terminal_ack(QueryTerminalAck::from_snapshot(&aborted_snapshot))
+        .terminal_ack(QueryTerminalAck::from_outcome(
+            &novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::proof(
+                aborted_snapshot.clone(),
+            )
+            .expect("terminal snapshot produces proof"),
+        ))
         .expect("coordinator-abort terminal snapshot ACK");
     assert_eq!(metrics.last_termination_reasons(), [1, 0, 0, 0, 1, 0]);
 

@@ -23,7 +23,7 @@ use novarocks_protocol::{common, expr, filter, novarocks, plan};
 
 const FETCH_RESULT_RESPONSE_FIXTURE_HEX: &str =
     "0801120572656164791a0c4e5258312d6669787475726520092801";
-const REPORT_QUERY_TERMINAL_REQUEST_FIXTURE_HEX: &str = "0ab801080112080a040801100210011a140809120e0a093132372e302e302e3110903f184d222011111111111111111111111111111111111111111111111111111111111111112a202222222222222222222222222222222222222222222222222222222222222222324c0a0408031004100918013a04086410094a060809105a180152320a300a105465726d696e616c467261676d656e741009221a0a06736f7572636512107465726d696e616c2d666978747572653a020801";
+const REPORT_QUERY_TERMINAL_REQUEST_FIXTURE_HEX: &str = "0ab3020a72080112080a040801100210011a140809120e0a093132372e302e302e3110903f184d222011111111111111111111111111111111111111111111111111111111111111112a202222222222222222222222222222222222222222222222222222222222222222320a0a0408031004100918011abc01080112080a040801100210011a140809120e0a093132372e302e302e3110903f184d222011111111111111111111111111111111111111111111111111111111111111112a202222222222222222222222222222222222222222222222222222222222222222324e0a0408031004100918013a04086410094a060809105a180152340a320a300a105465726d696e616c467261676d656e741009221a0a06736f7572636512107465726d696e616c2d666978747572653a040a020801";
 const LOOKUP_REQUEST_FIXTURE_HEX: &str = "0a04080110021021182c220a083710041a0400010203";
 const LOOKUP_RESPONSE_FIXTURE_HEX: &str = "0a0412024f4b120a083710041a0403020100";
 const PLAN_FRAGMENT_FIXTURE_HEX: &str = "0801128b03080a10011a010a28ffffffffffffffffff01426c080b10011a010b28ffffffffffffffffff0152580a0c0801120269641a040a02080552480a047470636812160a086c696e656974656d120a0a02696412040a0208051a086c696e656974656d220c0801120269641a040a0208052a0c0a040a0208015a040a021001320269644256080c10011a010c28ffffffffffffffffff015a42080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791802220c0801120269641a040a0208052a0672656d6f74653202080152b0010a0c0801120269641a040a020805c2019e01080112480a220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b657912220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657920022802324c084d12220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791a220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657928021a26080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792226080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792a02080132220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65793a0c0801120269641a040a020805";
@@ -364,74 +364,94 @@ fn release_fetch_result_response() -> novarocks::FetchResultResponse {
 }
 
 fn release_report_query_terminal_request() -> novarocks::ReportQueryTerminalRequest {
-    novarocks::ReportQueryTerminalRequest {
-        snapshot: Some(novarocks::QueryTerminalSnapshot {
-            version: 1,
-            execution_id: Some(novarocks::QueryExecutionId {
-                query_id: Some(id(1, 2)),
-                attempt_id: 1,
+    let snapshot = novarocks::QueryTerminalSnapshot {
+        version: 1,
+        execution_id: Some(novarocks::QueryExecutionId {
+            query_id: Some(id(1, 2)),
+            attempt_id: 1,
+        }),
+        backend: Some(novarocks::ParticipantBackendIdentity {
+            backend_id: 9,
+            endpoint: Some(novarocks::QueryControlEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
             }),
-            backend: Some(novarocks::ParticipantBackendIdentity {
+            start_epoch: 77,
+        }),
+        init_digest: vec![0x11; 32],
+        digest: vec![0x22; 32],
+        fragments: vec![novarocks::QueryTerminalFragmentSnapshot {
+            fragment_instance_id: Some(id(3, 4)),
+            backend_num: 9,
+            outcome: novarocks::QueryTerminalFragmentOutcome::Succeeded as i32,
+            error_code: String::new(),
+            error_detail: String::new(),
+            error_detail_truncated: false,
+            connector_staged_report_frames: vec![],
+            tablet_commit_infos: vec![novarocks::QueryTerminalTabletInfo {
+                tablet_id: 100,
                 backend_id: 9,
-                endpoint: Some(novarocks::QueryControlEndpoint {
-                    host: "127.0.0.1".to_string(),
-                    port: 8080,
-                }),
-                start_epoch: 77,
-            }),
-            init_digest: vec![0x11; 32],
-            digest: vec![0x22; 32],
-            fragments: vec![novarocks::QueryTerminalFragmentSnapshot {
-                fragment_instance_id: Some(id(3, 4)),
-                backend_num: 9,
-                outcome: novarocks::QueryTerminalFragmentOutcome::Succeeded as i32,
-                error_code: String::new(),
-                error_detail: String::new(),
-                error_detail_truncated: false,
-                connector_staged_report_frames: vec![],
-                tablet_commit_infos: vec![novarocks::QueryTerminalTabletInfo {
-                    tablet_id: 100,
-                    backend_id: 9,
-                }],
-                tablet_fail_infos: vec![],
-                load_stats: Some(novarocks::QueryTerminalLoadStats {
-                    loaded_rows: 9,
-                    loaded_bytes: 90,
-                    filtered_rows: 1,
-                }),
-                profile: Some(novarocks::FragmentTerminalProfileTelemetry {
-                    telemetry: Some(
-                        novarocks::fragment_terminal_profile_telemetry::Telemetry::Available(
-                            novarocks::RuntimeProfileTree {
-                                root: Some(novarocks::ProfileNode {
-                                    name: "TerminalFragment".to_string(),
-                                    node_id: 9,
-                                    counters: vec![],
-                                    info_strings: HashMap::from([(
-                                        "source".to_string(),
-                                        "terminal-fixture".to_string(),
-                                    )]),
-                                    children: vec![],
-                                }),
-                            },
-                        ),
-                    ),
-                }),
-                statistics_payload: Vec::new(),
             }],
-            profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
+            tablet_fail_infos: vec![],
+            load_stats: Some(novarocks::QueryTerminalLoadStats {
+                loaded_rows: 9,
+                loaded_bytes: 90,
+                filtered_rows: 1,
+            }),
+            profile: Some(novarocks::FragmentTerminalProfileTelemetry {
                 telemetry: Some(
-                    novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
-                        novarocks::QueryTerminalProfileContributionV1 {
-                            version: 1,
-                            channels: Vec::new(),
-                            producer_streams: Vec::new(),
-                            transport_routes: Vec::new(),
-                            consumers: Vec::new(),
+                    novarocks::fragment_terminal_profile_telemetry::Telemetry::Available(
+                        novarocks::RuntimeProfileTree {
+                            root: Some(novarocks::ProfileNode {
+                                name: "TerminalFragment".to_string(),
+                                node_id: 9,
+                                counters: vec![],
+                                info_strings: HashMap::from([(
+                                    "source".to_string(),
+                                    "terminal-fixture".to_string(),
+                                )]),
+                                children: vec![],
+                            }),
                         },
                     ),
                 ),
             }),
+            statistics_payload: Vec::new(),
+        }],
+        profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
+            telemetry: Some(
+                novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
+                    novarocks::QueryTerminalProfileContributionV1 {
+                        version: 1,
+                        channels: Vec::new(),
+                        producer_streams: Vec::new(),
+                        transport_routes: Vec::new(),
+                        consumers: Vec::new(),
+                    },
+                ),
+            ),
+        }),
+    };
+    novarocks::ReportQueryTerminalRequest {
+        outcome: Some(novarocks::ParticipantTerminalOutcome {
+            outcome: Some(novarocks::participant_terminal_outcome::Outcome::Proof(
+                novarocks::TerminalizationProof {
+                    version: 1,
+                    execution_id: snapshot.execution_id.clone(),
+                    backend: snapshot.backend.clone(),
+                    init_digest: snapshot.init_digest.clone(),
+                    digest: snapshot.digest.clone(),
+                    fragments: vec![novarocks::TerminalizationProofFragment {
+                        fragment_instance_id: Some(id(3, 4)),
+                        backend_num: 9,
+                        outcome: novarocks::QueryTerminalFragmentOutcome::Succeeded as i32,
+                        error_code: String::new(),
+                        error_detail: String::new(),
+                        error_detail_truncated: false,
+                    }],
+                },
+            )),
+            snapshot: Some(snapshot),
         }),
     }
 }
@@ -681,10 +701,18 @@ fn release_report_query_terminal_request_fixture_decodes() {
         "ReportQueryTerminalRequest",
         REPORT_QUERY_TERMINAL_REQUEST_FIXTURE_HEX,
     );
-    let snapshot = request
+    let outcome = request
+        .outcome
+        .as_ref()
+        .expect("ReportQueryTerminalRequest fixture outcome");
+    assert!(matches!(
+        outcome.outcome,
+        Some(novarocks::participant_terminal_outcome::Outcome::Proof(_))
+    ));
+    let snapshot = outcome
         .snapshot
         .as_ref()
-        .expect("ReportQueryTerminalRequest fixture snapshot");
+        .expect("ReportQueryTerminalRequest fixture proof snapshot");
     assert_eq!(snapshot.version, 1);
     assert_eq!(
         snapshot

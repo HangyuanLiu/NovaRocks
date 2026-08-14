@@ -391,7 +391,7 @@ async fn run_attached_control_stream(
                 let Some(event) = event else {
                     break;
                 };
-                if matches!(event, QueryControlEvent::TerminalSnapshot { .. })
+                if matches!(event, QueryControlEvent::TerminalOutcome { .. })
                     && let Some(scope) = terminal_snapshot_stream_drop.as_ref()
                 {
                     eprintln!(
