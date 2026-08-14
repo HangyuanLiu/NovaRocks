@@ -39,7 +39,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-use crate::novarocks_config::NovaRocksConfig;
 use crate::version;
 
 use self::encoding::write_query_result;
@@ -103,11 +102,19 @@ impl ResolvedMysqlListenerSettings {
 /// and application startup, then passes the resulting settings and a ready
 /// [`QuerySessionFactory`] to [`run_mysql_server_until_shutdown`].
 pub fn resolve_mysql_listener_settings(
-    cfg: &NovaRocksConfig,
+    configured_port: Option<u16>,
+    configured_user: Option<&str>,
     port_override: Option<u16>,
 ) -> Result<ResolvedMysqlListenerSettings, String> {
-    let (mysql_port, user) =
-        extract_server_settings(cfg.standalone_server.as_ref(), port_override)?;
+    let mysql_port = port_override
+        .or(configured_port)
+        .unwrap_or(DEFAULT_MYSQL_PORT);
+    let user = configured_user.unwrap_or(ROOT_USER);
+    if user != ROOT_USER {
+        return Err(format!(
+            "standalone server only supports user `{ROOT_USER}`, got `{user}`"
+        ));
+    }
     Ok(ResolvedMysqlListenerSettings::new(
         SocketAddr::from((Ipv4Addr::LOCALHOST, mysql_port)),
         user,
@@ -149,35 +156,6 @@ where
         move |bound_addr| emit_standalone_ready(bound_addr, &ready_user),
     )
     .await
-}
-
-/// Extract server-layer settings (port and user) from an
-/// optional [`StandaloneServerConfig`], applying `port_override` last.
-/// Shared by both the disk-load path and the pre-loaded-config path to keep
-/// validation logic in one place.
-fn extract_server_settings(
-    standalone: Option<&crate::common::app_config::StandaloneServerConfig>,
-    port_override: Option<u16>,
-) -> Result<(u16, String), String> {
-    let mut mysql_port = DEFAULT_MYSQL_PORT;
-    let mut user = ROOT_USER.to_string();
-
-    if let Some(sc) = standalone {
-        mysql_port = sc.mysql_port;
-        if sc.user != ROOT_USER {
-            return Err(format!(
-                "standalone server only supports user `{ROOT_USER}`, got `{}`",
-                sc.user
-            ));
-        }
-        user = sc.user.clone();
-    }
-
-    if let Some(port) = port_override {
-        mysql_port = port;
-    }
-
-    Ok((mysql_port, user))
 }
 
 fn emit_standalone_ready(bind_addr: SocketAddr, user: &str) {

@@ -397,8 +397,13 @@ pub fn compose_backend_server_config(
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<BackendServerConfig> {
     let runtime_config = &config.runtime;
-    let advertise_endpoint = network::standalone_advertise_endpoint_for_config(config)
-        .map_err(|error| anyhow::anyhow!("resolve backend advertise endpoint: {error}"))?;
+    let advertise_endpoint = network::standalone_advertise_endpoint(
+        &config.server.host,
+        &config.server.priority_networks,
+        &config.cluster.advertise_host,
+        config.server.grpc_port,
+    )
+    .map_err(|error| anyhow::anyhow!("resolve backend advertise endpoint: {error}"))?;
     Ok(BackendServerConfig {
         bind_host: config.server.host.clone(),
         grpc_port: config.server.grpc_port,
@@ -448,8 +453,13 @@ pub fn compose_frontend_server_config(
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<FrontendServerConfig> {
     let runtime_config = &config.runtime;
-    let advertised = network::standalone_advertise_endpoint_for_config(config)
-        .map_err(|error| anyhow::anyhow!("resolve frontend advertise endpoint: {error}"))?;
+    let advertised = network::standalone_advertise_endpoint(
+        &config.server.host,
+        &config.server.priority_networks,
+        &config.cluster.advertise_host,
+        config.server.grpc_port,
+    )
+    .map_err(|error| anyhow::anyhow!("resolve frontend advertise endpoint: {error}"))?;
     let runtime_filter_worker_count = NonZeroUsize::new(runtime_config.actual_exec_threads())
         .ok_or_else(|| anyhow::anyhow!("frontend runtime-filter worker count must be nonzero"))?;
     let failure_backoff_ms = config
@@ -521,8 +531,18 @@ pub fn compose_frontend_server_config(
         Duration::from_secs(config.cluster.decommission_timeout_secs),
     )
     .map_err(|error| anyhow::anyhow!("open frontend backend cluster configuration: {error}"))?;
-    let mysql_listener = novarocks::server::resolve_mysql_listener_settings(config, port_override)
-        .map_err(|error| anyhow::anyhow!("resolve MySQL listener settings: {error}"))?;
+    let mysql_listener = novarocks::server::resolve_mysql_listener_settings(
+        config
+            .standalone_server
+            .as_ref()
+            .map(|server| server.mysql_port),
+        config
+            .standalone_server
+            .as_ref()
+            .map(|server| server.user.as_str()),
+        port_override,
+    )
+    .map_err(|error| anyhow::anyhow!("resolve MySQL listener settings: {error}"))?;
     Ok(FrontendServerConfig {
         execution,
         backend_open,
@@ -708,8 +728,18 @@ where
     })?;
 
     let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
-    let listener = novarocks::server::resolve_mysql_listener_settings(&config, port_override)
-        .map_err(anyhow::Error::msg)?;
+    let listener = novarocks::server::resolve_mysql_listener_settings(
+        config
+            .standalone_server
+            .as_ref()
+            .map(|server| server.mysql_port),
+        config
+            .standalone_server
+            .as_ref()
+            .map(|server| server.user.as_str()),
+        port_override,
+    )
+    .map_err(anyhow::Error::msg)?;
     let server =
         novarocks::server::run_mysql_server_until_shutdown(listener, session_factory, async move {
             let _ = server_shutdown_rx.await;

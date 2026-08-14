@@ -26,7 +26,6 @@ use arrow::record_batch::RecordBatch;
 use tokio::runtime::Handle;
 
 use crate::mv::refresh::execution_context::MvRefreshPruningLimits;
-use crate::novarocks_config;
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::{PreparedImmediateQuery, PreparedQueryCompletion, StatementResult};
 use crate::runtime::global_async_runtime::data_block_on;
@@ -1832,21 +1831,6 @@ fn require_backend_management_role(
 // ---------------------------------------------------------------------------
 // Local parquet table helpers
 // ---------------------------------------------------------------------------
-
-/// Matches the `[standalone_server] mv_partition_state_max_entries` default.
-pub(crate) const DEFAULT_MV_PARTITION_STATE_MAX_ENTRIES: usize = 10_000;
-
-fn resolve_mv_refresh_pruning_limits(
-    cfg: &novarocks_config::NovaRocksConfig,
-) -> MvRefreshPruningLimits {
-    cfg.standalone_server
-        .as_ref()
-        .map(|config| MvRefreshPruningLimits {
-            max_touched_groups: config.mv_refresh_max_touched_groups,
-            max_affected_partitions: config.mv_refresh_max_affected_partitions,
-        })
-        .unwrap_or_default()
-}
 
 // ---------------------------------------------------------------------------
 // Utility functions
