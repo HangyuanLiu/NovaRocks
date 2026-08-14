@@ -335,16 +335,57 @@ mod refresh_property_facade_tests {
         let sqlparser::ast::Statement::Query(query) = statement else {
             panic!("expected query");
         };
-        let calls = extract_aggregate_sql_calls(&query).expect("extract aggregate calls");
-
         let input_types = analyzed_refresh_input(sql)
-            .aggregate_input_types(&calls)
+            .aggregate_layout_facts(&query, SqlMvAggregateLayoutScope::WholeQuery)
             .expect("derive aggregate input types");
 
         assert_eq!(
-            input_types,
-            vec![Some(DataType::Int64), Some(DataType::Int64)]
+            input_types.aggregate_input_types(),
+            &[Some(DataType::Int64), Some(DataType::Int64)]
         );
+    }
+
+    #[test]
+    fn opaque_refresh_input_projects_one_shot_aggregate_layout_facts() {
+        let sql = "SELECT region, sum(amount) AS total, avg(amount) AS average \
+                   FROM fact_east GROUP BY region";
+        let statement = crate::parser::parse_sql_raw(sql).expect("parse query");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query");
+        };
+
+        let facts = analyzed_refresh_input(sql)
+            .aggregate_layout_facts(&query, SqlMvAggregateLayoutScope::WholeQuery)
+            .expect("aggregate layout facts");
+
+        assert_eq!(facts.group_key_source_indexes().len(), 1);
+        assert_eq!(facts.calls().len(), 2);
+        assert_eq!(facts.output_columns().len(), 3);
+        assert_eq!(facts.output_columns()[1].name, "total");
+        assert_eq!(
+            facts.aggregate_input_types(),
+            &[Some(DataType::Int64), Some(DataType::Int64)]
+        );
+    }
+
+    #[test]
+    fn opaque_refresh_input_selects_first_union_branch_for_aggregate_layout() {
+        let sql = "SELECT region, sum(amount) AS total FROM fact_east GROUP BY region \
+                   UNION ALL \
+                   SELECT region, sum(amount) AS total FROM fact_west GROUP BY region";
+        let statement = crate::parser::parse_sql_raw(sql).expect("parse query");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query");
+        };
+
+        let facts = analyzed_refresh_input(sql)
+            .aggregate_layout_facts(&query, SqlMvAggregateLayoutScope::FirstUnionBranch)
+            .expect("first branch aggregate layout facts");
+
+        assert_eq!(facts.group_key_source_indexes().len(), 1);
+        assert_eq!(facts.calls().len(), 1);
+        assert_eq!(facts.output_columns().len(), 2);
+        assert_eq!(facts.aggregate_input_types(), &[Some(DataType::Int64)]);
     }
 
     #[test]
@@ -425,40 +466,52 @@ impl SqlResolvedMvRefreshInput {
     /// Project only the MV output facts application code needs to construct its
     /// target schema. Analyzer columns remain private to the SQL crate.
     pub fn analysis_facts(&self) -> SqlMvAnalysisFacts {
-        let output_columns = if self.0.output_columns.is_empty() {
-            match &self.0.body {
-                crate::analysis::QueryBody::Select(select) => select
-                    .projection
-                    .iter()
-                    .map(|item| SqlMvOutputColumnFacts {
-                        name: item.output_name.clone(),
-                        data_type: item.expr.data_type.clone(),
-                        nullable: item.expr.nullable,
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            }
-        } else {
-            self.0
-                .output_columns
-                .iter()
-                .map(|column| SqlMvOutputColumnFacts {
-                    name: column.name.clone(),
-                    data_type: column.data_type.clone(),
-                    nullable: column.nullable,
-                })
-                .collect()
-        };
-        SqlMvAnalysisFacts { output_columns }
+        SqlMvAnalysisFacts {
+            output_columns: output_column_facts(&self.0),
+        }
     }
 
-    /// Derive aggregate argument types without leaking the analyzed expression
-    /// tree to Core's aggregate-state builder.
-    pub fn aggregate_input_types(
+    /// Derive one immutable aggregate-layout input from the admitted query and
+    /// its matching analyzed query. SQL selects the representative UNION ALL
+    /// branch and derives argument types atomically, so Core never inspects an
+    /// analyzer tree to stitch those facts together.
+    pub fn aggregate_layout_facts(
         &self,
-        calls: &SqlMvAggregateCalls,
-    ) -> Result<Vec<Option<arrow::datatypes::DataType>>, String> {
-        aggregate_input_types_from_resolved_query(calls, &self.0)
+        query: &sqlparser::ast::Query,
+        scope: SqlMvAggregateLayoutScope,
+    ) -> Result<SqlMvAggregateLayoutFacts, String> {
+        let query = match scope {
+            SqlMvAggregateLayoutScope::WholeQuery => query.clone(),
+            SqlMvAggregateLayoutScope::FirstUnionBranch => first_union_branch_query(query)?,
+        };
+        let resolved = match scope {
+            SqlMvAggregateLayoutScope::WholeQuery => &self.0,
+            SqlMvAggregateLayoutScope::FirstUnionBranch => {
+                first_union_branch_resolved_query(&self.0)?
+            }
+        };
+        let calls = extract_aggregate_sql_calls(&query)?;
+        let aggregate_input_types = aggregate_input_types_from_resolved_query(&calls, resolved)?;
+        let group_key_source_indexes = group_key_source_indexes(&calls)?;
+        let calls = calls
+            .aggregates
+            .iter()
+            .enumerate()
+            .map(|(aggregate_index, aggregate)| {
+                Ok(SqlMvAggregateCallFacts {
+                    output_name: aggregate.output_name.clone(),
+                    function: aggregate.function,
+                    count_star: matches!(aggregate.input, AggregateInput::Star),
+                    visible_source_index: aggregate_visible_source_index(&calls, aggregate_index)?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(SqlMvAggregateLayoutFacts {
+            calls,
+            output_columns: output_column_facts(resolved),
+            aggregate_input_types,
+            group_key_source_indexes,
+        })
     }
 }
 
@@ -490,6 +543,72 @@ pub struct SqlMvOutputColumnFacts {
     pub name: String,
     pub data_type: arrow::datatypes::DataType,
     pub nullable: bool,
+}
+
+/// Selects the output whose aggregate layout is being derived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqlMvAggregateLayoutScope {
+    WholeQuery,
+    FirstUnionBranch,
+}
+
+/// One-shot immutable input for Core's aggregate-state layout mapping.
+///
+/// Its members are derived together from one admitted raw query and the
+/// corresponding opaque analyzed input. The SQL facade deliberately exposes
+/// only immutable aggregate calls, visible-column facts, and argument types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvAggregateLayoutFacts {
+    calls: Vec<SqlMvAggregateCallFacts>,
+    output_columns: Vec<SqlMvOutputColumnFacts>,
+    aggregate_input_types: Vec<Option<arrow::datatypes::DataType>>,
+    group_key_source_indexes: Vec<usize>,
+}
+
+impl SqlMvAggregateLayoutFacts {
+    pub fn calls(&self) -> &[SqlMvAggregateCallFacts] {
+        &self.calls
+    }
+
+    pub fn output_columns(&self) -> &[SqlMvOutputColumnFacts] {
+        &self.output_columns
+    }
+
+    pub fn aggregate_input_types(&self) -> &[Option<arrow::datatypes::DataType>] {
+        &self.aggregate_input_types
+    }
+
+    pub fn group_key_source_indexes(&self) -> &[usize] {
+        &self.group_key_source_indexes
+    }
+}
+
+/// Value-only aggregate-call facts needed by Core's aggregate-state mapper.
+/// The parsed expression and aggregate-shape tree remain SQL-private.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvAggregateCallFacts {
+    output_name: String,
+    function: AggregateFunctionKind,
+    count_star: bool,
+    visible_source_index: usize,
+}
+
+impl SqlMvAggregateCallFacts {
+    pub fn output_name(&self) -> &str {
+        &self.output_name
+    }
+
+    pub fn function(&self) -> AggregateFunctionKind {
+        self.function
+    }
+
+    pub fn count_star(&self) -> bool {
+        self.count_star
+    }
+
+    pub fn visible_source_index(&self) -> usize {
+        self.visible_source_index
+    }
 }
 
 /// Immutable schema facts for one SQL-owned internal MV target column.
@@ -627,6 +746,137 @@ fn aggregate_input_types_from_resolved_query(
         *slot = args.first().map(|arg| arg.data_type.clone());
     }
     Ok(input_types)
+}
+
+fn aggregate_visible_source_index(
+    calls: &SqlMvAggregateCalls,
+    aggregate_index: usize,
+) -> Result<usize, String> {
+    calls
+        .visible_outputs
+        .iter()
+        .position(|output| matches!(output, VisibleAggregateOutput::Aggregate(index) if *index == aggregate_index))
+        .ok_or_else(|| {
+            format!(
+                "aggregate MV aggregate output is not visible: aggregate_index={aggregate_index}"
+            )
+        })
+}
+
+fn group_key_source_indexes(calls: &SqlMvAggregateCalls) -> Result<Vec<usize>, String> {
+    let mut source_indexes_by_group_key = vec![None; calls.group_keys.len()];
+    for (source_index, output) in calls.visible_outputs.iter().enumerate() {
+        let VisibleAggregateOutput::GroupKey(group_key_index) = output else {
+            continue;
+        };
+        let slot = source_indexes_by_group_key
+            .get_mut(*group_key_index)
+            .ok_or_else(|| {
+                format!(
+                    "aggregate MV group key output index out of range: group_key_index={} group_keys={}",
+                    group_key_index,
+                    calls.group_keys.len()
+                )
+            })?;
+        if slot.replace(source_index).is_some() {
+            return Err(format!(
+                "aggregate MV group key output is duplicated: group_key_index={group_key_index}"
+            ));
+        }
+    }
+    source_indexes_by_group_key
+        .into_iter()
+        .enumerate()
+        .map(|(group_key_index, source_index)| {
+            source_index.ok_or_else(|| {
+                format!(
+                    "aggregate MV group key output is missing: group_key_index={group_key_index}"
+                )
+            })
+        })
+        .collect()
+}
+
+fn output_column_facts(resolved: &crate::analysis::ResolvedQuery) -> Vec<SqlMvOutputColumnFacts> {
+    if resolved.output_columns.is_empty() {
+        match &resolved.body {
+            crate::analysis::QueryBody::Select(select) => select
+                .projection
+                .iter()
+                .map(|item| SqlMvOutputColumnFacts {
+                    name: item.output_name.clone(),
+                    data_type: item.expr.data_type.clone(),
+                    nullable: item.expr.nullable,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    } else {
+        resolved
+            .output_columns
+            .iter()
+            .map(|column| SqlMvOutputColumnFacts {
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+            })
+            .collect()
+    }
+}
+
+fn first_union_branch_query(
+    query: &sqlparser::ast::Query,
+) -> Result<sqlparser::ast::Query, String> {
+    fn first_branch_body(
+        body: &sqlparser::ast::SetExpr,
+    ) -> Result<&sqlparser::ast::SetExpr, String> {
+        match body {
+            sqlparser::ast::SetExpr::SetOperation {
+                op,
+                set_quantifier,
+                left,
+                ..
+            } if *op == sqlparser::ast::SetOperator::Union
+                && matches!(
+                    set_quantifier,
+                    sqlparser::ast::SetQuantifier::All | sqlparser::ast::SetQuantifier::AllByName
+                ) =>
+            {
+                first_branch_body(left)
+            }
+            sqlparser::ast::SetExpr::SetOperation { .. } => {
+                Err("aggregate MV first branch requires UNION ALL set operations".to_string())
+            }
+            sqlparser::ast::SetExpr::Query(inner) => first_branch_body(inner.body.as_ref()),
+            _ => Ok(body),
+        }
+    }
+
+    let body = first_branch_body(query.body.as_ref())?;
+    // `SqlMvAggregateLayoutFacts` needs a full query wrapper for the existing
+    // FROM-agnostic aggregate extractor. Keep the wrapper private to SQL.
+    let mut branch = query.clone();
+    branch.body = Box::new(body.clone());
+    Ok(branch)
+}
+
+fn first_union_branch_resolved_query(
+    resolved: &crate::analysis::ResolvedQuery,
+) -> Result<&crate::analysis::ResolvedQuery, String> {
+    match &resolved.body {
+        crate::analysis::QueryBody::SetOperation(set_op) => {
+            if set_op.kind != crate::analysis::SetOpKind::Union || !set_op.all {
+                return Err(
+                    "aggregate MV first branch requires UNION ALL set operations".to_string(),
+                );
+            }
+            first_union_branch_resolved_query(&set_op.left)
+        }
+        crate::analysis::QueryBody::Select(_) => Ok(resolved),
+        crate::analysis::QueryBody::Values(_) => {
+            Err("aggregate MV first branch requires SELECT analysis".to_string())
+        }
+    }
 }
 
 /// Normalize catalog-qualified raw syntax for the local analyzer route. The

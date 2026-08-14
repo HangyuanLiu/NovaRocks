@@ -119,9 +119,9 @@ use novarocks_sql::planning::mv::{
     MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
     MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
     MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME, SqlMvAggregateCalls,
-    SqlMvApplyKeySourceFacts, SqlMvJoinAliases, SqlMvPersistedApplyKeySourceFacts,
-    extract_aggregate_sql_calls, extract_join_aliases, extract_single_scan_table_fqn,
-    mv_apply_key_source_from_column_name,
+    SqlMvAggregateLayoutScope, SqlMvApplyKeySourceFacts, SqlMvJoinAliases,
+    SqlMvPersistedApplyKeySourceFacts, extract_aggregate_sql_calls, extract_join_aliases,
+    extract_single_scan_table_fqn, mv_apply_key_source_from_column_name,
 };
 use novarocks_sql::syntax::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr,
@@ -798,7 +798,6 @@ fn prepare_frontend_first_refresh_write(
             current_catalog,
             current_database,
             &aggregate_layout_sql,
-            &calls,
             &connector_context,
         )?;
         // The aggregate-state layout remains an application/runtime concern,
@@ -3000,14 +2999,18 @@ fn representative_aggregate_layout(
     match inner_row_identity(&property.identity) {
         TargetIdentity::BaseRowId | TargetIdentity::JoinRowKey(_, _) => Ok(None),
         TargetIdentity::GroupRowId(_) => {
-            let (aggregate_calls, resolved_query) =
-                representative_aggregate_calls(property, canonical_query, analysis)?;
-            let layout = build_aggregate_layout_from_resolved_query(
-                &aggregate_calls,
-                &analysis.output_columns,
-                resolved_query,
-            )?;
-            Ok(Some(layout))
+            let scope = if matches!(property.identity, TargetIdentity::BranchScoped(_)) {
+                SqlMvAggregateLayoutScope::FirstUnionBranch
+            } else {
+                SqlMvAggregateLayoutScope::WholeQuery
+            };
+            let facts = analysis
+                .refresh_input
+                .aggregate_layout_facts(canonical_query, scope)?;
+            crate::mv::aggregate_state::mv_agg_state::build_aggregate_mv_layout_from_sql_facts(
+                &facts,
+            )
+            .map(Some)
         }
         // `inner_row_identity` already peeled the branch wrapper; a nested
         // `BranchScoped` cannot occur (construction flattens it).
@@ -3015,35 +3018,6 @@ fn representative_aggregate_layout(
             "Iceberg MV target layout internal error: unflattened branch-scoped identity"
                 .to_string(),
         ),
-    }
-}
-
-/// The representative aggregate `(calls, resolved query)` for the property: the
-/// whole query for a non-branch aggregate, or the first branch for a
-/// branch-union aggregate. The aggregate-call surface is sourced from the
-/// FROM-agnostic [`extract_aggregate_sql_calls`] extractor, so a simple
-/// aggregate, an aggregate over a join, and a fan-in aggregate all yield the
-/// same `group_keys`/`aggregates`/`visible_outputs` the layout builder needs —
-/// the build is driven by the focused extractor and the persisted contract.
-fn representative_aggregate_calls<'a>(
-    property: &RefreshFragmentProperty,
-    canonical_query: &sqlparser::ast::Query,
-    analysis: &'a MvAnalysis,
-) -> Result<
-    (
-        SqlMvAggregateCalls,
-        &'a novarocks_sql::analysis::ResolvedQuery,
-    ),
-    String,
-> {
-    if matches!(property.identity, TargetIdentity::BranchScoped(_)) {
-        let first_branch_ast = first_union_branch_ast_query(canonical_query)?;
-        let aggregate_calls = extract_aggregate_sql_calls(&first_branch_ast)?;
-        let resolved_query = first_union_branch_resolved_query(&analysis.resolved_query)?;
-        Ok((aggregate_calls, resolved_query))
-    } else {
-        let aggregate_calls = extract_aggregate_sql_calls(canonical_query)?;
-        Ok((aggregate_calls, &analysis.resolved_query))
     }
 }
 
@@ -3308,23 +3282,6 @@ fn base_snapshot_status_for_refresh(
     )
 }
 
-fn iceberg_aggregate_target_columns(
-    calls: &SqlMvAggregateCalls,
-    analysis: &MvAnalysis,
-) -> Result<Vec<TableColumnDef>, String> {
-    let layout = build_aggregate_layout_from_analysis(calls, analysis)?;
-    iceberg_aggregate_target_columns_from_layout(&layout)
-}
-
-fn iceberg_aggregate_target_columns_from_resolved_query(
-    calls: &SqlMvAggregateCalls,
-    output_columns: &[novarocks_sql::analysis::OutputColumn],
-    resolved_query: &novarocks_sql::analysis::ResolvedQuery,
-) -> Result<Vec<TableColumnDef>, String> {
-    let layout = build_aggregate_layout_from_resolved_query(calls, output_columns, resolved_query)?;
-    iceberg_aggregate_target_columns_from_layout(&layout)
-}
-
 fn iceberg_aggregate_target_columns_from_layout(
     layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<Vec<TableColumnDef>, String> {
@@ -3334,34 +3291,6 @@ fn iceberg_aggregate_target_columns_from_layout(
         .iter()
         .map(|column| column.column.clone())
         .collect())
-}
-
-fn build_aggregate_layout_from_analysis(
-    calls: &SqlMvAggregateCalls,
-    analysis: &MvAnalysis,
-) -> Result<crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout, String> {
-    build_aggregate_layout_from_resolved_query(
-        calls,
-        &analysis.output_columns,
-        &analysis.resolved_query,
-    )
-}
-
-fn build_aggregate_layout_from_resolved_query(
-    calls: &SqlMvAggregateCalls,
-    output_columns: &[novarocks_sql::analysis::OutputColumn],
-    resolved_query: &novarocks_sql::analysis::ResolvedQuery,
-) -> Result<crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout, String> {
-    let aggregate_input_types =
-        crate::mv::aggregate_state::mv_agg_state::aggregate_input_types_from_resolved_query(
-            calls,
-            resolved_query,
-        )?;
-    crate::mv::aggregate_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-        calls,
-        output_columns,
-        &aggregate_input_types,
-    )
 }
 
 fn first_union_branch_resolved_query(
@@ -3582,6 +3511,7 @@ fn build_non_branch_contract_core(
                 query,
                 resolved_query,
                 analysis,
+                SqlMvAggregateLayoutScope::WholeQuery,
                 base_refs,
                 base_field_observations,
                 target_observation,
@@ -3736,6 +3666,7 @@ fn build_aggregate_contract_core(
     query: &sqlparser::ast::Query,
     resolved_query: &novarocks_sql::analysis::ResolvedQuery,
     analysis: &crate::mv::analysis::MvAnalysis,
+    aggregate_layout_scope: SqlMvAggregateLayoutScope,
     base_refs: &[TableIdentity],
     base_field_observations: &std::collections::BTreeMap<
         String,
@@ -3743,17 +3674,17 @@ fn build_aggregate_contract_core(
     >,
     target_observation: &MvTargetCreationObservation,
 ) -> Result<NonBranchContractCore, String> {
-    // Aggregate-call surface (group keys, aggregates, visible-output ordering)
-    // is FROM-agnostic, so the focused extractor produces the same calls for a
-    // simple aggregate, a join-aggregate, and a fan-in aggregate — byte-identical
-    // to the legacy `AggregateSqlCalls::from(&shape)` (both share
-    // `classify_aggregate_select_outputs`).
-    let aggregate_calls = extract_aggregate_sql_calls(query)?;
-    let layout = build_aggregate_layout_from_resolved_query(
-        &aggregate_calls,
-        &analysis.output_columns,
-        resolved_query,
-    )?;
+    // SQL derives aggregate calls, visible output facts, and argument types
+    // from one matching admitted/analyzed query. Core receives only that
+    // immutable layout input; `resolved_query` remains below solely for the
+    // still-separate lineage cut.
+    let aggregate_layout_facts = analysis
+        .refresh_input
+        .aggregate_layout_facts(query, aggregate_layout_scope)?;
+    let layout =
+        crate::mv::aggregate_state::mv_agg_state::build_aggregate_mv_layout_from_sql_facts(
+            &aggregate_layout_facts,
+        )?;
 
     // Dispatch on the FROM structure rather than the legacy classifier:
     //   * a two-table inner equi-join FROM    -> JoinAggregate core
@@ -4064,6 +3995,7 @@ fn build_branch_union_schema_contract(
                 &first_branch_ast,
                 first_branch_resolved,
                 analysis,
+                SqlMvAggregateLayoutScope::FirstUnionBranch,
                 &first_branch_refs,
                 base_field_observations,
                 target_observation,
@@ -7324,7 +7256,6 @@ fn build_aggregate_layout_for_refresh_select_sql(
     current_catalog: Option<&str>,
     current_database: &str,
     select_sql: &str,
-    calls: &SqlMvAggregateCalls,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout, String> {
     let visible_query = parse_mv_select_query(select_sql)?;
@@ -7337,7 +7268,10 @@ fn build_aggregate_layout_for_refresh_select_sql(
         &visible_query,
         connector_context,
     )?;
-    build_aggregate_layout_from_analysis(calls, &visible_analysis)
+    let facts = visible_analysis
+        .refresh_input
+        .aggregate_layout_facts(&visible_query, SqlMvAggregateLayoutScope::WholeQuery)?;
+    crate::mv::aggregate_state::mv_agg_state::build_aggregate_mv_layout_from_sql_facts(&facts)
 }
 pub(crate) fn parse_mv_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
     let normalized = novarocks_sql::parser::dialect::normalize_for_raw_parse(sql)
