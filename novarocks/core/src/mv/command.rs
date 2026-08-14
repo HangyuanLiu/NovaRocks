@@ -293,7 +293,7 @@ fn parse_explain_refresh_materialized_view(
     Result<
         (
             RefreshMaterializedViewStmt,
-            novarocks_sql::explain::ExplainLevel,
+            novarocks_sql::compiler::ExplainLevel,
             bool,
         ),
         String,
@@ -303,22 +303,22 @@ fn parse_explain_refresh_materialized_view(
     let prefixes = [
         (
             "EXPLAIN ANALYZE REFRESH ",
-            novarocks_sql::explain::ExplainLevel::Analyze,
+            novarocks_sql::compiler::ExplainLevel::Analyze,
             true,
         ),
         (
             "EXPLAIN VERBOSE REFRESH ",
-            novarocks_sql::explain::ExplainLevel::Verbose,
+            novarocks_sql::compiler::ExplainLevel::Verbose,
             false,
         ),
         (
             "EXPLAIN COSTS REFRESH ",
-            novarocks_sql::explain::ExplainLevel::Costs,
+            novarocks_sql::compiler::ExplainLevel::Costs,
             false,
         ),
         (
             "EXPLAIN REFRESH ",
-            novarocks_sql::explain::ExplainLevel::Normal,
+            novarocks_sql::compiler::ExplainLevel::Normal,
             false,
         ),
     ];
@@ -356,14 +356,14 @@ mod tests {
         .expect("recognized")
         .expect("parsed");
         assert_eq!(verbose.0.name.parts, vec!["db", "mv"]);
-        assert_eq!(verbose.1, novarocks_sql::explain::ExplainLevel::Verbose);
+        assert_eq!(verbose.1, novarocks_sql::compiler::ExplainLevel::Verbose);
         assert!(!verbose.2);
 
         let analyze =
             parse_explain_refresh_materialized_view("EXPLAIN ANALYZE REFRESH MATERIALIZED VIEW mv")
                 .expect("recognized")
                 .expect("parsed");
-        assert_eq!(analyze.1, novarocks_sql::explain::ExplainLevel::Analyze);
+        assert_eq!(analyze.1, novarocks_sql::compiler::ExplainLevel::Analyze);
         assert!(analyze.2);
     }
 }

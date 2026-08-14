@@ -983,6 +983,17 @@ mod tests {
     }
 
     #[test]
+    fn explain_output_terminal_rejects_the_wrong_output_shape() {
+        let error = SqlCompileOutput::ImmediateExplain(vec!["EXPLAIN".to_string()])
+            .into_explain_lines(ExplainLevel::Normal, true)
+            .expect_err("logical explain must not accept immediate explain facts");
+        assert!(matches!(error, SqlCompileError::InvalidRequest(_)));
+
+        let _: fn(SqlCompileOutput, ExplainLevel, bool) -> Result<Vec<String>, SqlCompileError> =
+            SqlCompileOutput::into_explain_lines;
+    }
+
+    #[test]
     fn sqlx1_kernel_compiles_a_query_without_application_state() {
         let catalog = crate::catalog::local::PlannerMemoryCatalog::default();
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);

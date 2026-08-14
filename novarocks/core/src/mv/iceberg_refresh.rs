@@ -8802,7 +8802,7 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
     current_catalog: Option<&str>,
     current_database: &str,
     stmt: &RefreshMaterializedViewStmt,
-    level: novarocks_sql::explain::ExplainLevel,
+    level: novarocks_sql::compiler::ExplainLevel,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Vec<String>, String> {
     explain_refresh_full_guard(stmt.full)?;
@@ -8890,7 +8890,7 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
         );
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
     let mut query = (*rewrite.canonical_select_query).clone();
-    novarocks_sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
+    novarocks_sql::planning::mv::strip_catalog_from_three_part_names(&mut query);
     let input = novarocks_sql::compiler::SqlImvPlanningInput::new(
         rewrite.to_sql_rewrite_snapshot(target_binding)?,
         novarocks_sql::compiler::SqlImvRewriteValidation::None,
@@ -8901,13 +8901,12 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
         novarocks_sql::compiler::SqlSessionContext {
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
-            optimizer_settings:
-                novarocks_sql::optimizer::options::SessionOptimizerSettings::default(),
+            optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings::default(),
         },
         novarocks_sql::compiler::SqlPlanningEnvironment::NotApplicable,
         &catalog,
         &statistics,
-        novarocks_sql::functions::builtin_sql_function_catalog(),
+        novarocks_sql::compiler::builtin_sql_function_catalog(),
         None,
         novarocks_sql::compiler::SqlCompileControl::new(
             Some(connector_context.deadline()),
@@ -8917,13 +8916,9 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
         ),
     )
     .with_imv_rewrite(&input);
-    let novarocks_sql::compiler::SqlCompileOutput::Logical(output) =
-        novarocks_sql::compiler::SqlCompiler::compile(request)
-            .map_err(|error| error.to_string())?
-    else {
-        return Err("EXPLAIN REFRESH logical intent did not produce logical SQL facts".to_string());
-    };
-    novarocks_sql::explain::explain_plan_checked(&output.logical_plan, level)
+    novarocks_sql::compiler::SqlCompiler::compile(request)
+        .and_then(|output| output.into_explain_lines(level, true))
+        .map_err(|error| error.to_string())
 }
 
 struct MvRefreshConnectorCancellationObservation {
