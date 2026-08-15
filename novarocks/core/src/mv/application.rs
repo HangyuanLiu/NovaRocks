@@ -150,7 +150,7 @@ impl PreparedMvNativeWriteAssembly {
         self,
         native_bundle: NativeFragmentBundle,
     ) -> Result<PreparedDistributedWriteRequest, String> {
-        if !self.encoding.matches_native_bundle(&native_bundle) {
+        if !self.encoding.matches_native_attachment(&native_bundle) {
             return Err(
                 "native fragment bundle does not match the sealed MV encoding input".into(),
             );

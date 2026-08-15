@@ -382,7 +382,7 @@ fn execute_data_refresh(
         execution,
     )?;
     let encoding = assembly.native_encoding();
-    let native_bundle = encode_native_fragment_bundle(encoding.source()).map_err(invalid)?;
+    let native_bundle = encode_native_fragment_bundle(encoding.encoding_view()).map_err(invalid)?;
     let write = assembly.finish(native_bundle).map_err(invalid)?;
     if write.write_operation_id() != attempt.write_operation_id {
         return Err(invalid(

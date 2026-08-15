@@ -31,6 +31,7 @@ pub mod fragment_transport;
 pub(crate) mod frozen_connector_read;
 pub mod kernels;
 pub mod lifecycle;
+pub mod native_fragment;
 pub(crate) mod outcome;
 pub mod planning;
 pub use completion::{

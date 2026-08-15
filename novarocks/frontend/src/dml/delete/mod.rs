@@ -77,8 +77,9 @@ impl WriteExecutor for DeleteWriteExecutor<'_> {
             .engine
             .delete_native_encoding(self.prepared.handle.as_ref())?;
         let input = encoding.input()?;
-        let native_bundle =
-            novarocks::protocol::native::encode::encode_native_fragment_bundle(input.source())?;
+        let native_bundle = novarocks::protocol::native::encode::encode_native_fragment_bundle(
+            input.encoding_view(),
+        )?;
         drop(encoding);
         Ok(
             match self

@@ -1771,7 +1771,7 @@ impl CtasEngine for DmlExecutionKernel {
             .map_err(|error| internal_failure(format!("CTAS native encoding lock: {error}")))?
             .take()
             .ok_or_else(|| internal_failure("CTAS native encoding input was already consumed"))?;
-        if !encoding.matches_native_bundle(&native_bundle) {
+        if !encoding.matches_native_attachment(&native_bundle) {
             return Err(internal_failure(
                 "native fragment bundle does not match the sealed CTAS encoding input",
             ));

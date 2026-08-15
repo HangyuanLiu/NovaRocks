@@ -280,7 +280,7 @@ impl FrontendQueryCompiler {
             execution,
             completion_intent,
         )?;
-        let native_bundle = encode_native_fragment_bundle(assembly.encoding().source())?;
+        let native_bundle = encode_native_fragment_bundle(assembly.encoding().encoding_view())?;
         assembly.into_operation(native_bundle, completion)
     }
 

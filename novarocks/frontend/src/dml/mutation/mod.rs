@@ -51,7 +51,7 @@ impl MutationNativeFragmentEncoder for FrontendMutationNativeFragmentEncoder {
         &self,
         input: &novarocks::query_execution::compiler::NativeFragmentEncodingInput,
     ) -> Result<novarocks::protocol::native::encode::NativeFragmentBundle, String> {
-        novarocks::protocol::native::encode::encode_native_fragment_bundle(input.source())
+        novarocks::protocol::native::encode::encode_native_fragment_bundle(input.encoding_view())
     }
 }
 

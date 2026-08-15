@@ -2100,7 +2100,7 @@ impl PreparedDmlWriteAssembly {
         self,
         native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-        if !self.encoding.matches_native_bundle(&native_bundle) {
+        if !self.encoding.matches_native_attachment(&native_bundle) {
             return Err(
                 "native fragment bundle does not match the sealed DML encoding input".into(),
             );

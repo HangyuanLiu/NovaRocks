@@ -67,19 +67,21 @@ impl NativeFragmentEncodingInput {
         &self.prepared
     }
 
-    pub fn source(&self) -> crate::protocol::native::encode::NativeFragmentEncodingSource<'_> {
-        crate::protocol::native::encode::NativeFragmentEncodingSource::sealed(
+    pub fn encoding_view(
+        &self,
+    ) -> crate::query_execution::native_fragment::NativeFragmentEncodingView<'_> {
+        crate::query_execution::native_fragment::NativeFragmentEncodingView::sealed(
             &self.distributed_plan,
             &self.prepared,
             self.provenance,
         )
     }
 
-    pub(crate) fn matches_native_bundle(
+    pub(crate) fn matches_native_attachment(
         &self,
-        native_bundle: &crate::protocol::native::encode::NativeFragmentBundle,
+        native_attachment: &crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> bool {
-        native_bundle.matches_provenance(self.provenance)
+        native_attachment.matches_provenance(self.provenance)
     }
 
     pub(crate) fn into_parts(self) -> (DistributedPlan, PreparedFragmentSet) {
@@ -128,9 +130,9 @@ impl PreparedDistributedQueryAssembly {
 
     pub fn finish(
         self,
-        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+        native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
-        if !self.encoding.matches_native_bundle(&native_bundle) {
+        if !self.encoding.matches_native_attachment(&native_attachment) {
             return Err(
                 "native fragment bundle does not match the sealed query encoding input".into(),
             );
@@ -138,7 +140,7 @@ impl PreparedDistributedQueryAssembly {
         let (_, prepared) = self.encoding.into_parts();
         crate::query_execution::contract::build_distributed_query_request_with_execution(
             prepared,
-            native_bundle,
+            native_attachment,
             self.query_options,
             self.intent,
             &self.execution,
@@ -148,10 +150,10 @@ impl PreparedDistributedQueryAssembly {
 
     pub fn into_operation(
         self,
-        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+        native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
         completion: PreparedQueryCompletion,
     ) -> Result<PreparedQueryOperation, String> {
-        let request = self.finish(native_bundle)?;
+        let request = self.finish(native_attachment)?;
         Ok(PreparedQueryOperation::Distributed(
             crate::query_execution::PreparedQueryDistributedOperation::new(request, completion),
         ))
