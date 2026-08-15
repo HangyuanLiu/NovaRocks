@@ -22,15 +22,15 @@ pub mod init_plan;
 pub mod manifest;
 pub mod metrics;
 pub mod query_options_wire;
+pub mod residual;
 pub mod stage;
 pub mod terminal;
 
 pub use contract::{
     FragmentLiveObservation, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
     QueryControlEvent, QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryLifecycleError,
-    QueryLifecycleErrorCode, QueryLifecycleTarget, QueryTerminalAck, QueryTerminalIngress,
-    QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminationAck,
-    QueryTerminationReason,
+    QueryLifecycleErrorCode, QueryTerminalAck, QueryTerminalIngress, QueryTerminalReportAck,
+    QueryTerminalReportOutcome, QueryTerminationAck, QueryTerminationReason,
 };
 pub use contract::{
     decode_participant_terminal_outcome, decode_query_terminal_snapshot,
@@ -47,6 +47,7 @@ pub use manifest::{
     ParticipantManifestDigest, ParticipantQueryOptions, ParticipantRole, QueryControlEndpoint,
     RuntimeFilterContribution,
 };
+pub use residual::QueryLifecycleTarget;
 pub use stage::{
     QueryLaunchBarrier, QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck,
     QueryStartOutcome, QueryStartRequest, StageBatch, StageDigest, StageDigestVersion,

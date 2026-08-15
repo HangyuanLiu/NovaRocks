@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use super::identity::AttemptId;
@@ -301,35 +300,6 @@ pub trait QueryTerminalIngress: Send + Sync + 'static {
         &self,
         outcome: ParticipantTerminalOutcome,
     ) -> Result<QueryTerminalReportAck, QueryLifecycleError>;
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct QueryLifecycleTarget {
-    backend_idx: usize,
-    endpoint: SocketAddr,
-    start_epoch: u64,
-}
-
-impl QueryLifecycleTarget {
-    pub const fn new(backend_idx: usize, endpoint: SocketAddr, start_epoch: u64) -> Self {
-        Self {
-            backend_idx,
-            endpoint,
-            start_epoch,
-        }
-    }
-
-    pub const fn backend_idx(self) -> usize {
-        self.backend_idx
-    }
-
-    pub const fn endpoint(self) -> SocketAddr {
-        self.endpoint
-    }
-
-    pub const fn start_epoch(self) -> u64 {
-        self.start_epoch
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

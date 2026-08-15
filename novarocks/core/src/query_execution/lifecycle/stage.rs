@@ -31,9 +31,10 @@ use crate::common::types::UniqueId;
 use crate::query_execution::contract::DistributedQueryError;
 use novarocks_protocol::{novarocks, plan};
 
-use super::contract::{QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleTarget};
+use super::contract::{QueryLifecycleError, QueryLifecycleErrorCode};
 use super::identity::QueryExecutionId;
 use super::manifest::{ParticipantManifestDigest, ParticipantRole};
+use super::residual::QueryLifecycleTarget;
 
 pub const DEFAULT_STAGE_MAX_ENCODED_BYTES: usize = 48 * 1024 * 1024;
 pub const DEFAULT_STAGE_MAX_FRAGMENTS: usize = 256;
