@@ -995,3 +995,272 @@ impl From<&StoredCleanupOperationV4> for CleanupOperation {
         }
     }
 }
+
+#[cfg(test)]
+mod durable_record_budget_tests {
+    use novarocks_spi::state_store::{MAX_VALUE_BYTES, StateStoreLimits};
+
+    use super::*;
+    use crate::durable::{DurableRecordError, DurableRecordStore};
+
+    const SENTINEL: &str = "maintenance-opaque-budget-sentinel";
+
+    fn opaque<const MAX_BYTES: usize>(bytes: usize) -> DurableOpaqueBytes<MAX_BYTES> {
+        let payload = SENTINEL
+            .as_bytes()
+            .iter()
+            .copied()
+            .cycle()
+            .take(bytes)
+            .collect();
+        DurableOpaqueBytes::try_new(payload).expect("bounded opaque payload")
+    }
+
+    fn authority() -> MaintenanceAuthorityV1 {
+        // Serialization deliberately tests the largest accepted durable token;
+        // validation of a provider-issued token is covered at the authority
+        // boundary, not by this record-size proof.
+        MaintenanceAuthorityV1 {
+            attempt_id: Uuid::nil(),
+            fencing_token_v1: vec![0xa5; MAINTENANCE_FENCING_TOKEN_MAX_BYTES],
+        }
+    }
+
+    fn target() -> StoredMaintenanceTargetV1 {
+        StoredMaintenanceTargetV1 {
+            catalog: "c".repeat(1024),
+            namespace: "n".repeat(1024),
+            table: "t".repeat(1024),
+        }
+    }
+
+    fn owner() -> MetadataMaintenanceExactOwner {
+        MetadataMaintenanceExactOwner {
+            instance_id: "i".repeat(1024),
+            incarnation_id: Uuid::nil(),
+        }
+    }
+
+    fn metadata_operation() -> StoredMetadataMaintenanceOperationV2 {
+        StoredMetadataMaintenanceOperationV2 {
+            schema_version: METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION,
+            operation_id: Uuid::nil(),
+            target: target(),
+            owner: owner(),
+            kind: MetadataMaintenanceOperationKind::RewriteMetadataLayout,
+            request_digest: [1; 32],
+            request_payload_digest: [2; 32],
+            base_state_digest: [3; 32],
+            plan_digest: Some([4; 32]),
+            plan_summary: Some([u64::MAX; 5]),
+            state: MetadataMaintenanceOperationState::Unresolved,
+            error_message: Some(SENTINEL.repeat(32)),
+            created_at_ms: i64::MAX,
+            started_at_ms: Some(i64::MAX),
+            finished_at_ms: Some(i64::MAX),
+            authority: Some(authority()),
+        }
+    }
+
+    fn rewrite_operation() -> StoredDistributedRewriteOperationV3 {
+        StoredDistributedRewriteOperationV3 {
+            schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
+            operation_id: Uuid::nil(),
+            target: target(),
+            owner: owner(),
+            kind: DistributedRewriteOperationKind::RewritePositionDeleteFiles,
+            request_digest: [1; 32],
+            base_state_digest: [2; 32],
+            request_payload_digest: [3; 32],
+            plan_digest: Some([4; 32]),
+            manifest_digest: Some([5; 32]),
+            cohort_set_digest: Some([6; 32]),
+            cohort_count: Some(u32::MAX),
+            state: DistributedRewriteOperationState::Unresolved,
+            error_message: Some(SENTINEL.repeat(32)),
+            created_at_ms: i64::MAX,
+            started_at_ms: Some(i64::MAX),
+            finished_at_ms: Some(i64::MAX),
+            authority: Some(authority()),
+        }
+    }
+
+    fn cleanup_operation() -> StoredCleanupOperationV4 {
+        StoredCleanupOperationV4 {
+            schema_version: CLEANUP_OPERATION_SCHEMA_VERSION,
+            operation_id: Uuid::nil(),
+            target: target(),
+            owner: owner(),
+            request_digest: [1; 32],
+            older_than_ms: i64::MIN,
+            plan_digest: Some([2; 32]),
+            manifest_digest: Some([3; 32]),
+            candidate_count: Some(u32::MAX),
+            batch_count: Some(u16::MAX),
+            next_batch_ordinal: u16::MAX,
+            state: CleanupOperationState::Unresolved,
+            error_message: Some(SENTINEL.repeat(32)),
+            created_at_ms: i64::MAX,
+            started_at_ms: Some(i64::MAX),
+            finished_at_ms: Some(i64::MAX),
+            authority: Some(authority()),
+        }
+    }
+
+    fn assert_budget<R: DurableRecord>(record: R) {
+        let standard = DurableRecordStore::with_limits(StateStoreLimits::default());
+        let encoded = standard
+            .encode(&record)
+            .expect("maximal bounded record must fit its declared budget");
+        let actual_bytes = encoded.as_bytes().len();
+        assert!(actual_bytes <= R::ENCODED_LIMIT, "{}", R::RECORD_KIND);
+        assert!(R::ENCODED_LIMIT <= MAX_VALUE_BYTES, "{}", R::RECORD_KIND);
+
+        // with_limits has no StateStore attached. A failed encode therefore
+        // proves rejection occurs before any transaction, index, or record
+        // write can be opened.
+        let mut restricted = StateStoreLimits::default();
+        restricted.max_value_bytes = actual_bytes - 1;
+        let error = DurableRecordStore::with_limits(restricted)
+            .encode(&record)
+            .expect_err("one byte below the actual encoding must fail before writing");
+        assert_eq!(
+            error,
+            DurableRecordError::BudgetExceeded {
+                record_kind: R::RECORD_KIND,
+                schema_version: R::SCHEMA_VERSION,
+                actual_bytes,
+                limit_bytes: actual_bytes - 1,
+            }
+        );
+        assert!(!format!("{error}").contains(SENTINEL));
+        assert!(!format!("{error:?}").contains(SENTINEL));
+    }
+
+    #[test]
+    fn every_table_maintenance_record_has_a_checked_maximal_encoding() {
+        assert_budget(StoredOptimizeCounterV1 {
+            schema_version: OPTIMIZE_JOB_SCHEMA_VERSION,
+            last_job_id: i64::MAX,
+        });
+        assert_budget(StoredOptimizeJobV1 {
+            schema_version: OPTIMIZE_JOB_SCHEMA_VERSION,
+            job_id: i64::MAX,
+            target: target(),
+            base_snapshot_id: i64::MAX,
+            state: StoredOptimizeJobStateV1::Failed,
+            outcome: Some(StoredOptimizeOutcomeV1 {
+                target_snapshot_id: Some(i64::MAX),
+                rewritten_data_files: i64::MAX,
+                deleted_data_files: i64::MAX,
+                added_data_files: i64::MAX,
+                output_record_count: i64::MAX,
+            }),
+            error_message: Some(SENTINEL.repeat(32)),
+            created_at_ms: i64::MAX,
+            started_at_ms: Some(i64::MAX),
+            finished_at_ms: Some(i64::MAX),
+            last_operation_id: Uuid::nil(),
+            authority: Some(authority()),
+            dispatched_child: Some(Uuid::nil()),
+        });
+        assert_budget(StoredOptimizeOperationV1 {
+            schema_version: OPTIMIZE_JOB_SCHEMA_VERSION,
+            operation_id: Uuid::nil(),
+            action: StoredOptimizeOperationActionV1::Fail,
+            job_id: i64::MAX,
+            post_job: StoredOptimizeJobV1 {
+                schema_version: OPTIMIZE_JOB_SCHEMA_VERSION,
+                job_id: i64::MAX,
+                target: target(),
+                base_snapshot_id: i64::MAX,
+                state: StoredOptimizeJobStateV1::Failed,
+                outcome: None,
+                error_message: Some(SENTINEL.repeat(32)),
+                created_at_ms: i64::MAX,
+                started_at_ms: Some(i64::MAX),
+                finished_at_ms: Some(i64::MAX),
+                last_operation_id: Uuid::nil(),
+                authority: Some(authority()),
+                dispatched_child: Some(Uuid::nil()),
+            },
+        });
+
+        assert_budget(metadata_operation());
+        assert_budget(StoredMetadataMaintenanceTransactionV2 {
+            schema_version: METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION,
+            transaction_operation_id: Uuid::nil(),
+            action: StoredMetadataMaintenanceTransactionActionV2::Unresolve,
+            operation_id: Uuid::nil(),
+            post_operation: metadata_operation(),
+        });
+        assert_budget(StoredMetadataMaintenancePayloadV2 {
+            schema_version: METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION,
+            kind: StoredMetadataMaintenancePayloadKindV2::Evidence,
+            digest: [1; 32],
+            payload: opaque(METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES),
+        });
+
+        assert_budget(rewrite_operation());
+        assert_budget(StoredDistributedRewritePayloadV3 {
+            schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
+            kind: StoredDistributedRewritePayloadKindV3::Evidence,
+            digest: [1; 32],
+            payload: opaque(DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES),
+        });
+        assert_budget(StoredDistributedRewriteAttemptV3 {
+            schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
+            operation_id: Uuid::nil(),
+            cohort_id: [1; 32],
+            execution_query_id: [2; 16],
+            execution_attempt_id: u64::MAX,
+            disposition: DistributedRewriteAttemptDisposition::Superseded,
+            attempt_digest: [3; 32],
+            artifact_digest: [4; 32],
+            artifact_handle: opaque(DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES),
+            checkpoint_digest: [5; 32],
+        });
+        assert_budget(StoredDistributedRewriteTransactionV3 {
+            schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
+            transaction_operation_id: Uuid::nil(),
+            action: StoredDistributedRewriteTransactionActionV3::Unresolve,
+            operation_id: Uuid::nil(),
+            post_operation: rewrite_operation(),
+        });
+
+        assert_budget(cleanup_operation());
+        assert_budget(StoredCleanupPlanV4 {
+            schema_version: CLEANUP_OPERATION_SCHEMA_VERSION,
+            operation_id: Uuid::nil(),
+            plan_digest: [1; 32],
+            base_state_digest: [2; 32],
+            manifest_digest: [3; 32],
+            artifact_handle_digest: [4; 32],
+            artifact_handle: opaque(CLEANUP_MAX_PAYLOAD_BYTES),
+            candidate_count: u32::MAX,
+            total_bytes: u64::MAX,
+            manifest_parts: u16::MAX,
+            batch_count: u16::MAX,
+        });
+        assert_budget(StoredCleanupBatchV4 {
+            schema_version: CLEANUP_OPERATION_SCHEMA_VERSION,
+            operation_id: Uuid::nil(),
+            ordinal: u16::MAX,
+            prepared_handle_digest: [1; 32],
+            prepared_handle: opaque(CLEANUP_MAX_PAYLOAD_BYTES),
+            receipt_handle_digest: Some([2; 32]),
+            receipt_handle: Some(opaque(CLEANUP_MAX_PAYLOAD_BYTES)),
+            deleted_count: u32::MAX,
+            already_absent_count: u32::MAX,
+            failed_count: u32::MAX,
+            unknown_count: u32::MAX,
+        });
+        assert_budget(StoredCleanupTransactionV4 {
+            schema_version: CLEANUP_OPERATION_SCHEMA_VERSION,
+            transaction_operation_id: Uuid::nil(),
+            action: StoredCleanupTransactionActionV4::Unresolve,
+            operation_id: Uuid::nil(),
+            post_operation: cleanup_operation(),
+        });
+    }
+}

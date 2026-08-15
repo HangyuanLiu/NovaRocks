@@ -297,3 +297,89 @@ impl From<&StoredStatisticsJobV2> for StatisticsJob {
         }
     }
 }
+
+#[cfg(test)]
+mod durable_record_budget_tests {
+    use novarocks_spi::state_store::{MAX_VALUE_BYTES, StateStoreLimits};
+
+    use super::*;
+    use crate::durable::DurableRecordStore;
+
+    const SENTINEL: &str = "statistics-opaque-budget-sentinel";
+
+    fn opaque<const MAX_BYTES: usize>(bytes: usize) -> DurableOpaqueBytes<MAX_BYTES> {
+        DurableOpaqueBytes::try_new(
+            SENTINEL
+                .as_bytes()
+                .iter()
+                .copied()
+                .cycle()
+                .take(bytes)
+                .collect(),
+        )
+        .expect("bounded opaque payload")
+    }
+
+    #[test]
+    fn maximal_statistics_record_fits_and_fails_before_a_store_write_when_restricted() {
+        let record = StoredStatisticsJobV2 {
+            schema_version: STATISTICS_JOB_SCHEMA_VERSION,
+            job_id: Uuid::nil(),
+            operation_id: Uuid::nil(),
+            target: StatisticsJobTarget {
+                catalog: "c".repeat(MAX_STATISTICS_TARGET_COMPONENT_BYTES),
+                namespace: "n".repeat(MAX_STATISTICS_TARGET_COMPONENT_BYTES),
+                table: "t".repeat(MAX_STATISTICS_TARGET_COMPONENT_BYTES),
+            },
+            table_pin: StoredStatisticsJobTablePin {
+                connector_instance_id: "i".repeat(MAX_STATISTICS_TARGET_COMPONENT_BYTES),
+                table_handle: opaque(MAX_DURABLE_STATISTICS_TABLE_HANDLE_BYTES),
+                data_version: opaque(MAX_DURABLE_STATISTICS_DATA_VERSION_BYTES),
+                columns: (0..MAX_STATISTICS_PINNED_COLUMNS)
+                    .map(|_| "c".repeat(MAX_STATISTICS_PINNED_COLUMN_BYTES))
+                    .collect(),
+            },
+            metric_names: (0..MAX_STATISTICS_METRIC_NAMES)
+                .map(|_| "m".repeat(MAX_STATISTICS_METRIC_NAME_BYTES))
+                .collect(),
+            state: StatisticsJobState::Failed,
+            attempt: u32::MAX,
+            retry_not_before_ms: Some(i64::MAX),
+            publication_evidence: Some(opaque(MAX_DURABLE_STATISTICS_PUBLICATION_EVIDENCE_BYTES)),
+            cancel_requested: true,
+            error: Some(StatisticsJobError {
+                kind: StatisticsJobErrorKind::Internal,
+                message: SENTINEL.repeat(MAX_STATISTICS_ERROR_MESSAGE_BYTES / SENTINEL.len()),
+            }),
+            submitted_at_ms: i64::MAX,
+            updated_at_ms: i64::MAX,
+            completed_at_ms: Some(i64::MAX),
+        };
+        let standard = DurableRecordStore::with_limits(StateStoreLimits::default());
+        let encoded = standard
+            .encode(&record)
+            .expect("maximal bounded statistics record must fit");
+        let actual_bytes = encoded.as_bytes().len();
+        assert!(actual_bytes <= STATISTICS_JOB_RECORD_ENCODED_LIMIT);
+        assert!(STATISTICS_JOB_RECORD_ENCODED_LIMIT <= MAX_VALUE_BYTES);
+
+        // This encoder has no StateStore handle: rejection proves the error
+        // is raised before a transaction, job value, or index can be written.
+        let mut restricted = StateStoreLimits::default();
+        restricted.max_value_bytes = actual_bytes - 1;
+        let error = DurableRecordStore::with_limits(restricted)
+            .encode(&record)
+            .expect_err("restricted record budget must reject before writing");
+        assert!(matches!(
+            error,
+            DurableRecordError::BudgetExceeded {
+                record_kind: "statistics-job",
+                schema_version: STATISTICS_JOB_SCHEMA_VERSION,
+                actual_bytes: actual,
+                limit_bytes,
+            } if actual == actual_bytes && limit_bytes == actual_bytes - 1
+        ));
+        assert!(!format!("{error}").contains(SENTINEL));
+        assert!(!format!("{error:?}").contains(SENTINEL));
+    }
+}
