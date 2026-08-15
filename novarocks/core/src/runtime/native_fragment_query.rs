@@ -28,7 +28,6 @@ use std::time::Duration;
 use novarocks_spi::connector::ConnectorCancellation;
 
 use crate::common::types::UniqueId;
-use crate::query_execution::lifecycle::QueryExecutionId;
 use crate::runtime::query_context::{
     QueryContextManager, QueryExecutionKey, QueryId, query_context_manager,
 };
@@ -43,6 +42,7 @@ use novarocks_execution::runtime::fragment::io::{
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::profile::Profiler;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
+use novarocks_protocol::lifecycle::QueryExecutionId;
 use novarocks_types::SlotId;
 
 #[derive(Clone)]
