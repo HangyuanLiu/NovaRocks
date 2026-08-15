@@ -1541,7 +1541,7 @@ fn claim_terminal_ack_drop(
     let Some(scope) = claim_matching_fault(
         &root,
         QueryLifecycleFaultKind::TerminalAckDrop,
-        outcome.execution_id(),
+        protocol_execution_id(outcome.execution_id())?,
         backend_index,
         backend_id,
         session.target.start_epoch(),
@@ -1579,12 +1579,22 @@ fn claim_terminal_snapshot_conflict(
     claim_matching_fault(
         &root,
         QueryLifecycleFaultKind::TerminalSnapshotConflict,
-        outcome.execution_id(),
+        protocol_execution_id(outcome.execution_id())?,
         backend_index,
         backend_id,
         session.target.start_epoch(),
     )
     .map_err(|error| format!("claim terminal snapshot conflict fault: {error}"))
+}
+
+#[cfg(debug_assertions)]
+fn protocol_execution_id(
+    execution_id: QueryExecutionId,
+) -> Result<novarocks_protocol::lifecycle::QueryExecutionId, String> {
+    let attempt = novarocks_protocol::lifecycle::AttemptId::new(execution_id.attempt_id().get())
+        .map_err(|error| error.to_string())?;
+    novarocks_protocol::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(not(debug_assertions))]

@@ -333,7 +333,7 @@ fn bind_query_lifecycle_fault_scopes(
             if let Some(scope) = bind_armed_fault(
                 &root,
                 kind,
-                execution_id,
+                protocol_execution_id(execution_id)?,
                 backend_index,
                 backend_id,
                 start_epoch,
@@ -355,6 +355,16 @@ fn bind_query_lifecycle_fault_scopes(
         }
     }
     Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn protocol_execution_id(
+    execution_id: QueryExecutionId,
+) -> Result<novarocks_protocol::lifecycle::QueryExecutionId, DistributedQueryError> {
+    let attempt = novarocks_protocol::lifecycle::AttemptId::new(execution_id.attempt_id().get())
+        .map_err(|error| contract_error(error.to_string()))?;
+    novarocks_protocol::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
+        .map_err(|error| contract_error(error.to_string()))
 }
 
 #[cfg(not(debug_assertions))]
