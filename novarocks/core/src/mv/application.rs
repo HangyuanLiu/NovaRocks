@@ -30,8 +30,8 @@ use uuid::Uuid;
 use crate::mv::repository::{
     CreateMvRepositoryRequest, MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvTarget,
 };
-use crate::protocol::native::encode::NativeFragmentBundle;
 use crate::query_execution::compiler::NativeFragmentEncodingInput;
+use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::runtime::query_result::QueryResult;
 use novarocks_sql::planning::mv::{MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget};
@@ -148,7 +148,7 @@ impl PreparedMvNativeWriteAssembly {
 
     pub fn finish(
         self,
-        native_bundle: NativeFragmentBundle,
+        native_bundle: NativeFragmentAttachment,
     ) -> Result<PreparedDistributedWriteRequest, String> {
         if !self.encoding.matches_native_attachment(&native_bundle) {
             return Err(

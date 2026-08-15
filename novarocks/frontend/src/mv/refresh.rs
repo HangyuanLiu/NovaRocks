@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
+use crate::native::fragment_encoder::encode_native_fragment_bundle;
 use novarocks::connector::mutation::{
     CompletedCatalogMutation, ResolvedCatalogMutation, resolve_catalog_mutation_with_lease,
 };
@@ -36,7 +37,6 @@ use novarocks::mv::persistence::refresh::{
 use novarocks::mv::repository::{
     BeginFrontendMvRefreshIntentRequest, MvRepository, MvRepositoryError,
 };
-use novarocks::protocol::native::encode::encode_native_fragment_bundle;
 use novarocks::query_execution::ConnectorWriteCompletion;
 use novarocks::query_execution::contract::ConnectorWriteExecutionRegistration;
 use novarocks::query_execution::prepared_write::PreparedDistributedWriteRequest;

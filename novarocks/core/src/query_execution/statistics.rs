@@ -433,30 +433,6 @@ pub fn prepare_statistics_collection_request(
     })
 }
 
-/// Transitional Core executor entrypoint.  It intentionally exercises the
-/// same prepare -> sealed view -> attachment -> finish sequence that the
-/// Frontend encoder will own after the owner cut; it does not reacquire a
-/// connector lease or read from the pinned provider twice.
-pub(crate) fn build_statistics_collection_request(
-    controls: &dyn ConnectorControlResolver,
-    execution: &crate::query_execution::request_context::QueryExecutionContext,
-    context: ConnectorRequestContext,
-    program: StatisticsCollectionProgram,
-    planning_lease: ConnectorControlPlanningLease,
-) -> Result<DistributedQueryRequest, DistributedQueryError> {
-    let prepared = prepare_statistics_collection_request(
-        controls,
-        execution,
-        context,
-        program,
-        planning_lease,
-    )?;
-    let native_attachment =
-        crate::protocol::native::encode::encode_native_fragment_bundle(prepared.encoding_view())
-            .map_err(contract_violation)?;
-    prepared.finish(native_attachment)
-}
-
 /// Retain a request-local SQL token even though the opaque statistics read is
 /// supplied by `PinnedStatisticsReadResolver`.  The resolver holds the exact
 /// statistics lease; the binding store keeps the synthetic compiler source
@@ -1977,13 +1953,23 @@ mod tests {
         }
     }
 
+    fn seal_collection_attachment(
+        view: crate::query_execution::native_fragment::NativeFragmentEncodingView<'_>,
+    ) -> crate::query_execution::native_fragment::NativeFragmentAttachment {
+        let fragments = view.distributed_plan().fragments().iter().map(|fragment| {
+            novarocks_protocol::plan::PlanFragment {
+                fragment_id: fragment.fragment_id,
+                ..Default::default()
+            }
+        });
+        view.seal(fragments)
+            .expect("sealed statistics attachment for Core finish contract")
+    }
+
     #[test]
     fn prepared_statistics_request_preserves_typed_program_and_execution_intent() {
         let prepared = prepared_collection_request_for_test();
-        let native_attachment = crate::protocol::native::encode::encode_native_fragment_bundle(
-            prepared.encoding_view(),
-        )
-        .expect("encode exact statistics attachment");
+        let native_attachment = seal_collection_attachment(prepared.encoding_view());
         let request = prepared
             .finish(native_attachment)
             .expect("matching attachment completes statistics request");
@@ -2008,9 +1994,7 @@ mod tests {
     fn prepared_statistics_request_rejects_cross_provenance_attachment() {
         let prepared = prepared_collection_request_for_test();
         let other = prepared_collection_request_for_test();
-        let attachment =
-            crate::protocol::native::encode::encode_native_fragment_bundle(other.encoding_view())
-                .expect("encode other statistics attachment");
+        let attachment = seal_collection_attachment(other.encoding_view());
 
         let error = match prepared.finish(attachment) {
             Ok(_) => panic!("attachment from a different preparation must fail"),

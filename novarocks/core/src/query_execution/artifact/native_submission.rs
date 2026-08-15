@@ -29,6 +29,14 @@ use super::{
 use crate::common::types::UniqueId;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle::QueryExecutionId;
+use crate::query_execution::native_fragment::NativeFragmentAttachment;
+use crate::query_execution::preparation::PreparedFragmentSet;
+use crate::query_execution::schedule::SchedulingPlan;
+use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
+use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_spi::connector::ConnectorWriteCohortId;
+use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdge, FragmentId as PlannerFragmentId};
+use std::collections::BTreeMap;
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
@@ -77,7 +85,13 @@ pub struct NativeSubmissionEncodingView<'a> {
     execution_id: QueryExecutionId,
     keys: Vec<NativeSubmissionKey>,
     root: NativeSubmissionKey,
-    _borrowed: std::marker::PhantomData<&'a ()>,
+    prepared: &'a PreparedFragmentSet,
+    native_fragments: &'a NativeFragmentAttachment,
+    schedule: &'a SchedulingPlan,
+    options: &'a QueryOptions,
+    connector_write_plans: &'a BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
+    root_fetch: RootFetchMetadata,
+    expected_output: ExpectedOutputSchema,
 }
 
 impl<'a> NativeSubmissionEncodingView<'a> {
@@ -86,24 +100,27 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         execution_id: QueryExecutionId,
         keys: Vec<NativeSubmissionKey>,
         root: NativeSubmissionKey,
+        prepared: &'a PreparedFragmentSet,
+        native_fragments: &'a NativeFragmentAttachment,
+        schedule: &'a SchedulingPlan,
+        options: &'a QueryOptions,
+        connector_write_plans: &'a BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
+        root_fetch: RootFetchMetadata,
+        expected_output: ExpectedOutputSchema,
     ) -> Result<Self, DistributedQueryError> {
-        let actual = keys.iter().copied().collect::<BTreeSet<_>>();
-        if actual.len() != keys.len() {
-            return Err(contract_error(
-                "native submission encoding view repeats a sealed placement key",
-            ));
-        }
-        if !actual.contains(&root) {
-            return Err(contract_error(
-                "native submission encoding view root is absent from sealed placement keys",
-            ));
-        }
+        validate_keys(&keys, root)?;
         Ok(Self {
             handoff_id,
             execution_id,
             keys,
             root,
-            _borrowed: std::marker::PhantomData,
+            prepared,
+            native_fragments,
+            schedule,
+            options,
+            connector_write_plans,
+            root_fetch,
+            expected_output,
         })
     }
 
@@ -119,12 +136,66 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         self.root
     }
 
-    pub(crate) fn seal(
+    /// Exact static native templates projected from the sealed attachment.
+    /// The attachment itself remains Core-owned and consuming; this narrow
+    /// borrow gives the Frontend no replacement, reuse, or fragment-set
+    /// construction capability.
+    pub fn native_fragments_in_id_order(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (FragmentId, &novarocks_protocol::plan::PlanFragment)> + '_
+    {
+        self.native_fragments.fragments_in_id_order()
+    }
+
+    /// Frozen schedule placements, including assigned scan splits and stream
+    /// destinations.  The encoder receives no mutable scheduling capability.
+    pub fn schedule(&self) -> &'a SchedulingPlan {
+        self.schedule
+    }
+
+    pub fn query_options(&self) -> &'a QueryOptions {
+        self.options
+    }
+
+    pub fn connector_write_plans(
+        &self,
+    ) -> &'a BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment> {
+        self.connector_write_plans
+    }
+
+    pub fn query_id(&self) -> UniqueId {
+        let query_id = self.execution_id.query_id();
+        UniqueId::new(query_id.high(), query_id.low())
+    }
+
+    pub fn topological_fragment_order(&self) -> &'a [PlannerFragmentId] {
+        self.prepared.scheduling_view().topological_order()
+    }
+
+    pub fn edges(&self) -> &'a [FragmentEdge] {
+        self.prepared.scheduling_view().edges()
+    }
+
+    pub fn fragments(
+        &self,
+    ) -> impl ExactSizeIterator<Item = NativeSubmissionFragmentFacts<'a>> + '_ {
+        self.prepared
+            .scheduling_view()
+            .fragments()
+            .map(NativeSubmissionFragmentFacts::new)
+    }
+
+    pub fn fragment(&self, fragment_id: FragmentId) -> Option<NativeSubmissionFragmentFacts<'a>> {
+        self.prepared
+            .scheduling_view()
+            .fragment(fragment_id)
+            .map(NativeSubmissionFragmentFacts::new)
+    }
+
+    pub fn seal(
         &self,
         submissions: Vec<ValidatedNativeSubmission>,
-        root_fetch: RootFetchMetadata,
         writer_registrations: WriterRegistrationSet,
-        expected_output: ExpectedOutputSchema,
     ) -> Result<NativeSubmissionAttachment, DistributedQueryError> {
         let expected = self.keys.iter().copied().collect::<BTreeSet<_>>();
         let mut actual = BTreeSet::new();
@@ -153,9 +224,9 @@ impl<'a> NativeSubmissionEncodingView<'a> {
             )));
         }
         let root = NativeSubmissionKey::new(
-            root_fetch.backend_idx(),
-            root_fetch.fragment_id(),
-            root_fetch.fragment_instance_id(),
+            self.root_fetch.backend_idx(),
+            self.root_fetch.fragment_id(),
+            self.root_fetch.fragment_instance_id(),
         );
         if root != self.root {
             return Err(contract_error(
@@ -166,10 +237,89 @@ impl<'a> NativeSubmissionEncodingView<'a> {
             handoff_id: self.handoff_id,
             execution_id: self.execution_id,
             submissions,
-            root_fetch,
+            root_fetch: self.root_fetch.clone(),
             writer_registrations,
-            expected_output,
+            expected_output: self.expected_output.clone(),
         })
+    }
+}
+
+fn validate_keys(
+    keys: &[NativeSubmissionKey],
+    root: NativeSubmissionKey,
+) -> Result<(), DistributedQueryError> {
+    let actual = keys.iter().copied().collect::<BTreeSet<_>>();
+    if actual.len() != keys.len() {
+        return Err(contract_error(
+            "native submission encoding view repeats a sealed placement key",
+        ));
+    }
+    if !actual.contains(&root) {
+        return Err(contract_error(
+            "native submission encoding view root is absent from sealed placement keys",
+        ));
+    }
+    Ok(())
+}
+
+/// The subset of prepared-fragment facts needed by placement-local native
+/// submission mapping.  It is deliberately a read-only projection, not a
+/// way to reconstruct planning or scheduling state.
+#[derive(Clone, Copy)]
+pub struct NativeSubmissionFragmentFacts<'a> {
+    fragment: &'a crate::query_execution::preparation::PreparedFragment,
+}
+
+impl<'a> NativeSubmissionFragmentFacts<'a> {
+    fn new(fragment: &'a crate::query_execution::preparation::PreparedFragment) -> Self {
+        Self { fragment }
+    }
+
+    pub fn fragment_id(self) -> FragmentId {
+        self.fragment.fragment_id()
+    }
+
+    pub fn role(self) -> NativeSubmissionFragmentRole {
+        match self.fragment.execution_role() {
+            crate::query_execution::preparation::PreparedFragmentRole::Result => {
+                NativeSubmissionFragmentRole::Result
+            }
+            crate::query_execution::preparation::PreparedFragmentRole::Statistics => {
+                NativeSubmissionFragmentRole::Statistics
+            }
+            crate::query_execution::preparation::PreparedFragmentRole::TerminalWrite => {
+                NativeSubmissionFragmentRole::TerminalWrite
+            }
+            crate::query_execution::preparation::PreparedFragmentRole::NonTerminal => {
+                NativeSubmissionFragmentRole::NonTerminal
+            }
+        }
+    }
+
+    pub fn cte_id(self) -> Option<CteId> {
+        self.fragment.boundary_projection().cte_id()
+    }
+
+    pub fn cte_exchange_nodes(self) -> &'a [(CteId, i32, Vec<ColumnId>)] {
+        self.fragment.boundary_projection().cte_exchange_nodes()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeSubmissionFragmentRole {
+    Result,
+    Statistics,
+    TerminalWrite,
+    NonTerminal,
+}
+
+impl NativeSubmissionFragmentRole {
+    pub const fn uses_result_buffer(self) -> bool {
+        matches!(self, Self::Result)
+    }
+
+    pub const fn is_terminal_write(self) -> bool {
+        matches!(self, Self::TerminalWrite)
     }
 }
 
@@ -223,7 +373,7 @@ mod tests {
     #[test]
     fn view_rejects_duplicate_placement_key() {
         let key = NativeSubmissionKey::new(2, 3, UniqueId::new(5, 7));
-        let error = NativeSubmissionEncodingView::new(1, execution_id(), vec![key, key], key)
+        let error = validate_keys(&[key, key], key)
             .err()
             .expect("duplicate key must be rejected");
         assert!(error.message().contains("repeats a sealed placement key"));

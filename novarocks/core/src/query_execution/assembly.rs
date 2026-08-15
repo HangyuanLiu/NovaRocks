@@ -26,7 +26,7 @@ use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::{ConnectorSplit, ConnectorWriterHandle};
 
 use crate::novarocks_logging::debug;
-use crate::protocol::native::encode::NativeFragmentBundle;
+use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::{
     PreparedFragmentRole, PreparedFragmentSet, PreparedOutputColumn,
 };
@@ -148,7 +148,7 @@ fn same_unit_timestamp_metadata_mismatch(expected: &DataType, actual: &DataType)
 // any plain/router mix, so at most one plain stream edge exists per source and
 // the insert never overwrites. Re-adding a shape check here would duplicate a
 // planner-owned decision (guarded by `planner_topology_contract`).
-pub(crate) fn build_stream_edge_by_source<'a>(
+pub fn build_stream_edge_by_source<'a>(
     edges: &'a [FragmentEdge],
 ) -> BTreeMap<FragmentId, &'a FragmentEdge> {
     let mut stream_edge_by_source = BTreeMap::new();
@@ -168,7 +168,7 @@ pub(crate) fn build_stream_edge_by_source<'a>(
 // this used to re-check, so grouping here only collects the sealed branches. Re-
 // adding a shape check here would duplicate a planner-owned decision (guarded by
 // `planner_topology_contract`).
-pub(crate) fn group_router_edges_by_source<'a>(
+pub fn group_router_edges_by_source<'a>(
     edges: &'a [FragmentEdge],
 ) -> BTreeMap<(FragmentId, i32), Vec<&'a FragmentEdge>> {
     let mut grouped: BTreeMap<(FragmentId, i32), Vec<&FragmentEdge>> = BTreeMap::new();
@@ -186,7 +186,7 @@ pub(crate) fn group_router_edges_by_source<'a>(
     }
     grouped
 }
-pub(crate) fn ensure_native_fragment_sink_supported(
+pub fn ensure_native_fragment_sink_supported(
     fragment_id: FragmentId,
     is_root: bool,
     is_terminal_write: bool,
@@ -213,7 +213,7 @@ pub(crate) fn ensure_native_fragment_sink_supported(
 /// This is the only seam that installs the per-placement opaque handle; it
 /// neither decodes its provider payload nor permits a fallback to an
 /// unplanned handle.
-pub(crate) fn patch_native_connector_write_sink(
+pub fn patch_native_connector_write_sink(
     fragment: &mut novarocks_protocol::plan::PlanFragment,
     fragment_id: FragmentId,
     fragment_instance_id: crate::common::types::UniqueId,
@@ -384,7 +384,7 @@ pub(crate) fn validate_fragment_output_kind(
 
 pub(crate) fn validate_prepared_native_payloads(
     prepared: &PreparedFragmentSet,
-    native_bundle: &NativeFragmentBundle,
+    native_bundle: &NativeFragmentAttachment,
 ) -> Result<(), String> {
     let prepared_ids = prepared.fragment_ids();
     for (fragment_id, fragment) in native_bundle.fragments_in_id_order() {
@@ -421,7 +421,7 @@ pub(crate) fn validate_prepared_native_payloads(
 
 pub(crate) fn validate_artifact_fragment_sets(
     prepared: &PreparedFragmentSet,
-    native_bundle: &NativeFragmentBundle,
+    native_bundle: &NativeFragmentAttachment,
     scheduling: &SchedulingPlan,
 ) -> Result<(), String> {
     let expected = prepared.fragment_ids();
@@ -471,7 +471,7 @@ pub(crate) fn validate_scheduling_placements(plan: &SchedulingPlan) -> Result<()
 /// Applies only placement to an already-encoded provider-neutral connector
 /// source. The traversal deliberately has no provider branch and never
 /// interprets a split payload.
-pub(crate) fn patch_native_connector_read_splits(
+pub fn patch_native_connector_read_splits(
     fragment: &mut novarocks_protocol::plan::PlanFragment,
     node_id: i32,
     splits: &[ConnectorSplit],
@@ -541,7 +541,7 @@ fn patch_connector_splits_in_node(
     Ok(())
 }
 
-pub(crate) fn patch_native_change_stream_router_sink(
+pub fn patch_native_change_stream_router_sink(
     fragment: &mut novarocks_protocol::plan::PlanFragment,
     fragment_id: FragmentId,
     router_group_id: i32,
@@ -703,7 +703,7 @@ fn patch_native_change_stream_router_sink_in_place(
     Ok(())
 }
 
-pub(crate) fn patch_native_cte_multicast_sink(
+pub fn patch_native_cte_multicast_sink(
     fragment: &mut novarocks_protocol::plan::PlanFragment,
     fragment_id: FragmentId,
     cte_id: CteId,

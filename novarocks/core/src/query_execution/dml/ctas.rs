@@ -288,7 +288,7 @@ pub trait CtasEngine: Send + Sync {
     fn bind_ctas_write_native_bundle(
         &self,
         prepared: &dyn CtasPreparedWrite,
-        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<(), CtasFailure>;
 
     /// Consume the prepared source exactly once and return the sealed generic
@@ -1756,7 +1756,7 @@ impl CtasEngine for DmlExecutionKernel {
     fn bind_ctas_write_native_bundle(
         &self,
         prepared: &dyn CtasPreparedWrite,
-        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<(), CtasFailure> {
         let prepared = downcast_write(prepared)?;
         let pending = prepared

@@ -663,7 +663,6 @@ pub struct StatisticsAttemptExecutorPorts {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     backend_topology: BackendTopologyService,
     query_execution: QueryExecutionService,
-    iceberg_mv: novarocks::mv::iceberg_refresh::IcebergMvCorePorts,
 }
 
 impl StatisticsAttemptExecutorPorts {
@@ -672,30 +671,24 @@ impl StatisticsAttemptExecutorPorts {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         backend_topology: BackendTopologyService,
         query_execution: QueryExecutionService,
-        iceberg_mv: novarocks::mv::iceberg_refresh::IcebergMvCorePorts,
     ) -> Self {
         Self {
             execution_role,
             connector_control,
             backend_topology,
             query_execution,
-            iceberg_mv,
         }
     }
 }
 
-/// Build the native statistics attempt executor without exposing
-/// `ConnectorRegistry` to Frontend composition.
+/// Build the native statistics attempt executor from Frontend-owned leaves.
 pub fn statistics_attempt_executor(
     ports: StatisticsAttemptExecutorPorts,
 ) -> Arc<dyn novarocks::statistics::application::StatisticsAttemptExecutor> {
-    let mut registry = novarocks::connector::ConnectorRegistry::new();
-    registry.register_iceberg_mv_backend(ports.iceberg_mv);
     Arc::new(
-        novarocks::statistics::application::ConnectorStatisticsAttemptExecutor::new(
-            novarocks::statistics::application::StatisticsAttemptExecutionPorts::new(
+        crate::statistics_jobs::attempt_executor::FrontendStatisticsAttemptExecutor::new(
+            crate::statistics_jobs::attempt_executor::StatisticsAttemptExecutionPorts::new(
                 ports.execution_role,
-                Arc::new(std::sync::RwLock::new(registry)),
                 ports.connector_control,
                 ports.backend_topology,
                 ports.query_execution,

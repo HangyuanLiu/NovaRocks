@@ -16,6 +16,7 @@
 // under the License.
 
 pub mod application;
+pub(crate) use novarocks::{common, protocol, query_execution, runtime};
 pub mod capabilities;
 pub mod catalog_application;
 pub mod catalog_attachment;

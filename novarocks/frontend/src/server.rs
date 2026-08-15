@@ -175,7 +175,6 @@ pub fn build_frontend_query_session_factory(
             Arc::clone(&connector_control),
             topology.clone(),
             query_execution.clone(),
-            iceberg_mv_ports.clone(),
         ),
     )
     .map_err(FrontendApplicationError::server)?;

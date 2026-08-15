@@ -1983,7 +1983,7 @@ mod tests {
         fn bind_ctas_write_native_bundle(
             &self,
             _prepared: &dyn novarocks::query_execution::dml::ctas::CtasPreparedWrite,
-            _native_bundle: novarocks::protocol::native::encode::NativeFragmentBundle,
+            _native_bundle: novarocks::query_execution::native_fragment::NativeFragmentAttachment,
         ) -> Result<(), CtasFailure> {
             unreachable!("recovery never assembles native writers")
         }

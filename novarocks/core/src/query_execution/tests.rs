@@ -17,7 +17,8 @@
 
 use crate::query_execution::artifact::{
     BackendPlacement, ConnectorBindingInstallBarrier, ConnectorBindingInstallLease,
-    FragmentScheduleDraft, ValidatedFragmentSchedule,
+    FragmentScheduleDraft, ValidatedFragmentSchedule, ValidatedNativeSubmission,
+    WriterRegistrationSet,
 };
 use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::cancellation::{
@@ -174,7 +175,7 @@ impl QueryLaunchBarrier for RecordingQueryLaunchBarrier {
 
 fn real_execution_artifacts() -> (
     crate::query_execution::preparation::PreparedFragmentSet,
-    crate::protocol::native::encode::NativeFragmentBundle,
+    crate::query_execution::native_fragment::NativeFragmentAttachment,
 ) {
     let plan = native_preparation_plan(NativePreparationFixture::ResultOutput)
         .expect("sealed result execution fixture");
@@ -189,10 +190,16 @@ fn real_execution_artifacts() -> (
         crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),
     )
     .expect("prepare production execution artifact");
-    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
-        crate::protocol::native::encode::NativeFragmentEncodingSource::unsealed(&plan, &prepared),
-    )
-    .expect("encode production execution artifact");
+    let native_bundle =
+        crate::query_execution::native_fragment::native_fragment_attachment_for_test(
+            [novarocks_protocol::plan::PlanFragment {
+                fragment_id: 7,
+                ..Default::default()
+            }],
+            &std::collections::BTreeSet::from([7]),
+            None,
+        )
+        .expect("seal production execution artifact");
     (prepared, native_bundle)
 }
 
@@ -300,14 +307,44 @@ fn query_control_typestate_initializes_before_native_assembly() {
     let deployment = scheduled
         .seal_runtime_filter_deployment(std::iter::empty())
         .expect("seal explicit empty runtime-filter deployment");
-    let execution = scheduled
+    let ready = scheduled
         .attach_runtime_filter_deployment(deployment)
         .expect("attach empty runtime-filter deployment")
         .initialize_query(options, &barrier)
         .expect("initialize query")
         .prepare_connector_bindings(&NoopConnectorBindingBarrier)
-        .expect("install empty connector bindings")
-        .prepare_stage()
+        .expect("install empty connector bindings");
+    let submission_view = ready
+        .native_submission_view()
+        .expect("obtain sealed native submission view");
+    let key = submission_view.root_key();
+    let template = submission_view
+        .native_fragments_in_id_order()
+        .find_map(|(fragment_id, fragment)| {
+            (fragment_id == key.fragment_id()).then(|| fragment.clone())
+        })
+        .expect("sealed root template");
+    let instance_params = novarocks_protocol::novarocks::InstanceParams {
+        fragment_instance_id: Some(novarocks_protocol::common::UniqueId {
+            hi: key.fragment_instance_id().high(),
+            lo: key.fragment_instance_id().low(),
+        }),
+        ..Default::default()
+    };
+    let attachment = submission_view
+        .seal(
+            vec![ValidatedNativeSubmission::new(
+                key.backend_idx(),
+                key.fragment_instance_id(),
+                submission_view.execution_id(),
+                template,
+                instance_params,
+            )],
+            WriterRegistrationSet::new(std::iter::empty()),
+        )
+        .expect("seal explicit test submission attachment");
+    let execution = ready
+        .finish_stage(attachment)
         .expect("prepare exact stage batches")
         .stage(&RecordingQueryLaunchBarrier)
         .expect("stage after control ready")

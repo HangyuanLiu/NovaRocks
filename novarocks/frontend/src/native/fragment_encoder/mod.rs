@@ -15,8 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod expr;
-mod instance;
-mod integration;
+//! Native coordinator-to-runtime wire encoders.
 
-pub(super) use novarocks_sql::test_support::{column_expr, int_expr};
+mod bundle;
+pub(crate) mod expr;
+pub(crate) mod instance;
+pub(crate) mod plan;
+pub(crate) mod submission;
+
+pub use bundle::{
+    NativeFragmentAttachment, NativeFragmentEncodingView, encode_native_fragment_bundle,
+};
+pub(crate) use instance::encode_instance_params;
+pub(crate) use plan::encode_data_partition;
+
+#[cfg(test)]
+mod tests;

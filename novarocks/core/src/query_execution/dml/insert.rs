@@ -250,7 +250,7 @@ pub trait InsertEngine: StatisticsEngine + Send + Sync {
     fn run_iceberg_write_with_native_bundle(
         &self,
         _prepared: &dyn IcebergPreparedInsert,
-        _native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+        _native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<IcebergWriteReport, String> {
         Err("Iceberg INSERT engine requires Frontend native fragment assembly".to_string())
     }
@@ -420,7 +420,7 @@ impl InsertEngine for DmlExecutionKernel {
     fn run_iceberg_write_with_native_bundle(
         &self,
         prepared: &dyn IcebergPreparedInsert,
-        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<IcebergWriteReport, String> {
         let prepared = downcast_prepared(prepared)?;
         Ok(iceberg_write_report_from_result(

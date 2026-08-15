@@ -147,7 +147,7 @@ impl DeleteEngine for FakeDeleteEngine {
     fn run_delete_with_native_bundle(
         &self,
         prepared: &dyn DeletePrepared,
-        _native_bundle: novarocks::protocol::native::encode::NativeFragmentBundle,
+        _native_bundle: novarocks::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<DeleteWriteReport, String> {
         self.run_delete(prepared)
     }

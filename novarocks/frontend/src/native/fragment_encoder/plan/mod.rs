@@ -17,10 +17,9 @@
 
 use std::collections::HashMap;
 
+pub(crate) use self::type_mapping::encode_type;
 use super::expr::encode_expr;
-use crate::protocol::native::type_mapping::encode_type;
-use crate::query_execution::preparation::PreparedFragmentSet;
-use crate::query_execution::preparation::scan::ScanExecutionBindings;
+use novarocks::query_execution::preparation::NativeScanFactsView;
 use novarocks_protocol::{common, plan};
 use novarocks_sql::plan_read::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, FragmentEdge,
@@ -42,7 +41,7 @@ mod write;
 type ContextRef<'a, T> = Option<&'a T>;
 
 pub(super) struct NativePlanEncodeContext<'a> {
-    pub(super) scan_bindings: ContextRef<'a, ScanExecutionBindings>,
+    pub(super) scan_facts: Option<NativeScanFactsView<'a>>,
     /// The sealed node-output contract. The encoder reads each covered node's
     /// (join / scan / set-op / sort) execution output from here rather than
     /// re-deriving or repairing it. `None` only in bare-node encoder unit tests
@@ -66,9 +65,9 @@ pub(super) struct NativePlanEncodeContext<'a> {
 }
 
 impl<'a> NativePlanEncodeContext<'a> {
-    fn complete(src: &'a DistributedPlan, scan_bindings: &'a ScanExecutionBindings) -> Self {
+    fn complete(src: &'a DistributedPlan, scan_facts: NativeScanFactsView<'a>) -> Self {
         Self {
-            scan_bindings: Some(scan_bindings),
+            scan_facts: Some(scan_facts),
             node_outputs: Some(src.node_outputs()),
             fragment_edge_outputs: Some(src.fragment_edge_outputs()),
             write_contracts: Some(src.write_contracts()),
@@ -87,25 +86,13 @@ fn optional_context_ref<T>(value: Option<&T>) -> Option<&T> {
     value
 }
 
-#[cfg(test)]
 pub(super) fn encode_distributed_plan(
     src: &DistributedPlan,
-    scan_bindings: &ScanExecutionBindings,
+    scan_facts: NativeScanFactsView<'_>,
 ) -> Result<plan::DistributedPlan, String> {
-    let prepared =
-        crate::query_execution::preparation::prepared_fragment_set_for_native_encode_test(src)?;
-    encode_distributed_plan_from_prepared(src, scan_bindings, &prepared)
-}
-
-pub(super) fn encode_distributed_plan_from_prepared(
-    src: &DistributedPlan,
-    scan_bindings: &ScanExecutionBindings,
-    prepared: &PreparedFragmentSet,
-) -> Result<plan::DistributedPlan, String> {
-    let _ = prepared;
     encode_distributed_plan_with_context_inner(
         src,
-        NativePlanEncodeContext::complete(src, scan_bindings),
+        NativePlanEncodeContext::complete(src, scan_facts),
     )
 }
 
@@ -117,7 +104,7 @@ pub(super) fn encode_distributed_plan_with_context(
     encode_distributed_plan_with_context_inner(
         src,
         NativePlanEncodeContext {
-            scan_bindings: ctx.scan_bindings,
+            scan_facts: ctx.scan_facts,
             node_outputs: Some(src.node_outputs()),
             fragment_edge_outputs: Some(src.fragment_edge_outputs()),
             write_contracts: Some(src.write_contracts()),
@@ -159,7 +146,7 @@ pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode
     encode_node_with_context(
         src,
         &NativePlanEncodeContext {
-            scan_bindings: None,
+            scan_facts: None,
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
@@ -218,6 +205,3 @@ pub(super) fn encode_node_with_context(
 fn encode_exprs(src: &[TypedExpr]) -> Result<Vec<novarocks_protocol::expr::Expr>, String> {
     src.iter().map(encode_expr).collect()
 }
-
-#[cfg(test)]
-mod tests;

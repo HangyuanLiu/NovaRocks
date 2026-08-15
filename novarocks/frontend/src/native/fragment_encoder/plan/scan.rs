@@ -22,11 +22,11 @@ use arrow::ipc::writer::StreamWriter;
 
 use super::super::expr::encode_sort_items;
 use super::output::{encode_output_column, encode_output_columns};
+use super::type_mapping::encode_type;
 use super::type_mapping::{encode_edge_partition_type, encode_sql_type};
-use super::{NativePlanEncodeContext, encode_exprs, optional_context_ref};
-use crate::protocol::native::type_mapping::encode_type;
-use crate::query_execution::preparation::scan::{
-    ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution,
+use super::{NativePlanEncodeContext, encode_exprs};
+use novarocks::query_execution::preparation::{
+    NativeScanBindingView, NativeScanColumnKind, NativeScanColumnView, NativeScanExecutionKind,
 };
 use novarocks_protocol::{common, plan};
 use novarocks_sql::plan_read::{
@@ -51,9 +51,10 @@ pub(super) fn encode_scan_node(
     // Connector planning may remove only predicates explicitly negotiated as
     // Exact. All other scan sources, and PruningOnly/Unsupported connector
     // predicates, retain the original Core residuals.
-    let residual_predicates = optional_context_ref(ctx.scan_bindings)
-        .and_then(|bindings| bindings.connector_read_for_node(node_id))
-        .map(|planned| planned.residual_predicates.as_slice())
+    let residual_predicates = ctx
+        .scan_facts
+        .and_then(|facts| facts.connector_read_for_node(node_id))
+        .map(|planned| planned.residual_predicates())
         .unwrap_or(&src.predicates);
     Ok(plan::ScanNode {
         database: src.database.clone(),
@@ -93,12 +94,11 @@ pub(super) fn encode_scan_node(
 
 fn encode_bound_scan_output_columns(
     src: &SqlPlanScanNodeRead,
-    binding: &ResolvedScanBinding,
+    binding: NativeScanBindingView<'_>,
 ) -> Result<Vec<common::OutputColumn>, String> {
     let physical_by_planner_id = binding
-        .physical_columns
-        .iter()
-        .map(|column| (column.planner.column_id, column))
+        .physical_columns()
+        .map(|column| (column.planner().column_id, column))
         .collect::<HashMap<_, _>>();
     let synthetic_ids = src
         .variant_columns
@@ -109,14 +109,14 @@ fn encode_bound_scan_output_columns(
     let mut seen_physical_ids = HashSet::new();
     for column in &src.columns {
         if let Some(bound) = physical_by_planner_id.get(&column.column_id) {
-            encoded.push(encode_bound_scan_output_column(bound)?);
+            encoded.push(encode_bound_scan_output_column(*bound)?);
             seen_physical_ids.insert(column.column_id);
         } else if synthetic_ids.contains(&column.column_id) {
             encoded.push(encode_output_column(column)?);
         }
     }
-    for bound in &binding.physical_columns {
-        if seen_physical_ids.insert(bound.planner.column_id) {
+    for bound in binding.physical_columns() {
+        if seen_physical_ids.insert(bound.planner().column_id) {
             encoded.push(encode_bound_scan_output_column(bound)?);
         }
     }
@@ -125,12 +125,11 @@ fn encode_bound_scan_output_columns(
 
 fn encode_bound_required_columns(
     src: &SqlPlanScanNodeRead,
-    binding: &ResolvedScanBinding,
+    binding: NativeScanBindingView<'_>,
 ) -> Vec<String> {
     let mut required = binding
-        .required_reads
-        .iter()
-        .map(|read| read.source.name.clone())
+        .required_reads()
+        .map(|read| read.source().name.clone())
         .collect::<Vec<_>>();
     for variant in &src.variant_columns {
         let required_by_planner = src.required_columns.as_ref().is_none_or(|columns| {
@@ -150,18 +149,20 @@ fn encode_bound_required_columns(
 }
 
 fn encode_bound_scan_output_column(
-    column: &crate::query_execution::preparation::scan::ResolvedScanColumn,
+    column: NativeScanColumnView<'_>,
 ) -> Result<common::OutputColumn, String> {
-    let data_type = match column.source.logical_type.as_ref() {
+    let source = column.source();
+    let planner = column.planner();
+    let data_type = match source.logical_type.as_ref() {
         Some(logical_type) => encode_sql_type(logical_type)?,
-        None => encode_type(&column.source.data_type)?,
+        None => encode_type(&source.data_type)?,
     };
     Ok(common::OutputColumn {
-        column_id: column.planner.column_id.0,
-        name: column.source.name.clone(),
+        column_id: planner.column_id.0,
+        name: source.name.clone(),
         r#type: Some(data_type),
-        nullable: column.source.nullable,
-        is_internal: column.planner.is_internal,
+        nullable: source.nullable,
+        is_internal: planner.is_internal,
     })
 }
 
@@ -225,7 +226,7 @@ pub(super) fn encode_table_def_with_context(
     scan_output_columns: Option<&[common::OutputColumn]>,
     scan_required_columns: Option<&[String]>,
     scan_variant_columns: Option<&[ScanVariantColumn]>,
-    binding: Option<&ResolvedScanBinding>,
+    binding: Option<NativeScanBindingView<'_>>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::TableDef, String> {
     let (columns, metadata_columns) = match binding {
@@ -266,7 +267,7 @@ fn scan_source_requires_resolved_binding(_: &SqlScanSourceRead) -> bool {
 }
 
 fn resolved_binding_table_columns(
-    binding: &ResolvedScanBinding,
+    binding: NativeScanBindingView<'_>,
 ) -> (
     Vec<novarocks_catalog::schema::ColumnDef>,
     Vec<novarocks_catalog::schema::ColumnDef>,
@@ -275,20 +276,18 @@ fn resolved_binding_table_columns(
     let mut metadata_columns = Vec::new();
     let mut seen = HashSet::new();
 
-    for bound in &binding.physical_columns {
-        if !seen.insert(bound.source.name.to_ascii_lowercase()) {
+    for bound in binding.physical_columns() {
+        if !seen.insert(bound.source().name.to_ascii_lowercase()) {
             continue;
         }
-        match bound.kind {
-            ResolvedScanColumnKind::PhysicalTableColumn => columns.push(bound.source.clone()),
-            ResolvedScanColumnKind::IcebergMetadataColumn => {
-                metadata_columns.push(bound.source.clone())
-            }
+        match bound.kind() {
+            NativeScanColumnKind::PhysicalTable => columns.push(bound.source().clone()),
+            NativeScanColumnKind::IcebergMetadata => metadata_columns.push(bound.source().clone()),
         }
     }
-    for read in &binding.required_reads {
-        if seen.insert(read.source.name.to_ascii_lowercase()) {
-            columns.push(read.source.clone());
+    for read in binding.required_reads() {
+        if seen.insert(read.source().name.to_ascii_lowercase()) {
+            columns.push(read.source().clone());
         }
     }
 
@@ -298,36 +297,36 @@ fn resolved_binding_table_columns(
 fn merged_bound_table_columns(
     src: &SqlTableDefRead,
     scan_columns: &[AnalysisOutputColumn],
-    binding: &ResolvedScanBinding,
+    binding: NativeScanBindingView<'_>,
 ) -> (
     Vec<novarocks_catalog::schema::ColumnDef>,
     Vec<novarocks_catalog::schema::ColumnDef>,
 ) {
     let mut columns = src.columns.clone();
     let mut metadata_columns = src.iceberg_row_lineage_metadata_columns.clone();
-    for bound in &binding.physical_columns {
-        let target = match bound.kind {
-            ResolvedScanColumnKind::PhysicalTableColumn => &mut columns,
-            ResolvedScanColumnKind::IcebergMetadataColumn => &mut metadata_columns,
+    for bound in binding.physical_columns() {
+        let target = match bound.kind() {
+            NativeScanColumnKind::PhysicalTable => &mut columns,
+            NativeScanColumnKind::IcebergMetadata => &mut metadata_columns,
         };
         let planner_source_name = scan_columns
             .iter()
-            .find(|column| column.column_id == bound.planner.column_id)
+            .find(|column| column.column_id == bound.planner().column_id)
             .map(|column| column.name.as_str());
         overlay_bound_column(
             target,
-            &bound.planner.name,
+            &bound.planner().name,
             planner_source_name,
-            &bound.source,
+            bound.source(),
         );
     }
-    for read in &binding.required_reads {
-        if replace_column_by_name(&mut columns, &read.source)
-            || replace_column_by_name(&mut metadata_columns, &read.source)
+    for read in binding.required_reads() {
+        if replace_column_by_name(&mut columns, read.source())
+            || replace_column_by_name(&mut metadata_columns, read.source())
         {
             continue;
         }
-        columns.push(read.source.clone());
+        columns.push(read.source().clone());
     }
     (columns, metadata_columns)
 }
@@ -382,9 +381,8 @@ fn scan_binding_for_source<'a>(
     node_id: i32,
     source: &SqlScanSourceRead,
     ctx: &'a NativePlanEncodeContext<'_>,
-) -> Result<Option<&'a ResolvedScanBinding>, String> {
-    let binding =
-        optional_context_ref(ctx.scan_bindings).and_then(|bindings| bindings.binding(node_id));
+) -> Result<Option<NativeScanBindingView<'a>>, String> {
+    let binding = ctx.scan_facts.and_then(|facts| facts.binding(node_id));
     let required = scan_source_requires_resolved_binding(source);
     if required && binding.is_none() {
         return Err(match source {
@@ -404,20 +402,20 @@ fn scan_binding_for_source<'a>(
     let Some(binding) = binding else {
         return Ok(None);
     };
-    if binding.node_id != node_id {
+    if binding.node_id() != node_id {
         return Err(format!(
             "native scan encoder binding node mismatch: requested node_id={node_id}, binding node_id={}",
-            binding.node_id
+            binding.node_id()
         ));
     }
     let valid_execution = match source {
         SqlScanSourceRead::ConnectorRead => {
-            matches!(binding.execution, ResolvedScanExecution::ConnectorRead)
+            matches!(binding.execution(), NativeScanExecutionKind::ConnectorRead)
         }
         SqlScanSourceRead::Delta { .. } => {
             matches!(
-                binding.execution,
-                ResolvedScanExecution::SealedConnectorScan(_)
+                binding.execution(),
+                NativeScanExecutionKind::SealedConnectorScan
             )
         }
         SqlScanSourceRead::Data
@@ -426,8 +424,8 @@ fn scan_binding_for_source<'a>(
         | SqlScanSourceRead::MvTargetLocator
         | SqlScanSourceRead::Metadata => {
             matches!(
-                binding.execution,
-                ResolvedScanExecution::AdmittedConnectorRead(_)
+                binding.execution(),
+                NativeScanExecutionKind::AdmittedConnectorRead
             )
         }
     };
@@ -435,7 +433,7 @@ fn scan_binding_for_source<'a>(
         return Err(format!(
             "native scan encoder execution variant mismatch for node_id={node_id} source={}: binding={}",
             scan_source_kind(source),
-            resolved_execution_kind(&binding.execution)
+            resolved_execution_kind(binding.execution())
         ));
     }
     Ok(Some(binding))
@@ -453,11 +451,11 @@ fn scan_source_kind(source: &SqlScanSourceRead) -> &'static str {
     }
 }
 
-fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
+fn resolved_execution_kind(execution: NativeScanExecutionKind) -> &'static str {
     match execution {
-        ResolvedScanExecution::ConnectorRead => "ConnectorRead",
-        ResolvedScanExecution::AdmittedConnectorRead(_) => "AdmittedConnectorRead",
-        ResolvedScanExecution::SealedConnectorScan(_) => "SealedConnectorScan",
+        NativeScanExecutionKind::ConnectorRead => "ConnectorRead",
+        NativeScanExecutionKind::AdmittedConnectorRead => "AdmittedConnectorRead",
+        NativeScanExecutionKind::SealedConnectorScan => "SealedConnectorScan",
     }
 }
 
@@ -468,29 +466,29 @@ fn encode_scan_source(
     scan_output_columns: Option<&[common::OutputColumn]>,
     scan_required_columns: Option<&[String]>,
     scan_variant_columns: &[ScanVariantColumn],
-    binding: Option<&ResolvedScanBinding>,
+    binding: Option<NativeScanBindingView<'_>>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanSource, String> {
     use plan::scan_source::Kind;
 
     if let Some(planned) = scan_node_id.and_then(|node_id| {
-        optional_context_ref(ctx.scan_bindings)
-            .and_then(|bindings| bindings.connector_read_for_node(node_id))
+        ctx.scan_facts
+            .and_then(|facts| facts.connector_read_for_node(node_id))
     }) {
         return Ok(plan::ScanSource {
             kind: Some(Kind::ConnectorRead(plan::ConnectorReadSource {
                 instance_id: planned
-                    .declaration
+                    .declaration()
                     .descriptor()
                     .instance_id
                     .as_str()
                     .to_string(),
-                instance_incarnation: planned.declaration.incarnation().to_bytes().to_vec(),
-                scan_payload: planned.scan.handle().payload().to_vec(),
+                instance_incarnation: planned.declaration().incarnation().to_bytes().to_vec(),
+                scan_payload: planned.scan().handle().payload().to_vec(),
                 splits: Vec::new(),
-                max_batch_rows: u64::try_from(planned.batch.max_rows.get())
+                max_batch_rows: u64::try_from(planned.batch().max_rows.get())
                     .map_err(|_| "connector batch row budget does not fit u64".to_string())?,
-                max_batch_bytes: u64::try_from(planned.batch.max_bytes.get())
+                max_batch_bytes: u64::try_from(planned.batch().max_bytes.get())
                     .map_err(|_| "connector batch byte budget does not fit u64".to_string())?,
                 max_handle_payload_bytes: u64::try_from(
                     novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
@@ -506,7 +504,7 @@ fn encode_scan_source(
                     scan_required_columns.unwrap_or_default(),
                     scan_variant_columns,
                     binding,
-                    Some(planned.scan.output_schema()),
+                    Some(planned.scan().output_schema()),
                 )?,
             })),
         });
@@ -527,7 +525,7 @@ fn encode_connector_expected_schema_ipc(
     analysis_columns: &[AnalysisOutputColumn],
     required_columns: &[String],
     variant_columns: &[ScanVariantColumn],
-    binding: Option<&ResolvedScanBinding>,
+    binding: Option<NativeScanBindingView<'_>>,
     provider_schema: Option<&arrow::datatypes::SchemaRef>,
 ) -> Result<Vec<u8>, String> {
     let required = (!required_columns.is_empty()).then(|| {
@@ -562,16 +560,15 @@ fn encode_connector_expected_schema_ipc(
             let domain_column = binding
                 .and_then(|binding| {
                     binding
-                        .physical_columns
-                        .iter()
-                        .find(|bound| bound.planner.column_id.0 == column.column_id)
-                        .map(|bound| (&bound.source.data_type, bound.source.nullable))
+                        .physical_columns()
+                        .find(|bound| bound.planner().column_id.0 == column.column_id)
+                        .map(|bound| (bound.source().data_type.clone(), bound.source().nullable))
                 })
                 .or_else(|| {
                     analysis_columns
                         .iter()
                         .find(|candidate| candidate.column_id.0 == column.column_id)
-                        .map(|candidate| (&candidate.data_type, candidate.nullable))
+                        .map(|candidate| (candidate.data_type.clone(), candidate.nullable))
                 })
                 .ok_or_else(|| {
                     format!(
@@ -579,11 +576,7 @@ fn encode_connector_expected_schema_ipc(
                         column.column_id
                     )
                 })?;
-            Ok::<Field, String>(Field::new(
-                &column.name,
-                domain_column.0.clone(),
-                domain_column.1,
-            ))
+            Ok::<Field, String>(Field::new(&column.name, domain_column.0, domain_column.1))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let selected_schema = Schema::new(selected);
@@ -626,131 +619,4 @@ fn encode_connector_expected_schema_ipc(
         ));
     }
     Ok(bytes)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::io::Cursor;
-    use std::sync::Arc;
-
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::ipc::reader::StreamReader;
-
-    use super::{encode_bound_scan_output_column, encode_connector_expected_schema_ipc};
-    use crate::query_execution::preparation::scan::{ResolvedScanColumn, ResolvedScanColumnKind};
-    use novarocks_protocol::common;
-    use novarocks_sql::plan_read::{ColumnId, OutputColumn};
-
-    #[test]
-    fn connector_expected_schema_uses_domain_columns_not_encoded_type_desc() {
-        let bytes = encode_connector_expected_schema_ipc(
-            &[common::OutputColumn {
-                column_id: 7,
-                name: "id".to_string(),
-                r#type: None,
-                nullable: false,
-                is_internal: false,
-            }],
-            &[OutputColumn {
-                column_id: ColumnId(7),
-                name: "id".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                is_internal: false,
-            }],
-            &[],
-            &[],
-            None,
-            None,
-        )
-        .expect("domain schema should encode without a protobuf type descriptor");
-
-        assert!(!bytes.is_empty());
-    }
-
-    #[test]
-    fn spi5b_connector_expected_schema_preserves_provider_field_metadata() {
-        let provider_schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Int32, true).with_metadata(HashMap::from([(
-                "novarocks.iceberg.initial_default".to_string(),
-                "9".to_string(),
-            )])),
-        ]));
-        let bytes = encode_connector_expected_schema_ipc(
-            &[common::OutputColumn {
-                column_id: 7,
-                name: "value".to_string(),
-                r#type: None,
-                nullable: true,
-                is_internal: false,
-            }],
-            &[OutputColumn {
-                column_id: ColumnId(7),
-                name: "value".to_string(),
-                data_type: DataType::Int32,
-                nullable: true,
-                is_internal: false,
-            }],
-            &[],
-            &[],
-            None,
-            Some(&provider_schema),
-        )
-        .expect("provider schema should encode");
-        let decoded = StreamReader::try_new(Cursor::new(bytes), None)
-            .expect("decode provider schema")
-            .schema();
-        assert_eq!(
-            decoded.fields()[0]
-                .metadata()
-                .get("novarocks.iceberg.initial_default"),
-            Some(&"9".to_string())
-        );
-    }
-
-    #[test]
-    fn bound_scan_output_preserves_signed_binary_logical_types() {
-        fn encoded_primitive(
-            logical_type: Option<novarocks_catalog::schema::SqlType>,
-        ) -> common::PrimitiveType {
-            let column = ResolvedScanColumn {
-                planner: OutputColumn {
-                    column_id: ColumnId(7),
-                    name: "state".to_string(),
-                    data_type: DataType::Binary,
-                    nullable: true,
-                    is_internal: false,
-                },
-                source: novarocks_catalog::schema::ColumnDef {
-                    name: "state".to_string(),
-                    data_type: DataType::Binary,
-                    nullable: true,
-                    write_default: None,
-                    logical_type,
-                },
-                kind: ResolvedScanColumnKind::PhysicalTableColumn,
-            };
-            let encoded = encode_bound_scan_output_column(&column).expect("encode bound column");
-            let common::type_desc::Kind::Scalar(scalar) = encoded
-                .r#type
-                .expect("encoded type")
-                .kind
-                .expect("type kind")
-            else {
-                panic!("expected scalar type")
-            };
-            common::PrimitiveType::try_from(scalar.r#type).expect("known primitive")
-        }
-
-        assert_eq!(
-            encoded_primitive(Some(novarocks_catalog::schema::SqlType::Bitmap)),
-            common::PrimitiveType::Bitmap
-        );
-        assert_eq!(
-            encoded_primitive(Some(novarocks_catalog::schema::SqlType::Hll)),
-            common::PrimitiveType::Hll
-        );
-        assert_eq!(encoded_primitive(None), common::PrimitiveType::Varbinary);
-    }
 }

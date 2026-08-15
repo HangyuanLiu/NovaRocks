@@ -241,7 +241,7 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
 
     fn run_with_native_bundle(
         &self,
-        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<QueryExecutionResult, String> {
         self.native_assembly
             .lock()

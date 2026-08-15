@@ -17,11 +17,10 @@
 
 //! Borrow-only runtime-filter facts for the Frontend semantic encoder.
 
-use crate::protocol::native::encode::expr::encode_expr;
 use crate::query_execution::schedule::SchedulingPlan;
 use arrow::datatypes::DataType;
-use novarocks_protocol::expr;
 use novarocks_sql::plan_read::FragmentEdge;
+use novarocks_sql::plan_read::TypedExpr;
 use novarocks_sql::planning::query_execution as sql_facts;
 
 use super::projection::PreparedFragmentSet;
@@ -91,10 +90,10 @@ impl<'a> RuntimeFilterBindingFacts<'a> {
         }
     }
 
-    /// Core owns this generic TypedExpr-to-wire leaf projection. The Frontend
-    /// receives no TypedExpr or native encoder context.
-    pub fn expression(self) -> Result<expr::Expr, String> {
-        encode_expr(&self.binding.expression)
+    /// The Frontend owns the generic TypedExpr-to-wire mapping.  Core exposes
+    /// only the sealed typed fact and never an encoder context.
+    pub fn expression(self) -> &'a TypedExpr {
+        &self.binding.expression
     }
 
     pub fn logical_domain(self) -> RuntimeFilterLogicalDomainFacts {

@@ -19,12 +19,12 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use crate::native::fragment_encoder::encode_native_fragment_bundle;
 use novarocks::catalog_application::information_schema;
 use novarocks::catalog_application::virtual_table;
 use novarocks::connector::connector_request_context_for_query;
 use novarocks::mv::repository::MvRepository;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
-use novarocks::protocol::native::encode::encode_native_fragment_bundle;
 use novarocks::query_execution::PreparedQueryOperation;
 use novarocks::query_execution::compiler::{
     TableLookupMode, build_query_catalog_materializer, freeze_query_mv_rewrite_definition_index,

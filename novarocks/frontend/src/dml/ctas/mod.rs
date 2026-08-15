@@ -474,7 +474,7 @@ fn execute_foreground_write(
     };
     let native_bundle = match prepared.handle.native_encoding() {
         Ok(encoding) => match encoding.input() {
-            Ok(input) => match novarocks::protocol::native::encode::encode_native_fragment_bundle(
+            Ok(input) => match crate::native::fragment_encoder::encode_native_fragment_bundle(
                 input.encoding_view(),
             ) {
                 Ok(bundle) => bundle,

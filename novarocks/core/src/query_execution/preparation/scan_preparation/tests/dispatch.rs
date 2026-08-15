@@ -140,13 +140,23 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
     for (node_id, _) in &scan_facts {
         assert!(prepared.scan_bindings().binding(*node_id).is_some());
     }
-    let native = crate::protocol::native::encode::encode_native_fragment_bundle(
-        crate::protocol::native::encode::NativeFragmentEncodingSource::unsealed(
-            &distributed,
-            &prepared,
-        ),
+    let expected_ids = distributed
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.fragment_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let native = crate::query_execution::native_fragment::native_fragment_attachment_for_test(
+        expected_ids
+            .iter()
+            .copied()
+            .map(|fragment_id| novarocks_protocol::plan::PlanFragment {
+                fragment_id,
+                ..Default::default()
+            }),
+        &expected_ids,
+        None,
     )
-    .expect("tokenized coalesce fixture must lower to native fragments");
+    .expect("tokenized coalesce fixture must seal native fragment IDs");
     assert_eq!(native.fragment_ids().count(), distributed.fragments().len());
 }
 

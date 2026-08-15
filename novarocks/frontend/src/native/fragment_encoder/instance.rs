@@ -19,13 +19,13 @@
 
 use std::collections::HashMap;
 
-use crate::common::types::UniqueId;
-use crate::query_execution::lifecycle::query_options_wire::encode_query_options;
-use crate::query_execution::schedule::FragmentInstancePlacement;
-use crate::runtime::scan_range;
+use novarocks::query_execution::FragmentInstancePlacement;
+use novarocks::query_execution::lifecycle::query_options_wire::encode_query_options;
+use novarocks::runtime::scan_range;
 use novarocks_execution::runtime::endpoint::FragmentDestination;
 use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_protocol::{common, novarocks};
+use novarocks_protocol::{common, novarocks as wire};
+use novarocks_types::UniqueId;
 
 pub(crate) fn encode_instance_params(
     query_id: &UniqueId,
@@ -33,8 +33,8 @@ pub(crate) fn encode_instance_params(
     query_options: &QueryOptions,
     backend_num: i32,
     typed_result_sink: bool,
-) -> Result<novarocks::InstanceParams, String> {
-    Ok(novarocks::InstanceParams {
+) -> Result<wire::InstanceParams, String> {
+    Ok(wire::InstanceParams {
         query_id: Some(encode_unique_id(query_id)),
         fragment_instance_id: Some(encode_unique_id(&placement.finst_id)),
         backend_num,
@@ -44,7 +44,7 @@ pub(crate) fn encode_instance_params(
             .map(|(node_id, ranges)| {
                 Ok((
                     *node_id,
-                    novarocks::ScanRangeList {
+                    wire::ScanRangeList {
                         ranges: ranges
                             .iter()
                             .map(encode_scan_range_params)
@@ -77,8 +77,8 @@ fn encode_unique_id(src: &UniqueId) -> common::UniqueId {
 
 fn encode_scan_range_params(
     src: &scan_range::ScanRangeParams,
-) -> Result<novarocks::ScanRangeParams, String> {
-    Ok(novarocks::ScanRangeParams {
+) -> Result<wire::ScanRangeParams, String> {
+    Ok(wire::ScanRangeParams {
         range: Some(encode_scan_range(&src.range)?),
         volume_id: src.volume_id,
         empty: src.empty,
@@ -86,12 +86,10 @@ fn encode_scan_range_params(
     })
 }
 
-fn encode_scan_range(src: &scan_range::ScanRange) -> Result<novarocks::ScanRange, String> {
+fn encode_scan_range(src: &scan_range::ScanRange) -> Result<wire::ScanRange, String> {
     match src {
-        scan_range::ScanRange::File(file) => Ok(novarocks::ScanRange {
-            kind: Some(novarocks::scan_range::Kind::File(encode_file_scan_range(
-                file,
-            )?)),
+        scan_range::ScanRange::File(file) => Ok(wire::ScanRange {
+            kind: Some(wire::scan_range::Kind::File(encode_file_scan_range(file)?)),
         }),
         scan_range::ScanRange::BrokerFile(_) => {
             Err("native protocol cannot encode a StarRocks broker-file scan range".to_string())
@@ -102,10 +100,8 @@ fn encode_scan_range(src: &scan_range::ScanRange) -> Result<novarocks::ScanRange
     }
 }
 
-fn encode_file_scan_range(
-    src: &scan_range::FileScanRange,
-) -> Result<novarocks::FileScanRange, String> {
-    Ok(novarocks::FileScanRange {
+fn encode_file_scan_range(src: &scan_range::FileScanRange) -> Result<wire::FileScanRange, String> {
+    Ok(wire::FileScanRange {
         file_format: src.file_format.as_native_name().to_string(),
         full_path: src.full_path.clone(),
         relative_path: src.relative_path.clone(),
@@ -145,8 +141,8 @@ fn encode_file_scan_range(
 
 fn encode_file_pruning_min_max_value(
     src: &scan_range::FilePruningMinMaxValue,
-) -> novarocks::FilePruningMinMaxValue {
-    novarocks::FilePruningMinMaxValue {
+) -> wire::FilePruningMinMaxValue {
+    wire::FilePruningMinMaxValue {
         value_kind: encode_file_pruning_value_kind(src.value_kind),
         has_null: src.has_null,
         all_null: src.all_null,
@@ -167,8 +163,8 @@ fn encode_file_pruning_value_kind(src: scan_range::FilePruningValueKind) -> i32 
 
 fn encode_iceberg_delete_file(
     src: &scan_range::IcebergDeleteFile,
-) -> Result<novarocks::IcebergDeleteFile, String> {
-    Ok(novarocks::IcebergDeleteFile {
+) -> Result<wire::IcebergDeleteFile, String> {
+    Ok(wire::IcebergDeleteFile {
         full_path: src.full_path.clone(),
         file_format: src.file_format.as_native_name().to_string(),
         file_content: src.file_content.as_native_name().to_string(),
@@ -178,8 +174,8 @@ fn encode_iceberg_delete_file(
 
 fn encode_deletion_vector_descriptor(
     src: &scan_range::DeletionVectorDescriptor,
-) -> novarocks::DeletionVectorDescriptor {
-    novarocks::DeletionVectorDescriptor {
+) -> wire::DeletionVectorDescriptor {
+    wire::DeletionVectorDescriptor {
         storage_type: src.storage_type.clone(),
         path_or_inline_dv: src.path_or_inline_dv.clone(),
         offset: src.offset,
@@ -188,15 +184,15 @@ fn encode_deletion_vector_descriptor(
     }
 }
 
-fn encode_datacache_options(src: &scan_range::DatacacheOptions) -> novarocks::DatacacheOptions {
-    novarocks::DatacacheOptions {
+fn encode_datacache_options(src: &scan_range::DatacacheOptions) -> wire::DatacacheOptions {
+    wire::DatacacheOptions {
         enable_populate_datacache: src.enable_populate_datacache,
         priority: src.priority,
     }
 }
 
-fn encode_destination(src: &FragmentDestination) -> Result<novarocks::Destination, String> {
-    Ok(novarocks::Destination {
+fn encode_destination(src: &FragmentDestination) -> Result<wire::Destination, String> {
+    Ok(wire::Destination {
         finst_id: Some(encode_unique_id(src.finst_id())),
         endpoint: src.endpoint().as_host_port(),
     })
