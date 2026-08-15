@@ -15,7 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod encode;
 pub(crate) mod query_options_contract;
-pub(crate) mod type_encode;
 pub(crate) mod type_mapping;

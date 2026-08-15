@@ -263,7 +263,7 @@ impl InsertEngine for FakeInsertEngine {
     fn run_iceberg_write_with_native_bundle(
         &self,
         prepared: &dyn IcebergPreparedInsert,
-        _native_bundle: novarocks::protocol::native::encode::NativeFragmentBundle,
+        _native_bundle: novarocks::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<IcebergWriteReport, String> {
         self.run_iceberg_write(prepared)
     }

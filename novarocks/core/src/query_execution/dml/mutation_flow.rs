@@ -1654,7 +1654,7 @@ impl MorUpdateChangeStreamExecutor {
             .map(|route| (route.writer_fragment_id, route.cohort_id))
             .collect::<Vec<_>>();
         let native_bundle = native_encoder.encode(&encoding)?;
-        if !encoding.matches_native_bundle(&native_bundle) {
+        if !encoding.matches_native_attachment(&native_bundle) {
             return Err(
                 "native fragment bundle does not match the sealed MOR UPDATE encoding input".into(),
             );
@@ -1787,7 +1787,7 @@ impl MorMergeChangeStreamExecutor {
             .map(|route| (route.writer_fragment_id, route.cohort_id))
             .collect::<Vec<_>>();
         let native_bundle = native_encoder.encode(&encoding)?;
-        if !encoding.matches_native_bundle(&native_bundle) {
+        if !encoding.matches_native_attachment(&native_bundle) {
             return Err(
                 "native fragment bundle does not match the sealed MOR MERGE encoding input".into(),
             );
@@ -2928,7 +2928,7 @@ fn execute_exact_cow_match_query(
     let encoding =
         crate::query_execution::compiler::NativeFragmentEncodingInput::new(distributed, prepared);
     let native_bundle = native_encoder.encode(&encoding)?;
-    if !encoding.matches_native_bundle(&native_bundle) {
+    if !encoding.matches_native_attachment(&native_bundle) {
         return Err(
             "native fragment bundle does not match the sealed mutation read encoding input".into(),
         );

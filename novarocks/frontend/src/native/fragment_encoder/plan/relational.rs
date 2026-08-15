@@ -16,6 +16,7 @@
 // under the License.
 
 use super::super::expr::{encode_expr, encode_sort_items, encode_window_frame};
+use super::encode_type;
 use super::output::encode_output_columns;
 use super::scan::encode_scan_node;
 use super::type_mapping::{
@@ -24,7 +25,6 @@ use super::type_mapping::{
     encode_sort_topn_type, encode_topn_phase, usize_to_u64,
 };
 use super::{NativePlanEncodeContext, encode_exprs};
-use crate::protocol::native::type_mapping::encode_type;
 use novarocks_protocol::plan;
 use novarocks_sql::plan_read::{
     PhysicalPlanKind, PlanRowCountAssertion, SqlPhysicalPlanRead, physical_plan_read,

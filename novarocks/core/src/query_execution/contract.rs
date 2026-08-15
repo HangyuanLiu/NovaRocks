@@ -22,9 +22,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::protocol::native::encode::NativeFragmentBundle;
 use crate::query_execution::artifact::PreparedDistributedQuery;
 use crate::query_execution::cancellation::QueryCancellationView;
+use crate::query_execution::native_fragment::NativeFragmentAttachment;
 pub use crate::query_execution::outcome::DistributedQueryOutcome;
 pub use crate::query_execution::outcome::FragmentProfileSet;
 pub use crate::query_execution::outcome::QueryOutcomeFactory;
@@ -647,7 +647,7 @@ pub struct DistributedQueryRequestParts {
 /// fallback at the coordinator boundary.
 pub(crate) fn build_distributed_query_request_with_execution(
     prepared: PreparedFragmentSet,
-    native_bundle: NativeFragmentBundle,
+    native_bundle: NativeFragmentAttachment,
     options: Option<QueryOptions>,
     intent: DistributedQueryIntent,
     execution: &QueryExecutionContext,
@@ -676,7 +676,7 @@ pub(crate) fn build_distributed_query_request_with_execution(
 /// statistics completion capability.
 pub(crate) fn build_statistics_query_request_with_execution(
     prepared: PreparedFragmentSet,
-    native_bundle: NativeFragmentBundle,
+    native_bundle: NativeFragmentAttachment,
     options: Option<QueryOptions>,
     program: StatisticsCollectionProgram,
     execution: &QueryExecutionContext,

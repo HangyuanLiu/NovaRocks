@@ -2098,9 +2098,9 @@ impl PreparedDmlWriteAssembly {
 
     pub(crate) fn finish(
         self,
-        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-        if !self.encoding.matches_native_bundle(&native_bundle) {
+        if !self.encoding.matches_native_attachment(&native_bundle) {
             return Err(
                 "native fragment bundle does not match the sealed DML encoding input".into(),
             );
@@ -2444,7 +2444,7 @@ pub(crate) fn prepare_planned_iceberg_change_stream_write(
 
 fn prepare_distributed_write_request_with_execution(
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
-    native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     query_options: Option<QueryOptions>,
     _execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_write: Option<DistributedConnectorWrite>,
@@ -2754,7 +2754,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
 fn execute_distributed_result_with_execution(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
-    native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     query_options: Option<QueryOptions>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<QueryResult, String> {
@@ -2776,7 +2776,7 @@ fn execute_distributed_result_with_execution(
 fn execute_distributed_write_with_execution(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
-    native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     query_options: Option<QueryOptions>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_write: Option<DistributedConnectorWrite>,
@@ -2832,7 +2832,7 @@ fn execute_distributed_write_with_execution(
 fn execute_distributed_profile_with_execution(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
-    native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     query_options: Option<QueryOptions>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {

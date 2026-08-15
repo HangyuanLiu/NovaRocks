@@ -15,24 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Native coordinator-to-runtime wire encoders.
-
-#[cfg(test)]
-mod boundary_schema;
-#[cfg(test)]
-mod build;
-mod bundle;
-pub(crate) mod expr;
-pub(crate) mod instance;
-pub(crate) mod plan;
-
-#[cfg(feature = "query-execution-contract-test-support")]
-pub(crate) use bundle::native_fragment_bundle_for_contract_test;
-pub use bundle::{
-    NativeFragmentBundle, NativeFragmentEncodingSource, encode_native_fragment_bundle,
-};
-pub(crate) use instance::encode_instance_params;
-pub(crate) use plan::encode_data_partition;
-
-#[cfg(test)]
-mod tests;
+mod expr;
+mod instance;

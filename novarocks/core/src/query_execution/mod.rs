@@ -16,7 +16,9 @@
 // under the License.
 
 pub mod artifact;
-pub(crate) mod assembly;
+/// Carrier-neutral payload validation and patch helpers consumed by the
+/// Frontend-owned native submission mapper.
+pub mod assembly;
 pub mod backend;
 pub mod backend_command;
 pub mod cancellation;
@@ -31,6 +33,7 @@ pub mod fragment_transport;
 pub(crate) mod frozen_connector_read;
 pub mod kernels;
 pub mod lifecycle;
+pub mod native_fragment;
 pub(crate) mod outcome;
 pub mod planning;
 pub use completion::{
@@ -55,6 +58,7 @@ pub use preparation::runtime_filter_view::{
     RuntimeFilterReductionFacts, RuntimeFilterScanDomainTarget, RuntimeFilterSortDirection,
     RuntimeFilterValidatedPlacementFacts,
 };
+pub use schedule::FragmentInstancePlacement;
 pub mod post_compile;
 pub mod prepared_write;
 pub(crate) mod profile;

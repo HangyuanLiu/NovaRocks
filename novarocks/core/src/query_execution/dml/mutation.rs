@@ -129,7 +129,7 @@ pub trait MutationNativeFragmentEncoder: Send + Sync {
     fn encode(
         &self,
         input: &crate::query_execution::compiler::NativeFragmentEncodingInput,
-    ) -> Result<crate::protocol::native::encode::NativeFragmentBundle, String>;
+    ) -> Result<crate::query_execution::native_fragment::NativeFragmentAttachment, String>;
 }
 
 /// One-to-one capability consumed only by the frontend DML application owner.

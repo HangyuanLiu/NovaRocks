@@ -135,14 +135,11 @@ impl QueryInitOptions {
         &self.live_backends
     }
 
-    pub(crate) fn native_submission_context(
-        &self,
-    ) -> Result<crate::query_execution::artifact::NativeSubmissionContext, DistributedQueryError>
-    {
-        Ok(crate::query_execution::artifact::NativeSubmissionContext {
-            query_id: self.execution_id.query_id(),
-            options: self.query_options.clone(),
-        })
+    /// Frozen runtime options carried from Init through the sealed native
+    /// submission view.  They are read-only encoder input, never a route to
+    /// reacquire lifecycle or topology state.
+    pub fn native_submission_options(&self) -> &QueryOptions {
+        &self.query_options
     }
 }
 

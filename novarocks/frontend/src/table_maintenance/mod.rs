@@ -741,8 +741,8 @@ impl FrontendTableMaintenanceService {
             let completion =
                 match engine.prepare_distributed_rewrite_cohort(&session, cohort.cohort_id()) {
                     Ok(prepared) => {
-                        match novarocks::protocol::native::encode::encode_native_fragment_bundle(
-                            prepared.encoding().source(),
+                        match crate::native::fragment_encoder::encode_native_fragment_bundle(
+                            prepared.encoding().encoding_view(),
                         )
                         .map_err(|error| format!("encode distributed rewrite fragments: {error}"))
                         .and_then(|bundle| prepared.finish(bundle))

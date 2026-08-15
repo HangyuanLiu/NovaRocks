@@ -288,7 +288,7 @@ pub trait CtasEngine: Send + Sync {
     fn bind_ctas_write_native_bundle(
         &self,
         prepared: &dyn CtasPreparedWrite,
-        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<(), CtasFailure>;
 
     /// Consume the prepared source exactly once and return the sealed generic
@@ -1756,7 +1756,7 @@ impl CtasEngine for DmlExecutionKernel {
     fn bind_ctas_write_native_bundle(
         &self,
         prepared: &dyn CtasPreparedWrite,
-        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<(), CtasFailure> {
         let prepared = downcast_write(prepared)?;
         let pending = prepared
@@ -1771,7 +1771,7 @@ impl CtasEngine for DmlExecutionKernel {
             .map_err(|error| internal_failure(format!("CTAS native encoding lock: {error}")))?
             .take()
             .ok_or_else(|| internal_failure("CTAS native encoding input was already consumed"))?;
-        if !encoding.matches_native_bundle(&native_bundle) {
+        if !encoding.matches_native_attachment(&native_bundle) {
             return Err(internal_failure(
                 "native fragment bundle does not match the sealed CTAS encoding input",
             ));

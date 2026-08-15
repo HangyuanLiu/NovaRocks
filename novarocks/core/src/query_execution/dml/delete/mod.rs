@@ -182,7 +182,7 @@ pub(crate) trait PreparedDeleteExecution: Send + Sync {
     fn native_encoding(&self) -> Result<DeleteNativeEncoding<'_>, String>;
     fn run_with_native_bundle(
         &self,
-        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String>;
     fn commit_terminal(
         &self,
@@ -231,7 +231,7 @@ pub trait DeleteEngine: Send + Sync {
     fn run_delete_with_native_bundle(
         &self,
         _prepared: &dyn DeletePrepared,
-        _native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+        _native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<DeleteWriteReport, String> {
         Err("DELETE engine requires Frontend native fragment assembly".to_string())
     }
@@ -321,7 +321,7 @@ impl DeleteEngine for DmlExecutionKernel {
     fn run_delete_with_native_bundle(
         &self,
         prepared: &dyn DeletePrepared,
-        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<DeleteWriteReport, String> {
         let prepared = downcast_prepared(prepared)?;
         let result = prepared.execution.run_with_native_bundle(native_bundle)?;

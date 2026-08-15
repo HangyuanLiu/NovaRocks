@@ -2031,7 +2031,7 @@ fn encode_participant_manifest(
             .map(encode_unique_id)
             .collect(),
         query_options: Some(
-            crate::protocol::native::encode::instance::encode_query_options(
+            crate::query_execution::lifecycle::query_options_wire::encode_query_options(
                 manifest.query_options().native(),
             ),
         ),

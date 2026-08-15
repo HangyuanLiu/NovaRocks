@@ -17,6 +17,7 @@
 
 mod boundary;
 mod cte;
+mod native_encoding_view;
 mod projection;
 pub(crate) mod runtime_filter_binding;
 pub(crate) mod runtime_filter_view;
@@ -31,6 +32,11 @@ use crate::query_execution::planning::bindings::QueryTableBindingStore;
 use boundary::validate_and_group_boundary_contracts;
 use cte::sealed_cte_projection;
 
+pub use native_encoding_view::{
+    NativeConnectorReadView, NativeRequiredReadReason, NativeRequiredReadView,
+    NativeScanBindingView, NativeScanColumnKind, NativeScanColumnView, NativeScanExecutionKind,
+    NativeScanFactsView,
+};
 pub use projection::PreparedFragmentSet;
 pub(crate) use projection::{
     PreparedFragment, PreparedFragmentRole, PreparedFragmentSchedulingView, PreparedOutputColumn,

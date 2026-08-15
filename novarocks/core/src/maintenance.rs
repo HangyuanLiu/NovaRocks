@@ -88,9 +88,9 @@ impl PreparedDistributedRewriteCohort {
     /// bundle to submit the sealed connector write.
     pub fn finish(
         self,
-        native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<ConnectorWriteCompletion, String> {
-        if !self.encoding.matches_native_bundle(&native_bundle) {
+        if !self.encoding.matches_native_attachment(&native_bundle) {
             return Err(
                 "native fragment bundle does not match the sealed maintenance encoding input"
                     .into(),

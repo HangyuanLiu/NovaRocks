@@ -53,6 +53,7 @@ use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use crate::connector::{
     ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
 };
+use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::transport::{
     new_connector_binding_dispatcher, new_fragment_dispatcher, new_query_lifecycle_transport,
 };
@@ -880,10 +881,12 @@ impl FrontendDistributedQueryCoordinator {
                 control: Arc::clone(&self.connector_control),
             }),
         );
-        let stage_prepared = runtime_filter_ready
+        let connector_binding_ready = runtime_filter_ready
             .initialize_query(init_options, &lifecycle_barrier)?
-            .prepare_connector_bindings(&connector_bindings)?
-            .prepare_stage()?;
+            .prepare_connector_bindings(&connector_bindings)?;
+        let submission_view = connector_binding_ready.native_submission_view()?;
+        let submission_attachment = encode_native_submission(&submission_view).map_err(failed)?;
+        let stage_prepared = connector_binding_ready.finish_stage(submission_attachment)?;
         self.dispatch_ready_connector_retires(connector_binding_dispatcher.as_ref());
         let staged = stage_prepared.stage(&lifecycle_barrier)?;
         for batch in staged.batches() {

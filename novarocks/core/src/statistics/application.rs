@@ -23,19 +23,15 @@
 
 use std::any::Any;
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorControlRegistry, ConnectorMutationOperationId,
-    ConnectorRequestContext, ConnectorStatisticsResolver, ConnectorTableHandle,
-    ConnectorTableResolution, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_METRICS,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsCollectionRequest, StatisticsDataVersion,
-    StatisticsMetric, StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue,
-    StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
-    StatisticsReconcileRequest,
+    ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
+    ConnectorStatisticsResolver, ConnectorTableResolution, ExternalMutationEvidence,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_METRICS,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsMetric, StatisticsMetricRequest,
+    StatisticsMetricState, StatisticsMetricValue, StatisticsReadRequest,
 };
 use uuid::Uuid;
 
@@ -117,9 +113,10 @@ pub trait StatisticsCollectedAttempt: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-/// Core implementation of provider-native collection and publication.  The
-/// frontend owns the job state machine and lease fence; Core owns connector
-/// leases, the distributed request, and `ExternalMutationOutcome` handling.
+/// Frontend-owned implementation of provider-native collection and
+/// publication. Core retains only this durable-worker port and the immutable
+/// request types; the frontend owns connector leases, native mapping, the
+/// distributed request, and `ExternalMutationOutcome` handling.
 pub trait StatisticsAttemptExecutor: Send + Sync {
     fn collect(
         &self,
@@ -154,40 +151,6 @@ pub trait StatisticsAttemptExecutorSink: Send + Sync {
         &self,
         executor: Arc<dyn StatisticsAttemptExecutor>,
     ) -> Result<(), String>;
-}
-
-/// Exact Core capabilities retained by the frontend-owned durable ANALYZE
-/// worker.  Each attempt captures a fresh live topology snapshot through this
-/// port, while its table/version pin remains the immutable submission fact.
-///
-/// This is intentionally a leaf-port bundle: it does not retain an engine
-/// facade or application state, and it has no standalone/default execution
-/// path.  Every dependency must be supplied by the composition root.
-#[derive(Clone)]
-pub struct StatisticsAttemptExecutionPorts {
-    execution_role: novarocks_types::ClusterRole,
-    connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
-    connector_control: Arc<dyn ConnectorControlRegistry>,
-    backend_topology: crate::query_execution::backend::BackendTopologyService,
-    query_execution: crate::query_execution::service::QueryExecutionService,
-}
-
-impl StatisticsAttemptExecutionPorts {
-    pub fn new(
-        execution_role: novarocks_types::ClusterRole,
-        connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
-        connector_control: Arc<dyn ConnectorControlRegistry>,
-        backend_topology: crate::query_execution::backend::BackendTopologyService,
-        query_execution: crate::query_execution::service::QueryExecutionService,
-    ) -> Self {
-        Self {
-            execution_role,
-            connectors,
-            connector_control,
-            backend_topology,
-            query_execution,
-        }
-    }
 }
 
 pub struct ConnectorStatisticsTargetResolver {
@@ -431,264 +394,6 @@ impl StatisticsApplicationPort for UnavailableStatisticsApplicationPort {
         Err(StatisticsApplicationError::new(
             "unified statistics application service is not installed",
         ))
-    }
-}
-
-/// Core implementation of a durable attempt. The frontend can retain only
-/// this trait object and its opaque collected value; it cannot obtain a
-/// connector reader, catalog handle, or an unpinned metadata path.
-pub struct ConnectorStatisticsAttemptExecutor {
-    ports: StatisticsAttemptExecutionPorts,
-}
-
-impl ConnectorStatisticsAttemptExecutor {
-    pub fn new(ports: StatisticsAttemptExecutionPorts) -> Self {
-        Self { ports }
-    }
-
-    fn collection_context() -> Result<ConnectorRequestContext, StatisticsApplicationError> {
-        ConnectorRequestContext::try_new(
-            Instant::now() + crate::query_execution::statistics::MAX_STATISTICS_ATTEMPT_DURATION,
-            Arc::new(NeverCancelled),
-            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        )
-        .map_err(|error| StatisticsApplicationError::new(error.to_string()))
-    }
-
-    fn table_and_version(
-        request: &StatisticsAttemptRequest,
-    ) -> Result<(ConnectorTableHandle, StatisticsDataVersion), StatisticsApplicationError> {
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(
-            &request.table_pin.connector_instance_id,
-        )
-        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let table = ConnectorTableHandle::try_new(
-            instance_id,
-            Bytes::copy_from_slice(&request.table_pin.table_handle),
-        )
-        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let version =
-            StatisticsDataVersion::try_new(Bytes::copy_from_slice(&request.table_pin.data_version))
-                .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        Ok((table, version))
-    }
-
-    fn metrics(
-        request: &StatisticsAttemptRequest,
-    ) -> Result<StatisticsMetricRequest, StatisticsApplicationError> {
-        let mut metrics = vec![StatisticsMetric::RowCount];
-        let columns = if request.metric_names.is_empty() {
-            &request.table_pin.columns
-        } else {
-            &request.metric_names
-        };
-        for column in columns {
-            let column: Arc<str> = Arc::from(column.as_str());
-            metrics.extend([
-                StatisticsMetric::NullCount {
-                    column: Arc::clone(&column),
-                },
-                StatisticsMetric::Minimum {
-                    column: Arc::clone(&column),
-                },
-                StatisticsMetric::Maximum {
-                    column: Arc::clone(&column),
-                },
-                StatisticsMetric::AverageSize {
-                    column: Arc::clone(&column),
-                },
-                StatisticsMetric::ThetaNdv { column },
-            ]);
-        }
-        StatisticsMetricRequest::try_new(metrics)
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))
-    }
-
-    fn operation_id(request: &StatisticsAttemptRequest) -> ConnectorMutationOperationId {
-        ConnectorMutationOperationId::from_bytes(*request.operation_id.as_bytes())
-    }
-
-    fn collected<'a>(
-        collected: &'a dyn StatisticsCollectedAttempt,
-    ) -> Result<&'a ConnectorStatisticsCollectedAttempt, StatisticsApplicationError> {
-        collected
-            .as_any()
-            .downcast_ref::<ConnectorStatisticsCollectedAttempt>()
-            .ok_or_else(|| {
-                StatisticsApplicationError::new(
-                    "statistics publication received a collection artifact from another executor",
-                )
-            })
-    }
-
-    fn outcome(
-        outcome: ExternalMutationOutcome<novarocks_spi::connector::StatisticsReceipt>,
-    ) -> Result<(), StatisticsApplicationError> {
-        match outcome {
-            ExternalMutationOutcome::KnownCommitted {
-                finalization: ExternalMutationFinalization::Complete,
-                ..
-            } => Ok(()),
-            ExternalMutationOutcome::KnownCommitted {
-                finalization: ExternalMutationFinalization::Failed(failure),
-                ..
-            }
-            | ExternalMutationOutcome::KnownUncommitted { failure } => {
-                Err(StatisticsApplicationError::new(failure.to_string()))
-            }
-            ExternalMutationOutcome::CommitUnknown { failure, .. } => {
-                Err(StatisticsApplicationError::reconcile(failure.to_string()))
-            }
-        }
-    }
-}
-
-struct ConnectorStatisticsCollectedAttempt {
-    lease: novarocks_spi::connector::ConnectorStatisticsLease,
-    table: ConnectorTableHandle,
-    result: novarocks_spi::connector::StatisticsCollectionResult,
-    context: ConnectorRequestContext,
-}
-
-impl StatisticsCollectedAttempt for ConnectorStatisticsCollectedAttempt {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl StatisticsAttemptExecutor for ConnectorStatisticsAttemptExecutor {
-    fn collect(
-        &self,
-        request: &StatisticsAttemptRequest,
-    ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsApplicationError> {
-        let (table, data_version) = Self::table_and_version(request)?;
-        let metrics = Self::metrics(request)?;
-        let context = Self::collection_context()?;
-        let planning_lease = self
-            .ports
-            .connector_control
-            .acquire_current(table.owner())
-            .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
-        let lease = planning_lease
-            .derive_statistics_lease()
-            .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
-        let plan = lease
-            .prepare_collection(StatisticsCollectionRequest {
-                operation_id: Self::operation_id(request),
-                table: table.clone(),
-                data_version,
-                metrics,
-                context: context.clone(),
-            })
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let program = crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
-            plan,
-            crate::query_execution::statistics::StatisticsExecutionPolicy::try_new(
-                crate::query_execution::statistics::StatisticsExecutionMode::DurableJobAttempt,
-                crate::query_execution::statistics::MAX_STATISTICS_ATTEMPT_DURATION,
-            )
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,
-        )
-        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let topology = self
-            .ports
-            .backend_topology
-            .snapshot()
-            .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
-        let cancellation = crate::query_execution::cancellation::QueryCancellationSource::new();
-        let execution = crate::query_execution::request_context::QueryExecutionContext::new(
-            self.ports.execution_role,
-            topology,
-            Some(Instant::now() + program.policy().attempt_timeout()),
-            cancellation.view(),
-            novarocks_sql::compiler::SessionOptimizerSettings::default(),
-        );
-        let connectors = self
-            .ports
-            .connectors
-            .read()
-            .map_err(|_| StatisticsApplicationError::transient("connector registry lock poisoned"))?
-            .clone();
-        let distributed = crate::query_execution::statistics::build_statistics_collection_request(
-            &connectors,
-            self.ports.connector_control.as_ref(),
-            &execution,
-            context.clone(),
-            program,
-            planning_lease,
-        )
-        .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
-        let result = self
-            .ports
-            .query_execution
-            .execute(distributed)
-            .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_statistics)
-            .map(|outcome| outcome.into_collection_result())
-            .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
-        Ok(Box::new(ConnectorStatisticsCollectedAttempt {
-            lease,
-            table,
-            result,
-            context,
-        }))
-    }
-
-    fn prepare_publish(
-        &self,
-        request: &StatisticsAttemptRequest,
-        collected: &dyn StatisticsCollectedAttempt,
-    ) -> Result<ExternalMutationEvidence, StatisticsApplicationError> {
-        let collected = Self::collected(collected)?;
-        collected
-            .lease
-            .prepare_publish(StatisticsPublishPreparationRequest {
-                operation_id: Self::operation_id(request),
-                table: collected.table.clone(),
-                result: collected.result.clone(),
-                context: collected.context.clone(),
-            })
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))
-    }
-
-    fn publish(
-        &self,
-        request: &StatisticsAttemptRequest,
-        collected: &dyn StatisticsCollectedAttempt,
-        evidence: &ExternalMutationEvidence,
-    ) -> Result<(), StatisticsApplicationError> {
-        let collected = Self::collected(collected)?;
-        Self::outcome(
-            collected
-                .lease
-                .publish(StatisticsPublishRequest {
-                    operation_id: Self::operation_id(request),
-                    table: collected.table.clone(),
-                    result: collected.result.clone(),
-                    context: collected.context.clone(),
-                    evidence: evidence.clone(),
-                })
-                .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,
-        )
-    }
-
-    fn reconcile(
-        &self,
-        evidence: &ExternalMutationEvidence,
-    ) -> Result<(), StatisticsApplicationError> {
-        let lease = self
-            .ports
-            .connector_control
-            .acquire_current_statistics(&evidence.descriptor().instance_id)
-            .map_err(|error| StatisticsApplicationError::reconcile(error.to_string()))?;
-        Self::outcome(
-            lease
-                .reconcile(StatisticsReconcileRequest {
-                    evidence: evidence.clone(),
-                    context: Self::collection_context()?,
-                })
-                .map_err(|error| StatisticsApplicationError::reconcile(error.to_string()))?,
-        )
     }
 }
 

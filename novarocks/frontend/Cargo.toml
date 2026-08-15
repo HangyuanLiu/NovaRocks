@@ -11,6 +11,7 @@ doctest = false
 apache-avro = "0.21"
 async-trait = "0.1"
 arrow = { version = "58.2.0" }
+arrow-buffer = "58.2.0"
 axum = "0.7"
 bytes = "1"
 chrono = "0.4"
@@ -40,6 +41,7 @@ uuid = { version = "1", features = ["v7", "serde"] }
 novarocks = { path = "../core", features = ["query-execution-contract-test-support"] }
 novarocks-connector-starrocks = { path = "../connector/starrocks" }
 novarocks-spi = { path = "../spi", features = ["state-store-conformance"] }
+novarocks-sql = { path = "../sql", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 

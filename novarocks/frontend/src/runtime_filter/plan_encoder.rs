@@ -81,7 +81,10 @@ fn encode_binding(
         channel_id: binding.channel_id(),
         node_id: binding.node_id(),
         apply_point: encode_apply_point(binding.apply_point()),
-        expression: Some(binding.expression().map_err(encoding_error)?),
+        expression: Some(
+            crate::native::fragment_encoder::expr::encode_expr(binding.expression())
+                .map_err(encoding_error)?,
+        ),
         contract: Some(logical_domain.contract()),
         reduction: Some(logical_domain.encode_reduction(binding.reduction())?),
         role: Some(encode_role(binding.role())?),

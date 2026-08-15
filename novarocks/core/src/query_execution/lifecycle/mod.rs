@@ -21,6 +21,7 @@ pub mod identity;
 pub mod init_plan;
 pub mod manifest;
 pub mod metrics;
+pub mod query_options_wire;
 pub mod stage;
 pub mod terminal;
 

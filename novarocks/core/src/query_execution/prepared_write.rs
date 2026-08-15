@@ -19,12 +19,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::protocol::native::encode::NativeFragmentBundle;
 use crate::query_execution::contract::{
     ConnectorWriteExecutionRegistration, ConnectorWriteOperationRegistration,
     DistributedQueryError, DistributedQueryIntent, DistributedQueryRequest,
     build_distributed_query_request_with_execution, with_connector_write_operation,
 };
+use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::request_context::QueryExecutionContext;
 use novarocks_execution::runtime::query_options::QueryOptions;
@@ -39,7 +39,7 @@ use novarocks_sql::plan_read::FragmentId;
 /// preparation; bind must never reacquire a later current generation.
 pub struct PreparedDistributedWriteRequest {
     prepared: PreparedFragmentSet,
-    native_bundle: NativeFragmentBundle,
+    native_bundle: NativeFragmentAttachment,
     query_options: Option<QueryOptions>,
     registration: ConnectorWriteOperationRegistration,
     terminal_writer_fragment_ids: BTreeSet<FragmentId>,
@@ -50,7 +50,7 @@ pub struct PreparedDistributedWriteRequest {
 impl PreparedDistributedWriteRequest {
     pub(crate) fn new(
         prepared: PreparedFragmentSet,
-        native_bundle: NativeFragmentBundle,
+        native_bundle: NativeFragmentAttachment,
         query_options: Option<QueryOptions>,
         registration: ConnectorWriteOperationRegistration,
         cohort_id: ConnectorWriteCohortId,
@@ -71,7 +71,7 @@ impl PreparedDistributedWriteRequest {
 
     pub(crate) fn new_with_writer_fragment_cohorts<I>(
         prepared: PreparedFragmentSet,
-        native_bundle: NativeFragmentBundle,
+        native_bundle: NativeFragmentAttachment,
         query_options: Option<QueryOptions>,
         registration: ConnectorWriteOperationRegistration,
         writer_fragment_cohorts: I,

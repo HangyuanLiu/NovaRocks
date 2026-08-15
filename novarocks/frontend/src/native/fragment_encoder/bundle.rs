@@ -15,27 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::DataType;
+pub use novarocks::query_execution::native_fragment::{
+    NativeFragmentAttachment, NativeFragmentEncodingView,
+};
 
-use super::*;
-use novarocks_sql::plan_read::{ColumnId, OutputColumn};
-
-fn empty_scan_bindings() -> &'static ScanExecutionBindings {
-    Box::leak(Box::new(ScanExecutionBindings::default()))
+/// Encode one immutable distributed plan and its exact prepared bindings into
+/// the native FE-to-BE wire bundle.
+pub fn encode_native_fragment_bundle(
+    source: NativeFragmentEncodingView<'_>,
+) -> Result<NativeFragmentAttachment, String> {
+    let plan = source.distributed_plan();
+    let scan_facts = source.scan_facts();
+    let encoded = super::plan::encode_distributed_plan(plan, scan_facts)?;
+    source.seal(encoded.fragments)
 }
-
-fn output_column(id: u32, name: &str, data_type: DataType) -> OutputColumn {
-    OutputColumn {
-        column_id: ColumnId(id),
-        name: name.to_string(),
-        data_type,
-        nullable: false,
-        is_internal: false,
-    }
-}
-
-mod output;
-mod relational;
-mod scan;
-mod topology;
-mod write;
