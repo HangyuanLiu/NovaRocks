@@ -192,8 +192,9 @@ FROM parent_cte
 ORDER BY employee_id;
 
 -- query 9
--- Recursive CTE with mixed UNION ALL + UNION in body → self-reference reaches missing table metadata.
--- @expect_error=no metadata files
+-- Recursive CTE with mixed UNION ALL + UNION is rejected when the recursive
+-- reference is resolved; it must not reach a metadata lookup.
+-- @expect_error=unknown table: numbers
 WITH RECURSIVE numbers AS (
     SELECT cast(1 as bigint) AS n, cast(1 as bigint) AS category
     UNION ALL
@@ -265,8 +266,9 @@ FROM manager_chain
 ORDER BY steps;
 
 -- query 14
--- Error case: recursive reference in non-recursive anchor part reaches missing table metadata.
--- @expect_error=no metadata files
+-- Error case: a recursive reference in the non-recursive anchor is rejected
+-- by recursive-name resolution, before any metadata lookup.
+-- @expect_error=unknown table: invalid_cte
 WITH RECURSIVE invalid_cte AS (
     SELECT employee_id, name FROM ${case_db}.employees WHERE employee_id IN (SELECT employee_id FROM invalid_cte)
     UNION ALL
