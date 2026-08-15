@@ -8,10 +8,11 @@ build = "build.rs"
 doctest = false
 
 [dependencies]
+once_cell = "1.19"
 prost = "0.13"
-
-[dev-dependencies]
 prost-reflect = "0.14"
+sha2 = "0.10"
+novarocks-types = { path = "../types" }
 
 [build-dependencies]
 prost-build = "0.13"

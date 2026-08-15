@@ -1,5 +1,5 @@
 ---
-id: ADR-0066
+id: ADR-0075
 title: "Lake-first MV attempt discovery classifies conservatively or not at all"
 domain: [frontend-mv, provider-spi]
 status: active

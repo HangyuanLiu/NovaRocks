@@ -1,9 +1,9 @@
 ---
-id: ADR-0073
+id: ADR-0078
 title: "Runtime filter terminal observation has no lifecycle veto"
 domain: [runtime-filter, distributed-query-lifecycle]
 status: active
-supersedes: [ADR-0068]
+supersedes: [ADR-0076]
 superseded-by: null
 date: 2026-08-15
 provenance:
@@ -23,7 +23,7 @@ participant 事实，同时保证纯性能优化的观测面不会否决本来�
 ## 背景与执行事实
 
 ADR-0043 已确定 runtime filter evaluator 只产生保守的性能 Effect，ADR-0044 将 participant 的物理生命周期
-留在 Backend，ADR-0068 则曾把 terminal observation 作为 typed QLC contribution 跨进程交付。这个边界仍然成立，
+留在 Backend，ADR-0076 则曾把 terminal observation 作为 typed QLC contribution 跨进程交付。这个边界仍然成立，
 但把 observation capture 失败直接等同于 query 成败，会让性能诊断反向成为 SQL 正确性的权威。
 
 查询正确性已有独立且唯一的守卫：封存计划的静态验证、实际 fragment 执行结果、显式取消/abort，以及 QLC 的
@@ -41,7 +41,7 @@ participant 身份和终止状态机。join 本体而不是 runtime filter obser
 
 ## 考虑过的选项
 
-1. **延续 ADR-0068 的 capture-fail-closed 终止语义。** 这能保证 profile 从不静默丢失，但会让诊断面拥有
+1. **延续 ADR-0076 的 capture-fail-closed 终止语义。** 这能保证 profile 从不静默丢失，但会让诊断面拥有
    否决查询的能力，违背 runtime filter 仅是性能优化的边界。
 2. **capture 或传输失败时统一构造 empty contribution。** 查询不会被 observation 阻塞，但“没有 runtime filter”与
    “不能证明 runtime filter observation”不可区分，长期会污染 profile、故障归因和回归测试。

@@ -231,7 +231,7 @@ fn terminal_profile_contribution(
     )
 }
 
-// Design: ADR-0073 (docs/adr/ADR-0073-runtime-filter-terminal-observation-without-lifecycle-veto.md)
+// Design: ADR-0078 (docs/adr/ADR-0078-runtime-filter-terminal-observation-without-lifecycle-veto.md)
 fn capture_terminal_profile_contribution(
     participant: Option<&Arc<RuntimeFilterParticipant>>,
     runtime_filter_installed: bool,

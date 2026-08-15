@@ -62,12 +62,12 @@ code-anchors:
 - ADR-0027 — Runtime Filter 规划为何由 SQL 私有拥有、角色之间只交换封存 wire facts（active）
 - ADR-0043 — Runtime Filter row/scan evaluator 为何统一由 Execution 拥有、Backend 只提供 artifact query（active）
 - ADR-0044 — Runtime Filter participant 物理生命周期为何由 Backend 拥有、Execution 保留语义值与 evaluator（active）
-- ADR-0073 — Runtime Filter terminal observation 为何只作观测，且以 P0/P1/P2 查询终止契约交付（active）
+- ADR-0078 — Runtime Filter terminal observation 为何只作观测，且以 P0/P1/P2 查询终止契约交付（active）
 
 #### 历史
 
 - ADR-0041 — Runtime Filter scan-domain 评估为何由 Execution 拥有、Core 只提供中立 artifact capability（superseded → ADR-0043）
-- ADR-0068 — Runtime Filter terminal observation 为何由 Backend participant 有界聚合、并仅经 typed QLC contribution 出域（superseded → ADR-0073）
+- ADR-0076 — Runtime Filter terminal observation 为何由 Backend participant 有界聚合、并仅经 typed QLC contribution 出域（superseded → ADR-0078）
 
 ### join-execution
 
@@ -109,7 +109,7 @@ code-anchors:
 - ADR-0061 — MV repartition 为何由 Provider 在单次原子 write commit 中同时切换 partition spec 与 snapshot（active）
 - ADR-0063 — Copy-on-Write row mutation 的match与rewrite读源为何由Provider按exact base签发（active）
 - ADR-0068 — 分布式 DML 的 external write fence 为何做成 catalog 原子条件更新里的线性化点（active）
-- ADR-0069 — Hadoop catalog 创建表为何以 storage 条件创建 v1 metadata 作为线性化点（active）
+- ADR-0077 — Hadoop catalog 创建表为何以 storage 条件创建 v1 metadata 作为线性化点（active）
 - ADR-0070 — CTAS takeover 为何使用 catalog-native absent-target fence，并对未广告能力的 catalog 提前拒绝（active）
 
 #### 历史
@@ -130,11 +130,12 @@ code-anchors:
 - ADR-0011 — 请求执行为何使用 immutable context、一次 topology capture 并拒绝 ambient fallback（active）
 - ADR-0012 — Query session admission 与 router 为何由 frontend 拥有、core 只保留 wire/compiler kernel（active）
 - ADR-0047 — catalog/read admission 为何以 exact Connector generation 与中立 native carrier 封存（active）
-- ADR-0073 — Runtime Filter terminal observation 为何只作观测，且以 P0/P1/P2 查询终止契约交付（active）
+- ADR-0078 — Runtime Filter terminal observation 为何只作观测，且以 P0/P1/P2 查询终止契约交付（active）
+- ADR-0079 — IDL/proto 为何是 FE/BE 中立 query lifecycle 契约的规范形式、Protocol 如何同时拥有 schema 与已验证值（active）
 
 #### 历史
 
-- ADR-0068 — Runtime Filter terminal observation 为何由 Backend participant 有界聚合、并仅经 typed QLC contribution 出域（superseded → ADR-0073）
+- ADR-0076 — Runtime Filter terminal observation 为何由 Backend participant 有界聚合、并仅经 typed QLC contribution 出域（superseded → ADR-0078）
 
 ### sql-compiler
 
@@ -217,8 +218,8 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0037 — 历史 MV refresh 为什么只能跨 incarnation 做 lake inspection 与 guarded cleanup（active）
 - ADR-0038 — Frontend 为何拥有 MV background worker lifecycle 与 per-target activity gate（active）
 - ADR-0064 — MV publication 为何需要 lake 上专用的 fence ref，并在推进 main 的同一 commit 中做四方 exact 比较（active）
-- ADR-0065 — MV refresh 所有权为何按 target 上锁、且必须在每个事务内校验（active）
-- ADR-0066 — ledger 丢失后 MV attempt 为何以 lake-first 有界发现 + 保守分类收敛，而非按时间/ID 猜 winner（active）
+- ADR-0074 — MV refresh 所有权为何按 target 上锁、且必须在每个事务内校验（active）
+- ADR-0075 — ledger 丢失后 MV attempt 为何以 lake-first 有界发现 + 保守分类收敛，而非按时间/ID 猜 winner（active）
 
 #### 历史
 
@@ -248,6 +249,7 @@ engine port，connector 保留 catalog、snapshot、file 与 commit 等 external
 - ADR-0058 — 架构隔离为何由 crate 边界强制，而不用硬编码的 source-shape guard（active）
 - ADR-0069 — 共享测试机械能力为何使用零产品依赖的独立叶子 crate，而领域断言仍跟随其 owner（active）
 - ADR-0071 — 分布式测试编排为何由唯一 cluster harness 拥有、SQL runner 只作 frontend adapter（active）
+- ADR-0079 — IDL/proto 为何是 FE/BE 中立 query lifecycle 契约的规范形式、Protocol 如何同时拥有 schema 与已验证值（active）
 
 ### configuration
 

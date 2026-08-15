@@ -3409,10 +3409,13 @@ dependencies = [
 name = "novarocks-protocol"
 version = "0.1.0"
 dependencies = [
+ "novarocks-types",
+ "once_cell",
  "prost 0.13.5",
  "prost-build",
  "prost-reflect",
  "protoc-bin-vendored",
+ "sha2",
 ]
 
 [[package]]
