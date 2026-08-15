@@ -166,7 +166,7 @@ pub trait StatisticsAttemptExecutorSink: Send + Sync {
 #[derive(Clone)]
 pub struct StatisticsAttemptExecutionPorts {
     execution_role: novarocks_types::ClusterRole,
-    connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
+    _connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     backend_topology: crate::query_execution::backend::BackendTopologyService,
     query_execution: crate::query_execution::service::QueryExecutionService,
@@ -182,7 +182,7 @@ impl StatisticsAttemptExecutionPorts {
     ) -> Self {
         Self {
             execution_role,
-            connectors,
+            _connectors: connectors,
             connector_control,
             backend_topology,
             query_execution,
@@ -604,14 +604,7 @@ impl StatisticsAttemptExecutor for ConnectorStatisticsAttemptExecutor {
             cancellation.view(),
             novarocks_sql::compiler::SessionOptimizerSettings::default(),
         );
-        let connectors = self
-            .ports
-            .connectors
-            .read()
-            .map_err(|_| StatisticsApplicationError::transient("connector registry lock poisoned"))?
-            .clone();
         let distributed = crate::query_execution::statistics::build_statistics_collection_request(
-            &connectors,
             self.ports.connector_control.as_ref(),
             &execution,
             context.clone(),

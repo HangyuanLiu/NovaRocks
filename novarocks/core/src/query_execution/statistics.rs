@@ -316,20 +316,64 @@ fn statistics_target_parallelism(
     })
 }
 
-/// Compile an already-pinned connector statistics program into a normal
-/// native distributed request.  Preparation receives the opaque read produced
-/// above through a one-shot resolver; it cannot reopen the provider catalog or
-/// reinterpret the table's data version.  The emitted fragment source remains
-/// the regular `ConnectorReadSource`, so BE execution has no statistics-only
-/// connector identity or reader path.
-pub(crate) fn build_statistics_collection_request(
-    _connectors: &crate::connector::ConnectorRegistry,
+/// Prepared, one-shot statistics request assembly.
+///
+/// This is the statistics counterpart to the normal query assembly: provider
+/// planning and fragment preparation happen once, then the caller receives a
+/// borrow-only native encoding view.  `finish` accepts only the attachment
+/// sealed by that exact view, so it cannot substitute a later provider read,
+/// topology snapshot, cancellation view, or statistics program.
+pub struct PreparedStatisticsCollectionRequest {
+    encoding: crate::query_execution::post_compile::NativeFragmentEncodingInput,
+    program: StatisticsCollectionProgram,
+    execution: crate::query_execution::request_context::QueryExecutionContext,
+}
+
+impl PreparedStatisticsCollectionRequest {
+    /// Immutable facts consumed by the native encoder.  This has no acquire
+    /// path: connector leases and read sessions remain sealed in preparation.
+    pub fn encoding_view(
+        &self,
+    ) -> crate::query_execution::native_fragment::NativeFragmentEncodingView<'_> {
+        self.encoding.encoding_view()
+    }
+
+    /// Consume the matching native attachment into the sole statistics
+    /// distributed request.  Keeping the typed program here prevents a
+    /// statistics attempt from degrading into a generic result request.
+    pub fn finish(
+        self,
+        native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
+    ) -> Result<DistributedQueryRequest, DistributedQueryError> {
+        if !self.encoding.matches_native_attachment(&native_attachment) {
+            return Err(contract_violation(
+                "native fragment bundle does not match the sealed statistics encoding input",
+            ));
+        }
+        let (_, prepared) = self.encoding.into_parts();
+        Ok(build_statistics_query_request_with_execution(
+            prepared,
+            native_attachment,
+            None,
+            self.program,
+            &self.execution,
+        ))
+    }
+}
+
+/// Prepare an already-pinned connector statistics program for native
+/// distributed execution. Preparation receives the opaque read through a
+/// one-shot resolver; it cannot reopen the provider catalog or reinterpret
+/// the table's data version. The emitted fragment source remains the regular
+/// `ConnectorReadSource`, so BE execution has no statistics-only connector
+/// identity or reader path.
+pub fn prepare_statistics_collection_request(
     controls: &dyn ConnectorControlResolver,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     context: ConnectorRequestContext,
     program: StatisticsCollectionProgram,
     planning_lease: ConnectorControlPlanningLease,
-) -> Result<DistributedQueryRequest, DistributedQueryError> {
+) -> Result<PreparedStatisticsCollectionRequest, DistributedQueryError> {
     let read = prepare_statistics_connector_read(
         planning_lease,
         execution.topology(),
@@ -379,20 +423,38 @@ pub(crate) fn build_statistics_collection_request(
         ),
     )
     .map_err(contract_violation)?;
-    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
-        crate::protocol::native::encode::NativeFragmentEncodingSource::unsealed(
-            &distributed,
-            &prepared,
+    Ok(PreparedStatisticsCollectionRequest {
+        encoding: crate::query_execution::post_compile::NativeFragmentEncodingInput::new(
+            distributed,
+            prepared,
         ),
-    )
-    .map_err(contract_violation)?;
-    Ok(build_statistics_query_request_with_execution(
-        prepared,
-        native_bundle,
-        None,
         program,
+        execution: execution.clone(),
+    })
+}
+
+/// Transitional Core executor entrypoint.  It intentionally exercises the
+/// same prepare -> sealed view -> attachment -> finish sequence that the
+/// Frontend encoder will own after the owner cut; it does not reacquire a
+/// connector lease or read from the pinned provider twice.
+pub(crate) fn build_statistics_collection_request(
+    controls: &dyn ConnectorControlResolver,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    context: ConnectorRequestContext,
+    program: StatisticsCollectionProgram,
+    planning_lease: ConnectorControlPlanningLease,
+) -> Result<DistributedQueryRequest, DistributedQueryError> {
+    let prepared = prepare_statistics_collection_request(
+        controls,
         execution,
-    ))
+        context,
+        program,
+        planning_lease,
+    )?;
+    let native_attachment =
+        crate::protocol::native::encode::encode_native_fragment_bundle(prepared.encoding_view())
+            .map_err(contract_violation)?;
+    prepared.finish(native_attachment)
 }
 
 /// Retain a request-local SQL token even though the opaque statistics read is
@@ -1836,6 +1898,7 @@ mod tests {
         ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableHandle,
         StatisticsCollectionPlan,
     };
+    use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
 
     use super::*;
 
@@ -1888,6 +1951,76 @@ mod tests {
             .expect("policy"),
         )
         .expect("program")
+    }
+
+    fn prepared_collection_request_for_test() -> PreparedStatisticsCollectionRequest {
+        let plan = native_preparation_plan(NativePreparationFixture::ResultOutput)
+            .expect("sealed native plan");
+        let prepared =
+            crate::query_execution::preparation::prepared_fragment_set_for_native_encode_test(
+                &plan,
+            )
+            .expect("prepared native facts");
+        let execution = crate::query_execution::request_context::QueryExecutionContext::new(
+            novarocks_types::ClusterRole::AllInOne,
+            BackendTopologySnapshot::empty(17),
+            Some(Instant::now() + Duration::from_secs(60)),
+            crate::query_execution::cancellation::QueryCancellationSource::new().view(),
+            novarocks_sql::compiler::SessionOptimizerSettings::default(),
+        );
+        PreparedStatisticsCollectionRequest {
+            encoding: crate::query_execution::post_compile::NativeFragmentEncodingInput::new(
+                plan, prepared,
+            ),
+            program: program_for_preparation(),
+            execution,
+        }
+    }
+
+    #[test]
+    fn prepared_statistics_request_preserves_typed_program_and_execution_intent() {
+        let prepared = prepared_collection_request_for_test();
+        let native_attachment = crate::protocol::native::encode::encode_native_fragment_bundle(
+            prepared.encoding_view(),
+        )
+        .expect("encode exact statistics attachment");
+        let request = prepared
+            .finish(native_attachment)
+            .expect("matching attachment completes statistics request");
+
+        assert_eq!(
+            request.intent(),
+            crate::query_execution::contract::DistributedQueryIntent::Statistics
+        );
+        let program = request
+            .statistics_program()
+            .expect("statistics request retains typed program");
+        assert_eq!(
+            program.plan().data_version,
+            StatisticsDataVersion::try_new(Bytes::from_static(b"snapshot-1"))
+                .expect("expected data version")
+        );
+        assert_eq!(request.topology().revision(), 17);
+        assert!(request.deadline().is_some());
+    }
+
+    #[test]
+    fn prepared_statistics_request_rejects_cross_provenance_attachment() {
+        let prepared = prepared_collection_request_for_test();
+        let other = prepared_collection_request_for_test();
+        let attachment =
+            crate::protocol::native::encode::encode_native_fragment_bundle(other.encoding_view())
+                .expect("encode other statistics attachment");
+
+        let error = match prepared.finish(attachment) {
+            Ok(_) => panic!("attachment from a different preparation must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+        assert_eq!(
+            error.message(),
+            "native fragment bundle does not match the sealed statistics encoding input"
+        );
     }
 
     #[test]

@@ -17,6 +17,12 @@
 
 //! Opaque owned handoffs and neutral scheduling projections.
 
+mod native_submission;
+
+pub use native_submission::{
+    NativeSubmissionAttachment, NativeSubmissionEncodingView, NativeSubmissionKey,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -229,6 +235,7 @@ impl RuntimeFilterBoundPreparedDistributedQuery {
             ));
         }
         Ok(ScheduleBoundDistributedQuery {
+            handoff_id: self.handoff_id,
             prepared: self.prepared,
             native_bundle: self.native_bundle,
             schedule,
@@ -322,6 +329,7 @@ impl<'a> RuntimeFilterBindingEncodingView<'a> {
 /// A core artifact bound to one validated schedule. Query initialization/control
 /// readiness and the connector install/ACK barrier must first complete.
 pub struct ScheduleBoundDistributedQuery {
+    handoff_id: u64,
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentBundle,
     schedule: ValidatedFragmentSchedule,
@@ -383,6 +391,7 @@ impl ScheduleBoundDistributedQuery {
             ));
         }
         Ok(RuntimeFilterDeploymentReadyDistributedQuery {
+            handoff_id: self.handoff_id,
             prepared: self.prepared,
             native_bundle: self.native_bundle,
             schedule: self.schedule,
@@ -574,6 +583,7 @@ impl RuntimeFilterBackendTopologyEntry {
 /// entrypoint is intentionally introduced separately from the legacy
 /// transition entrypoint while owner-local deployment compilation migrates.
 pub struct RuntimeFilterDeploymentReadyDistributedQuery {
+    handoff_id: u64,
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentBundle,
     schedule: ValidatedFragmentSchedule,
@@ -613,6 +623,7 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
         let stage_bindings = plan.stage_participant_bindings()?;
         let query_lifecycle_lease = barrier.initialize_all(plan)?;
         Ok(ControlReadyDistributedQuery {
+            handoff_id: self.handoff_id,
             prepared: self.prepared,
             native_bundle: self.native_bundle,
             schedule: self.schedule,
@@ -700,6 +711,7 @@ fn attach_connector_write_plans(
 /// independent process-scoped install/ACK barrier before preparing native
 /// Stage batches.
 pub struct ControlReadyDistributedQuery {
+    handoff_id: u64,
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentBundle,
     schedule: ValidatedFragmentSchedule,
@@ -730,6 +742,7 @@ impl ControlReadyDistributedQuery {
             }
         };
         Ok(ConnectorBindingReadyDistributedQuery {
+            handoff_id: self.handoff_id,
             prepared: self.prepared,
             native_bundle: self.native_bundle,
             schedule: self.schedule,
@@ -746,6 +759,7 @@ impl ControlReadyDistributedQuery {
 /// it is impossible to create a submission before every selected BE has ACKed
 /// the connector declarations it will resolve by instance id.
 pub struct ConnectorBindingReadyDistributedQuery {
+    handoff_id: u64,
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentBundle,
     schedule: ValidatedFragmentSchedule,
@@ -763,8 +777,60 @@ impl ConnectorBindingReadyDistributedQuery {
         &self.connector_write_plans
     }
 
+    /// Stable placement identity facts for the owner-local native submission
+    /// mapper.  The view carries neither schedule mutation nor lifecycle or
+    /// connector leases.
+    pub fn native_submission_view(
+        &self,
+    ) -> Result<NativeSubmissionEncodingView<'static>, DistributedQueryError> {
+        native_submission_encoding_view(
+            self.handoff_id,
+            self.schedule.execution_id,
+            &self.schedule.inner,
+        )
+    }
+
+    /// Consume a matching native submission attachment and construct Stage
+    /// batches.  The mapper cannot bypass ControlReady or connector-binding
+    /// readiness because this typestate owns both abort-preserving leases.
+    pub fn finish_stage(
+        self,
+        attachment: NativeSubmissionAttachment,
+    ) -> Result<StagePreparedDistributedQuery, DistributedQueryError> {
+        let ConnectorBindingReadyDistributedQuery {
+            handoff_id,
+            prepared,
+            native_bundle: _,
+            schedule,
+            options,
+            query_lifecycle_lease,
+            connector_binding_lease,
+            stage_bindings,
+            connector_write_plans,
+        } = self;
+        let connector_read_sessions = ConnectorReadSessionSet::from_prepared(&prepared);
+        if let Err(error) = options.native_submission_context() {
+            let kind = error.kind();
+            let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
+            let message = connector_binding_lease.abort_preserving(message);
+            let message = connector_read_sessions.abort_preserving(message);
+            return Err(DistributedQueryError::new(kind, message));
+        }
+        finish_sealed_native_submission(
+            attachment,
+            handoff_id,
+            schedule.execution_id,
+            stage_bindings,
+            query_lifecycle_lease,
+            connector_binding_lease,
+            connector_write_plans,
+            connector_read_sessions,
+        )
+    }
+
     pub fn prepare_stage(self) -> Result<StagePreparedDistributedQuery, DistributedQueryError> {
         let ConnectorBindingReadyDistributedQuery {
+            handoff_id,
             prepared,
             native_bundle,
             schedule,
@@ -785,56 +851,44 @@ impl ConnectorBindingReadyDistributedQuery {
                 return Err(DistributedQueryError::new(kind, message));
             }
         };
+        let submission_view =
+            native_submission_encoding_view(handoff_id, schedule.execution_id, &schedule.inner)?;
         let assembled = assemble_native_execution(
-            prepared,
-            native_bundle,
-            schedule.inner,
+            &prepared,
+            &native_bundle,
+            &schedule.inner,
             schedule.execution_id,
             context,
             &connector_write_plans,
         );
         match assembled {
             Ok(assembled) => {
-                let mut fragments_by_backend = BTreeMap::<usize, Vec<StageFragment>>::new();
-                for submission in assembled.submissions {
-                    let (backend_idx, fragment) = submission.into_stage_fragment()?;
-                    fragments_by_backend
-                        .entry(backend_idx)
-                        .or_default()
-                        .push(fragment);
-                }
-                let mut batches = Vec::with_capacity(stage_bindings.len());
-                for binding in stage_bindings {
-                    let fragments = fragments_by_backend
-                        .remove(&binding.target().backend_idx())
-                        .unwrap_or_default();
-                    batches.push(
-                        StageBatch::new(schedule.execution_id, binding, fragments)
-                            .map_err(|error| contract_error(error.to_string()))?,
-                    );
-                }
-                if !fragments_by_backend.is_empty() {
-                    let error = contract_error(format!(
-                        "native stage assembly produced fragments for unknown participants: {:?}",
-                        fragments_by_backend.keys().collect::<Vec<_>>()
-                    ));
-                    let kind = error.kind();
-                    let message =
-                        query_lifecycle_lease.abort_preserving(error.message().to_string());
-                    let message = connector_binding_lease.abort_preserving(message);
-                    let message = connector_read_sessions.abort_preserving(message);
-                    return Err(DistributedQueryError::new(kind, message));
-                }
-                Ok(StagePreparedDistributedQuery {
-                    batches,
-                    root_fetch: assembled.root_fetch,
-                    writer_registrations: assembled.writer_registrations,
-                    expected_output: assembled.expected_output,
+                let attachment = match submission_view.seal(
+                    assembled.submissions,
+                    assembled.root_fetch,
+                    assembled.writer_registrations,
+                    assembled.expected_output,
+                ) {
+                    Ok(attachment) => attachment,
+                    Err(error) => {
+                        let kind = error.kind();
+                        let message =
+                            query_lifecycle_lease.abort_preserving(error.message().to_string());
+                        let message = connector_binding_lease.abort_preserving(message);
+                        let message = connector_read_sessions.abort_preserving(message);
+                        return Err(DistributedQueryError::new(kind, message));
+                    }
+                };
+                finish_sealed_native_submission(
+                    attachment,
+                    handoff_id,
+                    schedule.execution_id,
+                    stage_bindings,
                     query_lifecycle_lease,
                     connector_binding_lease,
                     connector_write_plans,
                     connector_read_sessions,
-                })
+                )
             }
             Err(error) => {
                 let kind = error.kind();
@@ -1466,6 +1520,10 @@ impl ValidatedNativeSubmission {
         self.finst_id
     }
 
+    pub const fn fragment_id(&self) -> FragmentId {
+        self.plan.fragment_id
+    }
+
     pub const fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
     }
@@ -1606,6 +1664,107 @@ struct AssembledNativeExecution {
     root_fetch: RootFetchMetadata,
     writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
+}
+
+fn native_submission_encoding_view(
+    handoff_id: u64,
+    execution_id: QueryExecutionId,
+    schedule: &SchedulingPlan,
+) -> Result<NativeSubmissionEncodingView<'static>, DistributedQueryError> {
+    let keys = schedule
+        .by_fragment
+        .iter()
+        .flat_map(|(&fragment_id, placements)| {
+            placements.iter().map(move |placement| {
+                NativeSubmissionKey::new(placement.backend_idx, fragment_id, placement.finst_id)
+            })
+        })
+        .collect::<Vec<_>>();
+    let root = NativeSubmissionKey::new(
+        schedule.root_backend_idx,
+        schedule.root_fragment_id,
+        schedule.root_finst_id,
+    );
+    NativeSubmissionEncodingView::new(handoff_id, execution_id, keys, root)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_sealed_native_submission(
+    attachment: NativeSubmissionAttachment,
+    handoff_id: u64,
+    execution_id: QueryExecutionId,
+    stage_bindings: Vec<StageParticipantBinding>,
+    query_lifecycle_lease: QueryLifecycleLease,
+    connector_binding_lease: ConnectorBindingInstallLease,
+    connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
+    connector_read_sessions: ConnectorReadSessionSet,
+) -> Result<StagePreparedDistributedQuery, DistributedQueryError> {
+    if !attachment.matches(handoff_id, execution_id) {
+        let error =
+            contract_error("native submission attachment does not match the sealed query handoff");
+        let kind = error.kind();
+        let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
+        let message = connector_binding_lease.abort_preserving(message);
+        let message = connector_read_sessions.abort_preserving(message);
+        return Err(DistributedQueryError::new(kind, message));
+    }
+    let (submissions, root_fetch, writer_registrations, expected_output) = attachment.into_parts();
+    let mut fragments_by_backend = BTreeMap::<usize, Vec<StageFragment>>::new();
+    for submission in submissions {
+        let (backend_idx, fragment) = match submission.into_stage_fragment() {
+            Ok(fragment) => fragment,
+            Err(error) => {
+                let kind = error.kind();
+                let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
+                let message = connector_binding_lease.abort_preserving(message);
+                let message = connector_read_sessions.abort_preserving(message);
+                return Err(DistributedQueryError::new(kind, message));
+            }
+        };
+        fragments_by_backend
+            .entry(backend_idx)
+            .or_default()
+            .push(fragment);
+    }
+    let mut batches = Vec::with_capacity(stage_bindings.len());
+    for binding in stage_bindings {
+        let fragments = fragments_by_backend
+            .remove(&binding.target().backend_idx())
+            .unwrap_or_default();
+        let batch = match StageBatch::new(execution_id, binding, fragments) {
+            Ok(batch) => batch,
+            Err(error) => {
+                let error = contract_error(error.to_string());
+                let kind = error.kind();
+                let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
+                let message = connector_binding_lease.abort_preserving(message);
+                let message = connector_read_sessions.abort_preserving(message);
+                return Err(DistributedQueryError::new(kind, message));
+            }
+        };
+        batches.push(batch);
+    }
+    if !fragments_by_backend.is_empty() {
+        let error = contract_error(format!(
+            "native stage assembly produced fragments for unknown participants: {:?}",
+            fragments_by_backend.keys().collect::<Vec<_>>()
+        ));
+        let kind = error.kind();
+        let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
+        let message = connector_binding_lease.abort_preserving(message);
+        let message = connector_read_sessions.abort_preserving(message);
+        return Err(DistributedQueryError::new(kind, message));
+    }
+    Ok(StagePreparedDistributedQuery {
+        batches,
+        root_fetch,
+        writer_registrations,
+        expected_output,
+        query_lifecycle_lease,
+        connector_binding_lease,
+        connector_write_plans,
+        connector_read_sessions,
+    })
 }
 
 impl StagePreparedDistributedQuery {
@@ -1769,9 +1928,9 @@ pub struct RunningNativeExecutionParts {
 }
 
 fn assemble_native_execution(
-    prepared: PreparedFragmentSet,
-    native_bundle: NativeFragmentBundle,
-    schedule: SchedulingPlan,
+    prepared: &PreparedFragmentSet,
+    native_bundle: &NativeFragmentBundle,
+    schedule: &SchedulingPlan,
     execution_id: QueryExecutionId,
     context: NativeSubmissionContext,
     connector_write_plans: &BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
@@ -1885,7 +2044,8 @@ fn assemble_native_execution(
         .collect::<BTreeMap<_, _>>();
 
     let mut native_by_fragment = native_bundle
-        .into_fragments()
+        .fragments_in_id_order()
+        .map(|(fragment_id, fragment)| (fragment_id, fragment.clone()))
         .collect::<BTreeMap<PlannerFragmentId, _>>();
     let mut connector_attachment_by_fragment =
         BTreeMap::<FragmentId, &ConnectorWritePlanAttachment>::new();
