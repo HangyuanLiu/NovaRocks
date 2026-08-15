@@ -8,7 +8,11 @@ use std::collections::BTreeSet;
 
 use crate::{canonical, common, novarocks};
 
-use super::{error::ContractError, identity::QueryExecutionId};
+use super::{
+    error::ContractError,
+    identity::QueryExecutionId,
+    manifest::{ParticipantBackendIdentity, ParticipantManifestDigest},
+};
 
 pub const QUERY_TERMINAL_SNAPSHOT_VERSION_V1: u32 = 1;
 pub const PARTICIPANT_TERMINAL_OUTCOME_VERSION_V1: u32 = 1;
@@ -59,6 +63,41 @@ impl QueryTerminalSnapshot {
         &self.raw
     }
 
+    pub const fn version(&self) -> u32 {
+        self.raw.version
+    }
+
+    pub fn execution_id(&self) -> QueryExecutionId {
+        required_execution_id(
+            self.raw.execution_id.as_ref(),
+            "terminal execution id is required",
+        )
+        .expect("validated QueryTerminalSnapshot always has an execution id")
+    }
+
+    pub fn backend(&self) -> ParticipantBackendIdentity {
+        required_backend(
+            self.raw.backend.as_ref(),
+            "terminal backend identity is required",
+        )
+        .expect("validated QueryTerminalSnapshot always has a backend identity")
+    }
+
+    pub fn init_digest(&self) -> ParticipantManifestDigest {
+        ParticipantManifestDigest::try_from_slice(&self.raw.init_digest)
+            .expect("validated QueryTerminalSnapshot always has an init digest")
+    }
+
+    pub fn fragments(&self) -> Vec<FragmentTerminalSnapshot> {
+        self.raw
+            .fragments
+            .iter()
+            .cloned()
+            .map(FragmentTerminalSnapshot::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("validated QueryTerminalSnapshot always has valid fragment snapshots")
+    }
+
     pub fn digest(&self) -> [u8; 32] {
         digest_array(&self.raw.digest).expect("validated terminal snapshot digest")
     }
@@ -93,6 +132,35 @@ impl TerminalizationProof {
 
     pub const fn as_proto(&self) -> &novarocks::TerminalizationProof {
         &self.raw
+    }
+
+    pub const fn version(&self) -> u32 {
+        self.raw.version
+    }
+
+    pub fn execution_id(&self) -> QueryExecutionId {
+        required_execution_id(
+            self.raw.execution_id.as_ref(),
+            "terminalization proof execution id is required",
+        )
+        .expect("validated TerminalizationProof always has an execution id")
+    }
+
+    pub fn backend(&self) -> ParticipantBackendIdentity {
+        required_backend(
+            self.raw.backend.as_ref(),
+            "terminalization proof backend is required",
+        )
+        .expect("validated TerminalizationProof always has a backend identity")
+    }
+
+    pub fn init_digest(&self) -> ParticipantManifestDigest {
+        ParticipantManifestDigest::try_from_slice(&self.raw.init_digest)
+            .expect("validated TerminalizationProof always has an init digest")
+    }
+
+    pub fn fragments(&self) -> &[novarocks::TerminalizationProofFragment] {
+        &self.raw.fragments
     }
 
     pub fn digest(&self) -> [u8; 32] {
@@ -133,6 +201,40 @@ impl NegativeAttestation {
 
     pub const fn as_proto(&self) -> &novarocks::NegativeAttestation {
         &self.raw
+    }
+
+    pub fn execution_id(&self) -> QueryExecutionId {
+        required_execution_id(
+            self.raw.execution_id.as_ref(),
+            "negative attestation execution id is required",
+        )
+        .expect("validated NegativeAttestation always has an execution id")
+    }
+
+    pub fn backend(&self) -> ParticipantBackendIdentity {
+        required_backend(
+            self.raw.backend.as_ref(),
+            "negative attestation backend is required",
+        )
+        .expect("validated NegativeAttestation always has a backend identity")
+    }
+
+    pub fn init_digest(&self) -> ParticipantManifestDigest {
+        ParticipantManifestDigest::try_from_slice(&self.raw.init_digest)
+            .expect("validated NegativeAttestation always has an init digest")
+    }
+
+    pub fn reason(&self) -> novarocks::NegativeAttestationReason {
+        novarocks::NegativeAttestationReason::try_from(self.raw.reason)
+            .expect("validated NegativeAttestation always has a known reason")
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.raw.detail
+    }
+
+    pub const fn detail_truncated(&self) -> bool {
+        self.raw.detail_truncated
     }
 
     pub fn digest(&self) -> [u8; 32] {
@@ -177,6 +279,110 @@ impl ParticipantTerminalOutcome {
     pub const fn as_proto(&self) -> &novarocks::ParticipantTerminalOutcome {
         &self.raw
     }
+
+    pub fn proof(&self) -> Option<TerminalizationProof> {
+        let novarocks::participant_terminal_outcome::Outcome::Proof(proof) =
+            self.raw.outcome.as_ref()?
+        else {
+            return None;
+        };
+        Some(
+            TerminalizationProof::parse(proof.clone())
+                .expect("validated ParticipantTerminalOutcome always has a valid proof"),
+        )
+    }
+
+    pub fn snapshot(&self) -> Option<QueryTerminalSnapshot> {
+        self.raw.snapshot.clone().map(|snapshot| {
+            QueryTerminalSnapshot::parse(snapshot)
+                .expect("validated ParticipantTerminalOutcome always has a valid snapshot")
+        })
+    }
+
+    pub fn negative_attestation(&self) -> Option<NegativeAttestation> {
+        let novarocks::participant_terminal_outcome::Outcome::NegativeAttestation(attestation) =
+            self.raw.outcome.as_ref()?
+        else {
+            return None;
+        };
+        Some(
+            NegativeAttestation::parse(attestation.clone()).expect(
+                "validated ParticipantTerminalOutcome always has a valid negative attestation",
+            ),
+        )
+    }
+
+    pub fn execution_id(&self) -> QueryExecutionId {
+        match self.raw.outcome.as_ref() {
+            Some(novarocks::participant_terminal_outcome::Outcome::Proof(proof)) => {
+                TerminalizationProof::parse(proof.clone())
+                    .expect("validated ParticipantTerminalOutcome always has a valid proof")
+                    .execution_id()
+            }
+            Some(novarocks::participant_terminal_outcome::Outcome::NegativeAttestation(
+                attestation,
+            )) => NegativeAttestation::parse(attestation.clone())
+                .expect(
+                    "validated ParticipantTerminalOutcome always has a valid negative attestation",
+                )
+                .execution_id(),
+            None => unreachable!("validated ParticipantTerminalOutcome always has an outcome"),
+        }
+    }
+
+    pub fn backend(&self) -> ParticipantBackendIdentity {
+        match self.raw.outcome.as_ref() {
+            Some(novarocks::participant_terminal_outcome::Outcome::Proof(proof)) => {
+                TerminalizationProof::parse(proof.clone())
+                    .expect("validated ParticipantTerminalOutcome always has a valid proof")
+                    .backend()
+            }
+            Some(novarocks::participant_terminal_outcome::Outcome::NegativeAttestation(
+                attestation,
+            )) => NegativeAttestation::parse(attestation.clone())
+                .expect(
+                    "validated ParticipantTerminalOutcome always has a valid negative attestation",
+                )
+                .backend(),
+            None => unreachable!("validated ParticipantTerminalOutcome always has an outcome"),
+        }
+    }
+
+    pub fn init_digest(&self) -> ParticipantManifestDigest {
+        match self.raw.outcome.as_ref() {
+            Some(novarocks::participant_terminal_outcome::Outcome::Proof(proof)) => {
+                TerminalizationProof::parse(proof.clone())
+                    .expect("validated ParticipantTerminalOutcome always has a valid proof")
+                    .init_digest()
+            }
+            Some(novarocks::participant_terminal_outcome::Outcome::NegativeAttestation(
+                attestation,
+            )) => NegativeAttestation::parse(attestation.clone())
+                .expect(
+                    "validated ParticipantTerminalOutcome always has a valid negative attestation",
+                )
+                .init_digest(),
+            None => unreachable!("validated ParticipantTerminalOutcome always has an outcome"),
+        }
+    }
+
+    pub fn digest(&self) -> [u8; 32] {
+        match self.raw.outcome.as_ref() {
+            Some(novarocks::participant_terminal_outcome::Outcome::Proof(proof)) => {
+                TerminalizationProof::parse(proof.clone())
+                    .expect("validated ParticipantTerminalOutcome always has a valid proof")
+                    .digest()
+            }
+            Some(novarocks::participant_terminal_outcome::Outcome::NegativeAttestation(
+                attestation,
+            )) => NegativeAttestation::parse(attestation.clone())
+                .expect(
+                    "validated ParticipantTerminalOutcome always has a valid negative attestation",
+                )
+                .digest(),
+            None => unreachable!("validated ParticipantTerminalOutcome always has an outcome"),
+        }
+    }
 }
 
 /// A validated P1 fragment snapshot, useful to Backend terminal encoders.
@@ -200,6 +406,21 @@ impl FragmentTerminalSnapshot {
 
     pub const fn as_proto(&self) -> &novarocks::QueryTerminalFragmentSnapshot {
         &self.raw
+    }
+
+    pub fn fragment_instance_id(&self) -> common::UniqueId {
+        self.raw
+            .fragment_instance_id
+            .expect("validated FragmentTerminalSnapshot always has an instance id")
+    }
+
+    pub const fn backend_num(&self) -> i32 {
+        self.raw.backend_num
+    }
+
+    pub fn outcome(&self) -> novarocks::QueryTerminalFragmentOutcome {
+        novarocks::QueryTerminalFragmentOutcome::try_from(self.raw.outcome)
+            .expect("validated FragmentTerminalSnapshot always has a known outcome")
     }
 }
 
@@ -903,8 +1124,14 @@ fn validate_execution(
     raw: Option<&novarocks::QueryExecutionId>,
     required: &'static str,
 ) -> Result<(), ContractError> {
+    required_execution_id(raw, required).map(|_| ())
+}
+
+fn required_execution_id(
+    raw: Option<&novarocks::QueryExecutionId>,
+    required: &'static str,
+) -> Result<QueryExecutionId, ContractError> {
     QueryExecutionId::try_from_proto(raw.ok_or_else(|| ContractError::invalid_value(required))?)
-        .map(|_| ())
 }
 
 fn validate_backend(raw: &novarocks::ParticipantBackendIdentity) -> Result<(), ContractError> {
@@ -928,6 +1155,14 @@ fn validate_backend(raw: &novarocks::ParticipantBackendIdentity) -> Result<(), C
         ));
     }
     Ok(())
+}
+
+fn required_backend(
+    raw: Option<&novarocks::ParticipantBackendIdentity>,
+    required: &'static str,
+) -> Result<ParticipantBackendIdentity, ContractError> {
+    let raw = raw.ok_or_else(|| ContractError::invalid_value(required))?;
+    ParticipantBackendIdentity::parse(raw.clone())
 }
 
 fn validate_attestation_reason(value: i32) -> Result<(), ContractError> {
@@ -1249,13 +1484,35 @@ mod tests {
             ..Default::default()
         };
         let proof = TerminalizationProof::seal(raw).expect("P0 proof");
+        assert_eq!(snapshot.execution_id().query_id().high(), 1);
+        assert_eq!(snapshot.backend().backend_id(), 1);
+        assert_eq!(snapshot.init_digest().as_bytes(), &[7; 32]);
+        assert_eq!(snapshot.fragments()[0].fragment_instance_id().lo, 1);
+        assert_eq!(snapshot.fragments()[0].backend_num(), 0);
+        assert_eq!(
+            snapshot.fragments()[0].outcome(),
+            novarocks::QueryTerminalFragmentOutcome::Succeeded
+        );
+
+        assert_eq!(proof.execution_id(), snapshot.execution_id());
+        assert_eq!(proof.backend(), snapshot.backend());
+        assert_eq!(proof.init_digest(), snapshot.init_digest());
+        assert_eq!(proof.fragments().len(), 1);
+
         let outcome = ParticipantTerminalOutcome::parse(novarocks::ParticipantTerminalOutcome {
             outcome: Some(novarocks::participant_terminal_outcome::Outcome::Proof(
                 proof.as_proto().clone(),
             )),
             snapshot: Some(snapshot.as_proto().clone()),
-        });
-        assert!(outcome.is_ok());
+        })
+        .expect("outcome");
+        assert!(outcome.proof().is_some());
+        assert!(outcome.snapshot().is_some());
+        assert!(outcome.negative_attestation().is_none());
+        assert_eq!(outcome.execution_id(), snapshot.execution_id());
+        assert_eq!(outcome.backend(), snapshot.backend());
+        assert_eq!(outcome.init_digest(), snapshot.init_digest());
+        assert_eq!(outcome.digest(), proof.digest());
     }
 
     #[test]
@@ -1288,6 +1545,15 @@ mod tests {
             ..Default::default()
         })
         .expect("negative attestation");
+        assert_eq!(attestation.execution_id().query_id().low(), 2);
+        assert_eq!(attestation.backend().start_epoch(), 1);
+        assert_eq!(attestation.init_digest().as_bytes(), &[7; 32]);
+        assert_eq!(
+            attestation.reason(),
+            novarocks::NegativeAttestationReason::AttemptAborted
+        );
+        assert_eq!(attestation.detail(), "aborted");
+        assert!(!attestation.detail_truncated());
         assert!(
             ParticipantTerminalOutcome::parse(novarocks::ParticipantTerminalOutcome {
                 outcome: Some(
