@@ -66,7 +66,10 @@ pub(crate) fn decode_native_query_execution_id(
                 ProtocolFamily::Native,
                 root.clone().field("attempt_id"),
                 ProtocolErrorKind::InvalidValue,
-                error.to_string(),
+                // Preserve the established native ingress error vocabulary
+                // while the lifecycle identity's validation owner moves to
+                // Protocol.
+                format!("InvalidManifest: {}", error.detail()),
             )
             .to_string(),
         )

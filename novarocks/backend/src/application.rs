@@ -681,12 +681,11 @@ mod tests {
     use crate::native::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use novarocks::common::network::AdvertiseEndpoint;
     use novarocks::query_execution::lifecycle::contract::{
-        decode_query_control_event, encode_abort_query_request, encode_query_control_attach,
-        encode_query_control_command, encode_query_init_request,
+        decode_query_control_event, encode_query_control_command, encode_query_init_request,
     };
     use novarocks::query_execution::lifecycle::{
-        AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
-        ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
+        AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
+        ParticipantQueryOptions, ParticipantRole, QueryAbortRequest, QueryControlCommand,
         QueryControlEndpoint, QueryControlEvent, QueryExecutionId, QueryInitRequest,
         QueryTerminationReason,
     };
@@ -696,8 +695,10 @@ mod tests {
     use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_protocol::novarocks::{
         AbortQueryRequest as ProtoAbortQueryRequest, HeartbeatRequest,
-        InitQueryRequest as ProtoInitQueryRequest,
+        InitQueryRequest as ProtoInitQueryRequest, QueryControlAttach as ProtoQueryControlAttach,
+        QueryControlRequest as ProtoQueryControlRequest,
     };
+    use novarocks_protocol::{lifecycle as protocol_lifecycle, novarocks as protocol};
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
     use novarocks_types::QueryId;
     use tokio_stream::wrappers::ReceiverStream;
@@ -812,6 +813,56 @@ mod tests {
         )
     }
 
+    fn protocol_init_request(request: &QueryInitRequest) -> protocol_lifecycle::QueryInitRequest {
+        let mut raw = encode_query_init_request(request).expect("encode legacy InitQuery fixture");
+        let manifest = protocol_lifecycle::ParticipantManifest::parse(
+            raw.manifest
+                .clone()
+                .expect("legacy InitQuery fixture has manifest"),
+        )
+        .expect("legacy manifest is valid under the Protocol contract");
+        raw.init_digest = manifest
+            .digest()
+            .expect("compute canonical manifest digest")
+            .as_bytes()
+            .to_vec();
+        protocol_lifecycle::QueryInitRequest::parse(raw)
+            .expect("canonical InitQuery fixture is valid")
+    }
+
+    fn protocol_control_attach(
+        init: &protocol_lifecycle::QueryInitRequest,
+        frontend_owner_epoch: u64,
+    ) -> ProtoQueryControlRequest {
+        let manifest = init.manifest().expect("validated InitQuery has manifest");
+        ProtoQueryControlRequest {
+            command: Some(protocol::query_control_request::Command::Attach(
+                ProtoQueryControlAttach {
+                    execution_id: manifest.as_proto().execution_id.clone(),
+                    init_digest: init
+                        .digest()
+                        .expect("validated InitQuery has digest")
+                        .as_bytes()
+                        .to_vec(),
+                    frontend_owner_epoch,
+                },
+            )),
+        }
+    }
+
+    fn protocol_abort_request(
+        init: &protocol_lifecycle::QueryInitRequest,
+        digest: &[u8],
+        reason: impl Into<String>,
+    ) -> ProtoAbortQueryRequest {
+        let manifest = init.manifest().expect("validated InitQuery has manifest");
+        ProtoAbortQueryRequest {
+            execution_id: manifest.as_proto().execution_id.clone(),
+            init_digest: digest.to_vec(),
+            reason: reason.into(),
+        }
+    }
+
     async fn connect_live_client(grpc_port: u16) -> NovaRocksGrpcClient<tonic::transport::Channel> {
         NovaRocksGrpcClient::connect(format!("http://127.0.0.1:{grpc_port}"))
             .await
@@ -870,16 +921,15 @@ mod tests {
             .expect("bind backend identity")
             .into_inner();
         let init = live_query_init_request(heartbeat.start_epoch, 901);
+        let protocol_init = protocol_init_request(&init);
         client
-            .init_query(encode_query_init_request(&init).expect("encode InitQuery"))
+            .init_query(protocol_init.as_proto().clone())
             .await
             .expect("InitQuery succeeds");
 
-        let attach = QueryControlAttach::new(init.manifest().execution_id(), init.digest(), 9)
-            .expect("valid Attach");
         let (commands, command_rx) = tokio::sync::mpsc::channel(4);
         commands
-            .send(encode_query_control_attach(&attach))
+            .send(protocol_control_attach(&protocol_init, 9))
             .await
             .expect("send Attach");
         let mut events = client
@@ -960,15 +1010,14 @@ mod tests {
             .expect("bind backend identity")
             .into_inner();
         let init = live_query_init_request(heartbeat.start_epoch, 902);
+        let protocol_init = protocol_init_request(&init);
         client
-            .init_query(encode_query_init_request(&init).expect("encode InitQuery"))
+            .init_query(protocol_init.as_proto().clone())
             .await
             .expect("InitQuery succeeds");
-        let attach = QueryControlAttach::new(init.manifest().execution_id(), init.digest(), 9)
-            .expect("valid Attach");
         let (commands, command_rx) = tokio::sync::mpsc::channel(1);
         commands
-            .send(encode_query_control_attach(&attach))
+            .send(protocol_control_attach(&protocol_init, 9))
             .await
             .expect("send Attach");
         let mut events = client
@@ -997,13 +1046,13 @@ mod tests {
             }
         );
         let termination = client
-            .abort_query(encode_abort_query_request(
-                &QueryAbortRequest::new(
-                    init.manifest().execution_id(),
-                    init.digest(),
-                    "probe latched timeout",
-                )
-                .expect("valid abort request"),
+            .abort_query(protocol_abort_request(
+                &protocol_init,
+                protocol_init
+                    .digest()
+                    .expect("validated InitQuery has digest")
+                    .as_bytes(),
+                "probe latched timeout",
             ))
             .await
             .expect("AbortQuery observes termination")
@@ -1036,15 +1085,14 @@ mod tests {
             .expect("bind backend identity")
             .into_inner();
         let init = live_query_init_request(heartbeat.start_epoch, 903);
+        let protocol_init = protocol_init_request(&init);
         client
-            .init_query(encode_query_init_request(&init).expect("encode InitQuery"))
+            .init_query(protocol_init.as_proto().clone())
             .await
             .expect("InitQuery succeeds");
-        let attach = QueryControlAttach::new(init.manifest().execution_id(), init.digest(), 9)
-            .expect("valid Attach");
         let (commands, command_rx) = tokio::sync::mpsc::channel(1);
         commands
-            .send(encode_query_control_attach(&attach))
+            .send(protocol_control_attach(&protocol_init, 9))
             .await
             .expect("send Attach");
         let mut events = client
@@ -1098,7 +1146,12 @@ mod tests {
             .abort_query(
                 QueryAbortRequest::new(
                     init.manifest().execution_id(),
-                    init.digest(),
+                    ParticipantManifestDigest::new(
+                        *protocol_init
+                            .digest()
+                            .expect("validated InitQuery has digest")
+                            .as_bytes(),
+                    ),
                     "observe fail-closed shutdown",
                 )
                 .expect("valid abort request"),
@@ -1161,28 +1214,29 @@ mod tests {
             .into_inner();
         let init = live_query_init_request(heartbeat.start_epoch, 904);
         let different = live_query_init_request(heartbeat.start_epoch, 905);
+        let protocol_init = protocol_init_request(&init);
+        let protocol_different = protocol_init_request(&different);
         client
-            .init_query(encode_query_init_request(&init).expect("encode InitQuery"))
+            .init_query(protocol_init.as_proto().clone())
             .await
             .expect("InitQuery succeeds");
 
-        let mismatch = QueryAbortRequest::new(
-            init.manifest().execution_id(),
-            different.digest(),
-            "mismatched digest",
-        )
-        .expect("valid mismatched abort");
         let error = client
-            .abort_query(encode_abort_query_request(&mismatch))
+            .abort_query(protocol_abort_request(
+                &protocol_init,
+                protocol_different
+                    .digest()
+                    .expect("validated InitQuery has digest")
+                    .as_bytes(),
+                "mismatched digest",
+            ))
             .await
             .expect_err("digest mismatch must be rejected");
         assert_eq!(error.code(), tonic::Code::AlreadyExists);
 
-        let attach = QueryControlAttach::new(init.manifest().execution_id(), init.digest(), 9)
-            .expect("valid Attach");
         let (commands, command_rx) = tokio::sync::mpsc::channel(1);
         commands
-            .send(encode_query_control_attach(&attach))
+            .send(protocol_control_attach(&protocol_init, 9))
             .await
             .expect("send Attach");
         let mut events = client

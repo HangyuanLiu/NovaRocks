@@ -24,17 +24,17 @@
 //! migrated to generated Protocol carriers.
 
 use novarocks::query_execution::lifecycle::contract::{
-    decode_abort_query_request, decode_query_control_attach, decode_query_control_command,
-    decode_query_init_request, decode_query_stage_request, decode_query_start_request,
+    decode_abort_query_request, decode_participant_manifest, decode_query_control_attach,
+    decode_query_control_command, decode_query_stage_request, decode_query_start_request,
     encode_abort_query_response, encode_query_init_response, encode_query_stage_response,
     encode_query_start_response,
 };
 use novarocks::query_execution::lifecycle::{
-    AttemptId as LegacyAttemptId, QueryAbortRequest as LegacyQueryAbortRequest,
-    QueryControlAttach as LegacyQueryControlAttach,
+    AttemptId as LegacyAttemptId, ParticipantManifestDigest as LegacyParticipantManifestDigest,
+    QueryAbortRequest as LegacyQueryAbortRequest, QueryControlAttach as LegacyQueryControlAttach,
     QueryControlCommand as LegacyQueryControlCommand, QueryExecutionId as LegacyQueryExecutionId,
     QueryInitAck as LegacyQueryInitAck, QueryInitRequest as LegacyQueryInitRequest,
-    QueryLifecycleError, QueryStageAck as LegacyQueryStageAck,
+    QueryLifecycleError, QueryLifecycleErrorCode, QueryStageAck as LegacyQueryStageAck,
     QueryStageRequest as LegacyQueryStageRequest, QueryStartAck as LegacyQueryStartAck,
     QueryStartRequest as LegacyQueryStartRequest, QueryTerminationAck as LegacyQueryTerminationAck,
 };
@@ -47,7 +47,24 @@ use novarocks_types::QueryId;
 pub(crate) fn legacy_init_request(
     request: QueryInitRequest,
 ) -> Result<LegacyQueryInitRequest, QueryLifecycleError> {
-    decode_query_init_request(request.as_proto())
+    let manifest = request
+        .as_proto()
+        .manifest
+        .as_ref()
+        .ok_or_else(|| {
+            QueryLifecycleError::new(
+                QueryLifecycleErrorCode::InvalidManifest,
+                "participant manifest is required",
+            )
+        })
+        .and_then(decode_participant_manifest)?;
+    let digest = request
+        .digest()
+        .expect("validated Protocol InitQuery request has a fixed-width digest");
+    Ok(LegacyQueryInitRequest::from_validated_protocol_manifest(
+        manifest,
+        LegacyParticipantManifestDigest::new(*digest.as_bytes()),
+    ))
 }
 
 pub(crate) fn protocol_init_ack(value: &LegacyQueryInitAck) -> QueryInitAck {

@@ -336,6 +336,19 @@ impl QueryInitRequest {
         Self { manifest, digest }
     }
 
+    /// Constructs a legacy registry request after Protocol has already
+    /// validated the manifest and supplied its canonical digest.
+    ///
+    /// This is a temporary CLS-R1 bridge for the Backend registry. The Core
+    /// lifecycle value and this constructor are removed with that registry's
+    /// terminal/profile cutover.
+    pub fn from_validated_protocol_manifest(
+        manifest: ParticipantManifest,
+        digest: ParticipantManifestDigest,
+    ) -> Self {
+        Self { manifest, digest }
+    }
+
     pub const fn manifest(&self) -> &ParticipantManifest {
         &self.manifest
     }
@@ -1824,7 +1837,12 @@ fn encode_participant_manifest(
     })
 }
 
-fn decode_participant_manifest(
+/// Decodes the legacy Core manifest representation from its generated carrier.
+///
+/// This remains public only for the temporary Backend protocol adapter while
+/// the registry still owns legacy terminal/profile state. The CLS-R1 terminal
+/// cutover removes this legacy codec together with its callers.
+pub fn decode_participant_manifest(
     manifest: &novarocks::ParticipantManifest,
 ) -> Result<ParticipantManifest, QueryLifecycleError> {
     let execution_id = decode_required_execution_id(manifest.execution_id.as_ref())?;
