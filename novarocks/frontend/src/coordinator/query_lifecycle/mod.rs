@@ -24,7 +24,8 @@ mod tests;
 
 pub(super) use barrier::{FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig};
 
-pub use novarocks::query_execution::lifecycle::{
-    QueryControlSession, QueryLifecycleTarget, QueryLifecycleTransport,
-    QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
+pub(super) use crate::native::query_lifecycle::{
+    QueryControlSession, QueryLifecycleTransport, QueryLifecycleTransportError,
+    QueryLifecycleTransportErrorKind,
 };
+pub(super) use novarocks::query_execution::lifecycle::QueryLifecycleTarget;

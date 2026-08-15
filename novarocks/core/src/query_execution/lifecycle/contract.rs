@@ -16,7 +16,6 @@
 // under the License.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use super::identity::AttemptId;
@@ -304,69 +303,6 @@ pub trait QueryTerminalIngress: Send + Sync + 'static {
     ) -> Result<QueryTerminalReportAck, QueryLifecycleError>;
 }
 
-/// BE-owned fallback transport.  Delivery never reconnects or recreates the
-/// control session; it only reports the already frozen outcome.
-pub trait QueryTerminalFallbackTransport: Send + Sync + 'static {
-    fn report_query_terminal(
-        &self,
-        endpoint: &QueryControlEndpoint,
-        outcome: ParticipantTerminalOutcome,
-        timeout: Duration,
-    ) -> Result<QueryTerminalReportAck, QueryLifecycleTransportError>;
-}
-
-pub trait QueryLifecycleTransport: Send + Sync + 'static {
-    fn init_query(
-        &self,
-        target: QueryLifecycleTarget,
-        request: QueryInitRequest,
-        timeout: Duration,
-    ) -> Result<QueryInitAck, QueryLifecycleTransportError>;
-
-    fn attach_control(
-        &self,
-        target: QueryLifecycleTarget,
-        attach: QueryControlAttach,
-        timeout: Duration,
-    ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError>;
-
-    /// Atomically stage the complete participant-local fragment batch.
-    ///
-    /// Implementations that have not completed the QLC-3 cutover return an
-    /// explicit unavailable error rather than falling back to per-fragment startup.
-    fn stage_fragments(
-        &self,
-        _target: QueryLifecycleTarget,
-        _request: &QueryStageRequest,
-        _timeout: Duration,
-    ) -> Result<QueryStageAck, QueryLifecycleTransportError> {
-        Err(QueryLifecycleTransportError::new(
-            QueryLifecycleTransportErrorKind::Unavailable,
-            "StageFragments is not supported by this lifecycle transport",
-        ))
-    }
-
-    /// Releases the already prepared participant-local start gate.
-    fn start_prepared_query(
-        &self,
-        _target: QueryLifecycleTarget,
-        _request: &QueryStartRequest,
-        _timeout: Duration,
-    ) -> Result<QueryStartAck, QueryLifecycleTransportError> {
-        Err(QueryLifecycleTransportError::new(
-            QueryLifecycleTransportErrorKind::Unavailable,
-            "StartPreparedQuery is not supported by this lifecycle transport",
-        ))
-    }
-
-    fn abort_query(
-        &self,
-        target: QueryLifecycleTarget,
-        request: QueryAbortRequest,
-        timeout: Duration,
-    ) -> Result<QueryTerminationAck, QueryLifecycleTransportError>;
-}
-
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct QueryLifecycleTarget {
     backend_idx: usize,
@@ -396,71 +332,6 @@ impl QueryLifecycleTarget {
     }
 }
 
-pub trait QueryControlSession: Send + Sync + 'static {
-    fn send(&self, command: QueryControlCommand) -> Result<(), QueryLifecycleTransportError>;
-
-    fn recv_timeout(
-        &self,
-        timeout: Duration,
-    ) -> Result<QueryControlEvent, QueryLifecycleTransportError>;
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QueryLifecycleTransportErrorKind {
-    DeadlineExceeded,
-    StreamClosed,
-    Backpressure,
-    InvalidResponse,
-    Unavailable,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryLifecycleTransportError {
-    kind: QueryLifecycleTransportErrorKind,
-    detail: String,
-}
-
-impl QueryLifecycleTransportError {
-    pub fn new(kind: QueryLifecycleTransportErrorKind, detail: impl Into<String>) -> Self {
-        Self {
-            kind,
-            detail: detail.into(),
-        }
-    }
-
-    pub const fn kind(&self) -> QueryLifecycleTransportErrorKind {
-        self.kind
-    }
-
-    pub fn detail(&self) -> &str {
-        &self.detail
-    }
-
-    pub const fn is_unknown_init_outcome(&self) -> bool {
-        matches!(
-            self.kind,
-            QueryLifecycleTransportErrorKind::DeadlineExceeded
-                | QueryLifecycleTransportErrorKind::StreamClosed
-        )
-    }
-
-    pub const fn is_unknown_stage_or_start_outcome(&self) -> bool {
-        matches!(
-            self.kind,
-            QueryLifecycleTransportErrorKind::DeadlineExceeded
-                | QueryLifecycleTransportErrorKind::StreamClosed
-        )
-    }
-}
-
-impl std::fmt::Display for QueryLifecycleTransportError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{:?}: {}", self.kind, self.detail)
-    }
-}
-
-impl std::error::Error for QueryLifecycleTransportError {}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryTerminationReason {
     CoordinatorAbort,
@@ -469,32 +340,6 @@ pub enum QueryTerminationReason {
     CoordinatorHeartbeatTimeout,
     LocalFailure,
     PreStartTimeout,
-}
-
-pub trait BackendQueryControl: Send + Sync + 'static {
-    fn heartbeat(&self, sequence: u64) -> Result<(), QueryLifecycleError>;
-
-    fn abort(&self, reason: String) -> Result<(), QueryLifecycleError>;
-
-    fn finalize(&self) -> Result<(), QueryLifecycleError>;
-
-    fn terminal_ack(&self, _ack: QueryTerminalAck) -> Result<(), QueryLifecycleError> {
-        Err(QueryLifecycleError::new(
-            QueryLifecycleErrorCode::Terminated,
-            "query terminal acknowledgement is not supported by this lifecycle owner",
-        ))
-    }
-
-    fn coordinator_lost(&self, reason: QueryTerminationReason) -> Result<(), QueryLifecycleError>;
-}
-
-pub struct QueryControlAttachment {
-    pub control: Arc<dyn BackendQueryControl>,
-    pub events: tokio::sync::mpsc::Receiver<QueryControlEvent>,
-    /// A single-slot, replaceable telemetry view. Correctness events remain on
-    /// `events` so a congested profiler/progress producer cannot delay an ACK,
-    /// drain barrier, or terminal snapshot.
-    pub observations: tokio::sync::watch::Receiver<Option<FragmentLiveObservation>>,
 }
 
 #[derive(Clone, Debug)]
@@ -685,47 +530,6 @@ impl QueryTerminationAck {
     pub const fn accepted_reason(&self) -> QueryTerminationReason {
         self.accepted_reason
     }
-}
-
-pub trait QueryLifecycleIngress: Send + Sync + 'static {
-    fn bind_backend_identity(&self, backend_id: u64) -> Result<(), QueryLifecycleError>;
-
-    fn init_query(&self, request: QueryInitRequest) -> QueryInitAck;
-
-    /// Atomically records the participant-local stage contract.  Fragment
-    /// materialization remains a backend concern; this contract boundary only
-    /// returns a typed outcome so an ambiguous RPC retry can be idempotent.
-    fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
-        QueryStageAck::new(
-            request.execution_id(),
-            request.digest_version(),
-            request.digest(),
-            QueryStageOutcome::RejectedInvalidState,
-            "StageFragments is not supported by this lifecycle ingress",
-        )
-    }
-
-    /// Releases one previously staged query bundle.  A duplicate request with
-    /// the same digest must not cause a second release.
-    fn start_prepared_query(&self, request: QueryStartRequest) -> QueryStartAck {
-        QueryStartAck::new(
-            request.execution_id(),
-            request.digest_version(),
-            request.digest(),
-            QueryStartOutcome::RejectedNotStaged,
-            "StartPreparedQuery is not supported by this lifecycle ingress",
-        )
-    }
-
-    fn abort_query(
-        &self,
-        request: QueryAbortRequest,
-    ) -> Result<QueryTerminationAck, QueryLifecycleError>;
-
-    fn attach_control(
-        &self,
-        attach: QueryControlAttach,
-    ) -> Result<QueryControlAttachment, QueryLifecycleError>;
 }
 
 pub fn encode_query_init_request(

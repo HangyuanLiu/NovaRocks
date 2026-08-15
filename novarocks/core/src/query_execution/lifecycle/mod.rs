@@ -26,13 +26,11 @@ pub mod stage;
 pub mod terminal;
 
 pub use contract::{
-    BackendQueryControl, FragmentLiveObservation, QueryAbortRequest, QueryControlAttach,
-    QueryControlAttachment, QueryControlCommand, QueryControlEvent, QueryControlSession,
-    QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
-    QueryLifecycleIngress, QueryLifecycleTarget, QueryLifecycleTransport,
-    QueryLifecycleTransportError, QueryLifecycleTransportErrorKind, QueryTerminalAck,
-    QueryTerminalFallbackTransport, QueryTerminalIngress, QueryTerminalReportAck,
-    QueryTerminalReportOutcome, QueryTerminationAck, QueryTerminationReason,
+    FragmentLiveObservation, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
+    QueryControlEvent, QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryLifecycleError,
+    QueryLifecycleErrorCode, QueryLifecycleTarget, QueryTerminalAck, QueryTerminalIngress,
+    QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminationAck,
+    QueryTerminationReason,
 };
 pub use contract::{
     decode_participant_terminal_outcome, decode_query_terminal_snapshot,

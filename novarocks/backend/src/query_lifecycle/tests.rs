@@ -22,12 +22,12 @@ use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetrics
 use novarocks::query_execution::lifecycle::{
     AttemptId, FragmentTerminalOutcome, NegativeAttestationReason, ParticipantBackendIdentity,
     ParticipantManifest, ParticipantQueryOptions, ParticipantRole, QueryAbortRequest,
-    QueryControlAttach, QueryControlAttachment, QueryControlEndpoint, QueryControlEvent,
-    QueryExecutionId, QueryInitOutcome, QueryInitRequest, QueryLifecycleError,
-    QueryLifecycleErrorCode, QueryStageOutcome, QueryStageRequest, QueryStartOutcome,
-    QueryStartRequest, QueryTerminalAck, QueryTerminalFallbackTransport, QueryTerminalReportAck,
-    QueryTerminalReportOutcome, QueryTerminalSnapshot, QueryTerminationReason,
-    RuntimeFilterContribution, StageDigest, StageDigestVersion, StageFragment,
+    QueryControlAttach, QueryControlEndpoint, QueryControlEvent, QueryExecutionId,
+    QueryInitOutcome, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
+    QueryStageOutcome, QueryStageRequest, QueryStartOutcome, QueryStartRequest, QueryTerminalAck,
+    QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminalSnapshot,
+    QueryTerminationReason, RuntimeFilterContribution, StageDigest, StageDigestVersion,
+    StageFragment,
 };
 use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
@@ -43,6 +43,9 @@ use super::entry::QueryLifecyclePhase;
 use super::registry::{
     MonotonicClock, QueryLifecycleLocalRuntime, QueryLifecycleMetricsSink, QueryLifecycleRegistry,
     QueryLifecycleRegistryConfig, StageBuildDecision,
+};
+use super::{
+    QueryControlAttachment, QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
 };
 use crate::native::runtime_filter_install::DecodedRuntimeFilterContribution;
 use crate::runtime_filter::participant::{
@@ -120,10 +123,7 @@ impl QueryTerminalFallbackTransport for RejectedTerminalFallback {
         _endpoint: &QueryControlEndpoint,
         _outcome: novarocks::query_execution::lifecycle::ParticipantTerminalOutcome,
         _timeout: Duration,
-    ) -> Result<
-        QueryTerminalReportAck,
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
-    > {
+    ) -> Result<QueryTerminalReportAck, QueryTerminalFallbackTransportError> {
         Ok(QueryTerminalReportAck::new(
             QueryTerminalReportOutcome::RejectedConflict,
             "injected terminal conflict",
@@ -139,10 +139,7 @@ impl QueryTerminalFallbackTransport for GoneTerminalFallback {
         _endpoint: &QueryControlEndpoint,
         _outcome: novarocks::query_execution::lifecycle::ParticipantTerminalOutcome,
         _timeout: Duration,
-    ) -> Result<
-        QueryTerminalReportAck,
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
-    > {
+    ) -> Result<QueryTerminalReportAck, QueryTerminalFallbackTransportError> {
         Ok(QueryTerminalReportAck::new(
             QueryTerminalReportOutcome::RejectedGone,
             "injected stale terminal ingress",
@@ -170,10 +167,7 @@ impl QueryTerminalFallbackTransport for AcceptedTerminalFallback {
         _endpoint: &QueryControlEndpoint,
         outcome: novarocks::query_execution::lifecycle::ParticipantTerminalOutcome,
         _timeout: Duration,
-    ) -> Result<
-        QueryTerminalReportAck,
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
-    > {
+    ) -> Result<QueryTerminalReportAck, QueryTerminalFallbackTransportError> {
         self.outcomes
             .lock()
             .expect("accepted terminal fallback outcomes")

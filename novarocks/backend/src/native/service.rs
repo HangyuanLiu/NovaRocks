@@ -33,8 +33,7 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use novarocks::query_execution::lifecycle::{
-    QueryLifecycleIngress, QueryTerminalIngress, QueryTerminalReportOutcome,
-    decode_participant_terminal_outcome,
+    QueryTerminalIngress, QueryTerminalReportOutcome, decode_participant_terminal_outcome,
 };
 use novarocks::service::native_data_plane::NativeDataPlaneKernel;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
@@ -55,6 +54,7 @@ use super::runtime_filter_adapter::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,
 };
 use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
+use crate::query_lifecycle::QueryLifecycleIngress;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 

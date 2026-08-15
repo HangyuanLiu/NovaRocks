@@ -26,21 +26,19 @@ use novarocks::common::query_lifecycle_fault::{claim_matching_fault, configured_
 use novarocks::novarocks_logging::{info, warn};
 use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
-    BackendQueryControl, FragmentLiveObservation, FragmentTerminalOutcome,
-    FragmentTerminalSnapshot, ImmutableQueryTerminalRecord, NegativeAttestation,
-    NegativeAttestationReason, ParticipantManifestDigest, ParticipantRole,
-    ParticipantTerminalOutcome, QueryAbortRequest, QueryControlAttach, QueryControlAttachment,
-    QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitOutcome, QueryInitRequest,
-    QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress,
-    QueryLifecycleTransportError, QueryLifecycleTransportErrorKind, QueryStageAck,
+    FragmentLiveObservation, FragmentTerminalOutcome, FragmentTerminalSnapshot,
+    ImmutableQueryTerminalRecord, NegativeAttestation, NegativeAttestationReason,
+    ParticipantManifestDigest, ParticipantRole, ParticipantTerminalOutcome, QueryAbortRequest,
+    QueryControlAttach, QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitOutcome,
+    QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode, QueryStageAck,
     QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome, QueryStartRequest,
-    QueryTerminalAck, QueryTerminalFallbackTransport, QueryTerminalProfileContributionV1,
-    QueryTerminalReportAck, QueryTerminalReportOutcome,
-    QueryTerminalRuntimeFilterChannelInstallStateV1, QueryTerminalRuntimeFilterChannelKeyV1,
-    QueryTerminalRuntimeFilterChannelTerminalStateV1, QueryTerminalRuntimeFilterChannelV1,
-    QueryTerminalRuntimeFilterConsumerKeyV1, QueryTerminalRuntimeFilterConsumerV1,
-    QueryTerminalRuntimeFilterProducerStreamKeyV1, QueryTerminalRuntimeFilterProducerStreamV1,
-    QueryTerminalRuntimeFilterScanNotEvaluatedV1, QueryTerminalRuntimeFilterSubscriptionTerminalV1,
+    QueryTerminalAck, QueryTerminalProfileContributionV1, QueryTerminalReportAck,
+    QueryTerminalReportOutcome, QueryTerminalRuntimeFilterChannelInstallStateV1,
+    QueryTerminalRuntimeFilterChannelKeyV1, QueryTerminalRuntimeFilterChannelTerminalStateV1,
+    QueryTerminalRuntimeFilterChannelV1, QueryTerminalRuntimeFilterConsumerKeyV1,
+    QueryTerminalRuntimeFilterConsumerV1, QueryTerminalRuntimeFilterProducerStreamKeyV1,
+    QueryTerminalRuntimeFilterProducerStreamV1, QueryTerminalRuntimeFilterScanNotEvaluatedV1,
+    QueryTerminalRuntimeFilterSubscriptionTerminalV1,
     QueryTerminalRuntimeFilterTransportRouteKeyV1, QueryTerminalRuntimeFilterTransportRouteV1,
     QueryTerminalSnapshot, QueryTerminationAck, QueryTerminationReason, StageDigest,
     StageDigestVersion, TerminalTelemetry, p0_max_encoded_len,
@@ -53,6 +51,10 @@ use novarocks_types::UniqueId;
 use prost::Message;
 
 use super::entry::{QueryLifecycleEntry, QueryLifecyclePhase};
+use super::{
+    BackendQueryControl, QueryControlAttachment, QueryLifecycleIngress,
+    QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
+};
 use crate::native::client::NativeGrpcClient;
 use crate::native::runtime_filter_adapter::{
     BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
@@ -557,14 +559,9 @@ impl QueryTerminalFallbackTransport for GrpcQueryTerminalFallbackTransport {
         endpoint: &novarocks::query_execution::lifecycle::QueryControlEndpoint,
         outcome: ParticipantTerminalOutcome,
         timeout: Duration,
-    ) -> Result<QueryTerminalReportAck, QueryLifecycleTransportError> {
+    ) -> Result<QueryTerminalReportAck, QueryTerminalFallbackTransportError> {
         let client = NativeGrpcClient::new_host_port(endpoint.host().to_string(), endpoint.port())
-            .map_err(|error| {
-                QueryLifecycleTransportError::new(
-                    QueryLifecycleTransportErrorKind::Unavailable,
-                    error,
-                )
-            })?;
+            .map_err(|error| QueryTerminalFallbackTransportError::unavailable(error))?;
         let response = client
             .blocking_report_query_terminal_with_timeout(
                 novarocks_protocol::novarocks::ReportQueryTerminalRequest {
@@ -576,12 +573,7 @@ impl QueryTerminalFallbackTransport for GrpcQueryTerminalFallbackTransport {
                 },
                 timeout,
             )
-            .map_err(|error| {
-                QueryLifecycleTransportError::new(
-                    QueryLifecycleTransportErrorKind::Unavailable,
-                    error,
-                )
-            })?;
+            .map_err(|error| QueryTerminalFallbackTransportError::unavailable(error))?;
         let outcome = match novarocks_protocol::novarocks::ReportQueryTerminalOutcome::try_from(
             response.outcome,
         ) {

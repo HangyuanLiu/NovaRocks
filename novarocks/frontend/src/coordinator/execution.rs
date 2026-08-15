@@ -37,16 +37,20 @@ use novarocks::query_execution::contract::{
     DistributedQueryRequest, ProfileTerminalBuilder,
 };
 use novarocks::query_execution::fragment_transport::{FetchOutcome, FragmentDispatcher};
-use novarocks::query_execution::lifecycle::{
-    AttemptId, QueryExecutionId, QueryInitOptions, QueryLifecycleTransport,
-};
+use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId, QueryInitOptions};
 use novarocks::query_execution::write::WriteTerminalBuilder;
 use novarocks::query_execution::write_operation::ConnectorWriteOperationSession;
 use novarocks_spi::connector::ConnectorWriteLease;
 use novarocks_types::QueryId;
 
 use super::backend_events::BackendQueryActivity;
-use super::query_lifecycle::{FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig};
+use super::query_lifecycle::{
+    FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig, QueryLifecycleTransport,
+};
+#[cfg(test)]
+use super::query_lifecycle::{
+    QueryControlSession, QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
+};
 use super::query_registry::{FrontendQueryRegistry, QueryLifecycleConvergenceReader};
 use super::report::FrontendCoordinatorTerminalIngress;
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
@@ -315,11 +319,11 @@ struct ReadyLifecycleSessionForTest {
 }
 
 #[cfg(test)]
-impl novarocks::query_execution::lifecycle::QueryControlSession for ReadyLifecycleSessionForTest {
+impl QueryControlSession for ReadyLifecycleSessionForTest {
     fn send(
         &self,
         command: novarocks::query_execution::lifecycle::QueryControlCommand,
-    ) -> Result<(), novarocks::query_execution::lifecycle::QueryLifecycleTransportError> {
+    ) -> Result<(), QueryLifecycleTransportError> {
         use novarocks::query_execution::lifecycle::{
             QueryControlCommand, QueryControlEvent, QueryTerminationReason,
         };
@@ -349,15 +353,15 @@ impl novarocks::query_execution::lifecycle::QueryControlSession for ReadyLifecyc
         _timeout: Duration,
     ) -> Result<
         novarocks::query_execution::lifecycle::QueryControlEvent,
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
+        QueryLifecycleTransportError,
     > {
         self.events
             .lock()
             .expect("ready lifecycle session")
             .pop_front()
             .ok_or_else(|| {
-                novarocks::query_execution::lifecycle::QueryLifecycleTransportError::new(
-                    novarocks::query_execution::lifecycle::QueryLifecycleTransportErrorKind::DeadlineExceeded,
+                QueryLifecycleTransportError::new(
+                    QueryLifecycleTransportErrorKind::DeadlineExceeded,
                     "ready lifecycle session has no pending event",
                 )
             })
@@ -371,10 +375,8 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
         request: novarocks::query_execution::lifecycle::QueryInitRequest,
         _timeout: Duration,
-    ) -> Result<
-        novarocks::query_execution::lifecycle::QueryInitAck,
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
-    > {
+    ) -> Result<novarocks::query_execution::lifecycle::QueryInitAck, QueryLifecycleTransportError>
+    {
         Ok(novarocks::query_execution::lifecycle::QueryInitAck::new(
             request.manifest().execution_id(),
             request.digest(),
@@ -387,10 +389,7 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
         _attach: novarocks::query_execution::lifecycle::QueryControlAttach,
         _timeout: Duration,
-    ) -> Result<
-        Arc<dyn novarocks::query_execution::lifecycle::QueryControlSession>,
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
-    > {
+    ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
         Ok(Arc::new(ReadyLifecycleSessionForTest {
             events: Mutex::new(VecDeque::from([
                 novarocks::query_execution::lifecycle::QueryControlEvent::ControlReady,
@@ -403,10 +402,8 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
         request: &novarocks::query_execution::lifecycle::QueryStageRequest,
         _timeout: Duration,
-    ) -> Result<
-        novarocks::query_execution::lifecycle::QueryStageAck,
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
-    > {
+    ) -> Result<novarocks::query_execution::lifecycle::QueryStageAck, QueryLifecycleTransportError>
+    {
         Ok(novarocks::query_execution::lifecycle::QueryStageAck::new(
             request.execution_id(),
             request.digest_version(),
@@ -421,10 +418,8 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
         request: &novarocks::query_execution::lifecycle::QueryStartRequest,
         _timeout: Duration,
-    ) -> Result<
-        novarocks::query_execution::lifecycle::QueryStartAck,
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
-    > {
+    ) -> Result<novarocks::query_execution::lifecycle::QueryStartAck, QueryLifecycleTransportError>
+    {
         Ok(novarocks::query_execution::lifecycle::QueryStartAck::new(
             request.execution_id(),
             request.digest_version(),
@@ -441,7 +436,7 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         _timeout: Duration,
     ) -> Result<
         novarocks::query_execution::lifecycle::QueryTerminationAck,
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
+        QueryLifecycleTransportError,
     > {
         Ok(
             novarocks::query_execution::lifecycle::QueryTerminationAck::new(

@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use novarocks::common::network::AdvertiseEndpoint;
 use novarocks::connector::ConnectorRegistry;
 use novarocks::query_execution::lifecycle::{
-    QueryAbortRequest, QueryControlAttach, QueryControlAttachment, QueryInitAck, QueryInitRequest,
-    QueryLifecycleError, QueryLifecycleIngress, QueryStageAck, QueryStageOutcome,
-    QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminalIngress, QueryTerminationAck,
+    QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest, QueryLifecycleError,
+    QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartRequest,
+    QueryTerminalIngress, QueryTerminationAck,
 };
 use novarocks::service::MetricsHttpServer;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
@@ -24,7 +24,8 @@ use crate::fragment::{
 use crate::native::runtime_filter_adapter::BackendRuntimeFilterEnvelopeIngress;
 use crate::native::service::{NativeBackendGrpcService, NativeGrpcServerHandle};
 use crate::query_lifecycle::{
-    NativeQueryLifecycleLocalRuntime, QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
+    NativeQueryLifecycleLocalRuntime, QueryControlAttachment, QueryLifecycleIngress,
+    QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
 };
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_spi::connector::WriteCommitEvidenceLimits;

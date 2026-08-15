@@ -30,10 +30,12 @@ use novarocks::query_execution::lifecycle::contract::{
     encode_query_stage_response, encode_query_start_response,
 };
 use novarocks::query_execution::lifecycle::{
-    BackendQueryControl, QueryControlCommand, QueryControlEvent, QueryInitOutcome,
-    QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress, QueryTerminationReason,
+    QueryControlCommand, QueryControlEvent, QueryInitOutcome, QueryLifecycleError,
+    QueryLifecycleErrorCode, QueryTerminationReason,
 };
 use novarocks_protocol::novarocks as proto;
+
+use crate::query_lifecycle::{BackendQueryControl, QueryLifecycleIngress};
 
 const CONTROL_STREAM_CAPACITY: usize = 16;
 

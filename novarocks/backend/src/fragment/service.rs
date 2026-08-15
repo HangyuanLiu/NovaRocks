@@ -813,8 +813,8 @@ mod tests {
     use novarocks::connector::ConnectorRegistry;
     use novarocks::query_execution::lifecycle::{
         AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
-        ParticipantRole, QueryControlAttach, QueryControlAttachment, QueryControlEndpoint,
-        QueryExecutionId, QueryInitOutcome, QueryInitRequest, StageFragment,
+        ParticipantRole, QueryControlAttach, QueryControlEndpoint, QueryExecutionId,
+        QueryInitOutcome, QueryInitRequest, StageFragment,
     };
     use novarocks_execution::runtime::fragment::{
         DormantFragmentHandle, FragmentOutcome, prepare_fragment,
@@ -829,7 +829,7 @@ mod tests {
         FRAGMENT_EXECUTOR_FAILURE_MESSAGE, start_with_fragment_failure_trigger,
     };
     use crate::native::ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
-    use crate::query_lifecycle::stage::StartGate;
+    use crate::query_lifecycle::{QueryControlAttachment, stage::StartGate};
 
     use super::{
         NativeFragmentLifecycleEvent, NativeFragmentRequest, NativeFragmentService,

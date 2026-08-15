@@ -24,11 +24,9 @@ use novarocks::query_execution::lifecycle::contract::{
     encode_query_stage_request, encode_query_start_request,
 };
 use novarocks::query_execution::lifecycle::{
-    QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent,
-    QueryControlSession, QueryInitAck, QueryInitRequest, QueryLifecycleTarget,
-    QueryLifecycleTransport, QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
-    QueryStageAck, QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminationAck,
-    QueryTerminationReason,
+    QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
+    QueryInitRequest, QueryLifecycleTarget, QueryStageAck, QueryStageRequest, QueryStartAck,
+    QueryStartRequest, QueryTerminationAck, QueryTerminationReason,
 };
 use novarocks::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
 use novarocks::service::observe_backend_heartbeat_rtt;
@@ -41,6 +39,10 @@ use novarocks_protocol::novarocks::{
 use novarocks_types::UniqueId;
 
 use super::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
+use super::query_lifecycle::{
+    QueryControlSession, QueryLifecycleTransport, QueryLifecycleTransportError,
+    QueryLifecycleTransportErrorKind,
+};
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const QUERY_CONTROL_CHANNEL_CAPACITY: usize = 32;

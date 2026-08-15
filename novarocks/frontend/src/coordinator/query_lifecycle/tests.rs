@@ -34,13 +34,12 @@ use novarocks::query_execution::lifecycle::contract::{
     encode_query_stage_response, encode_query_start_response,
 };
 use novarocks::query_execution::lifecycle::{
-    AttemptId, BackendQueryControl, FragmentLiveObservation, NegativeAttestation,
-    NegativeAttestationReason, ParticipantBackendIdentity, ParticipantManifest,
-    ParticipantQueryOptions, ParticipantRole, ParticipantTerminalOutcome, QueryAbortRequest,
-    QueryControlAttach, QueryControlAttachment, QueryControlCommand, QueryControlEndpoint,
-    QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitBarrier, QueryInitOutcome,
-    QueryInitPlan, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
-    QueryLifecycleIngress, QueryTerminalAck, QueryTerminationAck, QueryTerminationReason,
+    AttemptId, FragmentLiveObservation, NegativeAttestation, NegativeAttestationReason,
+    ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions, ParticipantRole,
+    ParticipantTerminalOutcome, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
+    QueryControlEndpoint, QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitBarrier,
+    QueryInitOutcome, QueryInitPlan, QueryInitRequest, QueryLifecycleError,
+    QueryLifecycleErrorCode, QueryTerminalAck, QueryTerminationAck, QueryTerminationReason,
     RuntimeFilterContribution,
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
@@ -69,6 +68,74 @@ fn terminal_outcome(
     snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot,
 ) -> ParticipantTerminalOutcome {
     ParticipantTerminalOutcome::proof(snapshot).expect("terminal proof outcome")
+}
+
+/// Test-only BE-shaped contract for the generated FE client wire tests.
+/// Production ownership is in `novarocks-backend`; this peer deliberately
+/// avoids adding a Frontend-to-Backend test dependency.
+trait QueryLifecycleIngress: Send + Sync + 'static {
+    fn bind_backend_identity(&self, backend_id: u64) -> Result<(), QueryLifecycleError>;
+
+    fn init_query(&self, request: QueryInitRequest) -> QueryInitAck;
+
+    fn stage_fragments(
+        &self,
+        request: novarocks::query_execution::lifecycle::QueryStageRequest,
+    ) -> novarocks::query_execution::lifecycle::QueryStageAck {
+        novarocks::query_execution::lifecycle::QueryStageAck::new(
+            request.execution_id(),
+            request.digest_version(),
+            request.digest(),
+            novarocks::query_execution::lifecycle::QueryStageOutcome::RejectedInvalidState,
+            "StageFragments is not supported by this lifecycle ingress",
+        )
+    }
+
+    fn start_prepared_query(
+        &self,
+        request: novarocks::query_execution::lifecycle::QueryStartRequest,
+    ) -> novarocks::query_execution::lifecycle::QueryStartAck {
+        novarocks::query_execution::lifecycle::QueryStartAck::new(
+            request.execution_id(),
+            request.digest_version(),
+            request.digest(),
+            novarocks::query_execution::lifecycle::QueryStartOutcome::RejectedNotStaged,
+            "StartPreparedQuery is not supported by this lifecycle ingress",
+        )
+    }
+
+    fn abort_query(
+        &self,
+        request: QueryAbortRequest,
+    ) -> Result<QueryTerminationAck, QueryLifecycleError>;
+
+    fn attach_control(
+        &self,
+        attach: QueryControlAttach,
+    ) -> Result<QueryControlAttachment, QueryLifecycleError>;
+}
+
+trait BackendQueryControl: Send + Sync + 'static {
+    fn heartbeat(&self, sequence: u64) -> Result<(), QueryLifecycleError>;
+
+    fn abort(&self, reason: String) -> Result<(), QueryLifecycleError>;
+
+    fn finalize(&self) -> Result<(), QueryLifecycleError>;
+
+    fn terminal_ack(&self, _ack: QueryTerminalAck) -> Result<(), QueryLifecycleError> {
+        Err(QueryLifecycleError::new(
+            QueryLifecycleErrorCode::Terminated,
+            "query terminal acknowledgement is not supported by this lifecycle owner",
+        ))
+    }
+
+    fn coordinator_lost(&self, reason: QueryTerminationReason) -> Result<(), QueryLifecycleError>;
+}
+
+struct QueryControlAttachment {
+    control: Arc<dyn BackendQueryControl>,
+    events: tokio::sync::mpsc::Receiver<QueryControlEvent>,
+    observations: tokio::sync::watch::Receiver<Option<FragmentLiveObservation>>,
 }
 
 #[derive(Default)]
