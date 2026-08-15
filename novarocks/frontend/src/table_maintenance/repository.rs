@@ -39,6 +39,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::durable::{DurableOpaqueBytes, DurableRecordError, DurableRecordStore, EncodedRecord};
+
 use super::coordination::MaintenanceFenceValidator;
 use super::model::{
     CLEANUP_MAX_BATCHES, CLEANUP_MAX_PAYLOAD_BYTES, CLEANUP_OPERATION_LEGACY_SCHEMA_VERSION,
@@ -204,6 +206,7 @@ type TransactionResult<T> = Result<RepositoryResult<T>, StateStoreError>;
 #[derive(Clone)]
 pub struct OptimizeJobRepository {
     store: Arc<dyn StateStore>,
+    durable: DurableRecordStore,
     metrics: Arc<StateStoreMetrics>,
 }
 
@@ -221,6 +224,7 @@ impl OptimizeJobRepository {
         let provider_id = store.metrics_snapshot().provider;
         let repository = Self {
             metrics: Arc::new(StateStoreMetrics::new(provider_id)),
+            durable: DurableRecordStore::new(Arc::clone(&store)),
             store,
         };
         repository.list().await?;
@@ -230,6 +234,7 @@ impl OptimizeJobRepository {
     pub async fn create(&self, request: OptimizeJobCreate) -> RepositoryResult<OptimizeJob> {
         let operation_id = OperationId::new_v7();
         let context = target_context(&request.target);
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -237,9 +242,10 @@ impl OptimizeJobRepository {
             "create frontend optimize job",
             |transaction| {
                 let request = request.clone();
-                Box::pin(
-                    async move { apply_create(transaction, operation_id, request, None).await },
-                )
+                let durable = durable.clone();
+                Box::pin(async move {
+                    apply_create(transaction, &durable, operation_id, request, None).await
+                })
             },
         )
         .await;
@@ -275,6 +281,7 @@ impl OptimizeJobRepository {
         admission: WriteAdmission,
     ) -> RepositoryResult<OptimizeJob> {
         let operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -283,8 +290,16 @@ impl OptimizeJobRepository {
             |transaction| {
                 let request = request.clone();
                 let admission = admission.clone();
+                let durable = durable.clone();
                 Box::pin(async move {
-                    apply_create(transaction, operation_id, request, Some(&admission)).await
+                    apply_create(
+                        transaction,
+                        &durable,
+                        operation_id,
+                        request,
+                        Some(&admission),
+                    )
+                    .await
                 })
             },
         )
@@ -359,14 +374,16 @@ impl OptimizeJobRepository {
     pub async fn claim(&self, job_id: i64, now_ms: i64) -> RepositoryResult<Option<OptimizeJob>> {
         validate_job_id(job_id, "claim optimize job")?;
         let operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
             operation_id,
             "claim frontend optimize job",
             |transaction| {
+                let durable = durable.clone();
                 Box::pin(async move {
-                    apply_claim(transaction, operation_id, job_id, now_ms, None).await
+                    apply_claim(transaction, &durable, operation_id, job_id, now_ms, None).await
                 })
             },
         )
@@ -415,6 +432,7 @@ impl OptimizeJobRepository {
         validate_job_id(job_id, "fenced claim optimize job")?;
         validate_authority(&authority)?;
         let operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -423,9 +441,11 @@ impl OptimizeJobRepository {
             |transaction| {
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_claim(
                         transaction,
+                        &durable,
                         operation_id,
                         job_id,
                         now_ms,
@@ -479,6 +499,7 @@ impl OptimizeJobRepository {
     ) -> RepositoryResult<()> {
         validate_job_id(job_id, "record optimize job outcome")?;
         let operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -486,8 +507,10 @@ impl OptimizeJobRepository {
             "record frontend optimize job outcome",
             |transaction| {
                 let outcome = outcome.clone();
+                let durable = durable.clone();
                 Box::pin(async move {
-                    apply_record_outcome(transaction, operation_id, job_id, outcome, None).await
+                    apply_record_outcome(transaction, &durable, operation_id, job_id, outcome, None)
+                        .await
                 })
             },
         )
@@ -516,6 +539,7 @@ impl OptimizeJobRepository {
         validate_job_id(job_id, "finish recovered optimize job")?;
         validate_authority(&authority)?;
         let operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -524,9 +548,11 @@ impl OptimizeJobRepository {
             |transaction| {
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_recovered_terminal(
                         transaction,
+                        &durable,
                         operation_id,
                         job_id,
                         now_ms,
@@ -562,6 +588,7 @@ impl OptimizeJobRepository {
         validate_job_id(job_id, "fail recovered optimize job")?;
         validate_authority(&authority)?;
         let operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -571,9 +598,11 @@ impl OptimizeJobRepository {
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
                 let message = message.clone();
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_recovered_terminal(
                         transaction,
+                        &durable,
                         operation_id,
                         job_id,
                         now_ms,
@@ -607,6 +636,7 @@ impl OptimizeJobRepository {
         validate_job_id(job_id, "release undispatched optimize job")?;
         validate_authority(&authority)?;
         let operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -615,9 +645,11 @@ impl OptimizeJobRepository {
             |transaction| {
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_release_undispatched(
                         transaction,
+                        &durable,
                         operation_id,
                         job_id,
                         &authority,
@@ -648,6 +680,7 @@ impl OptimizeJobRepository {
         validate_job_id(job_id, "fenced record optimize job outcome")?;
         validate_authority(&authority)?;
         let operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -657,9 +690,11 @@ impl OptimizeJobRepository {
                 let outcome = outcome.clone();
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_record_outcome(
                         transaction,
+                        &durable,
                         operation_id,
                         job_id,
                         outcome,
@@ -688,14 +723,16 @@ impl OptimizeJobRepository {
     pub async fn finish(&self, job_id: i64, now_ms: i64) -> RepositoryResult<()> {
         validate_job_id(job_id, "finish optimize job")?;
         let operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
             operation_id,
             "finish frontend optimize job",
             |transaction| {
+                let durable = durable.clone();
                 Box::pin(async move {
-                    apply_finish(transaction, operation_id, job_id, now_ms, None).await
+                    apply_finish(transaction, &durable, operation_id, job_id, now_ms, None).await
                 })
             },
         )
@@ -720,6 +757,7 @@ impl OptimizeJobRepository {
         validate_job_id(job_id, "fenced finish optimize job")?;
         validate_authority(&authority)?;
         let operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -728,9 +766,11 @@ impl OptimizeJobRepository {
             |transaction| {
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_finish(
                         transaction,
+                        &durable,
                         operation_id,
                         job_id,
                         now_ms,
@@ -759,6 +799,7 @@ impl OptimizeJobRepository {
     pub async fn fail(&self, job_id: i64, now_ms: i64, message: String) -> RepositoryResult<()> {
         validate_job_id(job_id, "fail optimize job")?;
         let operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -766,8 +807,18 @@ impl OptimizeJobRepository {
             "fail frontend optimize job",
             |transaction| {
                 let message = message.clone();
+                let durable = durable.clone();
                 Box::pin(async move {
-                    apply_fail(transaction, operation_id, job_id, now_ms, message, None).await
+                    apply_fail(
+                        transaction,
+                        &durable,
+                        operation_id,
+                        job_id,
+                        now_ms,
+                        message,
+                        None,
+                    )
+                    .await
                 })
             },
         )
@@ -793,6 +844,7 @@ impl OptimizeJobRepository {
         validate_job_id(job_id, "fenced fail optimize job")?;
         validate_authority(&authority)?;
         let operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -802,9 +854,11 @@ impl OptimizeJobRepository {
                 let message = message.clone();
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_fail(
                         transaction,
+                        &durable,
                         operation_id,
                         job_id,
                         now_ms,
@@ -1111,6 +1165,7 @@ struct VersionedStoredJob {
 
 async fn apply_create(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     operation_id: OperationId,
     request: OptimizeJobCreate,
     admission: Option<&WriteAdmission>,
@@ -1251,11 +1306,11 @@ async fn apply_create(
         schema_version: OPTIMIZE_JOB_SCHEMA_VERSION,
         last_job_id: job_id,
     };
-    let counter_value = match encode_json(&counter, "optimize job counter") {
+    let counter_value = match encode_durable_record(durable, &counter) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
-    let job_value = match encode_job(&stored) {
+    let job_value = match encode_job(durable, &stored) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
@@ -1267,11 +1322,12 @@ async fn apply_create(
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
     };
-    let index_value = match encode_index_value(job_id) {
+    let index_value = match encode_index_value(durable, job_id) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
     let (operation_key, operation_value) = match operation_record(
+        durable,
         operation_id,
         StoredOptimizeOperationActionV1::Create,
         &stored,
@@ -1280,11 +1336,16 @@ async fn apply_create(
         Err(error) => return Ok(Err(error)),
     };
 
-    transaction
-        .put(counter_key, counter_value, counter_precondition)
+    durable
+        .put_record(
+            transaction,
+            counter_key,
+            counter_value,
+            counter_precondition,
+        )
         .await?;
-    transaction
-        .put(job_key, job_value, Precondition::Absent)
+    durable
+        .put_record(transaction, job_key, job_value, Precondition::Absent)
         .await?;
     transaction
         .put(pending_key, index_value.clone(), Precondition::Absent)
@@ -1292,8 +1353,13 @@ async fn apply_create(
     transaction
         .put(active_key, index_value, Precondition::Absent)
         .await?;
-    transaction
-        .put(operation_key, operation_value, Precondition::Absent)
+    durable
+        .put_record(
+            transaction,
+            operation_key,
+            operation_value,
+            Precondition::Absent,
+        )
         .await?;
     Ok(Ok(OptimizeJob::from(&stored)))
 }
@@ -1337,6 +1403,7 @@ async fn validate_bound_fenced_authority(
 
 async fn apply_claim(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     operation_id: OperationId,
     job_id: i64,
     now_ms: i64,
@@ -1381,7 +1448,7 @@ async fn apply_claim(
     job.stored.state = StoredOptimizeJobStateV1::Running;
     job.stored.started_at_ms = Some(now_ms);
     job.stored.last_operation_id = *operation_id.as_uuid();
-    let value = match encode_job(&job.stored) {
+    let value = match encode_job(durable, &job.stored) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
@@ -1393,11 +1460,12 @@ async fn apply_claim(
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
     };
-    let index_value = match encode_index_value(job_id) {
+    let index_value = match encode_index_value(durable, job_id) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
     let (operation_key, operation_value) = match operation_record(
+        durable,
         operation_id,
         StoredOptimizeOperationActionV1::Claim,
         &job.stored,
@@ -1405,8 +1473,8 @@ async fn apply_claim(
         Ok(record) => record,
         Err(error) => return Ok(Err(error)),
     };
-    transaction
-        .put(key, value, Precondition::Version(job.version))
+    durable
+        .put_record(transaction, key, value, Precondition::Version(job.version))
         .await?;
     transaction
         .delete(pending_key, Precondition::Present)
@@ -1414,8 +1482,13 @@ async fn apply_claim(
     transaction
         .put(running_key, index_value, Precondition::Absent)
         .await?;
-    transaction
-        .put(operation_key, operation_value, Precondition::Absent)
+    durable
+        .put_record(
+            transaction,
+            operation_key,
+            operation_value,
+            Precondition::Absent,
+        )
         .await?;
     Ok(Ok(Some(OptimizeJob::from(&job.stored))))
 }
@@ -1428,6 +1501,7 @@ async fn apply_claim(
 /// record is rebound to the recovering attempt.
 async fn apply_recovered_terminal(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     operation_id: OperationId,
     job_id: i64,
     now_ms: i64,
@@ -1464,7 +1538,7 @@ async fn apply_recovered_terminal(
     };
     job.stored.finished_at_ms = Some(now_ms);
     job.stored.last_operation_id = *operation_id.as_uuid();
-    terminalize_job(transaction, operation_id, action, job).await
+    terminalize_job(transaction, durable, operation_id, action, job).await
 }
 
 /// Return a claimed-but-never-dispatched job to PENDING under the recovering
@@ -1477,6 +1551,7 @@ async fn apply_recovered_terminal(
 /// authority-bearing transition.
 async fn apply_release_undispatched(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     operation_id: OperationId,
     job_id: i64,
     authority: &MaintenanceAuthorityV1,
@@ -1513,7 +1588,7 @@ async fn apply_release_undispatched(
     // let a stale fence look current to a later fenced transition.
     job.stored.authority = None;
     job.stored.last_operation_id = *operation_id.as_uuid();
-    let value = match encode_job(&job.stored) {
+    let value = match encode_job(durable, &job.stored) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
@@ -1529,11 +1604,12 @@ async fn apply_release_undispatched(
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
     };
-    let index_value = match encode_index_value(job_id) {
+    let index_value = match encode_index_value(durable, job_id) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
     let (operation_key, operation_value) = match operation_record(
+        durable,
         operation_id,
         StoredOptimizeOperationActionV1::Claim,
         &job.stored,
@@ -1541,8 +1617,8 @@ async fn apply_release_undispatched(
         Ok(record) => record,
         Err(error) => return Ok(Err(error)),
     };
-    transaction
-        .put(key, value, Precondition::Version(job.version))
+    durable
+        .put_record(transaction, key, value, Precondition::Version(job.version))
         .await?;
     transaction
         .delete(running_key, Precondition::Present)
@@ -1550,14 +1626,20 @@ async fn apply_release_undispatched(
     transaction
         .put(pending_key, index_value, Precondition::Absent)
         .await?;
-    transaction
-        .put(operation_key, operation_value, Precondition::Absent)
+    durable
+        .put_record(
+            transaction,
+            operation_key,
+            operation_value,
+            Precondition::Absent,
+        )
         .await?;
     Ok(Ok(()))
 }
 
 async fn apply_record_outcome(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     operation_id: OperationId,
     job_id: i64,
     outcome: OptimizeJobOutcome,
@@ -1570,7 +1652,7 @@ async fn apply_record_outcome(
         };
     job.stored.outcome = Some(StoredOptimizeOutcomeV1::from(&outcome));
     job.stored.last_operation_id = *operation_id.as_uuid();
-    let value = match encode_job(&job.stored) {
+    let value = match encode_job(durable, &job.stored) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
@@ -1590,6 +1672,7 @@ async fn apply_record_outcome(
         Err(error) => return Ok(Err(error)),
     };
     let (operation_key, operation_value) = match operation_record(
+        durable,
         operation_id,
         StoredOptimizeOperationActionV1::RecordOutcome,
         &job.stored,
@@ -1597,17 +1680,23 @@ async fn apply_record_outcome(
         Ok(record) => record,
         Err(error) => return Ok(Err(error)),
     };
-    transaction
-        .put(key, value, Precondition::Version(job.version))
+    durable
+        .put_record(transaction, key, value, Precondition::Version(job.version))
         .await?;
-    transaction
-        .put(operation_key, operation_value, Precondition::Absent)
+    durable
+        .put_record(
+            transaction,
+            operation_key,
+            operation_value,
+            Precondition::Absent,
+        )
         .await?;
     Ok(Ok(()))
 }
 
 async fn apply_finish(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     operation_id: OperationId,
     job_id: i64,
     now_ms: i64,
@@ -1640,6 +1729,7 @@ async fn apply_finish(
     job.stored.last_operation_id = *operation_id.as_uuid();
     terminalize_job(
         transaction,
+        durable,
         operation_id,
         StoredOptimizeOperationActionV1::Finish,
         job,
@@ -1649,6 +1739,7 @@ async fn apply_finish(
 
 async fn apply_fail(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     operation_id: OperationId,
     job_id: i64,
     now_ms: i64,
@@ -1676,6 +1767,7 @@ async fn apply_fail(
     job.stored.last_operation_id = *operation_id.as_uuid();
     terminalize_job(
         transaction,
+        durable,
         operation_id,
         StoredOptimizeOperationActionV1::Fail,
         job,
@@ -1685,12 +1777,13 @@ async fn apply_fail(
 
 async fn terminalize_job(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     operation_id: OperationId,
     action: StoredOptimizeOperationActionV1,
     job: VersionedStoredJob,
 ) -> TransactionResult<()> {
     let job_id = job.stored.job_id;
-    let value = match encode_job(&job.stored) {
+    let value = match encode_job(durable, &job.stored) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
@@ -1706,13 +1799,13 @@ async fn terminalize_job(
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
     };
-    let (operation_key, operation_value) = match operation_record(operation_id, action, &job.stored)
-    {
-        Ok(record) => record,
-        Err(error) => return Ok(Err(error)),
-    };
-    transaction
-        .put(key, value, Precondition::Version(job.version))
+    let (operation_key, operation_value) =
+        match operation_record(durable, operation_id, action, &job.stored) {
+            Ok(record) => record,
+            Err(error) => return Ok(Err(error)),
+        };
+    durable
+        .put_record(transaction, key, value, Precondition::Version(job.version))
         .await?;
     transaction
         .delete(running_key, Precondition::Present)
@@ -1720,8 +1813,13 @@ async fn terminalize_job(
     transaction
         .delete(active_key, Precondition::Present)
         .await?;
-    transaction
-        .put(operation_key, operation_value, Precondition::Absent)
+    durable
+        .put_record(
+            transaction,
+            operation_key,
+            operation_value,
+            Precondition::Absent,
+        )
         .await?;
     Ok(Ok(()))
 }
@@ -1909,16 +2007,20 @@ fn validate_stored_job(stored: &StoredOptimizeJobV1) -> RepositoryResult<()> {
     Ok(())
 }
 
-fn encode_job(stored: &StoredOptimizeJobV1) -> RepositoryResult<Value> {
+fn encode_job(
+    durable: &DurableRecordStore,
+    stored: &StoredOptimizeJobV1,
+) -> RepositoryResult<EncodedRecord> {
     validate_stored_job(stored)?;
-    encode_json(stored, &format!("optimize job {}", stored.job_id))
+    encode_durable_record(durable, stored)
 }
 
 fn operation_record(
+    durable: &DurableRecordStore,
     operation_id: OperationId,
     action: StoredOptimizeOperationActionV1,
     post_job: &StoredOptimizeJobV1,
-) -> RepositoryResult<(Key, Value)> {
+) -> RepositoryResult<(Key, EncodedRecord)> {
     let marker = StoredOptimizeOperationV1 {
         schema_version: OPTIMIZE_JOB_SCHEMA_VERSION,
         operation_id: *operation_id.as_uuid(),
@@ -1928,7 +2030,7 @@ fn operation_record(
     };
     Ok((
         operation_key(operation_id)?,
-        encode_json(&marker, "optimize operation marker")?,
+        encode_durable_record(durable, &marker)?,
     ))
 }
 
@@ -2032,12 +2134,11 @@ fn validate_operation_successor(
     Ok(())
 }
 
-fn encode_json<T: Serialize>(value: &T, context: &str) -> RepositoryResult<Value> {
-    let bytes = serde_json::to_vec(value).map_err(|error| {
-        RepositoryError::corruption(format!("encode {context} failed: {error}"))
-    })?;
-    Value::try_from(Bytes::from(bytes))
-        .map_err(|error| RepositoryError::store(format!("encode {context} failed: {error}")))
+fn encode_durable_record<T: crate::durable::DurableRecord>(
+    durable: &DurableRecordStore,
+    value: &T,
+) -> RepositoryResult<EncodedRecord> {
+    durable.encode(value).map_err(durable_error)
 }
 
 fn decode_json<T: DeserializeOwned>(bytes: &[u8], context: &str) -> RepositoryResult<T> {
@@ -2109,11 +2210,16 @@ fn decode_index_key(prefix: &str, key: &Key) -> RepositoryResult<i64> {
     Ok(job_id)
 }
 
-fn encode_index_value(job_id: i64) -> RepositoryResult<Value> {
+/// State indexes are fixed-width identifiers, not durable records.
+fn encode_index_value(durable: &DurableRecordStore, job_id: i64) -> RepositoryResult<Value> {
     validate_job_id(job_id, "encode optimize job index")?;
-    Value::try_from(Bytes::from(format!("{job_id:016x}"))).map_err(|error| {
-        RepositoryError::store(format!("encode optimize job index failed: {error}"))
-    })
+    durable
+        .encode_small_value(
+            "optimize-job-index",
+            Bytes::from(format!("{job_id:016x}")),
+            16,
+        )
+        .map_err(durable_error)
 }
 
 fn decode_index_value(value: &Value) -> RepositoryResult<i64> {
@@ -2167,6 +2273,7 @@ fn target_context(target: &MaintenanceTarget) -> String {
 #[derive(Clone)]
 pub struct MetadataMaintenanceOperationRepository {
     store: Arc<dyn StateStore>,
+    durable: DurableRecordStore,
     metrics: Arc<StateStoreMetrics>,
 }
 
@@ -2195,6 +2302,7 @@ impl MetadataMaintenanceOperationRepository {
         let provider_id = store.metrics_snapshot().provider;
         let repository = Self {
             metrics: Arc::new(StateStoreMetrics::new(provider_id)),
+            durable: DurableRecordStore::new(Arc::clone(&store)),
             store,
         };
         repository.list().await?;
@@ -2207,6 +2315,7 @@ impl MetadataMaintenanceOperationRepository {
     ) -> RepositoryResult<MetadataMaintenanceOperation> {
         validate_metadata_create(&request)?;
         let transaction_operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let context = format!(
             "create metadata maintenance operation {}",
             request.operation_id
@@ -2218,9 +2327,16 @@ impl MetadataMaintenanceOperationRepository {
             "create frontend metadata maintenance operation",
             |transaction| {
                 let request = request.clone();
+                let durable = durable.clone();
                 Box::pin(async move {
-                    apply_metadata_create(transaction, transaction_operation_id, request, None)
-                        .await
+                    apply_metadata_create(
+                        transaction,
+                        &durable,
+                        transaction_operation_id,
+                        request,
+                        None,
+                    )
+                    .await
                 })
             },
         )
@@ -2242,6 +2358,7 @@ impl MetadataMaintenanceOperationRepository {
     ) -> RepositoryResult<MetadataMaintenanceOperation> {
         validate_metadata_create(&request)?;
         let transaction_operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let context = format!(
             "admitted create metadata maintenance operation {}",
             request.operation_id
@@ -2254,9 +2371,11 @@ impl MetadataMaintenanceOperationRepository {
             |transaction| {
                 let request = request.clone();
                 let admission = admission.clone();
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_metadata_create(
                         transaction,
+                        &durable,
                         transaction_operation_id,
                         request,
                         Some(&admission),
@@ -2295,6 +2414,7 @@ impl MetadataMaintenanceOperationRepository {
             "metadata maintenance plan payload",
         )?;
         let transaction_operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let context = format!("start metadata maintenance operation {operation_id}");
         let result = run_side_effect_free(
             self.store.as_ref(),
@@ -2303,9 +2423,11 @@ impl MetadataMaintenanceOperationRepository {
             "start frontend metadata maintenance operation",
             |transaction| {
                 let plan = plan.clone();
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_metadata_start(
                         transaction,
+                        &durable,
                         transaction_operation_id,
                         operation_id,
                         plan,
@@ -2344,6 +2466,7 @@ impl MetadataMaintenanceOperationRepository {
         )?;
         validate_authority(&authority)?;
         let transaction_operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let context = format!("fenced start metadata maintenance operation {operation_id}");
         let result = run_side_effect_free(
             self.store.as_ref(),
@@ -2354,9 +2477,11 @@ impl MetadataMaintenanceOperationRepository {
                 let plan = plan.clone();
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_metadata_start(
                         transaction,
+                        &durable,
                         transaction_operation_id,
                         operation_id,
                         plan,
@@ -2394,6 +2519,7 @@ impl MetadataMaintenanceOperationRepository {
             "metadata maintenance reconcile evidence",
         )?;
         let transaction_operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let context =
             format!("record reconcile-pending metadata maintenance operation {operation_id}");
         let result = run_side_effect_free(
@@ -2403,9 +2529,11 @@ impl MetadataMaintenanceOperationRepository {
             "record frontend metadata maintenance reconcile evidence",
             |transaction| {
                 let evidence = evidence.clone();
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_metadata_reconcile_pending(
                         transaction,
+                        &durable,
                         transaction_operation_id,
                         operation_id,
                         evidence,
@@ -2438,6 +2566,7 @@ impl MetadataMaintenanceOperationRepository {
     ) -> RepositoryResult<MetadataMaintenanceOperation> {
         validate_authority(&authority)?;
         let transaction_operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let context = format!("adopt metadata maintenance operation {operation_id}");
         let result = run_side_effect_free(
             self.store.as_ref(),
@@ -2447,9 +2576,11 @@ impl MetadataMaintenanceOperationRepository {
             |transaction| {
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_metadata_adopt(
                         transaction,
+                        &durable,
                         transaction_operation_id,
                         operation_id,
                         &authority,
@@ -2484,6 +2615,7 @@ impl MetadataMaintenanceOperationRepository {
         )?;
         validate_authority(&authority)?;
         let transaction_operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let context =
             format!("fenced reconcile-pending metadata maintenance operation {operation_id}");
         let result = run_side_effect_free(
@@ -2495,9 +2627,11 @@ impl MetadataMaintenanceOperationRepository {
                 let evidence = evidence.clone();
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_metadata_reconcile_pending(
                         transaction,
+                        &durable,
                         transaction_operation_id,
                         operation_id,
                         evidence,
@@ -2629,6 +2763,7 @@ impl MetadataMaintenanceOperationRepository {
     ) -> RepositoryResult<MetadataMaintenanceOperation> {
         validate_metadata_error(&message)?;
         let transaction_operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let context = format!("mark metadata maintenance operation {operation_id} unresolved");
         let result = run_side_effect_free(
             self.store.as_ref(),
@@ -2637,9 +2772,11 @@ impl MetadataMaintenanceOperationRepository {
             "mark frontend metadata maintenance operation unresolved",
             |transaction| {
                 let message = message.clone();
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_metadata_unresolved(
                         transaction,
+                        &durable,
                         transaction_operation_id,
                         operation_id,
                         message,
@@ -2672,6 +2809,7 @@ impl MetadataMaintenanceOperationRepository {
         validate_metadata_error(&message)?;
         validate_authority(&authority)?;
         let transaction_operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let context =
             format!("fenced mark metadata maintenance operation {operation_id} unresolved");
         let result = run_side_effect_free(
@@ -2683,9 +2821,11 @@ impl MetadataMaintenanceOperationRepository {
                 let message = message.clone();
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_metadata_unresolved(
                         transaction,
+                        &durable,
                         transaction_operation_id,
                         operation_id,
                         message,
@@ -2894,7 +3034,7 @@ impl MetadataMaintenanceOperationRepository {
             .map(|payload| {
                 payload.map(|payload| MetadataMaintenanceOpaquePayload {
                     digest: payload.digest,
-                    payload: payload.payload,
+                    payload: payload.payload.as_bytes().to_vec(),
                 })
             })
     }
@@ -2979,6 +3119,7 @@ impl MetadataMaintenanceOperationRepository {
         now_ms: i64,
     ) -> RepositoryResult<MetadataMaintenanceOperation> {
         let transaction_operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let context = format!("terminal metadata maintenance operation {operation_id}");
         let result = run_side_effect_free(
             self.store.as_ref(),
@@ -2988,9 +3129,11 @@ impl MetadataMaintenanceOperationRepository {
             |transaction| {
                 let receipt = receipt.clone();
                 let message = message.clone();
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_metadata_terminal(
                         transaction,
+                        &durable,
                         transaction_operation_id,
                         operation_id,
                         action,
@@ -3026,6 +3169,7 @@ impl MetadataMaintenanceOperationRepository {
         validator: MaintenanceFenceValidator,
     ) -> RepositoryResult<MetadataMaintenanceOperation> {
         let transaction_operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let context = format!("fenced terminal metadata maintenance operation {operation_id}");
         let result = run_side_effect_free(
             self.store.as_ref(),
@@ -3037,9 +3181,11 @@ impl MetadataMaintenanceOperationRepository {
                 let message = message.clone();
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_metadata_terminal(
                         transaction,
+                        &durable,
                         transaction_operation_id,
                         operation_id,
                         action,
@@ -3196,6 +3342,7 @@ struct VersionedStoredMetadataOperation {
 
 async fn apply_metadata_create(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_operation_id: OperationId,
     request: MetadataMaintenanceOperationCreate,
     admission: Option<&WriteAdmission>,
@@ -3326,11 +3473,12 @@ async fn apply_metadata_create(
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
     };
-    let operation_value = match encode_metadata_operation(&stored) {
+    let operation_value = match encode_metadata_operation(durable, &stored) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
     let request_value = match encode_metadata_payload(
+        durable,
         StoredMetadataMaintenancePayloadKindV2::Request,
         request.request_payload_digest,
         request.request_payload,
@@ -3338,11 +3486,12 @@ async fn apply_metadata_create(
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
-    let index_value = match encode_uuid_index_value(request.operation_id) {
+    let index_value = match encode_uuid_index_value(durable, request.operation_id) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
     let (marker_key, marker_value) = match metadata_transaction_record(
+        durable,
         transaction_operation_id,
         StoredMetadataMaintenanceTransactionActionV2::Create,
         &stored,
@@ -3350,11 +3499,21 @@ async fn apply_metadata_create(
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
-    transaction
-        .put(operation_key, operation_value, Precondition::Absent)
+    durable
+        .put_record(
+            transaction,
+            operation_key,
+            operation_value,
+            Precondition::Absent,
+        )
         .await?;
-    transaction
-        .put(request_key, request_value, Precondition::Absent)
+    durable
+        .put_record(
+            transaction,
+            request_key,
+            request_value,
+            Precondition::Absent,
+        )
         .await?;
     transaction
         .put(pending_key, index_value.clone(), Precondition::Absent)
@@ -3362,8 +3521,8 @@ async fn apply_metadata_create(
     transaction
         .put(active_key, index_value, Precondition::Absent)
         .await?;
-    transaction
-        .put(marker_key, marker_value, Precondition::Absent)
+    durable
+        .put_record(transaction, marker_key, marker_value, Precondition::Absent)
         .await?;
     Ok(Ok(MetadataMaintenanceOperation::from(&stored)))
 }
@@ -3375,6 +3534,7 @@ async fn apply_metadata_create(
 /// so this cannot skip a transition or fabricate progress.
 async fn apply_metadata_adopt(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_operation_id: OperationId,
     operation_id: Uuid,
     authority: &MaintenanceAuthorityV1,
@@ -3407,11 +3567,12 @@ async fn apply_metadata_adopt(
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
     };
-    let operation_value = match encode_metadata_operation(&operation.stored) {
+    let operation_value = match encode_metadata_operation(durable, &operation.stored) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
     let (marker_key, marker_value) = match metadata_transaction_record(
+        durable,
         transaction_operation_id,
         StoredMetadataMaintenanceTransactionActionV2::Start,
         &operation.stored,
@@ -3419,21 +3580,23 @@ async fn apply_metadata_adopt(
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
-    transaction
-        .put(
+    durable
+        .put_record(
+            transaction,
             operation_key,
             operation_value,
             Precondition::Version(operation.version),
         )
         .await?;
-    transaction
-        .put(marker_key, marker_value, Precondition::Absent)
+    durable
+        .put_record(transaction, marker_key, marker_value, Precondition::Absent)
         .await?;
     Ok(Ok(MetadataMaintenanceOperation::from(&operation.stored)))
 }
 
 async fn apply_metadata_start(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_operation_id: OperationId,
     operation_id: Uuid,
     plan: MetadataMaintenancePlanPayload,
@@ -3509,6 +3672,7 @@ async fn apply_metadata_start(
             Err(error) => return Ok(Err(error)),
         };
     let plan_value = match encode_metadata_payload(
+        durable,
         StoredMetadataMaintenancePayloadKindV2::Plan,
         plan.payload_digest,
         plan.payload,
@@ -3518,6 +3682,7 @@ async fn apply_metadata_start(
     };
     metadata_transition_state(
         transaction,
+        durable,
         transaction_operation_id,
         StoredMetadataMaintenanceTransactionActionV2::Start,
         operation,
@@ -3530,6 +3695,7 @@ async fn apply_metadata_start(
 
 async fn apply_metadata_reconcile_pending(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_operation_id: OperationId,
     operation_id: Uuid,
     evidence: MetadataMaintenanceOpaquePayload,
@@ -3595,6 +3761,7 @@ async fn apply_metadata_reconcile_pending(
         Err(error) => return Ok(Err(error)),
     };
     let evidence_value = match encode_metadata_payload(
+        durable,
         StoredMetadataMaintenancePayloadKindV2::Evidence,
         evidence.digest,
         evidence.payload,
@@ -3604,6 +3771,7 @@ async fn apply_metadata_reconcile_pending(
     };
     metadata_transition_state(
         transaction,
+        durable,
         transaction_operation_id,
         StoredMetadataMaintenanceTransactionActionV2::ReconcilePending,
         operation,
@@ -3617,6 +3785,7 @@ async fn apply_metadata_reconcile_pending(
 #[allow(clippy::too_many_arguments)]
 async fn apply_metadata_terminal(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_operation_id: OperationId,
     operation_id: Uuid,
     action: StoredMetadataMaintenanceTransactionActionV2,
@@ -3707,6 +3876,7 @@ async fn apply_metadata_terminal(
                 Err(error) => return Ok(Err(error)),
             };
             let value = match encode_metadata_payload(
+                durable,
                 StoredMetadataMaintenancePayloadKindV2::Receipt,
                 receipt.digest,
                 receipt.payload,
@@ -3720,6 +3890,7 @@ async fn apply_metadata_terminal(
     };
     metadata_transition_state(
         transaction,
+        durable,
         transaction_operation_id,
         action,
         operation,
@@ -3732,6 +3903,7 @@ async fn apply_metadata_terminal(
 
 async fn apply_metadata_unresolved(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_operation_id: OperationId,
     operation_id: Uuid,
     message: String,
@@ -3792,6 +3964,7 @@ async fn apply_metadata_unresolved(
     operation.stored.finished_at_ms = Some(now_ms);
     metadata_transition_state(
         transaction,
+        durable,
         transaction_operation_id,
         StoredMetadataMaintenanceTransactionActionV2::Unresolve,
         operation,
@@ -3804,12 +3977,13 @@ async fn apply_metadata_unresolved(
 
 async fn metadata_transition_state(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_operation_id: OperationId,
     action: StoredMetadataMaintenanceTransactionActionV2,
     operation: VersionedStoredMetadataOperation,
     prior: MetadataMaintenanceOperationState,
     next: MetadataMaintenanceOperationState,
-    payload: Option<(Key, Value)>,
+    payload: Option<(Key, EncodedRecord)>,
 ) -> TransactionResult<MetadataMaintenanceOperation> {
     let operation_id = operation.stored.operation_id;
     let operation_key = match metadata_operation_key(operation_id) {
@@ -3824,21 +3998,26 @@ async fn metadata_transition_state(
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
     };
-    let operation_value = match encode_metadata_operation(&operation.stored) {
+    let operation_value = match encode_metadata_operation(durable, &operation.stored) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
-    let index_value = match encode_uuid_index_value(operation_id) {
+    let index_value = match encode_uuid_index_value(durable, operation_id) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
-    let (marker_key, marker_value) =
-        match metadata_transaction_record(transaction_operation_id, action, &operation.stored) {
-            Ok(value) => value,
-            Err(error) => return Ok(Err(error)),
-        };
-    transaction
-        .put(
+    let (marker_key, marker_value) = match metadata_transaction_record(
+        durable,
+        transaction_operation_id,
+        action,
+        &operation.stored,
+    ) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    durable
+        .put_record(
+            transaction,
             operation_key,
             operation_value,
             Precondition::Version(operation.version),
@@ -3851,7 +4030,9 @@ async fn metadata_transition_state(
         .put(next_state_key, index_value, Precondition::Absent)
         .await?;
     if let Some((key, value)) = payload {
-        transaction.put(key, value, Precondition::Absent).await?;
+        durable
+            .put_record(transaction, key, value, Precondition::Absent)
+            .await?;
     }
     if next.is_terminal() {
         let active_key = match metadata_active_target_key(&operation.stored.target.clone().into()) {
@@ -3862,8 +4043,8 @@ async fn metadata_transition_state(
             .delete(active_key, Precondition::Present)
             .await?;
     }
-    transaction
-        .put(marker_key, marker_value, Precondition::Absent)
+    durable
+        .put_record(transaction, marker_key, marker_value, Precondition::Absent)
         .await?;
     Ok(Ok(MetadataMaintenanceOperation::from(&operation.stored)))
 }
@@ -3949,7 +4130,7 @@ async fn metadata_payload_matches(
         return Ok(false);
     };
     let decoded = decode_metadata_payload_record(record).map_err(repository_error_as_store)?;
-    Ok(decoded.digest == digest && decoded.payload == payload)
+    Ok(decoded.digest == digest && decoded.payload.as_bytes() == payload)
 }
 
 fn decode_metadata_operation_record(
@@ -4038,6 +4219,18 @@ fn validate_payload(payload: &[u8], digest: [u8; 32], context: &str) -> Reposito
     Ok(())
 }
 
+fn durable_opaque<const MAX_BYTES: usize>(
+    bytes: Vec<u8>,
+    context: &str,
+) -> RepositoryResult<DurableOpaqueBytes<MAX_BYTES>> {
+    DurableOpaqueBytes::try_new(bytes)
+        .map_err(|error| RepositoryError::store(format!("encode {context} failed: {error}")))
+}
+
+fn durable_error(error: DurableRecordError) -> RepositoryError {
+    RepositoryError::store(format!("durable table maintenance record failed: {error}"))
+}
+
 fn validate_metadata_error(message: &str) -> RepositoryResult<()> {
     if message.is_empty() || message.len() > 8 * 1024 || message.contains('\0') {
         return Err(RepositoryError::corruption(
@@ -4115,26 +4308,28 @@ fn validate_metadata_operation(
 }
 
 fn encode_metadata_operation(
+    durable: &DurableRecordStore,
     stored: &StoredMetadataMaintenanceOperationV2,
-) -> RepositoryResult<Value> {
+) -> RepositoryResult<EncodedRecord> {
     validate_metadata_operation(stored)?;
-    encode_metadata_json(stored, "metadata maintenance operation")
+    encode_durable_record(durable, stored)
 }
 
 fn encode_metadata_payload(
+    durable: &DurableRecordStore,
     kind: StoredMetadataMaintenancePayloadKindV2,
     digest: [u8; 32],
     payload: Vec<u8>,
-) -> RepositoryResult<Value> {
+) -> RepositoryResult<EncodedRecord> {
     validate_payload(&payload, digest, "metadata maintenance payload")?;
-    encode_metadata_json(
+    encode_durable_record(
+        durable,
         &StoredMetadataMaintenancePayloadV2 {
             schema_version: METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION,
             kind,
             digest,
-            payload,
+            payload: durable_opaque(payload, "metadata maintenance payload")?,
         },
-        "metadata maintenance payload",
     )
 }
 
@@ -4147,17 +4342,18 @@ fn validate_stored_metadata_payload(
         ));
     }
     validate_payload(
-        &stored.payload,
+        stored.payload.as_bytes(),
         stored.digest,
         "metadata maintenance payload",
     )
 }
 
 fn metadata_transaction_record(
+    durable: &DurableRecordStore,
     transaction_operation_id: OperationId,
     action: StoredMetadataMaintenanceTransactionActionV2,
     post_operation: &StoredMetadataMaintenanceOperationV2,
-) -> RepositoryResult<(Key, Value)> {
+) -> RepositoryResult<(Key, EncodedRecord)> {
     let marker = StoredMetadataMaintenanceTransactionV2 {
         schema_version: METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION,
         transaction_operation_id: *transaction_operation_id.as_uuid(),
@@ -4167,7 +4363,7 @@ fn metadata_transaction_record(
     };
     Ok((
         metadata_transaction_key(transaction_operation_id)?,
-        encode_metadata_json(&marker, "metadata maintenance transaction marker")?,
+        encode_durable_record(durable, &marker)?,
     ))
 }
 
@@ -4197,20 +4393,6 @@ fn metadata_operation_is_legal_successor(
         && post.base_state_digest == current.base_state_digest
         && post.created_at_ms == current.created_at_ms
         && (post == current || (post.state.holds_active_fence() && current.state.is_terminal()))
-}
-
-fn encode_metadata_json<T: Serialize>(value: &T, context: &str) -> RepositoryResult<Value> {
-    let bytes = serde_json::to_vec(value).map_err(|error| {
-        RepositoryError::corruption(format!("encode {context} failed: {error}"))
-    })?;
-    if bytes.len() > METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES {
-        return Err(RepositoryError::new(
-            RepositoryErrorKind::Store,
-            format!("encode {context} exceeds StateStore payload limit"),
-        ));
-    }
-    Value::try_from(Bytes::from(bytes))
-        .map_err(|error| RepositoryError::store(format!("encode {context} failed: {error}")))
 }
 
 fn decode_metadata_json<T>(bytes: &[u8], context: &str) -> RepositoryResult<T>
@@ -4290,10 +4472,11 @@ fn metadata_transaction_key(transaction_operation_id: OperationId) -> Repository
     )
 }
 
-fn encode_uuid_index_value(value: Uuid) -> RepositoryResult<Value> {
-    Value::try_from(Bytes::from(value.to_string())).map_err(|error| {
-        RepositoryError::store(format!("encode metadata maintenance index failed: {error}"))
-    })
+/// UUID state indexes are fixed-width identifiers, not durable records.
+fn encode_uuid_index_value(durable: &DurableRecordStore, value: Uuid) -> RepositoryResult<Value> {
+    durable
+        .encode_small_value("maintenance-uuid-index", Bytes::from(value.to_string()), 36)
+        .map_err(durable_error)
 }
 
 fn decode_uuid_index_value(value: &Value, context: &str) -> RepositoryResult<Uuid> {
@@ -4334,6 +4517,7 @@ struct StoredSharedActiveFenceV3 {
 #[derive(Clone)]
 pub struct DistributedRewriteOperationRepository {
     store: Arc<dyn StateStore>,
+    durable: DurableRecordStore,
     metrics: Arc<StateStoreMetrics>,
 }
 
@@ -4360,6 +4544,7 @@ impl DistributedRewriteOperationRepository {
     pub async fn open(store: Arc<dyn StateStore>) -> RepositoryResult<Self> {
         let repository = Self {
             metrics: Arc::new(StateStoreMetrics::new(store.metrics_snapshot().provider)),
+            durable: DurableRecordStore::new(Arc::clone(&store)),
             store,
         };
         repository.list().await?;
@@ -4381,6 +4566,7 @@ impl DistributedRewriteOperationRepository {
         validate_rewrite_create(&request)?;
         let transaction_operation_id = OperationId::new_v7();
         let operation_id = request.operation_id;
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -4389,9 +4575,11 @@ impl DistributedRewriteOperationRepository {
             |transaction| {
                 let request = request.clone();
                 let admission = admission.clone();
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_rewrite_create(
                         transaction,
+                        &durable,
                         transaction_operation_id,
                         request,
                         None,
@@ -4467,6 +4655,7 @@ impl DistributedRewriteOperationRepository {
         validate_rewrite_create(&request)?;
         let transaction_operation_id = OperationId::new_v7();
         let operation_id = request.operation_id;
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -4475,9 +4664,11 @@ impl DistributedRewriteOperationRepository {
             |transaction| {
                 let request = request.clone();
                 let fenced = fenced.clone();
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_rewrite_create(
                         transaction,
+                        &durable,
                         transaction_operation_id,
                         request,
                         claimed_optimize_job_id,
@@ -4847,6 +5038,7 @@ impl DistributedRewriteOperationRepository {
     ) -> RepositoryResult<DistributedRewriteOperation> {
         validate_authority(&authority)?;
         let transaction_operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let context = format!("adopt distributed rewrite operation {operation_id}");
         let result = run_side_effect_free(
             self.store.as_ref(),
@@ -4856,9 +5048,11 @@ impl DistributedRewriteOperationRepository {
             |transaction| {
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_rewrite_adopt(
                         transaction,
+                        &durable,
                         transaction_operation_id,
                         operation_id,
                         &authority,
@@ -5181,7 +5375,7 @@ impl DistributedRewriteOperationRepository {
         record.map(decode_rewrite_payload).transpose().map(|item| {
             item.map(|payload| DistributedRewriteOpaquePayload {
                 digest: payload.digest,
-                payload: payload.payload,
+                payload: payload.payload.as_bytes().to_vec(),
             })
         })
     }
@@ -5269,6 +5463,7 @@ impl DistributedRewriteOperationRepository {
         fenced: Option<(MaintenanceAuthorityV1, MaintenanceFenceValidator)>,
     ) -> RepositoryResult<DistributedRewriteOperation> {
         let transaction_operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -5279,9 +5474,11 @@ impl DistributedRewriteOperationRepository {
                 let checkpoint = checkpoint.clone();
                 let allowed = allowed.to_vec();
                 let fenced = fenced.clone();
+                let durable = durable.clone();
                 Box::pin(async move {
                     apply_rewrite_transition(
                         transaction,
+                        &durable,
                         transaction_operation_id,
                         operation_id,
                         action,
@@ -5382,7 +5579,7 @@ impl StoredDistributedRewriteAttemptV3 {
             disposition: self.disposition,
             attempt_digest: self.attempt_digest,
             artifact_digest: self.artifact_digest,
-            artifact_handle: self.artifact_handle,
+            artifact_handle: self.artifact_handle.as_bytes().to_vec(),
             checkpoint_digest: self.checkpoint_digest,
         }
     }
@@ -5390,6 +5587,7 @@ impl StoredDistributedRewriteAttemptV3 {
 
 async fn apply_rewrite_create(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_operation_id: OperationId,
     request: DistributedRewriteOperationCreate,
     claimed_optimize_job_id: Option<i64>,
@@ -5483,7 +5681,7 @@ async fn apply_rewrite_create(
         if active_job.dispatched_child.is_none() {
             active_job.dispatched_child = Some(request.operation_id);
             active_job.schema_version = OPTIMIZE_JOB_SCHEMA_VERSION;
-            let job_value = match encode_job(&active_job) {
+            let job_value = match encode_job(durable, &active_job) {
                 Ok(value) => value,
                 Err(error) => return Ok(Err(error)),
             };
@@ -5491,8 +5689,9 @@ async fn apply_rewrite_create(
                 Ok(key) => key,
                 Err(error) => return Ok(Err(error)),
             };
-            transaction
-                .put(
+            durable
+                .put_record(
+                    transaction,
                     job_record_key,
                     job_value,
                     Precondition::Version(active_job_version),
@@ -5550,8 +5749,9 @@ async fn apply_rewrite_create(
         request.operation_id,
         StoredDistributedRewritePayloadKindV3::Request,
     )?;
-    let index_value = encode_uuid_index_value(request.operation_id)?;
-    let shared_value = encode_rewrite_json(
+    let index_value = encode_uuid_index_value(durable, request.operation_id)?;
+    let shared_value = encode_control_value(
+        durable,
         &StoredSharedActiveFenceV3 {
             schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
             family: SharedMaintenanceOperationFamilyV3::DistributedRewrite,
@@ -5560,21 +5760,25 @@ async fn apply_rewrite_create(
         "shared maintenance active fence",
     )?;
     let (marker_key, marker_value) = rewrite_transaction_record(
+        durable,
         transaction_operation_id,
         StoredDistributedRewriteTransactionActionV3::Create,
         &stored,
     )?;
-    transaction
-        .put(
+    durable
+        .put_record(
+            transaction,
             operation_key,
-            encode_rewrite_operation(&stored)?,
+            encode_rewrite_operation(durable, &stored)?,
             Precondition::Absent,
         )
         .await?;
-    transaction
-        .put(
+    durable
+        .put_record(
+            transaction,
             request_key,
             encode_rewrite_payload(
+                durable,
                 StoredDistributedRewritePayloadKindV3::Request,
                 request.request_payload_digest,
                 request.request_payload,
@@ -5588,8 +5792,8 @@ async fn apply_rewrite_create(
     transaction
         .put(shared_key, shared_value, Precondition::Absent)
         .await?;
-    transaction
-        .put(marker_key, marker_value, Precondition::Absent)
+    durable
+        .put_record(transaction, marker_key, marker_value, Precondition::Absent)
         .await?;
     Ok(Ok(DistributedRewriteOperation::from(&stored)))
 }
@@ -5597,6 +5801,7 @@ async fn apply_rewrite_create(
 #[allow(clippy::too_many_arguments)]
 async fn apply_rewrite_transition(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_operation_id: OperationId,
     operation_id: Uuid,
     action: StoredDistributedRewriteTransactionActionV3,
@@ -5683,6 +5888,7 @@ async fn apply_rewrite_transition(
             extra = Some((
                 rewrite_payload_key(operation_id, StoredDistributedRewritePayloadKindV3::Plan)?,
                 encode_rewrite_payload(
+                    durable,
                     StoredDistributedRewritePayloadKindV3::Plan,
                     plan.payload_digest,
                     plan.payload,
@@ -5696,6 +5902,7 @@ async fn apply_rewrite_transition(
                     StoredDistributedRewritePayloadKindV3::Evidence,
                 )?,
                 encode_rewrite_payload(
+                    durable,
                     StoredDistributedRewritePayloadKindV3::Evidence,
                     evidence.digest,
                     evidence.payload,
@@ -5706,6 +5913,7 @@ async fn apply_rewrite_transition(
             extra = Some((
                 rewrite_payload_key(operation_id, StoredDistributedRewritePayloadKindV3::Receipt)?,
                 encode_rewrite_payload(
+                    durable,
                     StoredDistributedRewritePayloadKindV3::Receipt,
                     receipt.digest,
                     receipt.payload,
@@ -5734,6 +5942,7 @@ async fn apply_rewrite_transition(
     operation.stored.state = next;
     rewrite_transition_state(
         transaction,
+        durable,
         transaction_operation_id,
         action,
         operation,
@@ -5748,12 +5957,13 @@ async fn apply_rewrite_transition(
 #[allow(clippy::too_many_arguments)]
 async fn rewrite_transition_state(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_operation_id: OperationId,
     action: StoredDistributedRewriteTransactionActionV3,
     operation: VersionedStoredRewriteOperation,
     prior: DistributedRewriteOperationState,
     next: DistributedRewriteOperationState,
-    payload: Option<(Key, Value)>,
+    payload: Option<(Key, EncodedRecord)>,
     checkpoint: Option<DistributedRewriteAttemptCheckpoint>,
 ) -> TransactionResult<DistributedRewriteOperation> {
     let operation_id = operation.stored.operation_id;
@@ -5761,11 +5971,12 @@ async fn rewrite_transition_state(
     let old_state_key = rewrite_state_key(prior, operation_id)?;
     let next_state_key = rewrite_state_key(next, operation_id)?;
     let (marker_key, marker_value) =
-        rewrite_transaction_record(transaction_operation_id, action, &operation.stored)?;
-    transaction
-        .put(
+        rewrite_transaction_record(durable, transaction_operation_id, action, &operation.stored)?;
+    durable
+        .put_record(
+            transaction,
             operation_key,
-            encode_rewrite_operation(&operation.stored)?,
+            encode_rewrite_operation(durable, &operation.stored)?,
             Precondition::Version(operation.version),
         )
         .await?;
@@ -5776,13 +5987,15 @@ async fn rewrite_transition_state(
         transaction
             .put(
                 next_state_key,
-                encode_uuid_index_value(operation_id)?,
+                encode_uuid_index_value(durable, operation_id)?,
                 Precondition::Absent,
             )
             .await?;
     }
     if let Some((key, value)) = payload {
-        transaction.put(key, value, Precondition::Absent).await?;
+        durable
+            .put_record(transaction, key, value, Precondition::Absent)
+            .await?;
     }
     if let Some(checkpoint) = checkpoint {
         let key = rewrite_attempt_key(operation_id, checkpoint.cohort_id, checkpoint.execution_id)?;
@@ -5795,13 +6008,17 @@ async fn rewrite_transition_state(
             disposition: checkpoint.disposition,
             attempt_digest: checkpoint.attempt_digest,
             artifact_digest: checkpoint.artifact_digest,
-            artifact_handle: checkpoint.artifact_handle,
+            artifact_handle: durable_opaque(
+                checkpoint.artifact_handle,
+                "distributed rewrite attempt handle",
+            )?,
             checkpoint_digest: checkpoint.checkpoint_digest,
         };
-        transaction
-            .put(
+        durable
+            .put_record(
+                transaction,
                 key,
-                encode_rewrite_json(&stored, "distributed rewrite attempt")?,
+                encode_durable_record(durable, &stored)?,
                 Precondition::Absent,
             )
             .await?;
@@ -5814,8 +6031,8 @@ async fn rewrite_transition_state(
             )
             .await?;
     }
-    transaction
-        .put(marker_key, marker_value, Precondition::Absent)
+    durable
+        .put_record(transaction, marker_key, marker_value, Precondition::Absent)
         .await?;
     Ok(Ok(DistributedRewriteOperation::from(&operation.stored)))
 }
@@ -5823,6 +6040,7 @@ async fn rewrite_transition_state(
 /// Rebind a distributed rewrite to the caller's attempt after a takeover.
 async fn apply_rewrite_adopt(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_operation_id: OperationId,
     operation_id: Uuid,
     authority: &MaintenanceAuthorityV1,
@@ -5853,11 +6071,12 @@ async fn apply_rewrite_adopt(
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
     };
-    let operation_value = match encode_rewrite_operation(&operation.stored) {
+    let operation_value = match encode_rewrite_operation(durable, &operation.stored) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
     let (marker_key, marker_value) = match rewrite_transaction_record(
+        durable,
         transaction_operation_id,
         StoredDistributedRewriteTransactionActionV3::Checkpoint,
         &operation.stored,
@@ -5865,15 +6084,16 @@ async fn apply_rewrite_adopt(
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
-    transaction
-        .put(
+    durable
+        .put_record(
+            transaction,
             operation_key,
             operation_value,
             Precondition::Version(operation.version),
         )
         .await?;
-    transaction
-        .put(marker_key, marker_value, Precondition::Absent)
+    durable
+        .put_record(transaction, marker_key, marker_value, Precondition::Absent)
         .await?;
     Ok(Ok(DistributedRewriteOperation::from(&operation.stored)))
 }
@@ -5881,6 +6101,7 @@ async fn apply_rewrite_adopt(
 /// Rebind a cleanup operation to the caller's attempt after a takeover.
 async fn apply_cleanup_adopt(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_id: OperationId,
     operation_id: Uuid,
     authority: &MaintenanceAuthorityV1,
@@ -5907,11 +6128,12 @@ async fn apply_cleanup_adopt(
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
     };
-    let operation_value = match encode_cleanup_operation(&operation.stored) {
+    let operation_value = match encode_cleanup_operation(durable, &operation.stored) {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
     let (marker_key, marker_value) = match cleanup_transaction_record(
+        durable,
         transaction_id,
         StoredCleanupTransactionActionV4::Checkpoint,
         &operation.stored,
@@ -5919,15 +6141,16 @@ async fn apply_cleanup_adopt(
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
-    transaction
-        .put(
+    durable
+        .put_record(
+            transaction,
             operation_key,
             operation_value,
             Precondition::Version(operation.version),
         )
         .await?;
-    transaction
-        .put(marker_key, marker_value, Precondition::Absent)
+    durable
+        .put_record(transaction, marker_key, marker_value, Precondition::Absent)
         .await?;
     Ok(Ok(CleanupOperation::from(&operation.stored)))
 }
@@ -5997,7 +6220,7 @@ async fn rewrite_payload_matches(
         return Ok(false);
     };
     let stored = decode_rewrite_payload(record).map_err(repository_error_as_store)?;
-    Ok(stored.digest == digest && stored.payload == payload)
+    Ok(stored.digest == digest && stored.payload.as_bytes() == payload)
 }
 
 fn validate_rewrite_create(request: &DistributedRewriteOperationCreate) -> RepositoryResult<()> {
@@ -6149,10 +6372,11 @@ fn validate_rewrite_operation(
 }
 
 fn encode_rewrite_operation(
+    durable: &DurableRecordStore,
     stored: &StoredDistributedRewriteOperationV3,
-) -> RepositoryResult<Value> {
+) -> RepositoryResult<EncodedRecord> {
     validate_rewrite_operation(stored)?;
-    encode_rewrite_json(stored, "distributed rewrite operation")
+    encode_durable_record(durable, stored)
 }
 fn decode_rewrite_operation(
     record: StateRecord,
@@ -6173,19 +6397,20 @@ fn decode_rewrite_operation(
     Ok(stored)
 }
 fn encode_rewrite_payload(
+    durable: &DurableRecordStore,
     kind: StoredDistributedRewritePayloadKindV3,
     digest: [u8; 32],
     payload: Vec<u8>,
-) -> RepositoryResult<Value> {
+) -> RepositoryResult<EncodedRecord> {
     validate_rewrite_payload(&payload, digest, "distributed rewrite payload")?;
-    encode_rewrite_json(
+    encode_durable_record(
+        durable,
         &StoredDistributedRewritePayloadV3 {
             schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
             kind,
             digest,
-            payload,
+            payload: durable_opaque(payload, "distributed rewrite payload")?,
         },
-        "distributed rewrite payload",
     )
 }
 fn decode_rewrite_payload(
@@ -6199,7 +6424,7 @@ fn decode_rewrite_payload(
         ));
     }
     validate_rewrite_payload(
-        &stored.payload,
+        stored.payload.as_bytes(),
         stored.digest,
         "distributed rewrite payload",
     )?;
@@ -6224,22 +6449,23 @@ fn decode_rewrite_attempt(
         disposition: stored.disposition,
         attempt_digest: stored.attempt_digest,
         artifact_digest: stored.artifact_digest,
-        artifact_handle: stored.artifact_handle.clone(),
+        artifact_handle: stored.artifact_handle.as_bytes().to_vec(),
         checkpoint_digest: stored.checkpoint_digest,
     })?;
     Ok(stored)
 }
-fn encode_rewrite_json<T: Serialize>(value: &T, context: &str) -> RepositoryResult<Value> {
+/// Small, non-record control values (such as a shared active fence) use the
+/// explicit StateStore small-value budget instead of the durable-record path.
+fn encode_control_value<T: Serialize>(
+    durable: &DurableRecordStore,
+    value: &T,
+    context: &'static str,
+) -> RepositoryResult<Value> {
     let bytes = serde_json::to_vec(value)
         .map_err(|e| RepositoryError::corruption(format!("encode {context} failed: {e}")))?;
-    if bytes.len() > DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES {
-        return Err(RepositoryError::new(
-            RepositoryErrorKind::Store,
-            format!("encode {context} exceeds StateStore payload limit"),
-        ));
-    }
-    Value::try_from(Bytes::from(bytes))
-        .map_err(|e| RepositoryError::store(format!("encode {context} failed: {e}")))
+    durable
+        .encode_small_value(context, Bytes::from(bytes), 512)
+        .map_err(durable_error)
 }
 fn decode_rewrite_json<T>(bytes: &[u8], context: &str) -> RepositoryResult<T>
 where
@@ -6257,10 +6483,11 @@ where
     Ok(decoded)
 }
 fn rewrite_transaction_record(
+    durable: &DurableRecordStore,
     transaction_operation_id: OperationId,
     action: StoredDistributedRewriteTransactionActionV3,
     post_operation: &StoredDistributedRewriteOperationV3,
-) -> RepositoryResult<(Key, Value)> {
+) -> RepositoryResult<(Key, EncodedRecord)> {
     let marker = StoredDistributedRewriteTransactionV3 {
         schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
         transaction_operation_id: *transaction_operation_id.as_uuid(),
@@ -6270,7 +6497,7 @@ fn rewrite_transaction_record(
     };
     Ok((
         rewrite_transaction_key(transaction_operation_id)?,
-        encode_rewrite_json(&marker, "distributed rewrite transaction marker")?,
+        encode_durable_record(durable, &marker)?,
     ))
 }
 fn rewrite_operation_key(operation_id: Uuid) -> RepositoryResult<Key> {
@@ -6355,6 +6582,7 @@ fn shared_active_target_key(target: &MaintenanceTarget) -> RepositoryResult<Key>
 #[derive(Clone)]
 pub struct CleanupOperationRepository {
     store: Arc<dyn StateStore>,
+    durable: DurableRecordStore,
     metrics: Arc<StateStoreMetrics>,
 }
 
@@ -6382,6 +6610,7 @@ impl CleanupOperationRepository {
     pub async fn open(store: Arc<dyn StateStore>) -> RepositoryResult<Self> {
         let repository = Self {
             metrics: Arc::new(StateStoreMetrics::new(store.metrics_snapshot().provider)),
+            durable: DurableRecordStore::new(Arc::clone(&store)),
             store,
         };
         repository.list().await?;
@@ -6397,10 +6626,10 @@ impl CleanupOperationRepository {
             request.operation_id,
             StoredCleanupTransactionActionV4::Create,
             "create frontend connector cleanup operation",
-            move |transaction, transaction_id| {
+            move |transaction, transaction_id, durable| {
                 let request = request.clone();
                 Box::pin(async move {
-                    apply_cleanup_create(transaction, transaction_id, request, None).await
+                    apply_cleanup_create(transaction, &durable, transaction_id, request, None).await
                 })
             },
         )
@@ -6417,12 +6646,18 @@ impl CleanupOperationRepository {
             request.operation_id,
             StoredCleanupTransactionActionV4::Create,
             "admitted create frontend connector cleanup operation",
-            move |transaction, transaction_id| {
+            move |transaction, transaction_id, durable| {
                 let request = request.clone();
                 let admission = admission.clone();
                 Box::pin(async move {
-                    apply_cleanup_create(transaction, transaction_id, request, Some(&admission))
-                        .await
+                    apply_cleanup_create(
+                        transaction,
+                        &durable,
+                        transaction_id,
+                        request,
+                        Some(&admission),
+                    )
+                    .await
                 })
             },
         )
@@ -6448,11 +6683,12 @@ impl CleanupOperationRepository {
             operation_id,
             StoredCleanupTransactionActionV4::Plan,
             "persist frontend connector cleanup plan",
-            move |transaction, transaction_id| {
+            move |transaction, transaction_id, durable| {
                 let plan = plan.clone();
                 Box::pin(async move {
                     apply_cleanup_plan(
                         transaction,
+                        &durable,
                         transaction_id,
                         operation_id,
                         plan,
@@ -6480,13 +6716,14 @@ impl CleanupOperationRepository {
             operation_id,
             StoredCleanupTransactionActionV4::Plan,
             "fenced persist frontend connector cleanup plan",
-            move |transaction, transaction_id| {
+            move |transaction, transaction_id, durable| {
                 let plan = plan.clone();
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
                 Box::pin(async move {
                     apply_cleanup_plan(
                         transaction,
+                        &durable,
                         transaction_id,
                         operation_id,
                         plan,
@@ -6518,11 +6755,12 @@ impl CleanupOperationRepository {
             operation_id,
             StoredCleanupTransactionActionV4::Prepare,
             "persist frontend connector cleanup prepared batch",
-            move |transaction, transaction_id| {
+            move |transaction, transaction_id, durable| {
                 let checkpoint = checkpoint.clone();
                 Box::pin(async move {
                     apply_cleanup_prepare(
                         transaction,
+                        &durable,
                         transaction_id,
                         operation_id,
                         checkpoint,
@@ -6553,13 +6791,14 @@ impl CleanupOperationRepository {
             operation_id,
             StoredCleanupTransactionActionV4::Prepare,
             "fenced persist frontend connector cleanup prepared batch",
-            move |transaction, transaction_id| {
+            move |transaction, transaction_id, durable| {
                 let checkpoint = checkpoint.clone();
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
                 Box::pin(async move {
                     apply_cleanup_prepare(
                         transaction,
+                        &durable,
                         transaction_id,
                         operation_id,
                         checkpoint,
@@ -6591,11 +6830,12 @@ impl CleanupOperationRepository {
             operation_id,
             StoredCleanupTransactionActionV4::Checkpoint,
             "checkpoint frontend connector cleanup batch",
-            move |transaction, transaction_id| {
+            move |transaction, transaction_id, durable| {
                 let checkpoint = checkpoint.clone();
                 Box::pin(async move {
                     apply_cleanup_checkpoint(
                         transaction,
+                        &durable,
                         transaction_id,
                         operation_id,
                         checkpoint,
@@ -6622,13 +6862,14 @@ impl CleanupOperationRepository {
             operation_id,
             StoredCleanupTransactionActionV4::Checkpoint,
             "fenced checkpoint frontend connector cleanup batch",
-            move |transaction, transaction_id| {
+            move |transaction, transaction_id, durable| {
                 let checkpoint = checkpoint.clone();
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
                 Box::pin(async move {
                     apply_cleanup_checkpoint(
                         transaction,
+                        &durable,
                         transaction_id,
                         operation_id,
                         checkpoint,
@@ -6659,11 +6900,12 @@ impl CleanupOperationRepository {
             operation_id,
             StoredCleanupTransactionActionV4::Checkpoint,
             "checkpoint reconciled frontend connector cleanup batch",
-            move |transaction, transaction_id| {
+            move |transaction, transaction_id, durable| {
                 let checkpoint = checkpoint.clone();
                 Box::pin(async move {
                     apply_cleanup_reconciled_checkpoint(
                         transaction,
+                        &durable,
                         transaction_id,
                         operation_id,
                         checkpoint,
@@ -6690,13 +6932,14 @@ impl CleanupOperationRepository {
             operation_id,
             StoredCleanupTransactionActionV4::Checkpoint,
             "fenced checkpoint reconciled frontend connector cleanup batch",
-            move |transaction, transaction_id| {
+            move |transaction, transaction_id, durable| {
                 let checkpoint = checkpoint.clone();
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
                 Box::pin(async move {
                     apply_cleanup_reconciled_checkpoint(
                         transaction,
+                        &durable,
                         transaction_id,
                         operation_id,
                         checkpoint,
@@ -6743,12 +6986,13 @@ impl CleanupOperationRepository {
             operation_id,
             StoredCleanupTransactionActionV4::Checkpoint,
             "adopt frontend connector cleanup operation",
-            move |transaction, transaction_id| {
+            move |transaction, transaction_id, durable| {
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
                 Box::pin(async move {
                     apply_cleanup_adopt(
                         transaction,
+                        &durable,
                         transaction_id,
                         operation_id,
                         &authority,
@@ -7035,7 +7279,7 @@ impl CleanupOperationRepository {
                 base_state_digest: stored.base_state_digest,
                 manifest_digest: stored.manifest_digest,
                 artifact_handle_digest: stored.artifact_handle_digest,
-                artifact_handle: stored.artifact_handle,
+                artifact_handle: stored.artifact_handle.as_bytes().to_vec(),
                 candidate_count: stored.candidate_count,
                 total_bytes: stored.total_bytes,
                 manifest_parts: stored.manifest_parts,
@@ -7094,11 +7338,12 @@ impl CleanupOperationRepository {
             operation_id,
             action,
             "transition frontend connector cleanup operation",
-            move |transaction, transaction_id| {
+            move |transaction, transaction_id, durable| {
                 let error = error.clone();
                 Box::pin(async move {
                     apply_cleanup_transition(
                         transaction,
+                        &durable,
                         transaction_id,
                         operation_id,
                         action,
@@ -7132,13 +7377,14 @@ impl CleanupOperationRepository {
             operation_id,
             action,
             "fenced transition frontend connector cleanup operation",
-            move |transaction, transaction_id| {
+            move |transaction, transaction_id, durable| {
                 let error = error.clone();
                 let authority = authority.clone();
                 let validator = Arc::clone(&validator);
                 Box::pin(async move {
                     apply_cleanup_transition(
                         transaction,
+                        &durable,
                         transaction_id,
                         operation_id,
                         action,
@@ -7166,6 +7412,7 @@ impl CleanupOperationRepository {
         F: for<'a> Fn(
                 &'a mut dyn WriteTransaction,
                 OperationId,
+                DurableRecordStore,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = TransactionResult<CleanupOperation>>
@@ -7176,12 +7423,13 @@ impl CleanupOperationRepository {
             + 'static,
     {
         let transaction_id = OperationId::new_v7();
+        let durable = self.durable.clone();
         match run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
             transaction_id,
             description,
-            move |transaction| mutate(transaction, transaction_id),
+            move |transaction| mutate(transaction, transaction_id, durable.clone()),
         )
         .await
         {
@@ -7267,6 +7515,7 @@ struct VersionedStoredCleanupOperation {
 
 async fn apply_cleanup_create(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_id: OperationId,
     request: CleanupOperationCreate,
     admission: Option<&WriteAdmission>,
@@ -7332,28 +7581,31 @@ async fn apply_cleanup_create(
         authority: None,
     };
     let (marker_key, marker_value) = cleanup_transaction_record(
+        durable,
         transaction_id,
         StoredCleanupTransactionActionV4::Create,
         &stored,
     )?;
-    transaction
-        .put(
+    durable
+        .put_record(
+            transaction,
             cleanup_operation_key(request.operation_id)?,
-            encode_cleanup_operation(&stored)?,
+            encode_cleanup_operation(durable, &stored)?,
             Precondition::Absent,
         )
         .await?;
     transaction
         .put(
             cleanup_state_key(CleanupOperationState::Pending, request.operation_id)?,
-            encode_uuid_index_value(request.operation_id)?,
+            encode_uuid_index_value(durable, request.operation_id)?,
             Precondition::Absent,
         )
         .await?;
     transaction
         .put(
             shared_active_target_key(&request.target)?,
-            encode_cleanup_json(
+            encode_control_value(
+                durable,
                 &StoredSharedActiveFenceV3 {
                     schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
                     family: SharedMaintenanceOperationFamilyV3::Cleanup,
@@ -7364,14 +7616,15 @@ async fn apply_cleanup_create(
             Precondition::Absent,
         )
         .await?;
-    transaction
-        .put(marker_key, marker_value, Precondition::Absent)
+    durable
+        .put_record(transaction, marker_key, marker_value, Precondition::Absent)
         .await?;
     Ok(Ok(CleanupOperation::from(&stored)))
 }
 
 async fn apply_cleanup_plan(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_id: OperationId,
     operation_id: Uuid,
     plan: CleanupPlanPayload,
@@ -7430,6 +7683,7 @@ async fn apply_cleanup_plan(
     operation.stored.state = CleanupOperationState::Planned;
     cleanup_write_transition(
         transaction,
+        durable,
         transaction_id,
         StoredCleanupTransactionActionV4::Plan,
         operation,
@@ -7437,7 +7691,7 @@ async fn apply_cleanup_plan(
         CleanupOperationState::Planned,
         Some((
             cleanup_plan_key(operation_id)?,
-            encode_cleanup_plan(&plan, operation_id)?,
+            encode_cleanup_plan(durable, &plan, operation_id)?,
             Precondition::Absent,
         )),
     )
@@ -7446,6 +7700,7 @@ async fn apply_cleanup_plan(
 
 async fn apply_cleanup_prepare(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_id: OperationId,
     operation_id: Uuid,
     checkpoint: CleanupBatchCheckpoint,
@@ -7515,6 +7770,7 @@ async fn apply_cleanup_prepare(
     operation.stored.state = CleanupOperationState::Running;
     cleanup_write_transition(
         transaction,
+        durable,
         transaction_id,
         StoredCleanupTransactionActionV4::Prepare,
         operation,
@@ -7522,7 +7778,7 @@ async fn apply_cleanup_prepare(
         CleanupOperationState::Running,
         Some((
             batch_key,
-            encode_cleanup_batch(&checkpoint, operation_id)?,
+            encode_cleanup_batch(durable, &checkpoint, operation_id)?,
             Precondition::Absent,
         )),
     )
@@ -7531,6 +7787,7 @@ async fn apply_cleanup_prepare(
 
 async fn apply_cleanup_checkpoint(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_id: OperationId,
     operation_id: Uuid,
     checkpoint: CleanupBatchCheckpoint,
@@ -7580,7 +7837,7 @@ async fn apply_cleanup_checkpoint(
     };
     let prepared_version = existing.version.clone();
     let prepared = decode_cleanup_batch(existing)?;
-    if prepared.prepared_handle != checkpoint.prepared_handle
+    if prepared.prepared_handle.as_bytes() != checkpoint.prepared_handle
         || prepared.prepared_handle_digest != checkpoint.prepared_handle_digest
     {
         return Ok(Err(RepositoryError::corruption(
@@ -7613,6 +7870,7 @@ async fn apply_cleanup_checkpoint(
     operation.stored.state = next;
     cleanup_write_transition(
         transaction,
+        durable,
         transaction_id,
         StoredCleanupTransactionActionV4::Checkpoint,
         operation,
@@ -7620,7 +7878,7 @@ async fn apply_cleanup_checkpoint(
         next,
         Some((
             key,
-            encode_cleanup_batch(&checkpoint, operation_id)?,
+            encode_cleanup_batch(durable, &checkpoint, operation_id)?,
             Precondition::Version(prepared_version),
         )),
     )
@@ -7629,6 +7887,7 @@ async fn apply_cleanup_checkpoint(
 
 async fn apply_cleanup_reconciled_checkpoint(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_id: OperationId,
     operation_id: Uuid,
     checkpoint: CleanupBatchCheckpoint,
@@ -7677,7 +7936,7 @@ async fn apply_cleanup_reconciled_checkpoint(
     };
     let version = existing.version.clone();
     let prior = decode_cleanup_batch(existing)?;
-    if prior.prepared_handle != checkpoint.prepared_handle
+    if prior.prepared_handle.as_bytes() != checkpoint.prepared_handle
         || prior.prepared_handle_digest != checkpoint.prepared_handle_digest
     {
         return Ok(Err(RepositoryError::corruption(
@@ -7704,6 +7963,7 @@ async fn apply_cleanup_reconciled_checkpoint(
     operation.stored.state = next;
     cleanup_write_transition(
         transaction,
+        durable,
         transaction_id,
         StoredCleanupTransactionActionV4::Checkpoint,
         operation,
@@ -7711,7 +7971,7 @@ async fn apply_cleanup_reconciled_checkpoint(
         next,
         Some((
             key,
-            encode_cleanup_batch(&checkpoint, operation_id)?,
+            encode_cleanup_batch(durable, &checkpoint, operation_id)?,
             Precondition::Version(version),
         )),
     )
@@ -7721,6 +7981,7 @@ async fn apply_cleanup_reconciled_checkpoint(
 #[allow(clippy::too_many_arguments)]
 async fn apply_cleanup_transition(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_id: OperationId,
     operation_id: Uuid,
     action: StoredCleanupTransactionActionV4,
@@ -7784,6 +8045,7 @@ async fn apply_cleanup_transition(
     }
     cleanup_write_transition(
         transaction,
+        durable,
         transaction_id,
         action,
         operation,
@@ -7796,20 +8058,22 @@ async fn apply_cleanup_transition(
 
 async fn cleanup_write_transition(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     transaction_id: OperationId,
     action: StoredCleanupTransactionActionV4,
     operation: VersionedStoredCleanupOperation,
     prior: CleanupOperationState,
     next: CleanupOperationState,
-    extra: Option<(Key, Value, Precondition)>,
+    extra: Option<(Key, EncodedRecord, Precondition)>,
 ) -> TransactionResult<CleanupOperation> {
     let operation_id = operation.stored.operation_id;
     let (marker_key, marker_value) =
-        cleanup_transaction_record(transaction_id, action, &operation.stored)?;
-    transaction
-        .put(
+        cleanup_transaction_record(durable, transaction_id, action, &operation.stored)?;
+    durable
+        .put_record(
+            transaction,
             cleanup_operation_key(operation_id)?,
-            encode_cleanup_operation(&operation.stored)?,
+            encode_cleanup_operation(durable, &operation.stored)?,
             Precondition::Version(operation.version),
         )
         .await?;
@@ -7823,13 +8087,15 @@ async fn cleanup_write_transition(
         transaction
             .put(
                 cleanup_state_key(next, operation_id)?,
-                encode_uuid_index_value(operation_id)?,
+                encode_uuid_index_value(durable, operation_id)?,
                 Precondition::Absent,
             )
             .await?;
     }
     if let Some((key, value, precondition)) = extra {
-        transaction.put(key, value, precondition).await?;
+        durable
+            .put_record(transaction, key, value, precondition)
+            .await?;
     }
     if next.is_terminal() {
         transaction
@@ -7839,8 +8105,8 @@ async fn cleanup_write_transition(
             )
             .await?;
     }
-    transaction
-        .put(marker_key, marker_value, Precondition::Absent)
+    durable
+        .put_record(transaction, marker_key, marker_value, Precondition::Absent)
         .await?;
     Ok(Ok(CleanupOperation::from(&operation.stored)))
 }
@@ -8058,9 +8324,12 @@ fn validate_cleanup_operation(stored: &StoredCleanupOperationV4) -> RepositoryRe
     }
     Ok(())
 }
-fn encode_cleanup_operation(stored: &StoredCleanupOperationV4) -> RepositoryResult<Value> {
+fn encode_cleanup_operation(
+    durable: &DurableRecordStore,
+    stored: &StoredCleanupOperationV4,
+) -> RepositoryResult<EncodedRecord> {
     validate_cleanup_operation(stored)?;
-    encode_cleanup_json(stored, "cleanup operation")
+    encode_durable_record(durable, stored)
 }
 fn decode_cleanup_operation(record: StateRecord) -> RepositoryResult<StoredCleanupOperationV4> {
     let operation_id =
@@ -8075,9 +8344,14 @@ fn decode_cleanup_operation(record: StateRecord) -> RepositoryResult<StoredClean
     }
     Ok(stored)
 }
-fn encode_cleanup_plan(plan: &CleanupPlanPayload, operation_id: Uuid) -> RepositoryResult<Value> {
+fn encode_cleanup_plan(
+    durable: &DurableRecordStore,
+    plan: &CleanupPlanPayload,
+    operation_id: Uuid,
+) -> RepositoryResult<EncodedRecord> {
     validate_cleanup_plan(plan)?;
-    encode_cleanup_json(
+    encode_durable_record(
+        durable,
         &StoredCleanupPlanV4 {
             schema_version: CLEANUP_OPERATION_SCHEMA_VERSION,
             operation_id,
@@ -8085,13 +8359,15 @@ fn encode_cleanup_plan(plan: &CleanupPlanPayload, operation_id: Uuid) -> Reposit
             base_state_digest: plan.base_state_digest,
             manifest_digest: plan.manifest_digest,
             artifact_handle_digest: plan.artifact_handle_digest,
-            artifact_handle: plan.artifact_handle.clone(),
+            artifact_handle: durable_opaque(
+                plan.artifact_handle.clone(),
+                "cleanup plan artifact handle",
+            )?,
             candidate_count: plan.candidate_count,
             total_bytes: plan.total_bytes,
             manifest_parts: plan.manifest_parts,
             batch_count: plan.batch_count,
         },
-        "cleanup plan",
     )
 }
 fn decode_cleanup_plan(record: StateRecord) -> RepositoryResult<StoredCleanupPlanV4> {
@@ -8106,7 +8382,7 @@ fn decode_cleanup_plan(record: StateRecord) -> RepositoryResult<StoredCleanupPla
         base_state_digest: stored.base_state_digest,
         manifest_digest: stored.manifest_digest,
         artifact_handle_digest: stored.artifact_handle_digest,
-        artifact_handle: stored.artifact_handle.clone(),
+        artifact_handle: stored.artifact_handle.as_bytes().to_vec(),
         candidate_count: stored.candidate_count,
         total_bytes: stored.total_bytes,
         manifest_parts: stored.manifest_parts,
@@ -8115,25 +8391,33 @@ fn decode_cleanup_plan(record: StateRecord) -> RepositoryResult<StoredCleanupPla
     Ok(stored)
 }
 fn encode_cleanup_batch(
+    durable: &DurableRecordStore,
     checkpoint: &CleanupBatchCheckpoint,
     operation_id: Uuid,
-) -> RepositoryResult<Value> {
+) -> RepositoryResult<EncodedRecord> {
     validate_cleanup_checkpoint(checkpoint, checkpoint.receipt_handle.is_some())?;
-    encode_cleanup_json(
+    encode_durable_record(
+        durable,
         &StoredCleanupBatchV4 {
             schema_version: CLEANUP_OPERATION_SCHEMA_VERSION,
             operation_id,
             ordinal: checkpoint.ordinal,
             prepared_handle_digest: checkpoint.prepared_handle_digest,
-            prepared_handle: checkpoint.prepared_handle.clone(),
+            prepared_handle: durable_opaque(
+                checkpoint.prepared_handle.clone(),
+                "cleanup prepared handle",
+            )?,
             receipt_handle_digest: checkpoint.receipt_handle_digest,
-            receipt_handle: checkpoint.receipt_handle.clone(),
+            receipt_handle: checkpoint
+                .receipt_handle
+                .clone()
+                .map(|handle| durable_opaque(handle, "cleanup receipt handle"))
+                .transpose()?,
             deleted_count: checkpoint.deleted_count,
             already_absent_count: checkpoint.already_absent_count,
             failed_count: checkpoint.failed_count,
             unknown_count: checkpoint.unknown_count,
         },
-        "cleanup batch",
     )
 }
 fn decode_cleanup_batch(record: StateRecord) -> RepositoryResult<StoredCleanupBatchV4> {
@@ -8154,26 +8438,16 @@ fn cleanup_checkpoint_from_stored(value: StoredCleanupBatchV4) -> CleanupBatchCh
     CleanupBatchCheckpoint {
         ordinal: value.ordinal,
         prepared_handle_digest: value.prepared_handle_digest,
-        prepared_handle: value.prepared_handle,
+        prepared_handle: value.prepared_handle.as_bytes().to_vec(),
         receipt_handle_digest: value.receipt_handle_digest,
-        receipt_handle: value.receipt_handle,
+        receipt_handle: value
+            .receipt_handle
+            .map(|handle| handle.as_bytes().to_vec()),
         deleted_count: value.deleted_count,
         already_absent_count: value.already_absent_count,
         failed_count: value.failed_count,
         unknown_count: value.unknown_count,
     }
-}
-fn encode_cleanup_json<T: Serialize>(value: &T, context: &str) -> RepositoryResult<Value> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|e| RepositoryError::corruption(format!("encode {context} failed: {e}")))?;
-    if bytes.len() > CLEANUP_MAX_PAYLOAD_BYTES {
-        return Err(RepositoryError::new(
-            RepositoryErrorKind::Store,
-            format!("encode {context} exceeds StateStore payload limit"),
-        ));
-    }
-    Value::try_from(Bytes::from(bytes))
-        .map_err(|e| RepositoryError::store(format!("encode {context} failed: {e}")))
 }
 fn decode_cleanup_json<T>(bytes: &[u8], context: &str) -> RepositoryResult<T>
 where
@@ -8191,10 +8465,11 @@ where
     Ok(decoded)
 }
 fn cleanup_transaction_record(
+    durable: &DurableRecordStore,
     transaction_id: OperationId,
     action: StoredCleanupTransactionActionV4,
     post_operation: &StoredCleanupOperationV4,
-) -> RepositoryResult<(Key, Value)> {
+) -> RepositoryResult<(Key, EncodedRecord)> {
     let marker = StoredCleanupTransactionV4 {
         schema_version: CLEANUP_OPERATION_SCHEMA_VERSION,
         transaction_operation_id: *transaction_id.as_uuid(),
@@ -8204,7 +8479,7 @@ fn cleanup_transaction_record(
     };
     Ok((
         cleanup_transaction_key(transaction_id)?,
-        encode_cleanup_json(&marker, "cleanup transaction marker")?,
+        encode_durable_record(durable, &marker)?,
     ))
 }
 fn cleanup_operation_key(operation_id: Uuid) -> RepositoryResult<Key> {

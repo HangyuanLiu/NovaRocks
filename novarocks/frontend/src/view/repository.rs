@@ -242,8 +242,7 @@ pub fn database_key(catalog: &str, database: &str) -> Result<Key, String> {
 pub fn encode_record(record: StoredDatabaseViewsV1) -> Result<Value, String> {
     validate_record(&record)?;
     DurableRecordStore::with_limits(StateStoreLimits::default())
-        .encode(&record)
-        .map(|record| record.into_value())
+        .encode_compat_value(&record)
         .map_err(|error| {
             format!(
                 "encode frontend view database {}.{} failed: {error}",

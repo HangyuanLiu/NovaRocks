@@ -15,36 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Cursor;
-use std::sync::LazyLock;
-
-use apache_avro::{Schema, from_avro_datum, from_value, to_avro_datum, to_value};
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-const MAGIC: &[u8; 4] = b"NRCA";
-const ENVELOPE_VERSION: u8 = 1;
+use crate::durable::{DurableRecord, DurableRecordError, DurableRecordStore, EncodedRecord};
 
-static SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
-    Schema::parse_str(
-        r#"{
-          "type":"record", "name":"CatalogAttachmentV1", "namespace":"novarocks.frontend",
-          "fields":[
-            {"name":"attachment_id","type":"string"},
-            {"name":"instance_id","type":"string"},
-            {"name":"provider_id","type":"string"},
-            {"name":"display_name","type":"string"},
-            {"name":"durable_properties","type":{"type":"array","items":{"type":"record","name":"CatalogPropertyV1","fields":[{"name":"key","type":"string"},{"name":"value","type":"string"}]}}},
-            {"name":"created_at_ms","type":"long"}
-          ]
-        }"#,
-    )
-    .expect("catalog attachment v1 schema is valid")
-});
+/// Catalog attachments have no opaque payload fields. Their complete durable
+/// JSON record is capped at the global StateStore value budget before a write
+/// transaction is opened.
+const CATALOG_ATTACHMENT_ENCODED_LIMIT: usize = novarocks_spi::state_store::MAX_VALUE_BYTES;
+pub(crate) const CATALOG_ATTACHMENT_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StoredCatalogAttachment {
+    pub(crate) schema_version: u8,
     pub(crate) attachment_id: String,
     pub(crate) instance_id: String,
     pub(crate) provider_id: String,
@@ -54,43 +38,46 @@ pub(crate) struct StoredCatalogAttachment {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StoredProperty {
     pub(crate) key: String,
     pub(crate) value: String,
 }
 
-pub(crate) fn encode(value: &StoredCatalogAttachment) -> Result<Bytes, String> {
-    let encoded = to_avro_datum(&SCHEMA, to_value(value).map_err(|error| error.to_string())?)
-        .map_err(|error| format!("encode catalog attachment v1 Avro payload: {error}"))?;
-    let mut envelope = Vec::with_capacity(MAGIC.len() + 1 + encoded.len());
-    envelope.extend_from_slice(MAGIC);
-    envelope.push(ENVELOPE_VERSION);
-    envelope.extend_from_slice(&encoded);
-    Ok(Bytes::from(envelope))
+impl DurableRecord for StoredCatalogAttachment {
+    const RECORD_KIND: &'static str = "catalog-attachment";
+    const SCHEMA_VERSION: u8 = CATALOG_ATTACHMENT_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = CATALOG_ATTACHMENT_ENCODED_LIMIT;
+}
+
+pub(crate) fn encode(
+    store: &DurableRecordStore,
+    value: &StoredCatalogAttachment,
+) -> Result<EncodedRecord, DurableRecordError> {
+    store.encode(value)
 }
 
 pub(crate) fn decode(value: &[u8]) -> Result<StoredCatalogAttachment, String> {
-    if value.len() < MAGIC.len() + 1 || &value[..MAGIC.len()] != MAGIC {
-        return Err("catalog attachment has an invalid envelope magic".to_string());
-    }
-    if value[MAGIC.len()] != ENVELOPE_VERSION {
+    let stored = serde_json::from_slice::<StoredCatalogAttachment>(value)
+        .map_err(|error| format!("decode catalog attachment durable record: {error}"))?;
+    if stored.schema_version != CATALOG_ATTACHMENT_SCHEMA_VERSION {
         return Err(format!(
-            "catalog attachment has unsupported envelope version {}",
-            value[MAGIC.len()]
+            "catalog attachment has unsupported schema version {}",
+            stored.schema_version
         ));
     }
-    let datum = from_avro_datum(&SCHEMA, &mut Cursor::new(&value[MAGIC.len() + 1..]), None)
-        .map_err(|error| format!("decode catalog attachment v1 Avro payload: {error}"))?;
-    from_value(&datum).map_err(|error| format!("decode catalog attachment v1 fields: {error}"))
+    Ok(stored)
 }
 
 #[cfg(test)]
 mod tests {
+    use uuid::Uuid;
+
     use super::*;
 
-    #[test]
-    fn codec_round_trips_v1() {
-        let value = StoredCatalogAttachment {
+    fn stored_attachment() -> StoredCatalogAttachment {
+        StoredCatalogAttachment {
+            schema_version: CATALOG_ATTACHMENT_SCHEMA_VERSION,
             attachment_id: Uuid::now_v7().to_string(),
             instance_id: "warehouse".to_string(),
             provider_id: "iceberg".to_string(),
@@ -100,10 +87,47 @@ mod tests {
                 value: "iceberg".to_string(),
             }],
             created_at_ms: 42,
-        };
-        assert_eq!(
-            decode(&encode(&value).expect("encode")).expect("decode"),
-            value
+        }
+    }
+
+    #[test]
+    fn codec_round_trips_v1() {
+        let value = stored_attachment();
+        let store = DurableRecordStore::with_limits(
+            novarocks_spi::state_store::StateStoreLimits::default(),
         );
+        let encoded = encode(&store, &value).expect("encode");
+        assert_eq!(decode(encoded.as_bytes()).expect("decode"), value);
+    }
+
+    #[test]
+    fn codec_rejects_an_unknown_schema_version() {
+        let mut value = stored_attachment();
+        value.schema_version = CATALOG_ATTACHMENT_SCHEMA_VERSION + 1;
+        let encoded = serde_json::to_vec(&value).expect("serialize stored attachment");
+        assert!(
+            decode(&encoded)
+                .expect_err("unknown schema version must fail closed")
+                .contains("unsupported schema version")
+        );
+    }
+
+    #[test]
+    fn codec_reports_the_typed_record_budget_error() {
+        let mut value = stored_attachment();
+        value.display_name = "x".repeat(1_024);
+        let mut limits = novarocks_spi::state_store::StateStoreLimits::default();
+        limits.max_value_bytes = 256;
+        let error = encode(&DurableRecordStore::with_limits(limits), &value)
+            .expect_err("record beyond the StateStore limit must fail before a write");
+        assert!(matches!(
+            error,
+            DurableRecordError::BudgetExceeded {
+                record_kind: "catalog-attachment",
+                schema_version: CATALOG_ATTACHMENT_SCHEMA_VERSION,
+                actual_bytes,
+                limit_bytes: 256,
+            } if actual_bytes > 256
+        ));
     }
 }

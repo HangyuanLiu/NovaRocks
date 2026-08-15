@@ -44,7 +44,8 @@ use novarocks_spi::connector::{
     ConnectorMutationOperationId, ConnectorProviderId, ExternalMutationEvidence,
 };
 use novarocks_spi::state_store::{
-    Direction, FeDeploymentView, Key, KeyRange, RangeRequest, StateStore,
+    CommitOutcome, Direction, FeDeploymentView, Key, KeyRange, Precondition, RangeRequest,
+    StateStore, TransactionId, Value,
 };
 use novarocks_state_store::coordination::IncarnationGate;
 use novarocks_state_store::{
@@ -72,10 +73,13 @@ fn publication_evidence(
     .expect("test evidence")
 }
 
-fn sqlite_config(path: &Path) -> StateStoreConfig {
+fn sqlite_config_with_value_limit(path: &Path, max_value_bytes: Option<usize>) -> StateStoreConfig {
     StateStoreConfig {
         cluster_id: "statistics-repository-test".to_string(),
-        limits: StateStoreLimitOverrides::default(),
+        limits: StateStoreLimitOverrides {
+            max_value_bytes,
+            ..StateStoreLimitOverrides::default()
+        },
         provider: StateStoreProviderConfig::Sqlite {
             path: path.to_path_buf(),
             deployment_owner: "statistics-repository-fe".to_string(),
@@ -84,13 +88,22 @@ fn sqlite_config(path: &Path) -> StateStoreConfig {
 }
 
 async fn fixture() -> (TempDir, Arc<dyn StateStore>, StatisticsJobRepository) {
+    fixture_with_value_limit(None).await
+}
+
+async fn fixture_with_value_limit(
+    max_value_bytes: Option<usize>,
+) -> (TempDir, Arc<dyn StateStore>, StatisticsJobRepository) {
     let temp = TempDir::new().expect("create temp directory");
     let registry = builtin_state_store_provider_registry().expect("built-in provider registry");
     let store = StateStoreHost::open(
         &registry,
         StateStoreHostConfig {
             state_store: StateStoreAppConfig {
-                store: sqlite_config(&temp.path().join("state.sqlite")),
+                store: sqlite_config_with_value_limit(
+                    &temp.path().join("state.sqlite"),
+                    max_value_bytes,
+                ),
                 mysql_client: None,
             },
             foundationdb_client: None,
@@ -158,6 +171,43 @@ async fn stored_payloads(store: &dyn StateStore) -> Vec<String> {
     payloads
 }
 
+async fn replace_job_schema_version(
+    store: &dyn StateStore,
+    job_id: uuid::Uuid,
+    schema_version: u8,
+) {
+    let key = Key::try_from(Bytes::from(format!("{PREFIX}jobs/{job_id}"))).expect("valid job key");
+    let mut read = store.begin_read().await.expect("begin raw read");
+    let record = read
+        .get(&key)
+        .await
+        .expect("read stored job")
+        .expect("stored job");
+    read.abort().await.expect("finish raw read");
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(record.value.as_bytes()).expect("decode stored job JSON");
+    payload["schema_version"] = serde_json::json!(schema_version);
+    let mut write = store
+        .begin_write(
+            TransactionId::from(uuid::Uuid::now_v7()),
+            "replace statistics schema",
+        )
+        .await
+        .expect("begin raw write");
+    write
+        .put(
+            key,
+            Value::try_from(Bytes::from(
+                serde_json::to_vec(&payload).expect("encode stored job JSON"),
+            ))
+            .expect("bounded raw job value"),
+            Precondition::Any,
+        )
+        .await
+        .expect("replace stored job");
+    assert!(matches!(write.commit().await, CommitOutcome::Committed(_)));
+}
+
 #[tokio::test]
 async fn records_are_versioned_durable_and_identical_analyze_requests_remain_distinct() {
     let (_temp, store, repository) = fixture().await;
@@ -195,6 +245,47 @@ async fn records_are_versioned_durable_and_identical_analyze_requests_remain_dis
     for forbidden in ["artifact", "sketch", "runtime_handle", "record_batch"] {
         assert!(payloads.iter().all(|payload| !payload.contains(forbidden)));
     }
+}
+
+#[tokio::test]
+async fn record_budget_failure_is_typed_and_leaves_no_job_or_index_write() {
+    let (_temp, store, repository) = fixture_with_value_limit(Some(1)).await;
+
+    let error = repository
+        .create(request("budget_limited", 10))
+        .await
+        .expect_err("one-byte StateStore budget must reject the complete record");
+
+    assert_eq!(
+        error.kind(),
+        StatisticsJobRepositoryErrorKind::BudgetExceeded
+    );
+    assert_eq!(
+        error.budget().map(|budget| budget.record_kind),
+        Some("statistics-job")
+    );
+    let budget = error.budget().expect("typed record budget details");
+    assert_eq!(budget.schema_version, 2);
+    assert!(budget.actual_bytes > budget.limit_bytes);
+    assert_eq!(budget.limit_bytes, 1);
+    assert!(stored_payloads(store.as_ref()).await.is_empty());
+}
+
+#[tokio::test]
+async fn unsupported_stored_schema_fails_closed() {
+    let (_temp, store, repository) = fixture().await;
+    let created = repository
+        .create(request("schema_mismatch", 10))
+        .await
+        .expect("create durable job");
+    replace_job_schema_version(store.as_ref(), created.job_id, 255).await;
+
+    let error = repository
+        .get(created.job_id)
+        .await
+        .expect_err("unknown durable schema must not be decoded");
+    assert_eq!(error.kind(), StatisticsJobRepositoryErrorKind::Corruption);
+    assert!(error.to_string().contains("unsupported schema version"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

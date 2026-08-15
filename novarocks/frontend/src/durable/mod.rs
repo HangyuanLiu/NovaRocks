@@ -90,11 +90,13 @@ pub(crate) trait DurableRecord: Serialize {
 }
 
 /// A checked StateStore value. Only [`DurableRecordStore`] can consume it.
+#[derive(Clone)]
 pub(crate) struct EncodedRecord(Value);
 
 impl EncodedRecord {
-    pub(crate) fn into_value(self) -> Value {
-        self.0
+    #[cfg(test)]
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
     }
 }
 
@@ -220,6 +222,16 @@ impl DurableRecordStore {
         Ok(EncodedRecord(value))
     }
 
+    /// Compatibility adapter for existing pure codec call sites. Repository
+    /// mutation paths must retain [`Self::put_record`] and never write this
+    /// raw value directly.
+    pub(crate) fn encode_compat_value<R: DurableRecord>(
+        &self,
+        record: &R,
+    ) -> Result<Value, DurableRecordError> {
+        self.encode(record).map(|record| record.0)
+    }
+
     /// Encode a bounded, non-record StateStore value such as a state index.
     pub(crate) fn encode_small_value(
         &self,
@@ -246,9 +258,7 @@ impl DurableRecordStore {
         record: EncodedRecord,
         precondition: Precondition,
     ) -> Result<(), StateStoreError> {
-        transaction
-            .put(key, record.into_value(), precondition)
-            .await
+        transaction.put(key, record.0, precondition).await
     }
 }
 

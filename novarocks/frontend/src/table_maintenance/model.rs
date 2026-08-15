@@ -19,27 +19,45 @@ use bytes::Bytes;
 use novarocks::maintenance::{MaintenanceTarget, OptimizeJobState};
 use novarocks_spi::connector::ConnectorWriteExecutionId;
 use novarocks_state_store::coordination::FencingToken;
-use serde::{Deserialize, Serialize};
+use serde::ser::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
+
+use crate::durable::{DurableOpaqueBytes, DurableRecord};
 
 pub const OPTIMIZE_JOB_LEGACY_SCHEMA_VERSION: u8 = 1;
 pub const OPTIMIZE_JOB_SCHEMA_VERSION: u8 = 2;
 pub const METADATA_MAINTENANCE_OPERATION_LEGACY_SCHEMA_VERSION: u8 = 2;
 pub const METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION: u8 = 3;
-pub const METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+/// A metadata payload contributes at most 24 KiB after lowercase-hex durable
+/// encoding. Together with the 48 KiB full-record budget this leaves more
+/// than 20 KiB for target, owner, digests, lifecycle fields, and JSON framing.
+pub const METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES: usize = 12 * 1024;
+pub const METADATA_MAINTENANCE_RECORD_ENCODED_LIMIT: usize = 48 * 1024;
 /// E2 stores only bounded, credential-free handles in StateStore.  The
 /// provider-owned immutable manifest and reports live in object storage.
 pub const DISTRIBUTED_REWRITE_OPERATION_LEGACY_SCHEMA_VERSION: u8 = 3;
 pub const DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION: u8 = 4;
-pub const DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
-pub const DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES: usize = 64 * 1024;
+/// A rewrite payload contributes at most 24 KiB after durable encoding.
+/// Operation, payload, attempt, and transaction records each have separate
+/// 56 KiB budgets, leaving room for their fixed identifiers and framing.
+pub const DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES: usize = 12 * 1024;
+pub const DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES: usize = 12 * 1024;
+pub const DISTRIBUTED_REWRITE_RECORD_ENCODED_LIMIT: usize = 56 * 1024;
 /// V4 cleanup records retain only bounded, credential-free provider artifact
 /// handles. Candidate locations and object identities remain provider-owned.
 pub const CLEANUP_OPERATION_LEGACY_SCHEMA_VERSION: u8 = 4;
 pub const CLEANUP_OPERATION_SCHEMA_VERSION: u8 = 5;
-pub const CLEANUP_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+/// Cleanup plan records contain one handle and batch records can contain two.
+/// A 10 KiB raw handle becomes at most 20 KiB hex, so the two-handle batch
+/// remains below its 56 KiB whole-record budget with fixed metadata included.
+pub const CLEANUP_MAX_PAYLOAD_BYTES: usize = 10 * 1024;
+pub const CLEANUP_RECORD_ENCODED_LIMIT: usize = 56 * 1024;
 pub const CLEANUP_MAX_BATCHES: u16 = 256;
-pub const MAINTENANCE_FENCING_TOKEN_MAX_BYTES: usize = 8 * 1024;
+/// A fencing token contributes at most 8 KiB after durable hex encoding,
+/// leaving the enclosing operation records well below their 48/56 KiB limits.
+pub const MAINTENANCE_FENCING_TOKEN_MAX_BYTES: usize = 4 * 1024;
+pub const OPTIMIZE_JOB_RECORD_ENCODED_LIMIT: usize = 48 * 1024;
 
 /// Durable execution authority for one table-maintenance attempt.
 ///
@@ -47,7 +65,7 @@ pub const MAINTENANCE_FENCING_TOKEN_MAX_BYTES: usize = 8 * 1024;
 /// repository record remains provider-neutral and can prove which exact lease
 /// epoch was allowed to write it. `try_new` rejects non-canonical or
 /// unbounded provenance rather than accepting a best-effort replacement.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceAuthorityV1 {
     pub attempt_id: Uuid,
     pub fencing_token_v1: Vec<u8>,
@@ -55,6 +73,10 @@ pub struct MaintenanceAuthorityV1 {
 
 impl MaintenanceAuthorityV1 {
     pub fn try_new(attempt_id: Uuid, fencing_token_v1: Vec<u8>) -> Result<Self, String> {
+        DurableOpaqueBytes::<MAINTENANCE_FENCING_TOKEN_MAX_BYTES>::try_new(
+            fencing_token_v1.clone(),
+        )
+        .map_err(|error| format!("maintenance authority fencing token is invalid: {error}"))?;
         let authority = Self {
             attempt_id,
             fencing_token_v1,
@@ -69,11 +91,6 @@ impl MaintenanceAuthorityV1 {
         {
             return Err("maintenance authority attempt id must be UUIDv7".to_string());
         }
-        if self.fencing_token_v1.is_empty()
-            || self.fencing_token_v1.len() > MAINTENANCE_FENCING_TOKEN_MAX_BYTES
-        {
-            return Err("maintenance authority fencing token has invalid length".to_string());
-        }
         let token = FencingToken::decode_v1(Bytes::copy_from_slice(&self.fencing_token_v1))
             .map_err(|error| format!("maintenance authority fencing token is invalid: {error}"))?;
         let canonical = token.encode_v1().map_err(|error| {
@@ -83,6 +100,40 @@ impl MaintenanceAuthorityV1 {
             return Err("maintenance authority fencing token is non-canonical".to_string());
         }
         Ok(())
+    }
+}
+
+impl Serialize for MaintenanceAuthorityV1 {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct DurableAuthority {
+            attempt_id: Uuid,
+            fencing_token_v1: DurableOpaqueBytes<MAINTENANCE_FENCING_TOKEN_MAX_BYTES>,
+        }
+
+        let fencing_token_v1 =
+            DurableOpaqueBytes::try_new(self.fencing_token_v1.clone()).map_err(S::Error::custom)?;
+        DurableAuthority {
+            attempt_id: self.attempt_id,
+            fencing_token_v1,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MaintenanceAuthorityV1 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct DurableAuthority {
+            attempt_id: Uuid,
+            fencing_token_v1: DurableOpaqueBytes<MAINTENANCE_FENCING_TOKEN_MAX_BYTES>,
+        }
+
+        let durable = DurableAuthority::deserialize(deserializer)?;
+        Ok(Self {
+            attempt_id: durable.attempt_id,
+            fencing_token_v1: durable.fencing_token_v1.as_bytes().to_vec(),
+        })
     }
 }
 
@@ -174,6 +225,12 @@ pub(crate) struct StoredOptimizeCounterV1 {
     pub last_job_id: i64,
 }
 
+impl DurableRecord for StoredOptimizeCounterV1 {
+    const RECORD_KIND: &'static str = "table-maintenance-optimize-counter";
+    const SCHEMA_VERSION: u8 = OPTIMIZE_JOB_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = OPTIMIZE_JOB_RECORD_ENCODED_LIMIT;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum StoredOptimizeOperationActionV1 {
@@ -191,6 +248,18 @@ pub(crate) struct StoredOptimizeOperationV1 {
     pub action: StoredOptimizeOperationActionV1,
     pub job_id: i64,
     pub post_job: StoredOptimizeJobV1,
+}
+
+impl DurableRecord for StoredOptimizeOperationV1 {
+    const RECORD_KIND: &'static str = "table-maintenance-optimize-transaction";
+    const SCHEMA_VERSION: u8 = OPTIMIZE_JOB_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = OPTIMIZE_JOB_RECORD_ENCODED_LIMIT;
+}
+
+impl DurableRecord for StoredOptimizeJobV1 {
+    const RECORD_KIND: &'static str = "table-maintenance-optimize-job";
+    const SCHEMA_VERSION: u8 = OPTIMIZE_JOB_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = OPTIMIZE_JOB_RECORD_ENCODED_LIMIT;
 }
 
 impl From<&MaintenanceTarget> for StoredMaintenanceTargetV1 {
@@ -398,6 +467,12 @@ pub(crate) struct StoredMetadataMaintenanceOperationV2 {
     pub authority: Option<MaintenanceAuthorityV1>,
 }
 
+impl DurableRecord for StoredMetadataMaintenanceOperationV2 {
+    const RECORD_KIND: &'static str = "table-maintenance-metadata-operation";
+    const SCHEMA_VERSION: u8 = METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = METADATA_MAINTENANCE_RECORD_ENCODED_LIMIT;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum StoredMetadataMaintenanceTransactionActionV2 {
@@ -418,6 +493,12 @@ pub(crate) struct StoredMetadataMaintenanceTransactionV2 {
     pub post_operation: StoredMetadataMaintenanceOperationV2,
 }
 
+impl DurableRecord for StoredMetadataMaintenanceTransactionV2 {
+    const RECORD_KIND: &'static str = "table-maintenance-metadata-transaction";
+    const SCHEMA_VERSION: u8 = METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = METADATA_MAINTENANCE_RECORD_ENCODED_LIMIT;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum StoredMetadataMaintenancePayloadKindV2 {
@@ -432,7 +513,13 @@ pub(crate) struct StoredMetadataMaintenancePayloadV2 {
     pub schema_version: u8,
     pub kind: StoredMetadataMaintenancePayloadKindV2,
     pub digest: [u8; 32],
-    pub payload: Vec<u8>,
+    pub payload: DurableOpaqueBytes<METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES>,
+}
+
+impl DurableRecord for StoredMetadataMaintenancePayloadV2 {
+    const RECORD_KIND: &'static str = "table-maintenance-metadata-payload";
+    const SCHEMA_VERSION: u8 = METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = METADATA_MAINTENANCE_RECORD_ENCODED_LIMIT;
 }
 
 impl From<&StoredMetadataMaintenanceOperationV2> for MetadataMaintenanceOperation {
@@ -593,6 +680,12 @@ pub(crate) struct StoredDistributedRewriteOperationV3 {
     pub authority: Option<MaintenanceAuthorityV1>,
 }
 
+impl DurableRecord for StoredDistributedRewriteOperationV3 {
+    const RECORD_KIND: &'static str = "table-maintenance-distributed-rewrite-operation";
+    const SCHEMA_VERSION: u8 = DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = DISTRIBUTED_REWRITE_RECORD_ENCODED_LIMIT;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum StoredDistributedRewritePayloadKindV3 {
@@ -607,7 +700,13 @@ pub(crate) struct StoredDistributedRewritePayloadV3 {
     pub schema_version: u8,
     pub kind: StoredDistributedRewritePayloadKindV3,
     pub digest: [u8; 32],
-    pub payload: Vec<u8>,
+    pub payload: DurableOpaqueBytes<DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES>,
+}
+
+impl DurableRecord for StoredDistributedRewritePayloadV3 {
+    const RECORD_KIND: &'static str = "table-maintenance-distributed-rewrite-payload";
+    const SCHEMA_VERSION: u8 = DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = DISTRIBUTED_REWRITE_RECORD_ENCODED_LIMIT;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -620,8 +719,14 @@ pub(crate) struct StoredDistributedRewriteAttemptV3 {
     pub disposition: DistributedRewriteAttemptDisposition,
     pub attempt_digest: [u8; 32],
     pub artifact_digest: [u8; 32],
-    pub artifact_handle: Vec<u8>,
+    pub artifact_handle: DurableOpaqueBytes<DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES>,
     pub checkpoint_digest: [u8; 32],
+}
+
+impl DurableRecord for StoredDistributedRewriteAttemptV3 {
+    const RECORD_KIND: &'static str = "table-maintenance-distributed-rewrite-attempt";
+    const SCHEMA_VERSION: u8 = DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = DISTRIBUTED_REWRITE_RECORD_ENCODED_LIMIT;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -646,6 +751,12 @@ pub(crate) struct StoredDistributedRewriteTransactionV3 {
     pub action: StoredDistributedRewriteTransactionActionV3,
     pub operation_id: Uuid,
     pub post_operation: StoredDistributedRewriteOperationV3,
+}
+
+impl DurableRecord for StoredDistributedRewriteTransactionV3 {
+    const RECORD_KIND: &'static str = "table-maintenance-distributed-rewrite-transaction";
+    const SCHEMA_VERSION: u8 = DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = DISTRIBUTED_REWRITE_RECORD_ENCODED_LIMIT;
 }
 
 impl From<&StoredDistributedRewriteOperationV3> for DistributedRewriteOperation {
@@ -786,6 +897,12 @@ pub(crate) struct StoredCleanupOperationV4 {
     pub authority: Option<MaintenanceAuthorityV1>,
 }
 
+impl DurableRecord for StoredCleanupOperationV4 {
+    const RECORD_KIND: &'static str = "table-maintenance-cleanup-operation";
+    const SCHEMA_VERSION: u8 = CLEANUP_OPERATION_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = CLEANUP_RECORD_ENCODED_LIMIT;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct StoredCleanupPlanV4 {
     pub schema_version: u8,
@@ -794,11 +911,17 @@ pub(crate) struct StoredCleanupPlanV4 {
     pub base_state_digest: [u8; 32],
     pub manifest_digest: [u8; 32],
     pub artifact_handle_digest: [u8; 32],
-    pub artifact_handle: Vec<u8>,
+    pub artifact_handle: DurableOpaqueBytes<CLEANUP_MAX_PAYLOAD_BYTES>,
     pub candidate_count: u32,
     pub total_bytes: u64,
     pub manifest_parts: u16,
     pub batch_count: u16,
+}
+
+impl DurableRecord for StoredCleanupPlanV4 {
+    const RECORD_KIND: &'static str = "table-maintenance-cleanup-plan";
+    const SCHEMA_VERSION: u8 = CLEANUP_OPERATION_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = CLEANUP_RECORD_ENCODED_LIMIT;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -807,13 +930,19 @@ pub(crate) struct StoredCleanupBatchV4 {
     pub operation_id: Uuid,
     pub ordinal: u16,
     pub prepared_handle_digest: [u8; 32],
-    pub prepared_handle: Vec<u8>,
+    pub prepared_handle: DurableOpaqueBytes<CLEANUP_MAX_PAYLOAD_BYTES>,
     pub receipt_handle_digest: Option<[u8; 32]>,
-    pub receipt_handle: Option<Vec<u8>>,
+    pub receipt_handle: Option<DurableOpaqueBytes<CLEANUP_MAX_PAYLOAD_BYTES>>,
     pub deleted_count: u32,
     pub already_absent_count: u32,
     pub failed_count: u32,
     pub unknown_count: u32,
+}
+
+impl DurableRecord for StoredCleanupBatchV4 {
+    const RECORD_KIND: &'static str = "table-maintenance-cleanup-batch";
+    const SCHEMA_VERSION: u8 = CLEANUP_OPERATION_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = CLEANUP_RECORD_ENCODED_LIMIT;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -837,6 +966,12 @@ pub(crate) struct StoredCleanupTransactionV4 {
     pub action: StoredCleanupTransactionActionV4,
     pub operation_id: Uuid,
     pub post_operation: StoredCleanupOperationV4,
+}
+
+impl DurableRecord for StoredCleanupTransactionV4 {
+    const RECORD_KIND: &'static str = "table-maintenance-cleanup-transaction";
+    const SCHEMA_VERSION: u8 = CLEANUP_OPERATION_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = CLEANUP_RECORD_ENCODED_LIMIT;
 }
 
 impl From<&StoredCleanupOperationV4> for CleanupOperation {
