@@ -17,6 +17,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,10 +54,61 @@ id!(RuntimeFilterBindingId, u32);
 id!(RuntimeFilterChannelId, u32);
 id!(PartitionId, u32);
 id!(ProducerSequence, u64);
-id!(LogicalVersion, u64);
+
+/// A non-zero, monotonically increasing logical publication version.
+///
+/// Zero is reserved by wire envelopes that do not carry a logical artifact
+/// version (for example an unavailable frame), and is never a valid logical
+/// version inside the execution domain.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LogicalVersion(NonZeroU64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogicalVersionError {
+    Zero,
+}
+impl fmt::Display for LogicalVersionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero => f.write_str("logical runtime filter version must be non-zero"),
+        }
+    }
+}
+impl Error for LogicalVersionError {}
 
 impl LogicalVersion {
-    pub const FIRST: Self = Self(1);
+    pub const FIRST: Self = match NonZeroU64::new(1) {
+        Some(value) => Self(value),
+        None => panic!("one is non-zero"),
+    };
+
+    /// Constructs a logical version while enforcing the non-zero invariant.
+    ///
+    /// Decoder and byte-boundary callers must use this fallible constructor so
+    /// malformed zero values are reported as typed errors instead of entering
+    /// the execution domain.
+    pub const fn try_new(raw: u64) -> Result<Self, LogicalVersionError> {
+        match NonZeroU64::new(raw) {
+            Some(value) => Ok(Self(value)),
+            None => Err(LogicalVersionError::Zero),
+        }
+    }
+
+    /// Convenience for static, non-zero literals used by construction sites.
+    ///
+    /// Unlike the former tuple-like wrapper this validates `raw`; dynamic
+    /// values at protocol boundaries must use [`Self::try_new`].
+    pub const fn new(raw: u64) -> Self {
+        match Self::try_new(raw) {
+            Ok(value) => value,
+            Err(_) => panic!("logical runtime filter version must be non-zero"),
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
     pub const fn checked_next(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(v) => Some(Self(v)),
@@ -1490,6 +1542,12 @@ mod tests {
         )
         .expect("query evaluates");
         assert_eq!(outcome.effect().expect("evaluated query").output_rows(), 2);
+    }
+
+    #[test]
+    fn logical_version_rejects_zero_at_the_domain_boundary() {
+        assert_eq!(LogicalVersion::try_new(0), Err(LogicalVersionError::Zero));
+        assert_eq!(LogicalVersion::FIRST.get(), 1);
     }
 
     #[test]

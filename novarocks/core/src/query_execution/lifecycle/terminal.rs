@@ -31,14 +31,25 @@ use novarocks_execution::runtime::profile::RuntimeProfileTree;
 use novarocks_protocol::novarocks;
 
 use super::{
-    ParticipantBackendIdentity, ParticipantManifestDigest, QueryExecutionId, QueryLifecycleError,
+    ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest, QueryExecutionId,
+    QueryLifecycleError,
 };
 
 pub const QUERY_TERMINAL_SNAPSHOT_VERSION_V1: u32 = 1;
+/// Version carried by terminal delivery acknowledgements for both the proof
+/// and negative-attestation branches of `ParticipantTerminalOutcome`.
+pub const PARTICIPANT_TERMINAL_OUTCOME_VERSION_V1: u32 = 1;
 pub const QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1: u32 = 1;
+pub const QUERY_TERMINAL_FRAGMENT_OUTCOME_CODE_MAX_BYTES: usize = 128;
+pub const QUERY_TERMINAL_FRAGMENT_OUTCOME_DETAIL_MAX_BYTES: usize = 4096;
 const QUERY_TERMINAL_PROFILE_SECTION_MAX_ENTRIES: usize = 16_384;
 const QUERY_TERMINAL_SNAPSHOT_V1_DOMAIN: &[u8] =
     b"novarocks.query-lifecycle.terminal-snapshot.v1\0";
+const TERMINALIZATION_PROOF_V1_DOMAIN: &[u8] =
+    b"novarocks.query-lifecycle.terminalization-proof.v1\0";
+const NEGATIVE_ATTESTATION_V1_DOMAIN: &[u8] =
+    b"novarocks.query-lifecycle.negative-attestation.v1\0";
+const TERMINALIZATION_PROOF_VERSION_V1: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryTerminalSnapshotDigest([u8; 32]);
@@ -63,14 +74,56 @@ impl QueryTerminalSnapshotDigest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FragmentTerminalOutcome {
     Succeeded,
-    Failed { code: String, detail: String },
-    Cancelled { detail: String },
-    IncompleteDrain { detail: String },
+    Failed {
+        code: String,
+        detail: String,
+        detail_truncated: bool,
+    },
+    Cancelled {
+        detail: String,
+        detail_truncated: bool,
+    },
+    IncompleteDrain {
+        detail: String,
+        detail_truncated: bool,
+    },
 }
 
 impl FragmentTerminalOutcome {
     pub fn is_success(&self) -> bool {
         matches!(self, Self::Succeeded)
+    }
+
+    fn bounded(self) -> Self {
+        match self {
+            Self::Succeeded => Self::Succeeded,
+            Self::Failed { code, detail, .. } => {
+                let (code, _) = truncate_utf8(code, QUERY_TERMINAL_FRAGMENT_OUTCOME_CODE_MAX_BYTES);
+                let (detail, detail_truncated) =
+                    truncate_utf8(detail, QUERY_TERMINAL_FRAGMENT_OUTCOME_DETAIL_MAX_BYTES);
+                Self::Failed {
+                    code,
+                    detail,
+                    detail_truncated,
+                }
+            }
+            Self::Cancelled { detail, .. } => {
+                let (detail, detail_truncated) =
+                    truncate_utf8(detail, QUERY_TERMINAL_FRAGMENT_OUTCOME_DETAIL_MAX_BYTES);
+                Self::Cancelled {
+                    detail,
+                    detail_truncated,
+                }
+            }
+            Self::IncompleteDrain { detail, .. } => {
+                let (detail, detail_truncated) =
+                    truncate_utf8(detail, QUERY_TERMINAL_FRAGMENT_OUTCOME_DETAIL_MAX_BYTES);
+                Self::IncompleteDrain {
+                    detail,
+                    detail_truncated,
+                }
+            }
+        }
     }
 }
 
@@ -80,7 +133,7 @@ pub struct FragmentTerminalSnapshot {
     backend_num: i32,
     outcome: FragmentTerminalOutcome,
     sink: SinkCommitReportSnapshot,
-    profile: Option<RuntimeProfileTree>,
+    profile: TerminalTelemetry<RuntimeProfileTree>,
     statistics_payload: Vec<u8>,
 }
 
@@ -91,6 +144,20 @@ impl FragmentTerminalSnapshot {
         outcome: FragmentTerminalOutcome,
         sink: SinkCommitReportSnapshot,
         profile: Option<RuntimeProfileTree>,
+    ) -> Result<Self, QueryLifecycleError> {
+        let profile = match profile {
+            Some(profile) => TerminalTelemetry::Available(profile),
+            None => TerminalTelemetry::unavailable("fragment_profile", "PROFILE_UNAVAILABLE")?,
+        };
+        Self::new_with_profile_telemetry(fragment_instance_id, backend_num, outcome, sink, profile)
+    }
+
+    pub fn new_with_profile_telemetry(
+        fragment_instance_id: UniqueId,
+        backend_num: i32,
+        outcome: FragmentTerminalOutcome,
+        sink: SinkCommitReportSnapshot,
+        profile: TerminalTelemetry<RuntimeProfileTree>,
     ) -> Result<Self, QueryLifecycleError> {
         if fragment_instance_id.high() == 0 && fragment_instance_id.low() == 0 {
             return Err(QueryLifecycleError::invalid_manifest(
@@ -105,7 +172,7 @@ impl FragmentTerminalSnapshot {
         Ok(Self {
             fragment_instance_id,
             backend_num,
-            outcome,
+            outcome: outcome.bounded(),
             sink,
             profile,
             statistics_payload: Vec::new(),
@@ -122,9 +189,11 @@ impl FragmentTerminalSnapshot {
             FragmentOutcome::Failed(error) => FragmentTerminalOutcome::Failed {
                 code: "FRAGMENT_EXECUTION_FAILED".to_string(),
                 detail: error.to_string(),
+                detail_truncated: false,
             },
             FragmentOutcome::Cancelled { reason } => FragmentTerminalOutcome::Cancelled {
                 detail: reason.detail().to_string(),
+                detail_truncated: false,
             },
         };
         Self::new(
@@ -154,7 +223,11 @@ impl FragmentTerminalSnapshot {
     }
 
     pub const fn profile(&self) -> Option<&RuntimeProfileTree> {
-        self.profile.as_ref()
+        self.profile.available()
+    }
+
+    pub const fn profile_telemetry(&self) -> &TerminalTelemetry<RuntimeProfileTree> {
+        &self.profile
     }
 
     pub fn with_statistics_payload(
@@ -174,6 +247,471 @@ impl FragmentTerminalSnapshot {
 
     pub fn statistics_payload(&self) -> &[u8] {
         &self.statistics_payload
+    }
+}
+
+/// A P0-only fragment terminal fact. It deliberately omits all P1 correctness
+/// evidence and P2 telemetry so an outcome can be retained independently.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalizationProofFragment {
+    fragment_instance_id: UniqueId,
+    backend_num: i32,
+    outcome: FragmentTerminalOutcome,
+}
+
+impl TerminalizationProofFragment {
+    pub fn new(
+        fragment_instance_id: UniqueId,
+        backend_num: i32,
+        outcome: FragmentTerminalOutcome,
+    ) -> Result<Self, QueryLifecycleError> {
+        if fragment_instance_id.high() == 0 && fragment_instance_id.low() == 0 {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "terminalization proof fragment instance id must be nonzero",
+            ));
+        }
+        if backend_num < 0 {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "terminalization proof fragment backend number must be nonnegative",
+            ));
+        }
+        Ok(Self {
+            fragment_instance_id,
+            backend_num,
+            outcome: outcome.bounded(),
+        })
+    }
+
+    fn from_snapshot(snapshot: &FragmentTerminalSnapshot) -> Self {
+        Self::new(
+            snapshot.fragment_instance_id(),
+            snapshot.backend_num(),
+            snapshot.outcome().clone(),
+        )
+        .expect("fragment terminal snapshot is valid proof input")
+    }
+
+    pub const fn fragment_instance_id(&self) -> UniqueId {
+        self.fragment_instance_id
+    }
+
+    pub const fn backend_num(&self) -> i32 {
+        self.backend_num
+    }
+
+    pub const fn outcome(&self) -> &FragmentTerminalOutcome {
+        &self.outcome
+    }
+}
+
+/// The bounded P0 record proving a participant's terminal state was frozen.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalizationProof {
+    version: u32,
+    execution_id: QueryExecutionId,
+    backend: ParticipantBackendIdentity,
+    init_digest: ParticipantManifestDigest,
+    fragments: Vec<TerminalizationProofFragment>,
+    digest: QueryTerminalSnapshotDigest,
+}
+
+impl TerminalizationProof {
+    pub fn from_snapshot(snapshot: &QueryTerminalSnapshot) -> Result<Self, QueryLifecycleError> {
+        Self::new(
+            snapshot.execution_id(),
+            snapshot.backend().clone(),
+            snapshot.init_digest(),
+            snapshot
+                .fragments()
+                .iter()
+                .map(TerminalizationProofFragment::from_snapshot)
+                .collect(),
+        )
+    }
+
+    pub fn new(
+        execution_id: QueryExecutionId,
+        backend: ParticipantBackendIdentity,
+        init_digest: ParticipantManifestDigest,
+        mut fragments: Vec<TerminalizationProofFragment>,
+    ) -> Result<Self, QueryLifecycleError> {
+        fragments.sort_by_key(TerminalizationProofFragment::fragment_instance_id);
+        let mut ids = BTreeSet::new();
+        for fragment in &fragments {
+            if !ids.insert(fragment.fragment_instance_id) {
+                return Err(QueryLifecycleError::invalid_manifest(
+                    "terminalization proof contains duplicate fragment facts",
+                ));
+            }
+        }
+        let mut proof = Self {
+            version: TERMINALIZATION_PROOF_VERSION_V1,
+            execution_id,
+            backend,
+            init_digest,
+            fragments,
+            digest: QueryTerminalSnapshotDigest::new([0; 32]),
+        };
+        proof.digest = proof.compute_digest();
+        Ok(proof)
+    }
+
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub const fn execution_id(&self) -> QueryExecutionId {
+        self.execution_id
+    }
+
+    pub const fn backend(&self) -> &ParticipantBackendIdentity {
+        &self.backend
+    }
+
+    pub const fn init_digest(&self) -> ParticipantManifestDigest {
+        self.init_digest
+    }
+
+    pub fn fragments(&self) -> &[TerminalizationProofFragment] {
+        &self.fragments
+    }
+
+    pub const fn digest(&self) -> QueryTerminalSnapshotDigest {
+        self.digest
+    }
+
+    pub fn validate(&self) -> Result<(), QueryLifecycleError> {
+        if self.version != TERMINALIZATION_PROOF_VERSION_V1 {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "unsupported terminalization proof version",
+            ));
+        }
+        if self.compute_digest() != self.digest {
+            return Err(QueryLifecycleError::new(
+                super::QueryLifecycleErrorCode::Conflict,
+                "terminalization proof digest does not match canonical content",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, self.version);
+        put_i64(&mut bytes, self.execution_id.query_id().high());
+        put_i64(&mut bytes, self.execution_id.query_id().low());
+        put_u64(&mut bytes, self.execution_id.attempt_id().get());
+        put_u64(&mut bytes, self.backend.backend_id());
+        put_string(&mut bytes, self.backend.endpoint().host());
+        put_u16(&mut bytes, self.backend.endpoint().port());
+        put_u64(&mut bytes, self.backend.start_epoch());
+        put_bytes(&mut bytes, self.init_digest.as_bytes());
+        put_u64(&mut bytes, self.fragments.len() as u64);
+        for fragment in &self.fragments {
+            put_i64(&mut bytes, fragment.fragment_instance_id.high());
+            put_i64(&mut bytes, fragment.fragment_instance_id.low());
+            put_i32(&mut bytes, fragment.backend_num);
+            put_fragment_outcome(&mut bytes, &fragment.outcome);
+        }
+        bytes
+    }
+
+    fn compute_digest(&self) -> QueryTerminalSnapshotDigest {
+        let mut hasher = Sha256::new();
+        hasher.update(TERMINALIZATION_PROOF_V1_DOMAIN);
+        hasher.update(self.canonical_bytes());
+        QueryTerminalSnapshotDigest::new(hasher.finalize().into())
+    }
+}
+
+/// Worst-case P0 canonical payload size for a participant manifest. Backend
+/// QLC reserves this before ControlReady, independently of P1/P2 payloads.
+pub fn p0_max_encoded_len(manifest: &ParticipantManifest) -> usize {
+    let backend = manifest.backend();
+    let fixed_header = 4 + 8 + 8 + 8 + 8 + 8 + backend.endpoint().host().len() + 2 + 8 + 8 + 32 + 8;
+    let max_outcome = 1
+        + 8
+        + QUERY_TERMINAL_FRAGMENT_OUTCOME_CODE_MAX_BYTES
+        + 8
+        + QUERY_TERMINAL_FRAGMENT_OUTCOME_DETAIL_MAX_BYTES
+        + 1;
+    let proof_max = fixed_header.saturating_add(
+        manifest
+            .expected_fragment_instance_ids()
+            .len()
+            .saturating_mul(16 + 4 + max_outcome),
+    );
+    // An attestation has no fragment list, so a coordinator-only participant
+    // still needs a pre-ready reservation large enough for its bounded detail.
+    let attestation_max = 8
+        + 8
+        + 8
+        + 8
+        + 8
+        + backend.endpoint().host().len()
+        + 2
+        + 8
+        + 32
+        + 1
+        + 8
+        + QUERY_TERMINAL_FRAGMENT_OUTCOME_DETAIL_MAX_BYTES
+        + 1;
+    proof_max.max(attestation_max)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NegativeAttestationReason {
+    AttemptAborted,
+    AttemptTombstoned,
+    TerminalStateInvalid,
+    CorrectnessEvidenceEncodingFailed,
+    CorrectnessEvidenceRetentionExhausted,
+}
+
+impl NegativeAttestationReason {
+    fn tag(self) -> u8 {
+        match self {
+            Self::AttemptAborted => 1,
+            Self::AttemptTombstoned => 2,
+            Self::TerminalStateInvalid => 3,
+            Self::CorrectnessEvidenceEncodingFailed => 4,
+            Self::CorrectnessEvidenceRetentionExhausted => 5,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NegativeAttestation {
+    execution_id: QueryExecutionId,
+    backend: ParticipantBackendIdentity,
+    init_digest: ParticipantManifestDigest,
+    reason: NegativeAttestationReason,
+    detail: String,
+    detail_truncated: bool,
+    digest: QueryTerminalSnapshotDigest,
+}
+
+impl NegativeAttestation {
+    pub fn new(
+        execution_id: QueryExecutionId,
+        backend: ParticipantBackendIdentity,
+        init_digest: ParticipantManifestDigest,
+        reason: NegativeAttestationReason,
+        detail: String,
+    ) -> Self {
+        let (detail, detail_truncated) =
+            truncate_utf8(detail, QUERY_TERMINAL_FRAGMENT_OUTCOME_DETAIL_MAX_BYTES);
+        let mut attestation = Self {
+            execution_id,
+            backend,
+            init_digest,
+            reason,
+            detail,
+            detail_truncated,
+            digest: QueryTerminalSnapshotDigest::new([0; 32]),
+        };
+        attestation.digest = attestation.compute_digest();
+        attestation
+    }
+
+    pub const fn execution_id(&self) -> QueryExecutionId {
+        self.execution_id
+    }
+
+    pub const fn backend(&self) -> &ParticipantBackendIdentity {
+        &self.backend
+    }
+
+    pub const fn init_digest(&self) -> ParticipantManifestDigest {
+        self.init_digest
+    }
+
+    pub const fn reason(&self) -> NegativeAttestationReason {
+        self.reason
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    pub const fn detail_truncated(&self) -> bool {
+        self.detail_truncated
+    }
+
+    pub const fn digest(&self) -> QueryTerminalSnapshotDigest {
+        self.digest
+    }
+
+    pub fn validate(&self) -> Result<(), QueryLifecycleError> {
+        if self.compute_digest() != self.digest {
+            return Err(QueryLifecycleError::new(
+                super::QueryLifecycleErrorCode::Conflict,
+                "negative attestation digest does not match canonical content",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        put_i64(&mut bytes, self.execution_id.query_id().high());
+        put_i64(&mut bytes, self.execution_id.query_id().low());
+        put_u64(&mut bytes, self.execution_id.attempt_id().get());
+        put_u64(&mut bytes, self.backend.backend_id());
+        put_string(&mut bytes, self.backend.endpoint().host());
+        put_u16(&mut bytes, self.backend.endpoint().port());
+        put_u64(&mut bytes, self.backend.start_epoch());
+        put_bytes(&mut bytes, self.init_digest.as_bytes());
+        put_u8(&mut bytes, self.reason.tag());
+        put_string(&mut bytes, &self.detail);
+        put_u8(&mut bytes, u8::from(self.detail_truncated));
+        bytes
+    }
+
+    fn compute_digest(&self) -> QueryTerminalSnapshotDigest {
+        let mut hasher = Sha256::new();
+        hasher.update(NEGATIVE_ATTESTATION_V1_DOMAIN);
+        hasher.update(self.canonical_bytes());
+        QueryTerminalSnapshotDigest::new(hasher.finalize().into())
+    }
+}
+
+/// Stable, bounded reason for a P2 value that was intentionally omitted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalTelemetryUnavailable {
+    stage: String,
+    code: String,
+}
+
+impl TerminalTelemetryUnavailable {
+    pub fn new(
+        stage: impl Into<String>,
+        code: impl Into<String>,
+    ) -> Result<Self, QueryLifecycleError> {
+        let stage = stage.into();
+        let code = code.into();
+        if stage.trim().is_empty() || code.trim().is_empty() {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "terminal telemetry unavailable stage and code must be nonempty",
+            ));
+        }
+        Ok(Self { stage, code })
+    }
+
+    pub fn stage(&self) -> &str {
+        &self.stage
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+}
+
+/// Typed P2 availability. P1 values are intentionally not represented here.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TerminalTelemetry<T> {
+    Available(T),
+    Unavailable(TerminalTelemetryUnavailable),
+}
+
+impl<T> TerminalTelemetry<T> {
+    pub fn unavailable(
+        stage: impl Into<String>,
+        code: impl Into<String>,
+    ) -> Result<Self, QueryLifecycleError> {
+        Ok(Self::Unavailable(TerminalTelemetryUnavailable::new(
+            stage, code,
+        )?))
+    }
+
+    pub const fn available(&self) -> Option<&T> {
+        match self {
+            Self::Available(value) => Some(value),
+            Self::Unavailable(_) => None,
+        }
+    }
+
+    pub const fn unavailable_reason(&self) -> Option<&TerminalTelemetryUnavailable> {
+        match self {
+            Self::Available(_) => None,
+            Self::Unavailable(reason) => Some(reason),
+        }
+    }
+}
+
+/// The only Backend-authored participant terminal result. A proof retains the
+/// complete P1 snapshot alongside its independently deliverable P0 proof;
+/// an attestation states that a valid snapshot could not be formed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ParticipantTerminalOutcome {
+    Proof {
+        proof: TerminalizationProof,
+        snapshot: QueryTerminalSnapshot,
+    },
+    NegativeAttestation(NegativeAttestation),
+}
+
+impl ParticipantTerminalOutcome {
+    pub fn proof(snapshot: QueryTerminalSnapshot) -> Result<Self, QueryLifecycleError> {
+        let proof = TerminalizationProof::from_snapshot(&snapshot)?;
+        Ok(Self::Proof { proof, snapshot })
+    }
+
+    pub fn negative_attestation(attestation: NegativeAttestation) -> Self {
+        Self::NegativeAttestation(attestation)
+    }
+
+    pub const fn execution_id(&self) -> QueryExecutionId {
+        match self {
+            Self::Proof { proof, .. } => proof.execution_id(),
+            Self::NegativeAttestation(attestation) => attestation.execution_id(),
+        }
+    }
+
+    /// A negative attestation has no snapshot, so terminal delivery uses this
+    /// outcome-level version rather than the snapshot version in its ACK
+    /// identity. The value is shared by both variants deliberately.
+    pub const fn version(&self) -> u32 {
+        PARTICIPANT_TERMINAL_OUTCOME_VERSION_V1
+    }
+
+    pub const fn backend(&self) -> &ParticipantBackendIdentity {
+        match self {
+            Self::Proof { proof, .. } => proof.backend(),
+            Self::NegativeAttestation(attestation) => attestation.backend(),
+        }
+    }
+
+    pub const fn init_digest(&self) -> ParticipantManifestDigest {
+        match self {
+            Self::Proof { proof, .. } => proof.init_digest(),
+            Self::NegativeAttestation(attestation) => attestation.init_digest(),
+        }
+    }
+
+    pub const fn digest(&self) -> QueryTerminalSnapshotDigest {
+        match self {
+            Self::Proof { proof, .. } => proof.digest(),
+            Self::NegativeAttestation(attestation) => attestation.digest(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), QueryLifecycleError> {
+        match self {
+            Self::Proof { proof, snapshot } => {
+                proof.validate()?;
+                snapshot.validate()?;
+                let expected = TerminalizationProof::from_snapshot(snapshot)?;
+                if &expected != proof {
+                    return Err(QueryLifecycleError::new(
+                        super::QueryLifecycleErrorCode::Conflict,
+                        "terminalization proof does not match the immutable terminal snapshot",
+                    ));
+                }
+                Ok(())
+            }
+            Self::NegativeAttestation(attestation) => attestation.validate(),
+        }
     }
 }
 
@@ -1083,7 +1621,7 @@ pub struct QueryTerminalSnapshot {
     backend: ParticipantBackendIdentity,
     init_digest: ParticipantManifestDigest,
     fragments: Vec<FragmentTerminalSnapshot>,
-    profile_contribution: QueryTerminalProfileContributionV1,
+    profile_contribution: TerminalTelemetry<QueryTerminalProfileContributionV1>,
     digest: QueryTerminalSnapshotDigest,
 }
 
@@ -1121,6 +1659,22 @@ impl QueryTerminalSnapshot {
         mut fragments: Vec<FragmentTerminalSnapshot>,
         profile_contribution: QueryTerminalProfileContributionV1,
     ) -> Result<Self, QueryLifecycleError> {
+        Self::new_with_profile_telemetry(
+            execution_id,
+            backend,
+            init_digest,
+            fragments,
+            TerminalTelemetry::Available(profile_contribution),
+        )
+    }
+
+    pub fn new_with_profile_telemetry(
+        execution_id: QueryExecutionId,
+        backend: ParticipantBackendIdentity,
+        init_digest: ParticipantManifestDigest,
+        mut fragments: Vec<FragmentTerminalSnapshot>,
+        profile_contribution: TerminalTelemetry<QueryTerminalProfileContributionV1>,
+    ) -> Result<Self, QueryLifecycleError> {
         fragments.sort_by_key(|fact| fact.fragment_instance_id());
         let mut ids = BTreeSet::new();
         for fragment in &fragments {
@@ -1130,7 +1684,9 @@ impl QueryTerminalSnapshot {
                 ));
             }
         }
-        profile_contribution.validate()?;
+        if let TerminalTelemetry::Available(contribution) = &profile_contribution {
+            contribution.validate()?;
+        }
         let mut snapshot = Self {
             version: QUERY_TERMINAL_SNAPSHOT_VERSION_V1,
             execution_id,
@@ -1164,7 +1720,13 @@ impl QueryTerminalSnapshot {
         &self.fragments
     }
 
-    pub const fn profile_contribution(&self) -> &QueryTerminalProfileContributionV1 {
+    pub const fn profile_contribution(&self) -> Option<&QueryTerminalProfileContributionV1> {
+        self.profile_contribution.available()
+    }
+
+    pub const fn profile_contribution_telemetry(
+        &self,
+    ) -> &TerminalTelemetry<QueryTerminalProfileContributionV1> {
         &self.profile_contribution
     }
 
@@ -1184,7 +1746,9 @@ impl QueryTerminalSnapshot {
                 "unsupported query terminal snapshot version",
             ));
         }
-        self.profile_contribution.validate()?;
+        if let TerminalTelemetry::Available(contribution) = &self.profile_contribution {
+            contribution.validate()?;
+        }
         if self.compute_digest() != self.digest {
             return Err(QueryLifecycleError::new(
                 super::QueryLifecycleErrorCode::Conflict,
@@ -1212,31 +1776,58 @@ impl QueryTerminalSnapshot {
             put_i32(&mut bytes, fragment.backend_num);
             match &fragment.outcome {
                 FragmentTerminalOutcome::Succeeded => put_u8(&mut bytes, 1),
-                FragmentTerminalOutcome::Failed { code, detail } => {
+                FragmentTerminalOutcome::Failed {
+                    code,
+                    detail,
+                    detail_truncated,
+                } => {
                     put_u8(&mut bytes, 2);
                     put_string(&mut bytes, code);
                     put_string(&mut bytes, detail);
+                    put_u8(&mut bytes, u8::from(*detail_truncated));
                 }
-                FragmentTerminalOutcome::Cancelled { detail } => {
+                FragmentTerminalOutcome::Cancelled {
+                    detail,
+                    detail_truncated,
+                } => {
                     put_u8(&mut bytes, 3);
                     put_string(&mut bytes, detail);
+                    put_u8(&mut bytes, u8::from(*detail_truncated));
                 }
-                FragmentTerminalOutcome::IncompleteDrain { detail } => {
+                FragmentTerminalOutcome::IncompleteDrain {
+                    detail,
+                    detail_truncated,
+                } => {
                     put_u8(&mut bytes, 4);
                     put_string(&mut bytes, detail);
+                    put_u8(&mut bytes, u8::from(*detail_truncated));
                 }
             }
             put_sink(&mut bytes, &fragment.sink);
             match &fragment.profile {
-                Some(profile) => {
+                TerminalTelemetry::Available(profile) => {
                     put_u8(&mut bytes, 1);
                     put_profile(&mut bytes, profile);
                 }
-                None => put_u8(&mut bytes, 0),
+                TerminalTelemetry::Unavailable(reason) => {
+                    put_u8(&mut bytes, 2);
+                    put_string(&mut bytes, reason.stage());
+                    put_string(&mut bytes, reason.code());
+                }
             }
             put_bytes(&mut bytes, &fragment.statistics_payload);
         }
-        self.profile_contribution.put_canonical(&mut bytes);
+        match &self.profile_contribution {
+            TerminalTelemetry::Available(contribution) => {
+                put_u8(&mut bytes, 1);
+                contribution.put_canonical(&mut bytes);
+            }
+            TerminalTelemetry::Unavailable(reason) => {
+                put_u8(&mut bytes, 2);
+                put_string(&mut bytes, reason.stage());
+                put_string(&mut bytes, reason.code());
+            }
+        }
         bytes
     }
 
@@ -1246,6 +1837,17 @@ impl QueryTerminalSnapshot {
         hasher.update(self.canonical_bytes());
         QueryTerminalSnapshotDigest::new(hasher.finalize().into())
     }
+}
+
+fn truncate_utf8(value: String, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value, false);
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (value[..end].to_owned(), true)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1327,6 +1929,38 @@ impl QueryTerminalSet {
 
     pub fn is_success(&self) -> bool {
         self.snapshots.iter().all(QueryTerminalSnapshot::is_success)
+    }
+}
+
+fn put_fragment_outcome(bytes: &mut Vec<u8>, outcome: &FragmentTerminalOutcome) {
+    match outcome {
+        FragmentTerminalOutcome::Succeeded => put_u8(bytes, 1),
+        FragmentTerminalOutcome::Failed {
+            code,
+            detail,
+            detail_truncated,
+        } => {
+            put_u8(bytes, 2);
+            put_string(bytes, code);
+            put_string(bytes, detail);
+            put_u8(bytes, u8::from(*detail_truncated));
+        }
+        FragmentTerminalOutcome::Cancelled {
+            detail,
+            detail_truncated,
+        } => {
+            put_u8(bytes, 3);
+            put_string(bytes, detail);
+            put_u8(bytes, u8::from(*detail_truncated));
+        }
+        FragmentTerminalOutcome::IncompleteDrain {
+            detail,
+            detail_truncated,
+        } => {
+            put_u8(bytes, 4);
+            put_string(bytes, detail);
+            put_u8(bytes, u8::from(*detail_truncated));
+        }
     }
 }
 
@@ -1568,10 +2202,13 @@ fn put_string(bytes: &mut Vec<u8>, value: &str) {
 mod tests {
     use super::*;
     use crate::query_execution::contract::QueryId;
-    use crate::query_execution::lifecycle::{AttemptId, QueryControlEndpoint};
+    use crate::query_execution::lifecycle::{
+        AttemptId, ParticipantQueryOptions, ParticipantRole, QueryControlEndpoint,
+    };
     use novarocks_execution::runtime::profile::{
         CounterStrategy, ProfileCounter, ProfileNode, ProfileUnit, RuntimeProfileTree,
     };
+    use novarocks_execution::runtime::query_options::QueryOptions;
 
     fn snapshot(fragment_ids: &[i64]) -> QueryTerminalSnapshot {
         let execution =
@@ -1602,6 +2239,141 @@ mod tests {
             facts,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn terminal_outcome_bounds_utf8_diagnostics_without_touching_p1() {
+        let detail = "测".repeat(QUERY_TERMINAL_FRAGMENT_OUTCOME_DETAIL_MAX_BYTES);
+        let snapshot = FragmentTerminalSnapshot::new(
+            UniqueId::new(7, 8),
+            1,
+            FragmentTerminalOutcome::Failed {
+                code: "C".repeat(QUERY_TERMINAL_FRAGMENT_OUTCOME_CODE_MAX_BYTES + 1),
+                detail,
+                detail_truncated: false,
+            },
+            SinkCommitReportSnapshot::default(),
+            None,
+        )
+        .expect("bounded terminal snapshot");
+        match snapshot.outcome() {
+            FragmentTerminalOutcome::Failed {
+                code,
+                detail,
+                detail_truncated,
+            } => {
+                assert_eq!(code.len(), QUERY_TERMINAL_FRAGMENT_OUTCOME_CODE_MAX_BYTES);
+                assert!(detail.len() <= QUERY_TERMINAL_FRAGMENT_OUTCOME_DETAIL_MAX_BYTES);
+                assert!(detail.is_char_boundary(detail.len()));
+                assert!(*detail_truncated);
+            }
+            outcome => panic!("expected failed outcome, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn proof_is_independent_of_snapshot_p1_and_has_a_stable_digest() {
+        let snapshot = snapshot(&[3, 1]);
+        let proof = TerminalizationProof::from_snapshot(&snapshot).expect("proof");
+        assert_eq!(proof.fragments().len(), 2);
+        assert!(proof.validate().is_ok());
+        assert_eq!(
+            ParticipantTerminalOutcome::proof(snapshot.clone())
+                .expect("outcome")
+                .digest(),
+            proof.digest()
+        );
+    }
+
+    #[test]
+    fn p0_proof_bound_covers_the_worst_case_fragment_outcomes() {
+        let execution =
+            QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap();
+        let backend = ParticipantBackendIdentity::new(
+            1,
+            QueryControlEndpoint::new("127.0.0.1", 9030).unwrap(),
+            1,
+        )
+        .unwrap();
+        let ids = [UniqueId::new(0, 1), UniqueId::new(0, 2)];
+        let manifest = ParticipantManifest::new(
+            execution,
+            backend.clone(),
+            [ParticipantRole::FragmentExecutor],
+            ids,
+            ParticipantQueryOptions::new(QueryOptions::default()),
+            1_000,
+            [],
+            None,
+            std::time::Duration::from_secs(30),
+            QueryControlEndpoint::new("127.0.0.1", 9031).unwrap(),
+        )
+        .unwrap();
+        let facts = ids
+            .into_iter()
+            .map(|id| {
+                FragmentTerminalSnapshot::new(
+                    id,
+                    0,
+                    FragmentTerminalOutcome::Failed {
+                        code: "C".repeat(QUERY_TERMINAL_FRAGMENT_OUTCOME_CODE_MAX_BYTES),
+                        detail: "D".repeat(QUERY_TERMINAL_FRAGMENT_OUTCOME_DETAIL_MAX_BYTES),
+                        detail_truncated: false,
+                    },
+                    SinkCommitReportSnapshot::default(),
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        let snapshot = QueryTerminalSnapshot::new(
+            execution,
+            backend,
+            ParticipantManifestDigest::new([7; 32]),
+            facts,
+        )
+        .unwrap();
+        assert!(
+            TerminalizationProof::from_snapshot(&snapshot)
+                .unwrap()
+                .canonical_bytes()
+                .len()
+                <= p0_max_encoded_len(&manifest)
+        );
+    }
+
+    #[test]
+    fn p2_unavailable_is_explicit_and_does_not_block_proof_construction() {
+        let fragment = FragmentTerminalSnapshot::new_with_profile_telemetry(
+            UniqueId::new(7, 8),
+            1,
+            FragmentTerminalOutcome::Succeeded,
+            SinkCommitReportSnapshot::default(),
+            TerminalTelemetry::unavailable("profile_assembly", "BUDGET_EXHAUSTED").unwrap(),
+        )
+        .unwrap();
+        let snapshot = QueryTerminalSnapshot::new_with_profile_telemetry(
+            QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap(),
+            ParticipantBackendIdentity::new(
+                1,
+                QueryControlEndpoint::new("127.0.0.1", 9030).unwrap(),
+                1,
+            )
+            .unwrap(),
+            ParticipantManifestDigest::new([7; 32]),
+            vec![fragment],
+            TerminalTelemetry::unavailable("observation_assembly", "BUDGET_EXHAUSTED").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot
+                .profile_contribution_telemetry()
+                .unavailable_reason()
+                .unwrap()
+                .code(),
+            "BUDGET_EXHAUSTED"
+        );
+        assert!(TerminalizationProof::from_snapshot(&snapshot).is_ok());
     }
 
     #[test]

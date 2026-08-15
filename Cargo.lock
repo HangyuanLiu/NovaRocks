@@ -3239,6 +3239,9 @@ dependencies = [
  "anyhow",
  "mysql",
  "novarocks-test-support",
+ "reqwest",
+ "serde",
+ "serde_json",
  "toml",
 ]
 
@@ -4680,6 +4683,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",

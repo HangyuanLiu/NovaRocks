@@ -52,10 +52,7 @@ use super::domain::{
     BackendRuntimeFilterEvent, BackendRuntimeFilterEventObserver, BackendRuntimeFilterSession,
     BackendTransportEventIdentity, BackendTransportEventKind, BackendTransportFailOpenReason,
 };
-use super::observation::{
-    RuntimeFilterObservationEmitter, RuntimeFilterObservationError,
-    RuntimeFilterObservationSnapshot,
-};
+use super::observation::{RuntimeFilterObservationEmitter, RuntimeFilterObservationSnapshot};
 use crate::native::runtime_filter_adapter::{
     BackendNativeContributionRouteIdentity, BackendNativeDeliveryRouteIdentity,
     BackendNativeProducerInstanceRouteIdentity, BackendNativeRouteIdentity,
@@ -474,15 +471,11 @@ impl RuntimeFilterParticipant {
             BackendDeliveryAdmission::Fresh => {}
             BackendDeliveryAdmission::Duplicate => return BackendIngressResult::duplicate(),
             BackendDeliveryAdmission::Conflict => {
-                self.observation
-                    .reject(RuntimeFilterObservationError::DeliveryConflict);
                 return rejected(
                     "runtime filter ingress rejected [artifact-delivery]: replay content conflicts with an admitted delivery",
                 );
             }
             BackendDeliveryAdmission::ResourceLimit => {
-                self.observation
-                    .reject(RuntimeFilterObservationError::DeliveryResourceLimit);
                 return rejected(
                     "runtime filter ingress rejected [artifact-delivery]: delivery replay identity limit exceeded",
                 );
@@ -501,8 +494,6 @@ impl RuntimeFilterParticipant {
             }
             Err(_) => {
                 self.delivery_dedupe.abort_delivery(route, version);
-                self.observation
-                    .reject(RuntimeFilterObservationError::DeliveryConflict);
                 rejected(
                     "runtime filter ingress rejected [artifact-delivery]: subscription publication rejected the delivery",
                 )
@@ -674,9 +665,7 @@ impl RuntimeFilterParticipant {
         (self.close_hook)(self, reason)
     }
 
-    pub(crate) fn capture_runtime_filter_observation(
-        &self,
-    ) -> Result<RuntimeFilterObservationSnapshot, RuntimeFilterObservationError> {
+    pub(crate) fn capture_runtime_filter_observation(&self) -> RuntimeFilterObservationSnapshot {
         self.observation.capture()
     }
 
@@ -706,8 +695,6 @@ impl RuntimeFilterParticipant {
     ) {
         let Some(identity) = self.consumer_identity(effect.binding_id(), fragment_instance_id)
         else {
-            self.observation
-                .reject(RuntimeFilterObservationError::IdentityMismatch);
             return;
         };
         self.observation
@@ -726,8 +713,6 @@ impl RuntimeFilterParticipant {
     ) {
         let Some(identity) = self.consumer_identity(outcome.binding_id(), fragment_instance_id)
         else {
-            self.observation
-                .reject(RuntimeFilterObservationError::IdentityMismatch);
             return;
         };
         match outcome.evaluation() {
@@ -1933,9 +1918,7 @@ mod tests {
             subscription.acquire(Duration::from_millis(1)),
             SnapshotAcquireOutcome::Published(_)
         ));
-        let source_snapshot = source
-            .capture_runtime_filter_observation()
-            .expect("source observation capture");
+        let source_snapshot = source.capture_runtime_filter_observation();
         assert_eq!(source_snapshot.producer_streams().len(), 1);
         assert_eq!(
             source_snapshot.producer_streams()[0].latest_accepted_sequence(),
@@ -1954,9 +1937,7 @@ mod tests {
                 .iter()
                 .any(|route| route.sent() == 1 && route.sent_bytes() > 0)
         );
-        let target_snapshot = target
-            .capture_runtime_filter_observation()
-            .expect("target observation capture");
+        let target_snapshot = target.capture_runtime_filter_observation();
         assert!(
             target_snapshot
                 .channels()

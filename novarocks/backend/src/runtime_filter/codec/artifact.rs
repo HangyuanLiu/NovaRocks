@@ -65,6 +65,7 @@ pub(crate) enum ArtifactWireCodecError {
     UnknownKind,
     UnknownReason,
     UnknownArtifactKind,
+    InvalidLogicalVersion,
     InvalidFlags,
     KindMismatch,
     KindNotAccepted,
@@ -129,7 +130,7 @@ pub(crate) fn encode_artifact_bundle(
     let payload = frame(
         FrameKind::Bundle,
         expectation.profile.id().bytes(),
-        bundle.version(),
+        bundle.version().get(),
         &body,
     )?;
     Ok(EncodedArtifactFrame {
@@ -147,10 +148,12 @@ pub(crate) fn decode_artifact_bundle(
     if payload.len() > max_encoded {
         return Err(ArtifactWireCodecError::EncodedSizeExceeded);
     }
-    let (kind, header_digest, version, body) = parse_frame(payload)?;
+    let (kind, header_digest, raw_version, body) = parse_frame(payload)?;
     if kind != FrameKind::Bundle {
         return Err(ArtifactWireCodecError::KindMismatch);
     }
+    let version = LogicalVersion::try_new(raw_version)
+        .map_err(|_| ArtifactWireCodecError::InvalidLogicalVersion)?;
     if header_digest != *envelope_digest || header_digest != expectation.profile.id().bytes() {
         return Err(ArtifactWireCodecError::ProfileMismatch);
     }
@@ -243,7 +246,7 @@ pub(crate) fn encode_unavailable(
     let payload = frame(
         FrameKind::Unavailable,
         profile.id().bytes(),
-        LogicalVersion::new(0),
+        0,
         &[reason_tag(reason)],
     )?;
     if payload.len() > max_encoded {
@@ -268,7 +271,7 @@ pub(crate) fn decode_unavailable(
     if kind != FrameKind::Unavailable {
         return Err(ArtifactWireCodecError::KindMismatch);
     }
-    if version.get() != 0 || digest != *envelope_digest || digest != profile.id().bytes() {
+    if version != 0 || digest != *envelope_digest || digest != profile.id().bytes() {
         return Err(ArtifactWireCodecError::ProfileMismatch);
     }
     if body.len() != 1 {
@@ -304,7 +307,7 @@ impl FrameKind {
 fn frame(
     kind: FrameKind,
     profile: [u8; 32],
-    version: LogicalVersion,
+    version: u64,
     body: &[u8],
 ) -> Result<Vec<u8>, ArtifactWireCodecError> {
     let mut payload = Vec::with_capacity(
@@ -317,7 +320,7 @@ fn frame(
     payload.push(kind.tag());
     payload.push(0);
     payload.extend_from_slice(&profile);
-    payload.extend_from_slice(&version.get().to_be_bytes());
+    payload.extend_from_slice(&version.to_be_bytes());
     payload.extend_from_slice(
         &(u64::try_from(body.len()).map_err(|_| ArtifactWireCodecError::LengthOverflow)?)
             .to_be_bytes(),
@@ -327,7 +330,7 @@ fn frame(
 }
 fn parse_frame(
     payload: &[u8],
-) -> Result<(FrameKind, [u8; 32], LogicalVersion, &[u8]), ArtifactWireCodecError> {
+) -> Result<(FrameKind, [u8; 32], u64, &[u8]), ArtifactWireCodecError> {
     let mut r = Reader::new(payload);
     if r.take(4)? != MAGIC {
         return Err(ArtifactWireCodecError::Malformed);
@@ -340,7 +343,7 @@ fn parse_frame(
         return Err(ArtifactWireCodecError::InvalidFlags);
     }
     let digest = r.array()?;
-    let version = LogicalVersion::new(r.u64()?);
+    let version = r.u64()?;
     let len = usize::try_from(r.u64()?).map_err(|_| ArtifactWireCodecError::LengthOverflow)?;
     let body = r.take(len)?;
     if !r.empty() {
@@ -469,6 +472,55 @@ mod tests {
                 .channel_id(),
             7
         );
+    }
+
+    #[test]
+    fn nrfa_bundle_rejects_zero_logical_version() {
+        let profile =
+            ConsumerArtifactProfile::new(BTreeSet::from([ArtifactKind::ValueSet]), None).unwrap();
+        let schema = RuntimeFilterMembershipSchema::new(
+            &DataType::Int64,
+            RuntimeFilterNullSemantics::NeverMatches,
+        )
+        .unwrap();
+        let leaf = encode_membership_leaf(
+            &ValueDomainDelta::new(MembershipValues::int64([3]), false),
+            &schema,
+            LogicalVersion::FIRST,
+        )
+        .unwrap();
+        let physical = leaf::decode_leaf(
+            &leaf,
+            ArtifactDecodeExpectations {
+                expected_kind: ArtifactKind::ValueSet,
+                schema: &schema,
+                expected_logical_version: LogicalVersion::FIRST,
+                expected_hash_contract: None,
+            },
+            4096,
+        )
+        .unwrap();
+        let bundle = ArtifactBundle::new(
+            7,
+            LogicalVersion::FIRST,
+            &profile,
+            vec![(ArtifactKind::ValueSet, physical)],
+            4096,
+        )
+        .unwrap();
+        let expectation = ArtifactDecodeExpectation {
+            profile: &profile,
+            schema: &schema,
+            order_contract: None,
+        };
+        let mut frame = encode_artifact_bundle(&bundle, expectation, 4096)
+            .unwrap()
+            .payload;
+        frame[40..48].fill(0);
+        assert!(matches!(
+            decode_artifact_bundle(&frame, &profile.id().bytes(), expectation, 4096),
+            Err(ArtifactWireCodecError::InvalidLogicalVersion)
+        ));
     }
 
     #[test]

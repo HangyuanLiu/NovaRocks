@@ -128,6 +128,133 @@ fn parse_fenced_catalog_fault(raw: &str) -> anyhow::Result<FencedCatalogFaultDir
     Ok(FencedCatalogFaultDirective { action, fault })
 }
 
+fn parse_query_lifecycle_fault(raw: &str) -> anyhow::Result<QueryLifecycleFaultDirective> {
+    let (kind, index) = raw.split_once(',').ok_or_else(|| {
+        anyhow::anyhow!("@query_lifecycle_fault requires <kind>,<be_index>; received {raw:?}")
+    })?;
+    let kind = QueryLifecycleFaultKind::parse(kind.trim()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid query_lifecycle_fault kind {:?}; expected one of {}",
+            kind.trim(),
+            [
+                "observation-p2-assembly-failure",
+                "observation-p2-budget-pressure",
+                "terminal-p0-retained-slot-exhausted",
+                "terminal-p0-bytes-exhausted",
+                "terminal-p0-delivery-permit-exhausted",
+                "terminal-p1-encode-failure",
+                "terminal-p1-retention-exhausted",
+                "terminal-proof-stream-drop",
+                "terminal-attestation-stream-drop",
+                "terminal-outcome-suppress",
+            ]
+            .join(", ")
+        )
+    })?;
+    let be_index = index
+        .trim()
+        .parse::<usize>()
+        .with_context(|| format!("invalid query_lifecycle_fault BE index {:?}", index.trim()))?;
+    Ok(QueryLifecycleFaultDirective { kind, be_index })
+}
+
+fn parse_kill_be_at_lifecycle_phase(raw: &str) -> anyhow::Result<KillBeAtLifecyclePhaseDirective> {
+    let (be_index, phase) = raw.split_once(',').ok_or_else(|| {
+        anyhow::anyhow!("@kill_be_at_lifecycle_phase requires <be_index>,<phase>; received {raw:?}")
+    })?;
+    let be_index = be_index
+        .trim()
+        .parse::<usize>()
+        .with_context(|| format!("invalid kill_be_at_lifecycle_phase BE index {be_index:?}"))?;
+    let phase = QueryLifecyclePhase::parse(phase.trim()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid kill_be_at_lifecycle_phase phase {phase:?}; expected terminal-retained"
+        )
+    })?;
+    if phase != QueryLifecyclePhase::TerminalRetained {
+        bail!(
+            "invalid kill_be_at_lifecycle_phase phase {}; expected terminal-retained",
+            phase.as_str()
+        );
+    }
+    Ok(KillBeAtLifecyclePhaseDirective { be_index, phase })
+}
+
+fn parse_participant_outcome_expectation(
+    raw: &str,
+) -> anyhow::Result<ParticipantOutcomeExpectation> {
+    if raw == "proof" {
+        return Ok(ParticipantOutcomeExpectation::Proof);
+    }
+    if raw == "no-outcome" {
+        return Ok(ParticipantOutcomeExpectation::NoOutcome);
+    }
+    let Some(reason) = raw.strip_prefix("attestation:") else {
+        bail!(
+            "invalid expect_participant_outcome: {raw}; expected proof, no-outcome, or attestation:<reason>"
+        );
+    };
+    if reason.trim().is_empty() {
+        bail!("expect_participant_outcome attestation reason must not be empty");
+    }
+    Ok(ParticipantOutcomeExpectation::Attestation {
+        reason: reason.trim().to_string(),
+    })
+}
+
+fn parse_lifecycle_metric_delta(raw: &str) -> anyhow::Result<QueryLifecycleMetricDeltaExpectation> {
+    let (metric, delta) = raw.split_once(',').ok_or_else(|| {
+        anyhow::anyhow!(
+            "@expect_lifecycle_metric_delta requires <metric>,<signed_delta>; received {raw:?}"
+        )
+    })?;
+    let metric = metric.trim();
+    if metric.is_empty()
+        || !metric
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        bail!("invalid lifecycle metric name {metric:?}");
+    }
+    let delta = delta
+        .trim()
+        .parse::<i64>()
+        .with_context(|| format!("invalid lifecycle metric delta {:?}", delta.trim()))?;
+    Ok(QueryLifecycleMetricDeltaExpectation {
+        metric: metric.to_string(),
+        delta,
+    })
+}
+
+fn parse_lifecycle_telemetry_unavailable(
+    raw: &str,
+) -> anyhow::Result<QueryLifecycleTelemetryUnavailableExpectation> {
+    let mut fields = raw.splitn(3, ',');
+    let scope = fields.next().unwrap_or_default();
+    let stage = fields.next().unwrap_or_default();
+    let code = fields.next().unwrap_or_default();
+    if !matches!(scope, "fragment" | "query") || stage.is_empty() || code.is_empty() {
+        bail!(
+            "@expect_lifecycle_telemetry_unavailable requires <fragment|query>,<stage>,<code>; received {raw:?}"
+        );
+    }
+    Ok(QueryLifecycleTelemetryUnavailableExpectation {
+        scope: scope.to_string(),
+        stage: stage.to_string(),
+        code: code.to_string(),
+    })
+}
+
+fn structured_assertion_mut(meta: &mut QueryMeta) -> &mut QueryLifecycleStructuredAssertion {
+    meta.query_lifecycle_structured_assertion
+        .get_or_insert_with(|| QueryLifecycleStructuredAssertion {
+            error_source: None,
+            participant_outcome: None,
+            telemetry_unavailable: Vec::new(),
+            metric_deltas: Vec::new(),
+        })
+}
+
 fn detect_case_sequential(lines: &[String], file_meta_lines: &[String], meta_re: &Regex) -> bool {
     file_meta_lines.iter().any(|line| {
         parse_meta_line(line, meta_re)
@@ -354,6 +481,35 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                 })?;
                 meta.terminal_snapshot_conflict_be_index = Some(value);
             }
+            "query_lifecycle_fault" => {
+                let fault = parse_query_lifecycle_fault(&raw_value)?;
+                if meta.query_lifecycle_fault.is_none() {
+                    meta.query_lifecycle_fault = Some(fault);
+                }
+                meta.query_lifecycle_faults.push(fault);
+            }
+            "expect_lifecycle_error_source" => {
+                let source = QueryLifecycleErrorSource::parse(&raw_value).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid expect_lifecycle_error_source: {raw_value}; expected backend-attestation, frontend-liveness, or no-outcome"
+                    )
+                })?;
+                structured_assertion_mut(&mut meta).error_source = Some(source);
+            }
+            "expect_participant_outcome" => {
+                structured_assertion_mut(&mut meta).participant_outcome =
+                    Some(parse_participant_outcome_expectation(&raw_value)?);
+            }
+            "expect_lifecycle_telemetry_unavailable" => {
+                structured_assertion_mut(&mut meta)
+                    .telemetry_unavailable
+                    .push(parse_lifecycle_telemetry_unavailable(&raw_value)?);
+            }
+            "expect_lifecycle_metric_delta" => {
+                structured_assertion_mut(&mut meta)
+                    .metric_deltas
+                    .push(parse_lifecycle_metric_delta(&raw_value)?);
+            }
             "kill_query_at_lifecycle_phase" => {
                 meta.kill_query_at_lifecycle_phase = QueryLifecyclePhase::parse(&raw_value)
                     .ok_or_else(|| {
@@ -378,6 +534,10 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                     );
                 }
                 meta.kill_fe_at_lifecycle_phase = Some(phase);
+            }
+            "kill_be_at_lifecycle_phase" => {
+                meta.kill_be_at_lifecycle_phase =
+                    Some(parse_kill_be_at_lifecycle_phase(&raw_value)?);
             }
             "stop_query_control_heartbeat_after_stage_be_index" => {
                 let value = raw_value.parse::<usize>().with_context(|| {
@@ -483,6 +643,34 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
     Ok(meta)
 }
 
+fn merge_lifecycle_structured_assertion(
+    base: Option<&QueryLifecycleStructuredAssertion>,
+    override_meta: Option<&QueryLifecycleStructuredAssertion>,
+) -> Option<QueryLifecycleStructuredAssertion> {
+    let base = base?;
+    let override_meta = override_meta.unwrap_or(base);
+    Some(QueryLifecycleStructuredAssertion {
+        error_source: override_meta
+            .error_source
+            .clone()
+            .or_else(|| base.error_source.clone()),
+        participant_outcome: override_meta
+            .participant_outcome
+            .clone()
+            .or_else(|| base.participant_outcome.clone()),
+        telemetry_unavailable: if override_meta.telemetry_unavailable.is_empty() {
+            base.telemetry_unavailable.clone()
+        } else {
+            override_meta.telemetry_unavailable.clone()
+        },
+        metric_deltas: if override_meta.metric_deltas.is_empty() {
+            base.metric_deltas.clone()
+        } else {
+            override_meta.metric_deltas.clone()
+        },
+    })
+}
+
 pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
     QueryMeta {
         order_sensitive: override_meta.order_sensitive.or(base.order_sensitive),
@@ -562,7 +750,9 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .cleanup_fault
             .clone()
             .or_else(|| base.cleanup_fault.clone()),
-        fenced_catalog_fault: override_meta.fenced_catalog_fault.or(base.fenced_catalog_fault),
+        fenced_catalog_fault: override_meta
+            .fenced_catalog_fault
+            .or(base.fenced_catalog_fault),
         kill_query_after_control_ready_count: override_meta
             .kill_query_after_control_ready_count
             .or(base.kill_query_after_control_ready_count),
@@ -591,12 +781,33 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         terminal_snapshot_conflict_be_index: override_meta
             .terminal_snapshot_conflict_be_index
             .or(base.terminal_snapshot_conflict_be_index),
+        query_lifecycle_fault: override_meta
+            .query_lifecycle_fault
+            .or(base.query_lifecycle_fault),
+        query_lifecycle_faults: if override_meta.query_lifecycle_faults.is_empty() {
+            base.query_lifecycle_faults.clone()
+        } else {
+            override_meta.query_lifecycle_faults.clone()
+        },
+        query_lifecycle_structured_assertion: match (
+            base.query_lifecycle_structured_assertion.as_ref(),
+            override_meta.query_lifecycle_structured_assertion.as_ref(),
+        ) {
+            (None, None) => None,
+            (None, Some(override_assertion)) => Some(override_assertion.clone()),
+            (Some(base_assertion), override_assertion) => {
+                merge_lifecycle_structured_assertion(Some(base_assertion), override_assertion)
+            }
+        },
         kill_query_at_lifecycle_phase: override_meta
             .kill_query_at_lifecycle_phase
             .or(base.kill_query_at_lifecycle_phase),
         kill_fe_at_lifecycle_phase: override_meta
             .kill_fe_at_lifecycle_phase
             .or(base.kill_fe_at_lifecycle_phase),
+        kill_be_at_lifecycle_phase: override_meta
+            .kill_be_at_lifecycle_phase
+            .or(base.kill_be_at_lifecycle_phase),
         stop_query_control_heartbeat_after_stage_be_index: override_meta
             .stop_query_control_heartbeat_after_stage_be_index
             .or(base.stop_query_control_heartbeat_after_stage_be_index),
@@ -976,7 +1187,8 @@ mod opt5_directive_tests {
     #[test]
     fn parse_meta_parses_typed_fenced_catalog_fault() {
         let re = meta_re();
-        let lines = vec!["-- @fenced_catalog_fault=publish,after-downstream-before-response".to_string()];
+        let lines =
+            vec!["-- @fenced_catalog_fault=publish,after-downstream-before-response".to_string()];
         let meta = parse_meta(&lines, &re).expect("parse fenced catalog fault");
         assert_eq!(
             meta.fenced_catalog_fault,
@@ -992,7 +1204,11 @@ mod opt5_directive_tests {
         let re = meta_re();
         let lines = vec!["-- @fenced_catalog_fault=inspect,before-accept".to_string()];
         let error = parse_meta(&lines, &re).expect_err("unknown action must fail closed");
-        assert!(error.to_string().contains("invalid @fenced_catalog_fault action"));
+        assert!(
+            error
+                .to_string()
+                .contains("invalid @fenced_catalog_fault action")
+        );
     }
 
     #[test]
@@ -1098,6 +1314,7 @@ mod opt5_directive_tests {
             "-- @drop_next_terminal_ack_be_index=1".to_string(),
             "-- @kill_query_at_lifecycle_phase=starting".to_string(),
             "-- @kill_fe_at_lifecycle_phase=staged".to_string(),
+            "-- @kill_be_at_lifecycle_phase=2,terminal-retained".to_string(),
             "-- @stop_query_control_heartbeat_after_stage_be_index=1".to_string(),
             "-- @hold_start_until_early_ingress=true".to_string(),
             "-- @query_control_fragment_backend_limit=2".to_string(),
@@ -1119,6 +1336,13 @@ mod opt5_directive_tests {
         assert_eq!(meta.drop_next_start_ack_be_index, Some(2));
         assert_eq!(meta.suppress_start_ack_be_index, Some(0));
         assert_eq!(meta.drop_next_terminal_ack_be_index, Some(1));
+        assert_eq!(
+            meta.kill_be_at_lifecycle_phase,
+            Some(KillBeAtLifecyclePhaseDirective {
+                be_index: 2,
+                phase: QueryLifecyclePhase::TerminalRetained,
+            })
+        );
         assert_eq!(
             meta.kill_query_at_lifecycle_phase,
             Some(QueryLifecyclePhase::Starting)
@@ -1524,6 +1748,123 @@ mod opt5_directive_tests {
         assert_eq!(
             meta.be_log_contains,
             vec!["be_log_ingress rejected".to_string()]
+        );
+    }
+
+    #[test]
+    fn rfo_8r2_fault_and_structured_assertions_parse_without_log_text_contracts() {
+        let re = meta_re();
+        let lines = vec![
+            "-- @query_lifecycle_fault=terminal-p1-encode-failure,2".to_string(),
+            "-- @expect_lifecycle_error_source=backend-attestation".to_string(),
+            "-- @expect_participant_outcome=attestation:P1EncodeFailed".to_string(),
+            "-- @expect_lifecycle_telemetry_unavailable=query,runtime_filter_terminal_capture,INJECTED_P2_ASSEMBLY_FAILURE".to_string(),
+            "-- @expect_lifecycle_metric_delta=terminal_retained,1".to_string(),
+        ];
+
+        let meta = parse_meta(&lines, &re).expect("parse RFO-8R2 directives");
+        assert_eq!(
+            meta.query_lifecycle_fault,
+            Some(QueryLifecycleFaultDirective {
+                kind: QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                be_index: 2,
+            })
+        );
+        assert_eq!(
+            meta.query_lifecycle_faults,
+            vec![QueryLifecycleFaultDirective {
+                kind: QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                be_index: 2,
+            }]
+        );
+        let assertion = meta
+            .query_lifecycle_structured_assertion
+            .expect("structured assertion");
+        assert_eq!(
+            assertion.error_source,
+            Some(QueryLifecycleErrorSource::BackendAttestation)
+        );
+        assert_eq!(
+            assertion.participant_outcome,
+            Some(ParticipantOutcomeExpectation::Attestation {
+                reason: "P1EncodeFailed".to_string(),
+            })
+        );
+        assert_eq!(
+            assertion.telemetry_unavailable,
+            vec![QueryLifecycleTelemetryUnavailableExpectation {
+                scope: "query".to_string(),
+                stage: "runtime_filter_terminal_capture".to_string(),
+                code: "INJECTED_P2_ASSEMBLY_FAILURE".to_string(),
+            }]
+        );
+        assert_eq!(
+            assertion.metric_deltas,
+            vec![QueryLifecycleMetricDeltaExpectation {
+                metric: "terminal_retained".to_string(),
+                delta: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_meta_accumulates_rfo_8r2_fault_directives() {
+        let re = meta_re();
+        let lines = vec![
+            "-- @query_lifecycle_fault=terminal-p1-encode-failure,2".to_string(),
+            "-- @query_lifecycle_fault=terminal-attestation-stream-drop,2".to_string(),
+        ];
+
+        let meta = parse_meta(&lines, &re).expect("parse multiple RFO-8R2 directives");
+
+        assert_eq!(
+            meta.query_lifecycle_fault,
+            Some(QueryLifecycleFaultDirective {
+                kind: QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                be_index: 2,
+            })
+        );
+        assert_eq!(
+            meta.query_lifecycle_faults,
+            vec![
+                QueryLifecycleFaultDirective {
+                    kind: QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                    be_index: 2,
+                },
+                QueryLifecycleFaultDirective {
+                    kind: QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
+                    be_index: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_meta_rejects_be_kill_before_terminal_retention() {
+        let re = meta_re();
+        let error = parse_meta(
+            &["-- @kill_be_at_lifecycle_phase=1,running".to_string()],
+            &re,
+        )
+        .expect_err("BE kill must wait for immutable terminal evidence");
+
+        assert!(
+            format!("{error:#}").contains("expected terminal-retained"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn rfo_8r2_fault_parser_rejects_unknown_arm() {
+        let re = meta_re();
+        let error = parse_meta(
+            &["-- @query_lifecycle_fault=unknown-arm,0".to_string()],
+            &re,
+        )
+        .expect_err("unknown arm must fail");
+        assert!(
+            format!("{error:#}").contains("invalid query_lifecycle_fault kind"),
+            "unexpected error: {error:#}"
         );
     }
 }

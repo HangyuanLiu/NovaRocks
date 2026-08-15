@@ -1076,6 +1076,134 @@ fn run_be_log_directives_for_successful_step(
     }
 }
 
+fn capture_lifecycle_structured_snapshot(
+    meta: &QueryMeta,
+    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+) -> Result<Option<novarocks_cluster_harness::QueryLifecycleStructuredSnapshot>> {
+    if meta.query_lifecycle_structured_assertion.is_none() {
+        return Ok(None);
+    }
+    let mut server = server_handle
+        .lock()
+        .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
+    server
+        .query_lifecycle_structured_snapshot()?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "@expect_lifecycle_* requires a query-scoped structured lifecycle snapshot; diagnostic text is not a substitute"
+            )
+        })
+        .map(Some)
+}
+
+fn verify_lifecycle_structured_assertion(
+    meta: &QueryMeta,
+    before: Option<&novarocks_cluster_harness::QueryLifecycleStructuredSnapshot>,
+    after: &novarocks_cluster_harness::QueryLifecycleStructuredSnapshot,
+) -> Result<()> {
+    let Some(assertion) = meta.query_lifecycle_structured_assertion.as_ref() else {
+        return Ok(());
+    };
+    if let Some(expected) = assertion.error_source.as_ref() {
+        let expected = match expected {
+            QueryLifecycleErrorSource::BackendAttestation => {
+                novarocks_cluster_harness::QueryLifecycleErrorSource::BackendAttestation
+            }
+            QueryLifecycleErrorSource::FrontendLiveness => {
+                novarocks_cluster_harness::QueryLifecycleErrorSource::FrontendLiveness
+            }
+            QueryLifecycleErrorSource::NoOutcome => {
+                novarocks_cluster_harness::QueryLifecycleErrorSource::NoOutcome
+            }
+        };
+        if after.error_source != Some(expected) {
+            bail!(
+                "structured lifecycle error source mismatch: expected {}, actual {:?}, execution_id={:?}",
+                assertion.error_source.as_ref().expect("checked").as_str(),
+                after.error_source,
+                after.execution_id
+            );
+        }
+    }
+    if let Some(expected) = assertion.participant_outcome.as_ref() {
+        let matched = after
+            .participant_outcomes
+            .iter()
+            .any(|actual| match (expected, actual) {
+                (
+                    ParticipantOutcomeExpectation::Proof,
+                    novarocks_cluster_harness::ParticipantTerminalOutcomeKind::Proof,
+                ) => true,
+                (
+                    ParticipantOutcomeExpectation::NoOutcome,
+                    novarocks_cluster_harness::ParticipantTerminalOutcomeKind::NoOutcome,
+                ) => true,
+                (
+                    ParticipantOutcomeExpectation::Attestation { reason: expected },
+                    novarocks_cluster_harness::ParticipantTerminalOutcomeKind::Attestation {
+                        reason: actual,
+                    },
+                ) => expected == actual,
+                _ => false,
+            });
+        if !matched {
+            bail!(
+                "structured participant outcome mismatch: expected {expected:?}, actual {:?}, execution_id={:?}",
+                after.participant_outcomes,
+                after.execution_id
+            );
+        }
+    }
+    for expected in &assertion.telemetry_unavailable {
+        if !after.telemetry_unavailable.iter().any(|actual| {
+            actual.scope == expected.scope
+                && actual.stage == expected.stage
+                && actual.code == expected.code
+        }) {
+            bail!(
+                "structured lifecycle telemetry-unavailable mismatch: expected {expected:?}, actual {:?}, execution_id={:?}",
+                after.telemetry_unavailable,
+                after.execution_id
+            );
+        }
+    }
+    if !assertion.metric_deltas.is_empty() {
+        let before = before
+            .context("structured lifecycle metric delta assertion requires a pre-step snapshot")?;
+        for expected in &assertion.metric_deltas {
+            let previous = before.metrics.get(&expected.metric).with_context(|| {
+                format!(
+                    "pre-step structured lifecycle metric {} is missing",
+                    expected.metric
+                )
+            })?;
+            let current = after.metrics.get(&expected.metric).with_context(|| {
+                format!(
+                    "post-step structured lifecycle metric {} is missing",
+                    expected.metric
+                )
+            })?;
+            let actual = current.checked_sub(*previous).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "structured lifecycle metric {} overflowed while computing delta: before={previous}, after={current}",
+                    expected.metric
+                )
+            })?;
+            if actual != expected.delta {
+                bail!(
+                    "structured lifecycle metric delta mismatch for {}: expected {}, actual {} (before={}, after={})",
+                    expected.metric,
+                    expected.delta,
+                    actual,
+                    previous,
+                    current
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn execute_target_query_with_fault(
     meta: &QueryMeta,
     server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
@@ -1589,6 +1717,20 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         } else {
             None
         };
+        let structured_lifecycle_baseline = match capture_lifecycle_structured_snapshot(
+            &step.meta,
+            &ctx.server_handle,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                case_failed = true;
+                let _ = writeln!(
+                    log,
+                    "    ❌ failed to capture structured lifecycle assertion baseline: {error:#}"
+                );
+                break;
+            }
+        };
         if fault_injection::has_fault(&step.meta) {
             let fault_result = ctx
                 .server_handle
@@ -1645,25 +1787,24 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         };
         let fenced_catalog_fault_guard = match step.meta.fenced_catalog_fault {
             Some(directive) => match ctx.fenced_catalog_control.as_ref() {
-                Some(control) => match control.arm_next(
-                    directive.action.as_str(),
-                    directive.fault.as_str(),
-                ) {
-                    Ok(guard) => {
-                        let _ = writeln!(
-                            log,
-                            "    @fenced_catalog_fault armed action={} fault={}",
-                            directive.action.as_str(),
-                            directive.fault.as_str()
-                        );
-                        Some(guard)
+                Some(control) => {
+                    match control.arm_next(directive.action.as_str(), directive.fault.as_str()) {
+                        Ok(guard) => {
+                            let _ = writeln!(
+                                log,
+                                "    @fenced_catalog_fault armed action={} fault={}",
+                                directive.action.as_str(),
+                                directive.fault.as_str()
+                            );
+                            Some(guard)
+                        }
+                        Err(error) => {
+                            case_failed = true;
+                            let _ = writeln!(log, "    ❌ arm fenced catalog fault: {error:#}");
+                            break;
+                        }
                     }
-                    Err(error) => {
-                        case_failed = true;
-                        let _ = writeln!(log, "    ❌ arm fenced catalog fault: {error:#}");
-                        break;
-                    }
-                },
+                }
                 None => {
                     case_failed = true;
                     let _ = writeln!(
@@ -2557,6 +2698,34 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             }
         }
 
+        if step.meta.query_lifecycle_structured_assertion.is_some() {
+            let assertion_result =
+                capture_lifecycle_structured_snapshot(&step.meta, &ctx.server_handle).and_then(
+                    |after| {
+                        let after = after.context(
+                            "structured lifecycle assertion snapshot disappeared after the step",
+                        )?;
+                        verify_lifecycle_structured_assertion(
+                            &step.meta,
+                            structured_lifecycle_baseline.as_ref(),
+                            &after,
+                        )
+                    },
+                );
+            match assertion_result {
+                Ok(()) => {
+                    let _ = writeln!(log, "    ✅ structured lifecycle assertion passed");
+                }
+                Err(error) => {
+                    case_failed = true;
+                    let _ = writeln!(
+                        log,
+                        "    ❌ structured lifecycle assertion failed: {error:#}"
+                    );
+                }
+            }
+        }
+
         if case_failed {
             let _ = writeln!(log, "    ⏭️ skipping remaining steps in {}", case.case_id);
             break;
@@ -2968,8 +3137,14 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "drop_next_terminal_ack_be_index",
         "drop_terminal_snapshot_stream_be_index",
         "terminal_snapshot_conflict_be_index",
+        "query_lifecycle_fault",
+        "expect_lifecycle_error_source",
+        "expect_participant_outcome",
+        "expect_lifecycle_telemetry_unavailable",
+        "expect_lifecycle_metric_delta",
         "kill_query_at_lifecycle_phase",
         "kill_fe_at_lifecycle_phase",
+        "kill_be_at_lifecycle_phase",
         "stop_query_control_heartbeat_after_stage_be_index",
         "hold_start_until_early_ingress",
         "query_control_fragment_backend_limit",
@@ -4217,14 +4392,9 @@ mod tests {
     fn ctas_takeover_requires_fenced_native_serial_selection() {
         let suites = vec!["ctas-takeover".to_string()];
         let mut config = RunnerConfig::default();
-        let error = validate_ctas_takeover_preflight(
-            &config,
-            &suites,
-            ClusterMode::CrossProcess,
-            3,
-            1,
-        )
-        .expect_err("fixture must be explicitly enabled");
+        let error =
+            validate_ctas_takeover_preflight(&config, &suites, ClusterMode::CrossProcess, 3, 1)
+                .expect_err("fixture must be explicitly enabled");
         assert!(
             error
                 .to_string()

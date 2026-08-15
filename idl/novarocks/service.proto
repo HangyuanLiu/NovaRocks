@@ -306,7 +306,7 @@ message QueryControlResponse {
     QueryControlLocalFailure local_failure = 3;
     QueryControlTerminationAccepted termination_accepted = 4;
     QueryControlLocalDrained local_drained = 5;
-    QueryTerminalSnapshot terminal_snapshot = 6;
+    ParticipantTerminalOutcome terminal_outcome = 6;
     FragmentLiveObservation fragment_observation = 7;
   }
 }
@@ -358,11 +358,13 @@ message QueryTerminalFragmentSnapshot {
   repeated QueryTerminalTabletInfo tablet_commit_infos = 7;
   repeated QueryTerminalTabletInfo tablet_fail_infos = 8;
   QueryTerminalLoadStats load_stats = 9;
-  RuntimeProfileTree profile = 10;
+  FragmentTerminalProfileTelemetry profile = 10;
   repeated ConnectorStagedReportFrame connector_staged_report_frames = 11;
   // Bounded, opaque statistics collection state. It is internal to the
   // native lifecycle and never encoded as a client result row.
   bytes statistics_payload = 12;
+  // Diagnostic text may be bounded to retain a fixed P0 terminalization proof.
+  bool error_detail_truncated = 13;
 }
 
 enum QueryTerminalRuntimeFilterChannelInstallStateV1 {
@@ -468,6 +470,28 @@ message QueryTerminalProfileContributionV1 {
   repeated QueryTerminalRuntimeFilterConsumerV1 consumers = 5;
 }
 
+// P2 telemetry is always explicit: it is either the complete value or a
+// stable reason why the value was unavailable. It is never represented by an
+// empty telemetry payload.
+message TerminalTelemetryUnavailable {
+  string stage = 1;
+  string code = 2;
+}
+
+message FragmentTerminalProfileTelemetry {
+  oneof telemetry {
+    RuntimeProfileTree available = 1;
+    TerminalTelemetryUnavailable unavailable = 2;
+  }
+}
+
+message QueryTerminalProfileContributionTelemetry {
+  oneof telemetry {
+    QueryTerminalProfileContributionV1 available = 1;
+    TerminalTelemetryUnavailable unavailable = 2;
+  }
+}
+
 message QueryTerminalSnapshot {
   uint32 version = 1;
   QueryExecutionId execution_id = 2;
@@ -475,11 +499,60 @@ message QueryTerminalSnapshot {
   bytes init_digest = 4;
   bytes digest = 5;
   repeated QueryTerminalFragmentSnapshot fragments = 6;
-  QueryTerminalProfileContributionV1 profile_contribution = 7;
+  QueryTerminalProfileContributionTelemetry profile_contribution = 7;
+}
+
+message TerminalizationProofFragment {
+  novarocks.common.UniqueId fragment_instance_id = 1;
+  int32 backend_num = 2;
+  QueryTerminalFragmentOutcome outcome = 3;
+  string error_code = 4;
+  string error_detail = 5;
+  bool error_detail_truncated = 6;
+}
+
+// Bounded P0 terminalization proof. It remains independently encodable when
+// P1 evidence or P2 telemetry cannot be retained.
+message TerminalizationProof {
+  uint32 version = 1;
+  QueryExecutionId execution_id = 2;
+  ParticipantBackendIdentity backend = 3;
+  bytes init_digest = 4;
+  bytes digest = 5;
+  repeated TerminalizationProofFragment fragments = 6;
+}
+
+enum NegativeAttestationReason {
+  NEGATIVE_ATTESTATION_REASON_UNSPECIFIED = 0;
+  NEGATIVE_ATTESTATION_REASON_ATTEMPT_ABORTED = 1;
+  NEGATIVE_ATTESTATION_REASON_ATTEMPT_TOMBSTONED = 2;
+  NEGATIVE_ATTESTATION_REASON_TERMINAL_STATE_INVALID = 3;
+  NEGATIVE_ATTESTATION_REASON_CORRECTNESS_EVIDENCE_ENCODING_FAILED = 4;
+  NEGATIVE_ATTESTATION_REASON_CORRECTNESS_EVIDENCE_RETENTION_EXHAUSTED = 5;
+}
+
+message NegativeAttestation {
+  QueryExecutionId execution_id = 1;
+  ParticipantBackendIdentity backend = 2;
+  bytes init_digest = 3;
+  NegativeAttestationReason reason = 4;
+  string detail = 5;
+  bool detail_truncated = 6;
+  bytes digest = 7;
+}
+
+message ParticipantTerminalOutcome {
+  oneof outcome {
+    TerminalizationProof proof = 1;
+    NegativeAttestation negative_attestation = 2;
+  }
+  // Required exactly for proof outcomes. This P1/P2 payload is intentionally
+  // separate from the P0 proof so the latter remains independently deliverable.
+  QueryTerminalSnapshot snapshot = 3;
 }
 
 message ReportQueryTerminalRequest {
-  QueryTerminalSnapshot snapshot = 1;
+  ParticipantTerminalOutcome outcome = 1;
 }
 
 enum ReportQueryTerminalOutcome {

@@ -2,9 +2,9 @@
 id: ADR-0068
 title: "Backend-owned runtime-filter terminal observation"
 domain: [runtime-filter, distributed-query-lifecycle]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0073
 date: 2026-08-13
 provenance:
   - "mechanism: service-owned runtime-filter terminal observation; PR #741"

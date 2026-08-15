@@ -256,6 +256,7 @@ fn map_query_error(error: ArtifactCodecError) -> RuntimeFilterArtifactQueryError
         ArtifactCodecError::ContractViolation
         | ArtifactCodecError::Malformed
         | ArtifactCodecError::Truncated
+        | ArtifactCodecError::InvalidLogicalVersion
         | ArtifactCodecError::UnknownVersion
         | ArtifactCodecError::UnknownKind
         | ArtifactCodecError::InvalidFlags

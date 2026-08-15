@@ -58,6 +58,7 @@ use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, Toki
 use novarocks_spi::connector::{
     ConnectorControlFactory, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionInstaller, ConnectorRequestContext, ConnectorTableMetadata,
+    WriteCommitEvidenceLimits,
 };
 
 const BACKEND_SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -441,6 +442,11 @@ pub fn compose_backend_server_config(
             runtime_config.query_control_terminal_retained_capacity,
             runtime_config.query_control_terminal_max_retained_bytes,
         ),
+        write_commit_evidence_limits: WriteCommitEvidenceLimits::try_new(
+            runtime_config.write_commit_evidence_max_bytes,
+            runtime_config.write_commit_evidence_max_entries,
+        )
+        .map_err(|error| anyhow::anyhow!("resolve write commit evidence limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
         execution_installers: compose_backend_execution_installers(config, runtime)?,
     })

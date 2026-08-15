@@ -20,6 +20,131 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Stable runner-facing names for the RFO-8R2 lifecycle fault arms. The
+/// server-side owners consume the matching core file stem; the runner never
+/// infers an owner from log text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryLifecycleFaultKind {
+    ObservationP2AssemblyFailure,
+    ObservationP2BudgetPressure,
+    TerminalP0RetainedSlotExhausted,
+    TerminalP0BytesExhausted,
+    TerminalP0DeliveryPermitExhausted,
+    TerminalP1EncodeFailure,
+    TerminalP1RetentionExhausted,
+    TerminalProofStreamDrop,
+    TerminalAttestationStreamDrop,
+    TerminalOutcomeSuppress,
+}
+
+impl QueryLifecycleFaultKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ObservationP2AssemblyFailure => "observation-p2-assembly-failure",
+            Self::ObservationP2BudgetPressure => "observation-p2-budget-pressure",
+            Self::TerminalP0RetainedSlotExhausted => "terminal-p0-retained-slot-exhausted",
+            Self::TerminalP0BytesExhausted => "terminal-p0-bytes-exhausted",
+            Self::TerminalP0DeliveryPermitExhausted => "terminal-p0-delivery-permit-exhausted",
+            Self::TerminalP1EncodeFailure => "terminal-p1-encode-failure",
+            Self::TerminalP1RetentionExhausted => "terminal-p1-retention-exhausted",
+            Self::TerminalProofStreamDrop => "terminal-proof-stream-drop",
+            Self::TerminalAttestationStreamDrop => "terminal-attestation-stream-drop",
+            Self::TerminalOutcomeSuppress => "terminal-outcome-suppress",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "observation-p2-assembly-failure" => Some(Self::ObservationP2AssemblyFailure),
+            "observation-p2-budget-pressure" => Some(Self::ObservationP2BudgetPressure),
+            "terminal-p0-retained-slot-exhausted" => Some(Self::TerminalP0RetainedSlotExhausted),
+            "terminal-p0-bytes-exhausted" => Some(Self::TerminalP0BytesExhausted),
+            "terminal-p0-delivery-permit-exhausted" => {
+                Some(Self::TerminalP0DeliveryPermitExhausted)
+            }
+            "terminal-p1-encode-failure" => Some(Self::TerminalP1EncodeFailure),
+            "terminal-p1-retention-exhausted" => Some(Self::TerminalP1RetentionExhausted),
+            "terminal-proof-stream-drop" => Some(Self::TerminalProofStreamDrop),
+            "terminal-attestation-stream-drop" => Some(Self::TerminalAttestationStreamDrop),
+            "terminal-outcome-suppress" => Some(Self::TerminalOutcomeSuppress),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryLifecycleFaultDirective {
+    pub kind: QueryLifecycleFaultKind,
+    pub be_index: usize,
+}
+
+/// A runner-owned BE process fault released only after the frontend reaches a
+/// stable lifecycle barrier. The phase trigger is deliberately separate from
+/// the BE action: the frontend owns the phase marker while the harness owns
+/// process lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KillBeAtLifecyclePhaseDirective {
+    pub be_index: usize,
+    pub phase: QueryLifecyclePhase,
+}
+
+/// Structured fault assertions deliberately name a result category rather
+/// than matching a human-readable diagnostic. T7/T9 provide the actual
+/// snapshot producer; T4 owns this stable runner contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryLifecycleErrorSource {
+    BackendAttestation,
+    FrontendLiveness,
+    NoOutcome,
+}
+
+impl QueryLifecycleErrorSource {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "backend-attestation" => Some(Self::BackendAttestation),
+            "frontend-liveness" => Some(Self::FrontendLiveness),
+            "no-outcome" => Some(Self::NoOutcome),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::BackendAttestation => "backend-attestation",
+            Self::FrontendLiveness => "frontend-liveness",
+            Self::NoOutcome => "no-outcome",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParticipantOutcomeExpectation {
+    Proof,
+    Attestation { reason: String },
+    NoOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryLifecycleStructuredAssertion {
+    pub error_source: Option<QueryLifecycleErrorSource>,
+    pub participant_outcome: Option<ParticipantOutcomeExpectation>,
+    pub telemetry_unavailable: Vec<QueryLifecycleTelemetryUnavailableExpectation>,
+    pub metric_deltas: Vec<QueryLifecycleMetricDeltaExpectation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryLifecycleMetricDeltaExpectation {
+    pub metric: String,
+    pub delta: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryLifecycleTelemetryUnavailableExpectation {
+    pub scope: String,
+    pub stage: String,
+    pub code: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SuiteConfig {
     pub name: String,
@@ -122,8 +247,21 @@ pub struct QueryMeta {
     /// Inject a second valid-but-different participant snapshot at FE ingress
     /// before ACK, proving same-identity conflicts fail closed.
     pub terminal_snapshot_conflict_be_index: Option<usize>,
+    /// One RFO-8R2 owner-local lifecycle fault. The first field names the
+    /// stable arm and the second scopes it to one runner-owned BE.
+    pub query_lifecycle_fault: Option<QueryLifecycleFaultDirective>,
+    /// All explicitly configured RFO-8R2 owner-local lifecycle faults. The
+    /// legacy scalar remains for existing programmatic callers and for the
+    /// primary BE-log token, while parsed SQL directives populate this list.
+    pub query_lifecycle_faults: Vec<QueryLifecycleFaultDirective>,
+    /// Typed outcome/source assertion for RFO-8R2 resilience cases. It is
+    /// intentionally separate from `expect_error` and log assertions.
+    pub query_lifecycle_structured_assertion: Option<QueryLifecycleStructuredAssertion>,
     pub kill_query_at_lifecycle_phase: Option<QueryLifecyclePhase>,
     pub kill_fe_at_lifecycle_phase: Option<QueryLifecyclePhase>,
+    /// Kill one BE only after FE has retained an immutable participant outcome
+    /// for the requested lifecycle phase.
+    pub kill_be_at_lifecycle_phase: Option<KillBeAtLifecyclePhaseDirective>,
     pub stop_query_control_heartbeat_after_stage_be_index: Option<usize>,
     pub hold_start_until_early_ingress: bool,
     pub query_control_fragment_backend_limit: Option<usize>,
@@ -215,7 +353,6 @@ pub struct FencedCatalogFaultDirective {
     pub action: FencedCatalogAction,
     pub fault: FencedCatalogFault,
 }
-
 
 impl QueryMeta {
     pub fn has_be_log_directives(&self) -> bool {

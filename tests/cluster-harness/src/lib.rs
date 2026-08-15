@@ -30,6 +30,95 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml::Value;
 
+const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
+
+#[derive(serde::Deserialize)]
+struct LifecycleConvergenceWireSnapshot {
+    execution_id: String,
+    error_source: Option<String>,
+    participant_outcomes: Vec<LifecycleParticipantOutcomeWire>,
+    telemetry_unavailable: Vec<LifecycleTelemetryUnavailableWire>,
+    metrics: BTreeMap<String, i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum LifecycleParticipantOutcomeWire {
+    Proof,
+    Attestation { reason: String },
+    NoOutcome,
+}
+
+#[derive(serde::Deserialize)]
+struct LifecycleTelemetryUnavailableWire {
+    scope: String,
+    stage: String,
+    code: String,
+}
+
+fn query_lifecycle_structured_snapshot_from_fe(
+    port: u16,
+) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
+    let response = reqwest::blocking::Client::builder()
+        // The FE report listener is the native h2c lifecycle endpoint. Force
+        // h2c here instead of treating an HTTP/1 timeout as an absent snapshot.
+        .http2_prior_knowledge()
+        .timeout(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP)
+        .build()
+        .context("build FE lifecycle snapshot client")?
+        .get(format!(
+            "http://127.0.0.1:{port}{LIFECYCLE_CONVERGENCE_DEBUG_PATH}"
+        ))
+        .send()
+        .context("request FE lifecycle snapshot")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        bail!(
+            "FE lifecycle snapshot returned non-success status: {}",
+            response.status()
+        );
+    }
+    let wire: LifecycleConvergenceWireSnapshot = response
+        .json()
+        .context("decode FE lifecycle snapshot JSON")?;
+    let error_source = match wire.error_source.as_deref() {
+        None => None,
+        Some("backend-attestation") => Some(QueryLifecycleErrorSource::BackendAttestation),
+        Some("frontend-liveness") => Some(QueryLifecycleErrorSource::FrontendLiveness),
+        Some("no-outcome") => Some(QueryLifecycleErrorSource::NoOutcome),
+        Some(source) => bail!("unknown FE lifecycle snapshot error source {source:?}"),
+    };
+    let participant_outcomes = wire
+        .participant_outcomes
+        .into_iter()
+        .map(|outcome| match outcome {
+            LifecycleParticipantOutcomeWire::Proof => ParticipantTerminalOutcomeKind::Proof,
+            LifecycleParticipantOutcomeWire::Attestation { reason } => {
+                ParticipantTerminalOutcomeKind::Attestation { reason }
+            }
+            LifecycleParticipantOutcomeWire::NoOutcome => ParticipantTerminalOutcomeKind::NoOutcome,
+        })
+        .collect();
+    let telemetry_unavailable = wire
+        .telemetry_unavailable
+        .into_iter()
+        .map(|telemetry| QueryLifecycleTelemetryUnavailable {
+            scope: telemetry.scope,
+            stage: telemetry.stage,
+            code: telemetry.code,
+        })
+        .collect();
+    Ok(Some(QueryLifecycleStructuredSnapshot {
+        execution_id: Some(wire.execution_id),
+        error_source,
+        participant_outcomes,
+        telemetry_unavailable,
+        metrics: wire.metrics,
+    }))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterProcessRole {
     Fe,
@@ -74,6 +163,40 @@ pub enum QueryLifecyclePhase {
     Starting,
     Running,
     TerminalRetained,
+}
+
+/// Structured lifecycle facts exposed by a runner-owned cross-process
+/// cluster. T4 owns this test boundary; T7/T9 supply query-scoped values once
+/// their outcome and convergence contracts are implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryLifecycleErrorSource {
+    BackendAttestation,
+    FrontendLiveness,
+    NoOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParticipantTerminalOutcomeKind {
+    Proof,
+    Attestation { reason: String },
+    NoOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryLifecycleTelemetryUnavailable {
+    pub scope: String,
+    pub stage: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryLifecycleStructuredSnapshot {
+    /// The immutable execution identity used to correlate all values below.
+    pub execution_id: Option<String>,
+    pub error_source: Option<QueryLifecycleErrorSource>,
+    pub participant_outcomes: Vec<ParticipantTerminalOutcomeKind>,
+    pub telemetry_unavailable: Vec<QueryLifecycleTelemetryUnavailable>,
+    pub metrics: BTreeMap<String, i64>,
 }
 
 impl QueryLifecyclePhase {
@@ -590,6 +713,15 @@ pub trait ServerHandle: Send {
     fn clear_query_lifecycle_faults(&mut self) -> Result<()> {
         Ok(())
     }
+    /// Returns query-scoped outcome/source/metric facts for a structured SQL
+    /// assertion. `None` means the selected server mode does not expose the
+    /// RFO-8R2 contract yet; the runner rejects an assertion rather than
+    /// falling back to diagnostic text.
+    fn query_lifecycle_structured_snapshot(
+        &mut self,
+    ) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
+        Ok(None)
+    }
     fn release_query_lifecycle_phase_fault(
         &mut self,
         phase: QueryLifecyclePhase,
@@ -642,6 +774,13 @@ pub trait ServerHandle: Send {
     fn arm_terminal_snapshot_conflict(&mut self, index: usize) -> Result<()> {
         bail!("TerminalSnapshot conflict is unsupported by this server mode (index={index})")
     }
+    /// Arms one stable RFO-8R2 owner-local lifecycle fault. The harness owns
+    /// token publication and cleanup; application code alone claims the arm.
+    fn arm_query_lifecycle_fault(&mut self, index: usize, kind: &'static str) -> Result<()> {
+        bail!(
+            "query lifecycle fault is unsupported by this server mode (index={index}, kind={kind})"
+        )
+    }
     fn arm_kill_query_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
         bail!(
             "KILL QUERY lifecycle phase fault is unsupported by this server mode (phase={})",
@@ -651,6 +790,21 @@ pub trait ServerHandle: Send {
     fn arm_fe_crash_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
         bail!(
             "FE lifecycle phase fault is unsupported by this server mode (phase={})",
+            phase.as_str()
+        )
+    }
+    /// Arms the existing FE-owned phase barrier for a runner-owned BE kill.
+    /// The trigger is released by `release_be_kill_at_lifecycle_phase` after
+    /// the harness has killed its selected BE process.
+    fn arm_be_kill_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
+        bail!(
+            "BE lifecycle phase kill is unsupported by this server mode (phase={})",
+            phase.as_str()
+        )
+    }
+    fn release_be_kill_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
+        bail!(
+            "BE lifecycle phase kill release is unsupported by this server mode (phase={})",
             phase.as_str()
         )
     }
@@ -941,6 +1095,11 @@ impl QueryLifecycleFaultFiles {
         self.be_path(index, "heartbeat-stop-after-stage")
     }
 
+    fn rfo_8r2_fault_path(&self, index: usize, kind: &'static str) -> Result<PathBuf> {
+        validate_rfo_8r2_fault_kind(kind)?;
+        self.be_path(index, kind)
+    }
+
     fn fe_crash_path(&self) -> PathBuf {
         self.root.join("fe-crash-after-control-ready.trigger")
     }
@@ -1005,6 +1164,10 @@ impl QueryLifecycleFaultFiles {
 
     fn publish_heartbeat_stop_after_stage(&self, index: usize) -> Result<String> {
         self.publish(self.heartbeat_stop_after_stage_path(index)?, index, None)
+    }
+
+    fn publish_rfo_8r2_fault(&self, index: usize, kind: &'static str) -> Result<String> {
+        self.publish(self.rfo_8r2_fault_path(index, kind)?, index, None)
     }
 
     fn publish_fe_crash(&self, count: usize) -> Result<String> {
@@ -1106,6 +1269,26 @@ impl QueryLifecycleFaultFiles {
 impl Drop for QueryLifecycleFaultFiles {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn validate_rfo_8r2_fault_kind(kind: &str) -> Result<()> {
+    const KINDS: &[&str] = &[
+        "observation-p2-assembly-failure",
+        "observation-p2-budget-pressure",
+        "terminal-p0-retained-slot-exhausted",
+        "terminal-p0-bytes-exhausted",
+        "terminal-p0-delivery-permit-exhausted",
+        "terminal-p1-encode-failure",
+        "terminal-p1-retention-exhausted",
+        "terminal-proof-stream-drop",
+        "terminal-attestation-stream-drop",
+        "terminal-outcome-suppress",
+    ];
+    if KINDS.contains(&kind) {
+        Ok(())
+    } else {
+        bail!("unsupported RFO-8R2 query lifecycle fault kind {kind}")
     }
 }
 
@@ -1586,6 +1769,12 @@ impl ServerHandle for CrossProcessServerHandle {
         self.query_execution_resource_diagnostics_impl()
     }
 
+    fn query_lifecycle_structured_snapshot(
+        &mut self,
+    ) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
+        query_lifecycle_structured_snapshot_from_fe(self.runtime.fe_grpc_port)
+    }
+
     fn be_count(&self) -> usize {
         self.be_processes.len()
     }
@@ -1765,6 +1954,22 @@ impl ServerHandle for CrossProcessServerHandle {
         Ok(())
     }
 
+    fn arm_query_lifecycle_fault(&mut self, index: usize, kind: &'static str) -> Result<()> {
+        self.ensure_be_index(index)?;
+        let token = self
+            .query_lifecycle_fault_files
+            .publish_rfo_8r2_fault(index, kind)?;
+        self.query_lifecycle_fault_tokens
+            .insert((index, kind), token.clone());
+        println!(
+            "armed RFO-8R2 query lifecycle fault kind={kind} for cross-process BE[{index}] token={token} trigger={}",
+            self.query_lifecycle_fault_files
+                .rfo_8r2_fault_path(index, kind)?
+                .display()
+        );
+        Ok(())
+    }
+
     fn arm_kill_query_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
         let token = self
             .query_lifecycle_fault_files
@@ -1788,6 +1993,24 @@ impl ServerHandle for CrossProcessServerHandle {
             phase.as_str(),
             self.query_lifecycle_fault_files
                 .fe_crash_at_phase_path(phase)
+                .display()
+        );
+        Ok(())
+    }
+
+    fn arm_be_kill_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
+        // `record_lifecycle_phase_marker_for_execution` is a shared FE-owned
+        // barrier. Its kill-query trigger name describes the historical
+        // consumer, not the runner action; this caller kills a BE after the
+        // same immutable phase marker and releases that trigger itself.
+        let token = self
+            .query_lifecycle_fault_files
+            .publish_kill_query_at_phase(phase)?;
+        println!(
+            "armed BE kill at lifecycle phase={} token={token} trigger={}",
+            phase.as_str(),
+            self.query_lifecycle_fault_files
+                .kill_query_at_phase_path(phase)
                 .display()
         );
         Ok(())
@@ -1841,6 +2064,14 @@ impl ServerHandle for CrossProcessServerHandle {
                 phase.as_str()
             )
         })
+    }
+
+    fn release_be_kill_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
+        let path = self
+            .query_lifecycle_fault_files
+            .kill_query_at_phase_path(phase);
+        remove_fragment_failure_file(&path)
+            .with_context(|| format!("release BE kill lifecycle phase barrier {}", phase.as_str()))
     }
 
     fn arm_query_control_fragment_backend_limit(&mut self, limit: usize) -> Result<()> {
@@ -2891,6 +3122,38 @@ mod tests {
             !trigger_dir.exists(),
             "dropping the runner-owned fault scope must remove every trigger"
         );
+        fs::remove_dir(&root).expect("remove empty temp root");
+    }
+
+    #[test]
+    fn rfo_8r2_fault_arm_uses_the_same_tokenized_scope_and_rejects_unknown_kinds() {
+        let root = std::env::temp_dir().join(format!(
+            "novarocks-rfo-8r2-fault-test-{}",
+            next_fragment_failure_token(99)
+        ));
+        fs::create_dir_all(&root).expect("create temp root");
+        let trigger_dir = root.join("query-lifecycle-faults");
+        let paths = QueryLifecycleFaultFiles::new(&trigger_dir, 3).expect("create fault paths");
+        let token = paths
+            .publish_rfo_8r2_fault(2, "terminal-outcome-suppress")
+            .expect("publish RFO-8R2 arm");
+        assert_eq!(
+            fs::read_to_string(
+                paths
+                    .rfo_8r2_fault_path(2, "terminal-outcome-suppress")
+                    .expect("fault path"),
+            )
+            .expect("read fault arm"),
+            format!("token={token}\nbackend_index=2\n")
+        );
+        let error = paths
+            .publish_rfo_8r2_fault(0, "not-a-rfo-8r2-fault")
+            .expect_err("unknown fault kind must not publish a file");
+        assert!(
+            format!("{error:#}").contains("unsupported RFO-8R2 query lifecycle fault kind"),
+            "unexpected error: {error:#}"
+        );
+        drop(paths);
         fs::remove_dir(&root).expect("remove empty temp root");
     }
 

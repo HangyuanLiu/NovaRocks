@@ -67,6 +67,7 @@ impl ResourceCleanupFaults {
 
 pub(crate) struct SinkCommitLease {
     lease: Option<Box<dyn FragmentCommitLease>>,
+    write_commit_evidence_ledger: novarocks_spi::connector::WriteCommitEvidenceLedger,
     cleanup_should_fail: bool,
 }
 
@@ -77,10 +78,16 @@ impl SinkCommitLease {
         cleanup_should_fail: bool,
     ) -> Result<Self, FragmentLaunchError> {
         let lease = port.acquire(finst_id).map_err(registration_error)?;
+        let write_commit_evidence_ledger = lease.write_commit_evidence_ledger();
         Ok(Self {
             lease: Some(lease),
+            write_commit_evidence_ledger,
             cleanup_should_fail,
         })
+    }
+
+    fn write_commit_evidence_ledger(&self) -> novarocks_spi::connector::WriteCommitEvidenceLedger {
+        self.write_commit_evidence_ledger.clone()
     }
 
     fn rollback(&mut self) -> Result<(), String> {
@@ -294,6 +301,14 @@ impl FragmentResources {
             self.cleanup_faults.should_fail(ResourceKind::SinkCommit),
         )?);
         Ok(())
+    }
+
+    pub(crate) fn write_commit_evidence_ledger(
+        &self,
+    ) -> Option<novarocks_spi::connector::WriteCommitEvidenceLedger> {
+        self.sink_commit
+            .as_ref()
+            .map(SinkCommitLease::write_commit_evidence_ledger)
     }
 
     pub(crate) fn acquire_result(

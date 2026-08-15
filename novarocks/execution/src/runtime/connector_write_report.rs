@@ -22,14 +22,52 @@
 
 use std::sync::{Arc, Mutex};
 
-use novarocks_spi::connector::{ConnectorStagedReport, ConnectorStagedReportFrame};
+use novarocks_spi::connector::{
+    ConnectorStagedReport, ConnectorStagedReportFrame, WriteCommitEvidenceLedger,
+};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ConnectorStagedReportCollector {
-    inner: Arc<Mutex<Option<Vec<ConnectorStagedReportFrame>>>>,
+    inner: Arc<Mutex<ConnectorStagedReportCollectorState>>,
+}
+
+#[derive(Debug)]
+struct ConnectorStagedReportCollectorState {
+    frames: Option<Vec<ConnectorStagedReportFrame>>,
+    ledger: WriteCommitEvidenceLedger,
+}
+
+impl Default for ConnectorStagedReportCollector {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ConnectorStagedReportCollectorState {
+                frames: None,
+                ledger: WriteCommitEvidenceLedger::default(),
+            })),
+        }
+    }
 }
 
 impl ConnectorStagedReportCollector {
+    /// Bind this decoder-created collector to the fragment commit lease before
+    /// an operator can publish its connector frames.
+    pub fn bind_write_commit_evidence_ledger(
+        &self,
+        ledger: WriteCommitEvidenceLedger,
+    ) -> Result<(), String> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|error| format!("lock connector staged report collector: {error}"))?;
+        if guard.frames.is_some() {
+            return Err(
+                "connector staged report collector cannot rebind after publication".to_string(),
+            );
+        }
+        guard.ledger = ledger;
+        Ok(())
+    }
+
     pub fn record(&self, report: ConnectorStagedReport) -> Result<(), String> {
         report
             .validate()
@@ -38,20 +76,37 @@ impl ConnectorStagedReportCollector {
             .inner
             .lock()
             .map_err(|error| format!("lock connector staged report collector: {error}"))?;
-        if guard.is_some() {
+        if guard.frames.is_some() {
             return Err(
                 "connector staged report collector received more than one logical report"
                     .to_string(),
             );
         }
-        *guard = Some(report.frames());
+        let frames = report.frames();
+        let bytes = frames.iter().try_fold(0usize, |total, frame| {
+            frame
+                .terminal_evidence_encoded_len()
+                .map_err(|error| {
+                    format!("measure connector staged report terminal evidence: {error}")
+                })
+                .and_then(|bytes| {
+                    total.checked_add(bytes).ok_or_else(|| {
+                        "connector staged report byte accounting overflowed".to_string()
+                    })
+                })
+        })?;
+        guard
+            .ledger
+            .reserve(bytes, frames.len())
+            .map_err(|error| format!("reserve connector staged report evidence: {error}"))?;
+        guard.frames = Some(frames);
         Ok(())
     }
 
     pub fn take(&self) -> Vec<ConnectorStagedReportFrame> {
         self.inner
             .lock()
-            .map(|mut guard| guard.take().unwrap_or_default())
+            .map(|mut guard| guard.frames.take().unwrap_or_default())
             .unwrap_or_default()
     }
 
@@ -102,5 +157,28 @@ mod tests {
         collector.record(report.clone()).expect("record once");
         assert_eq!(collector.take().len(), 1);
         collector.record(report).expect("record after take");
+    }
+
+    #[test]
+    fn collector_reserves_before_publishing_frames() {
+        let collector = ConnectorStagedReportCollector::default();
+        collector
+            .bind_write_commit_evidence_ledger(
+                novarocks_spi::connector::WriteCommitEvidenceLedger::new(
+                    novarocks_spi::connector::WriteCommitEvidenceLimits::try_new(3, 1)
+                        .expect("limits"),
+                ),
+            )
+            .expect("bind ledger");
+        let report = ConnectorStagedReport::try_new(
+            writer(),
+            1,
+            ConnectorWriterTerminalState::Staged,
+            ConnectorStagedReportSummary::default(),
+            Bytes::from_static(b"four"),
+        )
+        .expect("report");
+        assert!(collector.record(report).is_err());
+        assert!(collector.take().is_empty());
     }
 }

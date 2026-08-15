@@ -34,8 +34,9 @@ use novarocks::query_execution::lifecycle::contract::{
     encode_query_stage_response, encode_query_start_response,
 };
 use novarocks::query_execution::lifecycle::{
-    AttemptId, BackendQueryControl, FragmentLiveObservation, ParticipantBackendIdentity,
-    ParticipantManifest, ParticipantQueryOptions, ParticipantRole, QueryAbortRequest,
+    AttemptId, BackendQueryControl, FragmentLiveObservation, NegativeAttestation,
+    NegativeAttestationReason, ParticipantBackendIdentity, ParticipantManifest,
+    ParticipantQueryOptions, ParticipantRole, ParticipantTerminalOutcome, QueryAbortRequest,
     QueryControlAttach, QueryControlAttachment, QueryControlCommand, QueryControlEndpoint,
     QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitBarrier, QueryInitOutcome,
     QueryInitPlan, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
@@ -54,12 +55,21 @@ use super::barrier::{
 };
 use super::lease::{
     ActiveSession, AttemptControl, FragmentObservationStoreOutcome, FrontendLifecycleMetrics,
+    TerminalOutcomeStoreOutcome,
 };
 use super::{
     QueryControlSession, QueryLifecycleTarget, QueryLifecycleTransport,
     QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
 };
-use crate::coordinator::query_registry::{ActiveQueryAttemptControl, FrontendQueryRegistry};
+use crate::coordinator::query_registry::{
+    ActiveQueryAttemptControl, FrontendQueryRegistry, QueryLifecycleConvergenceErrorSource,
+};
+
+fn terminal_outcome(
+    snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot,
+) -> ParticipantTerminalOutcome {
+    ParticipantTerminalOutcome::proof(snapshot).expect("terminal proof outcome")
+}
 
 #[derive(Default)]
 struct NoopFragmentDispatcher;
@@ -201,7 +211,9 @@ impl QueryControlSession for RecordingSession {
         {
             state
                 .events
-                .push_back(Ok(QueryControlEvent::TerminalSnapshot { snapshot }));
+                .push_back(Ok(QueryControlEvent::TerminalOutcome {
+                    outcome: terminal_outcome(snapshot),
+                }));
         }
         if let Some(reason) = terminal {
             state
@@ -530,7 +542,14 @@ fn observation_control(
         config(),
         Arc::new(FrontendLifecycleMetrics::default()),
     );
-    control.set_attempted(&materialized.participants);
+    control.set_planned(&materialized.participants);
+    control.set_init_attempted(&materialized.participants);
+    for participant in &materialized.participants {
+        control.mark_control_ready(participant.target.backend_idx());
+    }
+    control
+        .freeze_admitted()
+        .expect("fixture admits every ControlReady participant");
     let session = ActiveSession::new(
         participant.target,
         participant.digest,
@@ -674,7 +693,7 @@ fn frontend_terminal_snapshot_fences_later_fragment_observations() {
     )
     .expect("fixture terminal snapshot");
     control
-        .store_terminal_snapshot(terminal)
+        .store_terminal_outcome(terminal_outcome(terminal))
         .expect("terminal snapshot is accepted");
 
     assert_eq!(
@@ -689,6 +708,44 @@ fn frontend_terminal_snapshot_fences_later_fragment_observations() {
             .get(&(0, before_terminal.fragment_instance_id())),
         Some(&before_terminal),
         "terminal state must not be overwritten by late telemetry"
+    );
+}
+
+#[test]
+fn frontend_negative_attestation_is_deduplicated_and_surfaces_as_terminal_input() {
+    let (control, _session, participant) = observation_control(0);
+    let manifest = participant.request.manifest();
+    let outcome = ParticipantTerminalOutcome::negative_attestation(NegativeAttestation::new(
+        manifest.execution_id(),
+        manifest.backend().clone(),
+        participant.digest,
+        NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted,
+        "terminal evidence retention exhausted".to_string(),
+    ));
+
+    assert_eq!(
+        control
+            .store_terminal_outcome(outcome.clone())
+            .expect("attestation is stored"),
+        TerminalOutcomeStoreOutcome::Accepted
+    );
+    assert_eq!(
+        control
+            .store_terminal_outcome(outcome)
+            .expect("same attestation retry is idempotent"),
+        TerminalOutcomeStoreOutcome::AlreadyAccepted
+    );
+    assert!(matches!(
+        control.terminal_outcomes_for_test().as_slice(),
+        [ParticipantTerminalOutcome::NegativeAttestation(attestation)]
+            if attestation.reason()
+                == NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted
+    ));
+    assert_eq!(
+        ActiveQueryAttemptControl::convergence_snapshot(control.as_ref())
+            .expect("stored terminal outcome retains convergence evidence")
+            .error_source,
+        Some(QueryLifecycleConvergenceErrorSource::BackendAttestation)
     );
 }
 
@@ -857,9 +914,9 @@ impl QueryControlSession for HeartbeatGateSession {
                     .terminal_snapshot
                     .clone()
                     .expect("heartbeat fixture terminal snapshot");
-                state
-                    .events
-                    .push_back(QueryControlEvent::TerminalSnapshot { snapshot });
+                state.events.push_back(QueryControlEvent::TerminalOutcome {
+                    outcome: terminal_outcome(snapshot),
+                });
                 state
                     .events
                     .push_back(QueryControlEvent::TerminationAccepted {
@@ -996,7 +1053,8 @@ fn frontend_query_lifecycle_pre_ready_guard_unwind_aborts_and_unbinds() {
         config(),
         Arc::clone(&metrics),
     );
-    control.set_attempted(&materialized.participants);
+    control.set_planned(&materialized.participants);
+    control.set_init_attempted(&materialized.participants);
     let active: Arc<dyn ActiveQueryAttemptControl> = control.clone();
     let binding = registry
         .bind_active_attempt(execution_id, active)
@@ -1073,6 +1131,50 @@ fn frontend_query_lifecycle_all_participant_barrier_aborts_attempted_targets() {
         "{error}"
     );
     assert_eq!(sorted(transport.abort_targets()), vec![0, 1, 2]);
+}
+
+#[test]
+fn control_ready_then_peer_attach_failure_never_freezes_admitted_participants() {
+    let plan = query_init_plan(None);
+    let execution_id = plan.execution_id();
+    let (transport, _) = RecordingTransport::ready(&plan);
+    transport.state.lock().unwrap().attach_results.insert(
+        1,
+        VecDeque::from([Err(transport_error(
+            QueryLifecycleTransportErrorKind::Unavailable,
+            "backend 1 attach failed",
+        ))]),
+    );
+    let (registry, _query) = registry_for(&plan);
+    let materialized = super::manifest::materialize(plan).expect("materialize fixture plan");
+    let control = AttemptControl::new(
+        execution_id,
+        Arc::new(transport.clone()),
+        Arc::downgrade(&registry),
+        config(),
+        Arc::new(FrontendLifecycleMetrics::default()),
+    );
+    control.set_planned(&materialized.participants);
+    control.set_init_attempted(&materialized.participants);
+
+    let errors = super::barrier::attach_all(
+        &transport,
+        &materialized.participants,
+        execution_id.attempt_id().get(),
+        config(),
+        &FrontendLifecycleMetrics::default(),
+        &control,
+    );
+
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("backend 1 attach failed")),
+        "expected backend 1 attach failure: {errors:?}"
+    );
+    assert_eq!(control.admitted_for_test(), None);
+
+    control.abort_before_ready("fixture cleanup".to_string());
 }
 
 #[test]
@@ -1444,14 +1546,52 @@ fn frontend_query_lifecycle_finalize_keeps_heartbeats_until_all_participants_dra
         })
     });
     for session in sessions.values() {
-        session.push_event(QueryControlEvent::TerminalSnapshot {
-            snapshot: session.terminal_snapshot(),
+        session.push_event(QueryControlEvent::TerminalOutcome {
+            outcome: terminal_outcome(session.terminal_snapshot()),
         });
     }
     finalize
         .join()
         .expect("join finalize")
         .expect("finalize once every snapshot arrives");
+}
+
+#[test]
+fn frontend_query_lifecycle_finalization_reports_stable_no_outcome_participants() {
+    let plan = query_init_plan(None);
+    let (transport, sessions) = RecordingTransport::ready(&plan);
+    let (registry, _query) = registry_for(&plan);
+    let finalize_config = config()
+        .with_terminal_timeouts(Duration::from_millis(20), Duration::from_millis(20))
+        .expect("terminal timeouts");
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport), registry, finalize_config);
+    let lease = barrier
+        .initialize_all(plan)
+        .expect("all participants ready");
+    for session in sessions.values() {
+        session.suppress_terminal_snapshot_on_finalize();
+    }
+
+    let error = lease
+        .finalize()
+        .expect_err("missing terminal outcomes must fail");
+    let message = error.message();
+    assert!(
+        message.contains("NoOutcome missing admitted participants"),
+        "{message}"
+    );
+    for backend_idx in [0, 1, 2] {
+        assert!(
+            message.contains(&format!("backend={backend_idx}")),
+            "{message}"
+        );
+    }
+    assert!(
+        message.find("backend=0") < message.find("backend=1")
+            && message.find("backend=1") < message.find("backend=2"),
+        "missing participants must be stable-sorted: {message}"
+    );
 }
 
 #[test]
@@ -1986,12 +2126,12 @@ async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal
     session
         .send(QueryControlCommand::Finalize)
         .expect("send finalize");
-    let snapshot = match session
+    let outcome = match session
         .recv_timeout(Duration::from_secs(2))
-        .expect("TerminalSnapshot")
+        .expect("TerminalOutcome")
     {
-        QueryControlEvent::TerminalSnapshot { snapshot } => snapshot,
-        event => panic!("expected TerminalSnapshot, got {event:?}"),
+        QueryControlEvent::TerminalOutcome { outcome } => outcome,
+        event => panic!("expected TerminalOutcome, got {event:?}"),
     };
     assert_eq!(
         session
@@ -2003,7 +2143,7 @@ async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal
     );
     session
         .send(QueryControlCommand::TerminalAck {
-            ack: QueryTerminalAck::from_snapshot(&snapshot),
+            ack: QueryTerminalAck::from_outcome(&outcome),
         })
         .expect("TerminalAck");
     let close = session
@@ -2594,16 +2734,21 @@ impl BackendQueryControl for LiveBackendControl {
             return Ok(());
         }
         self.events
-            .try_send(QueryControlEvent::TerminalSnapshot {
-                snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
-                    self.execution_id,
-                    self.backend.clone(),
-                    self.digest,
-                    Vec::new(),
-                )
-                .map_err(|error| {
-                    QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error.to_string())
-                })?,
+            .try_send(QueryControlEvent::TerminalOutcome {
+                outcome: terminal_outcome(
+                    novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
+                        self.execution_id,
+                        self.backend.clone(),
+                        self.digest,
+                        Vec::new(),
+                    )
+                    .map_err(|error| {
+                        QueryLifecycleError::new(
+                            QueryLifecycleErrorCode::Internal,
+                            error.to_string(),
+                        )
+                    })?,
+                ),
             })
             .map_err(live_control_error)?;
         self.events
@@ -2620,16 +2765,21 @@ impl BackendQueryControl for LiveBackendControl {
             return Ok(());
         }
         self.events
-            .try_send(QueryControlEvent::TerminalSnapshot {
-                snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
-                    self.execution_id,
-                    self.backend.clone(),
-                    self.digest,
-                    Vec::new(),
-                )
-                .map_err(|error| {
-                    QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error.to_string())
-                })?,
+            .try_send(QueryControlEvent::TerminalOutcome {
+                outcome: terminal_outcome(
+                    novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
+                        self.execution_id,
+                        self.backend.clone(),
+                        self.digest,
+                        Vec::new(),
+                    )
+                    .map_err(|error| {
+                        QueryLifecycleError::new(
+                            QueryLifecycleErrorCode::Internal,
+                            error.to_string(),
+                        )
+                    })?,
+                ),
             })
             .map_err(live_control_error)?;
         self.events

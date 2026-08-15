@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,11 +23,39 @@ use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
-use novarocks::query_execution::lifecycle::{QueryExecutionId, QueryTerminalSnapshot};
+use novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot;
+use novarocks::query_execution::lifecycle::{ParticipantTerminalOutcome, QueryExecutionId};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 
 type QueryKey = (i64, i64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueryLifecycleConvergenceErrorSource {
+    BackendAttestation,
+    FrontendLiveness,
+    NoOutcome,
+}
+
+/// Immutable, query-scoped terminal convergence evidence retained alongside
+/// the unary terminal ingress.  It is intentionally produced by the attempt
+/// control that owns the control streams, never reconstructed from process
+/// metrics or logs.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct QueryLifecycleConvergenceSnapshot {
+    pub(crate) execution_id: QueryExecutionId,
+    pub(crate) error_source: Option<QueryLifecycleConvergenceErrorSource>,
+    pub(crate) primary_error: Option<String>,
+    pub(crate) participant_outcomes: Vec<ParticipantTerminalOutcome>,
+    pub(crate) metrics: FrontendQueryLifecycleMetricsSnapshot,
+}
+
+/// Read-only diagnostic seam for the immutable terminal evidence retained by
+/// the query registry.  It deliberately has no access to active streams or
+/// terminal ingress mutation.
+pub(crate) trait QueryLifecycleConvergenceReader: Send + Sync {
+    fn latest_convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot>;
+}
 
 pub(crate) trait ActiveQueryAttemptControl: Send + Sync {
     fn execution_id(&self) -> QueryExecutionId;
@@ -38,15 +66,19 @@ pub(crate) trait ActiveQueryAttemptControl: Send + Sync {
     /// rather than the legacy execution-report registry.  This keeps the
     /// store-before-ACK identity check in one place for stream and unary
     /// delivery.
-    fn report_terminal_snapshot(
+    fn report_terminal_outcome(
         &self,
-        snapshot: QueryTerminalSnapshot,
+        outcome: ParticipantTerminalOutcome,
     ) -> Result<bool, DistributedQueryError>;
 
-    /// Once every participant snapshot is stored, retain the FE ingress long
+    /// Once every participant outcome is stored, retain the FE ingress long
     /// enough for a BE whose stream ACK was lost to complete unary fallback.
     fn retain_terminal_ingress(&self) -> bool {
         false
+    }
+
+    fn convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
+        None
     }
 }
 
@@ -60,10 +92,41 @@ struct RetainedTerminalIngress {
 
 struct ActiveQuery {
     scheduled_backends: BTreeMap<usize, u64>,
+    /// The user-visible failure is the lexical minimum of all reported
+    /// failures.  This deliberately makes concurrent failure reporting
+    /// independent of arrival order until T9 introduces the richer typed
+    /// ordering.
     first_failure: Option<String>,
+    /// Keep every losing distinct failure for the later structured
+    /// convergence snapshot instead of discarding it at the first latch.
+    secondary_failures: BTreeSet<String>,
     cancellation_requested: bool,
     cancellation_dispatched: bool,
     active_attempt: Option<Arc<dyn ActiveQueryAttemptControl>>,
+}
+
+impl ActiveQuery {
+    /// Records a failure using a commutative, idempotent minimum fold.
+    ///
+    /// `first_failure` remains the compatibility-facing name for the primary
+    /// textual error while callers migrate to the typed T9 cause model.
+    fn record_failure(&mut self, message: String) -> String {
+        match self.first_failure.as_mut() {
+            None => self.first_failure = Some(message),
+            Some(primary) if message < *primary => {
+                let displaced = std::mem::replace(primary, message.clone());
+                self.secondary_failures.remove(&message);
+                self.secondary_failures.insert(displaced);
+            }
+            Some(primary) if message != *primary => {
+                self.secondary_failures.insert(message);
+            }
+            Some(_) => {}
+        }
+        self.first_failure
+            .clone()
+            .expect("recorded failure has a primary value")
+    }
 }
 
 #[derive(Default)]
@@ -77,6 +140,7 @@ struct BackendTopologyState {
 pub(crate) struct FrontendQueryRegistry {
     active: Mutex<BTreeMap<QueryKey, ActiveQuery>>,
     retained_terminal_ingress: Mutex<BTreeMap<QueryExecutionId, RetainedTerminalIngress>>,
+    latest_retained_execution: Mutex<Option<QueryExecutionId>>,
     backend_topology: Mutex<BackendTopologyState>,
 }
 
@@ -116,6 +180,7 @@ impl FrontendQueryRegistry {
                 entry.insert(ActiveQuery {
                     scheduled_backends: BTreeMap::new(),
                     first_failure: None,
+                    secondary_failures: BTreeSet::new(),
                     cancellation_requested: false,
                     cancellation_dispatched: false,
                     active_attempt: None,
@@ -260,9 +325,9 @@ impl FrontendQueryRegistry {
 
     pub(crate) fn report_query_terminal(
         &self,
-        snapshot: QueryTerminalSnapshot,
+        outcome: ParticipantTerminalOutcome,
     ) -> Result<bool, DistributedQueryError> {
-        let query_id = snapshot.execution_id().query_id();
+        let query_id = outcome.execution_id().query_id();
         let active = self
             .active
             .lock()
@@ -270,10 +335,10 @@ impl FrontendQueryRegistry {
             .get(&query_key(query_id))
             .and_then(|query| query.active_attempt.clone());
         let control = match active {
-            Some(control) if control.execution_id() == snapshot.execution_id() => control,
-            Some(_) | None => self.retained_terminal_control(snapshot.execution_id())?,
+            Some(control) if control.execution_id() == outcome.execution_id() => control,
+            Some(_) | None => self.retained_terminal_control(outcome.execution_id())?,
         };
-        control.report_terminal_snapshot(snapshot)
+        control.report_terminal_outcome(outcome)
     }
 
     pub(crate) fn set_scheduled_backend_ownership(
@@ -360,11 +425,9 @@ impl FrontendQueryRegistry {
             active
                 .values_mut()
                 .filter_map(|query| {
-                    query.first_failure.get_or_insert_with(|| {
-                        format!(
-                            "backend topology revision changed from {previous_revision} to {revision}"
-                        )
-                    });
+                    query.record_failure(format!(
+                        "backend topology revision changed from {previous_revision} to {revision}"
+                    ));
                     Some(request_cancellation(query))
                 })
                 .collect::<Vec<_>>()
@@ -408,6 +471,23 @@ impl FrontendQueryRegistry {
             .and_then(|query| query.first_failure.clone())
     }
 
+    pub(crate) fn retained_convergence_snapshot(
+        &self,
+        execution_id: QueryExecutionId,
+    ) -> Option<QueryLifecycleConvergenceSnapshot> {
+        self.retained_terminal_control(execution_id)
+            .ok()
+            .and_then(|control| control.convergence_snapshot())
+    }
+
+    fn latest_retained_convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
+        let execution_id = *self
+            .latest_retained_execution
+            .lock()
+            .expect("frontend latest retained terminal ingress lock");
+        execution_id.and_then(|execution_id| self.retained_convergence_snapshot(execution_id))
+    }
+
     pub(crate) fn preserve_failure_context(
         &self,
         query_id: QueryId,
@@ -417,11 +497,7 @@ impl FrontendQueryRegistry {
         let query = active
             .get_mut(&query_key(query_id))
             .ok_or_else(|| inactive_query(query_id))?;
-        match query.first_failure.as_mut() {
-            Some(primary) if message.starts_with(primary.as_str()) => *primary = message,
-            Some(_) => {}
-            None => query.first_failure = Some(message),
-        }
+        query.record_failure(message);
         Ok(())
     }
 
@@ -435,10 +511,7 @@ impl FrontendQueryRegistry {
             let query = active
                 .get_mut(&query_key(query_id))
                 .ok_or_else(|| inactive_query(query_id))?;
-            let message = query
-                .first_failure
-                .get_or_insert_with(|| message.into())
-                .clone();
+            let message = query.record_failure(message.into());
             (message, request_cancellation(query))
         };
         dispatch_cancellation(Some(cancellation));
@@ -455,8 +528,10 @@ impl FrontendQueryRegistry {
                     continue;
                 }
                 if query.first_failure.is_none() {
-                    query.first_failure = Some(message.clone());
+                    query.record_failure(message.clone());
                     affected.push(QueryId::new(high, low));
+                } else {
+                    query.record_failure(message.clone());
                 }
                 cancellations.push(request_cancellation(query));
             }
@@ -484,8 +559,10 @@ impl FrontendQueryRegistry {
                     continue;
                 }
                 if query.first_failure.is_none() {
-                    query.first_failure = Some(message.clone());
+                    query.record_failure(message.clone());
                     affected.push(QueryId::new(high, low));
+                } else {
+                    query.record_failure(message.clone());
                 }
                 cancellations.push(request_cancellation(query));
             }
@@ -537,6 +614,7 @@ impl FrontendQueryRegistry {
     }
 
     fn retain_terminal_control(&self, control: Arc<dyn ActiveQueryAttemptControl>) {
+        let execution_id = control.execution_id();
         let now = Instant::now();
         let mut retained = self
             .retained_terminal_ingress
@@ -553,12 +631,16 @@ impl FrontendQueryRegistry {
             }
         }
         retained.insert(
-            control.execution_id(),
+            execution_id,
             RetainedTerminalIngress {
                 control,
                 expires_at: now + TERMINAL_INGRESS_RETENTION,
             },
         );
+        *self
+            .latest_retained_execution
+            .lock()
+            .expect("frontend latest retained terminal ingress lock") = Some(execution_id);
     }
 
     fn retained_terminal_control(
@@ -571,6 +653,17 @@ impl FrontendQueryRegistry {
             .lock()
             .expect("frontend retained terminal ingress lock");
         retained.retain(|_, ingress| ingress.expires_at > now);
+        if self
+            .latest_retained_execution
+            .lock()
+            .expect("frontend latest retained terminal ingress lock")
+            .is_some_and(|latest| !retained.contains_key(&latest))
+        {
+            *self
+                .latest_retained_execution
+                .lock()
+                .expect("frontend latest retained terminal ingress lock") = None;
+        }
         retained
             .get(&execution_id)
             .map(|ingress| Arc::clone(&ingress.control))
@@ -580,6 +673,12 @@ impl FrontendQueryRegistry {
                     "query terminal snapshot execution id is stale or has no retained ingress",
                 )
             })
+    }
+}
+
+impl QueryLifecycleConvergenceReader for FrontendQueryRegistry {
+    fn latest_convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
+        self.latest_retained_convergence_snapshot()
     }
 }
 
@@ -671,7 +770,8 @@ mod tests {
 
     use novarocks::query_execution::lifecycle::{
         AttemptId, FragmentTerminalOutcome, FragmentTerminalSnapshot, ParticipantBackendIdentity,
-        ParticipantManifestDigest, QueryControlEndpoint, QueryTerminalSnapshot,
+        ParticipantManifestDigest, ParticipantTerminalOutcome, QueryControlEndpoint,
+        QueryTerminalSnapshot,
     };
     use novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
 
@@ -687,9 +787,9 @@ mod tests {
 
         fn request_abort(&self, _reason: String) {}
 
-        fn report_terminal_snapshot(
+        fn report_terminal_outcome(
             &self,
-            _snapshot: QueryTerminalSnapshot,
+            _outcome: ParticipantTerminalOutcome,
         ) -> Result<bool, DistributedQueryError> {
             self.reports.fetch_add(1, Ordering::SeqCst);
             Ok(false)
@@ -697,6 +797,16 @@ mod tests {
 
         fn retain_terminal_ingress(&self) -> bool {
             true
+        }
+
+        fn convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
+            Some(QueryLifecycleConvergenceSnapshot {
+                execution_id: self.execution_id,
+                error_source: None,
+                primary_error: Some("stable test failure".to_string()),
+                participant_outcomes: Vec::new(),
+                metrics: FrontendQueryLifecycleMetricsSnapshot::default(),
+            })
         }
     }
 
@@ -738,9 +848,76 @@ mod tests {
 
         assert!(
             !registry
-                .report_query_terminal(terminal_snapshot(execution_id))
+                .report_query_terminal(
+                    ParticipantTerminalOutcome::proof(terminal_snapshot(execution_id))
+                        .expect("terminal proof outcome"),
+                )
                 .expect("retained ingress accepts duplicate terminal delivery")
         );
         assert_eq!(control.reports.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            registry
+                .retained_convergence_snapshot(execution_id)
+                .expect("retained control exposes its immutable convergence snapshot")
+                .primary_error
+                .as_deref(),
+            Some("stable test failure")
+        );
+        assert_eq!(
+            QueryLifecycleConvergenceReader::latest_convergence_snapshot(&registry)
+                .expect("latest retained control exposes convergence snapshot")
+                .execution_id,
+            execution_id,
+            "the read-only diagnostic seam returns retained attempt evidence"
+        );
+    }
+
+    #[test]
+    fn failure_primary_is_stable_when_reports_arrive_in_different_orders() {
+        fn record_in_order(messages: &[&str]) -> (String, Vec<String>) {
+            let registry = Arc::new(FrontendQueryRegistry::default());
+            let query_id = QueryId::new(71, 72);
+            registry
+                .active
+                .lock()
+                .expect("frontend query registry lock")
+                .insert(
+                    query_key(query_id),
+                    ActiveQuery {
+                        scheduled_backends: BTreeMap::new(),
+                        first_failure: None,
+                        secondary_failures: BTreeSet::new(),
+                        cancellation_requested: false,
+                        cancellation_dispatched: false,
+                        active_attempt: None,
+                    },
+                );
+            for message in messages {
+                registry
+                    .latch_failure_and_cancel(query_id, (*message).to_string())
+                    .expect("latch failure");
+            }
+            let active = registry
+                .active
+                .lock()
+                .expect("frontend query registry lock");
+            let query = active
+                .get(&query_key(query_id))
+                .expect("registered query remains active");
+            (
+                query.first_failure.clone().expect("primary failure"),
+                query.secondary_failures.iter().cloned().collect(),
+            )
+        }
+
+        let forward = record_in_order(&["zeta failure", "alpha failure", "middle failure"]);
+        let reverse = record_in_order(&["middle failure", "alpha failure", "zeta failure"]);
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.0, "alpha failure");
+        assert_eq!(
+            forward.1,
+            vec!["middle failure".to_string(), "zeta failure".to_string()]
+        );
     }
 }

@@ -43,7 +43,8 @@ pub(crate) fn decode_range_leaf(
         return Err(ArtifactCodecError::NonCanonicalPayload);
     }
     let digest = r.array::<32>()?;
-    let version = LogicalVersion::new(r.u64()?);
+    let version =
+        LogicalVersion::try_new(r.u64()?).map_err(|_| ArtifactCodecError::InvalidLogicalVersion)?;
     if digest != expected.digest() || version != expected_version {
         return Err(ArtifactCodecError::ContractViolation);
     }
@@ -458,6 +459,30 @@ mod tests {
         assert!(matches!(
             decode_range_leaf(&bytes, &contract, LogicalVersion::new(2), 4096),
             Err(ArtifactCodecError::ContractViolation)
+        ));
+    }
+
+    #[test]
+    fn nrrg_rejects_zero_logical_version() {
+        let contract = RuntimeOrderContract::from_frozen(
+            [RuntimeOrderKey::with_order(
+                DataType::Int64,
+                RuntimeOrderSortDirection::Ascending,
+                RuntimeOrderNullOrder::Last,
+            )],
+            [3; 32],
+            [7; 32],
+        );
+        let mut bytes = encode_range_leaf(
+            &contract,
+            &OrderedTuple::new([Some(OrderedScalar::Int64(9))]),
+            LogicalVersion::FIRST,
+        )
+        .unwrap();
+        bytes[39..47].fill(0);
+        assert!(matches!(
+            decode_range_leaf(&bytes, &contract, LogicalVersion::FIRST, 4096),
+            Err(ArtifactCodecError::InvalidLogicalVersion)
         ));
     }
 }

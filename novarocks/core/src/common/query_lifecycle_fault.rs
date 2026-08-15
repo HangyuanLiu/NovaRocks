@@ -41,6 +41,32 @@ pub enum QueryLifecycleFaultKind {
     /// Causes frontend terminal ingress to observe a second, semantically
     /// different snapshot for the same participant before it sends an ACK.
     TerminalSnapshotConflict,
+    /// Makes one optional runtime-filter observation contribution unavailable
+    /// while preserving the terminal proof's P0/P1 obligations.
+    ObservationP2AssemblyFailure,
+    /// Exhausts the optional observation contribution budget only.
+    ObservationP2BudgetPressure,
+    /// Rejects the retained-record portion of the participant's P0 attach
+    /// reservation before ControlReady is published.
+    TerminalP0RetainedSlotExhausted,
+    /// Rejects the bounded P0 byte reservation before ControlReady is
+    /// published.
+    TerminalP0BytesExhausted,
+    /// Rejects the terminal-delivery permit before ControlReady is published.
+    TerminalP0DeliveryPermitExhausted,
+    /// Fails P1 encoding after admission, requiring a negative attestation.
+    TerminalP1EncodeFailure,
+    /// Exhausts P1 retention after admission while leaving the P0 permit
+    /// available for a negative attestation.
+    TerminalP1RetentionExhausted,
+    /// Drops a proof frame from the control stream, requiring unary fallback.
+    TerminalProofStreamDrop,
+    /// Drops an attestation frame from the control stream, requiring unary
+    /// fallback.
+    TerminalAttestationStreamDrop,
+    /// Suppresses every participant terminal-delivery path. This is reserved
+    /// for the explicit NoOutcome timeout characterization.
+    TerminalOutcomeSuppress,
 }
 
 impl QueryLifecycleFaultKind {
@@ -56,6 +82,16 @@ impl QueryLifecycleFaultKind {
             Self::TerminalAckDrop => "terminal-ack-drop",
             Self::TerminalSnapshotStreamDrop => "terminal-snapshot-stream-drop",
             Self::TerminalSnapshotConflict => "terminal-snapshot-conflict",
+            Self::ObservationP2AssemblyFailure => "observation-p2-assembly-failure",
+            Self::ObservationP2BudgetPressure => "observation-p2-budget-pressure",
+            Self::TerminalP0RetainedSlotExhausted => "terminal-p0-retained-slot-exhausted",
+            Self::TerminalP0BytesExhausted => "terminal-p0-bytes-exhausted",
+            Self::TerminalP0DeliveryPermitExhausted => "terminal-p0-delivery-permit-exhausted",
+            Self::TerminalP1EncodeFailure => "terminal-p1-encode-failure",
+            Self::TerminalP1RetentionExhausted => "terminal-p1-retention-exhausted",
+            Self::TerminalProofStreamDrop => "terminal-proof-stream-drop",
+            Self::TerminalAttestationStreamDrop => "terminal-attestation-stream-drop",
+            Self::TerminalOutcomeSuppress => "terminal-outcome-suppress",
         }
     }
 }
@@ -432,6 +468,66 @@ mod tests {
             );
         }
         assert!(trigger_path(&root, 1, QueryLifecycleFaultKind::StartAckSuppress).exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn rfo_8r2_fault_arms_bind_and_claim_with_the_same_identity_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "novarocks-rfo-8r2-faults-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create scope root");
+        let kinds = [
+            QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
+            QueryLifecycleFaultKind::ObservationP2BudgetPressure,
+            QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
+            QueryLifecycleFaultKind::TerminalP0BytesExhausted,
+            QueryLifecycleFaultKind::TerminalP0DeliveryPermitExhausted,
+            QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+            QueryLifecycleFaultKind::TerminalP1RetentionExhausted,
+            QueryLifecycleFaultKind::TerminalProofStreamDrop,
+            QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
+            QueryLifecycleFaultKind::TerminalOutcomeSuppress,
+        ];
+        for (index, kind) in kinds.into_iter().enumerate() {
+            let backend_index = index + 1;
+            let arm = arm_path(&root, backend_index, kind);
+            fs::write(
+                &arm,
+                format!("token=rfo-{backend_index}\nbackend_index={backend_index}\n"),
+            )
+            .expect("write arm");
+            let scope = bind_armed_fault(
+                &root,
+                kind,
+                execution_id(91),
+                backend_index,
+                backend_index as u64,
+                17,
+            )
+            .expect("bind")
+            .expect("armed");
+            assert_eq!(scope.token, format!("rfo-{backend_index}"));
+            assert_eq!(
+                claim_matching_fault(
+                    &root,
+                    kind,
+                    execution_id(91),
+                    backend_index,
+                    backend_index as u64,
+                    17,
+                )
+                .expect("claim")
+                .as_ref()
+                .map(|value| value.token.as_str()),
+                Some(scope.token.as_str())
+            );
+        }
         fs::remove_dir_all(root).expect("cleanup");
     }
 

@@ -19,34 +19,33 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.fragment_execution_failure (
-  id BIGINT,
-  delay_s BIGINT
-)
+CREATE TABLE ${case_db}.terminal_p0_admission (id BIGINT)
 TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_execution_failure VALUES (1, 5);
+INSERT INTO ${case_db}.terminal_p0_admission VALUES (1), (2), (3);
 
 -- query 3
--- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_execution_failure VALUES (2, 5);
+-- A retained-record slot must be reserved before ControlReady; failure is
+-- therefore pre-admission and cannot create a partial participant set.
+-- @query_lifecycle_fault=terminal-p0-retained-slot-exhausted,0
+-- @expect_error=before ControlReady
+SELECT COUNT(*) FROM ${case_db}.terminal_p0_admission;
 
 -- query 4
--- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_execution_failure VALUES (3, 5);
+-- The P0 byte bound is independently acquired before ControlReady.
+-- @query_lifecycle_fault=terminal-p0-bytes-exhausted,1
+-- @expect_error=before ControlReady
+SELECT COUNT(*) FROM ${case_db}.terminal_p0_admission;
 
 -- query 5
--- @fail_fragment_after_start_be_index=1
--- @expect_error=fragment executor failure injected after start
--- @expect_participant_outcome=proof
--- @be_log_exact_fragment_cancellation=3
-SELECT COUNT(*)
-FROM ${case_db}.fragment_execution_failure
-WHERE sleep(delay_s);
+-- The terminal delivery permit is the third independently required P0 item.
+-- @query_lifecycle_fault=terminal-p0-delivery-permit-exhausted,2
+-- @expect_error=before ControlReady
+SELECT COUNT(*) FROM ${case_db}.terminal_p0_admission;
 
 -- query 6
--- A destructive local executor failure must leave the following query healthy.
+-- A failed pre-ready attach does not poison the following query.
 -- @result_contains=3
-SELECT COUNT(*) FROM ${case_db}.fragment_execution_failure;
+SELECT COUNT(*) FROM ${case_db}.terminal_p0_admission;

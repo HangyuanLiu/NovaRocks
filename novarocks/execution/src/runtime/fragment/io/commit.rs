@@ -44,9 +44,12 @@ pub struct FragmentCommitReport {
 /// Dropping an active lease rolls the registration back. `finish` transfers
 /// its facts to the host and prevents a second rollback.
 pub trait FragmentCommitLease: Send {
+    /// The single per-fragment budget for connector frames and tablet facts.
+    /// It must be obtained before either producer publishes terminal evidence.
+    fn write_commit_evidence_ledger(&self) -> novarocks_spi::connector::WriteCommitEvidenceLedger;
     fn add_load_stats(&mut self, stats: FragmentSinkLoadStats);
-    fn add_tablet_commit_info(&mut self, info: TabletCommitInfo);
-    fn add_tablet_fail_info(&mut self, info: TabletFailInfo);
+    fn add_tablet_commit_info(&mut self, info: TabletCommitInfo) -> Result<(), String>;
+    fn add_tablet_fail_info(&mut self, info: TabletFailInfo) -> Result<(), String>;
     fn finish(self: Box<Self>) -> Result<FragmentCommitReport, String>;
     /// Transfer the registered facts to the host's later lifecycle finalizer.
     fn handoff(self: Box<Self>) -> Result<(), String>;

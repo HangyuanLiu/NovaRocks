@@ -407,6 +407,7 @@ where
         &config.report_bind_host,
         config.report_grpc_port,
         host.terminal_ingress(),
+        host.lifecycle_convergence_reader(),
     )
     .map_err(FrontendApplicationError::server)?;
     let exchange_port = report_server.bound_addr().port();
@@ -837,6 +838,7 @@ mod tests {
             "127.0.0.1",
             0,
             host.terminal_ingress(),
+            host.lifecycle_convergence_reader(),
         )
         .expect("start frontend-owned report endpoint");
         let grpc_port = report_server.bound_addr().port();

@@ -1,18 +1,20 @@
 //! Frontend-owned report-only native endpoint.
 
+use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
+use axum::Json;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use novarocks::query_execution::lifecycle::{
     QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress, QueryTerminalReportOutcome,
-    decode_query_terminal_snapshot,
+    decode_participant_terminal_outcome,
 };
 use novarocks_protocol::{filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -21,9 +23,164 @@ use tonic::body::boxed;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
 
+use crate::coordinator::{
+    QueryLifecycleConvergenceErrorSource, QueryLifecycleConvergenceReader,
+    QueryLifecycleConvergenceSnapshot,
+};
+
 use super::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
+
+fn lifecycle_convergence_debug_enabled() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR").is_some()
+}
+
+#[derive(serde::Serialize)]
+struct LifecycleConvergenceDebugSnapshot {
+    execution_id: String,
+    error_source: Option<&'static str>,
+    participant_outcomes: Vec<LifecycleParticipantOutcomeDebug>,
+    telemetry_unavailable: Vec<LifecycleTelemetryUnavailableDebug>,
+    /// This endpoint intentionally exposes only query-scoped immutable
+    /// terminal evidence. Process metrics are not an acceptable substitute.
+    metrics: BTreeMap<String, i64>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum LifecycleParticipantOutcomeDebug {
+    Proof,
+    Attestation { reason: String },
+    NoOutcome,
+}
+
+#[derive(serde::Serialize)]
+struct LifecycleTelemetryUnavailableDebug {
+    scope: &'static str,
+    stage: String,
+    code: String,
+}
+
+async fn latest_lifecycle_convergence_snapshot(
+    reader: Arc<dyn QueryLifecycleConvergenceReader>,
+) -> axum::response::Response {
+    let Some(snapshot) = reader.latest_convergence_snapshot() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(lifecycle_convergence_debug_snapshot(snapshot)).into_response()
+}
+
+fn lifecycle_convergence_debug_snapshot(
+    snapshot: QueryLifecycleConvergenceSnapshot,
+) -> LifecycleConvergenceDebugSnapshot {
+    let mut telemetry_unavailable = Vec::new();
+    let mut participant_outcomes = snapshot
+        .participant_outcomes
+        .iter()
+        .map(|outcome| {
+            match outcome {
+            novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::Proof {
+                snapshot,
+                ..
+            } => {
+                if let Some(reason) = snapshot
+                    .profile_contribution_telemetry()
+                    .unavailable_reason()
+                {
+                    telemetry_unavailable.push(LifecycleTelemetryUnavailableDebug {
+                        scope: "query",
+                        stage: reason.stage().to_string(),
+                        code: reason.code().to_string(),
+                    });
+                }
+                for fragment in snapshot.fragments() {
+                    if let Some(reason) = fragment.profile_telemetry().unavailable_reason() {
+                        telemetry_unavailable.push(LifecycleTelemetryUnavailableDebug {
+                            scope: "fragment",
+                            stage: reason.stage().to_string(),
+                            code: reason.code().to_string(),
+                        });
+                    }
+                }
+                LifecycleParticipantOutcomeDebug::Proof
+            }
+            novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::NegativeAttestation(
+                attestation,
+            ) => LifecycleParticipantOutcomeDebug::Attestation {
+                reason: format!("{:?}", attestation.reason()),
+            },
+        }
+        })
+        .collect::<Vec<_>>();
+    let error_source = snapshot.error_source.map(|source| match source {
+        QueryLifecycleConvergenceErrorSource::BackendAttestation => "backend-attestation",
+        QueryLifecycleConvergenceErrorSource::FrontendLiveness => "frontend-liveness",
+        QueryLifecycleConvergenceErrorSource::NoOutcome => {
+            participant_outcomes.push(LifecycleParticipantOutcomeDebug::NoOutcome);
+            "no-outcome"
+        }
+    });
+    LifecycleConvergenceDebugSnapshot {
+        execution_id: format!(
+            "{}:{}:{}",
+            snapshot.execution_id.query_id().high(),
+            snapshot.execution_id.query_id().low(),
+            snapshot.execution_id.attempt_id().get()
+        ),
+        error_source,
+        participant_outcomes,
+        telemetry_unavailable,
+        metrics: lifecycle_metric_map(snapshot.metrics),
+    }
+}
+
+fn lifecycle_metric_map(
+    metrics: novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot,
+) -> BTreeMap<String, i64> {
+    [
+        ("active_attempts", metrics.active_attempts as i64),
+        ("init_applied", metrics.init_applied as i64),
+        ("init_idempotent", metrics.init_idempotent as i64),
+        ("init_failed", metrics.init_failed as i64),
+        ("control_ready", metrics.control_ready as i64),
+        ("attach_failed", metrics.attach_failed as i64),
+        ("heartbeat_timeouts", metrics.heartbeat_timeouts as i64),
+        ("coordinator_lost", metrics.coordinator_lost as i64),
+        ("local_failures", metrics.local_failures as i64),
+        (
+            "backend_epoch_mismatches",
+            metrics.backend_epoch_mismatches as i64,
+        ),
+        ("cleanup_failures", metrics.cleanup_failures as i64),
+        (
+            "terminal_locally_drained",
+            metrics.terminal_locally_drained as i64,
+        ),
+        (
+            "terminal_snapshots_accepted",
+            metrics.terminal_snapshots_accepted as i64,
+        ),
+        (
+            "terminal_snapshots_idempotent",
+            metrics.terminal_snapshots_idempotent as i64,
+        ),
+        (
+            "terminal_snapshot_conflicts",
+            metrics.terminal_snapshot_conflicts as i64,
+        ),
+        (
+            "terminal_finalize_failures",
+            metrics.terminal_finalize_failures as i64,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_string(), value))
+    .collect()
+}
 
 #[derive(Clone)]
 struct FrontendReportService {
@@ -152,13 +309,13 @@ impl NovaRocksGrpc for FrontendReportService {
         &self,
         request: tonic::Request<proto::ReportQueryTerminalRequest>,
     ) -> Result<tonic::Response<proto::ReportQueryTerminalResponse>, tonic::Status> {
-        let snapshot = request.into_inner().snapshot.ok_or_else(|| {
-            tonic::Status::invalid_argument("ReportQueryTerminalRequest missing snapshot")
+        let outcome = request.into_inner().outcome.ok_or_else(|| {
+            tonic::Status::invalid_argument("ReportQueryTerminalRequest missing outcome")
         })?;
-        let snapshot =
-            decode_query_terminal_snapshot(&snapshot).map_err(status_from_lifecycle_error)?;
+        let outcome =
+            decode_participant_terminal_outcome(&outcome).map_err(status_from_lifecycle_error)?;
         let ingress = Arc::clone(&self.ingress);
-        let ack = tokio::task::spawn_blocking(move || ingress.report_query_terminal(snapshot))
+        let ack = tokio::task::spawn_blocking(move || ingress.report_query_terminal(outcome))
             .await
             .map_err(|error| {
                 tonic::Status::internal(format!("query terminal ingress panicked: {error}"))
@@ -212,6 +369,7 @@ impl FrontendReportServerHandle {
         host: &str,
         port: u16,
         ingress: Arc<dyn QueryTerminalIngress>,
+        convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
     ) -> Result<Self, String> {
         let address = parse_bind_addr(host, port)?;
         let listener = TcpListener::bind(address).map_err(|error| {
@@ -256,6 +414,17 @@ impl FrontendReportServerHandle {
                             .route_service(&grpc_path, AxumGrpcService::new(service))
                             .route("/metrics", get(novarocks::service::handle_metrics))
                             .fallback(grpc_unimplemented_fallback);
+                        let app = if lifecycle_convergence_debug_enabled() {
+                            let debug_reader = Arc::clone(&convergence_reader);
+                            app.route(
+                                LIFECYCLE_CONVERGENCE_DEBUG_PATH,
+                                get(move || {
+                                    latest_lifecycle_convergence_snapshot(Arc::clone(&debug_reader))
+                                }),
+                            )
+                        } else {
+                            app
+                        };
                         let mut shutdown_rx = shutdown_rx;
                         axum::serve(listener, app)
                             .with_graceful_shutdown(async move {

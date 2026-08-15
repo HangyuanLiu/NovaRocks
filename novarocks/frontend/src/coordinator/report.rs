@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use novarocks::query_execution::contract::DistributedQueryErrorKind;
 use novarocks::query_execution::lifecycle::{
-    QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress, QueryTerminalReportAck,
-    QueryTerminalReportOutcome, QueryTerminalSnapshot,
+    ParticipantTerminalOutcome, QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress,
+    QueryTerminalReportAck, QueryTerminalReportOutcome,
 };
 
 use super::query_registry::FrontendQueryRegistry;
@@ -42,16 +42,16 @@ impl FrontendCoordinatorTerminalIngress {
 impl QueryTerminalIngress for FrontendCoordinatorTerminalIngress {
     fn report_query_terminal(
         &self,
-        snapshot: QueryTerminalSnapshot,
+        outcome: ParticipantTerminalOutcome,
     ) -> Result<QueryTerminalReportAck, QueryLifecycleError> {
-        match self.registry.report_query_terminal(snapshot) {
+        match self.registry.report_query_terminal(outcome) {
             Ok(true) => Ok(QueryTerminalReportAck::new(
                 QueryTerminalReportOutcome::Accepted,
-                "terminal snapshot stored",
+                "terminal outcome stored",
             )),
             Ok(false) => Ok(QueryTerminalReportAck::new(
                 QueryTerminalReportOutcome::AlreadyAccepted,
-                "terminal snapshot already stored",
+                "terminal outcome already stored",
             )),
             Err(error) if matches!(error.kind(), DistributedQueryErrorKind::Rejected) => {
                 Ok(QueryTerminalReportAck::new(

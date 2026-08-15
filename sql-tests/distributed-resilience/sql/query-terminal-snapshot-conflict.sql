@@ -37,7 +37,7 @@ INSERT INTO ${case_db}.terminal_conflict VALUES (3, 30);
 -- never publish a successful terminal set, and clean up normally.
 -- @terminal_snapshot_conflict_be_index=0
 -- @query_control_fragment_backend_limit=2
--- @expect_error=query terminal snapshot conflicts with an already stored participant snapshot
+-- @expect_error=query terminal outcome conflicts with an already stored participant outcome
 SELECT SUM(left_side.payload) AS total
 FROM ${case_db}.terminal_conflict left_side
 JOIN ${case_db}.terminal_conflict right_side

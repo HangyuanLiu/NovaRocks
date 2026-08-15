@@ -28,7 +28,7 @@ use novarocks::novarocks_logging::error;
 use novarocks::novarocks_logging::warn;
 use novarocks::query_execution::lifecycle::StageFragment;
 use novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime;
-use novarocks::runtime::sink_commit::CoreSinkCommitPort;
+use novarocks::runtime::sink_commit::{ConfiguredCoreSinkCommitPort, CoreSinkCommitPort};
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_execution::runtime::fragment::io::{
     ExchangeFrameTransmitter, ExchangeReceiverPort, FragmentCommitPort, FragmentResultWriter,
@@ -41,6 +41,7 @@ use novarocks_execution::runtime::fragment::{
 use novarocks_execution::runtime::profile::Profiler;
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorRequestContext,
+    WriteCommitEvidenceLimits,
 };
 
 use super::control::{FragmentControlHandle, FragmentControlRegistry};
@@ -210,6 +211,14 @@ impl NativeFragmentService {
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     ) -> Self {
         self.exchange_receiver_port = exchange_receiver_port;
+        self
+    }
+
+    pub(crate) fn with_write_commit_evidence_limits(
+        mut self,
+        limits: WriteCommitEvidenceLimits,
+    ) -> Self {
+        self.commit_port = Arc::new(ConfiguredCoreSinkCommitPort::new(limits));
         self
     }
 

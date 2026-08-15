@@ -33,7 +33,9 @@ use crate::catalog_attachment::CatalogAttachmentRepository;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::connector::ConnectorControlHost;
 use crate::coordination::FrontendCoordinationRuntime;
-use crate::coordinator::{BackendQueryActivity, FrontendDistributedQueryCoordinator};
+use crate::coordinator::{
+    BackendQueryActivity, FrontendDistributedQueryCoordinator, QueryLifecycleConvergenceReader,
+};
 use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
 use crate::dml::recovery::DmlRecoveryController;
 use crate::dml::{DmlService, StateStoreOperationJournal};
@@ -865,6 +867,13 @@ impl FrontendApplicationHost {
                 .expect("frontend coordinator is installed before host open returns")
                 .terminal_ingress(),
         )
+    }
+
+    pub(crate) fn lifecycle_convergence_reader(&self) -> Arc<dyn QueryLifecycleConvergenceReader> {
+        self.coordinator
+            .as_ref()
+            .expect("frontend coordinator is installed before host open returns")
+            .convergence_reader()
     }
 
     #[cfg(test)]
