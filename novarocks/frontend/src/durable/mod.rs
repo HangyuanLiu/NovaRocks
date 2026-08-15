@@ -92,6 +92,12 @@ pub(crate) trait DurableRecord: Serialize {
 /// A checked StateStore value. Only [`DurableRecordStore`] can consume it.
 pub(crate) struct EncodedRecord(Value);
 
+impl EncodedRecord {
+    pub(crate) fn into_value(self) -> Value {
+        self.0
+    }
+}
+
 impl fmt::Debug for EncodedRecord {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -186,9 +192,11 @@ pub(crate) struct DurableRecordStore {
 
 impl DurableRecordStore {
     pub(crate) fn new(store: Arc<dyn StateStore>) -> Self {
-        Self {
-            limits: store.limits().clone(),
-        }
+        Self::with_limits(store.limits().clone())
+    }
+
+    pub(crate) fn with_limits(limits: StateStoreLimits) -> Self {
+        Self { limits }
     }
 
     pub(crate) fn encode<R: DurableRecord>(
@@ -237,11 +245,10 @@ impl DurableRecordStore {
         key: Key,
         record: EncodedRecord,
         precondition: Precondition,
-    ) -> Result<(), DurableRecordError> {
+    ) -> Result<(), StateStoreError> {
         transaction
-            .put(key, record.0, precondition)
+            .put(key, record.into_value(), precondition)
             .await
-            .map_err(DurableRecordError::from)
     }
 }
 
