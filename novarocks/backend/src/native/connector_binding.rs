@@ -32,6 +32,7 @@ use novarocks_protocol::novarocks::{
 };
 
 use super::decode::decode_native_query_execution_id;
+use crate::query_lifecycle::protocol_adapter::legacy_execution_id;
 
 const CONNECTOR_BINDING_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -58,7 +59,11 @@ pub fn decode_ensure_request(
         incarnation,
         Bytes::from(request.declaration_payload),
     )?;
-    Ok((execution_id, declaration))
+    Ok((
+        legacy_execution_id(execution_id)
+            .expect("validated Protocol execution id must convert for the legacy connector host"),
+        declaration,
+    ))
 }
 
 pub fn decode_retire_request(

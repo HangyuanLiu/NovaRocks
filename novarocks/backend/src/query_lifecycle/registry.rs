@@ -47,10 +47,23 @@ use novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
 use novarocks_execution::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
+use novarocks_protocol::lifecycle::{
+    QueryAbortRequest as ProtocolQueryAbortRequest,
+    QueryControlAttach as ProtocolQueryControlAttach, QueryInitAck as ProtocolQueryInitAck,
+    QueryInitRequest as ProtocolQueryInitRequest, QueryStageAck as ProtocolQueryStageAck,
+    QueryStageRequest as ProtocolQueryStageRequest, QueryStartAck as ProtocolQueryStartAck,
+    QueryStartRequest as ProtocolQueryStartRequest,
+    QueryTerminationAck as ProtocolQueryTerminationAck,
+};
 use novarocks_types::UniqueId;
 use prost::Message;
 
 use super::entry::{QueryLifecycleEntry, QueryLifecyclePhase};
+use super::protocol_adapter::{
+    legacy_abort_request, legacy_control_attach, legacy_init_request, legacy_stage_request,
+    legacy_start_request, protocol_execution_id, protocol_init_ack, protocol_stage_ack,
+    protocol_start_ack, protocol_termination_ack,
+};
 use super::{
     BackendQueryControl, QueryControlAttachment, QueryLifecycleIngress,
     QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
@@ -2981,7 +2994,7 @@ impl QueryLifecycleRegistry {
         let claimed = claim_matching_fault(
             &root,
             kind,
-            execution_id,
+            protocol_execution_id(execution_id),
             backend_index,
             backend_id,
             self.local_start_epoch,
@@ -4118,30 +4131,56 @@ impl QueryLifecycleIngress for QueryLifecycleRegistry {
         QueryLifecycleRegistry::bind_backend_identity(self, backend_id)
     }
 
-    fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
-        QueryLifecycleRegistry::init_query(self, request)
+    fn init_query(&self, request: ProtocolQueryInitRequest) -> ProtocolQueryInitAck {
+        protocol_init_ack(&QueryLifecycleRegistry::init_query(
+            self,
+            legacy_init_request(request).expect(
+                "validated Protocol InitQuery request must convert for the legacy registry",
+            ),
+        ))
     }
 
-    fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
-        QueryLifecycleRegistry::stage_fragments(self, request)
+    fn stage_fragments(&self, request: ProtocolQueryStageRequest) -> ProtocolQueryStageAck {
+        protocol_stage_ack(&QueryLifecycleRegistry::stage_fragments(
+            self,
+            legacy_stage_request(request).expect(
+                "validated Protocol StageFragments request must convert for the legacy registry",
+            ),
+        ))
     }
 
-    fn start_prepared_query(&self, request: QueryStartRequest) -> QueryStartAck {
-        QueryLifecycleRegistry::start_prepared_query(self, request)
+    fn start_prepared_query(&self, request: ProtocolQueryStartRequest) -> ProtocolQueryStartAck {
+        protocol_start_ack(&QueryLifecycleRegistry::start_prepared_query(
+            self,
+            legacy_start_request(request).expect(
+                "validated Protocol StartPreparedQuery request must convert for the legacy registry",
+            ),
+        ))
     }
 
     fn abort_query(
         &self,
-        request: QueryAbortRequest,
-    ) -> Result<QueryTerminationAck, QueryLifecycleError> {
-        QueryLifecycleRegistry::abort_query(self, request)
+        request: ProtocolQueryAbortRequest,
+    ) -> Result<ProtocolQueryTerminationAck, QueryLifecycleError> {
+        QueryLifecycleRegistry::abort_query(
+            self,
+            legacy_abort_request(request).expect(
+                "validated Protocol AbortQuery request must convert for the legacy registry",
+            ),
+        )
+        .map(|ack| protocol_termination_ack(&ack))
     }
 
     fn attach_control(
         &self,
-        attach: QueryControlAttach,
+        attach: ProtocolQueryControlAttach,
     ) -> Result<QueryControlAttachment, QueryLifecycleError> {
-        QueryLifecycleRegistry::attach_control(self, attach)
+        QueryLifecycleRegistry::attach_control(
+            self,
+            legacy_control_attach(attach).expect(
+                "validated Protocol QueryControlAttach must convert for the legacy registry",
+            ),
+        )
     }
 }
 

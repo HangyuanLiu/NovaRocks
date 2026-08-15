@@ -18,6 +18,7 @@
 mod contract;
 mod entry;
 mod local_runtime;
+pub(crate) mod protocol_adapter;
 mod registry;
 pub(crate) mod stage;
 

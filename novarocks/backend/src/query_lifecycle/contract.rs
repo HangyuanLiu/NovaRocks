@@ -23,12 +23,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use novarocks::query_execution::lifecycle::QueryControlEndpoint;
 use novarocks::query_execution::lifecycle::{
-    FragmentLiveObservation, ParticipantTerminalOutcome, QueryAbortRequest, QueryControlAttach,
-    QueryControlEvent, QueryInitAck, QueryInitRequest, QueryLifecycleError, QueryStageAck,
+    FragmentLiveObservation, ParticipantTerminalOutcome, QueryControlEndpoint, QueryControlEvent,
+    QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalAck, QueryTerminalReportAck,
+    QueryTerminationReason,
+};
+use novarocks_protocol::lifecycle::{
+    QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest, QueryStageAck,
     QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome, QueryStartRequest,
-    QueryTerminalAck, QueryTerminalReportAck, QueryTerminationAck, QueryTerminationReason,
+    QueryTerminationAck,
 };
 
 pub(crate) trait BackendQueryControl: Send + Sync + 'static {
@@ -40,7 +43,7 @@ pub(crate) trait BackendQueryControl: Send + Sync + 'static {
 
     fn terminal_ack(&self, _ack: QueryTerminalAck) -> Result<(), QueryLifecycleError> {
         Err(QueryLifecycleError::new(
-            novarocks::query_execution::lifecycle::QueryLifecycleErrorCode::Terminated,
+            QueryLifecycleErrorCode::Terminated,
             "query terminal acknowledgement is not supported by this lifecycle owner",
         ))
     }
@@ -73,6 +76,7 @@ pub(crate) trait QueryLifecycleIngress: Send + Sync + 'static {
             QueryStageOutcome::RejectedInvalidState,
             "StageFragments is not supported by this lifecycle ingress",
         )
+        .expect("existing validated Stage request has a valid acknowledgement projection")
     }
 
     /// Releases one previously staged query bundle. A duplicate request with
@@ -85,6 +89,7 @@ pub(crate) trait QueryLifecycleIngress: Send + Sync + 'static {
             QueryStartOutcome::RejectedNotStaged,
             "StartPreparedQuery is not supported by this lifecycle ingress",
         )
+        .expect("existing validated Start request has a valid acknowledgement projection")
     }
 
     fn abort_query(

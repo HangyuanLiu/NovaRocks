@@ -23,18 +23,21 @@ use std::sync::{Mutex, OnceLock};
 
 use tokio_stream::wrappers::ReceiverStream;
 
-use novarocks::query_execution::lifecycle::contract::{
-    decode_abort_query_request, decode_query_control_attach, decode_query_control_command,
-    decode_query_init_request, decode_query_stage_request, decode_query_start_request,
-    encode_abort_query_response, encode_query_control_event, encode_query_init_response,
-    encode_query_stage_response, encode_query_start_response,
-};
+use novarocks::query_execution::lifecycle::contract::encode_query_control_event;
 use novarocks::query_execution::lifecycle::{
-    QueryControlCommand, QueryControlEvent, QueryInitOutcome, QueryLifecycleError,
-    QueryLifecycleErrorCode, QueryTerminationReason,
+    QueryControlCommand, QueryControlEvent, QueryLifecycleError, QueryLifecycleErrorCode,
+    QueryTerminationReason,
+};
+use novarocks_protocol::lifecycle::{
+    ContractError, ContractErrorCode, QueryAbortRequest, QueryControlAttach,
+    QueryControlCommand as ProtocolQueryControlCommand, QueryInitOutcome, QueryInitRequest,
+    QueryStageRequest, QueryStartRequest,
 };
 use novarocks_protocol::novarocks as proto;
 
+use crate::query_lifecycle::protocol_adapter::{
+    legacy_control_command, legacy_execution_id, protocol_execution_id,
+};
 use crate::query_lifecycle::{BackendQueryControl, QueryLifecycleIngress};
 
 const CONTROL_STREAM_CAPACITY: usize = 16;
@@ -46,10 +49,17 @@ pub fn handle_init_query(
     ingress: &dyn QueryLifecycleIngress,
     request: proto::InitQueryRequest,
 ) -> Result<proto::InitQueryResponse, tonic::Status> {
-    let request = decode_query_init_request(&request).map_err(status_from_lifecycle_error)?;
-    let execution_id = request.manifest().execution_id();
+    let request = QueryInitRequest::parse(request).map_err(status_from_contract_error)?;
+    let execution_id = legacy_execution_id(
+        request
+            .manifest()
+            .map_err(status_from_contract_error)?
+            .execution_id()
+            .map_err(status_from_contract_error)?,
+    )
+    .map_err(status_from_lifecycle_error)?;
     let ack = ingress.init_query(request);
-    if ack.outcome() == QueryInitOutcome::Applied {
+    if matches!(ack.outcome(), Ok(QueryInitOutcome::QueryInitApplied)) {
         if let Some(scope) =
             claim_backend_fault(QueryLifecycleFaultKind::RestartAfterInitAck, execution_id)?
         {
@@ -83,19 +93,19 @@ pub fn handle_init_query(
             ));
         }
     }
-    Ok(encode_query_init_response(&ack))
+    Ok(ack.as_proto().clone())
 }
 
 pub fn handle_abort_query(
     ingress: &dyn QueryLifecycleIngress,
     request: proto::AbortQueryRequest,
 ) -> Result<proto::AbortQueryResponse, tonic::Status> {
-    let request = decode_abort_query_request(&request).map_err(status_from_lifecycle_error)?;
+    let request = QueryAbortRequest::parse(request).map_err(status_from_contract_error)?;
     let response = ingress
         .abort_query(request)
         .map_err(status_from_lifecycle_error)?;
     emit_query_lifecycle_abort_marker();
-    Ok(encode_abort_query_response(&response))
+    Ok(response.as_proto().clone())
 }
 
 fn emit_query_lifecycle_abort_marker() {
@@ -109,8 +119,9 @@ pub fn handle_stage_fragments(
     ingress: &dyn QueryLifecycleIngress,
     request: proto::StageFragmentsRequest,
 ) -> Result<proto::StageFragmentsResponse, tonic::Status> {
-    let request = decode_query_stage_request(&request).map_err(status_from_lifecycle_error)?;
-    let execution_id = request.execution_id();
+    let request = QueryStageRequest::parse(request).map_err(status_from_contract_error)?;
+    let execution_id =
+        legacy_execution_id(request.execution_id()).map_err(status_from_lifecycle_error)?;
     let response = ingress.stage_fragments(request);
     if response.outcome().is_staged() {
         if let Some(scope) = claim_backend_fault(
@@ -136,15 +147,16 @@ pub fn handle_stage_fragments(
             "runner-owned StageAck response dropped after staging",
         ));
     }
-    Ok(encode_query_stage_response(&response))
+    Ok(response.as_proto().clone())
 }
 
 pub fn handle_start_prepared_query(
     ingress: &dyn QueryLifecycleIngress,
     request: proto::StartPreparedQueryRequest,
 ) -> Result<proto::StartPreparedQueryResponse, tonic::Status> {
-    let request = decode_query_start_request(&request).map_err(status_from_lifecycle_error)?;
-    let execution_id = request.execution_id();
+    let request = QueryStartRequest::parse(request).map_err(status_from_contract_error)?;
+    let execution_id =
+        legacy_execution_id(request.execution_id()).map_err(status_from_lifecycle_error)?;
     let response = ingress.start_prepared_query(request);
     if response.outcome().is_running()
         && let Some(scope) =
@@ -178,7 +190,7 @@ pub fn handle_start_prepared_query(
             "runner-owned StartAck response suppressed after release",
         ));
     }
-    Ok(encode_query_start_response(&response))
+    Ok(response.as_proto().clone())
 }
 
 pub async fn handle_query_control_stream(
@@ -203,8 +215,17 @@ pub async fn handle_query_control_stream(
             "first frame must be Attach",
         ));
     }
-    let attach = decode_query_control_attach(&first).map_err(status_from_lifecycle_error)?;
-    let execution_id = attach.execution_id();
+    let attach = first
+        .command
+        .and_then(|command| match command {
+            proto::query_control_request::Command::Attach(attach) => Some(attach),
+            _ => None,
+        })
+        .expect("checked Attach frame must contain attach payload");
+    let attach = QueryControlAttach::parse(attach).map_err(status_from_contract_error)?;
+    let execution_id =
+        legacy_execution_id(attach.execution_id().map_err(status_from_contract_error)?)
+            .map_err(status_from_lifecycle_error)?;
     for kind in [
         QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
         QueryLifecycleFaultKind::TerminalP0BytesExhausted,
@@ -348,12 +369,15 @@ async fn run_attached_control_stream(
                     .await;
                     break;
                 }
-                let command = match decode_query_control_command(&request) {
+                let command = match ProtocolQueryControlCommand::parse(request)
+                    .map_err(status_from_contract_error)
+                    .and_then(|command| legacy_control_command(command).map_err(status_from_lifecycle_error))
+                {
                     Ok(command) => command,
                     Err(error) => {
                         let _ = send_control_response(
                             &outbound,
-                            Err(status_from_lifecycle_error(error)),
+                            Err(error),
                             &mut shutdown,
                         )
                         .await;
@@ -490,15 +514,10 @@ use novarocks::common::query_lifecycle_fault::{claim_matching_fault, trigger_pat
 
 #[cfg(debug_assertions)]
 fn staged_heartbeat_stops() -> &'static Mutex<
-    BTreeMap<novarocks::query_execution::lifecycle::QueryExecutionId, QueryLifecycleFaultScope>,
+    BTreeMap<novarocks_protocol::lifecycle::QueryExecutionId, QueryLifecycleFaultScope>,
 > {
     static STOPS: OnceLock<
-        Mutex<
-            BTreeMap<
-                novarocks::query_execution::lifecycle::QueryExecutionId,
-                QueryLifecycleFaultScope,
-            >,
-        >,
+        Mutex<BTreeMap<novarocks_protocol::lifecycle::QueryExecutionId, QueryLifecycleFaultScope>>,
     > = OnceLock::new();
     STOPS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
@@ -521,7 +540,7 @@ fn staged_heartbeat_stop(
     staged_heartbeat_stops()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&execution_id)
+        .get(&protocol_execution_id(execution_id))
         .cloned()
 }
 
@@ -554,7 +573,7 @@ fn claim_backend_fault(
     claim_matching_fault(
         &root,
         kind,
-        execution_id,
+        protocol_execution_id(execution_id),
         backend_index,
         backend_id,
         novarocks::runtime::start_epoch::start_epoch(),
@@ -617,7 +636,7 @@ fn observe_backend_fault(
     observe_matching_fault(
         &root,
         kind,
-        execution_id,
+        protocol_execution_id(execution_id),
         backend_index,
         backend_id,
         novarocks::runtime::start_epoch::start_epoch(),
@@ -713,5 +732,18 @@ pub fn status_from_lifecycle_error(error: QueryLifecycleError) -> tonic::Status 
         QueryLifecycleErrorCode::Capacity => tonic::Status::resource_exhausted(detail),
         QueryLifecycleErrorCode::Transport => tonic::Status::unavailable(detail),
         QueryLifecycleErrorCode::Internal => tonic::Status::internal(detail),
+    }
+}
+
+fn status_from_contract_error(error: ContractError) -> tonic::Status {
+    let detail = error.detail().to_string();
+    match error.code() {
+        ContractErrorCode::InvalidValue | ContractErrorCode::VersionMismatch => {
+            tonic::Status::invalid_argument(detail)
+        }
+        ContractErrorCode::Conflict | ContractErrorCode::DigestMismatch => {
+            tonic::Status::already_exists(detail)
+        }
+        ContractErrorCode::Capacity => tonic::Status::resource_exhausted(detail),
     }
 }

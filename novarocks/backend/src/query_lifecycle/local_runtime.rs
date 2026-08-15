@@ -25,6 +25,7 @@ use novarocks_types::UniqueId;
 use crate::ConnectorExecutionHost;
 use crate::fragment::control::FragmentControlRegistry;
 
+use super::protocol_adapter::protocol_execution_id;
 use super::registry::QueryLifecycleLocalRuntime;
 
 pub(crate) struct NativeQueryLifecycleLocalRuntime {
@@ -57,7 +58,7 @@ impl QueryLifecycleLocalRuntime for NativeQueryLifecycleLocalRuntime {
         let mut fragment_instance_ids = expected_instances.iter().copied().collect::<BTreeSet<_>>();
         fragment_instance_ids.extend(
             self.runtime
-                .cancel_execution(execution_id, detail.to_string()),
+                .cancel_execution(protocol_execution_id(execution_id), detail.to_string()),
         );
         let fragment_instance_ids = fragment_instance_ids.into_iter().collect::<Vec<_>>();
         self.controls.cancel_many(&fragment_instance_ids, detail);

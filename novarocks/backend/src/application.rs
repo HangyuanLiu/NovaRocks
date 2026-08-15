@@ -6,13 +6,13 @@ use std::time::{Duration, Instant};
 
 use novarocks::common::network::AdvertiseEndpoint;
 use novarocks::connector::ConnectorRegistry;
-use novarocks::query_execution::lifecycle::{
-    QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest, QueryLifecycleError,
-    QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartRequest,
-    QueryTerminalIngress, QueryTerminationAck,
-};
+use novarocks::query_execution::lifecycle::{QueryLifecycleError, QueryTerminalIngress};
 use novarocks::service::MetricsHttpServer;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
+use novarocks_protocol::lifecycle::{
+    QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest, QueryStageAck,
+    QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminationAck,
+};
 use novarocks_spi::connector::ConnectorExecutionInstaller;
 
 use crate::exchange_receiver::BackendExchangeReceiverPort;
@@ -23,6 +23,11 @@ use crate::fragment::{
 };
 use crate::native::runtime_filter_adapter::BackendRuntimeFilterEnvelopeIngress;
 use crate::native::service::{NativeBackendGrpcService, NativeGrpcServerHandle};
+use crate::query_lifecycle::protocol_adapter::{
+    legacy_abort_request, legacy_control_attach, legacy_init_request, legacy_stage_request,
+    legacy_start_request, protocol_init_ack, protocol_stage_ack, protocol_start_ack,
+    protocol_termination_ack,
+};
 use crate::query_lifecycle::{
     NativeQueryLifecycleLocalRuntime, QueryControlAttachment, QueryLifecycleIngress,
     QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
@@ -167,49 +172,64 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
     }
 
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
-        self.registry.init_query(request)
+        let legacy_request = legacy_init_request(request)
+            .expect("validated Protocol InitQuery request must convert for the legacy registry");
+        protocol_init_ack(&self.registry.init_query(legacy_request))
     }
 
     fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
-        match self.registry.begin_stage(request.clone()) {
-            crate::query_lifecycle::StageBuildDecision::Complete(ack) => ack,
+        let legacy_request = legacy_stage_request(request.clone()).expect(
+            "validated Protocol StageFragments request must convert for the legacy registry",
+        );
+        match self.registry.begin_stage(legacy_request.clone()) {
+            crate::query_lifecycle::StageBuildDecision::Complete(ack) => protocol_stage_ack(&ack),
             crate::query_lifecycle::StageBuildDecision::Build(permit) => {
                 let execution_id = request.execution_id();
                 let build = self.fragments.stage_fragments(
                     execution_id,
-                    request.fragments(),
+                    legacy_request.fragments(),
                     permit.gate(),
                 );
                 match build {
-                    Ok(()) => permit.commit(),
+                    Ok(()) => protocol_stage_ack(&permit.commit()),
                     Err(error) => QueryStageAck::new(
-                        execution_id,
+                        request.execution_id(),
                         request.digest_version(),
                         request.digest(),
                         QueryStageOutcome::RejectedLocalFailure,
                         error.to_string(),
-                    ),
+                    )
+                    .expect("validated Stage request has a valid failure acknowledgement"),
                 }
             }
         }
     }
 
     fn start_prepared_query(&self, request: QueryStartRequest) -> QueryStartAck {
-        self.registry.start_prepared_query(request)
+        let legacy_request = legacy_start_request(request).expect(
+            "validated Protocol StartPreparedQuery request must convert for the legacy registry",
+        );
+        protocol_start_ack(&self.registry.start_prepared_query(legacy_request))
     }
 
     fn abort_query(
         &self,
         request: QueryAbortRequest,
     ) -> Result<QueryTerminationAck, QueryLifecycleError> {
-        self.registry.abort_query(request)
+        let legacy_request = legacy_abort_request(request)
+            .expect("validated Protocol AbortQuery request must convert for the legacy registry");
+        self.registry
+            .abort_query(legacy_request)
+            .map(|ack| protocol_termination_ack(&ack))
     }
 
     fn attach_control(
         &self,
         attach: QueryControlAttach,
     ) -> Result<QueryControlAttachment, QueryLifecycleError> {
-        self.registry.attach_control(attach)
+        let legacy_attach = legacy_control_attach(attach)
+            .expect("validated Protocol QueryControlAttach must convert for the legacy registry");
+        self.registry.attach_control(legacy_attach)
     }
 }
 
