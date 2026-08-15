@@ -27,6 +27,7 @@ pub mod coordination;
 pub mod coordinator;
 pub mod deployment;
 pub mod dml;
+pub(crate) mod durable;
 pub mod mv;
 mod native;
 pub mod query;
