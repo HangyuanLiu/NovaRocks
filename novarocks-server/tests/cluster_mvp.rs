@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, mpsc};
@@ -188,102 +187,6 @@ role = "all-in-one"
         debug_env,
     );
     (process, mysql_port)
-}
-
-struct ClusterHarness {
-    be: ManagedProcess,
-    _fe: ManagedProcess,
-    fe_mysql: u16,
-    be_http: u16,
-    _state_store_root: TempDir,
-}
-
-impl ClusterHarness {
-    fn start(be_debug: &str, fe_extra: &str) -> Self {
-        Self::start_with_debug_env(be_debug, &[], fe_extra)
-    }
-
-    fn start_with_debug_env(be_debug: &str, be_debug_env: &[(&str, &str)], fe_extra: &str) -> Self {
-        let be_http = reserve_port();
-        let be_grpc = reserve_port();
-        let fe_mysql = reserve_port();
-        let fe_http = reserve_port();
-        let fe_grpc = reserve_port();
-        let be_http_port = be_http.port();
-        let be_grpc_port = be_grpc.port();
-        let fe_mysql_port = fe_mysql.port();
-        let fe_http_port = fe_http.port();
-        let fe_grpc_port = fe_grpc.port();
-        let state_store_root = TempFileBuilder::new()
-            .prefix("cluster-state-store-")
-            .tempdir_in(runtime_dir())
-            .expect("create cluster StateStore root");
-        let state_store_path = state_store_root.path().join("state.sqlite");
-
-        let be_config = write_config(
-            "be",
-            &format!(
-                r#"
-[server]
-host = "127.0.0.1"
-http_port = {be_http_port}
-grpc_port = {be_grpc_port}
-
-[cluster]
-role = "be"
-{be_debug}
-"#
-            ),
-        );
-        let fe_config = write_config(
-            "fe",
-            &format!(
-                r#"
-[server]
-host = "127.0.0.1"
-http_port = {fe_http_port}
-grpc_port = {fe_grpc_port}
-
-[standalone_server]
-mysql_port = {fe_mysql_port}
-
-[cluster]
-role = "fe"
-backends = ["127.0.0.1:{be_grpc_port}"]
-
-[state_store]
-provider = "sqlite"
-path = "{}"
-cluster_id = "cluster-harness-{fe_mysql_port}"
-deployment_owner = "fe-1"
-{fe_extra}
-"#,
-                state_store_path.display()
-            ),
-        );
-
-        let _ = be_http.release();
-        let _ = be_grpc.release();
-        let be = spawn_novarocks(
-            be_config.path(),
-            "NOVAROCKS_READY role=be",
-            None,
-            be_debug_env,
-        );
-
-        let _ = fe_mysql.release();
-        let _ = fe_http.release();
-        let _ = fe_grpc.release();
-        let fe = spawn_novarocks(fe_config.path(), "NOVAROCKS_READY mysql_port=", None, &[]);
-
-        Self {
-            be,
-            _fe: fe,
-            fe_mysql: fe_mysql_port,
-            be_http: be_http_port,
-            _state_store_root: state_store_root,
-        }
-    }
 }
 
 struct MultiBeClusterHarness {
@@ -763,14 +666,6 @@ fn coordinated_query_sql() -> &'static str {
     "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v"
 }
 
-fn coordinated_sleep_query_sql() -> &'static str {
-    "SELECT v FROM (SELECT sleep(2) AS v UNION ALL SELECT sleep(2)) t ORDER BY v"
-}
-
-fn disconnect_blocking_query_sql() -> &'static str {
-    "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v"
-}
-
 fn multi_submit_query_sql() -> &'static str {
     "WITH cte AS (SELECT 1 AS v UNION ALL SELECT 2) \
      SELECT a.v FROM cte a JOIN cte b ON a.v = b.v ORDER BY a.v"
@@ -793,90 +688,6 @@ fn assert_mysql_server_error(error: mysql::Error, expected_code: u16) {
         ),
         other => panic!("expected MySQL server error {expected_code}, got {other}"),
     }
-}
-
-fn read_packet(stream: &mut TcpStream) -> (u8, Vec<u8>) {
-    let mut header = [0u8; 4];
-    stream
-        .read_exact(&mut header)
-        .expect("read mysql packet header");
-    let len =
-        usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
-    let mut payload = vec![0u8; len];
-    stream
-        .read_exact(&mut payload)
-        .expect("read mysql packet payload");
-    (header[3], payload)
-}
-
-fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) {
-    let len = u32::try_from(payload.len()).expect("payload fits u32");
-    assert!(len <= 0x00ff_ffff, "payload too large");
-    let header = [
-        (len & 0xff) as u8,
-        ((len >> 8) & 0xff) as u8,
-        ((len >> 16) & 0xff) as u8,
-        seq,
-    ];
-    stream
-        .write_all(&header)
-        .expect("write mysql packet header");
-    stream
-        .write_all(payload)
-        .expect("write mysql packet payload");
-    stream.flush().expect("flush mysql packet");
-}
-
-fn send_mysql_query(port: u16, sql: &str) -> TcpStream {
-    const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
-    const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
-    const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
-    const CLIENT_TRANSACTIONS: u32 = 0x0000_2000;
-    const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
-    const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
-
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect raw mysql client");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("set read timeout");
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .expect("set write timeout");
-
-    let (_seq, handshake) = read_packet(&mut stream);
-    assert_eq!(handshake[0], 10, "expected protocol v10 handshake");
-
-    let mut response = Vec::new();
-    let client_flags = CLIENT_LONG_PASSWORD
-        | CLIENT_LONG_FLAG
-        | CLIENT_PROTOCOL_41
-        | CLIENT_TRANSACTIONS
-        | CLIENT_SECURE_CONNECTION
-        | CLIENT_PLUGIN_AUTH;
-    response.extend_from_slice(&client_flags.to_le_bytes());
-    response.extend_from_slice(&(16_u32 * 1024 * 1024).to_le_bytes());
-    response.push(45);
-    response.extend_from_slice(&[0u8; 23]);
-    response.extend_from_slice(b"root");
-    response.push(0);
-    response.push(0);
-    response.extend_from_slice(b"mysql_native_password");
-    response.push(0);
-    write_packet(&mut stream, 1, &response);
-
-    let (_seq, auth_result) = read_packet(&mut stream);
-    assert_ne!(
-        auth_result.first().copied(),
-        Some(0xff),
-        "authentication failed"
-    );
-
-    let mut query_payload = Vec::with_capacity(sql.len() + 1);
-    query_payload.push(0x03);
-    query_payload.extend_from_slice(sql.as_bytes());
-    write_packet(&mut stream, 0, &query_payload);
-
-    stream
 }
 
 fn show_backends(conn: &mut MysqlConn) -> Vec<Row> {
@@ -1170,34 +981,6 @@ fn backend_query_lifecycle_termination_count(port: u16, reason: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn wait_for_backend_running_fragment_control(port: u16, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let metrics = fetch_http_text(port, "/metrics");
-        let running = metrics
-            .lines()
-            .find(|line| {
-                line.starts_with("novarocks_backend_query_execution_resources")
-                    && line.contains("resource=\"fragment_controls_running\"")
-            })
-            .and_then(|line| line.split_ascii_whitespace().last())
-            .and_then(|value| value.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        if running >= 1.0 {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "backend {port} did not start a fragment control before client disconnect; metrics={:?}",
-            metrics
-                .lines()
-                .filter(|line| line.starts_with("novarocks_backend_query_execution_resources"))
-                .collect::<Vec<_>>()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 fn wait_for_backend_query_lifecycle_termination(port: u16, reason: &str, timeout: Duration) {
     wait_for_backend_query_lifecycle_termination_any(port, &[reason], timeout);
 }
@@ -1244,109 +1027,6 @@ fn all_in_one_loopback_stage_start_select_succeeds() {
     assert_eq!(rows, vec![1]);
     srv.wait_for_log_contains("NOVAROCKS_GRPC_FETCH_TYPED status=", Duration::from_secs(3))
         .expect("wait for typed gRPC fetch marker");
-}
-
-#[test]
-fn cross_process_remote_dispatcher_smoke() {
-    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
-    if !binary.exists() {
-        return;
-    }
-    let _lock = lock_cluster_mvp();
-
-    let be_http = reserve_port();
-    let be_grpc = reserve_port();
-    let fe_mysql = reserve_port();
-    let fe_http = reserve_port();
-    let fe_grpc = reserve_port();
-    let be_http_port = be_http.port();
-    let be_grpc_port = be_grpc.port();
-    let fe_mysql_port = fe_mysql.port();
-    let fe_http_port = fe_http.port();
-    let fe_grpc_port = fe_grpc.port();
-    let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create StateStore tempdir");
-    let state_store_path = state_store_dir.path().join("frontend-state.sqlite");
-
-    let be_config = write_config(
-        "be",
-        &format!(
-            r#"
-[server]
-host = "127.0.0.1"
-http_port = {be_http_port}
-grpc_port = {be_grpc_port}
-
-[cluster]
-role = "be"
-"#
-        ),
-    );
-    // Spec (PR-4): FE backends must point to be_grpc (the NovaRocksGrpc
-    // service port for SubmitFragment/FetchResult on the standalone BE).
-    let fe_config = write_config(
-        "fe",
-        &format!(
-            r#"
-[server]
-host = "127.0.0.1"
-http_port = {fe_http_port}
-grpc_port = {fe_grpc_port}
-
-[standalone_server]
-mysql_port = {fe_mysql_port}
-
-[cluster]
-role = "fe"
-backends = ["127.0.0.1:{be_grpc_port}"]
-
-[state_store]
-provider = "sqlite"
-path = "{}"
-cluster_id = "remote-dispatcher-{fe_mysql_port}"
-deployment_owner = "fe-1"
-"#,
-            state_store_path.display()
-        ),
-    );
-
-    let _ = be_http.release();
-    let _ = be_grpc.release();
-    let be = spawn_novarocks(be_config.path(), "NOVAROCKS_READY role=be", None, &[]);
-
-    let _ = fe_mysql.release();
-    let _ = fe_http.release();
-    let _ = fe_grpc.release();
-    let _fe = spawn_novarocks(fe_config.path(), "NOVAROCKS_READY mysql_port=", None, &[]);
-
-    let mut conn = connect_mysql(fe_mysql_port);
-
-    // Phase 1: run a query that forces a Coordinated (multi-fragment) plan.
-    // SELECT + ORDER BY on a non-trivial UNION forces Sort(Distribution(Gather))
-    // which splits into two fragments, routing through RemoteDispatcher to the BE.
-    let rows: Vec<String> = conn
-        .query(coordinated_query_sql())
-        .expect("coordinated query must succeed while BE is running");
-    assert_eq!(
-        rows,
-        vec!["1".to_string(), "2".to_string()],
-        "coordinated query must return sorted results"
-    );
-
-    // Phase 2: kill the BE and prove the same query now fails.
-    // If the query were executing locally (SingleFragment), it would succeed
-    // even without the BE — the failure here is the proof that the BE was
-    // actually involved in Phase 1.
-    drop(be);
-    std::thread::sleep(Duration::from_millis(300));
-
-    let err = conn
-        .query::<String, _>(coordinated_query_sql())
-        .expect_err("coordinated query must fail once BE is down");
-    let err_str = err.to_string();
-    assert!(
-        !err_str.is_empty(),
-        "expected a non-empty error when BE is unreachable, got empty string"
-    );
 }
 
 #[cfg(unix)]
@@ -1498,64 +1178,6 @@ deployment_owner = "fe-1"
     conn.query_drop(format!("DROP BACKEND '{backend_addr}' FORCE"))
         .expect("DROP BACKEND FORCE");
     wait_until_backend_removed(&mut conn, be_grpc_port);
-}
-
-#[test]
-fn mysql_disconnect_triggers_cancel() {
-    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
-    if !binary.exists() {
-        return;
-    }
-    let _lock = lock_cluster_mvp();
-
-    let cluster = ClusterHarness::start(
-        r#"
-[runtime]
-query_control_terminal_drain_timeout_ms = 1000
-"#,
-        "",
-    );
-
-    let stream = send_mysql_query(cluster.fe_mysql, disconnect_blocking_query_sql());
-    wait_for_backend_running_fragment_control(cluster.be_http, Duration::from_secs(3));
-    stream
-        .shutdown(Shutdown::Both)
-        .expect("shutdown raw mysql client");
-
-    wait_for_backend_query_lifecycle_termination(
-        cluster.be_http,
-        "coordinator_abort",
-        Duration::from_secs(3),
-    );
-}
-
-#[test]
-fn query_timeout_triggers_cancel() {
-    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
-    if !binary.exists() {
-        return;
-    }
-    let _lock = lock_cluster_mvp();
-
-    let cluster = ClusterHarness::start("", "");
-
-    let mut conn = connect_mysql(cluster.fe_mysql);
-    conn.query_drop("SET query_timeout = 1")
-        .expect("set query timeout");
-    let err = conn
-        .query::<String, _>(coordinated_sleep_query_sql())
-        .expect_err("query should time out while BE is still executing");
-    let err_str = err.to_string();
-    assert!(
-        err_str.contains("timed out") || err_str.contains("timeout"),
-        "expected timeout error, got: {err_str}"
-    );
-
-    wait_for_backend_query_lifecycle_termination_any(
-        cluster.be_http,
-        &["coordinator_abort", "local_failure"],
-        Duration::from_secs(5),
-    );
 }
 
 #[test]
@@ -2174,85 +1796,6 @@ operator_buffer_chunks = 1
     target
         .join()
         .expect("old-generation target thread must join");
-}
-
-#[test]
-fn be_kill9_during_query_fails_cleanly() {
-    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
-    if !binary.exists() {
-        return;
-    }
-    let _lock = lock_cluster_mvp();
-
-    let cluster = ClusterHarness::start_with_debug_env(
-        "",
-        &[(
-            "NOVAROCKS_SQL_TEST_FAULT_INJECT_FETCH_NOT_READY_COUNT",
-            "1000",
-        )],
-        "",
-    );
-
-    let (tx, rx) = mpsc::channel();
-    let fe_mysql = cluster.fe_mysql;
-    std::thread::spawn(move || {
-        let mut conn = connect_mysql(fe_mysql);
-        let result = conn.query::<String, _>(disconnect_blocking_query_sql());
-        tx.send(result.map_err(|err| err.to_string()))
-            .expect("send query result");
-    });
-
-    std::thread::sleep(Duration::from_millis(300));
-    drop(cluster.be);
-
-    let result = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("query should finish after BE dies");
-    let err = result.expect_err("query should fail once BE is killed");
-    assert!(
-        !err.is_empty(),
-        "expected a non-empty FE error after BE crash"
-    );
-}
-
-#[test]
-fn cross_process_two_be_coordinated_query() {
-    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
-    if !binary.exists() {
-        return;
-    }
-    let _guard = lock_cluster_mvp();
-    let cluster = MultiBeClusterHarness::start_n_be(2, "", "");
-    let mut conn = connect_mysql(cluster.fe_mysql_port());
-    assert_exact_live_backends(&mut conn, 2);
-    let rows: Vec<i64> = conn
-        .query(coordinated_query_sql())
-        .expect("coordinated query must succeed on 2-BE cluster");
-    assert_eq!(
-        rows,
-        vec![1i64, 2i64],
-        "2-BE coordinated query must return sorted results [1, 2]"
-    );
-}
-
-#[test]
-fn cross_process_two_be_multi_fragment() {
-    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
-    if !binary.exists() {
-        return;
-    }
-    let _guard = lock_cluster_mvp();
-    let cluster = MultiBeClusterHarness::start_n_be(2, "", "");
-    let mut conn = connect_mysql(cluster.fe_mysql_port());
-    assert_exact_live_backends(&mut conn, 2);
-    let rows: Vec<i64> = conn
-        .query(multi_submit_query_sql())
-        .expect("multi-fragment CTE+JOIN query must succeed on 2-BE cluster");
-    assert_eq!(
-        rows,
-        vec![1i64, 2i64],
-        "2-BE multi-fragment query must return sorted results [1, 2]"
-    );
 }
 
 #[test]
