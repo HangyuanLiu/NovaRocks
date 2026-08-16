@@ -1,5 +1,5 @@
 ---
-id: ADR-0069
+id: ADR-0077
 title: "Hadoop catalog table creation uses storage conditional publication"
 domain: [provider-spi]
 status: active

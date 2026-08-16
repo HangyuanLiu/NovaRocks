@@ -6,13 +6,13 @@ use std::time::{Duration, Instant};
 
 use novarocks::common::network::AdvertiseEndpoint;
 use novarocks::connector::ConnectorRegistry;
-use novarocks::query_execution::lifecycle::{
-    QueryAbortRequest, QueryControlAttach, QueryControlAttachment, QueryInitAck, QueryInitRequest,
-    QueryLifecycleError, QueryLifecycleIngress, QueryStageAck, QueryStageOutcome,
-    QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminalIngress, QueryTerminationAck,
-};
+use novarocks::query_execution::lifecycle::{QueryLifecycleError, QueryTerminalIngress};
 use novarocks::service::MetricsHttpServer;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
+use novarocks_protocol::lifecycle::{
+    QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest, QueryStageAck,
+    QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminationAck,
+};
 use novarocks_spi::connector::ConnectorExecutionInstaller;
 
 use crate::exchange_receiver::BackendExchangeReceiverPort;
@@ -24,7 +24,8 @@ use crate::fragment::{
 use crate::native::runtime_filter_adapter::BackendRuntimeFilterEnvelopeIngress;
 use crate::native::service::{NativeBackendGrpcService, NativeGrpcServerHandle};
 use crate::query_lifecycle::{
-    NativeQueryLifecycleLocalRuntime, QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
+    NativeQueryLifecycleLocalRuntime, QueryControlAttachment, QueryLifecycleIngress,
+    QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
 };
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_spi::connector::WriteCommitEvidenceLimits;
@@ -174,20 +175,20 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
             crate::query_lifecycle::StageBuildDecision::Complete(ack) => ack,
             crate::query_lifecycle::StageBuildDecision::Build(permit) => {
                 let execution_id = request.execution_id();
-                let build = self.fragments.stage_fragments(
-                    execution_id,
-                    request.fragments(),
-                    permit.gate(),
-                );
+                let fragments = request.fragments();
+                let build = self
+                    .fragments
+                    .stage_fragments(execution_id, &fragments, permit.gate());
                 match build {
                     Ok(()) => permit.commit(),
                     Err(error) => QueryStageAck::new(
-                        execution_id,
+                        request.execution_id(),
                         request.digest_version(),
                         request.digest(),
                         QueryStageOutcome::RejectedLocalFailure,
                         error.to_string(),
-                    ),
+                    )
+                    .expect("validated Stage request has a valid failure acknowledgement"),
                 }
             }
         }
@@ -659,24 +660,20 @@ mod tests {
     };
     use crate::native::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use novarocks::common::network::AdvertiseEndpoint;
-    use novarocks::query_execution::lifecycle::contract::{
-        decode_query_control_event, encode_abort_query_request, encode_query_control_attach,
-        encode_query_control_command, encode_query_init_request,
-    };
-    use novarocks::query_execution::lifecycle::{
-        AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
-        ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
-        QueryControlEndpoint, QueryControlEvent, QueryExecutionId, QueryInitRequest,
-        QueryTerminationReason,
-    };
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
-    use novarocks_execution::runtime::query_options::QueryOptions;
+    use novarocks_protocol::lifecycle::{
+        AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
+        ParticipantRole, QueryAbortRequest, QueryControlEndpoint, QueryExecutionId,
+        QueryInitRequest, QueryOptions, QueryTerminationReason,
+    };
     use novarocks_protocol::novarocks::{
         AbortQueryRequest as ProtoAbortQueryRequest, HeartbeatRequest,
-        InitQueryRequest as ProtoInitQueryRequest,
+        InitQueryRequest as ProtoInitQueryRequest, QueryControlAttach as ProtoQueryControlAttach,
+        QueryControlRequest as ProtoQueryControlRequest,
     };
+    use novarocks_protocol::{lifecycle as protocol_lifecycle, novarocks as protocol};
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
     use novarocks_types::QueryId;
     use tokio_stream::wrappers::ReceiverStream;
@@ -779,8 +776,12 @@ mod tests {
                 )
                 .expect("valid backend identity"),
                 [ParticipantRole::FragmentExecutor],
-                [novarocks_types::UniqueId::new(query_low, 1)],
-                ParticipantQueryOptions::new(QueryOptions::default()),
+                [novarocks_protocol::common::UniqueId {
+                    hi: query_low,
+                    lo: 1,
+                }],
+                QueryOptions::parse(protocol::QueryOptions::default())
+                    .expect("valid default query options"),
                 10_000,
                 [],
                 None,
@@ -789,6 +790,71 @@ mod tests {
             )
             .expect("valid participant manifest"),
         )
+    }
+
+    fn protocol_init_request(request: &QueryInitRequest) -> protocol_lifecycle::QueryInitRequest {
+        request.clone()
+    }
+
+    fn heartbeat_command(sequence: u64, sent_mono_ns: u64) -> ProtoQueryControlRequest {
+        ProtoQueryControlRequest {
+            command: Some(protocol::query_control_request::Command::Heartbeat(
+                protocol::QueryControlHeartbeat {
+                    sequence,
+                    sent_mono_ns,
+                },
+            )),
+        }
+    }
+
+    fn abort_command(reason: impl Into<String>) -> ProtoQueryControlRequest {
+        ProtoQueryControlRequest {
+            command: Some(protocol::query_control_request::Command::Abort(
+                protocol::QueryControlAbort {
+                    reason: reason.into(),
+                },
+            )),
+        }
+    }
+
+    fn assert_event(
+        event: protocol::QueryControlResponse,
+        predicate: impl FnOnce(protocol::query_control_response::Event) -> bool,
+    ) {
+        assert!(predicate(event.event.expect("query control event")));
+    }
+
+    fn protocol_control_attach(
+        init: &protocol_lifecycle::QueryInitRequest,
+        frontend_owner_epoch: u64,
+    ) -> ProtoQueryControlRequest {
+        let manifest = init.manifest().expect("validated InitQuery has manifest");
+        ProtoQueryControlRequest {
+            command: Some(protocol::query_control_request::Command::Attach(
+                ProtoQueryControlAttach {
+                    execution_id: manifest.as_proto().execution_id.clone(),
+                    init_digest: init
+                        .digest()
+                        .expect("validated InitQuery has digest")
+                        .as_bytes()
+                        .to_vec(),
+                    frontend_owner_epoch,
+                },
+            )),
+        }
+    }
+
+    fn protocol_abort_request(
+        init: &protocol_lifecycle::QueryInitRequest,
+        digest: &[u8],
+        reason: impl Into<String>,
+    ) -> ProtoAbortQueryRequest {
+        let manifest = init.manifest().expect("validated InitQuery has manifest");
+        ProtoAbortQueryRequest {
+            execution_id: manifest.as_proto().execution_id.clone(),
+            init_digest: digest.to_vec(),
+            reason: reason.into(),
+        }
     }
 
     async fn connect_live_client(grpc_port: u16) -> NovaRocksGrpcClient<tonic::transport::Channel> {
@@ -849,16 +915,15 @@ mod tests {
             .expect("bind backend identity")
             .into_inner();
         let init = live_query_init_request(heartbeat.start_epoch, 901);
+        let protocol_init = protocol_init_request(&init);
         client
-            .init_query(encode_query_init_request(&init).expect("encode InitQuery"))
+            .init_query(protocol_init.as_proto().clone())
             .await
             .expect("InitQuery succeeds");
 
-        let attach = QueryControlAttach::new(init.manifest().execution_id(), init.digest(), 9)
-            .expect("valid Attach");
         let (commands, command_rx) = tokio::sync::mpsc::channel(4);
         commands
-            .send(encode_query_control_attach(&attach))
+            .send(protocol_control_attach(&protocol_init, 9))
             .await
             .expect("send Attach");
         let mut events = client
@@ -866,55 +931,56 @@ mod tests {
             .await
             .expect("attach QueryControlStream")
             .into_inner();
-        assert_eq!(
-            decode_query_control_event(
-                &events
-                    .message()
-                    .await
-                    .expect("read ControlReady")
-                    .expect("ControlReady")
-            )
-            .expect("decode ControlReady"),
-            QueryControlEvent::ControlReady
+        assert_event(
+            events
+                .message()
+                .await
+                .expect("read ControlReady")
+                .expect("ControlReady"),
+            |event| {
+                matches!(
+                    event,
+                    protocol::query_control_response::Event::ControlReady(_)
+                )
+            },
         );
         commands
-            .send(encode_query_control_command(
-                &QueryControlCommand::Heartbeat {
-                    sequence: 77,
-                    sent_mono_ns: 123,
-                },
-            ))
+            .send(heartbeat_command(77, 123))
             .await
             .expect("send heartbeat");
-        assert_eq!(
-            decode_query_control_event(
-                &events
-                    .message()
-                    .await
-                    .expect("read HeartbeatAck")
-                    .expect("HeartbeatAck")
-            )
-            .expect("decode HeartbeatAck"),
-            QueryControlEvent::HeartbeatAck { sequence: 77 }
+        assert_event(
+            events
+                .message()
+                .await
+                .expect("read HeartbeatAck")
+                .expect("HeartbeatAck"),
+            |event| {
+                matches!(
+                    event,
+                    protocol::query_control_response::Event::HeartbeatAck(
+                        protocol::QueryControlHeartbeatAck { sequence: 77 }
+                    )
+                )
+            },
         );
         commands
-            .send(encode_query_control_command(&QueryControlCommand::Abort {
-                reason: "live loopback cancellation".to_string(),
-            }))
+            .send(abort_command("live loopback cancellation"))
             .await
             .expect("send Abort");
-        assert_eq!(
-            decode_query_control_event(
-                &events
-                    .message()
-                    .await
-                    .expect("read TerminationAccepted")
-                    .expect("TerminationAccepted")
-            )
-            .expect("decode TerminationAccepted"),
-            QueryControlEvent::TerminationAccepted {
-                reason: QueryTerminationReason::CoordinatorAbort
-            }
+        assert_event(
+            events
+                .message()
+                .await
+                .expect("read TerminationAccepted")
+                .expect("TerminationAccepted"),
+            |event| {
+                matches!(
+                    event,
+                    protocol::query_control_response::Event::TerminationAccepted(
+                        protocol::QueryControlTerminationAccepted { reason }
+                    ) if reason == QueryTerminationReason::CoordinatorAbort as i32
+                )
+            },
         );
         drop(events);
         drop(commands);
@@ -939,15 +1005,14 @@ mod tests {
             .expect("bind backend identity")
             .into_inner();
         let init = live_query_init_request(heartbeat.start_epoch, 902);
+        let protocol_init = protocol_init_request(&init);
         client
-            .init_query(encode_query_init_request(&init).expect("encode InitQuery"))
+            .init_query(protocol_init.as_proto().clone())
             .await
             .expect("InitQuery succeeds");
-        let attach = QueryControlAttach::new(init.manifest().execution_id(), init.digest(), 9)
-            .expect("valid Attach");
         let (commands, command_rx) = tokio::sync::mpsc::channel(1);
         commands
-            .send(encode_query_control_attach(&attach))
+            .send(protocol_control_attach(&protocol_init, 9))
             .await
             .expect("send Attach");
         let mut events = client
@@ -962,27 +1027,29 @@ mod tests {
             .expect("ControlReady");
 
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        assert_eq!(
-            decode_query_control_event(
-                &tokio::time::timeout(std::time::Duration::from_secs(1), events.message())
-                    .await
-                    .expect("timeout termination event arrives")
-                    .expect("read timeout termination event")
-                    .expect("timeout TerminationAccepted")
-            )
-            .expect("decode timeout termination event"),
-            QueryControlEvent::TerminationAccepted {
-                reason: QueryTerminationReason::CoordinatorHeartbeatTimeout
-            }
+        assert_event(
+            tokio::time::timeout(std::time::Duration::from_secs(1), events.message())
+                .await
+                .expect("timeout termination event arrives")
+                .expect("read timeout termination event")
+                .expect("timeout TerminationAccepted"),
+            |event| {
+                matches!(
+                    event,
+                    protocol::query_control_response::Event::TerminationAccepted(
+                        protocol::QueryControlTerminationAccepted { reason }
+                    ) if reason == QueryTerminationReason::CoordinatorHeartbeatTimeout as i32
+                )
+            },
         );
         let termination = client
-            .abort_query(encode_abort_query_request(
-                &QueryAbortRequest::new(
-                    init.manifest().execution_id(),
-                    init.digest(),
-                    "probe latched timeout",
-                )
-                .expect("valid abort request"),
+            .abort_query(protocol_abort_request(
+                &protocol_init,
+                protocol_init
+                    .digest()
+                    .expect("validated InitQuery has digest")
+                    .as_bytes(),
+                "probe latched timeout",
             ))
             .await
             .expect("AbortQuery observes termination")
@@ -1015,15 +1082,14 @@ mod tests {
             .expect("bind backend identity")
             .into_inner();
         let init = live_query_init_request(heartbeat.start_epoch, 903);
+        let protocol_init = protocol_init_request(&init);
         client
-            .init_query(encode_query_init_request(&init).expect("encode InitQuery"))
+            .init_query(protocol_init.as_proto().clone())
             .await
             .expect("InitQuery succeeds");
-        let attach = QueryControlAttach::new(init.manifest().execution_id(), init.digest(), 9)
-            .expect("valid Attach");
         let (commands, command_rx) = tokio::sync::mpsc::channel(1);
         commands
-            .send(encode_query_control_attach(&attach))
+            .send(protocol_control_attach(&protocol_init, 9))
             .await
             .expect("send Attach");
         let mut events = client
@@ -1038,12 +1104,7 @@ mod tests {
             .expect("ControlReady");
         for sequence in 1..=17 {
             commands
-                .send(encode_query_control_command(
-                    &QueryControlCommand::Heartbeat {
-                        sequence,
-                        sent_mono_ns: sequence,
-                    },
-                ))
+                .send(heartbeat_command(sequence, sequence))
                 .await
                 .expect("send heartbeat without draining ACKs");
         }
@@ -1074,17 +1135,24 @@ mod tests {
         );
 
         let termination = registry
-            .abort_query(
-                QueryAbortRequest::new(
-                    init.manifest().execution_id(),
-                    init.digest(),
-                    "observe fail-closed shutdown",
-                )
-                .expect("valid abort request"),
-            )
+            .abort_query(QueryAbortRequest::new(
+                init.manifest()
+                    .expect("validated init manifest")
+                    .execution_id()
+                    .expect("validated manifest execution id"),
+                ParticipantManifestDigest::new(
+                    *protocol_init
+                        .digest()
+                        .expect("validated InitQuery has digest")
+                        .as_bytes(),
+                ),
+                "observe fail-closed shutdown",
+            ))
             .expect("observe latched shutdown termination");
         assert_eq!(
-            termination.accepted_reason(),
+            termination
+                .accepted_reason()
+                .expect("validated termination reason"),
             QueryTerminationReason::CoordinatorStreamLost
         );
     }
@@ -1140,28 +1208,29 @@ mod tests {
             .into_inner();
         let init = live_query_init_request(heartbeat.start_epoch, 904);
         let different = live_query_init_request(heartbeat.start_epoch, 905);
+        let protocol_init = protocol_init_request(&init);
+        let protocol_different = protocol_init_request(&different);
         client
-            .init_query(encode_query_init_request(&init).expect("encode InitQuery"))
+            .init_query(protocol_init.as_proto().clone())
             .await
             .expect("InitQuery succeeds");
 
-        let mismatch = QueryAbortRequest::new(
-            init.manifest().execution_id(),
-            different.digest(),
-            "mismatched digest",
-        )
-        .expect("valid mismatched abort");
         let error = client
-            .abort_query(encode_abort_query_request(&mismatch))
+            .abort_query(protocol_abort_request(
+                &protocol_init,
+                protocol_different
+                    .digest()
+                    .expect("validated InitQuery has digest")
+                    .as_bytes(),
+                "mismatched digest",
+            ))
             .await
             .expect_err("digest mismatch must be rejected");
         assert_eq!(error.code(), tonic::Code::AlreadyExists);
 
-        let attach = QueryControlAttach::new(init.manifest().execution_id(), init.digest(), 9)
-            .expect("valid Attach");
         let (commands, command_rx) = tokio::sync::mpsc::channel(1);
         commands
-            .send(encode_query_control_attach(&attach))
+            .send(protocol_control_attach(&protocol_init, 9))
             .await
             .expect("send Attach");
         let mut events = client
@@ -1169,16 +1238,18 @@ mod tests {
             .await
             .expect("mismatched abort leaves entry attachable")
             .into_inner();
-        assert_eq!(
-            decode_query_control_event(
-                &events
-                    .message()
-                    .await
-                    .expect("read ControlReady")
-                    .expect("ControlReady")
-            )
-            .expect("decode ControlReady"),
-            QueryControlEvent::ControlReady
+        assert_event(
+            events
+                .message()
+                .await
+                .expect("read ControlReady")
+                .expect("ControlReady"),
+            |event| {
+                matches!(
+                    event,
+                    protocol::query_control_response::Event::ControlReady(_)
+                )
+            },
         );
 
         drop(events);

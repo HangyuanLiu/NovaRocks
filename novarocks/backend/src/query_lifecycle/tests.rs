@@ -19,21 +19,23 @@ use std::sync::{Arc, Barrier, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot;
-use novarocks::query_execution::lifecycle::{
-    AttemptId, FragmentTerminalOutcome, NegativeAttestationReason, ParticipantBackendIdentity,
-    ParticipantManifest, ParticipantQueryOptions, ParticipantRole, QueryAbortRequest,
-    QueryControlAttach, QueryControlAttachment, QueryControlEndpoint, QueryControlEvent,
-    QueryExecutionId, QueryInitOutcome, QueryInitRequest, QueryLifecycleError,
-    QueryLifecycleErrorCode, QueryStageOutcome, QueryStageRequest, QueryStartOutcome,
-    QueryStartRequest, QueryTerminalAck, QueryTerminalFallbackTransport, QueryTerminalReportAck,
-    QueryTerminalReportOutcome, QueryTerminalSnapshot, QueryTerminationReason,
-    RuntimeFilterContribution, StageDigest, StageDigestVersion, StageFragment,
-};
+use novarocks::query_execution::lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };
-use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_protocol::{common, filter, novarocks as proto_novarocks, plan};
+use novarocks_protocol::{
+    common, filter,
+    lifecycle::{
+        AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantRole,
+        ParticipantTerminalOutcome as ProtocolParticipantTerminalOutcome, QueryAbortRequest,
+        QueryControlAttach, QueryControlEndpoint, QueryExecutionId, QueryInitOutcome,
+        QueryInitRequest, QueryOptions, QueryStageOutcome, QueryStageRequest, QueryStartOutcome,
+        QueryStartRequest, QueryTerminalReportAck, QueryTerminalReportOutcome,
+        QueryTerminationReason, RuntimeFilterContribution, StageDigest, StageDigestVersion,
+        StageFragment,
+    },
+    novarocks as proto_novarocks, plan,
+};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 use prost::Message;
@@ -44,6 +46,9 @@ use super::registry::{
     MonotonicClock, QueryLifecycleLocalRuntime, QueryLifecycleMetricsSink, QueryLifecycleRegistry,
     QueryLifecycleRegistryConfig, StageBuildDecision,
 };
+use super::{
+    QueryControlAttachment, QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
+};
 use crate::native::runtime_filter_install::DecodedRuntimeFilterContribution;
 use crate::runtime_filter::participant::{
     BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipantFactory,
@@ -53,6 +58,33 @@ use novarocks::common::query_lifecycle_fault::QueryLifecycleFaultKind;
 const LOCAL_BACKEND_ID: u64 = 7;
 const LOCAL_START_EPOCH: u64 = 11;
 const ATTEMPT_1: u64 = 1;
+
+type NegativeAttestationReason = proto_novarocks::NegativeAttestationReason;
+
+trait TestManifestResult {
+    fn execution_id(&self) -> QueryExecutionId;
+}
+
+impl TestManifestResult
+    for Result<ParticipantManifest, novarocks_protocol::lifecycle::ContractError>
+{
+    fn execution_id(&self) -> QueryExecutionId {
+        self.as_ref()
+            .expect("validated init request retains a manifest")
+            .execution_id()
+            .expect("validated manifest retains an execution id")
+    }
+}
+
+trait TestQueryAbortExpect {
+    fn expect(self, message: &str) -> Self;
+}
+
+impl TestQueryAbortExpect for QueryAbortRequest {
+    fn expect(self, _message: &str) -> Self {
+        self
+    }
+}
 
 #[derive(Clone)]
 struct ManualClock {
@@ -118,16 +150,14 @@ impl QueryTerminalFallbackTransport for RejectedTerminalFallback {
     fn report_query_terminal(
         &self,
         _endpoint: &QueryControlEndpoint,
-        _outcome: novarocks::query_execution::lifecycle::ParticipantTerminalOutcome,
+        _outcome: ProtocolParticipantTerminalOutcome,
         _timeout: Duration,
-    ) -> Result<
-        QueryTerminalReportAck,
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
-    > {
+    ) -> Result<QueryTerminalReportAck, QueryTerminalFallbackTransportError> {
         Ok(QueryTerminalReportAck::new(
             QueryTerminalReportOutcome::RejectedConflict,
             "injected terminal conflict",
-        ))
+        )
+        .expect("fixed rejected-conflict terminal ack is valid"))
     }
 }
 
@@ -137,26 +167,24 @@ impl QueryTerminalFallbackTransport for GoneTerminalFallback {
     fn report_query_terminal(
         &self,
         _endpoint: &QueryControlEndpoint,
-        _outcome: novarocks::query_execution::lifecycle::ParticipantTerminalOutcome,
+        _outcome: ProtocolParticipantTerminalOutcome,
         _timeout: Duration,
-    ) -> Result<
-        QueryTerminalReportAck,
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
-    > {
+    ) -> Result<QueryTerminalReportAck, QueryTerminalFallbackTransportError> {
         Ok(QueryTerminalReportAck::new(
             QueryTerminalReportOutcome::RejectedGone,
             "injected stale terminal ingress",
-        ))
+        )
+        .expect("fixed rejected-gone terminal ack is valid"))
     }
 }
 
 #[derive(Clone, Default)]
 struct AcceptedTerminalFallback {
-    outcomes: Arc<Mutex<Vec<novarocks::query_execution::lifecycle::ParticipantTerminalOutcome>>>,
+    outcomes: Arc<Mutex<Vec<ProtocolParticipantTerminalOutcome>>>,
 }
 
 impl AcceptedTerminalFallback {
-    fn outcomes(&self) -> Vec<novarocks::query_execution::lifecycle::ParticipantTerminalOutcome> {
+    fn outcomes(&self) -> Vec<ProtocolParticipantTerminalOutcome> {
         self.outcomes
             .lock()
             .expect("accepted terminal fallback outcomes")
@@ -168,12 +196,9 @@ impl QueryTerminalFallbackTransport for AcceptedTerminalFallback {
     fn report_query_terminal(
         &self,
         _endpoint: &QueryControlEndpoint,
-        outcome: novarocks::query_execution::lifecycle::ParticipantTerminalOutcome,
+        outcome: ProtocolParticipantTerminalOutcome,
         _timeout: Duration,
-    ) -> Result<
-        QueryTerminalReportAck,
-        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
-    > {
+    ) -> Result<QueryTerminalReportAck, QueryTerminalFallbackTransportError> {
         self.outcomes
             .lock()
             .expect("accepted terminal fallback outcomes")
@@ -181,7 +206,8 @@ impl QueryTerminalFallbackTransport for AcceptedTerminalFallback {
         Ok(QueryTerminalReportAck::new(
             QueryTerminalReportOutcome::Accepted,
             "accepted injected unary fallback",
-        ))
+        )
+        .expect("fixed accepted terminal ack is valid"))
     }
 }
 
@@ -437,7 +463,10 @@ fn terminal_fallback_conflict_releases_bounded_delivery_record() {
     let request = fragment_init_request_fixture(863, &[fragment_instance_id]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _control = attach_control(&registry, &request);
@@ -448,8 +477,12 @@ fn terminal_fallback_conflict_releases_bounded_delivery_record() {
         .expect("fragment admission commits");
     registry
         .abort_query(
-            QueryAbortRequest::new(execution_id, request.digest(), "terminal conflict")
-                .expect("valid abort"),
+            QueryAbortRequest::new(
+                execution_id,
+                request.digest().expect("validated init digest"),
+                "terminal conflict",
+            )
+            .expect("valid abort"),
         )
         .expect("abort is accepted");
 
@@ -486,7 +519,10 @@ fn terminal_fallback_gone_releases_bounded_delivery_record() {
     let request = fragment_init_request_fixture(864, &[fragment_instance_id]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _control = attach_control(&registry, &request);
@@ -497,8 +533,12 @@ fn terminal_fallback_gone_releases_bounded_delivery_record() {
         .expect("fragment admission commits");
     registry
         .abort_query(
-            QueryAbortRequest::new(execution_id, request.digest(), "stale terminal ingress")
-                .expect("valid abort"),
+            QueryAbortRequest::new(
+                execution_id,
+                request.digest().expect("validated init digest"),
+                "stale terminal ingress",
+            )
+            .expect("valid abort"),
         )
         .expect("abort is accepted");
 
@@ -569,7 +609,10 @@ fn query_control_attachment_requires_backend_identity_binding() {
     let request = init_request_fixture(700, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
 
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::RejectedStaleBackend
     );
     registry
@@ -583,7 +626,10 @@ fn query_control_attachment_requires_backend_identity_binding() {
         QueryLifecycleErrorCode::Conflict
     );
     assert_eq!(
-        registry.init_query(request).outcome(),
+        registry
+            .init_query(request)
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
 }
@@ -597,22 +643,29 @@ fn attach_reserves_p0_before_control_ready_and_releases_on_terminal_cleanup() {
     let first = init_request_fixture(9_701, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let second = init_request_fixture(9_702, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     assert_eq!(
-        registry.init_query(first.clone()).outcome(),
+        registry
+            .init_query(first.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     assert_eq!(
-        registry.init_query(second.clone()).outcome(),
+        registry
+            .init_query(second.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
 
     let mut first_attachment = attach_control(&registry, &first);
-    assert!(matches!(
-        first_attachment.events.try_recv(),
-        Ok(QueryControlEvent::ControlReady)
-    ));
+    assert_control_ready(&mut first_attachment);
     let error = match registry.attach_control(
-        QueryControlAttach::new(second.manifest().execution_id(), second.digest(), 1)
-            .expect("valid control attach"),
+        QueryControlAttach::new(
+            second.manifest().execution_id(),
+            second.digest().expect("validated init digest"),
+            1,
+        )
+        .expect("valid control attach"),
     ) {
         Ok(_) => panic!("P0 capacity is consumed before a second ControlReady can be emitted"),
         Err(error) => error,
@@ -623,17 +676,14 @@ fn attach_reserves_p0_before_control_ready_and_releases_on_terminal_cleanup() {
         .abort_query(
             QueryAbortRequest::new(
                 first.manifest().execution_id(),
-                first.digest(),
+                first.digest().expect("validated init digest"),
                 "release P0 reservation",
             )
             .expect("valid abort"),
         )
         .expect("first attached entry aborts");
     let mut second_attachment = attach_control(&registry, &second);
-    assert!(matches!(
-        second_attachment.events.try_recv(),
-        Ok(QueryControlEvent::ControlReady)
-    ));
+    assert_control_ready(&mut second_attachment);
 }
 
 #[test]
@@ -653,14 +703,21 @@ fn injected_p0_faults_reject_before_control_ready_and_leave_entry_retryable() {
         let request = init_request_fixture(query_low, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
         let execution_id = request.manifest().execution_id();
         assert_eq!(
-            registry.init_query(request.clone()).outcome(),
+            registry
+                .init_query(request.clone())
+                .outcome()
+                .expect("validated lifecycle acknowledgement"),
             QueryInitOutcome::Applied
         );
         registry.inject_terminal_fault_for_test(execution_id, fault);
 
         let error = match registry.attach_control(
-            QueryControlAttach::new(execution_id, request.digest(), 1)
-                .expect("valid control attach"),
+            QueryControlAttach::new(
+                execution_id,
+                request.digest().expect("validated init digest"),
+                1,
+            )
+            .expect("valid control attach"),
         ) {
             Ok(_) => panic!("injected P0 fault rejects before ControlReady"),
             Err(error) => error,
@@ -673,10 +730,7 @@ fn injected_p0_faults_reject_before_control_ready_and_leave_entry_retryable() {
         assert_eq!(registry.metrics_snapshot().terminal_retained, 0);
 
         let mut retry = attach_control(&registry, &request);
-        assert!(matches!(
-            retry.events.try_recv(),
-            Ok(QueryControlEvent::ControlReady)
-        ));
+        assert_control_ready(&mut retry);
     }
 }
 
@@ -712,18 +766,24 @@ fn restoration_status_counts_all_retained_execution_indexes_without_clearing_the
     let pre_init_tombstone = init_request_fixture(122, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
 
     assert_eq!(
-        registry.init_query(active.clone()).outcome(),
+        registry
+            .init_query(active.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     assert_eq!(
-        registry.init_query(lifecycle_tombstone.clone()).outcome(),
+        registry
+            .init_query(lifecycle_tombstone.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     registry
         .abort_query(
             QueryAbortRequest::new(
                 lifecycle_tombstone.manifest().execution_id(),
-                lifecycle_tombstone.digest(),
+                lifecycle_tombstone.digest().expect("validated init digest"),
                 "retain lifecycle tombstone",
             )
             .expect("valid lifecycle tombstone abort"),
@@ -733,7 +793,7 @@ fn restoration_status_counts_all_retained_execution_indexes_without_clearing_the
         .abort_query(
             QueryAbortRequest::new(
                 pre_init_tombstone.manifest().execution_id(),
-                pre_init_tombstone.digest(),
+                pre_init_tombstone.digest().expect("validated init digest"),
                 "retain pre-init tombstone",
             )
             .expect("valid pre-init tombstone abort"),
@@ -759,6 +819,18 @@ fn execution_id(query_low: i64, attempt: u64) -> QueryExecutionId {
         AttemptId::new(attempt).expect("nonzero attempt"),
     )
     .expect("nonzero query execution id")
+}
+
+fn default_query_options() -> QueryOptions {
+    QueryOptions::parse(proto_novarocks::QueryOptions::default())
+        .expect("default generated query options are valid")
+}
+
+fn protocol_unique_id(id: UniqueId) -> common::UniqueId {
+    common::UniqueId {
+        hi: id.high(),
+        lo: id.low(),
+    }
 }
 
 fn runtime_filter_contribution(
@@ -788,7 +860,7 @@ fn runtime_filter_contribution(
     let mut digest = sha2::Sha256::new();
     digest.update(b"novarocks.query-lifecycle.runtime-filter-contribution.v1\0");
     digest.update(envelope.encode_to_vec());
-    RuntimeFilterContribution::from_wire(proto_novarocks::RuntimeFilterContribution {
+    RuntimeFilterContribution::parse(proto_novarocks::RuntimeFilterContribution {
         participant_id,
         lifecycle: Some(lifecycle),
         install: Some(install),
@@ -815,7 +887,7 @@ fn init_request_fixture(
         .expect("valid backend identity"),
         [ParticipantRole::RuntimeFilterService],
         [],
-        ParticipantQueryOptions::new(QueryOptions::default()),
+        default_query_options(),
         query_deadline_unix_ms,
         [],
         Some(runtime_filter),
@@ -837,8 +909,8 @@ fn fragment_init_request_fixture(query_low: i64, expected: &[UniqueId]) -> Query
         )
         .expect("valid backend identity"),
         [ParticipantRole::FragmentExecutor],
-        expected.iter().copied(),
-        ParticipantQueryOptions::new(QueryOptions::default()),
+        expected.iter().copied().map(protocol_unique_id),
+        default_query_options(),
         10_000,
         [],
         None,
@@ -866,8 +938,8 @@ fn fragment_runtime_filter_init_request_fixture(
             ParticipantRole::FragmentExecutor,
             ParticipantRole::RuntimeFilterService,
         ],
-        expected.iter().copied(),
-        ParticipantQueryOptions::new(QueryOptions::default()),
+        expected.iter().copied().map(protocol_unique_id),
+        default_query_options(),
         10_000,
         [],
         Some(runtime_filter_contribution(execution_id, 3)),
@@ -884,26 +956,63 @@ fn attach_control(
 ) -> QueryControlAttachment {
     registry
         .attach_control(
-            QueryControlAttach::new(request.manifest().execution_id(), request.digest(), 1)
-                .expect("valid control attach"),
+            QueryControlAttach::new(
+                request.manifest().execution_id(),
+                request.digest().expect("validated init digest"),
+                1,
+            )
+            .expect("valid control attach"),
         )
         .expect("control attaches")
 }
 
-fn wait_for_terminal_snapshot(attachment: &mut QueryControlAttachment) -> QueryTerminalSnapshot {
+/// Production queues carry generated Protocol events. Tests inspect the
+/// generated oneof directly so a sealed Protocol digest never re-enters the
+/// retired Core codec.
+fn try_recv_event(
+    attachment: &mut QueryControlAttachment,
+) -> Result<proto_novarocks::QueryControlResponse, tokio::sync::mpsc::error::TryRecvError> {
+    attachment
+        .events
+        .try_recv()
+        .map(|event| event.as_proto().clone())
+}
+
+fn assert_control_ready(attachment: &mut QueryControlAttachment) {
+    assert!(matches!(
+        try_recv_event(attachment),
+        Ok(proto_novarocks::QueryControlResponse {
+            event: Some(proto_novarocks::query_control_response::Event::ControlReady(_)),
+        })
+    ));
+}
+
+fn terminal_ack_from_outcome(
+    outcome: proto_novarocks::ParticipantTerminalOutcome,
+) -> novarocks_protocol::lifecycle::QueryTerminalAck {
+    let outcome = ProtocolParticipantTerminalOutcome::parse(outcome)
+        .expect("registry emitted a Protocol-valid terminal outcome");
+    novarocks_protocol::lifecycle::QueryTerminalAck::parse(
+        proto_novarocks::QueryControlTerminalAck {
+            execution_id: Some(outcome.execution_id().to_proto()),
+            init_digest: outcome.init_digest().as_bytes().to_vec(),
+            snapshot_version: 1,
+            snapshot_digest: outcome.digest().to_vec(),
+        },
+    )
+    .expect("terminal outcome forms a valid acknowledgement")
+}
+
+fn wait_for_terminal_outcome(
+    attachment: &mut QueryControlAttachment,
+) -> proto_novarocks::ParticipantTerminalOutcome {
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        match attachment.events.try_recv() {
-            Ok(QueryControlEvent::TerminalOutcome {
-                outcome:
-                    novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::Proof {
-                        snapshot,
-                        ..
-                    },
-            }) => return snapshot,
-            Ok(QueryControlEvent::TerminalOutcome { outcome }) => {
-                panic!("expected terminal proof, got {outcome:?}")
-            }
+        match try_recv_event(attachment) {
+            Ok(proto_novarocks::QueryControlResponse {
+                event:
+                    Some(proto_novarocks::query_control_response::Event::TerminalOutcome(outcome)),
+            }) => return outcome,
             Ok(_) => {}
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(1));
@@ -913,9 +1022,12 @@ fn wait_for_terminal_snapshot(attachment: &mut QueryControlAttachment) -> QueryT
     }
 }
 
-fn stage_fragment(instance_id: UniqueId) -> StageFragment {
+fn stage_fragment(instance_id: UniqueId, semantic_nonce: u8) -> StageFragment {
     StageFragment::new(
-        plan::PlanFragment::default(),
+        plan::PlanFragment {
+            fragment_id: u32::from(semantic_nonce),
+            ..Default::default()
+        },
         proto_novarocks::InstanceParams {
             fragment_instance_id: Some(common::UniqueId {
                 hi: instance_id.high(),
@@ -932,14 +1044,42 @@ fn stage_request(
     digest_byte: u8,
     instances: &[UniqueId],
 ) -> QueryStageRequest {
+    let execution_id = protocol_execution_id(request.manifest().execution_id());
+    let init_digest = protocol_manifest_digest(request.digest().expect("validated init digest"));
+    let fragments = instances
+        .iter()
+        .copied()
+        .map(|instance| stage_fragment(instance, digest_byte))
+        .collect::<Vec<_>>();
+    let digest = StageDigest::compute_v1(execution_id, init_digest, &fragments)
+        .expect("valid test Stage digest");
     QueryStageRequest::new(
-        request.manifest().execution_id(),
-        request.digest(),
+        execution_id,
+        init_digest,
         StageDigestVersion::V1,
-        StageDigest::new([digest_byte; 32]),
-        instances.iter().copied().map(stage_fragment).collect(),
+        digest,
+        fragments,
     )
     .expect("valid stage request")
+}
+
+fn protocol_execution_id(execution_id: QueryExecutionId) -> QueryExecutionId {
+    execution_id
+}
+
+fn protocol_manifest_digest(
+    digest: novarocks_protocol::lifecycle::ParticipantManifestDigest,
+) -> novarocks_protocol::lifecycle::ParticipantManifestDigest {
+    digest
+}
+
+fn start_request(request: &QueryInitRequest, stage: &QueryStageRequest) -> QueryStartRequest {
+    QueryStartRequest::new(
+        protocol_execution_id(request.manifest().execution_id()),
+        StageDigestVersion::V1,
+        stage.digest(),
+    )
+    .expect("valid test Start request")
 }
 
 #[test]
@@ -948,7 +1088,10 @@ fn stage_and_start_are_idempotent_after_control_ready() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
     let request = fragment_init_request_fixture(1_801, &expected);
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _attachment = attach_control(&registry, &request);
@@ -973,13 +1116,9 @@ fn stage_and_start_are_idempotent_after_control_ready() {
         QueryStageOutcome::RejectedConflict
     );
 
-    let start = QueryStartRequest::new(
-        request.manifest().execution_id(),
-        StageDigestVersion::V1,
-        stage.digest(),
-    );
+    let start = start_request(&request, &stage);
     assert_eq!(
-        registry.start_prepared_query(start).outcome(),
+        registry.start_prepared_query(start.clone()).outcome(),
         QueryStartOutcome::Applied
     );
     assert_eq!(
@@ -998,7 +1137,10 @@ fn stage_requires_matching_manifest_exact_set_and_control_attachment() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
     let request = fragment_init_request_fixture(1_802, &expected);
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
 
@@ -1017,11 +1159,24 @@ fn stage_requires_matching_manifest_exact_set_and_control_attachment() {
     );
 
     let mismatched_digest = QueryStageRequest::new(
-        request.manifest().execution_id(),
-        novarocks::query_execution::lifecycle::ParticipantManifestDigest::new([7; 32]),
+        protocol_execution_id(request.manifest().execution_id()),
+        novarocks_protocol::lifecycle::ParticipantManifestDigest::new([7; 32]),
         StageDigestVersion::V1,
-        StageDigest::new([1; 32]),
-        expected.iter().copied().map(stage_fragment).collect(),
+        StageDigest::compute_v1(
+            protocol_execution_id(request.manifest().execution_id()),
+            novarocks_protocol::lifecycle::ParticipantManifestDigest::new([7; 32]),
+            &expected
+                .iter()
+                .copied()
+                .map(|instance| stage_fragment(instance, 1))
+                .collect::<Vec<_>>(),
+        )
+        .expect("well formed mismatched stage digest"),
+        expected
+            .iter()
+            .copied()
+            .map(|instance| stage_fragment(instance, 1))
+            .collect(),
     )
     .expect("well formed mismatched stage request");
     assert_eq!(
@@ -1035,7 +1190,10 @@ fn service_only_empty_stage_starts_and_abort_prevents_late_start() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
     let request = init_request_fixture(1_803, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _attachment = attach_control(&registry, &request);
@@ -1048,7 +1206,7 @@ fn service_only_empty_stage_starts_and_abort_prevents_late_start() {
         .abort_query(
             QueryAbortRequest::new(
                 request.manifest().execution_id(),
-                request.digest(),
+                request.digest().expect("validated init digest"),
                 "abort staged service participant",
             )
             .expect("valid abort"),
@@ -1056,11 +1214,7 @@ fn service_only_empty_stage_starts_and_abort_prevents_late_start() {
         .expect("abort accepted");
     assert_eq!(
         registry
-            .start_prepared_query(QueryStartRequest::new(
-                request.manifest().execution_id(),
-                StageDigestVersion::V1,
-                stage.digest(),
-            ))
+            .start_prepared_query(start_request(&request, &stage))
             .outcome(),
         QueryStartOutcome::RejectedTerminated
     );
@@ -1072,9 +1226,7 @@ fn stage_resource_ledger_rejects_second_staged_bundle_and_releases_on_start() {
     let first = fragment_init_request_fixture(1_804, &expected);
     let second = fragment_init_request_fixture(1_805, &expected);
     let first_stage = stage_request(&first, 13, &expected);
-    let encoded_bytes =
-        novarocks::query_execution::lifecycle::contract::encode_query_stage_request(&first_stage)
-            .encoded_len();
+    let encoded_bytes = first_stage.as_proto().encoded_len();
     let mut config = registry_config(8);
     config.stage_max_fragments = 1;
     config.stage_max_encoded_bytes = encoded_bytes;
@@ -1084,7 +1236,10 @@ fn stage_resource_ledger_rejects_second_staged_bundle_and_releases_on_start() {
 
     for request in [&first, &second] {
         assert_eq!(
-            registry.init_query(request.clone()).outcome(),
+            registry
+                .init_query(request.clone())
+                .outcome()
+                .expect("validated lifecycle acknowledgement"),
             QueryInitOutcome::Applied
         );
         let _attachment = attach_control(&registry, request);
@@ -1103,11 +1258,7 @@ fn stage_resource_ledger_rejects_second_staged_bundle_and_releases_on_start() {
 
     assert_eq!(
         registry
-            .start_prepared_query(QueryStartRequest::new(
-                first.manifest().execution_id(),
-                StageDigestVersion::V1,
-                first_stage.digest(),
-            ))
+            .start_prepared_query(start_request(&first, &first_stage))
             .outcome(),
         QueryStartOutcome::Applied
     );
@@ -1130,7 +1281,10 @@ fn stage_builder_limit_is_held_until_commit_or_drop() {
 
     for request in [&first, &second] {
         assert_eq!(
-            registry.init_query(request.clone()).outcome(),
+            registry
+                .init_query(request.clone())
+                .outcome()
+                .expect("validated lifecycle acknowledgement"),
             QueryInitOutcome::Applied
         );
         let _attachment = attach_control(&registry, request);
@@ -1161,11 +1315,17 @@ fn query_lifecycle_registry_same_digest_init_is_idempotent_and_installs_once() {
     let request = init_request_fixture(1, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
 
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     assert_eq!(
-        registry.init_query(request).outcome(),
+        registry
+            .init_query(request)
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::AlreadyApplied
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 1);
@@ -1177,7 +1337,10 @@ fn query_lifecycle_abort_digest_mismatch_keeps_live_entry_attachable() {
     let request = init_request_fixture(101, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let different = init_request_fixture(102, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
 
@@ -1186,7 +1349,7 @@ fn query_lifecycle_abort_digest_mismatch_keeps_live_entry_attachable() {
             .abort_query(
                 QueryAbortRequest::new(
                     request.manifest().execution_id(),
-                    different.digest(),
+                    different.digest().expect("validated init digest"),
                     "mismatched digest must not terminate",
                 )
                 .expect("valid mismatched abort request"),
@@ -1198,8 +1361,12 @@ fn query_lifecycle_abort_digest_mismatch_keeps_live_entry_attachable() {
 
     registry
         .attach_control(
-            QueryControlAttach::new(request.manifest().execution_id(), request.digest(), 1)
-                .expect("valid control attach"),
+            QueryControlAttach::new(
+                request.manifest().execution_id(),
+                request.digest().expect("validated init digest"),
+                1,
+            )
+            .expect("valid control attach"),
         )
         .expect("digest mismatch must leave the live entry attachable");
 }
@@ -1209,7 +1376,10 @@ fn query_lifecycle_terminal_event_survives_saturated_heartbeat_queue() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
     let request = init_request_fixture(103, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let mut attachment = attach_control(&registry, &request);
@@ -1228,13 +1398,15 @@ fn query_lifecycle_terminal_event_survives_saturated_heartbeat_queue() {
         .expect("abort is accepted despite ACK backpressure");
 
     let mut events = Vec::new();
-    while let Ok(event) = attachment.events.try_recv() {
+    while let Ok(event) = try_recv_event(&mut attachment) {
         events.push(event);
     }
     assert!(
-        events.contains(&QueryControlEvent::TerminationAccepted {
-            reason: QueryTerminationReason::CoordinatorAbort,
-        }),
+        events.iter().any(|event| matches!(
+            event.event,
+            Some(proto_novarocks::query_control_response::Event::TerminationAccepted(ref accepted))
+                if accepted.reason == proto_novarocks::QueryTerminationReason::QueryTerminationCoordinatorAbort as i32
+        )),
         "terminal acceptance must not be dropped behind heartbeat ACKs: {events:?}"
     );
 }
@@ -1246,7 +1418,10 @@ fn query_lifecycle_observations_coalesce_without_consuming_correctness_capacity(
     let request = fragment_init_request_fixture(181, &[fragment]);
     let current_execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let mut attachment = attach_control(&registry, &request);
@@ -1269,10 +1444,7 @@ fn query_lifecycle_observations_coalesce_without_consuming_correctness_capacity(
     assert_eq!(observation.output_rows(), 5);
     assert_eq!(observation.elapsed_ms(), 6);
 
-    assert!(matches!(
-        attachment.events.try_recv(),
-        Ok(QueryControlEvent::ControlReady)
-    ));
+    assert_control_ready(&mut attachment);
     assert!(!registry.publish_fragment_observation(
         execution_id(181, ATTEMPT_1 + 1),
         fragment,
@@ -1297,7 +1469,10 @@ fn query_lifecycle_drain_and_snapshot_survive_saturated_heartbeat_queue() {
     let request = init_request_fixture(104, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let mut attachment = attach_control(&registry, &request);
@@ -1317,17 +1492,16 @@ fn query_lifecycle_drain_and_snapshot_survive_saturated_heartbeat_queue() {
     }
     assert_eq!(
         registry
-            .start_prepared_query(QueryStartRequest::new(
-                execution_id,
-                StageDigestVersion::V1,
-                stage.digest(),
-            ))
+            .start_prepared_query(start_request(&request, &stage))
             .outcome(),
         QueryStartOutcome::Applied
     );
     let mut saw_local_drained = false;
-    while let Ok(event) = attachment.events.try_recv() {
-        saw_local_drained |= event == QueryControlEvent::LocalDrained;
+    while let Ok(event) = try_recv_event(&mut attachment) {
+        saw_local_drained |= matches!(
+            event.event,
+            Some(proto_novarocks::query_control_response::Event::LocalDrained(_))
+        );
     }
     assert!(
         saw_local_drained,
@@ -1344,15 +1518,12 @@ fn query_lifecycle_drain_and_snapshot_survive_saturated_heartbeat_queue() {
         .control
         .finalize()
         .expect("locally drained participant finalizes");
-    let snapshot = loop {
-        match attachment.events.try_recv() {
-            Ok(QueryControlEvent::TerminalOutcome {
-                outcome:
-                    novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::Proof {
-                        snapshot,
-                        ..
-                    },
-            }) => break snapshot,
+    let outcome = loop {
+        match try_recv_event(&mut attachment) {
+            Ok(proto_novarocks::QueryControlResponse {
+                event:
+                    Some(proto_novarocks::query_control_response::Event::TerminalOutcome(outcome)),
+            }) => break outcome,
             Ok(_) => {}
             Err(error) => {
                 panic!("TerminalSnapshot must use its reserved correctness permit: {error}")
@@ -1361,12 +1532,7 @@ fn query_lifecycle_drain_and_snapshot_survive_saturated_heartbeat_queue() {
     };
     attachment
         .control
-        .terminal_ack(QueryTerminalAck::from_outcome(
-            &novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::proof(
-                snapshot.clone(),
-            )
-            .expect("terminal snapshot produces proof"),
-        ))
+        .terminal_ack(terminal_ack_from_outcome(outcome))
         .expect("terminal snapshot ACK");
 }
 
@@ -1383,7 +1549,8 @@ fn query_lifecycle_registry_different_digest_conflicts() {
                 LOCAL_START_EPOCH,
                 10_000,
             ))
-            .outcome(),
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     assert_eq!(
@@ -1394,7 +1561,8 @@ fn query_lifecycle_registry_different_digest_conflicts() {
                 LOCAL_START_EPOCH,
                 20_000,
             ))
-            .outcome(),
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::RejectedConflict
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 1);
@@ -1413,7 +1581,8 @@ fn query_lifecycle_registry_capacity_rejects_without_install() {
                 LOCAL_START_EPOCH,
                 10_000,
             ))
-            .outcome(),
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     assert_eq!(
@@ -1424,7 +1593,8 @@ fn query_lifecycle_registry_capacity_rejects_without_install() {
                 LOCAL_START_EPOCH,
                 10_000,
             ))
-            .outcome(),
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::RejectedCapacity
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 1);
@@ -1443,7 +1613,8 @@ fn query_lifecycle_registry_backend_epoch_mismatch_rejects() {
                 LOCAL_START_EPOCH + 1,
                 10_000,
             ))
-            .outcome(),
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::RejectedStaleBackend
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 0);
@@ -1466,7 +1637,8 @@ fn query_lifecycle_registry_unbound_application_identity_rejects_init() {
                 LOCAL_START_EPOCH,
                 10_000,
             ))
-            .outcome(),
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::RejectedStaleBackend
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 0);
@@ -1479,7 +1651,7 @@ fn query_lifecycle_init_abort_race_never_publishes_initialized_and_rolls_back_on
     let registry = registry_with(runtime.clone(), 8);
     let request = init_request_fixture(6, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let execution_id = request.manifest().execution_id();
-    let digest = request.digest();
+    let digest = request.digest().expect("validated init digest");
 
     let init_registry = Arc::clone(&registry);
     let init_thread = std::thread::spawn(move || init_registry.init_query(request));
@@ -1492,13 +1664,19 @@ fn query_lifecycle_init_abort_race_never_publishes_initialized_and_rolls_back_on
         )
         .expect("abort is accepted");
     assert_eq!(
-        termination.accepted_reason(),
+        termination
+            .accepted_reason()
+            .expect("validated termination acknowledgement"),
         QueryTerminationReason::CoordinatorAbort
     );
     runtime.release_install();
 
     assert_eq!(
-        init_thread.join().expect("init thread").outcome(),
+        init_thread
+            .join()
+            .expect("init thread")
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::RejectedTerminated
     );
     assert_eq!(runtime.runtime_filter_abort_calls(), 1);
@@ -1527,7 +1705,7 @@ fn query_lifecycle_initializing_to_terminating_publishes_metrics_immediately() {
         );
     let request = init_request_fixture(7, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let execution_id = request.manifest().execution_id();
-    let digest = request.digest();
+    let digest = request.digest().expect("validated init digest");
 
     let init_registry = Arc::clone(&registry);
     let init_thread = std::thread::spawn(move || init_registry.init_query(request));
@@ -1556,7 +1734,10 @@ fn query_lifecycle_admission_requires_control_ready_and_commits_exactly_once() {
     let request = fragment_init_request_fixture(71, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
 
@@ -1569,10 +1750,7 @@ fn query_lifecycle_admission_requires_control_ready_and_commits_exactly_once() {
     );
 
     let mut attachment = attach_control(&registry, &request);
-    assert_eq!(
-        attachment.events.try_recv().expect("ControlReady event"),
-        novarocks::query_execution::lifecycle::QueryControlEvent::ControlReady
-    );
+    assert_control_ready(&mut attachment);
     registry
         .admit_fragment(execution_id, expected)
         .expect("exact fragment is admitted")
@@ -1595,7 +1773,10 @@ fn query_lifecycle_admission_rejects_outside_set_and_service_only_participant() 
     let fragment_request = fragment_init_request_fixture(72, &[expected]);
     let fragment_execution = fragment_request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(fragment_request.clone()).outcome(),
+        registry
+            .init_query(fragment_request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _fragment_control = attach_control(&registry, &fragment_request);
@@ -1610,7 +1791,10 @@ fn query_lifecycle_admission_rejects_outside_set_and_service_only_participant() 
     let service_request = init_request_fixture(73, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let service_execution = service_request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(service_request.clone()).outcome(),
+        registry
+            .init_query(service_request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _service_control = attach_control(&registry, &service_request);
@@ -1630,7 +1814,10 @@ fn query_lifecycle_admission_dropped_permit_rolls_back_in_flight() {
     let request = fragment_init_request_fixture(74, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _control = attach_control(&registry, &request);
@@ -1654,7 +1841,10 @@ fn query_lifecycle_admission_commit_does_not_hold_entry_while_waiting_for_regist
     let request = fragment_init_request_fixture(741, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _control = attach_control(&registry, &request);
@@ -1716,7 +1906,10 @@ fn query_lifecycle_registry_abort_rejects_late_permit_commit() {
     let request = fragment_init_request_fixture(75, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _control = attach_control(&registry, &request);
@@ -1726,8 +1919,12 @@ fn query_lifecycle_registry_abort_rejects_late_permit_commit() {
 
     registry
         .abort_query(
-            QueryAbortRequest::new(execution_id, request.digest(), "abort before permit commit")
-                .expect("valid abort"),
+            QueryAbortRequest::new(
+                execution_id,
+                request.digest().expect("validated init digest"),
+                "abort before permit commit",
+            )
+            .expect("valid abort"),
         )
         .expect("abort is accepted");
 
@@ -1755,14 +1952,14 @@ fn fragment_failure_emits_query_local_failure() {
     let request = fragment_init_request_fixture(76, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let mut attachment = attach_control(&registry, &request);
-    assert_eq!(
-        attachment.events.try_recv().expect("ControlReady event"),
-        QueryControlEvent::ControlReady
-    );
+    assert_control_ready(&mut attachment);
     registry
         .admit_fragment(execution_id, expected)
         .expect("fragment permit")
@@ -1778,13 +1975,12 @@ fn fragment_failure_emits_query_local_failure() {
         )),
     );
 
-    assert_eq!(
-        attachment.events.try_recv().expect("LocalFailure event"),
-        QueryControlEvent::LocalFailure {
-            code: "FRAGMENT_EXECUTION_FAILED".to_string(),
-            detail: "fragment execution error (pipeline): pipeline worker failed".to_string(),
-        }
-    );
+    assert!(matches!(
+        try_recv_event(&mut attachment).expect("LocalFailure event").event,
+        Some(proto_novarocks::query_control_response::Event::LocalFailure(ref failure))
+            if failure.code == "FRAGMENT_EXECUTION_FAILED"
+                && failure.detail == "fragment execution error (pipeline): pipeline worker failed"
+    ));
     assert_eq!(
         registry.termination_reason(execution_id),
         Some(QueryTerminationReason::LocalFailure)
@@ -1815,14 +2011,14 @@ fn running_fragment_failure_drains_and_freezes_a_failed_terminal_snapshot() {
     let request = fragment_init_request_fixture(76_002, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let mut attachment = attach_control(&registry, &request);
-    assert_eq!(
-        attachment.events.try_recv().expect("ControlReady event"),
-        QueryControlEvent::ControlReady
-    );
+    assert_control_ready(&mut attachment);
     registry
         .admit_fragment(execution_id, expected)
         .expect("fragment permit")
@@ -1839,12 +2035,14 @@ fn running_fragment_failure_drains_and_freezes_a_failed_terminal_snapshot() {
     );
 
     assert!(matches!(
-        attachment.events.try_recv().expect("LocalFailure event"),
-        QueryControlEvent::LocalFailure { .. }
+        try_recv_event(&mut attachment)
+            .expect("LocalFailure event")
+            .event,
+        Some(proto_novarocks::query_control_response::Event::LocalFailure(_))
     ));
     let deadline = Instant::now() + Duration::from_secs(1);
-    let snapshot = loop {
-        match attachment.events.try_recv() {
+    let event = loop {
+        match try_recv_event(&mut attachment) {
             Ok(event) => break event,
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(1));
@@ -1852,24 +2050,27 @@ fn running_fragment_failure_drains_and_freezes_a_failed_terminal_snapshot() {
             Err(error) => panic!("failed terminal snapshot is not delivered after drain: {error}"),
         }
     };
-    let QueryControlEvent::TerminalOutcome {
-        outcome:
-            novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::Proof {
-                snapshot, ..
-            },
-    } = snapshot
+    let Some(proto_novarocks::query_control_response::Event::TerminalOutcome(outcome)) =
+        event.event
     else {
         panic!("expected failed terminal snapshot");
     };
-    assert_eq!(snapshot.execution_id(), execution_id);
-    assert!(matches!(
+    let Some(snapshot) = outcome.snapshot else {
+        panic!("terminal proof must carry a snapshot");
+    };
+    assert_eq!(
         snapshot
-            .fragments()
-            .first()
-            .expect("one fragment")
-            .outcome(),
-        FragmentTerminalOutcome::Failed { .. }
-    ));
+            .execution_id
+            .expect("snapshot execution id")
+            .query_id
+            .expect("query id")
+            .lo,
+        execution_id.query_id().low()
+    );
+    assert_eq!(
+        snapshot.fragments.first().expect("one fragment").outcome,
+        proto_novarocks::QueryTerminalFragmentOutcome::Failed as i32
+    );
     let metrics = registry.metrics_snapshot();
     assert_eq!(metrics.terminal_facts, 1);
     assert_eq!(metrics.terminal_records_frozen, 1);
@@ -1895,14 +2096,14 @@ fn terminal_p1_faults_keep_the_attestation_delivery_permit() {
         let request = fragment_init_request_fixture(query_low, &[expected]);
         let execution_id = request.manifest().execution_id();
         assert_eq!(
-            registry.init_query(request.clone()).outcome(),
+            registry
+                .init_query(request.clone())
+                .outcome()
+                .expect("validated lifecycle acknowledgement"),
             QueryInitOutcome::Applied
         );
         let mut attachment = attach_control(&registry, &request);
-        assert!(matches!(
-            attachment.events.try_recv(),
-            Ok(QueryControlEvent::ControlReady)
-        ));
+        assert_control_ready(&mut attachment);
         registry.inject_terminal_fault_for_test(execution_id, fault);
         registry
             .admit_fragment(execution_id, expected)
@@ -1920,8 +2121,11 @@ fn terminal_p1_faults_keep_the_attestation_delivery_permit() {
 
         let deadline = Instant::now() + Duration::from_secs(1);
         let outcome = loop {
-            match attachment.events.try_recv() {
-                Ok(QueryControlEvent::TerminalOutcome { outcome }) => break outcome,
+            match try_recv_event(&mut attachment) {
+                Ok(proto_novarocks::QueryControlResponse {
+                    event:
+                        Some(proto_novarocks::query_control_response::Event::TerminalOutcome(outcome)),
+                }) => break outcome,
                 Ok(_) => {}
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(1));
@@ -1929,13 +2133,25 @@ fn terminal_p1_faults_keep_the_attestation_delivery_permit() {
                 Err(error) => panic!("terminal attestation was not delivered: {error}"),
             }
         };
-        let novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::NegativeAttestation(
+        let Some(proto_novarocks::participant_terminal_outcome::Outcome::NegativeAttestation(
             attestation,
-        ) = &outcome
+        )) = outcome.outcome.as_ref()
         else {
             panic!("P1 failure must deliver a negative attestation, got {outcome:?}");
         };
-        assert_eq!(attestation.reason(), expected_reason);
+        assert_eq!(
+            attestation.reason,
+            match expected_reason {
+                NegativeAttestationReason::Unspecified => {
+                    proto_novarocks::NegativeAttestationReason::Unspecified as i32
+                }
+                NegativeAttestationReason::AttemptAborted => proto_novarocks::NegativeAttestationReason::AttemptAborted as i32,
+                NegativeAttestationReason::AttemptTombstoned => proto_novarocks::NegativeAttestationReason::AttemptTombstoned as i32,
+                NegativeAttestationReason::TerminalStateInvalid => proto_novarocks::NegativeAttestationReason::TerminalStateInvalid as i32,
+                NegativeAttestationReason::CorrectnessEvidenceEncodingFailed => proto_novarocks::NegativeAttestationReason::CorrectnessEvidenceEncodingFailed as i32,
+                NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted => proto_novarocks::NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted as i32,
+            }
+        );
         assert_eq!(
             registry.metrics_snapshot().terminal_retained,
             1,
@@ -1943,7 +2159,7 @@ fn terminal_p1_faults_keep_the_attestation_delivery_permit() {
         );
         attachment
             .control
-            .terminal_ack(QueryTerminalAck::from_outcome(&outcome))
+            .terminal_ack(terminal_ack_from_outcome(outcome))
             .expect("attestation ACK releases the retained P0 permit");
         assert_eq!(registry.metrics_snapshot().terminal_retained, 0);
     }
@@ -1968,14 +2184,14 @@ fn injected_p2_faults_keep_terminal_proof_and_publish_typed_unavailability() {
         let request = fragment_runtime_filter_init_request_fixture(query_low, &[fragment]);
         let execution_id = request.manifest().execution_id();
         assert_eq!(
-            registry.init_query(request.clone()).outcome(),
+            registry
+                .init_query(request.clone())
+                .outcome()
+                .expect("validated lifecycle acknowledgement"),
             QueryInitOutcome::Applied
         );
         let mut attachment = attach_control(&registry, &request);
-        assert!(matches!(
-            attachment.events.try_recv(),
-            Ok(QueryControlEvent::ControlReady)
-        ));
+        assert_control_ready(&mut attachment);
         registry.inject_terminal_fault_for_test(execution_id, fault);
         registry
             .admit_fragment(execution_id, fragment)
@@ -1991,13 +2207,21 @@ fn injected_p2_faults_keep_terminal_proof_and_publish_typed_unavailability() {
             )),
         );
 
-        let snapshot = wait_for_terminal_snapshot(&mut attachment);
-        let unavailable = snapshot
-            .profile_contribution_telemetry()
-            .unavailable_reason()
-            .expect("P2 fault is encoded as typed unavailable telemetry");
-        assert_eq!(unavailable.stage(), "runtime_filter_terminal_capture");
-        assert_eq!(unavailable.code(), expected_code);
+        let outcome = wait_for_terminal_outcome(&mut attachment);
+        let snapshot = outcome.snapshot.expect("terminal proof has a snapshot");
+        let Some(
+            proto_novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(
+                unavailable,
+            ),
+        ) = snapshot
+            .profile_contribution
+            .expect("P2 telemetry is present")
+            .telemetry
+        else {
+            panic!("P2 fault is encoded as typed unavailable telemetry");
+        };
+        assert_eq!(unavailable.stage, "runtime_filter_terminal_capture");
+        assert_eq!(unavailable.code, expected_code);
         assert_eq!(registry.metrics_snapshot().terminal_records_frozen, 1);
     }
 }
@@ -2036,14 +2260,14 @@ fn injected_terminal_stream_drops_use_unary_fallback_without_losing_outcomes() {
         let request = fragment_init_request_fixture(query_low, &[fragment]);
         let execution_id = request.manifest().execution_id();
         assert_eq!(
-            registry.init_query(request.clone()).outcome(),
+            registry
+                .init_query(request.clone())
+                .outcome()
+                .expect("validated lifecycle acknowledgement"),
             QueryInitOutcome::Applied
         );
         let mut attachment = attach_control(&registry, &request);
-        assert!(matches!(
-            attachment.events.try_recv(),
-            Ok(QueryControlEvent::ControlReady)
-        ));
+        assert_control_ready(&mut attachment);
         for fault in faults {
             registry.inject_terminal_fault_for_test(execution_id, fault);
         }
@@ -2071,15 +2295,19 @@ fn injected_terminal_stream_drops_use_unary_fallback_without_losing_outcomes() {
         let outcomes = fallback.outcomes();
         assert_eq!(outcomes.len(), 1);
         assert_eq!(
-            matches!(
-                outcomes.first().expect("one unary fallback outcome"),
-                novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::NegativeAttestation(_)
-            ),
+            outcomes
+                .first()
+                .expect("one unary fallback outcome")
+                .negative_attestation()
+                .is_some(),
             expect_attestation
         );
-        while let Ok(event) = attachment.events.try_recv() {
+        while let Ok(event) = try_recv_event(&mut attachment) {
             assert!(
-                !matches!(event, QueryControlEvent::TerminalOutcome { .. }),
+                !matches!(
+                    event.event,
+                    Some(proto_novarocks::query_control_response::Event::TerminalOutcome(_))
+                ),
                 "injected stream drop must not publish a terminal outcome on the attached stream"
             );
         }
@@ -2108,7 +2336,10 @@ fn failure_drain_sweep_does_not_close_runtime_filter_before_terminal_capture() {
     let request = fragment_runtime_filter_init_request_fixture(76_020, &[failed, pending]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _attachment = attach_control(&registry, &request);
@@ -2158,14 +2389,14 @@ fn spi5b_local_failure_then_coordinator_abort_acknowledges_the_abort_command() {
     let request = fragment_init_request_fixture(76_003, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let mut attachment = attach_control(&registry, &request);
-    assert_eq!(
-        attachment.events.try_recv().expect("ControlReady event"),
-        QueryControlEvent::ControlReady
-    );
+    assert_control_ready(&mut attachment);
     registry
         .admit_fragment(execution_id, expected)
         .expect("fragment permit")
@@ -2180,8 +2411,10 @@ fn spi5b_local_failure_then_coordinator_abort_acknowledges_the_abort_command() {
         )),
     );
     assert!(matches!(
-        attachment.events.try_recv().expect("LocalFailure event"),
-        QueryControlEvent::LocalFailure { .. }
+        try_recv_event(&mut attachment)
+            .expect("LocalFailure event")
+            .event,
+        Some(proto_novarocks::query_control_response::Event::LocalFailure(_))
     ));
 
     attachment
@@ -2191,9 +2424,16 @@ fn spi5b_local_failure_then_coordinator_abort_acknowledges_the_abort_command() {
 
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        match attachment.events.try_recv() {
-            Ok(QueryControlEvent::TerminationAccepted { reason }) => {
-                assert_eq!(reason, QueryTerminationReason::CoordinatorAbort);
+        match try_recv_event(&mut attachment) {
+            Ok(proto_novarocks::QueryControlResponse {
+                event:
+                    Some(proto_novarocks::query_control_response::Event::TerminationAccepted(accepted)),
+            }) => {
+                assert_eq!(
+                    accepted.reason,
+                    proto_novarocks::QueryTerminationReason::QueryTerminationCoordinatorAbort
+                        as i32
+                );
                 return;
             }
             Ok(_) => {}
@@ -2228,7 +2468,10 @@ fn terminal_closeout_preserves_first_wins_termination_reason_metrics() {
     let failed_request = fragment_init_request_fixture(76_004, &[failed_fragment]);
     let failed_execution = failed_request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(failed_request.clone()).outcome(),
+        registry
+            .init_query(failed_request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let mut failed_attachment = attach_control(&registry, &failed_request);
@@ -2245,15 +2488,10 @@ fn terminal_closeout_preserves_first_wins_termination_reason_metrics() {
             "pipeline worker failed",
         )),
     );
-    let failed_snapshot = wait_for_terminal_snapshot(&mut failed_attachment);
+    let failed_outcome = wait_for_terminal_outcome(&mut failed_attachment);
     failed_attachment
         .control
-        .terminal_ack(QueryTerminalAck::from_outcome(
-            &novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::proof(
-                failed_snapshot.clone(),
-            )
-            .expect("terminal snapshot produces proof"),
-        ))
+        .terminal_ack(terminal_ack_from_outcome(failed_outcome))
         .expect("local-failure terminal snapshot ACK");
     assert_eq!(metrics.last_termination_reasons(), [0, 0, 0, 0, 1, 0]);
 
@@ -2261,7 +2499,10 @@ fn terminal_closeout_preserves_first_wins_termination_reason_metrics() {
     let aborted_request = fragment_init_request_fixture(76_005, &[aborted_fragment]);
     let aborted_execution = aborted_request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(aborted_request.clone()).outcome(),
+        registry
+            .init_query(aborted_request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let mut aborted_attachment = attach_control(&registry, &aborted_request);
@@ -2279,15 +2520,10 @@ fn terminal_closeout_preserves_first_wins_termination_reason_metrics() {
         aborted_fragment,
         &FragmentOutcome::Succeeded,
     );
-    let aborted_snapshot = wait_for_terminal_snapshot(&mut aborted_attachment);
+    let aborted_outcome = wait_for_terminal_outcome(&mut aborted_attachment);
     aborted_attachment
         .control
-        .terminal_ack(QueryTerminalAck::from_outcome(
-            &novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::proof(
-                aborted_snapshot.clone(),
-            )
-            .expect("terminal snapshot produces proof"),
-        ))
+        .terminal_ack(terminal_ack_from_outcome(aborted_outcome))
         .expect("coordinator-abort terminal snapshot ACK");
     assert_eq!(metrics.last_termination_reasons(), [1, 0, 0, 0, 1, 0]);
 
@@ -2295,7 +2531,10 @@ fn terminal_closeout_preserves_first_wins_termination_reason_metrics() {
     let expired_request = fragment_init_request_fixture(76_006, &[expired_fragment]);
     let expired_execution = expired_request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(expired_request.clone()).outcome(),
+        registry
+            .init_query(expired_request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let mut expired_attachment = attach_control(&registry, &expired_request);
@@ -2313,7 +2552,7 @@ fn terminal_closeout_preserves_first_wins_termination_reason_metrics() {
         expired_fragment,
         &FragmentOutcome::Succeeded,
     );
-    let _expired_snapshot = wait_for_terminal_snapshot(&mut expired_attachment);
+    let _expired_outcome = wait_for_terminal_outcome(&mut expired_attachment);
     clock.advance(Duration::from_millis(2));
     registry.sweep_expired(clock.now());
     assert_eq!(metrics.last_termination_reasons(), [2, 0, 0, 0, 1, 0]);
@@ -2327,14 +2566,14 @@ fn coordinator_abort_immediately_retains_incomplete_drain_proof_for_admitted_par
     let request = fragment_init_request_fixture(76_007, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let mut attachment = attach_control(&registry, &request);
-    assert!(matches!(
-        attachment.events.try_recv(),
-        Ok(QueryControlEvent::ControlReady)
-    ));
+    assert_control_ready(&mut attachment);
     registry
         .admit_fragment(execution_id, expected)
         .expect("fragment permit")
@@ -2348,8 +2587,11 @@ fn coordinator_abort_immediately_retains_incomplete_drain_proof_for_admitted_par
 
     let deadline = Instant::now() + Duration::from_secs(1);
     let outcome = loop {
-        match attachment.events.try_recv() {
-            Ok(QueryControlEvent::TerminalOutcome { outcome }) => break outcome,
+        match try_recv_event(&mut attachment) {
+            Ok(proto_novarocks::QueryControlResponse {
+                event:
+                    Some(proto_novarocks::query_control_response::Event::TerminalOutcome(outcome)),
+            }) => break outcome,
             Ok(_) => {}
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(1));
@@ -2357,21 +2599,13 @@ fn coordinator_abort_immediately_retains_incomplete_drain_proof_for_admitted_par
             Err(error) => panic!("coordinator abort terminal proof was not delivered: {error}"),
         }
     };
-    let novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::Proof {
-        snapshot, ..
-    } = outcome
-    else {
+    let Some(snapshot) = outcome.snapshot else {
         panic!("coordinator abort must retain a terminal proof");
     };
-    assert_eq!(snapshot.execution_id(), execution_id);
-    assert!(matches!(
-        snapshot
-            .fragments()
-            .first()
-            .expect("one fragment")
-            .outcome(),
-        FragmentTerminalOutcome::IncompleteDrain { .. }
-    ));
+    assert_eq!(
+        snapshot.fragments.first().expect("one fragment").outcome,
+        proto_novarocks::QueryTerminalFragmentOutcome::IncompleteDrain as i32
+    );
     assert_eq!(registry.metrics_snapshot().terminal_records_frozen, 1);
 }
 
@@ -2383,7 +2617,8 @@ fn query_lifecycle_registry_rejects_fragment_executor_without_exact_set() {
     assert_eq!(
         registry
             .init_query(fragment_init_request_fixture(76, &[]))
-            .outcome(),
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::RejectedInvalidManifest
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 0);
@@ -2395,12 +2630,19 @@ fn query_lifecycle_attach_distinguishes_duplicate_active_from_terminated() {
     let request = init_request_fixture(77, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _control = attach_control(&registry, &request);
-    let attach =
-        QueryControlAttach::new(execution_id, request.digest(), 1).expect("valid control attach");
+    let attach = QueryControlAttach::new(
+        execution_id,
+        request.digest().expect("validated init digest"),
+        1,
+    )
+    .expect("valid control attach");
 
     let Err(duplicate_error) = registry.attach_control(attach.clone()) else {
         panic!("duplicate active attach must conflict");
@@ -2408,8 +2650,12 @@ fn query_lifecycle_attach_distinguishes_duplicate_active_from_terminated() {
     assert_eq!(duplicate_error.code(), QueryLifecycleErrorCode::Conflict);
     registry
         .abort_query(
-            QueryAbortRequest::new(execution_id, request.digest(), "terminate before attach")
-                .expect("valid abort"),
+            QueryAbortRequest::new(
+                execution_id,
+                request.digest().expect("validated init digest"),
+                "terminate before attach",
+            )
+            .expect("valid abort"),
         )
         .expect("abort is accepted");
     let Err(terminated_error) = registry.attach_control(attach) else {
@@ -2432,7 +2678,10 @@ fn query_lifecycle_tombstone_capacity_evicts_only_oldest_tombstone() {
     );
     let active = init_request_fixture(80, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     assert_eq!(
-        registry.init_query(active.clone()).outcome(),
+        registry
+            .init_query(active.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let mut terminated = Vec::new();
@@ -2440,13 +2689,20 @@ fn query_lifecycle_tombstone_capacity_evicts_only_oldest_tombstone() {
         let request = init_request_fixture(query_low, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
         let execution_id = request.manifest().execution_id();
         assert_eq!(
-            registry.init_query(request.clone()).outcome(),
+            registry
+                .init_query(request.clone())
+                .outcome()
+                .expect("validated lifecycle acknowledgement"),
             QueryInitOutcome::Applied
         );
         registry
             .abort_query(
-                QueryAbortRequest::new(execution_id, request.digest(), "bounded tombstone")
-                    .expect("valid abort"),
+                QueryAbortRequest::new(
+                    execution_id,
+                    request.digest().expect("validated init digest"),
+                    "bounded tombstone",
+                )
+                .expect("valid abort"),
             )
             .expect("abort is accepted");
         terminated.push(execution_id);
@@ -2477,7 +2733,10 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
     let first = fragment_init_request_fixture(811, &[fragment_instance_id]);
     let first_execution = first.manifest().execution_id();
     assert_eq!(
-        registry.init_query(first.clone()).outcome(),
+        registry
+            .init_query(first.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _first_control = attach_control(&registry, &first);
@@ -2488,8 +2747,12 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
         .expect("first fragment admission commits");
     registry
         .abort_query(
-            QueryAbortRequest::new(first_execution, first.digest(), "first tombstone")
-                .expect("valid abort"),
+            QueryAbortRequest::new(
+                first_execution,
+                first.digest().expect("validated init digest"),
+                "first tombstone",
+            )
+            .expect("valid abort"),
         )
         .expect("first abort is accepted");
     wait_for_failed_terminal_freeze(&registry);
@@ -2499,13 +2762,20 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
     let second = init_request_fixture(812, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let second_execution = second.manifest().execution_id();
     assert_eq!(
-        registry.init_query(second.clone()).outcome(),
+        registry
+            .init_query(second.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     registry
         .abort_query(
-            QueryAbortRequest::new(second_execution, second.digest(), "evict first tombstone")
-                .expect("valid abort"),
+            QueryAbortRequest::new(
+                second_execution,
+                second.digest().expect("validated init digest"),
+                "evict first tombstone",
+            )
+            .expect("valid abort"),
         )
         .expect("second abort is accepted");
     assert!(!registry.contains(first_execution));
@@ -2531,7 +2801,10 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
     let replacement = fragment_init_request_fixture(813, &[fragment_instance_id]);
     let replacement_execution = replacement.manifest().execution_id();
     assert_eq!(
-        registry.init_query(replacement.clone()).outcome(),
+        registry
+            .init_query(replacement.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _replacement_control = attach_control(&registry, &replacement);
@@ -2561,7 +2834,10 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
     let first = fragment_init_request_fixture(814, &[fragment_instance_id]);
     let first_execution = first.manifest().execution_id();
     assert_eq!(
-        registry.init_query(first.clone()).outcome(),
+        registry
+            .init_query(first.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _first_control = attach_control(&registry, &first);
@@ -2572,8 +2848,12 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
         .expect("first fragment admission commits");
     registry
         .abort_query(
-            QueryAbortRequest::new(first_execution, first.digest(), "first tombstone")
-                .expect("valid abort"),
+            QueryAbortRequest::new(
+                first_execution,
+                first.digest().expect("validated init digest"),
+                "first tombstone",
+            )
+            .expect("valid abort"),
         )
         .expect("first abort is accepted");
     wait_for_failed_terminal_freeze(&registry);
@@ -2583,14 +2863,17 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
     let eviction = init_request_fixture(815, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let eviction_execution = eviction.manifest().execution_id();
     assert_eq!(
-        registry.init_query(eviction.clone()).outcome(),
+        registry
+            .init_query(eviction.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     registry
         .abort_query(
             QueryAbortRequest::new(
                 eviction_execution,
-                eviction.digest(),
+                eviction.digest().expect("validated init digest"),
                 "evict first tombstone",
             )
             .expect("valid abort"),
@@ -2601,7 +2884,10 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
     let replacement = fragment_init_request_fixture(816, &[fragment_instance_id]);
     let replacement_execution = replacement.manifest().execution_id();
     assert_eq!(
-        registry.init_query(replacement.clone()).outcome(),
+        registry
+            .init_query(replacement.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _replacement_control = attach_control(&registry, &replacement);
@@ -2624,7 +2910,10 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
     let competing = fragment_init_request_fixture(817, &[fragment_instance_id]);
     let competing_execution = competing.manifest().execution_id();
     assert_eq!(
-        registry.init_query(competing.clone()).outcome(),
+        registry
+            .init_query(competing.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _competing_control = attach_control(&registry, &competing);
@@ -2644,14 +2933,17 @@ fn query_lifecycle_tombstone_releases_active_capacity() {
     let registry = registry_with(RecordingLocalRuntime::default(), 1);
     let first = init_request_fixture(84, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     assert_eq!(
-        registry.init_query(first.clone()).outcome(),
+        registry
+            .init_query(first.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     registry
         .abort_query(
             QueryAbortRequest::new(
                 first.manifest().execution_id(),
-                first.digest(),
+                first.digest().expect("validated init digest"),
                 "release capacity",
             )
             .expect("valid abort"),
@@ -2666,7 +2958,8 @@ fn query_lifecycle_tombstone_releases_active_capacity() {
                 LOCAL_START_EPOCH,
                 10_000,
             ))
-            .outcome(),
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
 }
@@ -2686,13 +2979,20 @@ fn query_lifecycle_tombstone_retention_reclaims_expired_tombstone_incrementally(
     let terminated = init_request_fixture(86, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let terminated_id = terminated.manifest().execution_id();
     assert_eq!(
-        registry.init_query(terminated.clone()).outcome(),
+        registry
+            .init_query(terminated.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     registry
         .abort_query(
-            QueryAbortRequest::new(terminated_id, terminated.digest(), "retention")
-                .expect("valid abort"),
+            QueryAbortRequest::new(
+                terminated_id,
+                terminated.digest().expect("validated init digest"),
+                "retention",
+            )
+            .expect("valid abort"),
         )
         .expect("abort is accepted");
     assert!(registry.contains(terminated_id));
@@ -2701,7 +3001,8 @@ fn query_lifecycle_tombstone_retention_reclaims_expired_tombstone_incrementally(
     assert_eq!(
         registry
             .init_query(fragment_init_request_fixture(87, &[UniqueId::new(87, 1)],))
-            .outcome(),
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     assert!(!registry.contains(terminated_id));
@@ -2725,7 +3026,10 @@ fn query_lifecycle_tombstone_retention_evicts_committed_fragment_mapping() {
     let first = fragment_init_request_fixture(861, &[fragment_instance_id]);
     let first_execution = first.manifest().execution_id();
     assert_eq!(
-        registry.init_query(first.clone()).outcome(),
+        registry
+            .init_query(first.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _first_control = attach_control(&registry, &first);
@@ -2736,8 +3040,12 @@ fn query_lifecycle_tombstone_retention_evicts_committed_fragment_mapping() {
         .expect("first fragment admission commits");
     registry
         .abort_query(
-            QueryAbortRequest::new(first_execution, first.digest(), "retention cleanup")
-                .expect("valid abort"),
+            QueryAbortRequest::new(
+                first_execution,
+                first.digest().expect("validated init digest"),
+                "retention cleanup",
+            )
+            .expect("valid abort"),
         )
         .expect("abort is accepted");
     wait_for_failed_terminal_freeze(&registry);
@@ -2754,7 +3062,10 @@ fn query_lifecycle_tombstone_retention_evicts_committed_fragment_mapping() {
     let replacement = fragment_init_request_fixture(862, &[fragment_instance_id]);
     let replacement_execution = replacement.manifest().execution_id();
     assert_eq!(
-        registry.init_query(replacement.clone()).outcome(),
+        registry
+            .init_query(replacement.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _replacement_control = attach_control(&registry, &replacement);
@@ -2774,7 +3085,10 @@ fn query_lifecycle_pre_start_timeout_terminates_fragment_participant_without_acc
     let request = fragment_init_request_fixture(90, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _control = attach_control(&registry, &request);
@@ -2809,7 +3123,10 @@ fn query_lifecycle_pre_start_timeout_is_disarmed_by_first_accept_and_service_con
     let fragment_request = fragment_init_request_fixture(91, &[expected]);
     let fragment_execution = fragment_request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(fragment_request.clone()).outcome(),
+        registry
+            .init_query(fragment_request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let fragment_control = attach_control(&registry, &fragment_request);
@@ -2822,7 +3139,10 @@ fn query_lifecycle_pre_start_timeout_is_disarmed_by_first_accept_and_service_con
     let service_request = init_request_fixture(92, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let service_execution = service_request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(service_request.clone()).outcome(),
+        registry
+            .init_query(service_request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let service_control = attach_control(&registry, &service_request);
@@ -2856,7 +3176,10 @@ fn query_lifecycle_heartbeat_timeout_terminates_control_attached_entry() {
     let request = fragment_init_request_fixture(99, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let _control = attach_control(&registry, &request);
@@ -2887,7 +3210,10 @@ fn query_lifecycle_registry_metrics_follow_state_rejection_and_termination() {
     let request = fragment_init_request_fixture(93, &[expected]);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let initialized = registry.metrics_snapshot();
@@ -2906,8 +3232,12 @@ fn query_lifecycle_registry_metrics_follow_state_rejection_and_termination() {
 
     registry
         .abort_query(
-            QueryAbortRequest::new(execution_id, request.digest(), "metrics termination")
-                .expect("valid abort"),
+            QueryAbortRequest::new(
+                execution_id,
+                request.digest().expect("validated init digest"),
+                "metrics termination",
+            )
+            .expect("valid abort"),
         )
         .expect("abort is accepted");
     let terminated = registry.metrics_snapshot();
@@ -2923,7 +3253,10 @@ fn query_lifecycle_registry_termination_is_first_wins_and_runs_local_cleanup_onc
     let request = init_request_fixture(94, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     let mut attachment = attach_control(&registry, &request);
@@ -2933,17 +3266,15 @@ fn query_lifecycle_registry_termination_is_first_wins_and_runs_local_cleanup_onc
         .abort("first reason".to_string())
         .expect("first abort");
     attachment.control.finalize().expect("repeated finalize");
-    assert_eq!(
-        attachment.events.try_recv().expect("ControlReady"),
-        novarocks::query_execution::lifecycle::QueryControlEvent::ControlReady
-    );
+    assert_control_ready(&mut attachment);
     for _ in 0..2 {
-        assert_eq!(
-            attachment.events.try_recv().expect("termination accepted"),
-            novarocks::query_execution::lifecycle::QueryControlEvent::TerminationAccepted {
-                reason: QueryTerminationReason::CoordinatorAbort,
-            }
-        );
+        assert!(matches!(
+            try_recv_event(&mut attachment)
+                .expect("termination accepted")
+                .event,
+            Some(proto_novarocks::query_control_response::Event::TerminationAccepted(ref accepted))
+                if accepted.reason == proto_novarocks::QueryTerminationReason::QueryTerminationCoordinatorAbort as i32
+        ));
     }
     assert_eq!(
         registry.termination_reason(execution_id),
@@ -2970,10 +3301,20 @@ fn query_lifecycle_registry_same_digest_concurrent_init_is_single_flight() {
 
     let first_registry = Arc::clone(&registry);
     let first_request = request.clone();
-    let first = std::thread::spawn(move || first_registry.init_query(first_request).outcome());
+    let first = std::thread::spawn(move || {
+        first_registry
+            .init_query(first_request)
+            .outcome()
+            .expect("validated lifecycle acknowledgement")
+    });
     runtime.wait_until_install_enters();
     let second_registry = Arc::clone(&registry);
-    let second = std::thread::spawn(move || second_registry.init_query(request).outcome());
+    let second = std::thread::spawn(move || {
+        second_registry
+            .init_query(request)
+            .outcome()
+            .expect("validated lifecycle acknowledgement")
+    });
     runtime.release_install();
 
     assert_eq!(first.join().expect("first init"), QueryInitOutcome::Applied);
@@ -2993,7 +3334,10 @@ fn query_lifecycle_registry_runtime_filter_install_failure_rolls_back_workspace(
     let execution_id = request.manifest().execution_id();
 
     assert_eq!(
-        registry.init_query(request).outcome(),
+        registry
+            .init_query(request)
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::RejectedInvalidManifest
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 1);
@@ -3005,7 +3349,8 @@ fn query_lifecycle_registry_runtime_filter_install_failure_rolls_back_workspace(
     assert_eq!(
         registry
             .init_query(fragment_init_request_fixture(97, &[UniqueId::new(97, 1)],))
-            .outcome(),
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
 }
@@ -3018,15 +3363,22 @@ fn query_lifecycle_runtime_filter_abort_failure_retains_capacity_until_sweep_ret
     let request = init_request_fixture(961, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
-        registry.init_query(request.clone()).outcome(),
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
     runtime.fail_abort();
 
     registry
         .abort_query(
-            QueryAbortRequest::new(execution_id, request.digest(), "abort with cleanup failure")
-                .expect("valid abort"),
+            QueryAbortRequest::new(
+                execution_id,
+                request.digest().expect("validated init digest"),
+                "abort with cleanup failure",
+            )
+            .expect("valid abort"),
         )
         .expect("abort is accepted");
 
@@ -3040,7 +3392,8 @@ fn query_lifecycle_runtime_filter_abort_failure_retains_capacity_until_sweep_ret
     assert_eq!(
         registry
             .init_query(fragment_init_request_fixture(962, &[UniqueId::new(962, 1)],))
-            .outcome(),
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::RejectedCapacity
     );
 
@@ -3055,7 +3408,8 @@ fn query_lifecycle_runtime_filter_abort_failure_retains_capacity_until_sweep_ret
     assert_eq!(
         registry
             .init_query(fragment_init_request_fixture(963, &[UniqueId::new(963, 1)],))
-            .outcome(),
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::Applied
     );
 }
@@ -3068,7 +3422,7 @@ fn query_lifecycle_install_failure_racing_abort_preserves_first_reason_without_p
     let registry = registry_with(runtime.clone(), 8);
     let request = init_request_fixture(97, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let execution_id = request.manifest().execution_id();
-    let digest = request.digest();
+    let digest = request.digest().expect("validated init digest");
 
     let init_registry = Arc::clone(&registry);
     let init_thread = std::thread::spawn(move || init_registry.init_query(request));
@@ -3080,13 +3434,18 @@ fn query_lifecycle_install_failure_racing_abort_preserves_first_reason_without_p
                     .expect("valid abort"),
             )
             .expect("abort is accepted")
-            .accepted_reason(),
+            .accepted_reason()
+            .expect("validated termination acknowledgement"),
         QueryTerminationReason::CoordinatorAbort
     );
     runtime.release_install();
 
     assert_eq!(
-        init_thread.join().expect("init thread").outcome(),
+        init_thread
+            .join()
+            .expect("init thread")
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::RejectedInvalidManifest
     );
     assert_eq!(
@@ -3117,13 +3476,20 @@ fn query_lifecycle_registry_abort_before_init_leaves_fail_closed_tombstone() {
     let execution_id = request.manifest().execution_id();
     registry
         .abort_query(
-            QueryAbortRequest::new(execution_id, request.digest(), "abort before init")
-                .expect("valid abort"),
+            QueryAbortRequest::new(
+                execution_id,
+                request.digest().expect("validated init digest"),
+                "abort before init",
+            )
+            .expect("valid abort"),
         )
         .expect("abort-before-init is accepted");
 
     assert_eq!(
-        registry.init_query(request).outcome(),
+        registry
+            .init_query(request)
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::RejectedTerminated
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 0);

@@ -28,6 +28,7 @@ use crate::common::types::UniqueId;
 use crate::runtime::sink_commit::SinkCommitReportSnapshot;
 use novarocks_execution::runtime::fragment::fact::{FragmentOutcome, FragmentTerminalFact};
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
+use novarocks_protocol::lifecycle::QueryTerminalSnapshot as ProtocolQueryTerminalSnapshot;
 use novarocks_protocol::novarocks;
 
 use super::{
@@ -50,6 +51,14 @@ const TERMINALIZATION_PROOF_V1_DOMAIN: &[u8] =
 const NEGATIVE_ATTESTATION_V1_DOMAIN: &[u8] =
     b"novarocks.query-lifecycle.negative-attestation.v1\0";
 const TERMINALIZATION_PROOF_VERSION_V1: u32 = 1;
+
+fn validated_endpoint(
+    backend: &ParticipantBackendIdentity,
+) -> novarocks_protocol::lifecycle::QueryControlEndpoint {
+    backend
+        .endpoint()
+        .expect("validated lifecycle backend identity always has an endpoint")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryTerminalSnapshotDigest([u8; 32]);
@@ -305,7 +314,7 @@ impl TerminalizationProofFragment {
 }
 
 /// The bounded P0 record proving a participant's terminal state was frozen.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TerminalizationProof {
     version: u32,
     execution_id: QueryExecutionId,
@@ -402,8 +411,9 @@ impl TerminalizationProof {
         put_i64(&mut bytes, self.execution_id.query_id().low());
         put_u64(&mut bytes, self.execution_id.attempt_id().get());
         put_u64(&mut bytes, self.backend.backend_id());
-        put_string(&mut bytes, self.backend.endpoint().host());
-        put_u16(&mut bytes, self.backend.endpoint().port());
+        let endpoint = validated_endpoint(&self.backend);
+        put_string(&mut bytes, endpoint.host());
+        put_u16(&mut bytes, endpoint.port());
         put_u64(&mut bytes, self.backend.start_epoch());
         put_bytes(&mut bytes, self.init_digest.as_bytes());
         put_u64(&mut bytes, self.fragments.len() as u64);
@@ -427,8 +437,11 @@ impl TerminalizationProof {
 /// Worst-case P0 canonical payload size for a participant manifest. Backend
 /// QLC reserves this before ControlReady, independently of P1/P2 payloads.
 pub fn p0_max_encoded_len(manifest: &ParticipantManifest) -> usize {
-    let backend = manifest.backend();
-    let fixed_header = 4 + 8 + 8 + 8 + 8 + 8 + backend.endpoint().host().len() + 2 + 8 + 8 + 32 + 8;
+    let backend = manifest
+        .backend()
+        .expect("validated participant manifest has a backend");
+    let endpoint = validated_endpoint(&backend);
+    let fixed_header: usize = 4 + 8 + 8 + 8 + 8 + 8 + endpoint.host().len() + 2 + 8 + 8 + 32 + 8;
     let max_outcome = 1
         + 8
         + QUERY_TERMINAL_FRAGMENT_OUTCOME_CODE_MAX_BYTES
@@ -448,7 +461,7 @@ pub fn p0_max_encoded_len(manifest: &ParticipantManifest) -> usize {
         + 8
         + 8
         + 8
-        + backend.endpoint().host().len()
+        + endpoint.host().len()
         + 2
         + 8
         + 32
@@ -480,7 +493,7 @@ impl NegativeAttestationReason {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NegativeAttestation {
     execution_id: QueryExecutionId,
     backend: ParticipantBackendIdentity,
@@ -558,8 +571,9 @@ impl NegativeAttestation {
         put_i64(&mut bytes, self.execution_id.query_id().low());
         put_u64(&mut bytes, self.execution_id.attempt_id().get());
         put_u64(&mut bytes, self.backend.backend_id());
-        put_string(&mut bytes, self.backend.endpoint().host());
-        put_u16(&mut bytes, self.backend.endpoint().port());
+        let endpoint = validated_endpoint(&self.backend);
+        put_string(&mut bytes, endpoint.host());
+        put_u16(&mut bytes, endpoint.port());
         put_u64(&mut bytes, self.backend.start_epoch());
         put_bytes(&mut bytes, self.init_digest.as_bytes());
         put_u8(&mut bytes, self.reason.tag());
@@ -1765,8 +1779,9 @@ impl QueryTerminalSnapshot {
         put_i64(&mut bytes, self.execution_id.query_id().low());
         put_u64(&mut bytes, self.execution_id.attempt_id().get());
         put_u64(&mut bytes, self.backend.backend_id());
-        put_string(&mut bytes, self.backend.endpoint().host());
-        put_u16(&mut bytes, self.backend.endpoint().port());
+        let endpoint = validated_endpoint(&self.backend);
+        put_string(&mut bytes, endpoint.host());
+        put_u16(&mut bytes, endpoint.port());
         put_u64(&mut bytes, self.backend.start_epoch());
         put_bytes(&mut bytes, self.init_digest.as_bytes());
         put_u64(&mut bytes, self.fragments.len() as u64);
@@ -1915,6 +1930,21 @@ impl QueryTerminalSet {
             }
         }
         Ok(Self { snapshots })
+    }
+
+    /// CLS-R1 keeps the lease aggregate in Core while native ingress carries
+    /// only the validated Protocol snapshot. Protocol has already validated
+    /// its canonical digest, which intentionally differs from the retired
+    /// Core digest domain; rebuild the aggregate projection here so Frontend
+    /// never regains a lifecycle codec. CLS-R2 retires this input with lease.
+    pub fn from_protocol_snapshots(
+        snapshots: Vec<ProtocolQueryTerminalSnapshot>,
+    ) -> Result<Self, QueryLifecycleError> {
+        snapshots
+            .into_iter()
+            .map(|snapshot| decode_protocol_terminal_snapshot_projection(snapshot.as_proto()))
+            .collect::<Result<Vec<_>, _>>()
+            .and_then(Self::new)
     }
 
     pub fn snapshots(&self) -> &[QueryTerminalSnapshot] {
@@ -2198,17 +2228,357 @@ fn put_string(bytes: &mut Vec<u8>, value: &str) {
     put_bytes(bytes, value.as_bytes());
 }
 
+fn decode_terminal_telemetry_unavailable(
+    value: &novarocks::TerminalTelemetryUnavailable,
+) -> Result<TerminalTelemetryUnavailable, QueryLifecycleError> {
+    TerminalTelemetryUnavailable::new(value.stage.clone(), value.code.clone())
+}
+
+fn decode_fragment_terminal_profile_telemetry(
+    value: &novarocks::FragmentTerminalProfileTelemetry,
+) -> Result<TerminalTelemetry<RuntimeProfileTree>, QueryLifecycleError> {
+    use novarocks::fragment_terminal_profile_telemetry::Telemetry;
+
+    match value.telemetry.as_ref().ok_or_else(|| {
+        QueryLifecycleError::invalid_manifest("terminal fragment profile telemetry is required")
+    })? {
+        Telemetry::Available(profile) => {
+            crate::runtime::profile_codec::decode_runtime_profile_tree(profile)
+                .map(TerminalTelemetry::Available)
+                .map_err(QueryLifecycleError::invalid_manifest)
+        }
+        Telemetry::Unavailable(reason) => {
+            decode_terminal_telemetry_unavailable(reason).map(TerminalTelemetry::Unavailable)
+        }
+    }
+}
+
+fn decode_query_terminal_profile_contribution_telemetry(
+    value: &novarocks::QueryTerminalProfileContributionTelemetry,
+) -> Result<TerminalTelemetry<QueryTerminalProfileContributionV1>, QueryLifecycleError> {
+    use novarocks::query_terminal_profile_contribution_telemetry::Telemetry;
+
+    match value.telemetry.as_ref().ok_or_else(|| {
+        QueryLifecycleError::invalid_manifest(
+            "query terminal profile contribution telemetry is required",
+        )
+    })? {
+        Telemetry::Available(contribution) => {
+            decode_query_terminal_profile_contribution(contribution)
+                .map(TerminalTelemetry::Available)
+        }
+        Telemetry::Unavailable(reason) => {
+            decode_terminal_telemetry_unavailable(reason).map(TerminalTelemetry::Unavailable)
+        }
+    }
+}
+
+fn decode_query_terminal_profile_contribution(
+    contribution: &novarocks::QueryTerminalProfileContributionV1,
+) -> Result<QueryTerminalProfileContributionV1, QueryLifecycleError> {
+    use {
+        QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
+        QueryTerminalRuntimeFilterChannelInstallStateV1, QueryTerminalRuntimeFilterChannelKeyV1,
+        QueryTerminalRuntimeFilterChannelTerminalStateV1, QueryTerminalRuntimeFilterChannelV1,
+        QueryTerminalRuntimeFilterConsumerKeyV1, QueryTerminalRuntimeFilterConsumerV1,
+        QueryTerminalRuntimeFilterProducerStreamKeyV1, QueryTerminalRuntimeFilterProducerStreamV1,
+        QueryTerminalRuntimeFilterScanNotEvaluatedV1,
+        QueryTerminalRuntimeFilterSubscriptionTerminalV1,
+        QueryTerminalRuntimeFilterTransportRouteKeyV1, QueryTerminalRuntimeFilterTransportRouteV1,
+    };
+
+    if contribution.version != QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1 {
+        return Err(QueryLifecycleError::invalid_manifest(
+            "unsupported query terminal profile contribution wire version",
+        ));
+    }
+    let channel_key = |binding_id, channel_id| {
+        QueryTerminalRuntimeFilterChannelKeyV1::new(binding_id, channel_id)
+    };
+    let channels = contribution
+        .channels
+        .iter()
+        .map(|value| {
+            let install_state = match value.install_state {
+                1 => QueryTerminalRuntimeFilterChannelInstallStateV1::Installed,
+                _ => {
+                    return Err(QueryLifecycleError::invalid_manifest(
+                        "invalid terminal runtime-filter channel install state",
+                    ));
+                }
+            };
+            let terminal_state = match value.terminal_state {
+                1 => QueryTerminalRuntimeFilterChannelTerminalStateV1::Open,
+                2 => QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed,
+                3 => QueryTerminalRuntimeFilterChannelTerminalStateV1::Unavailable,
+                4 => QueryTerminalRuntimeFilterChannelTerminalStateV1::Cancelled,
+                _ => {
+                    return Err(QueryLifecycleError::invalid_manifest(
+                        "invalid terminal runtime-filter channel terminal state",
+                    ));
+                }
+            };
+            Ok(QueryTerminalRuntimeFilterChannelV1::new(
+                channel_key(value.channel_binding_id, value.channel_id),
+                install_state,
+                terminal_state,
+                value.latest_published_logical_version,
+                value.published_count,
+                value.completed_count,
+                value.unavailable_count,
+                value.cancelled_count,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let producer_streams = contribution
+        .producer_streams
+        .iter()
+        .map(|value| {
+            let fragment = value
+                .producer_fragment_instance_id
+                .as_ref()
+                .ok_or_else(|| {
+                    QueryLifecycleError::invalid_manifest(
+                        "terminal runtime-filter producer fragment instance id is required",
+                    )
+                })?;
+            Ok(QueryTerminalRuntimeFilterProducerStreamV1::new(
+                QueryTerminalRuntimeFilterProducerStreamKeyV1::new(
+                    channel_key(value.channel_binding_id, value.channel_id),
+                    novarocks_types::UniqueId::new(fragment.hi, fragment.lo),
+                    value.partition_id,
+                ),
+                value.latest_accepted_sequence,
+                value.accepted_count,
+                value.duplicate_count,
+                value.stale_count,
+                value.conflict_count,
+                value.resource_limit_count,
+            ))
+        })
+        .collect::<Result<Vec<_>, QueryLifecycleError>>()?;
+    let transport_routes = contribution
+        .transport_routes
+        .iter()
+        .map(|value| {
+            QueryTerminalRuntimeFilterTransportRouteV1::new(
+                QueryTerminalRuntimeFilterTransportRouteKeyV1::new(
+                    channel_key(value.channel_binding_id, value.channel_id),
+                    value.route_edge_id,
+                ),
+                value.sent_count,
+                value.sent_bytes,
+                value.retried_count,
+                value.retried_bytes,
+                value.acked_count,
+                value.acked_bytes,
+                value.fail_open_count,
+                value.fail_open_bytes,
+            )
+        })
+        .collect();
+    let consumers = contribution
+        .consumers
+        .iter()
+        .map(|value| {
+            let fragment = value.fragment_instance_id.as_ref().ok_or_else(|| {
+                QueryLifecycleError::invalid_manifest(
+                    "terminal runtime-filter consumer fragment instance id is required",
+                )
+            })?;
+            let reasons = value.scan_not_evaluated_reasons.as_ref().ok_or_else(|| {
+                QueryLifecycleError::invalid_manifest(
+                    "terminal runtime-filter scan not-evaluated counters are required",
+                )
+            })?;
+            let terminal = match value.subscription_terminal {
+                1 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::Pending,
+                2 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::Acquired,
+                3 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::TimedOut,
+                4 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::Unavailable,
+                5 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::Unsupported,
+                6 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::Cancelled,
+                7 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::Completed,
+                8 => QueryTerminalRuntimeFilterSubscriptionTerminalV1::CompletedWithoutArtifact,
+                _ => {
+                    return Err(QueryLifecycleError::invalid_manifest(
+                        "invalid terminal runtime-filter subscription terminal state",
+                    ));
+                }
+            };
+            Ok(QueryTerminalRuntimeFilterConsumerV1::new(
+                QueryTerminalRuntimeFilterConsumerKeyV1::new(
+                    channel_key(value.channel_binding_id, value.channel_id),
+                    value.consumer_binding_id,
+                    novarocks_types::UniqueId::new(fragment.hi, fragment.lo),
+                ),
+                value.latest_delivered_logical_version,
+                value.latest_applied_logical_version,
+                terminal,
+                value.row_evaluations,
+                value.input_rows,
+                value.output_rows,
+                value.scan_evaluated,
+                value.scan_kept,
+                value.scan_pruned,
+                value.scan_not_evaluated,
+                QueryTerminalRuntimeFilterScanNotEvaluatedV1::new(
+                    reasons.unit_facts_missing,
+                    reasons.column_facts_missing,
+                    reasons.data_type_unsupported,
+                    reasons.predicate_capability_unsupported,
+                    reasons.resource_unavailable,
+                    reasons.snapshot_unavailable,
+                    reasons.snapshot_timed_out,
+                    reasons.snapshot_not_published,
+                ),
+            ))
+        })
+        .collect::<Result<Vec<_>, QueryLifecycleError>>()?;
+    QueryTerminalProfileContributionV1::try_new(
+        channels,
+        producer_streams,
+        transport_routes,
+        consumers,
+    )
+}
+
+/// Rebuilds the Core-only lease aggregate after Protocol has validated the
+/// terminal snapshot. This is the explicitly deferred CLS-R2 aggregation
+/// residual; no RPC boundary reaches this projection.
+fn decode_protocol_terminal_snapshot_projection(
+    value: &novarocks::QueryTerminalSnapshot,
+) -> Result<QueryTerminalSnapshot, QueryLifecycleError> {
+    decode_query_terminal_snapshot_projection(value)
+}
+
+fn decode_query_terminal_snapshot_projection(
+    value: &novarocks::QueryTerminalSnapshot,
+) -> Result<QueryTerminalSnapshot, QueryLifecycleError> {
+    use crate::runtime::sink_commit::{
+        SinkCommitReportSnapshot, SinkLoadStats, TabletCommitInfo, TabletFailInfo,
+    };
+    let fragments = value
+        .fragments
+        .iter()
+        .map(|fragment| {
+            let id = fragment.fragment_instance_id.as_ref().ok_or_else(|| {
+                QueryLifecycleError::invalid_manifest("terminal fragment instance id is required")
+            })?;
+            let outcome = match fragment.outcome {
+                1 => FragmentTerminalOutcome::Succeeded,
+                2 if !fragment.error_code.trim().is_empty() => FragmentTerminalOutcome::Failed {
+                    code: fragment.error_code.clone(),
+                    detail: fragment.error_detail.clone(),
+                    detail_truncated: fragment.error_detail_truncated,
+                },
+                3 => FragmentTerminalOutcome::Cancelled {
+                    detail: fragment.error_detail.clone(),
+                    detail_truncated: fragment.error_detail_truncated,
+                },
+                4 => FragmentTerminalOutcome::IncompleteDrain {
+                    detail: fragment.error_detail.clone(),
+                    detail_truncated: fragment.error_detail_truncated,
+                },
+                _ => {
+                    return Err(QueryLifecycleError::invalid_manifest(
+                        "invalid terminal fragment outcome",
+                    ));
+                }
+            };
+            let stats = fragment.load_stats.as_ref().ok_or_else(|| {
+                QueryLifecycleError::invalid_manifest("terminal fragment load stats are required")
+            })?;
+            let sink = SinkCommitReportSnapshot {
+                connector_staged_report_frames: fragment
+                    .connector_staged_report_frames
+                    .iter()
+                    .map(crate::query_execution::write::decode_connector_staged_report_frame)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| QueryLifecycleError::invalid_manifest(error.message()))?,
+                tablet_commit_infos: fragment
+                    .tablet_commit_infos
+                    .iter()
+                    .map(|value| TabletCommitInfo {
+                        tablet_id: value.tablet_id,
+                        backend_id: value.backend_id,
+                    })
+                    .collect(),
+                tablet_fail_infos: fragment
+                    .tablet_fail_infos
+                    .iter()
+                    .map(|value| TabletFailInfo {
+                        tablet_id: value.tablet_id,
+                        backend_id: value.backend_id,
+                    })
+                    .collect(),
+                load_stats: SinkLoadStats {
+                    loaded_rows: stats.loaded_rows,
+                    loaded_bytes: stats.loaded_bytes,
+                    filtered_rows: stats.filtered_rows,
+                },
+            };
+            let profile = decode_fragment_terminal_profile_telemetry(
+                fragment.profile.as_ref().ok_or_else(|| {
+                    QueryLifecycleError::invalid_manifest(
+                        "terminal fragment profile telemetry is required",
+                    )
+                })?,
+            )?;
+            FragmentTerminalSnapshot::new_with_profile_telemetry(
+                novarocks_types::UniqueId::new(id.hi, id.lo),
+                fragment.backend_num,
+                outcome,
+                sink,
+                profile,
+            )
+            .and_then(|snapshot| {
+                snapshot.with_statistics_payload(fragment.statistics_payload.clone())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let profile_contribution = decode_query_terminal_profile_contribution_telemetry(
+        value.profile_contribution.as_ref().ok_or_else(|| {
+            QueryLifecycleError::invalid_manifest(
+                "query terminal profile contribution telemetry is required",
+            )
+        })?,
+    )?;
+    QueryTerminalSnapshot::new_with_profile_telemetry(
+        value
+            .execution_id
+            .as_ref()
+            .ok_or_else(|| {
+                QueryLifecycleError::invalid_manifest("terminal execution id is required")
+            })
+            .and_then(|raw| {
+                QueryExecutionId::try_from_proto(raw).map_err(QueryLifecycleError::from)
+            })?,
+        value
+            .backend
+            .clone()
+            .ok_or_else(|| {
+                QueryLifecycleError::invalid_manifest("terminal backend identity is required")
+            })
+            .and_then(|raw| {
+                ParticipantBackendIdentity::parse(raw).map_err(QueryLifecycleError::from)
+            })?,
+        ParticipantManifestDigest::try_from_slice(&value.init_digest)
+            .map_err(QueryLifecycleError::from)?,
+        fragments,
+        profile_contribution,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::query_execution::contract::QueryId;
-    use crate::query_execution::lifecycle::{
-        AttemptId, ParticipantQueryOptions, ParticipantRole, QueryControlEndpoint,
-    };
+    use crate::query_execution::lifecycle::{AttemptId, ParticipantRole, QueryControlEndpoint};
     use novarocks_execution::runtime::profile::{
         CounterStrategy, ProfileCounter, ProfileNode, ProfileUnit, RuntimeProfileTree,
     };
-    use novarocks_execution::runtime::query_options::QueryOptions;
+    use novarocks_protocol::{common, novarocks};
 
     fn snapshot(fragment_ids: &[i64]) -> QueryTerminalSnapshot {
         let execution =
@@ -2239,6 +2609,64 @@ mod tests {
             facts,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn query_terminal_set_projects_validated_protocol_snapshot_for_lease_aggregation() {
+        let execution = QueryExecutionId::new(
+            QueryId::new(1, 2),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("valid execution id");
+        let backend = ParticipantBackendIdentity::new(
+            1,
+            QueryControlEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
+            1,
+        )
+        .expect("backend");
+        let raw = novarocks::QueryTerminalSnapshot {
+            version: QUERY_TERMINAL_SNAPSHOT_VERSION_V1,
+            execution_id: Some(execution.to_proto()),
+            backend: Some(backend.as_proto().clone()),
+            init_digest: vec![7; 32],
+            fragments: vec![novarocks::QueryTerminalFragmentSnapshot {
+                fragment_instance_id: Some(common::UniqueId { hi: 0, lo: 1 }),
+                backend_num: 0,
+                outcome: novarocks::QueryTerminalFragmentOutcome::Succeeded as i32,
+                load_stats: Some(novarocks::QueryTerminalLoadStats::default()),
+                profile: Some(novarocks::FragmentTerminalProfileTelemetry {
+                    telemetry: Some(
+                        novarocks::fragment_terminal_profile_telemetry::Telemetry::Unavailable(
+                            novarocks::TerminalTelemetryUnavailable {
+                                stage: "fragment".to_string(),
+                                code: "PROFILE_UNAVAILABLE".to_string(),
+                            },
+                        ),
+                    ),
+                }),
+                ..Default::default()
+            }],
+            profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
+                telemetry: Some(
+                    novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(
+                        novarocks::TerminalTelemetryUnavailable {
+                            stage: "query".to_string(),
+                            code: "PROFILE_UNAVAILABLE".to_string(),
+                        },
+                    ),
+                ),
+            }),
+            ..Default::default()
+        };
+        let protocol = novarocks_protocol::lifecycle::QueryTerminalSnapshot::seal(raw)
+            .expect("valid protocol terminal snapshot");
+
+        let set = QueryTerminalSet::from_protocol_snapshots(vec![protocol])
+            .expect("validated protocol snapshot projects into Core lease aggregate");
+
+        assert!(set.is_success());
+        assert_eq!(set.snapshots().len(), 1);
+        assert_eq!(set.fragments().count(), 1);
     }
 
     #[test]
@@ -2296,18 +2724,29 @@ mod tests {
         )
         .unwrap();
         let ids = [UniqueId::new(0, 1), UniqueId::new(0, 2)];
-        let manifest = ParticipantManifest::new(
-            execution,
-            backend.clone(),
-            [ParticipantRole::FragmentExecutor],
-            ids,
-            ParticipantQueryOptions::new(QueryOptions::default()),
-            1_000,
-            [],
-            None,
-            std::time::Duration::from_secs(30),
-            QueryControlEndpoint::new("127.0.0.1", 9031).unwrap(),
-        )
+        let manifest = ParticipantManifest::parse(novarocks::ParticipantManifest {
+            execution_id: Some(execution.to_proto()),
+            backend: Some(backend.as_proto().clone()),
+            participant_roles: vec![i32::from(ParticipantRole::FragmentExecutor)],
+            expected_fragment_instance_ids: ids
+                .iter()
+                .map(|id| common::UniqueId {
+                    hi: id.high(),
+                    lo: id.low(),
+                })
+                .collect(),
+            query_options: Some(novarocks::QueryOptions::default()),
+            query_deadline_unix_ms: 1_000,
+            exchange_routes: Vec::new(),
+            runtime_filter: None,
+            pre_start_timeout_ms: 30_000,
+            report_endpoint: Some(
+                QueryControlEndpoint::new("127.0.0.1", 9031)
+                    .unwrap()
+                    .as_proto()
+                    .clone(),
+            ),
+        })
         .unwrap();
         let facts = ids
             .into_iter()
@@ -2629,11 +3068,6 @@ mod tests {
         )
         .expect("terminal snapshot with contribution");
         assert_ne!(empty.digest(), non_empty.digest());
-        let decoded = super::super::decode_query_terminal_snapshot(
-            &super::super::encode_query_terminal_snapshot(&non_empty),
-        )
-        .expect("non-empty contribution wire round trip");
-        assert_eq!(decoded, non_empty);
     }
 
     #[test]
@@ -2695,15 +3129,10 @@ mod tests {
         assert_eq!(
             snapshot.digest().as_bytes(),
             &[
-                153, 104, 198, 50, 156, 136, 64, 128, 172, 88, 76, 134, 194, 243, 47, 82, 186, 38,
-                226, 160, 113, 146, 238, 2, 152, 233, 135, 200, 244, 10, 143, 233,
+                193, 68, 231, 25, 65, 110, 75, 9, 55, 1, 255, 153, 201, 135, 100, 91, 66, 217, 212,
+                234, 246, 84, 168, 137, 146, 207, 33, 57, 151, 166, 40, 122,
             ]
         );
         snapshot.validate().expect("profile digest stays canonical");
-        let wire = super::super::encode_query_terminal_snapshot(&snapshot);
-        let decoded =
-            super::super::decode_query_terminal_snapshot(&wire).expect("profile wire round trip");
-        assert_eq!(decoded.digest(), snapshot.digest());
-        assert_eq!(decoded, snapshot);
     }
 }

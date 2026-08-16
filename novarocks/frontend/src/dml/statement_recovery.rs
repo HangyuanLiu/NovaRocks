@@ -65,7 +65,7 @@
 //!
 //! [`permits_source_scope_release`]: ConnectorHistoricalDataMutationDisposition::permits_source_scope_release
 
-// Design: ADR-0065 (docs/adr/ADR-0065-external-write-fence-as-catalog-linearization-point.md)
+// Design: ADR-0068 (docs/adr/ADR-0068-external-write-fence-as-catalog-linearization-point.md)
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

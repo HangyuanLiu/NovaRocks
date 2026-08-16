@@ -26,15 +26,72 @@ use crate::query_execution::contract::{
 use crate::query_execution::schedule::FragmentLifecycleProjection;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime::query_options::QueryOptions;
-
-use super::manifest::{
-    ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
-    ParticipantQueryOptions, ParticipantRole, QueryControlEndpoint, RuntimeFilterContribution,
+use novarocks_protocol::common;
+use novarocks_protocol::lifecycle::{
+    ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest, ParticipantRole,
+    QueryControlEndpoint, QueryExecutionId, QueryOptions as ProtocolQueryOptions,
+    RuntimeFilterContribution,
 };
-use super::{QueryExecutionId, QueryLifecycleTarget, QueryTerminalSet, StageParticipantBinding};
+use novarocks_protocol::novarocks;
+
+use super::{QueryLifecycleTarget, QueryTerminalSet, StageParticipantBinding};
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
+}
+
+fn protocol_contract_error(
+    error: novarocks_protocol::lifecycle::ContractError,
+) -> DistributedQueryError {
+    contract_error(error.to_string())
+}
+
+fn protocol_report_endpoint(
+    endpoint: CoordinatorReportEndpoint,
+) -> Result<QueryControlEndpoint, DistributedQueryError> {
+    let endpoint = endpoint.into_runtime_endpoint();
+    let port = u32::try_from(endpoint.port())
+        .map_err(|_| contract_error("report endpoint port is outside u32 range"))?;
+    QueryControlEndpoint::parse(novarocks::QueryControlEndpoint {
+        host: endpoint.host().to_string(),
+        port,
+    })
+    .map_err(protocol_contract_error)
+}
+
+fn protocol_backend_identity(
+    target: LiveBackendTarget,
+) -> Result<ParticipantBackendIdentity, DistributedQueryError> {
+    let backend_id = u64::try_from(target.backend_idx())
+        .map_err(|_| contract_error("query initialization backend index is outside u64 range"))?;
+    ParticipantBackendIdentity::parse(novarocks::ParticipantBackendIdentity {
+        backend_id,
+        endpoint: Some(novarocks::QueryControlEndpoint {
+            host: target.endpoint().ip().to_string(),
+            port: u32::from(target.endpoint().port()),
+        }),
+        start_epoch: target.start_epoch(),
+    })
+    .map_err(protocol_contract_error)
+}
+
+fn protocol_unique_id(id: crate::common::types::UniqueId) -> common::UniqueId {
+    common::UniqueId {
+        hi: id.high(),
+        lo: id.low(),
+    }
+}
+
+fn protocol_exchange_route(
+    route: &novarocks_protocol::lifecycle::ExchangeRouteManifest,
+) -> novarocks::ExchangeRouteManifest {
+    route.as_proto().clone()
+}
+
+fn duration_millis(duration: Duration) -> Result<u64, DistributedQueryError> {
+    duration.as_millis().try_into().map_err(|_| {
+        contract_error("query initialization pre-start timeout must fit in u64 milliseconds")
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,7 +116,10 @@ impl QueryInitPlanHeader {
 pub struct QueryInitOptions {
     execution_id: QueryExecutionId,
     live_backends: Vec<LiveBackendTarget>,
-    query_options: QueryOptions,
+    /// Execution-owned options retained solely for sealed native fragment
+    /// submission. They are not the lifecycle wire carrier.
+    native_submission_options: QueryOptions,
+    query_options: ProtocolQueryOptions,
     query_deadline_unix_ms: u64,
     pre_start_timeout: Duration,
     report_endpoint: QueryControlEndpoint,
@@ -70,7 +130,8 @@ impl QueryInitOptions {
     pub fn new(
         execution_id: QueryExecutionId,
         live_backends: Vec<LiveBackendTarget>,
-        query_options: &ResolvedQueryOptions,
+        native_submission_options: &ResolvedQueryOptions,
+        query_options: ProtocolQueryOptions,
         query_deadline_unix_ms: u64,
         pre_start_timeout: Duration,
         report_endpoint: CoordinatorReportEndpoint,
@@ -112,7 +173,7 @@ impl QueryInitOptions {
                 )));
             }
         }
-        let report_endpoint = QueryControlEndpoint::try_from(report_endpoint).map_err(|error| {
+        let report_endpoint = protocol_report_endpoint(report_endpoint).map_err(|error| {
             contract_error(format!(
                 "query initialization report endpoint is invalid: {error}"
             ))
@@ -120,7 +181,8 @@ impl QueryInitOptions {
         Ok(Self {
             execution_id,
             live_backends,
-            query_options: query_options.runtime_options().clone(),
+            native_submission_options: native_submission_options.runtime_options().clone(),
+            query_options,
             query_deadline_unix_ms,
             pre_start_timeout,
             report_endpoint,
@@ -139,6 +201,12 @@ impl QueryInitOptions {
     /// submission view.  They are read-only encoder input, never a route to
     /// reacquire lifecycle or topology state.
     pub fn native_submission_options(&self) -> &QueryOptions {
+        &self.native_submission_options
+    }
+
+    /// The exact validated protocol options frozen into every participant
+    /// manifest. Core does not project execution options into this carrier.
+    pub const fn query_options(&self) -> &ProtocolQueryOptions {
         &self.query_options
     }
 }
@@ -188,30 +256,32 @@ impl QueryInitPlan {
         self.participants
             .iter()
             .map(|participant| {
-                let endpoint_ip = participant
+                let endpoint = participant
                     .backend()
                     .endpoint()
-                    .host()
-                    .parse::<IpAddr>()
-                    .map_err(|error| {
-                        contract_error(format!(
-                            "query stage backend {} endpoint is not an IP address: {error}",
-                            participant.backend_idx()
-                        ))
-                    })?;
+                    .map_err(protocol_contract_error)?;
+                let endpoint_ip = endpoint.host().parse::<IpAddr>().map_err(|error| {
+                    contract_error(format!(
+                        "query stage backend {} endpoint is not an IP address: {error}",
+                        participant.backend_idx()
+                    ))
+                })?;
                 StageParticipantBinding::new(
                     QueryLifecycleTarget::new(
                         participant.backend_idx(),
-                        SocketAddr::new(endpoint_ip, participant.backend().endpoint().port()),
+                        SocketAddr::new(endpoint_ip, endpoint.port()),
                         participant.backend().start_epoch(),
                     ),
                     participant.digest(),
-                    participant.manifest().roles().iter().copied(),
+                    participant
+                        .manifest()
+                        .roles()
+                        .map_err(protocol_contract_error)?,
                     participant
                         .manifest()
                         .expected_fragment_instance_ids()
-                        .iter()
-                        .copied(),
+                        .into_iter()
+                        .map(|id| novarocks_types::UniqueId::new(id.hi, id.lo)),
                 )
                 .map_err(|error| {
                     contract_error(format!(
@@ -231,20 +301,25 @@ impl QueryInitPlan {
         let mut participants = manifests
             .into_iter()
             .map(|(backend_idx, manifest)| {
-                if manifest.execution_id() != execution_id {
+                if manifest.execution_id().map_err(protocol_contract_error)? != execution_id {
                     return Err(contract_error(
                         "contract-test participant execution id differs from query init plan",
                     ));
                 }
-                if manifest.backend().backend_id() != backend_idx as u64 {
+                if manifest
+                    .backend()
+                    .map_err(protocol_contract_error)?
+                    .backend_id()
+                    != backend_idx as u64
+                {
                     return Err(contract_error(
                         "contract-test participant backend identity differs from backend index",
                     ));
                 }
-                let digest = manifest.digest();
+                let digest = manifest.digest().map_err(protocol_contract_error)?;
                 Ok(QueryInitParticipant {
                     backend_idx,
-                    backend: manifest.backend().clone(),
+                    backend: manifest.backend().map_err(protocol_contract_error)?,
                     manifest,
                     digest,
                 })
@@ -449,11 +524,7 @@ pub(crate) fn compile_query_init_plan(
                 "query initialization participant backend {backend_idx} is not live"
             ))
         })?;
-        let backend = ParticipantBackendIdentity::from_live_backend(target).map_err(|error| {
-            contract_error(format!(
-                "query initialization backend identity is invalid: {error}"
-            ))
-        })?;
+        let backend = protocol_backend_identity(target)?;
         let mut roles = BTreeSet::new();
         let expected_instances = fragments
             .instances_by_backend
@@ -467,24 +538,31 @@ pub(crate) fn compile_query_init_plan(
         if runtime_filter.is_some() {
             roles.insert(ParticipantRole::RuntimeFilterService);
         }
-        let manifest = ParticipantManifest::new(
-            options.execution_id,
-            backend.clone(),
-            roles,
-            expected_instances,
-            ParticipantQueryOptions::new(options.query_options.clone()),
-            options.query_deadline_unix_ms,
-            fragments.exchange_routes.iter().cloned(),
-            runtime_filter,
-            options.pre_start_timeout,
-            options.report_endpoint.clone(),
-        )
+        let manifest = ParticipantManifest::parse(novarocks::ParticipantManifest {
+            execution_id: Some(options.execution_id.to_proto()),
+            backend: Some(backend.as_proto().clone()),
+            participant_roles: roles.into_iter().map(i32::from).collect(),
+            expected_fragment_instance_ids: expected_instances
+                .into_iter()
+                .map(protocol_unique_id)
+                .collect(),
+            query_options: Some(options.query_options.as_proto().clone()),
+            query_deadline_unix_ms: options.query_deadline_unix_ms,
+            exchange_routes: fragments
+                .exchange_routes
+                .iter()
+                .map(protocol_exchange_route)
+                .collect(),
+            runtime_filter: runtime_filter.map(|contribution| contribution.as_proto().clone()),
+            pre_start_timeout_ms: duration_millis(options.pre_start_timeout)?,
+            report_endpoint: Some(options.report_endpoint.as_proto().clone()),
+        })
         .map_err(|error| {
             contract_error(format!(
                 "query initialization participant manifest is invalid: {error}"
             ))
         })?;
-        let digest = manifest.digest();
+        let digest = manifest.digest().map_err(protocol_contract_error)?;
         participants.push(QueryInitParticipant {
             backend_idx,
             backend,
@@ -495,7 +573,7 @@ pub(crate) fn compile_query_init_plan(
     let header = QueryInitPlanHeader::new(options.execution_id, options.query_deadline_unix_ms);
     fragments.freeze_query_init_header(header)?;
     Ok(QueryInitPlan {
-        execution_id: header.execution_id,
+        execution_id: options.execution_id,
         query_deadline_unix_ms: header.query_deadline_unix_ms,
         participants,
     })
@@ -510,10 +588,11 @@ mod tests {
     use crate::common::types::UniqueId;
     use crate::query_execution::backend::{CoordinatorReportEndpoint, LiveBackendTarget};
     use crate::query_execution::contract::{QueryId, ResolvedQueryOptions};
-    use crate::query_execution::lifecycle::{
-        AttemptId, ParticipantRole, QueryExecutionId, RuntimeFilterContribution,
-    };
     use crate::query_execution::schedule::FragmentLifecycleProjection;
+    use novarocks_protocol::lifecycle::{
+        AttemptId, ParticipantRole, QueryExecutionId, QueryOptions, RuntimeFilterContribution,
+    };
+    use novarocks_protocol::novarocks;
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(
@@ -535,10 +614,17 @@ mod tests {
 
     fn runtime_filter(backend_idx: usize) -> (usize, RuntimeFilterContribution) {
         let participant_id = u32::try_from(backend_idx + 1).expect("participant");
-        let contribution =
-            RuntimeFilterContribution::empty_for_contract_test(execution_id(), participant_id)
-                .expect("valid opaque contribution");
+        let contribution = RuntimeFilterContribution::parse(novarocks::RuntimeFilterContribution {
+            participant_id,
+            contribution_digest: vec![0; 32],
+            ..Default::default()
+        })
+        .expect("valid opaque contribution");
         (backend_idx, contribution)
+    }
+
+    fn wire_query_options() -> QueryOptions {
+        QueryOptions::parse(novarocks::QueryOptions::default()).expect("valid wire query options")
     }
 
     #[test]
@@ -573,6 +659,7 @@ mod tests {
             execution_id(),
             vec![backend(0), backend(1), backend(2)],
             &resolved,
+            wire_query_options(),
             1_000,
             Duration::from_secs(30),
             CoordinatorReportEndpoint::from_socket_addr(
@@ -594,14 +681,15 @@ mod tests {
                 .expect("service-only participant")
                 .manifest()
                 .expected_fragment_instance_ids(),
-            &BTreeSet::new()
+            Vec::new()
         );
         assert_eq!(
             plan.participant(2)
                 .expect("service-only participant")
                 .manifest()
-                .roles(),
-            &BTreeSet::from([ParticipantRole::RuntimeFilterService])
+                .roles()
+                .expect("validated roles"),
+            vec![ParticipantRole::RuntimeFilterService]
         );
     }
 
@@ -616,6 +704,7 @@ mod tests {
             execution_id(),
             vec![backend(2)],
             &resolved,
+            wire_query_options(),
             1_000,
             Duration::from_secs(30),
             CoordinatorReportEndpoint::from_socket_addr(
@@ -631,6 +720,7 @@ mod tests {
             .expect("runtime filter participant")
             .manifest()
             .runtime_filter()
+            .expect("validated runtime filter")
             .expect("runtime filter contribution");
 
         assert_eq!(contribution.participant_id(), 3);
@@ -661,6 +751,7 @@ mod tests {
             execution_id(),
             vec![restarted],
             &resolved,
+            wire_query_options(),
             1_000,
             Duration::from_secs(30),
             CoordinatorReportEndpoint::from_socket_addr(
@@ -692,6 +783,7 @@ mod tests {
             execution_id(),
             vec![backend(1)],
             &resolved,
+            wire_query_options(),
             9_000,
             Duration::from_secs(30),
             CoordinatorReportEndpoint::from_socket_addr(
@@ -727,6 +819,7 @@ mod tests {
             execution_id(),
             vec![backend(2)],
             &resolved,
+            wire_query_options(),
             9_000,
             Duration::from_secs(30),
             CoordinatorReportEndpoint::from_socket_addr(
@@ -744,6 +837,7 @@ mod tests {
             execution_id(),
             vec![backend(2)],
             &resolved,
+            wire_query_options(),
             9_001,
             Duration::from_secs(30),
             CoordinatorReportEndpoint::from_socket_addr(

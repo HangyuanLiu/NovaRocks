@@ -21,7 +21,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::query_execution::lifecycle::QueryExecutionId;
+use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryLifecycleFaultKind {
@@ -277,8 +277,7 @@ fn parse_scope(contents: &str) -> Result<QueryLifecycleFaultScope, String> {
         required_i64(&fields, "execution_lo")?,
     );
     let attempt =
-        crate::query_execution::lifecycle::AttemptId::new(required_u64(&fields, "attempt")?)
-            .map_err(|error| error.to_string())?;
+        AttemptId::new(required_u64(&fields, "attempt")?).map_err(|error| error.to_string())?;
     let execution_id =
         QueryExecutionId::new(query_id, attempt).map_err(|error| error.to_string())?;
     Ok(QueryLifecycleFaultScope {
@@ -366,7 +365,7 @@ fn publish_new(path: &Path, contents: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_execution::lifecycle::AttemptId;
+    use novarocks_protocol::lifecycle::AttemptId;
 
     fn execution_id(lo: i64) -> QueryExecutionId {
         QueryExecutionId::new(

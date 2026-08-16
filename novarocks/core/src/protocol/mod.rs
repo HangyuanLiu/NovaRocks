@@ -40,9 +40,9 @@ pub fn decode_native_query_options(
 /// handlers; it deliberately does not expose fragment-program assembly.
 pub fn decode_native_query_execution_id(
     execution_id: &novarocks_protocol::novarocks::QueryExecutionId,
-) -> Result<crate::query_execution::lifecycle::QueryExecutionId, ProtocolError> {
+) -> Result<novarocks_protocol::lifecycle::QueryExecutionId, ProtocolError> {
     use crate::query_execution::contract::QueryId;
-    use crate::query_execution::lifecycle::AttemptId;
+    use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
 
     let root = FieldPath::root("execution_id");
     let query_id = execution_id.query_id.as_ref().ok_or_else(|| {
@@ -61,11 +61,7 @@ pub fn decode_native_query_execution_id(
             error.to_string(),
         )
     })?;
-    crate::query_execution::lifecycle::QueryExecutionId::new(
-        QueryId::new(query_id.hi, query_id.lo),
-        attempt_id,
-    )
-    .map_err(|error| {
+    QueryExecutionId::new(QueryId::new(query_id.hi, query_id.lo), attempt_id).map_err(|error| {
         ProtocolError::new(
             ProtocolFamily::Native,
             root,

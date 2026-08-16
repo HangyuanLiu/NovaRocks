@@ -1,14 +1,21 @@
 //! NovaRocks-native protobuf schema artifacts.
 //!
-//! This crate owns generated DTOs, the descriptor set, and schema-ledger
-//! metadata only. Transport and FE/BE semantic conversion remain outside this
-//! package.
+//! This crate owns generated DTOs, schema-ledger metadata, and the neutral
+//! lifecycle contract derived from the canonical repository-level IDL.
+//! Transport, role-local state machines, and FE/BE execution conversion remain
+//! outside this package.
 
 pub const SCHEMA_LEDGER_VERSION: u32 = 1;
 
 /// File descriptor set generated from the canonical repository-level IDL.
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/novarocks_descriptor.bin"));
+
+/// Canonical descriptor-driven projection and digest utilities.
+pub mod canonical;
+
+/// Validated neutral values used by the native query lifecycle.
+pub mod lifecycle;
 
 #[allow(clippy::len_without_is_empty)]
 pub mod common {

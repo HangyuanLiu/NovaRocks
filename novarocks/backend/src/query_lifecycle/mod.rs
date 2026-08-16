@@ -15,11 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod contract;
 mod entry;
 mod local_runtime;
 mod registry;
 pub(crate) mod stage;
 
+pub(crate) use contract::{
+    BackendQueryControl, QueryControlAttachment, QueryLifecycleIngress,
+    QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
+};
 pub(crate) use local_runtime::NativeQueryLifecycleLocalRuntime;
 pub use registry::QueryLifecycleRegistryConfig;
 pub(crate) use registry::{QueryLifecycleRegistry, StageBuildDecision};

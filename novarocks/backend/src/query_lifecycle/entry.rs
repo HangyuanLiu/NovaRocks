@@ -19,12 +19,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use novarocks::query_execution::lifecycle::{
-    FragmentLiveObservation, FragmentTerminalSnapshot, ImmutableQueryTerminalRecord,
-    ParticipantManifest, ParticipantManifestDigest, ParticipantTerminalOutcome, QueryControlEvent,
-    QueryInitOutcome, QueryTerminationReason, StageDigest,
+use novarocks::query_execution::lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
+use novarocks_protocol::lifecycle::{
+    FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantManifest,
+    ParticipantManifestDigest, ParticipantTerminalOutcome, QueryControlEvent, QueryInitOutcome,
+    QueryTerminalSnapshot, QueryTerminationReason, StageDigest,
 };
 use novarocks_types::UniqueId;
+use prost::Message;
 
 use super::stage::StartGate;
 use crate::runtime_filter::participant::RuntimeFilterParticipant;
@@ -45,6 +47,10 @@ pub(crate) enum QueryLifecyclePhase {
 pub(crate) struct QueryLifecycleEntry {
     pub(crate) digest: ParticipantManifestDigest,
     pub(crate) manifest: ParticipantManifest,
+    /// Backend-local execution routing IDs.  The manifest remains the
+    /// canonical Protocol value; this converts generated IDs once for the
+    /// BE runtime maps that key on `novarocks_types::UniqueId`.
+    pub(crate) expected_fragment_instance_ids: Vec<UniqueId>,
     pub(crate) state: Mutex<QueryLifecycleEntryState>,
     pub(crate) init_completed: Condvar,
     pub(crate) stage_completed: Condvar,
@@ -52,6 +58,42 @@ pub(crate) struct QueryLifecycleEntry {
     /// immutable record, so an acknowledged snapshot does not retain a
     /// sleeping fallback worker for the full ACK timeout.
     pub(crate) terminal_delivery_completed: Condvar,
+}
+
+/// Backend-owned retention bookkeeping for an already sealed Protocol
+/// terminal snapshot.  It deliberately adds no lifecycle value model: the
+/// snapshot itself is the validated generated Protocol carrier.
+#[derive(Clone, Debug)]
+pub(crate) struct ImmutableQueryTerminalRecord {
+    snapshot: QueryTerminalSnapshot,
+    encoded_len: usize,
+}
+
+impl ImmutableQueryTerminalRecord {
+    pub(crate) fn new(
+        snapshot: QueryTerminalSnapshot,
+        max_encoded_bytes: usize,
+    ) -> Result<Self, QueryLifecycleError> {
+        let encoded_len = snapshot.as_proto().encoded_len();
+        if encoded_len > max_encoded_bytes {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Capacity,
+                "query terminal snapshot exceeds retained-record byte limit",
+            ));
+        }
+        Ok(Self {
+            snapshot,
+            encoded_len,
+        })
+    }
+
+    pub(crate) const fn snapshot(&self) -> &QueryTerminalSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) const fn encoded_len(&self) -> usize {
+        self.encoded_len
+    }
 }
 
 pub(crate) struct QueryLifecycleEntryState {
@@ -119,9 +161,15 @@ impl QueryLifecycleEntry {
         manifest: ParticipantManifest,
         digest: ParticipantManifestDigest,
     ) -> Self {
+        let expected_fragment_instance_ids = manifest
+            .expected_fragment_instance_ids()
+            .into_iter()
+            .map(|value| UniqueId::new(value.hi, value.lo))
+            .collect();
         Self {
             digest,
             manifest,
+            expected_fragment_instance_ids,
             state: Mutex::new(QueryLifecycleEntryState {
                 phase: QueryLifecyclePhase::Initializing,
                 init_outcome: None,

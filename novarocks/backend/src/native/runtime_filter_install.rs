@@ -26,9 +26,7 @@ use std::time::Duration;
 
 use arrow::datatypes::DataType;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
-use novarocks::query_execution::lifecycle::{
-    QueryExecutionId, QueryLifecycleError, QueryLifecycleErrorCode, RuntimeFilterContribution,
-};
+use novarocks::query_execution::lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime_filter::{
     ConsumerActivation, RuntimeFilterBindingId, RuntimeFilterChannelId,
@@ -36,7 +34,11 @@ use novarocks_execution::runtime_filter::{
     RuntimeFilterLateApplyGranularity, RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics,
     RuntimeFilterProducerContract, RuntimeFilterProducerKind, RuntimeFilterReduction, contribution,
 };
-use novarocks_protocol::{common, filter, plan};
+use novarocks_protocol::{
+    common, filter,
+    lifecycle::{QueryExecutionId, RuntimeFilterContribution},
+    plan,
+};
 use novarocks_types::UniqueId;
 use prost::Message;
 use sha2::Digest;
@@ -87,7 +89,7 @@ pub(crate) fn decode_runtime_filter_contribution(
     execution_id: QueryExecutionId,
     contribution: &RuntimeFilterContribution,
 ) -> Result<DecodedRuntimeFilterContribution, QueryLifecycleError> {
-    let wire = contribution.wire();
+    let wire = contribution.as_proto();
     let request = filter::InstallRuntimeFilterDeploymentRequest {
         query_id: Some(common::UniqueId {
             hi: execution_id.query_id().high(),
@@ -1778,10 +1780,11 @@ mod tests {
         },
         test_support::BackendRuntimeFilterFixture,
     };
-    use novarocks::query_execution::lifecycle::{
-        AttemptId, QueryExecutionId, RuntimeFilterContribution,
+    use novarocks_protocol::{
+        common, filter,
+        lifecycle::{AttemptId, QueryExecutionId, RuntimeFilterContribution},
+        novarocks as proto_novarocks,
     };
-    use novarocks_protocol::{common, filter, novarocks as proto_novarocks};
     use novarocks_types::QueryId;
     use prost::Message;
     use sha2::Digest;
@@ -1818,7 +1821,7 @@ mod tests {
         let mut digest = sha2::Sha256::new();
         digest.update(CONTRIBUTION_DIGEST_DOMAIN);
         digest.update(envelope.encode_to_vec());
-        RuntimeFilterContribution::from_wire(proto_novarocks::RuntimeFilterContribution {
+        RuntimeFilterContribution::parse(proto_novarocks::RuntimeFilterContribution {
             participant_id: 3,
             lifecycle: Some(lifecycle),
             install: Some(install),
@@ -1844,9 +1847,9 @@ mod tests {
     fn rejects_bad_digest_before_constructing_participant_domain() {
         let execution_id = execution_id();
         let contribution = valid_empty_contribution(execution_id);
-        let mut wire = contribution.wire().clone();
+        let mut wire = contribution.as_proto().clone();
         wire.contribution_digest[0] ^= 0x01;
-        let malformed = RuntimeFilterContribution::from_wire(wire)
+        let malformed = RuntimeFilterContribution::parse(wire)
             .expect("length remains a generic carrier invariant");
 
         let error = decode_runtime_filter_contribution(execution_id, &malformed)

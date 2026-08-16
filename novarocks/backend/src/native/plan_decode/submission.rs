@@ -190,9 +190,9 @@ mod tests {
     use arrow::datatypes::DataType;
     use novarocks::connector::ConnectorRegistry;
     use novarocks::protocol::ProtocolErrorKind;
-    use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_execution::exec::fragment::program::FragmentSinkKind;
     use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_protocol::{common, expr, novarocks as proto, plan};
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,

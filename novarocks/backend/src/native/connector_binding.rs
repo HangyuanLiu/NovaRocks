@@ -26,7 +26,7 @@ use novarocks_spi::connector::{
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
-use novarocks::query_execution::lifecycle::QueryExecutionId;
+use novarocks_protocol::lifecycle::QueryExecutionId;
 use novarocks_protocol::novarocks::{
     EnsureConnectorExecutionBindingRequest, RetireConnectorExecutionBindingRequest,
 };

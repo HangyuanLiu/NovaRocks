@@ -822,7 +822,7 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
     /// generation, another operation's marker, or an uninterpretable marker all
     /// refuse with a typed external-fence failure.
     ///
-    /// Design: ADR-0065 (docs/adr/ADR-0065-external-write-fence-as-catalog-linearization-point.md)
+    /// Design: ADR-0068 (docs/adr/ADR-0068-external-write-fence-as-catalog-linearization-point.md)
     fn establish_external_fence(
         &self,
         request: ConnectorExternalFenceRequest,

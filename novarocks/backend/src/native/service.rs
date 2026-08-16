@@ -32,13 +32,10 @@ use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use novarocks::query_execution::lifecycle::{
-    QueryLifecycleIngress, QueryTerminalIngress, QueryTerminalReportOutcome,
-    decode_participant_terminal_outcome,
-};
+use novarocks::query_execution::lifecycle::QueryTerminalIngress;
 use novarocks::service::native_data_plane::NativeDataPlaneKernel;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
-use novarocks_protocol::{filter, novarocks as proto};
+use novarocks_protocol::{filter, lifecycle::ParticipantTerminalOutcome, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
@@ -49,12 +46,14 @@ use tonic::server::NamedService;
 use super::ingress::NativeFragmentIngress;
 use super::lifecycle_adapter::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
-    handle_stage_fragments, handle_start_prepared_query, status_from_lifecycle_error,
+    handle_stage_fragments, handle_start_prepared_query, status_from_contract_error,
+    status_from_lifecycle_error,
 };
 use super::runtime_filter_adapter::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,
 };
 use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
+use crate::query_lifecycle::QueryLifecycleIngress;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -380,23 +379,30 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
             tonic::Status::invalid_argument("ReportQueryTerminalRequest missing outcome")
         })?;
         let outcome =
-            decode_participant_terminal_outcome(&outcome).map_err(status_from_lifecycle_error)?;
+            ParticipantTerminalOutcome::parse(outcome).map_err(status_from_contract_error)?;
         let ack = tokio::task::spawn_blocking(move || ingress.report_query_terminal(outcome))
             .await
             .map_err(|error| {
                 tonic::Status::internal(format!("query terminal ingress panicked: {error}"))
             })?
             .map_err(status_from_lifecycle_error)?;
-        let outcome = match ack.outcome() {
-            QueryTerminalReportOutcome::Accepted => proto::ReportQueryTerminalOutcome::Accepted,
-            QueryTerminalReportOutcome::AlreadyAccepted => {
+        let outcome = match ack.outcome().map_err(status_from_contract_error)? {
+            proto::ReportQueryTerminalOutcome::Accepted => {
+                proto::ReportQueryTerminalOutcome::Accepted
+            }
+            proto::ReportQueryTerminalOutcome::AlreadyAccepted => {
                 proto::ReportQueryTerminalOutcome::AlreadyAccepted
             }
-            QueryTerminalReportOutcome::RejectedConflict => {
+            proto::ReportQueryTerminalOutcome::RejectedConflict => {
                 proto::ReportQueryTerminalOutcome::RejectedConflict
             }
-            QueryTerminalReportOutcome::RejectedGone => {
+            proto::ReportQueryTerminalOutcome::RejectedGone => {
                 proto::ReportQueryTerminalOutcome::RejectedGone
+            }
+            proto::ReportQueryTerminalOutcome::Unspecified => {
+                return Err(tonic::Status::internal(
+                    "validated terminal report acknowledgement has an unspecified outcome",
+                ));
             }
         };
         Ok(tonic::Response::new(proto::ReportQueryTerminalResponse {

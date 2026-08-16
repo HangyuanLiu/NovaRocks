@@ -13,8 +13,10 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use novarocks::query_execution::lifecycle::{
-    QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress, QueryTerminalReportOutcome,
-    decode_participant_terminal_outcome,
+    QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress,
+};
+use novarocks_protocol::lifecycle::{
+    ContractError, ContractErrorCode, ParticipantTerminalOutcome, QueryTerminalReportOutcome,
 };
 use novarocks_protocol::{filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -82,38 +84,46 @@ fn lifecycle_convergence_debug_snapshot(
         .participant_outcomes
         .iter()
         .map(|outcome| {
-            match outcome {
-            novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::Proof {
-                snapshot,
-                ..
-            } => {
-                if let Some(reason) = snapshot
-                    .profile_contribution_telemetry()
-                    .unavailable_reason()
+            if let Some(snapshot) = outcome.snapshot() {
+                let snapshot = snapshot.as_proto();
+                if let Some(
+                    proto::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(
+                        reason,
+                    ),
+                ) = snapshot
+                    .profile_contribution
+                    .as_ref()
+                    .and_then(|telemetry| telemetry.telemetry.as_ref())
                 {
                     telemetry_unavailable.push(LifecycleTelemetryUnavailableDebug {
                         scope: "query",
-                        stage: reason.stage().to_string(),
-                        code: reason.code().to_string(),
+                        stage: reason.stage.clone(),
+                        code: reason.code.clone(),
                     });
                 }
-                for fragment in snapshot.fragments() {
-                    if let Some(reason) = fragment.profile_telemetry().unavailable_reason() {
+                for fragment in &snapshot.fragments {
+                    if let Some(
+                        proto::fragment_terminal_profile_telemetry::Telemetry::Unavailable(reason),
+                    ) = fragment
+                        .profile
+                        .as_ref()
+                        .and_then(|telemetry| telemetry.telemetry.as_ref())
+                    {
                         telemetry_unavailable.push(LifecycleTelemetryUnavailableDebug {
                             scope: "fragment",
-                            stage: reason.stage().to_string(),
-                            code: reason.code().to_string(),
+                            stage: reason.stage.clone(),
+                            code: reason.code.clone(),
                         });
                     }
                 }
                 LifecycleParticipantOutcomeDebug::Proof
+            } else if let Some(attestation) = outcome.negative_attestation() {
+                LifecycleParticipantOutcomeDebug::Attestation {
+                    reason: format!("{:?}", attestation.reason()),
+                }
+            } else {
+                unreachable!("validated participant terminal outcome must be proof or attestation")
             }
-            novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::NegativeAttestation(
-                attestation,
-            ) => LifecycleParticipantOutcomeDebug::Attestation {
-                reason: format!("{:?}", attestation.reason()),
-            },
-        }
         })
         .collect::<Vec<_>>();
     let error_source = snapshot.error_source.map(|source| match source {
@@ -313,7 +323,7 @@ impl NovaRocksGrpc for FrontendReportService {
             tonic::Status::invalid_argument("ReportQueryTerminalRequest missing outcome")
         })?;
         let outcome =
-            decode_participant_terminal_outcome(&outcome).map_err(status_from_lifecycle_error)?;
+            ParticipantTerminalOutcome::parse(outcome).map_err(status_from_contract_error)?;
         let ingress = Arc::clone(&self.ingress);
         let ack = tokio::task::spawn_blocking(move || ingress.report_query_terminal(outcome))
             .await
@@ -321,7 +331,7 @@ impl NovaRocksGrpc for FrontendReportService {
                 tonic::Status::internal(format!("query terminal ingress panicked: {error}"))
             })?
             .map_err(status_from_lifecycle_error)?;
-        let outcome = match ack.outcome() {
+        let outcome = match ack.outcome().map_err(status_from_contract_error)? {
             QueryTerminalReportOutcome::Accepted => proto::ReportQueryTerminalOutcome::Accepted,
             QueryTerminalReportOutcome::AlreadyAccepted => {
                 proto::ReportQueryTerminalOutcome::AlreadyAccepted
@@ -331,6 +341,11 @@ impl NovaRocksGrpc for FrontendReportService {
             }
             QueryTerminalReportOutcome::RejectedGone => {
                 proto::ReportQueryTerminalOutcome::RejectedGone
+            }
+            QueryTerminalReportOutcome::Unspecified => {
+                return Err(tonic::Status::internal(
+                    "validated query terminal report acknowledgement has an unspecified outcome",
+                ));
             }
         };
         Ok(tonic::Response::new(proto::ReportQueryTerminalResponse {
@@ -351,6 +366,19 @@ fn status_from_lifecycle_error(error: QueryLifecycleError) -> tonic::Status {
         QueryLifecycleErrorCode::Capacity => tonic::Status::resource_exhausted(detail),
         QueryLifecycleErrorCode::Transport => tonic::Status::unavailable(detail),
         QueryLifecycleErrorCode::Internal => tonic::Status::internal(detail),
+    }
+}
+
+fn status_from_contract_error(error: ContractError) -> tonic::Status {
+    let detail = error.detail().to_string();
+    match error.code() {
+        ContractErrorCode::InvalidValue | ContractErrorCode::VersionMismatch => {
+            tonic::Status::invalid_argument(detail)
+        }
+        ContractErrorCode::Conflict | ContractErrorCode::DigestMismatch => {
+            tonic::Status::already_exists(detail)
+        }
+        ContractErrorCode::Capacity => tonic::Status::resource_exhausted(detail),
     }
 }
 

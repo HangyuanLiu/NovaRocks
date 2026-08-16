@@ -266,6 +266,15 @@ fn query_control_typestate_initializes_before_native_assembly() {
     let parts = request.into_parts();
     let query_id = crate::query_execution::contract::QueryId::new(41, 73);
     let execution_id = execution_id(query_id);
+    let protocol_execution_id = novarocks_protocol::lifecycle::QueryExecutionId::new(
+        query_id,
+        novarocks_protocol::lifecycle::AttemptId::new(9).expect("nonzero protocol attempt"),
+    )
+    .expect("valid protocol execution id");
+    let wire_query_options = novarocks_protocol::lifecycle::QueryOptions::parse(
+        novarocks_protocol::novarocks::QueryOptions::default(),
+    )
+    .expect("valid protocol query options");
     let endpoint = "127.0.0.1:19031".parse().expect("valid endpoint");
     let mut draft = FragmentScheduleDraft::new();
     draft
@@ -280,11 +289,12 @@ fn query_control_typestate_initializes_before_native_assembly() {
         ValidatedFragmentSchedule::validate(parts.artifacts.scheduling_view(), execution_id, draft)
             .expect("validate schedule");
     let options = QueryInitOptions::new(
-        execution_id,
+        protocol_execution_id,
         vec![crate::query_execution::backend::LiveBackendTarget::new(
             3, endpoint, 11,
         )],
         &parts.options,
+        wire_query_options,
         1_000,
         std::time::Duration::from_secs(30),
         crate::query_execution::backend::CoordinatorReportEndpoint::from_socket_addr(

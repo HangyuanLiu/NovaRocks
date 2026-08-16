@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use novarocks::connector::ConnectorRegistry;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
-use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
 use novarocks_execution::runtime::fragment::FragmentSubmission;
+use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
 use novarocks_protocol::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorExecutionResolver;
 use novarocks_types::QueryId as ExecutionQueryId;
@@ -66,7 +66,10 @@ pub(crate) fn decode_native_query_execution_id(
                 ProtocolFamily::Native,
                 root.clone().field("attempt_id"),
                 ProtocolErrorKind::InvalidValue,
-                error.to_string(),
+                // Preserve the established native ingress error vocabulary
+                // while the lifecycle identity's validation owner moves to
+                // Protocol.
+                format!("InvalidManifest: {}", error.detail()),
             )
             .to_string(),
         )
@@ -213,7 +216,7 @@ mod tests {
     use std::time::Duration;
 
     use novarocks::connector::ConnectorRegistry;
-    use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
+    use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_protocol::{common, novarocks as proto, plan};
     use novarocks_types::QueryId;
 

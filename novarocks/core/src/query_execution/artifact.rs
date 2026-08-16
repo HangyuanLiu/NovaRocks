@@ -55,7 +55,11 @@ use crate::query_execution::{RuntimeFilterBindingFactsView, RuntimeFilterDeploym
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use novarocks_protocol::lifecycle::{
+    AttemptId as ProtocolAttemptId, QueryExecutionId as ProtocolQueryExecutionId,
+};
 use novarocks_protocol::plan::RuntimeFilterBindingTable;
+use novarocks_protocol::{common, novarocks};
 use novarocks_sql::plan_read::{FragmentEdgeKind, FragmentStreamKind, PartitionKind};
 use novarocks_types::SlotId;
 
@@ -69,6 +73,15 @@ pub type PlanNodeId = i32;
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
+}
+
+fn protocol_execution_id(
+    execution_id: QueryExecutionId,
+) -> Result<ProtocolQueryExecutionId, DistributedQueryError> {
+    let attempt = ProtocolAttemptId::new(execution_id.attempt_id().get())
+        .map_err(|error| contract_error(error.to_string()))?;
+    ProtocolQueryExecutionId::new(execution_id.query_id(), attempt)
+        .map_err(|error| contract_error(error.to_string()))
 }
 
 /// Assign connector splits without inventing a byte estimate for an unknown
@@ -600,7 +613,10 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
         options: QueryInitOptions,
         barrier: &dyn QueryInitBarrier,
     ) -> Result<ControlReadyDistributedQuery, DistributedQueryError> {
-        if options.execution_id() != self.schedule.execution_id {
+        if options.execution_id().query_id() != self.schedule.execution_id.query_id()
+            || options.execution_id().attempt_id().get()
+                != self.schedule.execution_id.attempt_id().get()
+        {
             return Err(contract_error(
                 "query initialization execution id does not match validated schedule",
             ));
@@ -609,7 +625,7 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
             .runtime_filter_contributions
             .into_iter()
             .map(|(backend_idx, contribution)| {
-                RuntimeFilterContribution::from_wire(contribution)
+                novarocks_protocol::lifecycle::RuntimeFilterContribution::parse(contribution)
                     .map(|contribution| (backend_idx, contribution))
                     .map_err(|error| contract_error(error.to_string()))
             })
@@ -1353,13 +1369,19 @@ fn build_fragment_lifecycle_projection(
                 .map_err(|_| contract_error("exchange sender ordinal exceeds u32 width"))?;
             for destination in destinations {
                 exchange_routes.push(
-                    ExchangeRouteManifest::new(
-                        source.finst_id,
-                        destination.finst_id,
-                        edge.target_exchange_node_id,
+                    ExchangeRouteManifest::parse(novarocks::ExchangeRouteManifest {
+                        source_fragment_instance_id: Some(common::UniqueId {
+                            hi: source.finst_id.high(),
+                            lo: source.finst_id.low(),
+                        }),
+                        destination_fragment_instance_id: Some(common::UniqueId {
+                            hi: destination.finst_id.high(),
+                            lo: destination.finst_id.low(),
+                        }),
+                        destination_node_id: edge.target_exchange_node_id,
                         sender_ordinal,
                         sender_count,
-                    )
+                    })
                     .map_err(|error| contract_error(error.to_string()))?,
                 );
             }
@@ -1712,7 +1734,17 @@ fn finish_sealed_native_submission(
         let fragments = fragments_by_backend
             .remove(&binding.target().backend_idx())
             .unwrap_or_default();
-        let batch = match StageBatch::new(execution_id, binding, fragments) {
+        let protocol_execution_id = match protocol_execution_id(execution_id) {
+            Ok(execution_id) => execution_id,
+            Err(error) => {
+                let kind = error.kind();
+                let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
+                let message = connector_binding_lease.abort_preserving(message);
+                let message = connector_read_sessions.abort_preserving(message);
+                return Err(DistributedQueryError::new(kind, message));
+            }
+        };
+        let batch = match StageBatch::new(protocol_execution_id, binding, fragments) {
             Ok(batch) => batch,
             Err(error) => {
                 let error = contract_error(error.to_string());
@@ -1765,12 +1797,16 @@ impl StagePreparedDistributedQuery {
                 .batches
                 .iter()
                 .flat_map(|batch| {
-                    batch.request().fragments().iter().map(move |fragment| {
-                        (
-                            batch.binding().target().backend_idx(),
-                            fragment.fragment_instance_id(),
-                        )
-                    })
+                    batch
+                        .request()
+                        .fragments()
+                        .into_iter()
+                        .map(move |fragment| {
+                            (
+                                batch.binding().target().backend_idx(),
+                                fragment.fragment_instance_id(),
+                            )
+                        })
                 })
                 .collect(),
             writer_identities: self.writer_registrations.writer_identities(),
@@ -1973,6 +2009,7 @@ mod tests {
     use crate::query_execution::lifecycle::{AttemptId, ExchangeRouteManifest, QueryExecutionId};
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+    use novarocks_protocol::{common, novarocks};
     use novarocks_sql::plan_read::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
     };
@@ -2106,6 +2143,29 @@ mod tests {
                 .to_string()
                 .contains("connector split placement requires at least one fragment instance")
         );
+    }
+
+    fn exchange_route(
+        source: UniqueId,
+        destination: UniqueId,
+        destination_node_id: i32,
+        sender_ordinal: u32,
+        sender_count: u32,
+    ) -> ExchangeRouteManifest {
+        ExchangeRouteManifest::parse(novarocks::ExchangeRouteManifest {
+            source_fragment_instance_id: Some(common::UniqueId {
+                hi: source.high(),
+                lo: source.low(),
+            }),
+            destination_fragment_instance_id: Some(common::UniqueId {
+                hi: destination.high(),
+                lo: destination.low(),
+            }),
+            destination_node_id,
+            sender_ordinal,
+            sender_count,
+        })
+        .expect("valid protocol exchange route")
     }
 
     fn stream_edge(source_fragment_id: u32, target_fragment_id: u32, node_id: i32) -> FragmentEdge {
@@ -2606,16 +2666,11 @@ mod tests {
         let projection = build_fragment_lifecycle_projection(&schedule, &edges, live_backends)
             .expect("valid lifecycle projection");
         let expected = vec![
-            ExchangeRouteManifest::new(UniqueId::new(1, 1), UniqueId::new(2, 1), 200, 1, 2)
-                .expect("valid route"),
-            ExchangeRouteManifest::new(UniqueId::new(1, 1), UniqueId::new(8, 1), 200, 1, 2)
-                .expect("valid route"),
-            ExchangeRouteManifest::new(UniqueId::new(7, 1), UniqueId::new(6, 1), 400, 0, 1)
-                .expect("valid route"),
-            ExchangeRouteManifest::new(UniqueId::new(9, 1), UniqueId::new(2, 1), 200, 0, 2)
-                .expect("valid route"),
-            ExchangeRouteManifest::new(UniqueId::new(9, 1), UniqueId::new(8, 1), 200, 0, 2)
-                .expect("valid route"),
+            exchange_route(UniqueId::new(1, 1), UniqueId::new(2, 1), 200, 1, 2),
+            exchange_route(UniqueId::new(1, 1), UniqueId::new(8, 1), 200, 1, 2),
+            exchange_route(UniqueId::new(7, 1), UniqueId::new(6, 1), 400, 0, 1),
+            exchange_route(UniqueId::new(9, 1), UniqueId::new(2, 1), 200, 0, 2),
+            exchange_route(UniqueId::new(9, 1), UniqueId::new(8, 1), 200, 0, 2),
         ];
 
         assert_eq!(projection.exchange_routes, expected);

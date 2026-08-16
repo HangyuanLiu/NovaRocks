@@ -27,9 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use novarocks::query_execution::lifecycle::{
-    QueryExecutionId, QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminationReason,
-};
+use novarocks::query_execution::lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime_filter::{
     RuntimeFilterBindOutcome, RuntimeFilterContractViolation, RuntimeFilterContractViolationKind,
@@ -40,6 +38,7 @@ use novarocks_execution::runtime_filter::{
     RuntimeFilterSessionRef, RuntimeFilterSnapshot, RuntimeFilterSubscriptionHandle,
     RuntimeFilterSubscriptionRequest,
 };
+use novarocks_protocol::lifecycle::{QueryExecutionId, QueryTerminationReason};
 use novarocks_types::UniqueId;
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -671,7 +670,7 @@ impl RuntimeFilterParticipant {
 
     pub(crate) fn prepare_terminal_capture(&self, reason: QueryTerminationReason) {
         self.outbound.drain_transport_completions();
-        if reason == QueryTerminationReason::CoordinatorFinalize {
+        if reason == QueryTerminationReason::QueryTerminationCoordinatorFinalize {
             return;
         }
         for channel in self.install.channels().values() {
@@ -1605,12 +1604,12 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use novarocks::query_execution::lifecycle::AttemptId;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_execution::runtime_filter::{
         RuntimeFilterBindOutcome, RuntimeFilterConsumerContract, RuntimeFilterSubscriptionHandle,
         RuntimeFilterSubscriptionRequest, SnapshotAcquireOutcome,
     };
+    use novarocks_protocol::lifecycle::AttemptId;
     use novarocks_types::QueryId;
 
     use super::*;

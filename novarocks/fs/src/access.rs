@@ -346,7 +346,7 @@ impl FsAccessHandle {
 
     /// Atomically create one authorized path without replacing an existing file.
     ///
-    /// Design: ADR-0069 makes native conditional storage creation the publication
+    /// Design: ADR-0077 makes native conditional storage creation the publication
     /// fence; this method must never emulate it with an existence check plus write.
     pub async fn create_if_absent(
         &self,

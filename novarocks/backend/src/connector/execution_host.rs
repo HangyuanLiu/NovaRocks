@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
-use novarocks::query_execution::lifecycle::QueryExecutionId;
+use novarocks_protocol::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
     ConnectorExecutionDeclaration, ConnectorExecutionInstaller, ConnectorExecutionResolver,
@@ -446,7 +446,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
-    use novarocks::query_execution::lifecycle::AttemptId;
+    use novarocks_protocol::lifecycle::AttemptId;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
         ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,

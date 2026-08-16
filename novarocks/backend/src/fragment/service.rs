@@ -26,7 +26,6 @@ use novarocks::connector::ConnectorRegistry;
 use novarocks::novarocks_logging::error;
 #[cfg(test)]
 use novarocks::novarocks_logging::warn;
-use novarocks::query_execution::lifecycle::StageFragment;
 use novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use novarocks::runtime::sink_commit::{ConfiguredCoreSinkCommitPort, CoreSinkCommitPort};
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
@@ -39,6 +38,7 @@ use novarocks_execution::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
 };
 use novarocks_execution::runtime::profile::Profiler;
+use novarocks_protocol::lifecycle::{QueryExecutionId, StageFragment};
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorRequestContext,
     WriteCommitEvidenceLimits,
@@ -273,7 +273,7 @@ impl NativeFragmentService {
     /// pure cleanup path and never calls `DormantFragmentHandle::start`.
     pub(crate) fn stage_fragments(
         &self,
-        execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
+        execution_id: QueryExecutionId,
         fragments: &[StageFragment],
         gate: Arc<StartGate>,
     ) -> Result<(), NativeFragmentIngressError> {
@@ -634,7 +634,7 @@ impl NativeFragmentService {
 impl NativeFragmentIngress for NativeFragmentService {
     fn ensure_connector_execution_binding(
         &self,
-        execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
+        execution_id: QueryExecutionId,
         declaration: ConnectorExecutionDeclaration,
         context: ConnectorRequestContext,
     ) -> Result<(), NativeFragmentIngressError> {
@@ -738,7 +738,7 @@ fn consume_terminal_fact(
     token: super::control::FragmentControlToken,
     queries: NativeFragmentQueryRuntime,
     lifecycle: Arc<QueryLifecycleRegistry>,
-    execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
+    execution_id: QueryExecutionId,
     backend_num: i32,
 ) {
     let fact = running.join();
@@ -811,15 +811,16 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks::connector::ConnectorRegistry;
-    use novarocks::query_execution::lifecycle::{
-        AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
-        ParticipantRole, QueryControlAttach, QueryControlAttachment, QueryControlEndpoint,
-        QueryExecutionId, QueryInitOutcome, QueryInitRequest, StageFragment,
-    };
     use novarocks_execution::runtime::fragment::{
         DormantFragmentHandle, FragmentOutcome, prepare_fragment,
     };
     use novarocks_protocol as proto;
+    use novarocks_protocol::lifecycle::{
+        AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantRole,
+        QueryControlAttach, QueryControlEndpoint, QueryInitOutcome, QueryInitRequest, QueryOptions,
+        StageFragment,
+    };
+    use novarocks_protocol::lifecycle::{AttemptId as ProtocolAttemptId, QueryExecutionId};
     use novarocks_types::QueryId as ExecutionQueryId;
     use novarocks_types::QueryId;
     use novarocks_types::UniqueId;
@@ -829,7 +830,7 @@ mod tests {
         FRAGMENT_EXECUTOR_FAILURE_MESSAGE, start_with_fragment_failure_trigger,
     };
     use crate::native::ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
-    use crate::query_lifecycle::stage::StartGate;
+    use crate::query_lifecycle::{QueryControlAttachment, stage::StartGate};
 
     use super::{
         NativeFragmentLifecycleEvent, NativeFragmentRequest, NativeFragmentService,
@@ -920,7 +921,7 @@ mod tests {
         NativeFragmentRequest::try_decode(
             QueryExecutionId::new(
                 ExecutionQueryId::new(query_base, query_base + 1),
-                AttemptId::new(1).expect("nonzero attempt"),
+                ProtocolAttemptId::new(1).expect("nonzero attempt"),
             )
             .expect("valid execution id"),
             proto::plan::PlanFragment {
@@ -990,10 +991,14 @@ mod tests {
             )
             .expect("backend identity"),
             [ParticipantRole::FragmentExecutor],
-            expected_fragments,
-            ParticipantQueryOptions::new(
-                novarocks_execution::runtime::query_options::QueryOptions::default(),
-            ),
+            expected_fragments
+                .into_iter()
+                .map(|id| proto::common::UniqueId {
+                    hi: id.high(),
+                    lo: id.low(),
+                }),
+            QueryOptions::parse(proto::novarocks::QueryOptions::default())
+                .expect("valid default query options"),
             u64::MAX,
             [],
             None,
@@ -1003,20 +1008,29 @@ mod tests {
         .expect("fragment participant manifest");
         let init = QueryInitRequest::from_manifest(manifest);
         assert_eq!(
-            service.lifecycle.init_query(init.clone()).outcome(),
+            service
+                .lifecycle
+                .init_query(init.clone())
+                .outcome()
+                .expect("valid init acknowledgement"),
             QueryInitOutcome::Applied
         );
         let mut attachment = service
             .lifecycle
             .attach_control(
-                QueryControlAttach::new(execution_id, init.digest(), 1)
+                QueryControlAttach::new(execution_id, init.digest().expect("valid init digest"), 1)
                     .expect("control attachment"),
             )
             .expect("control attaches");
-        assert_eq!(
-            attachment.events.try_recv().expect("ControlReady"),
-            novarocks::query_execution::lifecycle::QueryControlEvent::ControlReady
-        );
+        assert!(matches!(
+            attachment
+                .events
+                .try_recv()
+                .expect("ControlReady")
+                .as_proto()
+                .event,
+            Some(novarocks_protocol::novarocks::query_control_response::Event::ControlReady(_))
+        ));
         attachment
     }
 

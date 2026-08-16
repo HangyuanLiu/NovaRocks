@@ -19,8 +19,10 @@ use std::sync::Arc;
 
 use novarocks::query_execution::contract::DistributedQueryErrorKind;
 use novarocks::query_execution::lifecycle::{
-    ParticipantTerminalOutcome, QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress,
-    QueryTerminalReportAck, QueryTerminalReportOutcome,
+    QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress,
+};
+use novarocks_protocol::lifecycle::{
+    ParticipantTerminalOutcome, QueryTerminalReportAck, QueryTerminalReportOutcome,
 };
 
 use super::query_registry::FrontendQueryRegistry;
@@ -45,25 +47,22 @@ impl QueryTerminalIngress for FrontendCoordinatorTerminalIngress {
         outcome: ParticipantTerminalOutcome,
     ) -> Result<QueryTerminalReportAck, QueryLifecycleError> {
         match self.registry.report_query_terminal(outcome) {
-            Ok(true) => Ok(QueryTerminalReportAck::new(
+            Ok(true) => terminal_report_ack(
                 QueryTerminalReportOutcome::Accepted,
                 "terminal outcome stored",
-            )),
-            Ok(false) => Ok(QueryTerminalReportAck::new(
+            ),
+            Ok(false) => terminal_report_ack(
                 QueryTerminalReportOutcome::AlreadyAccepted,
                 "terminal outcome already stored",
-            )),
+            ),
             Err(error) if matches!(error.kind(), DistributedQueryErrorKind::Rejected) => {
-                Ok(QueryTerminalReportAck::new(
-                    QueryTerminalReportOutcome::RejectedGone,
-                    error.message(),
-                ))
+                terminal_report_ack(QueryTerminalReportOutcome::RejectedGone, error.message())
             }
             Err(error) if matches!(error.kind(), DistributedQueryErrorKind::ContractViolation) => {
-                Ok(QueryTerminalReportAck::new(
+                terminal_report_ack(
                     QueryTerminalReportOutcome::RejectedConflict,
                     error.message(),
-                ))
+                )
             }
             Err(error) => Err(QueryLifecycleError::new(
                 QueryLifecycleErrorCode::Internal,
@@ -71,4 +70,16 @@ impl QueryTerminalIngress for FrontendCoordinatorTerminalIngress {
             )),
         }
     }
+}
+
+fn terminal_report_ack(
+    outcome: QueryTerminalReportOutcome,
+    detail: impl Into<String>,
+) -> Result<QueryTerminalReportAck, QueryLifecycleError> {
+    QueryTerminalReportAck::new(outcome, detail).map_err(|error| {
+        QueryLifecycleError::new(
+            QueryLifecycleErrorCode::Internal,
+            format!("failed to construct query terminal report acknowledgement: {error}"),
+        )
+    })
 }
