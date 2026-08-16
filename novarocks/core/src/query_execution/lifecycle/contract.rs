@@ -1439,6 +1439,31 @@ fn decode_query_terminal_profile_contribution(
 pub fn decode_query_terminal_snapshot(
     value: &novarocks::QueryTerminalSnapshot,
 ) -> Result<QueryTerminalSnapshot, QueryLifecycleError> {
+    let snapshot = decode_query_terminal_snapshot_projection(value)?;
+    if value.version != snapshot.version()
+        || QueryTerminalSnapshotDigest::try_from_slice(&value.digest)? != snapshot.digest()
+    {
+        return Err(QueryLifecycleError::new(
+            QueryLifecycleErrorCode::Conflict,
+            "terminal snapshot wire content has invalid version or digest",
+        ));
+    }
+    Ok(snapshot)
+}
+
+/// Rebuilds the Core-only terminal aggregate from an already validated Protocol
+/// snapshot projection. Protocol owns its own canonical digest domain, so this
+/// helper deliberately does not reinterpret that digest as the retired Core
+/// wire digest.
+pub(super) fn decode_protocol_terminal_snapshot_projection(
+    value: &novarocks::QueryTerminalSnapshot,
+) -> Result<QueryTerminalSnapshot, QueryLifecycleError> {
+    decode_query_terminal_snapshot_projection(value)
+}
+
+fn decode_query_terminal_snapshot_projection(
+    value: &novarocks::QueryTerminalSnapshot,
+) -> Result<QueryTerminalSnapshot, QueryLifecycleError> {
     use crate::runtime::sink_commit::{
         SinkCommitReportSnapshot, SinkLoadStats, TabletCommitInfo, TabletFailInfo,
     };
@@ -1530,7 +1555,7 @@ pub fn decode_query_terminal_snapshot(
             )
         })?,
     )?;
-    let snapshot = QueryTerminalSnapshot::new_with_profile_telemetry(
+    QueryTerminalSnapshot::new_with_profile_telemetry(
         decode_required_execution_id(value.execution_id.as_ref())?,
         decode_backend_identity(value.backend.as_ref().ok_or_else(|| {
             QueryLifecycleError::invalid_manifest("terminal backend identity is required")
@@ -1538,16 +1563,7 @@ pub fn decode_query_terminal_snapshot(
         ParticipantManifestDigest::try_from_slice(&value.init_digest)?,
         fragments,
         profile_contribution,
-    )?;
-    if value.version != snapshot.version()
-        || QueryTerminalSnapshotDigest::try_from_slice(&value.digest)? != snapshot.digest()
-    {
-        return Err(QueryLifecycleError::new(
-            QueryLifecycleErrorCode::Conflict,
-            "terminal snapshot wire content has invalid version or digest",
-        ));
-    }
-    Ok(snapshot)
+    )
 }
 
 pub fn encode_participant_terminal_outcome(

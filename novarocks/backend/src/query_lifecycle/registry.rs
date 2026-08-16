@@ -1489,9 +1489,21 @@ impl QueryLifecycleRegistry {
                 "stage fragment count exceeds the backend Stage limit",
             ));
         }
-        let stage_encoded_bytes =
-            novarocks::query_execution::lifecycle::contract::encode_query_stage_request(&request)
-                .encoded_len();
+        let stage_encoded_bytes = novarocks_protocol::novarocks::StageFragmentsRequest {
+            execution_id: Some(protocol_execution_id(request.execution_id()).to_proto()),
+            init_digest: request.init_digest().as_bytes().to_vec(),
+            stage_digest_version: request.digest_version().get(),
+            stage_digest: request.digest().as_bytes().to_vec(),
+            fragments: request
+                .fragments()
+                .iter()
+                .map(|fragment| novarocks_protocol::novarocks::StageFragment {
+                    plan: Some(fragment.plan().clone()),
+                    instance_params: Some(fragment.instance_params().clone()),
+                })
+                .collect(),
+        }
+        .encoded_len();
         if stage_encoded_bytes > self.config.stage_max_encoded_bytes {
             return StageBuildDecision::Complete(QueryStageAck::new(
                 execution_id,

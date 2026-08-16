@@ -133,7 +133,7 @@ pub(super) enum FragmentObservationStoreOutcome {
 }
 
 #[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct FragmentObservationSnapshot {
     pub latest: BTreeMap<(usize, novarocks_types::UniqueId), FragmentLiveObservation>,
     pub accepted: u64,

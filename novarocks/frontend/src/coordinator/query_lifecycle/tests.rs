@@ -30,7 +30,9 @@ use novarocks::query_execution::fragment_transport::{
 use novarocks::query_execution::lifecycle::contract::{
     decode_abort_query_request, decode_query_control_attach, decode_query_control_command,
     decode_query_init_request, decode_query_stage_request, decode_query_start_request,
-    encode_abort_query_response, encode_query_control_event, encode_query_init_response,
+    encode_abort_query_request, encode_abort_query_response, encode_fragment_live_observation,
+    encode_participant_terminal_outcome, encode_query_control_attach, encode_query_control_command,
+    encode_query_control_event, encode_query_init_request, encode_query_init_response,
     encode_query_stage_response, encode_query_start_response,
 };
 use novarocks::query_execution::lifecycle::{
@@ -43,6 +45,7 @@ use novarocks::query_execution::lifecycle::{
     RuntimeFilterContribution,
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::lifecycle as protocol_lifecycle;
 use novarocks_protocol::{filter, novarocks as proto};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
@@ -66,8 +69,238 @@ use crate::coordinator::query_registry::{
 
 fn terminal_outcome(
     snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot,
-) -> ParticipantTerminalOutcome {
-    ParticipantTerminalOutcome::proof(snapshot).expect("terminal proof outcome")
+) -> protocol_lifecycle::ParticipantTerminalOutcome {
+    let execution_id = protocol_execution_id(snapshot.execution_id());
+    let backend = protocol_backend(snapshot.backend());
+    let init_digest = snapshot.init_digest().as_bytes().to_vec();
+    let snapshot = protocol_lifecycle::QueryTerminalSnapshot::seal(proto::QueryTerminalSnapshot {
+        version: 1,
+        execution_id: Some(execution_id.into()),
+        backend: Some(backend.clone()),
+        init_digest: init_digest.clone(),
+        digest: Vec::new(),
+        fragments: Vec::new(),
+        profile_contribution: Some(proto::QueryTerminalProfileContributionTelemetry {
+            telemetry: Some(
+                proto::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(
+                    proto::TerminalTelemetryUnavailable {
+                        stage: "test".to_string(),
+                        code: "TEST".to_string(),
+                    },
+                ),
+            ),
+        }),
+    })
+    .expect("protocol terminal snapshot");
+    let proof = protocol_lifecycle::TerminalizationProof::seal(proto::TerminalizationProof {
+        version: 1,
+        execution_id: Some(execution_id.into()),
+        backend: Some(backend),
+        init_digest,
+        digest: Vec::new(),
+        fragments: Vec::new(),
+    })
+    .expect("protocol terminal proof");
+    protocol_lifecycle::ParticipantTerminalOutcome::parse(proto::ParticipantTerminalOutcome {
+        snapshot: Some(snapshot.as_proto().clone()),
+        outcome: Some(proto::participant_terminal_outcome::Outcome::Proof(
+            proof.as_proto().clone(),
+        )),
+    })
+    .expect("protocol terminal proof outcome")
+}
+
+fn negative_attestation_outcome(
+    execution_id: QueryExecutionId,
+    backend: ParticipantBackendIdentity,
+    digest: novarocks::query_execution::lifecycle::ParticipantManifestDigest,
+) -> protocol_lifecycle::ParticipantTerminalOutcome {
+    let attestation = protocol_lifecycle::NegativeAttestation::seal(proto::NegativeAttestation {
+        execution_id: Some(protocol_execution_id(execution_id).into()),
+        backend: Some(protocol_backend(&backend)),
+        init_digest: digest.as_bytes().to_vec(),
+        reason: proto::NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted as i32,
+        detail: "terminal evidence retention exhausted".to_string(),
+        detail_truncated: false,
+        digest: Vec::new(),
+    })
+    .expect("protocol negative attestation");
+    protocol_lifecycle::ParticipantTerminalOutcome::parse(proto::ParticipantTerminalOutcome {
+        snapshot: None,
+        outcome: Some(
+            proto::participant_terminal_outcome::Outcome::NegativeAttestation(
+                attestation.as_proto().clone(),
+            ),
+        ),
+    })
+    .expect("protocol negative attestation outcome")
+}
+
+// The production test peer is deliberately Protocol-native. The small bridges
+// below let older behavioural fixtures keep their compact Core constructors
+// while proving that every transport-facing input/output is the validated
+// generated carrier.
+fn protocol_init_request(request: QueryInitRequest) -> protocol_lifecycle::QueryInitRequest {
+    let mut raw = encode_query_init_request(&request).expect("Core init request encoder");
+    let manifest = protocol_lifecycle::ParticipantManifest::parse(
+        raw.manifest
+            .clone()
+            .expect("Core init request carries a manifest"),
+    )
+    .expect("Protocol fixture manifest");
+    raw.init_digest = manifest
+        .digest()
+        .expect("Protocol fixture manifest digest")
+        .as_bytes()
+        .to_vec();
+    protocol_lifecycle::QueryInitRequest::parse(raw).expect("protocol init request")
+}
+
+fn protocol_init_ack(ack: QueryInitAck) -> protocol_lifecycle::QueryInitAck {
+    protocol_lifecycle::QueryInitAck::parse(encode_query_init_response(&ack))
+        .expect("protocol init acknowledgement")
+}
+
+fn protocol_abort_request(request: QueryAbortRequest) -> protocol_lifecycle::QueryAbortRequest {
+    protocol_lifecycle::QueryAbortRequest::parse(encode_abort_query_request(&request))
+        .expect("protocol abort request")
+}
+
+fn protocol_abort_ack(ack: QueryTerminationAck) -> protocol_lifecycle::QueryTerminationAck {
+    protocol_lifecycle::QueryTerminationAck::parse(encode_abort_query_response(&ack))
+        .expect("protocol abort acknowledgement")
+}
+
+fn protocol_control_attach(attach: QueryControlAttach) -> protocol_lifecycle::QueryControlAttach {
+    let wire = encode_query_control_attach(&attach);
+    let Some(proto::query_control_request::Command::Attach(attach)) = wire.command else {
+        unreachable!("Core attach encoder must emit an attach frame");
+    };
+    protocol_lifecycle::QueryControlAttach::parse(attach).expect("protocol control attach")
+}
+
+fn protocol_control_command(
+    command: QueryControlCommand,
+) -> protocol_lifecycle::QueryControlCommand {
+    protocol_lifecycle::QueryControlCommand::parse(encode_query_control_command(&command))
+        .expect("protocol control command")
+}
+
+fn protocol_control_event(event: QueryControlEvent) -> protocol_lifecycle::QueryControlEvent {
+    protocol_lifecycle::QueryControlEvent::parse(encode_query_control_event(&event))
+        .expect("protocol control event")
+}
+
+fn protocol_event(
+    event: proto::query_control_response::Event,
+) -> protocol_lifecycle::QueryControlEvent {
+    protocol_lifecycle::QueryControlEvent::parse(proto::QueryControlResponse { event: Some(event) })
+        .expect("protocol control event")
+}
+
+fn protocol_command(
+    command: proto::query_control_request::Command,
+) -> protocol_lifecycle::QueryControlCommand {
+    protocol_lifecycle::QueryControlCommand::parse(proto::QueryControlRequest {
+        command: Some(command),
+    })
+    .expect("protocol control command")
+}
+
+fn protocol_heartbeat(sequence: u64) -> protocol_lifecycle::QueryControlCommand {
+    protocol_command(proto::query_control_request::Command::Heartbeat(
+        proto::QueryControlHeartbeat {
+            sequence,
+            sent_mono_ns: sequence,
+        },
+    ))
+}
+
+fn protocol_finalize() -> protocol_lifecycle::QueryControlCommand {
+    protocol_command(proto::query_control_request::Command::Finalize(
+        proto::QueryControlFinalize {},
+    ))
+}
+
+fn protocol_terminal_ack_command(
+    outcome: &protocol_lifecycle::ParticipantTerminalOutcome,
+) -> protocol_lifecycle::QueryControlCommand {
+    let snapshot = outcome.snapshot().expect("fixture terminal snapshot");
+    let ack = protocol_lifecycle::QueryTerminalAck::parse(proto::QueryControlTerminalAck {
+        execution_id: Some(outcome.execution_id().into()),
+        init_digest: outcome.init_digest().as_bytes().to_vec(),
+        snapshot_version: snapshot.version(),
+        snapshot_digest: outcome.digest().to_vec(),
+    })
+    .expect("protocol terminal acknowledgement");
+    protocol_command(proto::query_control_request::Command::TerminalAck(
+        ack.as_proto().clone(),
+    ))
+}
+
+fn protocol_attach_for(
+    execution_id: protocol_lifecycle::QueryExecutionId,
+    digest: protocol_lifecycle::ParticipantManifestDigest,
+    epoch: u64,
+) -> protocol_lifecycle::QueryControlAttach {
+    protocol_lifecycle::QueryControlAttach::parse(proto::QueryControlAttach {
+        execution_id: Some(execution_id.into()),
+        init_digest: digest.as_bytes().to_vec(),
+        frontend_owner_epoch: epoch,
+    })
+    .expect("protocol control attach")
+}
+
+fn protocol_abort_for(
+    execution_id: protocol_lifecycle::QueryExecutionId,
+    digest: protocol_lifecycle::ParticipantManifestDigest,
+    reason: impl Into<String>,
+) -> protocol_lifecycle::QueryAbortRequest {
+    protocol_lifecycle::QueryAbortRequest::parse(proto::AbortQueryRequest {
+        execution_id: Some(execution_id.into()),
+        init_digest: digest.as_bytes().to_vec(),
+        reason: reason.into(),
+    })
+    .expect("protocol abort request")
+}
+
+fn protocol_event_control_ready() -> protocol_lifecycle::QueryControlEvent {
+    protocol_event(proto::query_control_response::Event::ControlReady(
+        proto::QueryControlReady {},
+    ))
+}
+
+fn protocol_event_heartbeat_ack(sequence: u64) -> protocol_lifecycle::QueryControlEvent {
+    protocol_event(proto::query_control_response::Event::HeartbeatAck(
+        proto::QueryControlHeartbeatAck { sequence },
+    ))
+}
+
+fn protocol_event_termination(
+    reason: proto::QueryTerminationReason,
+) -> protocol_lifecycle::QueryControlEvent {
+    protocol_event(proto::query_control_response::Event::TerminationAccepted(
+        proto::QueryControlTerminationAccepted {
+            reason: reason as i32,
+        },
+    ))
+}
+
+fn protocol_terminal_outcome_event(
+    outcome: protocol_lifecycle::ParticipantTerminalOutcome,
+) -> protocol_lifecycle::QueryControlEvent {
+    protocol_event(proto::query_control_response::Event::TerminalOutcome(
+        outcome.as_proto().clone(),
+    ))
+}
+
+fn protocol_fragment_observation(
+    observation: FragmentLiveObservation,
+) -> protocol_lifecycle::FragmentLiveObservation {
+    protocol_lifecycle::FragmentLiveObservation::parse(encode_fragment_live_observation(
+        &observation,
+    ))
+    .expect("protocol fragment observation")
 }
 
 /// Test-only BE-shaped contract for the generated FE client wire tests.
@@ -76,42 +309,47 @@ fn terminal_outcome(
 trait QueryLifecycleIngress: Send + Sync + 'static {
     fn bind_backend_identity(&self, backend_id: u64) -> Result<(), QueryLifecycleError>;
 
-    fn init_query(&self, request: QueryInitRequest) -> QueryInitAck;
+    fn init_query(
+        &self,
+        request: protocol_lifecycle::QueryInitRequest,
+    ) -> protocol_lifecycle::QueryInitAck;
 
     fn stage_fragments(
         &self,
-        request: novarocks::query_execution::lifecycle::QueryStageRequest,
-    ) -> novarocks::query_execution::lifecycle::QueryStageAck {
-        novarocks::query_execution::lifecycle::QueryStageAck::new(
+        request: protocol_lifecycle::QueryStageRequest,
+    ) -> protocol_lifecycle::QueryStageAck {
+        protocol_lifecycle::QueryStageAck::new(
             request.execution_id(),
             request.digest_version(),
             request.digest(),
-            novarocks::query_execution::lifecycle::QueryStageOutcome::RejectedInvalidState,
+            protocol_lifecycle::QueryStageOutcome::RejectedInvalidState,
             "StageFragments is not supported by this lifecycle ingress",
         )
+        .expect("protocol stage rejection")
     }
 
     fn start_prepared_query(
         &self,
-        request: novarocks::query_execution::lifecycle::QueryStartRequest,
-    ) -> novarocks::query_execution::lifecycle::QueryStartAck {
-        novarocks::query_execution::lifecycle::QueryStartAck::new(
+        request: protocol_lifecycle::QueryStartRequest,
+    ) -> protocol_lifecycle::QueryStartAck {
+        protocol_lifecycle::QueryStartAck::new(
             request.execution_id(),
             request.digest_version(),
             request.digest(),
-            novarocks::query_execution::lifecycle::QueryStartOutcome::RejectedNotStaged,
+            protocol_lifecycle::QueryStartOutcome::RejectedNotStaged,
             "StartPreparedQuery is not supported by this lifecycle ingress",
         )
+        .expect("protocol start rejection")
     }
 
     fn abort_query(
         &self,
-        request: QueryAbortRequest,
-    ) -> Result<QueryTerminationAck, QueryLifecycleError>;
+        request: protocol_lifecycle::QueryAbortRequest,
+    ) -> Result<protocol_lifecycle::QueryTerminationAck, QueryLifecycleError>;
 
     fn attach_control(
         &self,
-        attach: QueryControlAttach,
+        attach: protocol_lifecycle::QueryControlAttach,
     ) -> Result<QueryControlAttachment, QueryLifecycleError>;
 }
 
@@ -122,7 +360,10 @@ trait BackendQueryControl: Send + Sync + 'static {
 
     fn finalize(&self) -> Result<(), QueryLifecycleError>;
 
-    fn terminal_ack(&self, _ack: QueryTerminalAck) -> Result<(), QueryLifecycleError> {
+    fn terminal_ack(
+        &self,
+        _ack: protocol_lifecycle::QueryTerminalAck,
+    ) -> Result<(), QueryLifecycleError> {
         Err(QueryLifecycleError::new(
             QueryLifecycleErrorCode::Terminated,
             "query terminal acknowledgement is not supported by this lifecycle owner",
@@ -134,7 +375,7 @@ trait BackendQueryControl: Send + Sync + 'static {
 
 struct QueryControlAttachment {
     control: Arc<dyn BackendQueryControl>,
-    events: tokio::sync::mpsc::Receiver<QueryControlEvent>,
+    events: tokio::sync::mpsc::Receiver<protocol_lifecycle::QueryControlEvent>,
     observations: tokio::sync::watch::Receiver<Option<FragmentLiveObservation>>,
 }
 
@@ -165,7 +406,7 @@ struct RecordingSession {
 #[derive(Default)]
 struct RecordingSessionState {
     commands: Vec<QueryControlCommand>,
-    events: VecDeque<Result<QueryControlEvent, QueryLifecycleTransportError>>,
+    events: VecDeque<Result<protocol_lifecycle::QueryControlEvent, QueryLifecycleTransportError>>,
     send_errors: VecDeque<QueryLifecycleTransportError>,
     terminal_snapshot: Option<novarocks::query_execution::lifecycle::QueryTerminalSnapshot>,
     emit_terminal_snapshot_on_finalize: bool,
@@ -173,7 +414,9 @@ struct RecordingSessionState {
 
 impl RecordingSession {
     fn with_events(
-        events: impl IntoIterator<Item = Result<QueryControlEvent, QueryLifecycleTransportError>>,
+        events: impl IntoIterator<
+            Item = Result<protocol_lifecycle::QueryControlEvent, QueryLifecycleTransportError>,
+        >,
     ) -> Self {
         let state = RecordingSessionState {
             events: events.into_iter().collect(),
@@ -185,7 +428,9 @@ impl RecordingSession {
     }
 
     fn with_terminal_snapshot(
-        events: impl IntoIterator<Item = Result<QueryControlEvent, QueryLifecycleTransportError>>,
+        events: impl IntoIterator<
+            Item = Result<protocol_lifecycle::QueryControlEvent, QueryLifecycleTransportError>,
+        >,
         terminal_snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot,
     ) -> Self {
         let state = RecordingSessionState {
@@ -250,6 +495,16 @@ impl RecordingSession {
             .lock()
             .expect("recording session lock")
             .events
+            .push_back(Ok(protocol_control_event(event)));
+        self.state.1.notify_all();
+    }
+
+    fn push_protocol_event(&self, event: protocol_lifecycle::QueryControlEvent) {
+        self.state
+            .0
+            .lock()
+            .expect("recording session lock")
+            .events
             .push_back(Ok(event));
         self.state.1.notify_all();
     }
@@ -260,7 +515,12 @@ impl RecordingSession {
 }
 
 impl QueryControlSession for RecordingSession {
-    fn send(&self, command: QueryControlCommand) -> Result<(), QueryLifecycleTransportError> {
+    fn send(
+        &self,
+        command: protocol_lifecycle::QueryControlCommand,
+    ) -> Result<(), QueryLifecycleTransportError> {
+        let command = decode_query_control_command(command.as_proto())
+            .expect("test transport accepts only validated protocol commands");
         let mut state = self.state.0.lock().expect("recording session lock");
         if let Some(error) = state.send_errors.pop_front() {
             state.commands.push(command);
@@ -278,14 +538,14 @@ impl QueryControlSession for RecordingSession {
         {
             state
                 .events
-                .push_back(Ok(QueryControlEvent::TerminalOutcome {
-                    outcome: terminal_outcome(snapshot),
-                }));
+                .push_back(Ok(protocol_terminal_outcome_event(terminal_outcome(
+                    snapshot,
+                ))));
         }
         if let Some(reason) = terminal {
-            state
-                .events
-                .push_back(Ok(QueryControlEvent::TerminationAccepted { reason }));
+            state.events.push_back(Ok(protocol_control_event(
+                QueryControlEvent::TerminationAccepted { reason },
+            )));
         }
         drop(state);
         self.state.1.notify_all();
@@ -295,7 +555,7 @@ impl QueryControlSession for RecordingSession {
     fn recv_timeout(
         &self,
         timeout: Duration,
-    ) -> Result<QueryControlEvent, QueryLifecycleTransportError> {
+    ) -> Result<protocol_lifecycle::QueryControlEvent, QueryLifecycleTransportError> {
         let (lock, ready) = &*self.state;
         let mut state = lock.lock().expect("recording session lock");
         if state.events.is_empty() {
@@ -320,16 +580,21 @@ struct RecordingTransport {
 
 #[derive(Default)]
 struct RecordingTransportState {
-    init_results: BTreeMap<usize, VecDeque<Result<QueryInitAck, QueryLifecycleTransportError>>>,
+    init_results: BTreeMap<
+        usize,
+        VecDeque<Result<protocol_lifecycle::QueryInitAck, QueryLifecycleTransportError>>,
+    >,
     attach_results: BTreeMap<
         usize,
         VecDeque<Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError>>,
     >,
-    init_calls: Vec<(QueryLifecycleTarget, QueryInitRequest)>,
+    init_calls: Vec<(QueryLifecycleTarget, protocol_lifecycle::QueryInitRequest)>,
     attach_calls: Vec<(QueryLifecycleTarget, QueryControlAttach)>,
     abort_calls: Vec<(QueryLifecycleTarget, QueryAbortRequest)>,
-    abort_results:
-        BTreeMap<usize, VecDeque<Result<QueryTerminationAck, QueryLifecycleTransportError>>>,
+    abort_results: BTreeMap<
+        usize,
+        VecDeque<Result<protocol_lifecycle::QueryTerminationAck, QueryLifecycleTransportError>>,
+    >,
     cancel_on_init: Option<QueryCancellationSource>,
 }
 
@@ -356,22 +621,23 @@ impl RecordingTransport {
                 .expect("fixture participant exists");
             state.init_results.insert(
                 backend_idx,
-                VecDeque::from([Ok(QueryInitAck::new(
-                    plan.execution_id(),
-                    participant.digest(),
+                VecDeque::from([Ok(protocol_init_ack(QueryInitAck::new(
+                    core_execution_id(plan.execution_id()),
+                    core_digest(participant.digest()),
                     QueryInitOutcome::Applied,
-                ))]),
+                )))]),
             );
+            let backend = core_backend(participant.backend().clone());
             let snapshot = novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
-                plan.execution_id(),
-                participant.backend().clone(),
-                participant.digest(),
+                core_execution_id(plan.execution_id()),
+                backend,
+                core_digest(participant.digest()),
                 Vec::new(),
             )
             .expect("recording terminal snapshot");
-            let mut events = vec![Ok(QueryControlEvent::ControlReady)];
+            let mut events = vec![Ok(protocol_control_event(QueryControlEvent::ControlReady))];
             if include_local_drain {
-                events.push(Ok(QueryControlEvent::LocalDrained));
+                events.push(Ok(protocol_control_event(QueryControlEvent::LocalDrained)));
             }
             let session = RecordingSession::with_terminal_snapshot(events, snapshot);
             state.attach_results.insert(
@@ -388,7 +654,7 @@ impl RecordingTransport {
         )
     }
 
-    fn init_calls(&self) -> Vec<(QueryLifecycleTarget, QueryInitRequest)> {
+    fn init_calls(&self) -> Vec<(QueryLifecycleTarget, protocol_lifecycle::QueryInitRequest)> {
         self.state
             .lock()
             .expect("recording transport lock")
@@ -421,9 +687,9 @@ impl QueryLifecycleTransport for RecordingTransport {
     fn init_query(
         &self,
         target: QueryLifecycleTarget,
-        request: QueryInitRequest,
+        request: protocol_lifecycle::QueryInitRequest,
         _timeout: Duration,
-    ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
+    ) -> Result<protocol_lifecycle::QueryInitAck, QueryLifecycleTransportError> {
         let mut state = self.state.lock().expect("recording transport lock");
         state.init_calls.push((target, request));
         let result = state
@@ -447,9 +713,15 @@ impl QueryLifecycleTransport for RecordingTransport {
     fn attach_control(
         &self,
         target: QueryLifecycleTarget,
-        attach: QueryControlAttach,
+        attach: protocol_lifecycle::QueryControlAttach,
         _timeout: Duration,
     ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
+        let attach = decode_query_control_attach(&proto::QueryControlRequest {
+            command: Some(proto::query_control_request::Command::Attach(
+                attach.as_proto().clone(),
+            )),
+        })
+        .expect("test transport accepts only validated protocol attach");
         let mut state = self.state.lock().expect("recording transport lock");
         state.attach_calls.push((target, attach));
         state
@@ -467,9 +739,11 @@ impl QueryLifecycleTransport for RecordingTransport {
     fn abort_query(
         &self,
         target: QueryLifecycleTarget,
-        request: QueryAbortRequest,
+        request: protocol_lifecycle::QueryAbortRequest,
         _timeout: Duration,
-    ) -> Result<QueryTerminationAck, QueryLifecycleTransportError> {
+    ) -> Result<protocol_lifecycle::QueryTerminationAck, QueryLifecycleTransportError> {
+        let request = decode_abort_query_request(request.as_proto())
+            .expect("test transport accepts only validated protocol AbortQuery");
         let mut state = self.state.lock().expect("recording transport lock");
         state.abort_calls.push((target, request.clone()));
         state
@@ -477,10 +751,10 @@ impl QueryLifecycleTransport for RecordingTransport {
             .get_mut(&target.backend_idx())
             .and_then(VecDeque::pop_front)
             .unwrap_or_else(|| {
-                Ok(QueryTerminationAck::new(
+                Ok(protocol_abort_ack(QueryTerminationAck::new(
                     request.execution_id(),
                     QueryTerminationReason::CoordinatorAbort,
-                ))
+                )))
             })
     }
 }
@@ -500,7 +774,56 @@ fn query_execution_id() -> QueryExecutionId {
     .expect("fixture execution id")
 }
 
-fn manifest(
+fn protocol_execution_id(execution_id: QueryExecutionId) -> protocol_lifecycle::QueryExecutionId {
+    protocol_lifecycle::QueryExecutionId::new(
+        execution_id.query_id(),
+        protocol_lifecycle::AttemptId::new(execution_id.attempt_id().get())
+            .expect("protocol fixture attempt id"),
+    )
+    .expect("protocol fixture execution id")
+}
+
+fn core_execution_id(execution_id: protocol_lifecycle::QueryExecutionId) -> QueryExecutionId {
+    QueryExecutionId::new(
+        execution_id.query_id(),
+        AttemptId::new(execution_id.attempt_id().get()).expect("Core fixture attempt id"),
+    )
+    .expect("Core fixture execution id")
+}
+
+fn core_digest(
+    digest: protocol_lifecycle::ParticipantManifestDigest,
+) -> novarocks::query_execution::lifecycle::ParticipantManifestDigest {
+    novarocks::query_execution::lifecycle::ParticipantManifestDigest::new(*digest.as_bytes())
+}
+
+fn core_backend(
+    backend: protocol_lifecycle::ParticipantBackendIdentity,
+) -> ParticipantBackendIdentity {
+    let endpoint = backend
+        .endpoint()
+        .expect("protocol fixture backend endpoint");
+    ParticipantBackendIdentity::new(
+        backend.backend_id(),
+        QueryControlEndpoint::new(endpoint.host(), endpoint.port())
+            .expect("Core fixture backend endpoint"),
+        backend.start_epoch(),
+    )
+    .expect("Core fixture backend identity")
+}
+
+fn protocol_backend(backend: &ParticipantBackendIdentity) -> proto::ParticipantBackendIdentity {
+    proto::ParticipantBackendIdentity {
+        backend_id: backend.backend_id(),
+        endpoint: Some(proto::QueryControlEndpoint {
+            host: backend.endpoint().host().to_string(),
+            port: u32::from(backend.endpoint().port()),
+        }),
+        start_epoch: backend.start_epoch(),
+    }
+}
+
+fn legacy_manifest(
     execution_id: QueryExecutionId,
     backend_idx: usize,
     service_only: bool,
@@ -544,10 +867,24 @@ fn manifest(
     .expect("fixture participant manifest")
 }
 
+fn manifest(
+    execution_id: QueryExecutionId,
+    backend_idx: usize,
+    service_only: bool,
+) -> protocol_lifecycle::ParticipantManifest {
+    protocol_init_request(QueryInitRequest::from_manifest(legacy_manifest(
+        execution_id,
+        backend_idx,
+        service_only,
+    )))
+    .manifest()
+    .expect("protocol fixture participant manifest")
+}
+
 fn query_init_plan(service_only_backend: Option<usize>) -> QueryInitPlan {
     let execution_id = query_execution_id();
     QueryInitPlan::from_manifests_for_contract_test(
-        execution_id,
+        protocol_execution_id(execution_id),
         (0..3).map(|backend_idx| {
             (
                 backend_idx,
@@ -629,23 +966,29 @@ fn fragment_observation(
     participant: &super::manifest::MaterializedParticipant,
     sequence: u64,
     input_rows: u64,
-) -> FragmentLiveObservation {
-    let manifest = participant.request.manifest();
-    FragmentLiveObservation::new(
-        manifest.execution_id(),
-        participant.digest,
-        manifest.backend().clone(),
-        *manifest
-            .expected_fragment_instance_ids()
-            .first()
-            .expect("fragment participant has an expected instance"),
-        sequence,
-        input_rows,
-        input_rows + 1,
-        input_rows + 2,
-        None,
+) -> protocol_lifecycle::FragmentLiveObservation {
+    let manifest = participant.request.manifest().expect("fixture manifest");
+    let execution_id = core_execution_id(manifest.execution_id().expect("fixture execution id"));
+    let backend = core_backend(manifest.backend().expect("fixture backend"));
+    let fragment = manifest
+        .expected_fragment_instance_ids()
+        .first()
+        .copied()
+        .expect("fragment participant has an expected instance");
+    protocol_fragment_observation(
+        FragmentLiveObservation::new(
+            execution_id,
+            core_digest(participant.digest),
+            backend,
+            UniqueId::new(fragment.hi, fragment.lo),
+            sequence,
+            input_rows,
+            input_rows + 1,
+            input_rows + 2,
+            None,
+        )
+        .expect("fixture fragment observation"),
     )
-    .expect("fixture fragment observation")
 }
 
 #[test]
@@ -678,7 +1021,10 @@ fn frontend_fragment_observation_keeps_latest_sequence_and_counts_replays() {
     assert_eq!(snapshot.conflict, 0);
     assert_eq!(snapshot.rejected, 0);
     assert_eq!(
-        snapshot.latest.get(&(0, newer.fragment_instance_id())),
+        snapshot.latest.get(&(0, {
+            let id = newer.fragment_instance_id().expect("fixture fragment id");
+            UniqueId::new(id.hi, id.lo)
+        })),
         Some(&newer)
     );
 }
@@ -696,39 +1042,48 @@ fn frontend_fragment_observation_rejects_conflicts_and_wrong_participants() {
         FragmentObservationStoreOutcome::Conflict
     );
 
-    let manifest = participant.request.manifest();
-    let unknown = FragmentLiveObservation::new(
-        manifest.execution_id(),
-        participant.digest,
-        manifest.backend().clone(),
-        UniqueId::new(999, 999),
-        2,
-        0,
-        0,
-        0,
-        None,
-    )
-    .expect("unknown fragment observation remains wire-valid");
+    let manifest = participant.request.manifest().expect("fixture manifest");
+    let manifest_execution_id = manifest.execution_id().expect("fixture execution id");
+    let manifest_backend = core_backend(manifest.backend().expect("fixture backend"));
+    let unknown = protocol_fragment_observation(
+        FragmentLiveObservation::new(
+            core_execution_id(manifest_execution_id),
+            core_digest(participant.digest),
+            manifest_backend.clone(),
+            UniqueId::new(999, 999),
+            2,
+            0,
+            0,
+            0,
+            None,
+        )
+        .expect("unknown fragment observation remains wire-valid"),
+    );
     assert_eq!(
         control.store_fragment_observation(&session, unknown),
         FragmentObservationStoreOutcome::Rejected
     );
-    let old_attempt = FragmentLiveObservation::new(
-        QueryExecutionId::new(
-            manifest.execution_id().query_id(),
-            AttemptId::new(2).expect("fixture attempt id"),
+    let old_attempt = protocol_fragment_observation(
+        FragmentLiveObservation::new(
+            QueryExecutionId::new(
+                manifest_execution_id.query_id(),
+                AttemptId::new(2).expect("fixture attempt id"),
+            )
+            .expect("fixture old attempt execution id"),
+            core_digest(participant.digest),
+            manifest_backend,
+            {
+                let id = first.fragment_instance_id().expect("fixture fragment id");
+                UniqueId::new(id.hi, id.lo)
+            },
+            2,
+            0,
+            0,
+            0,
+            None,
         )
-        .expect("fixture old attempt execution id"),
-        participant.digest,
-        manifest.backend().clone(),
-        first.fragment_instance_id(),
-        2,
-        0,
-        0,
-        0,
-        None,
-    )
-    .expect("old attempt observation remains wire-valid");
+        .expect("old attempt observation remains wire-valid"),
+    );
     assert_eq!(
         control.store_fragment_observation(&session, old_attempt),
         FragmentObservationStoreOutcome::Rejected
@@ -738,7 +1093,10 @@ fn frontend_fragment_observation_rejects_conflicts_and_wrong_participants() {
     assert_eq!(snapshot.conflict, 1);
     assert_eq!(snapshot.rejected, 2);
     assert_eq!(
-        snapshot.latest.get(&(0, first.fragment_instance_id())),
+        snapshot.latest.get(&(0, {
+            let id = first.fragment_instance_id().expect("fixture fragment id");
+            UniqueId::new(id.hi, id.lo)
+        })),
         Some(&first),
         "same-sequence conflicts must retain the original sample"
     );
@@ -752,10 +1110,11 @@ fn frontend_terminal_snapshot_fences_later_fragment_observations() {
         control.store_fragment_observation(&session, before_terminal.clone()),
         FragmentObservationStoreOutcome::Accepted
     );
+    let manifest = participant.request.manifest().expect("fixture manifest");
     let terminal = novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
-        participant.request.manifest().execution_id(),
-        participant.request.manifest().backend().clone(),
-        participant.digest,
+        core_execution_id(manifest.execution_id().expect("fixture execution id")),
+        core_backend(manifest.backend().expect("fixture backend")),
+        core_digest(participant.digest),
         Vec::new(),
     )
     .expect("fixture terminal snapshot");
@@ -770,9 +1129,12 @@ fn frontend_terminal_snapshot_fences_later_fragment_observations() {
     let snapshot = control.fragment_observation_snapshot();
     assert_eq!(snapshot.rejected, 1);
     assert_eq!(
-        snapshot
-            .latest
-            .get(&(0, before_terminal.fragment_instance_id())),
+        snapshot.latest.get(&(0, {
+            let id = before_terminal
+                .fragment_instance_id()
+                .expect("fixture fragment id");
+            UniqueId::new(id.hi, id.lo)
+        })),
         Some(&before_terminal),
         "terminal state must not be overwritten by late telemetry"
     );
@@ -781,14 +1143,12 @@ fn frontend_terminal_snapshot_fences_later_fragment_observations() {
 #[test]
 fn frontend_negative_attestation_is_deduplicated_and_surfaces_as_terminal_input() {
     let (control, _session, participant) = observation_control(0);
-    let manifest = participant.request.manifest();
-    let outcome = ParticipantTerminalOutcome::negative_attestation(NegativeAttestation::new(
-        manifest.execution_id(),
-        manifest.backend().clone(),
-        participant.digest,
-        NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted,
-        "terminal evidence retention exhausted".to_string(),
-    ));
+    let manifest = participant.request.manifest().expect("fixture manifest");
+    let outcome = negative_attestation_outcome(
+        core_execution_id(manifest.execution_id().expect("fixture execution id")),
+        core_backend(manifest.backend().expect("fixture backend")),
+        core_digest(participant.digest),
+    );
 
     assert_eq!(
         control
@@ -802,12 +1162,15 @@ fn frontend_negative_attestation_is_deduplicated_and_surfaces_as_terminal_input(
             .expect("same attestation retry is idempotent"),
         TerminalOutcomeStoreOutcome::AlreadyAccepted
     );
-    assert!(matches!(
-        control.terminal_outcomes_for_test().as_slice(),
-        [ParticipantTerminalOutcome::NegativeAttestation(attestation)]
-            if attestation.reason()
-                == NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted
-    ));
+    let outcomes = control.terminal_outcomes_for_test();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(
+        outcomes[0]
+            .negative_attestation()
+            .expect("fixture stores negative attestation")
+            .reason(),
+        proto::NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted,
+    );
     assert_eq!(
         ActiveQueryAttemptControl::convergence_snapshot(control.as_ref())
             .expect("stored terminal outcome retains convergence evidence")
@@ -910,7 +1273,7 @@ struct HeartbeatGateSession {
 #[derive(Default)]
 struct HeartbeatGateSessionState {
     ready_sent: bool,
-    events: VecDeque<QueryControlEvent>,
+    events: VecDeque<protocol_lifecycle::QueryControlEvent>,
     commands: Vec<QueryControlCommand>,
     terminal_snapshot: Option<novarocks::query_execution::lifecycle::QueryTerminalSnapshot>,
 }
@@ -958,37 +1321,44 @@ impl HeartbeatGateSession {
 }
 
 impl QueryControlSession for HeartbeatGateSession {
-    fn send(&self, command: QueryControlCommand) -> Result<(), QueryLifecycleTransportError> {
+    fn send(
+        &self,
+        command: protocol_lifecycle::QueryControlCommand,
+    ) -> Result<(), QueryLifecycleTransportError> {
+        let command = decode_query_control_command(command.as_proto())
+            .expect("test transport accepts only validated protocol commands");
         let mut state = self.state.lock().expect("heartbeat gate state");
         match &command {
             QueryControlCommand::Heartbeat { sequence, .. } => {
-                state.events.push_back(QueryControlEvent::HeartbeatAck {
-                    sequence: *sequence,
-                });
+                state
+                    .events
+                    .push_back(protocol_control_event(QueryControlEvent::HeartbeatAck {
+                        sequence: *sequence,
+                    }));
                 let mut released = self.gate.0.lock().expect("heartbeat gate");
                 *released = true;
                 self.gate.1.notify_all();
             }
             QueryControlCommand::Abort { .. } => {
-                state
-                    .events
-                    .push_back(QueryControlEvent::TerminationAccepted {
+                state.events.push_back(protocol_control_event(
+                    QueryControlEvent::TerminationAccepted {
                         reason: QueryTerminationReason::CoordinatorAbort,
-                    });
+                    },
+                ));
             }
             QueryControlCommand::Finalize => {
                 let snapshot = state
                     .terminal_snapshot
                     .clone()
                     .expect("heartbeat fixture terminal snapshot");
-                state.events.push_back(QueryControlEvent::TerminalOutcome {
-                    outcome: terminal_outcome(snapshot),
-                });
                 state
                     .events
-                    .push_back(QueryControlEvent::TerminationAccepted {
+                    .push_back(protocol_terminal_outcome_event(terminal_outcome(snapshot)));
+                state.events.push_back(protocol_control_event(
+                    QueryControlEvent::TerminationAccepted {
                         reason: QueryTerminationReason::CoordinatorFinalize,
-                    });
+                    },
+                ));
             }
             QueryControlCommand::TerminalAck { .. } => {}
         }
@@ -999,13 +1369,15 @@ impl QueryControlSession for HeartbeatGateSession {
     fn recv_timeout(
         &self,
         timeout: Duration,
-    ) -> Result<QueryControlEvent, QueryLifecycleTransportError> {
+    ) -> Result<protocol_lifecycle::QueryControlEvent, QueryLifecycleTransportError> {
         {
             let mut state = self.state.lock().expect("heartbeat gate state");
             if !state.ready_sent && !self.wait_for_heartbeat_before_ready {
                 state.ready_sent = true;
-                state.events.push_back(QueryControlEvent::LocalDrained);
-                return Ok(QueryControlEvent::ControlReady);
+                state
+                    .events
+                    .push_back(protocol_control_event(QueryControlEvent::LocalDrained));
+                return Ok(protocol_control_event(QueryControlEvent::ControlReady));
             }
             if let Some(event) = state.events.pop_front() {
                 return Ok(event);
@@ -1022,8 +1394,10 @@ impl QueryControlSession for HeartbeatGateSession {
                 let mut state = self.state.lock().expect("heartbeat gate state");
                 if !state.ready_sent {
                     state.ready_sent = true;
-                    state.events.push_back(QueryControlEvent::LocalDrained);
-                    return Ok(QueryControlEvent::ControlReady);
+                    state
+                        .events
+                        .push_back(protocol_control_event(QueryControlEvent::LocalDrained));
+                    return Ok(protocol_control_event(QueryControlEvent::ControlReady));
                 }
                 if let Some(event) = state.events.pop_front() {
                     return Ok(event);
@@ -1044,10 +1418,11 @@ fn early_control_ready_session_is_heartbeated_while_other_attach_is_slow() {
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
     let terminal_snapshot = |backend_idx| {
         let participant = plan.participant(backend_idx).expect("fixture participant");
+        let backend = core_backend(participant.backend().clone());
         novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
-            plan.execution_id(),
-            participant.backend().clone(),
-            participant.digest(),
+            core_execution_id(plan.execution_id()),
+            backend,
+            core_digest(participant.digest()),
             Vec::new(),
         )
         .expect("heartbeat fixture terminal snapshot")
@@ -1257,11 +1632,11 @@ fn frontend_query_lifecycle_unknown_init_ack_retries_same_request_once() {
                 QueryLifecycleTransportErrorKind::DeadlineExceeded,
                 "InitAck was lost",
             )),
-            Ok(QueryInitAck::new(
-                execution_id,
-                retry_digest,
+            Ok(protocol_init_ack(QueryInitAck::new(
+                core_execution_id(execution_id),
+                core_digest(retry_digest),
                 QueryInitOutcome::AlreadyApplied,
-            )),
+            ))),
         ]),
     );
     let (registry, _query) = registry_for(&plan);
@@ -1281,8 +1656,16 @@ fn frontend_query_lifecycle_unknown_init_ack_retries_same_request_once() {
         .collect::<Vec<_>>();
     assert_eq!(backend_one.len(), 2);
     assert_eq!(
-        backend_one[0].1.manifest().execution_id(),
-        backend_one[1].1.manifest().execution_id()
+        backend_one[0]
+            .1
+            .manifest()
+            .expect("Protocol manifest")
+            .execution_id(),
+        backend_one[1]
+            .1
+            .manifest()
+            .expect("Protocol manifest")
+            .execution_id()
     );
     assert_eq!(backend_one[0].1.digest(), backend_one[1].1.digest());
     assert_eq!(
@@ -1302,11 +1685,11 @@ fn frontend_query_lifecycle_business_rejection_is_not_retried() {
     let (transport, _) = RecordingTransport::ready(&plan);
     transport.state.lock().unwrap().init_results.insert(
         1,
-        VecDeque::from([Ok(QueryInitAck::new(
-            execution_id,
-            rejected_digest,
+        VecDeque::from([Ok(protocol_init_ack(QueryInitAck::new(
+            core_execution_id(execution_id),
+            core_digest(rejected_digest),
             QueryInitOutcome::RejectedCapacity,
-        ))]),
+        )))]),
     );
     let (registry, _query) = registry_for(&plan);
     let barrier =
@@ -1337,11 +1720,11 @@ fn frontend_query_lifecycle_manifest_conflict_is_classified() {
     let (transport, _) = RecordingTransport::ready(&plan);
     transport.state.lock().unwrap().init_results.insert(
         1,
-        VecDeque::from([Ok(QueryInitAck::new(
-            execution_id,
-            digest,
+        VecDeque::from([Ok(protocol_init_ack(QueryInitAck::new(
+            core_execution_id(execution_id),
+            core_digest(digest),
             QueryInitOutcome::RejectedConflict,
-        ))]),
+        )))]),
     );
     let (registry, _query) = registry_for(&plan);
     let barrier = FrontendQueryLifecycleBarrier::new(Arc::new(transport), registry, config());
@@ -1416,7 +1799,10 @@ fn frontend_query_lifecycle_unary_fallback_accepts_first_wins_terminal_reasons()
             ));
             state.abort_results.insert(
                 backend_idx,
-                VecDeque::from([Ok(QueryTerminationAck::new(execution_id, reason))]),
+                VecDeque::from([Ok(protocol_abort_ack(QueryTerminationAck::new(
+                    core_execution_id(execution_id),
+                    reason,
+                )))]),
             );
         }
     }
@@ -1613,9 +1999,9 @@ fn frontend_query_lifecycle_finalize_keeps_heartbeats_until_all_participants_dra
         })
     });
     for session in sessions.values() {
-        session.push_event(QueryControlEvent::TerminalOutcome {
-            outcome: terminal_outcome(session.terminal_snapshot()),
-        });
+        session.push_protocol_event(protocol_terminal_outcome_event(terminal_outcome(
+            session.terminal_snapshot(),
+        )));
     }
     finalize
         .join()
@@ -1702,11 +2088,11 @@ fn frontend_query_lifecycle_lease_local_failure_aborts_other_participants() {
     let query_id = plan.execution_id().query_id();
     let (transport, sessions) = RecordingTransport::ready(&plan);
     sessions.get(&0).unwrap().state.0.lock().unwrap().events = VecDeque::from([
-        Ok(QueryControlEvent::ControlReady),
-        Ok(QueryControlEvent::LocalFailure {
+        Ok(protocol_control_event(QueryControlEvent::ControlReady)),
+        Ok(protocol_control_event(QueryControlEvent::LocalFailure {
             code: "LOCAL_SCAN_FAILURE".to_string(),
             detail: "backend 0 scan failed".to_string(),
-        }),
+        })),
     ]);
     for backend_idx in [1, 2] {
         sessions
@@ -1717,8 +2103,10 @@ fn frontend_query_lifecycle_lease_local_failure_aborts_other_participants() {
             .lock()
             .unwrap()
             .events = VecDeque::from([
-            Ok(QueryControlEvent::ControlReady),
-            Ok(QueryControlEvent::HeartbeatAck { sequence: 1 }),
+            Ok(protocol_control_event(QueryControlEvent::ControlReady)),
+            Ok(protocol_control_event(QueryControlEvent::HeartbeatAck {
+                sequence: 1,
+            })),
         ]);
     }
     let (registry, _query) = registry_for(&plan);
@@ -1794,13 +2182,19 @@ fn frontend_query_lifecycle_lease_service_only_participant_joins_barrier() {
         .find(|(target, _)| target.backend_idx() == 2)
         .expect("service-only InitQuery");
     assert_eq!(
-        service_request.1.manifest().roles(),
-        &BTreeSet::from([ParticipantRole::RuntimeFilterService])
+        service_request
+            .1
+            .manifest()
+            .expect("Protocol manifest")
+            .roles()
+            .expect("Protocol roles"),
+        vec![proto::QueryParticipantRole::RuntimeFilterService]
     );
     assert!(
         service_request
             .1
             .manifest()
+            .expect("Protocol manifest")
             .expected_fragment_instance_ids()
             .is_empty()
     );
@@ -1813,7 +2207,7 @@ fn frontend_query_lifecycle_heartbeat_timeout_fails_closed() {
     let (transport, sessions) = RecordingTransport::ready(&plan);
     for session in sessions.values() {
         session.state.0.lock().unwrap().events =
-            VecDeque::from([Ok(QueryControlEvent::ControlReady)]);
+            VecDeque::from([Ok(protocol_event_control_ready())]);
     }
     let (registry, _query) = registry_for(&plan);
     let heartbeat_config = FrontendQueryLifecycleConfig::new(
@@ -1850,7 +2244,7 @@ fn frontend_query_lifecycle_backend_stream_loss_is_classified_as_heartbeat_timeo
     let query_id = plan.execution_id().query_id();
     let (transport, sessions) = RecordingTransport::ready(&plan);
     sessions.get(&0).unwrap().state.0.lock().unwrap().events = VecDeque::from([
-        Ok(QueryControlEvent::ControlReady),
+        Ok(protocol_control_event(QueryControlEvent::ControlReady)),
         Err(transport_error(
             QueryLifecycleTransportErrorKind::StreamClosed,
             "backend 0 stream closed",
@@ -1865,8 +2259,10 @@ fn frontend_query_lifecycle_backend_stream_loss_is_classified_as_heartbeat_timeo
             .lock()
             .unwrap()
             .events = VecDeque::from([
-            Ok(QueryControlEvent::ControlReady),
-            Ok(QueryControlEvent::HeartbeatAck { sequence: 1 }),
+            Ok(protocol_control_event(QueryControlEvent::ControlReady)),
+            Ok(protocol_control_event(QueryControlEvent::HeartbeatAck {
+                sequence: 1,
+            })),
         ]);
     }
     let (registry, _query) = registry_for(&plan);
@@ -2027,22 +2423,15 @@ async fn frontend_query_lifecycle_live_transport_crosses_generated_grpc_service(
     let ingress = Arc::new(LiveLifecycleIngress::default());
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
 
-    let execution_id = query_execution_id();
     let backend = LiveBackendTarget::new(7, endpoint, 77);
-    let live_manifest = ParticipantManifest::new(
-        execution_id,
-        ParticipantBackendIdentity::from_live_backend(backend).expect("backend identity"),
-        [ParticipantRole::FragmentExecutor],
-        [UniqueId::new(801, 1)],
-        ParticipantQueryOptions::new(QueryOptions::default()),
-        1_900_000_000_000,
-        [],
-        None,
-        Duration::from_secs(30),
-        QueryControlEndpoint::new("127.0.0.1", 19_000).expect("report endpoint"),
-    )
-    .expect("live manifest");
-    let digest = QueryInitRequest::from_manifest(live_manifest.clone()).digest();
+    let request = live_init_request(backend, 801);
+    let execution_id = request
+        .manifest()
+        .expect("live manifest")
+        .execution_id()
+        .expect("id");
+    let digest = request.digest().expect("digest");
+    let live_manifest = request.manifest().expect("live manifest");
     let plan = QueryInitPlan::from_manifests_for_contract_test(execution_id, [(7, live_manifest)])
         .expect("live plan");
     let (registry, _query) = registry_for(&plan);
@@ -2060,19 +2449,21 @@ async fn frontend_query_lifecycle_live_transport_crosses_generated_grpc_service(
     let lease = barrier
         .initialize_all(plan)
         .expect("Init and ControlReady cross the generated gRPC service");
-    ingress.send_control_event(QueryControlEvent::LocalDrained);
+    ingress.send_control_event(protocol_control_event(QueryControlEvent::LocalDrained));
     lease
         .finalize()
         .expect("Finalize crosses the same control stream");
     let abort_ack = transport
         .abort_query(
             QueryLifecycleTarget::new(7, endpoint, 77),
-            QueryAbortRequest::new(execution_id, digest, "idempotent cleanup")
-                .expect("abort request"),
+            protocol_abort_for(execution_id, digest, "idempotent cleanup"),
             Duration::from_secs(2),
         )
         .expect("AbortQuery crosses the generated gRPC service");
-    assert_eq!(abort_ack.execution_id(), execution_id);
+    assert_eq!(
+        abort_ack.execution_id().expect("abort identity"),
+        execution_id
+    );
 
     assert_eq!(
         ingress
@@ -2098,22 +2489,13 @@ async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stre
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress).await;
     let backend = LiveBackendTarget::new(7, endpoint, 88);
     let target = QueryLifecycleTarget::new(7, endpoint, 88);
-    let live_manifest = ParticipantManifest::new(
-        query_execution_id(),
-        ParticipantBackendIdentity::from_live_backend(backend).expect("backend identity"),
-        [ParticipantRole::FragmentExecutor],
-        [UniqueId::new(802, 1)],
-        ParticipantQueryOptions::new(QueryOptions::default()),
-        1_900_000_000_000,
-        [],
-        None,
-        Duration::from_secs(30),
-        QueryControlEndpoint::new("127.0.0.1", 19_000).expect("report endpoint"),
-    )
-    .expect("live manifest");
-    let request = QueryInitRequest::from_manifest(live_manifest);
-    let execution_id = request.manifest().execution_id();
-    let digest = request.digest();
+    let request = live_init_request(backend, 802);
+    let execution_id = request
+        .manifest()
+        .expect("manifest")
+        .execution_id()
+        .expect("id");
+    let digest = request.digest().expect("digest");
     let transport =
         new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
     transport
@@ -2122,7 +2504,7 @@ async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stre
     let session = transport
         .attach_control(
             target,
-            QueryControlAttach::new(execution_id, digest, 9).expect("attach"),
+            protocol_attach_for(execution_id, digest, 9),
             Duration::from_secs(2),
         )
         .expect("attach");
@@ -2130,22 +2512,16 @@ async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stre
         session
             .recv_timeout(Duration::from_secs(2))
             .expect("ControlReady"),
-        QueryControlEvent::ControlReady
+        protocol_event_control_ready()
     );
 
     for sequence in 0..32 {
         session
-            .send(QueryControlCommand::Heartbeat {
-                sequence,
-                sent_mono_ns: sequence,
-            })
+            .send(protocol_heartbeat(sequence))
             .expect("bounded command");
     }
     let error = session
-        .send(QueryControlCommand::Heartbeat {
-            sequence: 33,
-            sent_mono_ns: 33,
-        })
+        .send(protocol_heartbeat(33))
         .expect_err("the 33rd unacknowledged command must backpressure");
     assert_eq!(error.kind(), QueryLifecycleTransportErrorKind::Backpressure);
     wait_until(Duration::from_secs(2), || {
@@ -2169,8 +2545,12 @@ async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal
     let backend = LiveBackendTarget::new(7, endpoint, 89);
     let target = QueryLifecycleTarget::new(7, endpoint, 89);
     let request = live_init_request(backend, 803);
-    let execution_id = request.manifest().execution_id();
-    let digest = request.digest();
+    let execution_id = request
+        .manifest()
+        .expect("manifest")
+        .execution_id()
+        .expect("id");
+    let digest = request.digest().expect("digest");
     let transport =
         new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
     transport
@@ -2179,7 +2559,7 @@ async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal
     let session = transport
         .attach_control(
             target,
-            QueryControlAttach::new(execution_id, digest, 11).expect("attach"),
+            protocol_attach_for(execution_id, digest, 11),
             Duration::from_secs(2),
         )
         .expect("attach");
@@ -2187,41 +2567,37 @@ async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal
         session
             .recv_timeout(Duration::from_secs(2))
             .expect("ControlReady"),
-        QueryControlEvent::ControlReady
+        protocol_event_control_ready()
     );
 
-    session
-        .send(QueryControlCommand::Finalize)
-        .expect("send finalize");
-    let outcome = match session
+    session.send(protocol_finalize()).expect("send finalize");
+    let event = session
         .recv_timeout(Duration::from_secs(2))
-        .expect("TerminalOutcome")
-    {
-        QueryControlEvent::TerminalOutcome { outcome } => outcome,
-        event => panic!("expected TerminalOutcome, got {event:?}"),
+        .expect("TerminalOutcome");
+    let Some(proto::query_control_response::Event::TerminalOutcome(outcome)) =
+        event.as_proto().event.as_ref()
+    else {
+        panic!("expected TerminalOutcome, got {event:?}");
     };
+    let outcome = protocol_lifecycle::ParticipantTerminalOutcome::parse(outcome.clone())
+        .expect("terminal outcome");
     assert_eq!(
         session
             .recv_timeout(Duration::from_secs(2))
             .expect("TerminationAccepted"),
-        QueryControlEvent::TerminationAccepted {
-            reason: QueryTerminationReason::CoordinatorFinalize,
-        }
+        protocol_event_termination(
+            proto::QueryTerminationReason::QueryTerminationCoordinatorFinalize
+        )
     );
     session
-        .send(QueryControlCommand::TerminalAck {
-            ack: QueryTerminalAck::from_outcome(&outcome),
-        })
+        .send(protocol_terminal_ack_command(&outcome))
         .expect("TerminalAck");
     let close = session
         .recv_timeout(Duration::from_secs(2))
         .expect_err("TerminalAck must close the fake backend control stream");
     assert_eq!(close.kind(), QueryLifecycleTransportErrorKind::StreamClosed);
     let error = session
-        .send(QueryControlCommand::Heartbeat {
-            sequence: 1,
-            sent_mono_ns: 1,
-        })
+        .send(protocol_heartbeat(1))
         .expect_err("terminal observation must imply a closed command side");
     assert_eq!(error.kind(), QueryLifecycleTransportErrorKind::StreamClosed);
 
@@ -2239,8 +2615,12 @@ async fn frontend_query_lifecycle_live_transport_ack_releases_only_its_pending_c
     let backend = LiveBackendTarget::new(7, endpoint, 90);
     let target = QueryLifecycleTarget::new(7, endpoint, 90);
     let request = live_init_request(backend, 804);
-    let execution_id = request.manifest().execution_id();
-    let digest = request.digest();
+    let execution_id = request
+        .manifest()
+        .expect("manifest")
+        .execution_id()
+        .expect("id");
+    let digest = request.digest().expect("digest");
     let transport =
         new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
     transport
@@ -2249,7 +2629,7 @@ async fn frontend_query_lifecycle_live_transport_ack_releases_only_its_pending_c
     let session = transport
         .attach_control(
             target,
-            QueryControlAttach::new(execution_id, digest, 12).expect("attach"),
+            protocol_attach_for(execution_id, digest, 12),
             Duration::from_secs(2),
         )
         .expect("attach");
@@ -2257,53 +2637,41 @@ async fn frontend_query_lifecycle_live_transport_ack_releases_only_its_pending_c
         session
             .recv_timeout(Duration::from_secs(2))
             .expect("ControlReady"),
-        QueryControlEvent::ControlReady
+        protocol_event_control_ready()
     );
 
     for sequence in 0..32 {
         session
-            .send(QueryControlCommand::Heartbeat {
-                sequence,
-                sent_mono_ns: sequence,
-            })
+            .send(protocol_heartbeat(sequence))
             .expect("fill pending command capacity");
     }
     assert_eq!(
         session
-            .send(QueryControlCommand::Heartbeat {
-                sequence: 32,
-                sent_mono_ns: 32,
-            })
+            .send(protocol_heartbeat(32))
             .expect_err("33rd pending command must backpressure")
             .kind(),
         QueryLifecycleTransportErrorKind::Backpressure
     );
 
-    ingress.send_control_event(QueryControlEvent::HeartbeatAck { sequence: 0 });
+    ingress.send_control_event(protocol_event_heartbeat_ack(0));
     assert_eq!(
         session
             .recv_timeout(Duration::from_secs(2))
             .expect("matching heartbeat acknowledgement"),
-        QueryControlEvent::HeartbeatAck { sequence: 0 }
+        protocol_event_heartbeat_ack(0)
     );
     session
-        .send(QueryControlCommand::Heartbeat {
-            sequence: 32,
-            sent_mono_ns: 32,
-        })
+        .send(protocol_heartbeat(32))
         .expect("one matching acknowledgement releases exactly one slot");
     assert_eq!(
         session
-            .send(QueryControlCommand::Heartbeat {
-                sequence: 33,
-                sent_mono_ns: 33,
-            })
+            .send(protocol_heartbeat(33))
             .expect_err("only one slot was released")
             .kind(),
         QueryLifecycleTransportErrorKind::Backpressure
     );
 
-    ingress.send_control_event(QueryControlEvent::HeartbeatAck { sequence: 0 });
+    ingress.send_control_event(protocol_event_heartbeat_ack(0));
     let error = session
         .recv_timeout(Duration::from_secs(2))
         .expect_err("duplicate acknowledgement must terminate the invalid stream");
@@ -2313,10 +2681,7 @@ async fn frontend_query_lifecycle_live_transport_ack_releases_only_its_pending_c
     );
     assert_eq!(
         session
-            .send(QueryControlCommand::Heartbeat {
-                sequence: 33,
-                sent_mono_ns: 33,
-            })
+            .send(protocol_heartbeat(33))
             .expect_err("duplicate acknowledgement must not release capacity")
             .kind(),
         QueryLifecycleTransportErrorKind::InvalidResponse
@@ -2336,8 +2701,12 @@ async fn frontend_query_lifecycle_live_transport_rejects_mismatched_terminal_ack
     let backend = LiveBackendTarget::new(7, endpoint, 91);
     let target = QueryLifecycleTarget::new(7, endpoint, 91);
     let request = live_init_request(backend, 805);
-    let execution_id = request.manifest().execution_id();
-    let digest = request.digest();
+    let execution_id = request
+        .manifest()
+        .expect("manifest")
+        .execution_id()
+        .expect("id");
+    let digest = request.digest().expect("digest");
     let transport =
         new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
     transport
@@ -2346,7 +2715,7 @@ async fn frontend_query_lifecycle_live_transport_rejects_mismatched_terminal_ack
     let session = transport
         .attach_control(
             target,
-            QueryControlAttach::new(execution_id, digest, 13).expect("attach"),
+            protocol_attach_for(execution_id, digest, 13),
             Duration::from_secs(2),
         )
         .expect("attach");
@@ -2354,15 +2723,13 @@ async fn frontend_query_lifecycle_live_transport_rejects_mismatched_terminal_ack
         session
             .recv_timeout(Duration::from_secs(2))
             .expect("ControlReady"),
-        QueryControlEvent::ControlReady
+        protocol_event_control_ready()
     );
 
-    session
-        .send(QueryControlCommand::Finalize)
-        .expect("send finalize");
-    ingress.send_control_event(QueryControlEvent::TerminationAccepted {
-        reason: QueryTerminationReason::CoordinatorAbort,
-    });
+    session.send(protocol_finalize()).expect("send finalize");
+    ingress.send_control_event(protocol_event_termination(
+        proto::QueryTerminationReason::QueryTerminationCoordinatorAbort,
+    ));
     let error = session
         .recv_timeout(Duration::from_secs(2))
         .expect_err("Finalize must not accept an Abort acknowledgement");
@@ -2430,9 +2797,12 @@ async fn frontend_query_lifecycle_live_transport_post_submission_timeout_is_unkn
     server.await.expect("join live lifecycle server");
 }
 
-fn live_init_request(backend: LiveBackendTarget, finst_high: i64) -> QueryInitRequest {
+fn live_init_request(
+    backend: LiveBackendTarget,
+    finst_high: i64,
+) -> protocol_lifecycle::QueryInitRequest {
     let execution_id = query_execution_id();
-    QueryInitRequest::from_manifest(
+    protocol_init_request(QueryInitRequest::from_manifest(
         ParticipantManifest::new(
             execution_id,
             ParticipantBackendIdentity::from_live_backend(backend).expect("backend identity"),
@@ -2446,7 +2816,7 @@ fn live_init_request(backend: LiveBackendTarget, finst_high: i64) -> QueryInitRe
             QueryControlEndpoint::new("127.0.0.1", 19_000).expect("report endpoint"),
         )
         .expect("live manifest"),
-    )
+    ))
 }
 
 /// Test-only BE-shaped wire peer implemented with Frontend's generated stub.
@@ -2525,39 +2895,46 @@ impl crate::native::generated::nova_rocks_grpc_server::NovaRocksGrpc
         &self,
         request: Request<proto::InitQueryRequest>,
     ) -> Result<Response<proto::InitQueryResponse>, Status> {
-        let request = decode_query_init_request(&request.into_inner()).map_err(Self::status)?;
-        Ok(Response::new(encode_query_init_response(
-            &self.ingress.init_query(request),
-        )))
+        let request = protocol_lifecycle::QueryInitRequest::parse(request.into_inner())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(
+            self.ingress.init_query(request).as_proto().clone(),
+        ))
     }
 
     async fn stage_fragments(
         &self,
         request: Request<proto::StageFragmentsRequest>,
     ) -> Result<Response<proto::StageFragmentsResponse>, Status> {
-        let request = decode_query_stage_request(&request.into_inner()).map_err(Self::status)?;
-        Ok(Response::new(encode_query_stage_response(
-            &self.ingress.stage_fragments(request),
-        )))
+        let request = protocol_lifecycle::QueryStageRequest::parse(request.into_inner())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(
+            self.ingress.stage_fragments(request).as_proto().clone(),
+        ))
     }
 
     async fn start_prepared_query(
         &self,
         request: Request<proto::StartPreparedQueryRequest>,
     ) -> Result<Response<proto::StartPreparedQueryResponse>, Status> {
-        let request = decode_query_start_request(&request.into_inner()).map_err(Self::status)?;
-        Ok(Response::new(encode_query_start_response(
-            &self.ingress.start_prepared_query(request),
-        )))
+        let request = protocol_lifecycle::QueryStartRequest::parse(request.into_inner())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(
+            self.ingress
+                .start_prepared_query(request)
+                .as_proto()
+                .clone(),
+        ))
     }
 
     async fn abort_query(
         &self,
         request: Request<proto::AbortQueryRequest>,
     ) -> Result<Response<proto::AbortQueryResponse>, Status> {
-        let request = decode_abort_query_request(&request.into_inner()).map_err(Self::status)?;
+        let request = protocol_lifecycle::QueryAbortRequest::parse(request.into_inner())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let response = self.ingress.abort_query(request).map_err(Self::status)?;
-        Ok(Response::new(encode_abort_query_response(&response)))
+        Ok(Response::new(response.as_proto().clone()))
     }
 
     async fn query_control_stream(
@@ -2570,7 +2947,11 @@ impl crate::native::generated::nova_rocks_grpc_server::NovaRocksGrpc
             .await
             .map_err(|error| Status::invalid_argument(format!("read attach frame: {error}")))?
             .ok_or_else(|| Status::failed_precondition("first frame must be Attach"))?;
-        let attach = decode_query_control_attach(&first).map_err(Self::status)?;
+        let Some(proto::query_control_request::Command::Attach(attach)) = first.command else {
+            return Err(Status::failed_precondition("first frame must be Attach"));
+        };
+        let attach = protocol_lifecycle::QueryControlAttach::parse(attach)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let attachment = self.ingress.attach_control(attach).map_err(Self::status)?;
         let (outbound, receiver) = tokio::sync::mpsc::channel(32);
         tokio::spawn(async move {
@@ -2584,20 +2965,24 @@ impl crate::native::generated::nova_rocks_grpc_server::NovaRocksGrpc
                             Ok(None) => break,
                             Err(error) => { let _ = outbound.send(Err(Status::invalid_argument(format!("read query control command: {error}")))).await; break; }
                         };
-                        let command = match decode_query_control_command(&request) {
+                        let command = match protocol_lifecycle::QueryControlCommand::parse(request) {
                             Ok(command) => command,
-                            Err(error) => { let _ = outbound.send(Err(Self::status(error))).await; break; }
+                            Err(error) => { let _ = outbound.send(Err(Status::invalid_argument(error.to_string()))).await; break; }
                         };
-                        let result = match command {
-                            QueryControlCommand::Heartbeat { sequence, .. } => control.heartbeat(sequence),
-                            QueryControlCommand::Abort { reason } => control.abort(reason),
-                            QueryControlCommand::Finalize => control.finalize(),
-                            QueryControlCommand::TerminalAck { ack } => control.terminal_ack(ack),
+                        let result = match command.as_proto().command.as_ref() {
+                            Some(proto::query_control_request::Command::Heartbeat(heartbeat)) => control.heartbeat(heartbeat.sequence),
+                            Some(proto::query_control_request::Command::Abort(abort)) => control.abort(abort.reason.clone()),
+                            Some(proto::query_control_request::Command::Finalize(_)) => control.finalize(),
+                            Some(proto::query_control_request::Command::TerminalAck(ack)) => match protocol_lifecycle::QueryTerminalAck::parse(ack.clone()) {
+                                Ok(ack) => control.terminal_ack(ack),
+                                Err(error) => Err(QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())),
+                            },
+                            Some(proto::query_control_request::Command::Attach(_)) | None => Err(QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, "invalid active control command")),
                         };
                         if let Err(error) = result { let _ = outbound.send(Err(Self::status(error))).await; break; }
                     }
                     event = events.recv() => match event {
-                        Some(event) if outbound.send(Ok(encode_query_control_event(&event))).await.is_ok() => {}
+                        Some(event) if outbound.send(Ok(event.as_proto().clone())).await.is_ok() => {}
                         _ => break,
                     },
                 }
@@ -2680,11 +3065,11 @@ struct LiveLifecycleIngress {
     manual_heartbeat_acks: bool,
     manual_terminal_acks: bool,
     init_delay: Mutex<Option<Duration>>,
-    control_events: Mutex<Option<tokio::sync::mpsc::Sender<QueryControlEvent>>>,
+    control_events: Mutex<Option<tokio::sync::mpsc::Sender<protocol_lifecycle::QueryControlEvent>>>,
 }
 
 impl LiveLifecycleIngress {
-    fn send_control_event(&self, event: QueryControlEvent) {
+    fn send_control_event(&self, event: protocol_lifecycle::QueryControlEvent) {
         self.control_events
             .lock()
             .expect("control events")
@@ -2700,36 +3085,63 @@ impl QueryLifecycleIngress for LiveLifecycleIngress {
         Ok(())
     }
 
-    fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
+    fn init_query(
+        &self,
+        request: protocol_lifecycle::QueryInitRequest,
+    ) -> protocol_lifecycle::QueryInitAck {
         if let Some(delay) = *self.init_delay.lock().expect("init delay") {
             std::thread::sleep(delay);
         }
-        let execution_id = request.manifest().execution_id();
-        let digest = request.digest();
+        let manifest = request
+            .manifest()
+            .map_err(|error| {
+                QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::InvalidManifest,
+                    error.to_string(),
+                )
+            })
+            .expect("validated Protocol InitQuery carries manifest");
+        let execution_id =
+            core_execution_id(manifest.execution_id().expect("validated execution id"));
+        let digest = core_digest(request.digest().expect("validated digest"));
         *self
             .initialized_backend
             .lock()
-            .expect("initialized backend") = Some(request.manifest().backend().clone());
+            .expect("initialized backend") =
+            Some(core_backend(manifest.backend().expect("validated backend")));
         *self.initialized.lock().expect("initialized") = Some((execution_id, digest));
-        QueryInitAck::new(execution_id, digest, QueryInitOutcome::Applied)
+        protocol_init_ack(QueryInitAck::new(
+            execution_id,
+            digest,
+            QueryInitOutcome::Applied,
+        ))
     }
 
     fn abort_query(
         &self,
-        request: QueryAbortRequest,
-    ) -> Result<QueryTerminationAck, QueryLifecycleError> {
-        Ok(QueryTerminationAck::new(
+        request: protocol_lifecycle::QueryAbortRequest,
+    ) -> Result<protocol_lifecycle::QueryTerminationAck, QueryLifecycleError> {
+        let request = decode_abort_query_request(request.as_proto()).map_err(|error| {
+            QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())
+        })?;
+        Ok(protocol_abort_ack(QueryTerminationAck::new(
             request.execution_id(),
             QueryTerminationReason::CoordinatorAbort,
-        ))
+        )))
     }
 
     fn attach_control(
         &self,
-        attach: QueryControlAttach,
+        attach: protocol_lifecycle::QueryControlAttach,
     ) -> Result<QueryControlAttachment, QueryLifecycleError> {
+        let execution_id = attach.execution_id().map_err(|error| {
+            QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())
+        })?;
+        let digest = attach.digest().map_err(|error| {
+            QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())
+        })?;
         if *self.initialized.lock().expect("initialized")
-            != Some((attach.execution_id(), attach.digest()))
+            != Some((core_execution_id(execution_id), core_digest(digest)))
         {
             return Err(QueryLifecycleError::new(
                 QueryLifecycleErrorCode::Conflict,
@@ -2739,7 +3151,7 @@ impl QueryLifecycleIngress for LiveLifecycleIngress {
         let (events, receiver) = tokio::sync::mpsc::channel(32);
         let (_observation_events, observations) = tokio::sync::watch::channel(None);
         events
-            .try_send(QueryControlEvent::ControlReady)
+            .try_send(protocol_control_event(QueryControlEvent::ControlReady))
             .expect("ControlReady");
         *self.control_events.lock().expect("control events") = Some(events.clone());
         Ok(QueryControlAttachment {
@@ -2749,14 +3161,14 @@ impl QueryLifecycleIngress for LiveLifecycleIngress {
                 gate: self.gate.clone(),
                 manual_heartbeat_acks: self.manual_heartbeat_acks,
                 manual_terminal_acks: self.manual_terminal_acks,
-                execution_id: attach.execution_id(),
+                execution_id: core_execution_id(execution_id),
                 backend: self
                     .initialized_backend
                     .lock()
                     .expect("initialized backend")
                     .clone()
                     .expect("InitQuery precedes attach"),
-                digest: attach.digest(),
+                digest: core_digest(digest),
             }),
             events: receiver,
             observations,
@@ -2765,7 +3177,7 @@ impl QueryLifecycleIngress for LiveLifecycleIngress {
 }
 
 struct LiveBackendControl {
-    events: tokio::sync::mpsc::Sender<QueryControlEvent>,
+    events: tokio::sync::mpsc::Sender<protocol_lifecycle::QueryControlEvent>,
     finalized: Arc<std::sync::atomic::AtomicBool>,
     gate: Option<Arc<LiveHeartbeatGate>>,
     manual_heartbeat_acks: bool,
@@ -2792,7 +3204,9 @@ impl BackendQueryControl for LiveBackendControl {
             return Ok(());
         }
         self.events
-            .try_send(QueryControlEvent::HeartbeatAck { sequence })
+            .try_send(protocol_control_event(QueryControlEvent::HeartbeatAck {
+                sequence,
+            }))
             .map_err(live_control_error)
     }
 
@@ -2801,27 +3215,24 @@ impl BackendQueryControl for LiveBackendControl {
             return Ok(());
         }
         self.events
-            .try_send(QueryControlEvent::TerminalOutcome {
-                outcome: terminal_outcome(
-                    novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
-                        self.execution_id,
-                        self.backend.clone(),
-                        self.digest,
-                        Vec::new(),
-                    )
-                    .map_err(|error| {
-                        QueryLifecycleError::new(
-                            QueryLifecycleErrorCode::Internal,
-                            error.to_string(),
-                        )
-                    })?,
-                ),
-            })
+            .try_send(protocol_terminal_outcome_event(terminal_outcome(
+                novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
+                    self.execution_id,
+                    self.backend.clone(),
+                    self.digest,
+                    Vec::new(),
+                )
+                .map_err(|error| {
+                    QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error.to_string())
+                })?,
+            )))
             .map_err(live_control_error)?;
         self.events
-            .try_send(QueryControlEvent::TerminationAccepted {
-                reason: QueryTerminationReason::CoordinatorAbort,
-            })
+            .try_send(protocol_control_event(
+                QueryControlEvent::TerminationAccepted {
+                    reason: QueryTerminationReason::CoordinatorAbort,
+                },
+            ))
             .map_err(live_control_error)
     }
 
@@ -2832,27 +3243,24 @@ impl BackendQueryControl for LiveBackendControl {
             return Ok(());
         }
         self.events
-            .try_send(QueryControlEvent::TerminalOutcome {
-                outcome: terminal_outcome(
-                    novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
-                        self.execution_id,
-                        self.backend.clone(),
-                        self.digest,
-                        Vec::new(),
-                    )
-                    .map_err(|error| {
-                        QueryLifecycleError::new(
-                            QueryLifecycleErrorCode::Internal,
-                            error.to_string(),
-                        )
-                    })?,
-                ),
-            })
+            .try_send(protocol_terminal_outcome_event(terminal_outcome(
+                novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
+                    self.execution_id,
+                    self.backend.clone(),
+                    self.digest,
+                    Vec::new(),
+                )
+                .map_err(|error| {
+                    QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error.to_string())
+                })?,
+            )))
             .map_err(live_control_error)?;
         self.events
-            .try_send(QueryControlEvent::TerminationAccepted {
-                reason: QueryTerminationReason::CoordinatorFinalize,
-            })
+            .try_send(protocol_control_event(
+                QueryControlEvent::TerminationAccepted {
+                    reason: QueryTerminationReason::CoordinatorFinalize,
+                },
+            ))
             .map_err(live_control_error)
     }
 
@@ -2868,7 +3276,7 @@ struct LiveHeartbeatGate {
 }
 
 fn live_control_error(
-    error: tokio::sync::mpsc::error::TrySendError<QueryControlEvent>,
+    error: tokio::sync::mpsc::error::TrySendError<protocol_lifecycle::QueryControlEvent>,
 ) -> QueryLifecycleError {
     QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error.to_string())
 }

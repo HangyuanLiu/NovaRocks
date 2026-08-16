@@ -23,44 +23,40 @@
 //! avoids a Core facade while the registry's terminal/profile representation is
 //! migrated to generated Protocol carriers.
 
-use novarocks::query_execution::lifecycle::contract::{
-    decode_abort_query_request, decode_participant_manifest, decode_query_control_attach,
-    decode_query_control_command, decode_query_stage_request, decode_query_start_request,
-    encode_abort_query_response, encode_query_init_response, encode_query_stage_response,
-    encode_query_start_response,
-};
 use novarocks::query_execution::lifecycle::{
-    AttemptId as LegacyAttemptId, ParticipantManifestDigest as LegacyParticipantManifestDigest,
+    AttemptId as LegacyAttemptId, ExchangeRouteManifest as LegacyExchangeRouteManifest,
+    ParticipantBackendIdentity as LegacyParticipantBackendIdentity,
+    ParticipantManifest as LegacyParticipantManifest,
+    ParticipantManifestDigest as LegacyParticipantManifestDigest,
+    ParticipantQueryOptions as LegacyParticipantQueryOptions,
+    ParticipantRole as LegacyParticipantRole,
     ParticipantTerminalOutcome as LegacyParticipantTerminalOutcome,
     QueryAbortRequest as LegacyQueryAbortRequest, QueryControlAttach as LegacyQueryControlAttach,
-    QueryControlCommand as LegacyQueryControlCommand, QueryExecutionId as LegacyQueryExecutionId,
+    QueryControlCommand as LegacyQueryControlCommand,
+    QueryControlEndpoint as LegacyQueryControlEndpoint, QueryExecutionId as LegacyQueryExecutionId,
     QueryInitAck as LegacyQueryInitAck, QueryInitRequest as LegacyQueryInitRequest,
     QueryLifecycleError, QueryLifecycleErrorCode, QueryStageAck as LegacyQueryStageAck,
     QueryStageRequest as LegacyQueryStageRequest, QueryStartAck as LegacyQueryStartAck,
-    QueryStartRequest as LegacyQueryStartRequest, QueryTerminationAck as LegacyQueryTerminationAck,
+    QueryStartRequest as LegacyQueryStartRequest, QueryTerminalAck as LegacyQueryTerminalAck,
+    QueryTerminationAck as LegacyQueryTerminationAck,
+    QueryTerminationReason as LegacyQueryTerminationReason,
+    RuntimeFilterContribution as LegacyRuntimeFilterContribution, StageDigest as LegacyStageDigest,
+    StageDigestVersion as LegacyStageDigestVersion, StageFragment as LegacyStageFragment,
 };
+use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
+use novarocks_execution::runtime::query_options::{QueryCacheOptions, QueryOptions};
 use novarocks_protocol::lifecycle::{
     ParticipantTerminalOutcome, QueryAbortRequest, QueryControlAttach, QueryInitAck,
     QueryInitRequest, QueryStageAck, QueryStageRequest, QueryStartAck, QueryStartRequest,
     QueryTerminationAck,
 };
 use novarocks_protocol::{common as wire_common, novarocks as wire};
-use novarocks_types::QueryId;
+use novarocks_types::{QueryId, UniqueId};
 
 pub(crate) fn legacy_init_request(
     request: QueryInitRequest,
 ) -> Result<LegacyQueryInitRequest, QueryLifecycleError> {
-    let manifest = request
-        .as_proto()
-        .manifest
-        .as_ref()
-        .ok_or_else(|| {
-            QueryLifecycleError::new(
-                QueryLifecycleErrorCode::InvalidManifest,
-                "participant manifest is required",
-            )
-        })
-        .and_then(decode_participant_manifest)?;
+    let manifest = legacy_participant_manifest(request.manifest().map_err(legacy_contract_error)?)?;
     let digest = request
         .digest()
         .expect("validated Protocol InitQuery request has a fixed-width digest");
@@ -71,60 +67,391 @@ pub(crate) fn legacy_init_request(
 }
 
 pub(crate) fn protocol_init_ack(value: &LegacyQueryInitAck) -> QueryInitAck {
-    QueryInitAck::parse(encode_query_init_response(value))
-        .expect("legacy InitQuery acknowledgement remains a valid Protocol response")
+    QueryInitAck::parse(wire::InitQueryResponse {
+        execution_id: Some(protocol_execution_id(value.execution_id()).to_proto()),
+        init_digest: value.digest().as_bytes().to_vec(),
+        outcome: match value.outcome() {
+            novarocks::query_execution::lifecycle::QueryInitOutcome::Applied => {
+                wire::QueryInitOutcome::QueryInitApplied as i32
+            }
+            novarocks::query_execution::lifecycle::QueryInitOutcome::AlreadyApplied => {
+                wire::QueryInitOutcome::QueryInitAlreadyApplied as i32
+            }
+            novarocks::query_execution::lifecycle::QueryInitOutcome::RejectedConflict => {
+                wire::QueryInitOutcome::QueryInitRejectedConflict as i32
+            }
+            novarocks::query_execution::lifecycle::QueryInitOutcome::RejectedStaleBackend => {
+                wire::QueryInitOutcome::QueryInitRejectedStaleBackend as i32
+            }
+            novarocks::query_execution::lifecycle::QueryInitOutcome::RejectedCapacity => {
+                wire::QueryInitOutcome::QueryInitRejectedCapacity as i32
+            }
+            novarocks::query_execution::lifecycle::QueryInitOutcome::RejectedInvalidManifest => {
+                wire::QueryInitOutcome::QueryInitRejectedInvalidManifest as i32
+            }
+            novarocks::query_execution::lifecycle::QueryInitOutcome::RejectedTerminated => {
+                wire::QueryInitOutcome::QueryInitRejectedTerminated as i32
+            }
+        },
+    })
+    .expect("legacy InitQuery acknowledgement remains a valid Protocol response")
 }
 
 pub(crate) fn legacy_stage_request(
     request: QueryStageRequest,
 ) -> Result<LegacyQueryStageRequest, QueryLifecycleError> {
-    decode_query_stage_request(request.as_proto())
+    let fragments = request
+        .fragments()
+        .into_iter()
+        .map(|fragment| {
+            LegacyStageFragment::new(fragment.plan().clone(), fragment.instance_params().clone())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    LegacyQueryStageRequest::new(
+        legacy_execution_id(request.execution_id())?,
+        LegacyParticipantManifestDigest::new(*request.init_digest().as_bytes()),
+        LegacyStageDigestVersion::try_from_wire(request.digest_version().get())?,
+        LegacyStageDigest::new(*request.digest().as_bytes()),
+        fragments,
+    )
 }
 
 pub(crate) fn protocol_stage_ack(value: &LegacyQueryStageAck) -> QueryStageAck {
-    QueryStageAck::parse(encode_query_stage_response(value))
-        .expect("legacy StageFragments acknowledgement remains a valid Protocol response")
+    QueryStageAck::parse(wire::StageFragmentsResponse {
+        execution_id: Some(protocol_execution_id(value.execution_id()).to_proto()),
+        stage_digest_version: value.digest_version().get(),
+        stage_digest: value.digest().as_bytes().to_vec(),
+        outcome: match value.outcome() {
+            novarocks::query_execution::lifecycle::QueryStageOutcome::Applied => {
+                wire::StageFragmentsOutcome::StageFragmentsApplied as i32
+            }
+            novarocks::query_execution::lifecycle::QueryStageOutcome::AlreadyApplied => {
+                wire::StageFragmentsOutcome::StageFragmentsAlreadyApplied as i32
+            }
+            novarocks::query_execution::lifecycle::QueryStageOutcome::RejectedConflict => {
+                wire::StageFragmentsOutcome::StageFragmentsRejectedConflict as i32
+            }
+            novarocks::query_execution::lifecycle::QueryStageOutcome::RejectedInvalidState => {
+                wire::StageFragmentsOutcome::StageFragmentsRejectedInvalidState as i32
+            }
+            novarocks::query_execution::lifecycle::QueryStageOutcome::RejectedInvalidBatch => {
+                wire::StageFragmentsOutcome::StageFragmentsRejectedInvalidBatch as i32
+            }
+            novarocks::query_execution::lifecycle::QueryStageOutcome::RejectedCapacity => {
+                wire::StageFragmentsOutcome::StageFragmentsRejectedCapacity as i32
+            }
+            novarocks::query_execution::lifecycle::QueryStageOutcome::RejectedTerminated => {
+                wire::StageFragmentsOutcome::StageFragmentsRejectedTerminated as i32
+            }
+            novarocks::query_execution::lifecycle::QueryStageOutcome::RejectedLocalFailure => {
+                wire::StageFragmentsOutcome::StageFragmentsRejectedLocalFailure as i32
+            }
+        },
+        detail: value.detail().to_owned(),
+    })
+    .expect("legacy StageFragments acknowledgement remains a valid Protocol response")
 }
 
 pub(crate) fn legacy_start_request(
     request: QueryStartRequest,
 ) -> Result<LegacyQueryStartRequest, QueryLifecycleError> {
-    decode_query_start_request(request.as_proto())
+    Ok(LegacyQueryStartRequest::new(
+        legacy_execution_id(request.execution_id())?,
+        LegacyStageDigestVersion::try_from_wire(request.digest_version().get())?,
+        LegacyStageDigest::new(*request.digest().as_bytes()),
+    ))
 }
 
 pub(crate) fn protocol_start_ack(value: &LegacyQueryStartAck) -> QueryStartAck {
-    QueryStartAck::parse(encode_query_start_response(value))
-        .expect("legacy StartPreparedQuery acknowledgement remains a valid Protocol response")
+    QueryStartAck::parse(wire::StartPreparedQueryResponse {
+        execution_id: Some(protocol_execution_id(value.execution_id()).to_proto()),
+        stage_digest_version: value.digest_version().get(),
+        stage_digest: value.digest().as_bytes().to_vec(),
+        outcome: match value.outcome() {
+            novarocks::query_execution::lifecycle::QueryStartOutcome::Applied => {
+                wire::StartPreparedQueryOutcome::StartPreparedQueryApplied as i32
+            }
+            novarocks::query_execution::lifecycle::QueryStartOutcome::AlreadyStarted => {
+                wire::StartPreparedQueryOutcome::StartPreparedQueryAlreadyStarted as i32
+            }
+            novarocks::query_execution::lifecycle::QueryStartOutcome::RejectedNotStaged => {
+                wire::StartPreparedQueryOutcome::StartPreparedQueryRejectedNotStaged as i32
+            }
+            novarocks::query_execution::lifecycle::QueryStartOutcome::RejectedConflict => {
+                wire::StartPreparedQueryOutcome::StartPreparedQueryRejectedConflict as i32
+            }
+            novarocks::query_execution::lifecycle::QueryStartOutcome::RejectedTerminated => {
+                wire::StartPreparedQueryOutcome::StartPreparedQueryRejectedTerminated as i32
+            }
+        },
+        detail: value.detail().to_owned(),
+    })
+    .expect("legacy StartPreparedQuery acknowledgement remains a valid Protocol response")
 }
 
 pub(crate) fn legacy_abort_request(
     request: QueryAbortRequest,
 ) -> Result<LegacyQueryAbortRequest, QueryLifecycleError> {
-    decode_abort_query_request(request.as_proto())
+    LegacyQueryAbortRequest::new(
+        legacy_execution_id(request.execution_id().map_err(legacy_contract_error)?)?,
+        LegacyParticipantManifestDigest::new(
+            *request.digest().map_err(legacy_contract_error)?.as_bytes(),
+        ),
+        request.reason(),
+    )
 }
 
 pub(crate) fn protocol_termination_ack(value: &LegacyQueryTerminationAck) -> QueryTerminationAck {
-    QueryTerminationAck::parse(encode_abort_query_response(value))
-        .expect("legacy AbortQuery acknowledgement remains a valid Protocol response")
+    QueryTerminationAck::parse(wire::AbortQueryResponse {
+        execution_id: Some(protocol_execution_id(value.execution_id()).to_proto()),
+        accepted_reason: protocol_termination_reason(value.accepted_reason()) as i32,
+    })
+    .expect("legacy AbortQuery acknowledgement remains a valid Protocol response")
 }
 
 pub(crate) fn legacy_control_attach(
     attach: QueryControlAttach,
 ) -> Result<LegacyQueryControlAttach, QueryLifecycleError> {
-    let frame = novarocks_protocol::novarocks::QueryControlRequest {
-        command: Some(
-            novarocks_protocol::novarocks::query_control_request::Command::Attach(
-                attach.as_proto().clone(),
-            ),
+    LegacyQueryControlAttach::new(
+        legacy_execution_id(attach.execution_id().map_err(legacy_contract_error)?)?,
+        LegacyParticipantManifestDigest::new(
+            *attach.digest().map_err(legacy_contract_error)?.as_bytes(),
         ),
-    };
-    decode_query_control_attach(&frame)
+        attach.frontend_owner_epoch(),
+    )
 }
 
 pub(crate) fn legacy_control_command(
     command: novarocks_protocol::lifecycle::QueryControlCommand,
 ) -> Result<LegacyQueryControlCommand, QueryLifecycleError> {
-    decode_query_control_command(command.as_proto())
+    use wire::query_control_request::Command;
+
+    match command.as_proto().command.as_ref() {
+        Some(Command::Heartbeat(heartbeat)) => Ok(LegacyQueryControlCommand::Heartbeat {
+            sequence: heartbeat.sequence,
+            sent_mono_ns: heartbeat.sent_mono_ns,
+        }),
+        Some(Command::Abort(abort)) => Ok(LegacyQueryControlCommand::Abort {
+            reason: abort.reason.clone(),
+        }),
+        Some(Command::Finalize(_)) => Ok(LegacyQueryControlCommand::Finalize),
+        Some(Command::TerminalAck(ack)) => Ok(LegacyQueryControlCommand::TerminalAck {
+            ack: LegacyQueryTerminalAck::new(
+                legacy_execution_id(
+                    novarocks_protocol::lifecycle::QueryExecutionId::try_from_proto(
+                        ack.execution_id
+                            .as_ref()
+                            .ok_or_else(|| invalid_manifest("query execution id is required"))?,
+                    )
+                    .map_err(legacy_contract_error)?,
+                )?,
+                LegacyParticipantManifestDigest::try_from_slice(&ack.init_digest)?,
+                ack.snapshot_version,
+                novarocks::query_execution::lifecycle::QueryTerminalSnapshotDigest::try_from_slice(
+                    &ack.snapshot_digest,
+                )?,
+            ),
+        }),
+        Some(Command::Attach(_)) | None => Err(invalid_manifest(
+            "validated Protocol control command must not contain attach or be empty",
+        )),
+    }
+}
+
+fn legacy_contract_error(
+    error: novarocks_protocol::lifecycle::ContractError,
+) -> QueryLifecycleError {
+    QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())
+}
+
+fn invalid_manifest(detail: impl Into<String>) -> QueryLifecycleError {
+    QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, detail)
+}
+
+fn protocol_termination_reason(
+    reason: LegacyQueryTerminationReason,
+) -> wire::QueryTerminationReason {
+    match reason {
+        LegacyQueryTerminationReason::CoordinatorAbort => {
+            wire::QueryTerminationReason::QueryTerminationCoordinatorAbort
+        }
+        LegacyQueryTerminationReason::CoordinatorFinalize => {
+            wire::QueryTerminationReason::QueryTerminationCoordinatorFinalize
+        }
+        LegacyQueryTerminationReason::CoordinatorStreamLost => {
+            wire::QueryTerminationReason::QueryTerminationCoordinatorStreamLost
+        }
+        LegacyQueryTerminationReason::CoordinatorHeartbeatTimeout => {
+            wire::QueryTerminationReason::QueryTerminationCoordinatorHeartbeatTimeout
+        }
+        LegacyQueryTerminationReason::LocalFailure => {
+            wire::QueryTerminationReason::QueryTerminationLocalFailure
+        }
+        LegacyQueryTerminationReason::PreStartTimeout => {
+            wire::QueryTerminationReason::QueryTerminationPreStartTimeout
+        }
+    }
+}
+
+fn legacy_participant_manifest(
+    manifest: novarocks_protocol::lifecycle::ParticipantManifest,
+) -> Result<LegacyParticipantManifest, QueryLifecycleError> {
+    let execution_id =
+        legacy_execution_id(manifest.execution_id().map_err(legacy_contract_error)?)?;
+    let backend = manifest.backend().map_err(legacy_contract_error)?;
+    let endpoint = backend.endpoint().map_err(legacy_contract_error)?;
+    let backend = LegacyParticipantBackendIdentity::new(
+        backend.backend_id(),
+        LegacyQueryControlEndpoint::new(endpoint.host(), endpoint.port())?,
+        backend.start_epoch(),
+    )?;
+    let roles = manifest
+        .roles()
+        .map_err(legacy_contract_error)?
+        .into_iter()
+        .map(|role| match role {
+            wire::QueryParticipantRole::FragmentExecutor => {
+                Ok(LegacyParticipantRole::FragmentExecutor)
+            }
+            wire::QueryParticipantRole::RuntimeFilterService => {
+                Ok(LegacyParticipantRole::RuntimeFilterService)
+            }
+            wire::QueryParticipantRole::Unspecified => {
+                Err(invalid_manifest("participant role must not be unspecified"))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let fragments = manifest
+        .expected_fragment_instance_ids()
+        .into_iter()
+        .map(|id| UniqueId::new(id.hi, id.lo))
+        .collect::<Vec<_>>();
+    let options = legacy_query_options(
+        manifest
+            .query_options()
+            .map_err(legacy_contract_error)?
+            .as_proto(),
+    )?;
+    let routes = manifest
+        .exchange_routes()
+        .map_err(legacy_contract_error)?
+        .into_iter()
+        .map(|route| {
+            let source = route
+                .source_fragment_instance_id()
+                .map_err(legacy_contract_error)?;
+            let destination = route
+                .destination_fragment_instance_id()
+                .map_err(legacy_contract_error)?;
+            LegacyExchangeRouteManifest::new(
+                UniqueId::new(source.hi, source.lo),
+                UniqueId::new(destination.hi, destination.lo),
+                route.destination_node_id(),
+                route.sender_ordinal(),
+                route.sender_count(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let runtime_filter = manifest
+        .runtime_filter()
+        .map_err(legacy_contract_error)?
+        .map(|value| LegacyRuntimeFilterContribution::from_wire(value.as_proto().clone()))
+        .transpose()?;
+    let report = manifest.report_endpoint().map_err(legacy_contract_error)?;
+    LegacyParticipantManifest::new(
+        execution_id,
+        backend,
+        roles,
+        fragments,
+        LegacyParticipantQueryOptions::new(options),
+        manifest.query_deadline_unix_ms(),
+        routes,
+        runtime_filter,
+        std::time::Duration::from_millis(manifest.pre_start_timeout_ms()),
+        LegacyQueryControlEndpoint::new(report.host(), report.port())?,
+    )
+}
+
+fn legacy_query_options(raw: &wire::QueryOptions) -> Result<QueryOptions, QueryLifecycleError> {
+    let spill = if raw.enable_spill {
+        let spill = raw
+            .spill_options
+            .as_ref()
+            .ok_or_else(|| invalid_manifest("enable_spill=true requires spill_options"))?;
+        let spill_mode = match spill.spill_mode {
+            0 => SpillMode::Auto,
+            1 => SpillMode::Force,
+            2 => SpillMode::None,
+            3 => return Err(invalid_manifest("spill_mode RANDOM is not supported yet")),
+            value => {
+                return Err(invalid_manifest(format!(
+                    "unknown spill_mode value {value}"
+                )));
+            }
+        };
+        if !spill.spill_mem_limit_threshold.is_finite() {
+            return Err(invalid_manifest("spill_mem_limit_threshold must be finite"));
+        }
+        Some(SpillConfig {
+            enable_spill: true,
+            spill_mode,
+            spill_mem_limit_threshold: (spill.spill_mem_limit_threshold > 0.0)
+                .then_some(spill.spill_mem_limit_threshold),
+            spill_operator_min_bytes: (spill.spill_operator_min_bytes > 0)
+                .then_some(spill.spill_operator_min_bytes),
+            spill_operator_max_bytes: (spill.spill_operator_max_bytes > 0)
+                .then_some(spill.spill_operator_max_bytes),
+            spill_encode_level: (spill.spill_encode_level > 0).then_some(spill.spill_encode_level),
+            enable_spill_buffer_read: Some(spill.enable_spill_buffer_read),
+            max_spill_read_buffer_bytes_per_driver: (spill.max_spill_read_buffer_bytes_per_driver
+                > 0)
+            .then_some(spill.max_spill_read_buffer_bytes_per_driver),
+            spill_mem_table_size: (spill.spill_mem_table_size > 0)
+                .then_some(spill.spill_mem_table_size),
+            spill_mem_table_num: (spill.spill_mem_table_num > 0)
+                .then_some(spill.spill_mem_table_num),
+        })
+    } else {
+        None
+    };
+    Ok(QueryOptions {
+        batch_size: (raw.batch_size > 0).then_some(raw.batch_size),
+        query_timeout: (raw.query_timeout > 0).then_some(raw.query_timeout),
+        query_delivery_timeout: (raw.query_delivery_timeout > 0)
+            .then_some(raw.query_delivery_timeout),
+        enable_profile: raw.enable_profile,
+        runtime_profile_report_interval: (raw.runtime_profile_report_interval > 0)
+            .then_some(raw.runtime_profile_report_interval),
+        pipeline_dop: (raw.pipeline_dop > 0).then_some(raw.pipeline_dop),
+        exec_mem_limit: (raw.query_mem_limit > 0).then_some(raw.query_mem_limit),
+        connector_io_tasks_per_scan_operator: (raw.connector_io_tasks_per_scan_operator > 0)
+            .then_some(raw.connector_io_tasks_per_scan_operator),
+        orc_use_column_names: raw.orc_use_column_names,
+        enable_file_metacache: raw.enable_file_metacache,
+        enable_file_pagecache: raw.enable_file_pagecache,
+        enable_parquet_reader_page_index: raw.enable_parquet_reader_page_index,
+        runtime_filter_scan_wait_time_ms: raw.runtime_filter_scan_wait_time_ms,
+        runtime_filter_wait_timeout_ms: raw.runtime_filter_wait_timeout_ms,
+        allow_throw_exception: raw.allow_throw_exception,
+        group_concat_max_len: raw.group_concat_max_len,
+        enable_join_runtime_bitset_filter: raw.enable_join_runtime_bitset_filter,
+        global_runtime_filter_build_max_size: (raw.global_runtime_filter_build_max_size > 0)
+            .then_some(raw.global_runtime_filter_build_max_size),
+        cache: QueryCacheOptions {
+            enable_scan_datacache: raw.enable_scan_datacache,
+            enable_populate_datacache: raw.enable_populate_datacache,
+            enable_datacache_async_populate_mode: raw.enable_datacache_async_populate_mode,
+            enable_datacache_io_adaptor: raw.enable_datacache_io_adaptor,
+            enable_cache_select: raw.enable_cache_select,
+            datacache_evict_probability: raw.datacache_evict_probability,
+            datacache_priority: (raw.datacache_priority != 0).then_some(raw.datacache_priority),
+            datacache_ttl_seconds: (raw.datacache_ttl_seconds > 0)
+                .then_some(raw.datacache_ttl_seconds),
+            datacache_sharing_work_period: (raw.datacache_sharing_work_period > 0)
+                .then_some(raw.datacache_sharing_work_period),
+        },
+        spill,
+    })
 }
 
 pub(crate) fn legacy_execution_id(
@@ -396,38 +723,72 @@ fn protocol_profile_contribution(
     // This projection intentionally stays at the BE capture boundary; the
     // legacy Core contribution remains only until the registry state itself is
     // cut over together with the BE control-event contract.
-    let snapshot = novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new_with_profile_contribution(
-        novarocks::query_execution::lifecycle::QueryExecutionId::new(
-            QueryId::new(1, 1),
-            LegacyAttemptId::new(1).expect("one is a valid attempt"),
-        )
-        .expect("static execution identity"),
-        novarocks::query_execution::lifecycle::ParticipantBackendIdentity::new(
-            1,
-            novarocks::query_execution::lifecycle::QueryControlEndpoint::new(
-                "terminal-projection",
-                1,
-            )
-                .expect("static endpoint"),
-            1,
-        )
-        .expect("static backend identity"),
-        LegacyParticipantManifestDigest::new([0; 32]),
-        Vec::new(),
-        contribution.clone(),
-    )
-    .expect("validated terminal contribution");
-    novarocks::query_execution::lifecycle::encode_query_terminal_snapshot(&snapshot)
-        .profile_contribution
-        .expect("encoded terminal snapshot always contains profile telemetry")
-        .telemetry
-        .and_then(|telemetry| match telemetry {
-            wire::query_terminal_profile_contribution_telemetry::Telemetry::Available(value) => {
-                Some(value)
+    let channels = contribution.channels().iter().map(|value| wire::QueryTerminalRuntimeFilterChannelV1 {
+        channel_binding_id: value.key().channel_binding_id(), channel_id: value.key().channel_id(), install_state: 1,
+        terminal_state: match value.terminal_state() {
+            novarocks::query_execution::lifecycle::QueryTerminalRuntimeFilterChannelTerminalStateV1::Open => 1,
+            novarocks::query_execution::lifecycle::QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed => 2,
+            novarocks::query_execution::lifecycle::QueryTerminalRuntimeFilterChannelTerminalStateV1::Unavailable => 3,
+            novarocks::query_execution::lifecycle::QueryTerminalRuntimeFilterChannelTerminalStateV1::Cancelled => 4,
+        }, latest_published_logical_version: value.latest_published_logical_version(), published_count: value.published_count(), completed_count: value.completed_count(), unavailable_count: value.unavailable_count(), cancelled_count: value.cancelled_count(),
+    }).collect();
+    let producer_streams = contribution
+        .producer_streams()
+        .iter()
+        .map(|value| {
+            let fragment = value.key().producer_fragment_instance_id();
+            wire::QueryTerminalRuntimeFilterProducerStreamV1 {
+                channel_binding_id: value.key().channel().channel_binding_id(),
+                channel_id: value.key().channel().channel_id(),
+                producer_fragment_instance_id: Some(protocol_unique_id(fragment)),
+                partition_id: value.key().partition_id(),
+                latest_accepted_sequence: value.latest_accepted_sequence(),
+                accepted_count: value.accepted_count(),
+                duplicate_count: value.duplicate_count(),
+                stale_count: value.stale_count(),
+                conflict_count: value.conflict_count(),
+                resource_limit_count: value.resource_limit_count(),
             }
-            wire::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(_) => None,
         })
-        .expect("available terminal contribution stays available")
+        .collect();
+    let transport_routes = contribution
+        .transport_routes()
+        .iter()
+        .map(|value| wire::QueryTerminalRuntimeFilterTransportRouteV1 {
+            channel_binding_id: value.key().channel().channel_binding_id(),
+            channel_id: value.key().channel().channel_id(),
+            route_edge_id: value.key().route_edge_id(),
+            sent_count: value.sent_count(),
+            sent_bytes: value.sent_bytes(),
+            retried_count: value.retried_count(),
+            retried_bytes: value.retried_bytes(),
+            acked_count: value.acked_count(),
+            acked_bytes: value.acked_bytes(),
+            fail_open_count: value.fail_open_count(),
+            fail_open_bytes: value.fail_open_bytes(),
+        })
+        .collect();
+    let consumers = contribution.consumers().iter().map(|value| { let fragment = value.key().fragment_instance_id(); let reasons = value.scan_not_evaluated_reasons(); wire::QueryTerminalRuntimeFilterConsumerV1 {
+        channel_binding_id: value.key().channel().channel_binding_id(), channel_id: value.key().channel().channel_id(), consumer_binding_id: value.key().consumer_binding_id(), fragment_instance_id: Some(protocol_unique_id(fragment)), latest_delivered_logical_version: value.latest_delivered_logical_version(), latest_applied_logical_version: value.latest_applied_logical_version(), subscription_terminal: match value.subscription_terminal() {
+            novarocks::query_execution::lifecycle::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Pending => 1,
+            novarocks::query_execution::lifecycle::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Acquired => 2,
+            novarocks::query_execution::lifecycle::QueryTerminalRuntimeFilterSubscriptionTerminalV1::TimedOut => 3,
+            novarocks::query_execution::lifecycle::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Unavailable => 4,
+            novarocks::query_execution::lifecycle::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Unsupported => 5,
+            novarocks::query_execution::lifecycle::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Cancelled => 6,
+            novarocks::query_execution::lifecycle::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Completed => 7,
+            novarocks::query_execution::lifecycle::QueryTerminalRuntimeFilterSubscriptionTerminalV1::CompletedWithoutArtifact => 8,
+        }, row_evaluations: value.row_evaluations(), input_rows: value.input_rows(), output_rows: value.output_rows(), scan_evaluated: value.scan_evaluated(), scan_kept: value.scan_kept(), scan_pruned: value.scan_pruned(), scan_not_evaluated: value.scan_not_evaluated(), scan_not_evaluated_reasons: Some(wire::QueryTerminalRuntimeFilterScanNotEvaluatedV1 {
+            unit_facts_missing: reasons.unit_facts_missing(), column_facts_missing: reasons.column_facts_missing(), data_type_unsupported: reasons.data_type_unsupported(), predicate_capability_unsupported: reasons.predicate_capability_unsupported(), resource_unavailable: reasons.resource_unavailable(), snapshot_unavailable: reasons.snapshot_unavailable(), snapshot_timed_out: reasons.snapshot_timed_out(), snapshot_not_published: reasons.snapshot_not_published(),
+        }),
+    }}).collect();
+    wire::QueryTerminalProfileContributionV1 {
+        version: contribution.version(),
+        channels,
+        producer_streams,
+        transport_routes,
+        consumers,
+    }
 }
 
 fn protocol_runtime_profile_tree(

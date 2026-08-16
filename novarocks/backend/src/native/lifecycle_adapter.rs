@@ -23,7 +23,6 @@ use std::sync::{Mutex, OnceLock};
 
 use tokio_stream::wrappers::ReceiverStream;
 
-use novarocks::query_execution::lifecycle::contract::encode_query_control_event;
 use novarocks::query_execution::lifecycle::{
     QueryControlCommand, QueryControlEvent, QueryLifecycleError, QueryLifecycleErrorCode,
     QueryTerminationReason,
@@ -36,7 +35,7 @@ use novarocks_protocol::lifecycle::{
 use novarocks_protocol::novarocks as proto;
 
 use crate::query_lifecycle::protocol_adapter::{
-    legacy_control_command, legacy_execution_id, protocol_execution_id,
+    legacy_control_command, legacy_execution_id, protocol_execution_id, protocol_terminal_outcome,
 };
 use crate::query_lifecycle::{BackendQueryControl, QueryLifecycleIngress};
 
@@ -282,6 +281,139 @@ pub async fn handle_query_control_stream(
     Ok(ReceiverStream::new(outbound_rx))
 }
 
+/// The registry still retains its local event enum, but native egress owns the
+/// generated Protocol frame.  Do not route this role boundary through Core's
+/// retired lifecycle codec.
+fn protocol_control_event(
+    event: &QueryControlEvent,
+) -> novarocks_protocol::lifecycle::QueryControlEvent {
+    use proto::query_control_response::Event;
+
+    let event = match event {
+        QueryControlEvent::ControlReady => Event::ControlReady(proto::QueryControlReady {}),
+        QueryControlEvent::HeartbeatAck { sequence } => {
+            Event::HeartbeatAck(proto::QueryControlHeartbeatAck {
+                sequence: *sequence,
+            })
+        }
+        QueryControlEvent::LocalFailure { code, detail } => {
+            Event::LocalFailure(proto::QueryControlLocalFailure {
+                code: code.clone(),
+                detail: detail.clone(),
+            })
+        }
+        QueryControlEvent::LocalDrained => Event::LocalDrained(proto::QueryControlLocalDrained {}),
+        QueryControlEvent::TerminalOutcome { outcome } => {
+            Event::TerminalOutcome(protocol_terminal_outcome(outcome).as_proto().clone())
+        }
+        QueryControlEvent::TerminationAccepted { reason } => {
+            Event::TerminationAccepted(proto::QueryControlTerminationAccepted {
+                reason: match reason {
+                    QueryTerminationReason::CoordinatorAbort => {
+                        proto::QueryTerminationReason::QueryTerminationCoordinatorAbort as i32
+                    }
+                    QueryTerminationReason::CoordinatorFinalize => {
+                        proto::QueryTerminationReason::QueryTerminationCoordinatorFinalize as i32
+                    }
+                    QueryTerminationReason::CoordinatorStreamLost => {
+                        proto::QueryTerminationReason::QueryTerminationCoordinatorStreamLost as i32
+                    }
+                    QueryTerminationReason::CoordinatorHeartbeatTimeout => {
+                        proto::QueryTerminationReason::QueryTerminationCoordinatorHeartbeatTimeout
+                            as i32
+                    }
+                    QueryTerminationReason::LocalFailure => {
+                        proto::QueryTerminationReason::QueryTerminationLocalFailure as i32
+                    }
+                    QueryTerminationReason::PreStartTimeout => {
+                        proto::QueryTerminationReason::QueryTerminationPreStartTimeout as i32
+                    }
+                },
+            })
+        }
+        QueryControlEvent::FragmentObservation { observation } => {
+            Event::FragmentObservation(proto::FragmentLiveObservation {
+                execution_id: Some(protocol_execution_id(observation.execution_id()).to_proto()),
+                init_digest: observation.init_digest().as_bytes().to_vec(),
+                backend: Some(proto::ParticipantBackendIdentity {
+                    backend_id: observation.backend().backend_id(),
+                    endpoint: Some(proto::QueryControlEndpoint {
+                        host: observation.backend().endpoint().host().to_owned(),
+                        port: u32::from(observation.backend().endpoint().port()),
+                    }),
+                    start_epoch: observation.backend().start_epoch(),
+                }),
+                fragment_instance_id: Some(novarocks_protocol::common::UniqueId {
+                    hi: observation.fragment_instance_id().high(),
+                    lo: observation.fragment_instance_id().low(),
+                }),
+                sequence: observation.sequence(),
+                input_rows: observation.input_rows(),
+                output_rows: observation.output_rows(),
+                elapsed_ms: observation.elapsed_ms(),
+                profile: observation.profile().map(protocol_runtime_profile_tree),
+            })
+        }
+    };
+    novarocks_protocol::lifecycle::QueryControlEvent::parse(proto::QueryControlResponse {
+        event: Some(event),
+    })
+    .expect("registry event must satisfy the Protocol control-event contract")
+}
+
+fn protocol_runtime_profile_tree(
+    tree: &novarocks_execution::runtime::profile::RuntimeProfileTree,
+) -> proto::RuntimeProfileTree {
+    proto::RuntimeProfileTree {
+        root: Some(protocol_profile_node(&tree.root)),
+    }
+}
+
+fn protocol_profile_node(
+    node: &novarocks_execution::runtime::profile::ProfileNode,
+) -> proto::ProfileNode {
+    proto::ProfileNode {
+        name: node.name.clone(),
+        node_id: node.node_id,
+        counters: node
+            .counters
+            .iter()
+            .map(|counter| proto::Counter {
+                name: counter.name.clone(),
+                parent_name: counter.parent_name.clone(),
+                unit: match counter.unit {
+                    novarocks_execution::runtime::profile::ProfileUnit::Unit => {
+                        proto::ProfileUnit::Unit as i32
+                    }
+                    novarocks_execution::runtime::profile::ProfileUnit::CpuTicks => {
+                        proto::ProfileUnit::CpuTicks as i32
+                    }
+                    novarocks_execution::runtime::profile::ProfileUnit::Bytes => {
+                        proto::ProfileUnit::Bytes as i32
+                    }
+                    novarocks_execution::runtime::profile::ProfileUnit::TimeNs => {
+                        proto::ProfileUnit::TimeNs as i32
+                    }
+                    novarocks_execution::runtime::profile::ProfileUnit::TimeMs => {
+                        proto::ProfileUnit::TimeMs as i32
+                    }
+                    novarocks_execution::runtime::profile::ProfileUnit::TimeS => {
+                        proto::ProfileUnit::TimeS as i32
+                    }
+                    novarocks_execution::runtime::profile::ProfileUnit::None => {
+                        proto::ProfileUnit::None as i32
+                    }
+                },
+                value: counter.value,
+                min_value: counter.min_value,
+                max_value: counter.max_value,
+            })
+            .collect(),
+        info_strings: node.info_strings.clone().into_iter().collect(),
+        children: node.children.iter().map(protocol_profile_node).collect(),
+    }
+}
+
 async fn run_attached_control_stream(
     mut inbound: tonic::Streaming<proto::QueryControlRequest>,
     mut lease: CoordinatorLease,
@@ -323,7 +455,7 @@ async fn run_attached_control_stream(
     }
     if !send_control_response(
         &outbound,
-        Ok(encode_query_control_event(&first_event)),
+        Ok(protocol_control_event(&first_event).as_proto().clone()),
         &mut shutdown,
     )
     .await
@@ -482,7 +614,7 @@ async fn run_attached_control_stream(
                     matches!(event, QueryControlEvent::TerminationAccepted { .. });
                 if !send_control_response(
                     &outbound,
-                    Ok(encode_query_control_event(&event)),
+                    Ok(protocol_control_event(&event).as_proto().clone()),
                     &mut shutdown,
                 )
                 .await

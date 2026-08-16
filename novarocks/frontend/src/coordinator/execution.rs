@@ -70,6 +70,16 @@ use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
 };
 use crate::runtime_filter::plan_encoder::encode_binding_attachment;
+#[cfg(test)]
+use novarocks_protocol::{
+    lifecycle::{
+        QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent,
+        QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryStageAck, QueryStageOutcome,
+        QueryStageRequest, QueryStartAck, QueryStartOutcome, QueryStartRequest,
+        QueryTerminationAck, QueryTerminationReason,
+    },
+    novarocks as protocol,
+};
 
 trait QueryIdSource: Send + Sync + 'static {
     fn next_query_id(&self) -> QueryId;
@@ -320,32 +330,44 @@ struct ReadyLifecycleTransportForTest;
 
 #[cfg(test)]
 struct ReadyLifecycleSessionForTest {
-    events: Mutex<VecDeque<novarocks::query_execution::lifecycle::QueryControlEvent>>,
+    events: Mutex<VecDeque<QueryControlEvent>>,
 }
 
 #[cfg(test)]
 impl QueryControlSession for ReadyLifecycleSessionForTest {
-    fn send(
-        &self,
-        command: novarocks::query_execution::lifecycle::QueryControlCommand,
-    ) -> Result<(), QueryLifecycleTransportError> {
-        use novarocks::query_execution::lifecycle::{
-            QueryControlCommand, QueryControlEvent, QueryTerminationReason,
-        };
-        let event = match command {
-            QueryControlCommand::Heartbeat { sequence, .. } => {
-                QueryControlEvent::HeartbeatAck { sequence }
+    fn send(&self, command: QueryControlCommand) -> Result<(), QueryLifecycleTransportError> {
+        use protocol::query_control_request::Command;
+        use protocol::query_control_response::Event;
+
+        let event = match command.as_proto().command.as_ref() {
+            Some(Command::Heartbeat(heartbeat)) => {
+                QueryControlEvent::parse(protocol::QueryControlResponse {
+                    event: Some(Event::HeartbeatAck(protocol::QueryControlHeartbeatAck {
+                        sequence: heartbeat.sequence,
+                    })),
+                })
             }
-            QueryControlCommand::Abort { .. } => QueryControlEvent::TerminationAccepted {
-                reason: QueryTerminationReason::CoordinatorAbort,
-            },
-            QueryControlCommand::Finalize => QueryControlEvent::TerminationAccepted {
-                reason: QueryTerminationReason::CoordinatorFinalize,
-            },
-            QueryControlCommand::TerminalAck { .. } => {
-                return Ok(());
+            Some(Command::Abort(_)) => QueryControlEvent::parse(protocol::QueryControlResponse {
+                event: Some(Event::TerminationAccepted(
+                    protocol::QueryControlTerminationAccepted {
+                        reason: QueryTerminationReason::QueryTerminationCoordinatorAbort as i32,
+                    },
+                )),
+            }),
+            Some(Command::Finalize(_)) => {
+                QueryControlEvent::parse(protocol::QueryControlResponse {
+                    event: Some(Event::TerminationAccepted(
+                        protocol::QueryControlTerminationAccepted {
+                            reason: QueryTerminationReason::QueryTerminationCoordinatorFinalize
+                                as i32,
+                        },
+                    )),
+                })
             }
+            Some(Command::TerminalAck(_)) => return Ok(()),
+            Some(Command::Attach(_)) | None => unreachable!("validated control command"),
         };
+        let event = event.map_err(protocol_contract_error)?;
         self.events
             .lock()
             .expect("ready lifecycle session")
@@ -356,10 +378,7 @@ impl QueryControlSession for ReadyLifecycleSessionForTest {
     fn recv_timeout(
         &self,
         _timeout: Duration,
-    ) -> Result<
-        novarocks::query_execution::lifecycle::QueryControlEvent,
-        QueryLifecycleTransportError,
-    > {
+    ) -> Result<QueryControlEvent, QueryLifecycleTransportError> {
         self.events
             .lock()
             .expect("ready lifecycle session")
@@ -378,78 +397,99 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
     fn init_query(
         &self,
         _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
-        request: novarocks::query_execution::lifecycle::QueryInitRequest,
+        request: QueryInitRequest,
         _timeout: Duration,
-    ) -> Result<novarocks::query_execution::lifecycle::QueryInitAck, QueryLifecycleTransportError>
-    {
-        Ok(novarocks::query_execution::lifecycle::QueryInitAck::new(
-            request.manifest().execution_id(),
-            request.digest(),
-            novarocks::query_execution::lifecycle::QueryInitOutcome::Applied,
-        ))
+    ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
+        let execution_id = request
+            .manifest()
+            .and_then(|manifest| manifest.execution_id())
+            .map_err(protocol_contract_error)?;
+        let digest = request.digest().map_err(protocol_contract_error)?;
+        QueryInitAck::parse(protocol::InitQueryResponse {
+            execution_id: Some(execution_id.to_proto()),
+            init_digest: digest.as_bytes().to_vec(),
+            outcome: QueryInitOutcome::QueryInitApplied as i32,
+        })
+        .map_err(protocol_contract_error)
     }
 
     fn attach_control(
         &self,
         _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
-        _attach: novarocks::query_execution::lifecycle::QueryControlAttach,
+        _attach: QueryControlAttach,
         _timeout: Duration,
     ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
         Ok(Arc::new(ReadyLifecycleSessionForTest {
-            events: Mutex::new(VecDeque::from([
-                novarocks::query_execution::lifecycle::QueryControlEvent::ControlReady,
-            ])),
+            events: Mutex::new(VecDeque::from([QueryControlEvent::parse(
+                protocol::QueryControlResponse {
+                    event: Some(protocol::query_control_response::Event::ControlReady(
+                        protocol::QueryControlReady {},
+                    )),
+                },
+            )
+            .expect("ready lifecycle control-ready event is valid")])),
         }))
     }
 
     fn stage_fragments(
         &self,
         _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
-        request: &novarocks::query_execution::lifecycle::QueryStageRequest,
+        request: &QueryStageRequest,
         _timeout: Duration,
-    ) -> Result<novarocks::query_execution::lifecycle::QueryStageAck, QueryLifecycleTransportError>
-    {
-        Ok(novarocks::query_execution::lifecycle::QueryStageAck::new(
+    ) -> Result<QueryStageAck, QueryLifecycleTransportError> {
+        QueryStageAck::new(
             request.execution_id(),
             request.digest_version(),
             request.digest(),
-            novarocks::query_execution::lifecycle::QueryStageOutcome::Applied,
+            QueryStageOutcome::Applied,
             "test participant staged",
-        ))
+        )
+        .map_err(protocol_contract_error)
     }
 
     fn start_prepared_query(
         &self,
         _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
-        request: &novarocks::query_execution::lifecycle::QueryStartRequest,
+        request: &QueryStartRequest,
         _timeout: Duration,
-    ) -> Result<novarocks::query_execution::lifecycle::QueryStartAck, QueryLifecycleTransportError>
-    {
-        Ok(novarocks::query_execution::lifecycle::QueryStartAck::new(
+    ) -> Result<QueryStartAck, QueryLifecycleTransportError> {
+        QueryStartAck::new(
             request.execution_id(),
             request.digest_version(),
             request.digest(),
-            novarocks::query_execution::lifecycle::QueryStartOutcome::Applied,
+            QueryStartOutcome::Applied,
             "test participant started",
-        ))
+        )
+        .map_err(protocol_contract_error)
     }
 
     fn abort_query(
         &self,
         _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
-        request: novarocks::query_execution::lifecycle::QueryAbortRequest,
+        request: QueryAbortRequest,
         _timeout: Duration,
-    ) -> Result<
-        novarocks::query_execution::lifecycle::QueryTerminationAck,
-        QueryLifecycleTransportError,
-    > {
-        Ok(
-            novarocks::query_execution::lifecycle::QueryTerminationAck::new(
-                request.execution_id(),
-                novarocks::query_execution::lifecycle::QueryTerminationReason::CoordinatorAbort,
+    ) -> Result<QueryTerminationAck, QueryLifecycleTransportError> {
+        QueryTerminationAck::parse(protocol::AbortQueryResponse {
+            execution_id: Some(
+                request
+                    .execution_id()
+                    .map_err(protocol_contract_error)?
+                    .to_proto(),
             ),
-        )
+            accepted_reason: QueryTerminationReason::QueryTerminationCoordinatorAbort as i32,
+        })
+        .map_err(protocol_contract_error)
     }
+}
+
+#[cfg(test)]
+fn protocol_contract_error(
+    error: novarocks_protocol::lifecycle::ContractError,
+) -> QueryLifecycleTransportError {
+    QueryLifecycleTransportError::new(
+        QueryLifecycleTransportErrorKind::InvalidResponse,
+        error.to_string(),
+    )
 }
 
 #[cfg(test)]

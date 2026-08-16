@@ -1919,15 +1919,18 @@ impl QueryTerminalSet {
     }
 
     /// CLS-R1 keeps the lease aggregate in Core while native ingress carries
-    /// only the validated Protocol snapshot.  Decode at this Core-owned
-    /// orchestration boundary so Frontend never regains a lifecycle codec.
-    /// CLS-R2 will retire this compatibility input with the lease API.
+    /// only the validated Protocol snapshot. Protocol has already validated
+    /// its canonical digest, which intentionally differs from the retired
+    /// Core digest domain; rebuild the aggregate projection here so Frontend
+    /// never regains a lifecycle codec. CLS-R2 retires this input with lease.
     pub fn from_protocol_snapshots(
         snapshots: Vec<ProtocolQueryTerminalSnapshot>,
     ) -> Result<Self, QueryLifecycleError> {
         snapshots
             .into_iter()
-            .map(|snapshot| super::contract::decode_query_terminal_snapshot(snapshot.as_proto()))
+            .map(|snapshot| {
+                super::contract::decode_protocol_terminal_snapshot_projection(snapshot.as_proto())
+            })
             .collect::<Result<Vec<_>, _>>()
             .and_then(Self::new)
     }
