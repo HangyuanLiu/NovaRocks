@@ -149,6 +149,12 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
         execute(
             context,
             &mut conn,
+            "seed asynchronous MV source rows",
+            "INSERT INTO orders VALUES (1, 10), (2, 20)",
+        )?;
+        execute(
+            context,
+            &mut conn,
             "create first asynchronous scheduler MV",
             "CREATE MATERIALIZED VIEW orders_mv_a DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND AS SELECT k1, v2 FROM orders",
         )?;
@@ -174,12 +180,6 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
         }
         context.action("verified scheduler permit admitted exactly one native refresh");
 
-        execute(
-            context,
-            &mut conn,
-            "seed asynchronous MV source rows",
-            "INSERT INTO orders VALUES (1, 10), (2, 20)",
-        )?;
         _hold.remove()?;
         context.action("released scheduler admission barrier");
         wait_for_rows(
