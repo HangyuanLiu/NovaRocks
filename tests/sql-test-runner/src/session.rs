@@ -21,28 +21,7 @@ use crate::types::*;
 use anyhow::{Context, Result, bail};
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder, Row as MysqlRow, Value as MysqlValue};
-use std::process::Command;
 use std::time::{Duration, Instant};
-
-pub fn build_statements(
-    sql: &str,
-    query_timeout: u64,
-    catalog: Option<&str>,
-    db: Option<&str>,
-) -> String {
-    let mut statements = Vec::new();
-    if let Some(c) = catalog {
-        statements.push(format!("SET catalog {};", c));
-    }
-    if let Some(d) = db
-        && !d.is_empty()
-    {
-        statements.push(format!("USE {};", d));
-    }
-    statements.push(format!("SET query_timeout={};", query_timeout));
-    statements.push(sql.to_string());
-    statements.join("\n")
-}
 
 pub fn mysql_value_to_string(value: &MysqlValue) -> String {
     match value {
@@ -448,38 +427,13 @@ fn normalize_statement_fragment(fragment: &str) -> Option<String> {
     }
 }
 
-pub fn run_mysql_sql(
-    conn: &ConnectionConfig,
-    sql: &str,
-    skip_column_names: bool,
-) -> Result<String> {
-    let mut cmd = Command::new(&conn.mysql);
-    cmd.arg(format!("-h{}", conn.host))
-        .arg(format!("-P{}", conn.port))
-        .arg(format!("-u{}", conn.user))
-        .arg("--batch")
-        .arg("--raw")
-        .arg("--default-character-set=utf8mb4");
-    if let Some(password) = conn.password.as_deref()
-        && !password.is_empty()
-    {
-        cmd.arg(format!("-p{}", password));
+pub fn run_mysql_sql(conn: &ConnectionConfig, query_timeout: u64, sql: &str) -> Result<String> {
+    let mut session = MysqlSession::new(conn)?;
+    let (ok, execution, message) = session.execute_query(query_timeout, sql, None);
+    if !ok {
+        bail!("mysql protocol command failed: {message}");
     }
-    if skip_column_names {
-        cmd.arg("--skip-column-names");
-    }
-    cmd.arg("-e").arg(sql);
-
-    let output = cmd
-        .output()
-        .with_context(|| format!("failed to execute mysql command: {}", conn.mysql))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        bail!("mysql command failed: {}", detail);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(execution.map_or_else(String::new, |execution| execution.text_output))
 }
 
 pub fn execute_suite_hook(
@@ -488,8 +442,7 @@ pub fn execute_suite_hook(
     hook: &SuiteHook,
     label: &str,
 ) -> Result<()> {
-    let sql = build_statements(&hook.sql, query_timeout, None, None);
-    run_mysql_sql(conn, &sql, true)
+    run_mysql_sql(conn, query_timeout, &hook.sql)
         .with_context(|| format!("{} suite hook failed: {}", label, hook.path.display()))?;
     Ok(())
 }
@@ -500,13 +453,8 @@ pub fn reset_case_database(
     db_name: &str,
     label: &str,
 ) -> Result<()> {
-    let sql = build_statements(
-        &format!("DROP DATABASE IF EXISTS `{db_name}` FORCE;\nCREATE DATABASE `{db_name}`;"),
-        query_timeout,
-        conn.catalog.as_deref(),
-        conn.db.as_deref(),
-    );
-    run_mysql_sql(conn, &sql, true)
+    let sql = format!("DROP DATABASE IF EXISTS `{db_name}` FORCE;\nCREATE DATABASE `{db_name}`;");
+    run_mysql_sql(conn, query_timeout, &sql)
         .with_context(|| format!("{} case database reset failed: {}", label, db_name))?;
     Ok(())
 }
@@ -517,13 +465,8 @@ pub fn drop_case_database(
     db_name: &str,
     label: &str,
 ) -> Result<()> {
-    let sql = build_statements(
-        &format!("DROP DATABASE IF EXISTS `{db_name}` FORCE;"),
-        query_timeout,
-        conn.catalog.as_deref(),
-        conn.db.as_deref(),
-    );
-    run_mysql_sql(conn, &sql, true)
+    let sql = format!("DROP DATABASE IF EXISTS `{db_name}` FORCE;");
+    run_mysql_sql(conn, query_timeout, &sql)
         .with_context(|| format!("{} case database cleanup failed: {}", label, db_name))?;
     Ok(())
 }
