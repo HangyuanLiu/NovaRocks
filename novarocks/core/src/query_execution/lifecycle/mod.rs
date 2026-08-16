@@ -29,8 +29,8 @@ pub mod terminal;
 pub use contract::{
     FragmentLiveObservation, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
     QueryControlEvent, QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryLifecycleError,
-    QueryLifecycleErrorCode, QueryTerminalAck, QueryTerminalIngress, QueryTerminalReportAck,
-    QueryTerminalReportOutcome, QueryTerminationAck, QueryTerminationReason,
+    QueryLifecycleErrorCode, QueryTerminalAck, QueryTerminalIngress, QueryTerminationAck,
+    QueryTerminationReason,
 };
 pub use contract::{
     decode_participant_terminal_outcome, decode_query_terminal_snapshot,
@@ -47,6 +47,7 @@ pub use manifest::{
     ParticipantManifestDigest, ParticipantQueryOptions, ParticipantRole, QueryControlEndpoint,
     RuntimeFilterContribution,
 };
+pub use novarocks_protocol::lifecycle::{QueryTerminalReportAck, QueryTerminalReportOutcome};
 pub use residual::QueryLifecycleTarget;
 pub use stage::{
     QueryLaunchBarrier, QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck,

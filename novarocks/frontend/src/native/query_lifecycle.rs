@@ -1,8 +1,9 @@
 //! Frontend-local lifecycle transport ports.
-use novarocks::query_execution::lifecycle::{
+use novarocks::query_execution::lifecycle::QueryLifecycleTarget;
+use novarocks_protocol::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
-    QueryInitRequest, QueryLifecycleTarget, QueryStageAck, QueryStageRequest, QueryStartAck,
-    QueryStartRequest, QueryTerminationAck,
+    QueryInitRequest, QueryStageAck, QueryStageRequest, QueryStartAck, QueryStartRequest,
+    QueryTerminationAck,
 };
 use std::sync::Arc;
 use std::time::Duration;

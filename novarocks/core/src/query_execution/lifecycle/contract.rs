@@ -298,8 +298,8 @@ impl QueryTerminalReportAck {
 pub trait QueryTerminalIngress: Send + Sync + 'static {
     fn report_query_terminal(
         &self,
-        outcome: ParticipantTerminalOutcome,
-    ) -> Result<QueryTerminalReportAck, QueryLifecycleError>;
+        outcome: novarocks_protocol::lifecycle::ParticipantTerminalOutcome,
+    ) -> Result<novarocks_protocol::lifecycle::QueryTerminalReportAck, QueryLifecycleError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

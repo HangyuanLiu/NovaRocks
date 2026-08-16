@@ -17,20 +17,15 @@ use novarocks::query_execution::backend::{BeId, HeartbeatOutcome, LiveBackendTar
 use novarocks::query_execution::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, decode_fetched_query_batch,
 };
-use novarocks::query_execution::lifecycle::contract::{
-    decode_abort_query_response, decode_query_control_event, decode_query_init_response,
-    decode_query_stage_response, decode_query_start_response, encode_abort_query_request,
-    encode_query_control_attach, encode_query_control_command, encode_query_init_request,
-    encode_query_stage_request, encode_query_start_request,
-};
-use novarocks::query_execution::lifecycle::{
-    QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
-    QueryInitRequest, QueryLifecycleTarget, QueryStageAck, QueryStageRequest, QueryStartAck,
-    QueryStartRequest, QueryTerminationAck, QueryTerminationReason,
-};
+use novarocks::query_execution::lifecycle::QueryLifecycleTarget;
 use novarocks::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
 use novarocks::service::observe_backend_heartbeat_rtt;
 use novarocks_protocol::common::UniqueId as ProtoUniqueId;
+use novarocks_protocol::lifecycle::{
+    QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
+    QueryInitRequest, QueryStageAck, QueryStageRequest, QueryStartAck, QueryStartRequest,
+    QueryTerminationAck, QueryTerminationReason,
+};
 use novarocks_protocol::novarocks::{
     EnsureConnectorExecutionBindingRequest, FetchResultRequest,
     QueryExecutionId as ProtoQueryExecutionId, RetireConnectorExecutionBindingRequest,
@@ -406,18 +401,22 @@ impl QueryLifecycleTransport for LifecycleTransport {
         timeout: Duration,
     ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
         validate_init_target(target, &request)?;
-        let identity = request.manifest().execution_id();
-        let digest = request.digest();
-        let wire = encode_query_init_request(&request).map_err(invalid)?;
+        let identity = request
+            .manifest()
+            .and_then(|manifest| manifest.execution_id())
+            .map_err(invalid)?;
+        let digest = request.digest().map_err(invalid)?;
         let response = unary(
             self.client(target)?,
             "InitQuery",
             timeout,
             |mut grpc, wire| async move { grpc.init_query(wire).await },
-            wire,
+            request.as_proto().clone(),
         )?;
-        let ack = decode_query_init_response(&response).map_err(invalid)?;
-        if ack.execution_id() != identity || ack.digest() != digest {
+        let ack = QueryInitAck::parse(response).map_err(invalid)?;
+        if ack.execution_id().map_err(invalid)? != identity
+            || ack.digest().map_err(invalid)? != digest
+        {
             return Err(invalid(
                 "InitQuery acknowledgement identity or digest mismatch",
             ));
@@ -431,8 +430,14 @@ impl QueryLifecycleTransport for LifecycleTransport {
         timeout: Duration,
     ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
         let (tx, rx) = mpsc::channel(QUERY_CONTROL_CHANNEL_CAPACITY);
-        tx.try_send(encode_query_control_attach(&attach))
-            .map_err(|error| unavailable(error.to_string()))?;
+        tx.try_send(novarocks_protocol::novarocks::QueryControlRequest {
+            command: Some(
+                novarocks_protocol::novarocks::query_control_request::Command::Attach(
+                    attach.as_proto().clone(),
+                ),
+            ),
+        })
+        .map_err(|error| unavailable(error.to_string()))?;
         let client = self.client(target)?.clone();
         let stream = data_block_on(async move {
             let deadline = tokio::time::Instant::now() + timeout;
@@ -479,9 +484,9 @@ impl QueryLifecycleTransport for LifecycleTransport {
             "StageFragments",
             timeout,
             |mut grpc, wire| async move { grpc.stage_fragments(wire).await },
-            encode_query_stage_request(request),
+            request.as_proto().clone(),
         )?;
-        let ack = decode_query_stage_response(&response).map_err(invalid)?;
+        let ack = QueryStageAck::parse(response).map_err(invalid)?;
         if ack.execution_id() != request.execution_id()
             || ack.digest_version() != request.digest_version()
             || ack.digest() != request.digest()
@@ -503,9 +508,9 @@ impl QueryLifecycleTransport for LifecycleTransport {
             "StartPreparedQuery",
             timeout,
             |mut grpc, wire| async move { grpc.start_prepared_query(wire).await },
-            encode_query_start_request(request),
+            request.as_proto().clone(),
         )?;
-        let ack = decode_query_start_response(&response).map_err(invalid)?;
+        let ack = QueryStartAck::parse(response).map_err(invalid)?;
         if ack.execution_id() != request.execution_id()
             || ack.digest_version() != request.digest_version()
             || ack.digest() != request.digest()
@@ -522,16 +527,16 @@ impl QueryLifecycleTransport for LifecycleTransport {
         request: QueryAbortRequest,
         timeout: Duration,
     ) -> Result<QueryTerminationAck, QueryLifecycleTransportError> {
-        let execution_id = request.execution_id();
+        let execution_id = request.execution_id().map_err(invalid)?;
         let response = unary(
             self.client(target)?,
             "AbortQuery",
             timeout,
             |mut grpc, wire| async move { grpc.abort_query(wire).await },
-            encode_abort_query_request(&request),
+            request.as_proto().clone(),
         )?;
-        let ack = decode_abort_query_response(&response).map_err(invalid)?;
-        if ack.execution_id() != execution_id {
+        let ack = QueryTerminationAck::parse(response).map_err(invalid)?;
+        if ack.execution_id().map_err(invalid)? != execution_id {
             return Err(invalid("AbortQuery acknowledgement execution id mismatch"));
         }
         Ok(ack)
@@ -633,7 +638,7 @@ impl QueryControlSession for ControlSession {
                 .unwrap_or_else(|| closed("query control stream is closed"))
         })?;
         sender
-            .try_send(encode_query_control_command(&command))
+            .try_send(command.as_proto().clone())
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => {
                     backpressure("query control command capacity is exhausted")
@@ -642,13 +647,26 @@ impl QueryControlSession for ControlSession {
                     closed("query control command stream is closed")
                 }
             })?;
-        match command {
-            QueryControlCommand::Heartbeat { sequence, .. } => {
-                state.pending.push_back(Pending::Heartbeat(sequence))
+        match command.as_proto().command.as_ref() {
+            Some(novarocks_protocol::novarocks::query_control_request::Command::Heartbeat(
+                heartbeat,
+            )) => state
+                .pending
+                .push_back(Pending::Heartbeat(heartbeat.sequence)),
+            Some(novarocks_protocol::novarocks::query_control_request::Command::Abort(_)) => {
+                state.pending.push_back(Pending::Abort)
             }
-            QueryControlCommand::Abort { .. } => state.pending.push_back(Pending::Abort),
-            QueryControlCommand::Finalize => state.pending.push_back(Pending::Finalize),
-            QueryControlCommand::TerminalAck { .. } => {}
+            Some(novarocks_protocol::novarocks::query_control_request::Command::Finalize(_)) => {
+                state.pending.push_back(Pending::Finalize)
+            }
+            Some(novarocks_protocol::novarocks::query_control_request::Command::TerminalAck(_)) => {
+            }
+            Some(novarocks_protocol::novarocks::query_control_request::Command::Attach(_))
+            | None => {
+                return Err(invalid(
+                    "validated query control command has an invalid variant",
+                ));
+            }
         }
         Ok(())
     }
@@ -688,7 +706,7 @@ async fn bridge(
 ) {
     loop {
         let next = match stream.message().await {
-            Ok(Some(response)) => decode_query_control_event(&response).map_err(invalid),
+            Ok(Some(response)) => QueryControlEvent::parse(response).map_err(invalid),
             Ok(None) => Err(closed("query control response stream closed")),
             Err(status) => Err(stream_status_error(status)),
         };
@@ -722,28 +740,48 @@ fn validate_control_event(
     let mut commands = commands
         .lock()
         .map_err(|_| unavailable("query control command lock poisoned"))?;
-    match event {
-        QueryControlEvent::HeartbeatAck { sequence } => match commands.pending.front().copied() {
-            Some(Pending::Heartbeat(expected)) if expected == *sequence => {
-                commands.pending.pop_front();
-                Ok(())
+    match event.as_proto().event.as_ref() {
+        Some(novarocks_protocol::novarocks::query_control_response::Event::HeartbeatAck(ack)) => {
+            match commands.pending.front().copied() {
+                Some(Pending::Heartbeat(expected)) if expected == ack.sequence => {
+                    commands.pending.pop_front();
+                    Ok(())
+                }
+                Some(other) => Err(invalid(format!(
+                    "unexpected heartbeat acknowledgement {} for {other:?}",
+                    ack.sequence
+                ))),
+                None => Err(invalid(format!(
+                    "received unsolicited heartbeat sequence {}",
+                    ack.sequence
+                ))),
             }
-            Some(other) => Err(invalid(format!(
-                "unexpected heartbeat acknowledgement {sequence} for {other:?}"
-            ))),
-            None => Err(invalid(format!(
-                "received unsolicited heartbeat sequence {sequence}"
-            ))),
-        },
-        QueryControlEvent::TerminationAccepted { reason } => {
+        }
+        Some(
+            novarocks_protocol::novarocks::query_control_response::Event::TerminationAccepted(
+                accepted,
+            ),
+        ) => {
+            let reason = QueryTerminationReason::try_from(accepted.reason).map_err(|_| {
+                invalid(format!(
+                    "unknown query termination reason {}",
+                    accepted.reason
+                ))
+            })?;
             let expected = commands
                 .pending
                 .iter()
                 .copied()
                 .find(|command| !matches!(command, Pending::Heartbeat(_)));
             let matches_reason = match (expected, reason) {
-                (Some(Pending::Abort), QueryTerminationReason::CoordinatorAbort)
-                | (Some(Pending::Finalize), QueryTerminationReason::CoordinatorFinalize) => true,
+                (
+                    Some(Pending::Abort),
+                    QueryTerminationReason::QueryTerminationCoordinatorAbort,
+                )
+                | (
+                    Some(Pending::Finalize),
+                    QueryTerminationReason::QueryTerminationCoordinatorFinalize,
+                ) => true,
                 (None, _) => {
                     commands
                         .pending
@@ -771,16 +809,20 @@ fn validate_init_target(
     target: QueryLifecycleTarget,
     request: &QueryInitRequest,
 ) -> Result<(), QueryLifecycleTransportError> {
-    let identity = request.manifest().backend();
+    let identity = request
+        .manifest()
+        .and_then(|manifest| manifest.backend())
+        .map_err(invalid)?;
     let id = usize::try_from(identity.backend_id())
         .map_err(|_| invalid("InitQuery backend id exceeds usize"))?;
-    let ip = IpAddr::from_str(identity.endpoint().host()).map_err(|error| {
+    let endpoint = identity.endpoint().map_err(invalid)?;
+    let ip = IpAddr::from_str(endpoint.host()).map_err(|error| {
         invalid(format!(
             "InitQuery backend endpoint is not an IP address: {error}"
         ))
     })?;
     if id != target.backend_idx()
-        || SocketAddr::new(ip, identity.endpoint().port()) != target.endpoint()
+        || SocketAddr::new(ip, endpoint.port()) != target.endpoint()
         || identity.start_epoch() != target.start_epoch()
     {
         return Err(invalid(

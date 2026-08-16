@@ -24,15 +24,12 @@ use std::time::{Duration, Instant};
 use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
-    FragmentLiveObservation, ParticipantManifestDigest, ParticipantTerminalOutcome,
-    QueryAbortRequest, QueryControlCommand, QueryControlEvent, QueryExecutionId,
     QueryLifecycleAbortOutcome, QueryLifecycleLease, QueryLifecycleLeaseGuard, QueryTerminalSet,
-    QueryTerminalSnapshot, QueryTerminationReason,
 };
-#[cfg(debug_assertions)]
-use novarocks::query_execution::lifecycle::{
-    FragmentTerminalOutcome, FragmentTerminalSnapshot, NegativeAttestation,
-    NegativeAttestationReason,
+use novarocks_protocol::lifecycle::{
+    FragmentLiveObservation, ParticipantManifestDigest, ParticipantTerminalOutcome,
+    QueryAbortRequest, QueryControlCommand, QueryControlEvent, QueryExecutionId, QueryTerminalAck,
+    QueryTerminationReason,
 };
 
 use super::barrier::FrontendQueryLifecycleConfig;
@@ -458,17 +455,35 @@ impl AttemptControl {
             .get(&backend_idx)
             .cloned();
         let valid = participant.is_some_and(|participant| {
+            let Ok(manifest) = participant.request.manifest() else {
+                return false;
+            };
+            let Ok(manifest_execution_id) = manifest.execution_id() else {
+                return false;
+            };
+            let Ok(observation_execution_id) = observation.execution_id() else {
+                return false;
+            };
+            let Ok(observation_digest) = observation.init_digest() else {
+                return false;
+            };
+            let Ok(observation_backend) = observation.backend() else {
+                return false;
+            };
+            let expected_fragment_instance_ids = manifest.expected_fragment_instance_ids();
+            let Ok(fragment_instance_id) = observation.fragment_instance_id() else {
+                return false;
+            };
+            let Ok(manifest_backend) = manifest.backend() else {
+                return false;
+            };
             participant.target == session.target
                 && participant.digest == session.digest
-                && participant.request.manifest().execution_id() == self.execution_id
-                && observation.execution_id() == self.execution_id
-                && observation.init_digest() == participant.digest
-                && observation.backend() == participant.request.manifest().backend()
-                && participant
-                    .request
-                    .manifest()
-                    .expected_fragment_instance_ids()
-                    .contains(&observation.fragment_instance_id())
+                && manifest_execution_id == self.execution_id
+                && observation_execution_id == self.execution_id
+                && observation_digest == participant.digest
+                && observation_backend == manifest_backend
+                && expected_fragment_instance_ids.contains(&fragment_instance_id)
         });
         if !valid {
             return self
@@ -490,7 +505,18 @@ impl AttemptControl {
                 .record_fragment_observation_outcome(FragmentObservationStoreOutcome::Rejected);
         }
 
-        let key = (backend_idx, observation.fragment_instance_id());
+        let fragment_instance_id = match observation.fragment_instance_id() {
+            Ok(fragment_instance_id) => fragment_instance_id,
+            Err(_) => {
+                return self.record_fragment_observation_outcome(
+                    FragmentObservationStoreOutcome::Rejected,
+                );
+            }
+        };
+        let key = (
+            backend_idx,
+            novarocks_types::UniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo),
+        );
         let outcome = {
             let mut state = self.observations.lock().expect("fragment observations");
             match state.latest.get(&key) {
@@ -582,15 +608,12 @@ impl AttemptControl {
         &self,
         outcome: ParticipantTerminalOutcome,
     ) -> Result<TerminalOutcomeStoreOutcome, DistributedQueryError> {
-        outcome
-            .validate()
-            .map_err(|error| failed(error.to_string()))?;
         if outcome.execution_id() != self.execution_id {
             return Err(contract_violation(
                 "query terminal outcome execution id differs from active lifecycle attempt",
             ));
         }
-        if matches!(outcome, ParticipantTerminalOutcome::NegativeAttestation(_)) {
+        if outcome.negative_attestation().is_some() {
             *self
                 .convergence_error_source
                 .lock()
@@ -612,7 +635,11 @@ impl AttemptControl {
             .iter()
             .find(|(_, participant)| {
                 participant.digest == outcome.init_digest()
-                    && participant.request.manifest().backend() == outcome.backend()
+                    && participant.request.manifest().is_ok_and(|manifest| {
+                        manifest
+                            .backend()
+                            .is_ok_and(|backend| backend == outcome.backend())
+                    })
             })
             .map(|(backend_idx, participant)| (*backend_idx, participant.clone()))
             .ok_or_else(|| {
@@ -620,7 +647,13 @@ impl AttemptControl {
                     "query terminal outcome is not owned by an init-attempted lifecycle participant",
                 )
             })?;
-        if participant.request.manifest().execution_id() != self.execution_id {
+        if participant
+            .request
+            .manifest()
+            .and_then(|manifest| manifest.execution_id())
+            .map_err(|error| contract_violation(error.to_string()))?
+            != self.execution_id
+        {
             return Err(contract_violation(
                 "init-attempted participant manifest execution id differs from active lifecycle attempt",
             ));
@@ -659,7 +692,7 @@ impl AttemptControl {
         if store_outcome == TerminalOutcomeStoreOutcome::Accepted {
             super::barrier::record_lifecycle_phase_marker_for_execution(
                 "terminal-retained",
-                self.execution_id,
+                marker_execution_id(self.execution_id)?,
             )?;
         }
         self.terminal.1.notify_all();
@@ -673,12 +706,6 @@ impl AttemptControl {
         outcome: ParticipantTerminalOutcome,
         conflict: ParticipantTerminalOutcome,
     ) -> Result<(), DistributedQueryError> {
-        outcome
-            .validate()
-            .map_err(|error| failed(error.to_string()))?;
-        conflict
-            .validate()
-            .map_err(|error| failed(error.to_string()))?;
         let backend_idx = self.terminal_outcome_backend_idx(&outcome)?;
         if self.terminal_outcome_backend_idx(&conflict)? != backend_idx {
             return Err(contract_violation(
@@ -722,17 +749,19 @@ impl AttemptControl {
         let snapshots = terminal
             .outcomes
             .values()
-            .map(|outcome| match outcome {
-                ParticipantTerminalOutcome::Proof { snapshot, .. } => Ok(snapshot.clone()),
-                ParticipantTerminalOutcome::NegativeAttestation(attestation) => {
-                    Err(failed(format!(
-                        "query lifecycle participant returned negative attestation: {:?}",
-                        attestation.reason()
-                    )))
-                }
+            .map(|outcome| match outcome.snapshot() {
+                Some(snapshot) => Ok(snapshot),
+                None => Err(failed(format!(
+                    "query lifecycle participant returned negative attestation: {:?}",
+                    outcome
+                        .negative_attestation()
+                        .expect("validated terminal outcome is proof or attestation")
+                        .reason()
+                ))),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        QueryTerminalSet::new(snapshots).map_err(|error| failed(error.to_string()))
+        QueryTerminalSet::from_protocol_snapshots(snapshots)
+            .map_err(|error| failed(error.to_string()))
     }
 
     #[cfg(test)]
@@ -904,9 +933,18 @@ impl AttemptControl {
             let stream_result = (|| {
                 session
                     .session
-                    .send(QueryControlCommand::Abort {
-                        reason: reason.to_string(),
-                    })
+                    .send(
+                        control_command(
+                            novarocks_protocol::novarocks::query_control_request::Command::Abort(
+                                novarocks_protocol::novarocks::QueryControlAbort {
+                                    reason: reason.to_string(),
+                                },
+                            ),
+                        )
+                        .map_err(|error| {
+                            (QueryLifecycleTransportErrorKind::InvalidResponse, error)
+                        })?,
+                    )
                     .map_err(|error| (error.kind(), error.to_string()))?;
                 match self.wait_for_termination(
                     participant.target.backend_idx(),
@@ -933,15 +971,18 @@ impl AttemptControl {
             }
         }
 
-        let request =
-            QueryAbortRequest::new(self.execution_id, participant.digest, reason.to_string())
-                .map_err(|error| {
-                    AbortCleanupFailure::new(
-                        participant,
-                        QueryLifecycleTransportErrorKind::InvalidResponse,
-                        error.to_string(),
-                    )
-                })?;
+        let request = QueryAbortRequest::parse(novarocks_protocol::novarocks::AbortQueryRequest {
+            execution_id: Some(self.execution_id.into()),
+            init_digest: participant.digest.as_bytes().to_vec(),
+            reason: reason.to_string(),
+        })
+        .map_err(|error| {
+            AbortCleanupFailure::new(
+                participant,
+                QueryLifecycleTransportErrorKind::InvalidResponse,
+                error.to_string(),
+            )
+        })?;
         let ack = self
             .transport
             .abort_query(participant.target, request, self.config.attach_timeout())
@@ -955,7 +996,14 @@ impl AttemptControl {
                     ),
                 )
             })?;
-        if ack.execution_id() != self.execution_id {
+        if ack.execution_id().map_err(|error| {
+            AbortCleanupFailure::new(
+                participant,
+                QueryLifecycleTransportErrorKind::InvalidResponse,
+                error.to_string(),
+            )
+        })? != self.execution_id
+        {
             return Err(AbortCleanupFailure::new(
                 participant,
                 QueryLifecycleTransportErrorKind::InvalidResponse,
@@ -972,7 +1020,11 @@ impl AttemptControl {
             backend_id = participant.target.backend_idx(),
             backend_start_epoch = participant.target.start_epoch(),
             participant_digest = %hex::encode(participant.digest.as_bytes()),
-            accepted_reason = ?ack.accepted_reason(),
+            accepted_reason = ?ack.accepted_reason().map_err(|error| AbortCleanupFailure::new(
+                participant,
+                QueryLifecycleTransportErrorKind::InvalidResponse,
+                error.to_string(),
+            ))?,
             "frontend query lifecycle unary abort accepted"
         );
         Ok(())
@@ -1073,16 +1125,20 @@ impl AttemptControl {
             let snapshots = terminal
                 .outcomes
                 .values()
-                .map(|outcome| match outcome {
-                    ParticipantTerminalOutcome::Proof { snapshot, .. } => Ok(snapshot.clone()),
-                    ParticipantTerminalOutcome::NegativeAttestation(attestation) => Err(format!(
+                .map(|outcome| match outcome.snapshot() {
+                    Some(snapshot) => Ok(snapshot),
+                    None => Err(format!(
                         "query lifecycle participant returned negative attestation: {:?}",
-                        attestation.reason()
+                        outcome
+                            .negative_attestation()
+                            .expect("validated terminal outcome is proof or attestation")
+                            .reason()
                     )),
                 })
                 .collect::<Result<Vec<_>, _>>();
             Some(snapshots.and_then(|snapshots| {
-                QueryTerminalSet::new(snapshots).map_err(|error| error.to_string())
+                QueryTerminalSet::from_protocol_snapshots(snapshots)
+                    .map_err(|error| error.to_string())
             }))
         });
         result.unwrap_or_else(|| Err(self.no_outcome_error()))
@@ -1222,7 +1278,11 @@ impl AttemptControl {
                     scope.spawn(move || {
                         session
                             .session
-                            .send(QueryControlCommand::Finalize)
+                            .send(control_command(
+                                novarocks_protocol::novarocks::query_control_request::Command::Finalize(
+                                    novarocks_protocol::novarocks::QueryControlFinalize {},
+                                ),
+                            )?)
                             .map_err(|error| error.to_string())
                     })
                 })
@@ -1360,11 +1420,16 @@ fn control_event_reader(control: Weak<AttemptControl>, session: ActiveSession) {
                 return;
             }
         };
-        if let QueryControlEvent::LocalFailure { code, detail } = event {
+        if let Some(novarocks_protocol::novarocks::query_control_response::Event::LocalFailure(
+            failure,
+        )) = event.as_proto().event.as_ref()
+        {
             control.supervisor_failed(
                 format!(
-                    "query lifecycle local failure on backend {} ({code}): {detail}",
-                    session.target.backend_idx()
+                    "query lifecycle local failure on backend {} ({}): {}",
+                    session.target.backend_idx(),
+                    failure.code,
+                    failure.detail
                 ),
                 SupervisorFailureKind::LocalFailure,
             );
@@ -1374,7 +1439,10 @@ fn control_event_reader(control: Weak<AttemptControl>, session: ActiveSession) {
             // leaves the stream.
             continue;
         }
-        let terminal_outcome = matches!(&event, QueryControlEvent::TerminalOutcome { .. });
+        let terminal_outcome = matches!(
+            event.as_proto().event.as_ref(),
+            Some(novarocks_protocol::novarocks::query_control_response::Event::TerminalOutcome(_))
+        );
         if let Err(error) = control.handle_control_event(&session, event) {
             control.record_reader_failure(error);
             return;
@@ -1397,18 +1465,20 @@ impl AttemptControl {
         session: &ActiveSession,
         event: QueryControlEvent,
     ) -> Result<(), String> {
-        match event {
-            QueryControlEvent::HeartbeatAck { sequence } => {
+        match event.as_proto().event.as_ref() {
+            Some(novarocks_protocol::novarocks::query_control_response::Event::HeartbeatAck(
+                heartbeat,
+            )) => {
                 let mut terminal = self.terminal.0.lock().expect("query terminal state");
                 let prior = terminal
                     .heartbeat_acks
                     .entry(session.target.backend_idx())
                     .or_insert(0);
-                *prior = (*prior).max(sequence);
+                *prior = (*prior).max(heartbeat.sequence);
                 self.terminal.1.notify_all();
                 Ok(())
             }
-            QueryControlEvent::LocalDrained => {
+            Some(novarocks_protocol::novarocks::query_control_response::Event::LocalDrained(_)) => {
                 let newly_drained = self
                     .terminal
                     .0
@@ -1422,7 +1492,13 @@ impl AttemptControl {
                 self.terminal.1.notify_all();
                 Ok(())
             }
-            QueryControlEvent::TerminationAccepted { reason } => {
+            Some(
+                novarocks_protocol::novarocks::query_control_response::Event::TerminationAccepted(
+                    accepted,
+                ),
+            ) => {
+                let reason = QueryTerminationReason::try_from(accepted.reason)
+                    .map_err(|_| format!("unknown query termination reason {}", accepted.reason))?;
                 self.terminal
                     .0
                     .lock()
@@ -1432,11 +1508,23 @@ impl AttemptControl {
                 self.terminal.1.notify_all();
                 Ok(())
             }
-            QueryControlEvent::FragmentObservation { observation } => {
+            Some(
+                novarocks_protocol::novarocks::query_control_response::Event::FragmentObservation(
+                    observation,
+                ),
+            ) => {
+                let observation = FragmentLiveObservation::parse(observation.clone())
+                    .map_err(|error| error.to_string())?;
                 let _ = self.store_fragment_observation(session, observation);
                 Ok(())
             }
-            QueryControlEvent::TerminalOutcome { outcome } => {
+            Some(
+                novarocks_protocol::novarocks::query_control_response::Event::TerminalOutcome(
+                    outcome,
+                ),
+            ) => {
+                let outcome = ParticipantTerminalOutcome::parse(outcome.clone())
+                    .map_err(|error| error.to_string())?;
                 if let Some(scope) = claim_terminal_snapshot_conflict(session, &outcome)? {
                     let conflict = conflicting_terminal_outcome(&outcome)?;
                     eprintln!(
@@ -1460,11 +1548,7 @@ impl AttemptControl {
                 }
                 session
                     .session
-                    .send(QueryControlCommand::TerminalAck {
-                        ack: novarocks::query_execution::lifecycle::QueryTerminalAck::from_outcome(
-                            &outcome,
-                        ),
-                    })
+                    .send(terminal_ack_command(&outcome)?)
                     .map_err(|error| {
                         format!(
                             "query lifecycle terminal ACK failed for backend {}: {error}",
@@ -1472,14 +1556,21 @@ impl AttemptControl {
                         )
                     })
             }
-            QueryControlEvent::LocalFailure { code, detail } => Err(format!(
-                "query lifecycle local failure on backend {} ({code}): {detail}",
-                session.target.backend_idx()
+            Some(novarocks_protocol::novarocks::query_control_response::Event::LocalFailure(
+                failure,
+            )) => Err(format!(
+                "query lifecycle local failure on backend {} ({}): {}",
+                session.target.backend_idx(),
+                failure.code,
+                failure.detail
             )),
-            QueryControlEvent::ControlReady => Err(format!(
-                "backend {} emitted duplicate ControlReady after attachment",
-                session.target.backend_idx()
-            )),
+            Some(novarocks_protocol::novarocks::query_control_response::Event::ControlReady(_)) => {
+                Err(format!(
+                    "backend {} emitted duplicate ControlReady after attachment",
+                    session.target.backend_idx()
+                ))
+            }
+            None => Err("validated query control event is missing its oneof".to_string()),
         }
     }
 
@@ -1588,13 +1679,8 @@ fn claim_terminal_snapshot_conflict(
 }
 
 #[cfg(debug_assertions)]
-fn protocol_execution_id(
-    execution_id: QueryExecutionId,
-) -> Result<novarocks_protocol::lifecycle::QueryExecutionId, String> {
-    let attempt = novarocks_protocol::lifecycle::AttemptId::new(execution_id.attempt_id().get())
-        .map_err(|error| error.to_string())?;
-    novarocks_protocol::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
-        .map_err(|error| error.to_string())
+fn protocol_execution_id(execution_id: QueryExecutionId) -> Result<QueryExecutionId, String> {
+    Ok(execution_id)
 }
 
 #[cfg(not(debug_assertions))]
@@ -1609,42 +1695,28 @@ fn claim_terminal_snapshot_conflict(
 fn conflicting_terminal_outcome(
     outcome: &ParticipantTerminalOutcome,
 ) -> Result<ParticipantTerminalOutcome, String> {
-    let ParticipantTerminalOutcome::Proof { snapshot, .. } = outcome else {
-        return Ok(ParticipantTerminalOutcome::negative_attestation(
-            NegativeAttestation::new(
-                outcome.execution_id(),
-                outcome.backend().clone(),
-                outcome.init_digest(),
-                NegativeAttestationReason::TerminalStateInvalid,
-                "same participant produced a conflicting terminal outcome".to_string(),
-            ),
-        ));
-    };
-    let mut fragments = snapshot.fragments().to_vec();
-    let first = fragments.first().cloned().ok_or_else(|| {
-        "terminal snapshot conflict fault requires a fragment participant".to_string()
-    })?;
-    fragments[0] = FragmentTerminalSnapshot::new_with_profile_telemetry(
-        first.fragment_instance_id(),
-        first.backend_num(),
-        FragmentTerminalOutcome::Failed {
-            code: "RUNNER_INJECTED_TERMINAL_CONFLICT".to_string(),
-            detail: "same participant produced a conflicting terminal snapshot".to_string(),
+    let attestation = novarocks_protocol::lifecycle::NegativeAttestation::seal(
+        novarocks_protocol::novarocks::NegativeAttestation {
+            execution_id: Some(outcome.execution_id().into()),
+            backend: Some(outcome.backend().as_proto().clone()),
+            init_digest: outcome.init_digest().as_bytes().to_vec(),
+            reason: novarocks_protocol::novarocks::NegativeAttestationReason::TerminalStateInvalid
+                as i32,
+            detail: "same participant produced a conflicting terminal outcome".to_string(),
             detail_truncated: false,
+            digest: Vec::new(),
         },
-        first.sink().clone(),
-        first.profile_telemetry().clone(),
     )
     .map_err(|error| error.to_string())?;
-    let conflict = QueryTerminalSnapshot::new_with_profile_telemetry(
-        snapshot.execution_id(),
-        snapshot.backend().clone(),
-        snapshot.init_digest(),
-        fragments,
-        snapshot.profile_contribution_telemetry().clone(),
-    )
-    .map_err(|error| error.to_string())?;
-    ParticipantTerminalOutcome::proof(conflict).map_err(|error| error.to_string())
+    ParticipantTerminalOutcome::parse(novarocks_protocol::novarocks::ParticipantTerminalOutcome {
+        outcome: Some(
+            novarocks_protocol::novarocks::participant_terminal_outcome::Outcome::NegativeAttestation(
+                attestation.as_proto().clone(),
+            ),
+        ),
+        snapshot: None,
+    })
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(not(debug_assertions))]
@@ -1748,10 +1820,21 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
         };
         let sessions = control.sessions();
         for session in &sessions {
-            if let Err(error) = session.session.send(QueryControlCommand::Heartbeat {
-                sequence,
-                sent_mono_ns: started.elapsed().as_nanos() as u64,
-            }) {
+            let command = match control_command(
+                novarocks_protocol::novarocks::query_control_request::Command::Heartbeat(
+                    novarocks_protocol::novarocks::QueryControlHeartbeat {
+                        sequence,
+                        sent_mono_ns: started.elapsed().as_nanos() as u64,
+                    },
+                ),
+            ) {
+                Ok(command) => command,
+                Err(error) => {
+                    control.supervisor_failed(error, SupervisorFailureKind::CoordinatorLost);
+                    return;
+                }
+            };
+            if let Err(error) = session.session.send(command) {
                 if matches!(error.kind(), QueryLifecycleTransportErrorKind::StreamClosed) {
                     control.supervisor_failed(
                         format!(
@@ -1887,4 +1970,47 @@ fn failed(message: impl Into<String>) -> DistributedQueryError {
 
 fn contract_violation(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
+}
+
+/// Phase-marker diagnostics are a Core-local orchestration residual. The
+/// native transport carries the Protocol identity exclusively; this conversion
+/// exists only until the marker registry moves with the remaining lease API in
+/// CLS-R2.
+fn marker_execution_id(
+    execution_id: QueryExecutionId,
+) -> Result<novarocks::query_execution::lifecycle::QueryExecutionId, DistributedQueryError> {
+    let attempt =
+        novarocks::query_execution::lifecycle::AttemptId::new(execution_id.attempt_id().get())
+            .map_err(|error| contract_violation(error.to_string()))?;
+    novarocks::query_execution::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
+        .map_err(|error| contract_violation(error.to_string()))
+}
+
+fn control_command(
+    command: novarocks_protocol::novarocks::query_control_request::Command,
+) -> Result<QueryControlCommand, String> {
+    QueryControlCommand::parse(novarocks_protocol::novarocks::QueryControlRequest {
+        command: Some(command),
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn terminal_ack_command(
+    outcome: &ParticipantTerminalOutcome,
+) -> Result<QueryControlCommand, String> {
+    let snapshot = outcome.snapshot().ok_or_else(|| {
+        "negative terminal attestation cannot be acknowledged as a snapshot".to_string()
+    })?;
+    let ack = QueryTerminalAck::parse(novarocks_protocol::novarocks::QueryControlTerminalAck {
+        execution_id: Some(outcome.execution_id().into()),
+        init_digest: outcome.init_digest().as_bytes().to_vec(),
+        snapshot_version: snapshot.version(),
+        snapshot_digest: outcome.digest().to_vec(),
+    })
+    .map_err(|error| error.to_string())?;
+    control_command(
+        novarocks_protocol::novarocks::query_control_request::Command::TerminalAck(
+            ack.as_proto().clone(),
+        ),
+    )
 }

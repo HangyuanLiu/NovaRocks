@@ -40,6 +40,10 @@ use novarocks::query_execution::fragment_transport::{FetchOutcome, FragmentDispa
 use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId, QueryInitOptions};
 use novarocks::query_execution::write::WriteTerminalBuilder;
 use novarocks::query_execution::write_operation::ConnectorWriteOperationSession;
+use novarocks_protocol::lifecycle::{
+    AttemptId as ProtocolAttemptId, QueryExecutionId as ProtocolQueryExecutionId,
+    QueryOptions as ProtocolQueryOptions,
+};
 use novarocks_spi::connector::ConnectorWriteLease;
 use novarocks_types::QueryId;
 
@@ -57,6 +61,7 @@ use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use crate::connector::{
     ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
 };
+use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::transport::{
     new_connector_binding_dispatcher, new_fragment_dispatcher, new_query_lifecycle_transport,
@@ -860,10 +865,30 @@ impl FrontendDistributedQueryCoordinator {
             self.lifecycle_config,
         )
         .with_cancellation(parts.cancellation.clone());
+        let protocol_attempt =
+            ProtocolAttemptId::new(execution_id.attempt_id().get()).map_err(|error| {
+                failed(format!(
+                    "query attempt protocol projection is invalid: {error}"
+                ))
+            })?;
+        let protocol_execution_id =
+            ProtocolQueryExecutionId::new(execution_id.query_id(), protocol_attempt).map_err(
+                |error| {
+                    failed(format!(
+                        "query execution protocol projection is invalid: {error}"
+                    ))
+                },
+            )?;
         let init_options = QueryInitOptions::new(
-            execution_id,
+            protocol_execution_id,
             backend_services.live_backends,
             &parts.options,
+            ProtocolQueryOptions::parse(encode_query_options(parts.options.runtime_options()))
+                .map_err(|error| {
+                    failed(format!(
+                        "query options protocol projection is invalid: {error}"
+                    ))
+                })?,
             query_deadline_unix_ms,
             self.pre_start_timeout,
             self.report_endpoint.resolve()?,

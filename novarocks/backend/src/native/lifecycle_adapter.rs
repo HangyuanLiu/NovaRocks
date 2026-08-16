@@ -735,7 +735,7 @@ pub fn status_from_lifecycle_error(error: QueryLifecycleError) -> tonic::Status 
     }
 }
 
-fn status_from_contract_error(error: ContractError) -> tonic::Status {
+pub(crate) fn status_from_contract_error(error: ContractError) -> tonic::Status {
     let detail = error.detail().to_string();
     match error.code() {
         ContractErrorCode::InvalidValue | ContractErrorCode::VersionMismatch => {

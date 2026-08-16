@@ -22,10 +22,14 @@ use std::time::{Duration, Instant};
 use novarocks::query_execution::cancellation::QueryCancellationView;
 use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use novarocks::query_execution::lifecycle::{
-    QueryControlAttach, QueryControlEvent, QueryExecutionId, QueryInitBarrier, QueryInitOutcome,
-    QueryInitPlan, QueryLaunchBarrier, QueryLifecycleLease, QueryStageAck, QueryStartAck,
+    QueryExecutionId, QueryInitBarrier, QueryInitPlan, QueryLaunchBarrier, QueryLifecycleLease,
     StageBatch,
 };
+use novarocks_protocol::lifecycle::{
+    AttemptId as ProtocolAttemptId, QueryControlAttach, QueryInitOutcome, QueryStageAck,
+    QueryStageRequest, QueryStartAck, QueryStartRequest,
+};
+use novarocks_protocol::novarocks as protocol_wire;
 
 use super::QueryLifecycleTransport;
 use super::lease::{
@@ -287,8 +291,9 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
             "frontend query lifecycle attempt created"
         );
 
+        let wire_execution_id = protocol_execution_id(execution_id).map_err(contract_error)?;
         let control = AttemptControl::new(
-            execution_id,
+            wire_execution_id,
             Arc::clone(&self.transport),
             Arc::downgrade(&self.registry),
             self.config,
@@ -320,7 +325,7 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
         let active_control: Arc<dyn ActiveQueryAttemptControl> = control.clone();
         let registry_binding = match self
             .registry
-            .bind_active_attempt(execution_id, active_control)
+            .bind_active_attempt(wire_execution_id, active_control)
         {
             Ok(binding) => binding,
             Err(error) => {
@@ -454,12 +459,20 @@ fn stage_one(
     config: FrontendQueryLifecycleConfig,
 ) -> Result<(), (usize, String)> {
     let target = batch.binding().target();
-    let request = batch.request();
-    let first = transport.stage_fragments(target, request, config.stage_rpc_timeout());
+    let request = protocol_stage_request(batch.request()).map_err(|error| {
+        (
+            target.backend_idx(),
+            format!(
+                "backend {} StageFragments request is invalid: {error}",
+                target.backend_idx()
+            ),
+        )
+    })?;
+    let first = transport.stage_fragments(target, &request, config.stage_rpc_timeout());
     let ack = match first {
         Ok(ack) => ack,
         Err(error) if error.is_unknown_stage_or_start_outcome() => transport
-            .stage_fragments(target, request, config.stage_rpc_timeout())
+            .stage_fragments(target, &request, config.stage_rpc_timeout())
             .map_err(|retry| (target.backend_idx(), format!(
                 "backend {} StageFragments retry failed after unknown outcome ({error}): {retry}",
                 target.backend_idx()
@@ -468,7 +481,7 @@ fn stage_one(
             "backend {} StageFragments failed: {error}", target.backend_idx()
         ))),
     };
-    validate_stage_ack(target.backend_idx(), request, &ack)
+    validate_stage_ack(target.backend_idx(), &request, &ack)
 }
 
 fn start_one(
@@ -477,7 +490,15 @@ fn start_one(
     config: FrontendQueryLifecycleConfig,
 ) -> Result<(), (usize, String)> {
     let target = batch.binding().target();
-    let request = batch.start_request();
+    let request = protocol_start_request(&batch.start_request()).map_err(|error| {
+        (
+            target.backend_idx(),
+            format!(
+                "backend {} StartPreparedQuery request is invalid: {error}",
+                target.backend_idx()
+            ),
+        )
+    })?;
     let first = transport.start_prepared_query(target, &request, config.start_rpc_timeout());
     let ack = match first {
         Ok(ack) => ack,
@@ -496,7 +517,7 @@ fn start_one(
 
 fn validate_stage_ack(
     backend_idx: usize,
-    request: &novarocks::query_execution::lifecycle::QueryStageRequest,
+    request: &QueryStageRequest,
     ack: &QueryStageAck,
 ) -> Result<(), (usize, String)> {
     if ack.execution_id() != request.execution_id()
@@ -523,7 +544,7 @@ fn validate_stage_ack(
 
 fn validate_start_ack(
     backend_idx: usize,
-    request: &novarocks::query_execution::lifecycle::QueryStartRequest,
+    request: &QueryStartRequest,
     ack: &QueryStartAck,
 ) -> Result<(), (usize, String)> {
     if ack.execution_id() != request.execution_id()
@@ -546,6 +567,62 @@ fn validate_start_ack(
         ));
     }
     Ok(())
+}
+
+/// The coordinator still receives the Core-owned stage batching model while
+/// CLS-R1 retires it. The FE owns this one-way projection into the canonical
+/// Protocol carrier immediately before transport; it deliberately does not
+/// route through a Core lifecycle codec.
+fn protocol_stage_request(
+    request: &novarocks::query_execution::lifecycle::QueryStageRequest,
+) -> Result<QueryStageRequest, String> {
+    QueryStageRequest::parse(protocol_wire::StageFragmentsRequest {
+        execution_id: Some(protocol_execution_id(request.execution_id())?.to_proto()),
+        init_digest: request.init_digest().as_bytes().to_vec(),
+        stage_digest_version: request.digest_version().get(),
+        stage_digest: request.digest().as_bytes().to_vec(),
+        fragments: request
+            .fragments()
+            .iter()
+            .map(|fragment| protocol_wire::StageFragment {
+                plan: Some(fragment.plan().clone()),
+                instance_params: Some(fragment.instance_params().clone()),
+            })
+            .collect(),
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// See [`protocol_stage_request`]. Start has no fragments but must preserve
+/// the same execution and stage-digest fence before it reaches transport.
+fn protocol_start_request(
+    request: &novarocks::query_execution::lifecycle::QueryStartRequest,
+) -> Result<QueryStartRequest, String> {
+    QueryStartRequest::parse(protocol_wire::StartPreparedQueryRequest {
+        execution_id: Some(protocol_execution_id(request.execution_id())?.to_proto()),
+        stage_digest_version: request.digest_version().get(),
+        stage_digest: request.digest().as_bytes().to_vec(),
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn protocol_execution_id(
+    execution_id: QueryExecutionId,
+) -> Result<novarocks_protocol::lifecycle::QueryExecutionId, String> {
+    let attempt = ProtocolAttemptId::new(execution_id.attempt_id().get())
+        .map_err(|error| error.to_string())?;
+    novarocks_protocol::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
+        .map_err(|error| error.to_string())
+}
+
+fn participant_execution_id(
+    participant: &MaterializedParticipant,
+) -> novarocks_protocol::lifecycle::QueryExecutionId {
+    participant
+        .request
+        .manifest()
+        .and_then(|manifest| manifest.execution_id())
+        .expect("materialized Protocol init request retains its validated execution id")
 }
 
 #[cfg(debug_assertions)]
@@ -673,10 +750,10 @@ fn init_all(
                     let result = init_one(transport, participant, config.init_rpc_timeout());
                     let latency = started.elapsed();
                     match &result {
-                        Ok(QueryInitOutcome::Applied) => {
+                        Ok(QueryInitOutcome::QueryInitApplied) => {
                             metrics.observe_init(true, false, false, false, latency)
                         }
-                        Ok(QueryInitOutcome::AlreadyApplied) => {
+                        Ok(QueryInitOutcome::QueryInitAlreadyApplied) => {
                             metrics.observe_init(false, true, false, false, latency)
                         }
                         Ok(_) => metrics.observe_init(false, false, false, false, latency),
@@ -695,9 +772,9 @@ fn init_all(
                         metrics.backend_epoch_mismatch();
                     }
                     tracing::info!(
-                        query_id_high = participant.request.manifest().execution_id().query_id().high(),
-                        query_id_low = participant.request.manifest().execution_id().query_id().low(),
-                        attempt_id = participant.request.manifest().execution_id().attempt_id().get(),
+                        query_id_high = participant_execution_id(participant).query_id().high(),
+                        query_id_low = participant_execution_id(participant).query_id().low(),
+                        attempt_id = participant_execution_id(participant).attempt_id().get(),
                         backend_id = participant.target.backend_idx(),
                         backend_start_epoch = participant.target.start_epoch(),
                         participant_digest = %hex::encode(participant.digest.as_bytes()),
@@ -789,13 +866,23 @@ fn init_one(
             )));
         }
     };
-    if ack.execution_id() != participant.request.manifest().execution_id() {
+    let expected_execution_id = participant_execution_id(participant);
+    if ack
+        .execution_id()
+        .map_err(|error| InitFailure::failed(error.to_string()))?
+        != expected_execution_id
+    {
         return Err(InitFailure::uncertain(format!(
             "backend {} InitAck execution id mismatch",
             participant.target.backend_idx()
         )));
     }
-    if ack.digest() != participant.digest {
+    if ack
+        .digest()
+        .map_err(|error| InitFailure::failed(error.to_string()))?
+        .as_bytes()
+        != participant.digest.as_bytes()
+    {
         return Err(InitFailure::manifest_conflict(
             format!(
                 "backend {} InitAck digest mismatch",
@@ -804,23 +891,30 @@ fn init_one(
             true,
         ));
     }
-    if !ack.outcome().is_ready() {
+    let outcome = ack
+        .outcome()
+        .map_err(|error| InitFailure::failed(error.to_string()))?;
+    if !matches!(
+        outcome,
+        QueryInitOutcome::QueryInitApplied | QueryInitOutcome::QueryInitAlreadyApplied
+    ) {
         let message = format!(
             "backend {} InitQuery rejected with {:?}",
             participant.target.backend_idx(),
-            ack.outcome()
+            outcome
         );
-        return match ack.outcome() {
-            QueryInitOutcome::RejectedConflict | QueryInitOutcome::RejectedInvalidManifest => {
+        return match outcome {
+            QueryInitOutcome::QueryInitRejectedConflict
+            | QueryInitOutcome::QueryInitRejectedInvalidManifest => {
                 Err(InitFailure::manifest_conflict(message, false))
             }
-            QueryInitOutcome::RejectedStaleBackend => {
+            QueryInitOutcome::QueryInitRejectedStaleBackend => {
                 Err(InitFailure::backend_epoch_mismatch(message))
             }
             _ => Err(InitFailure::failed(message)),
         };
     }
-    Ok(ack.outcome())
+    Ok(outcome)
 }
 
 pub(super) fn attach_all(
@@ -837,14 +931,13 @@ pub(super) fn attach_all(
             .map(|participant| {
                 scope.spawn(move || {
                     let started = Instant::now();
-                    let outcome =
-                        attach_one(transport, participant, frontend_owner_epoch, config);
+                    let outcome = attach_one(transport, participant, frontend_owner_epoch, config);
                     let latency = started.elapsed();
                     metrics.observe_attach(outcome.is_ok(), latency);
                     tracing::info!(
-                        query_id_high = participant.request.manifest().execution_id().query_id().high(),
-                        query_id_low = participant.request.manifest().execution_id().query_id().low(),
-                        attempt_id = participant.request.manifest().execution_id().attempt_id().get(),
+                        query_id_high = participant_execution_id(participant).query_id().high(),
+                        query_id_low = participant_execution_id(participant).query_id().low(),
+                        attempt_id = participant_execution_id(participant).attempt_id().get(),
                         backend_id = participant.target.backend_idx(),
                         backend_start_epoch = participant.target.start_epoch(),
                         participant_digest = %hex::encode(participant.digest.as_bytes()),
@@ -892,11 +985,11 @@ fn attach_one(
     frontend_owner_epoch: u64,
     config: FrontendQueryLifecycleConfig,
 ) -> Result<ActiveSession, (Option<ActiveSession>, String)> {
-    let attach = QueryControlAttach::new(
-        participant.request.manifest().execution_id(),
-        participant.digest,
+    let attach = QueryControlAttach::parse(protocol_wire::QueryControlAttach {
+        execution_id: Some(participant_execution_id(participant).to_proto()),
+        init_digest: participant.digest.as_bytes().to_vec(),
         frontend_owner_epoch,
-    )
+    })
     .map_err(|error| (None, error.to_string()))?;
     let session = transport
         .attach_control(participant.target, attach, config.attach_timeout())
@@ -911,7 +1004,14 @@ fn attach_one(
         })?;
     let active = ActiveSession::new(participant.target, participant.digest, session);
     match active.recv(config.attach_timeout()) {
-        Ok(QueryControlEvent::ControlReady) => {
+        Ok(event)
+            if matches!(
+                event.as_proto().event.as_ref(),
+                Some(protocol_wire::query_control_response::Event::ControlReady(
+                    _
+                ))
+            ) =>
+        {
             if let Err(error) = record_control_ready_marker(participant) {
                 return Err((Some(active), error));
             }
@@ -939,7 +1039,7 @@ fn record_control_ready_marker(participant: &MaterializedParticipant) -> Result<
     let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(());
     };
-    let execution_id = participant.request.manifest().execution_id();
+    let execution_id = participant_execution_id(participant);
     let backend_index = participant.target.backend_idx();
     let trigger_path = root.join("fe-crash-after-control-ready.trigger");
     let contents = match std::fs::read_to_string(&trigger_path) {

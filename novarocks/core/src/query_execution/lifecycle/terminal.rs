@@ -28,6 +28,7 @@ use crate::common::types::UniqueId;
 use crate::runtime::sink_commit::SinkCommitReportSnapshot;
 use novarocks_execution::runtime::fragment::fact::{FragmentOutcome, FragmentTerminalFact};
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
+use novarocks_protocol::lifecycle::QueryTerminalSnapshot as ProtocolQueryTerminalSnapshot;
 use novarocks_protocol::novarocks;
 
 use super::{
@@ -1915,6 +1916,20 @@ impl QueryTerminalSet {
             }
         }
         Ok(Self { snapshots })
+    }
+
+    /// CLS-R1 keeps the lease aggregate in Core while native ingress carries
+    /// only the validated Protocol snapshot.  Decode at this Core-owned
+    /// orchestration boundary so Frontend never regains a lifecycle codec.
+    /// CLS-R2 will retire this compatibility input with the lease API.
+    pub fn from_protocol_snapshots(
+        snapshots: Vec<ProtocolQueryTerminalSnapshot>,
+    ) -> Result<Self, QueryLifecycleError> {
+        snapshots
+            .into_iter()
+            .map(|snapshot| super::contract::decode_query_terminal_snapshot(snapshot.as_proto()))
+            .collect::<Result<Vec<_>, _>>()
+            .and_then(Self::new)
     }
 
     pub fn snapshots(&self) -> &[QueryTerminalSnapshot] {

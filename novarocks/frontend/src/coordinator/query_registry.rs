@@ -24,9 +24,8 @@ use novarocks::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
 use novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot;
-use novarocks::query_execution::lifecycle::{ParticipantTerminalOutcome, QueryExecutionId};
+use novarocks_protocol::lifecycle::{ParticipantTerminalOutcome, QueryExecutionId};
 use novarocks_types::QueryId;
-use novarocks_types::UniqueId;
 
 type QueryKey = (i64, i64);
 
@@ -768,12 +767,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use novarocks::query_execution::lifecycle::{
-        AttemptId, FragmentTerminalOutcome, FragmentTerminalSnapshot, ParticipantBackendIdentity,
-        ParticipantManifestDigest, ParticipantTerminalOutcome, QueryControlEndpoint,
-        QueryTerminalSnapshot,
+    use novarocks_protocol::lifecycle::{
+        AttemptId, ParticipantTerminalOutcome, QueryTerminalSnapshot, TerminalizationProof,
     };
-    use novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
+    use novarocks_protocol::{common, novarocks as proto};
 
     struct RetainedControl {
         execution_id: QueryExecutionId,
@@ -810,28 +807,72 @@ mod tests {
         }
     }
 
-    fn terminal_snapshot(execution_id: QueryExecutionId) -> QueryTerminalSnapshot {
-        let backend = ParticipantBackendIdentity::new(
-            7,
-            QueryControlEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
-            11,
-        )
-        .expect("backend identity");
-        let fragment = FragmentTerminalSnapshot::new(
-            UniqueId::new(1, 2),
-            7,
-            FragmentTerminalOutcome::Succeeded,
-            SinkCommitReportSnapshot::default(),
-            None,
-        )
-        .expect("fragment snapshot");
-        QueryTerminalSnapshot::new(
-            execution_id,
-            backend,
-            ParticipantManifestDigest::new([3; 32]),
-            vec![fragment],
-        )
-        .expect("terminal snapshot")
+    fn terminal_outcome(execution_id: QueryExecutionId) -> ParticipantTerminalOutcome {
+        let backend = proto::ParticipantBackendIdentity {
+            backend_id: 7,
+            endpoint: Some(proto::QueryControlEndpoint {
+                host: "127.0.0.1".into(),
+                port: 9030,
+            }),
+            start_epoch: 11,
+        };
+        let fragment = proto::QueryTerminalFragmentSnapshot {
+            fragment_instance_id: Some(common::UniqueId { hi: 1, lo: 2 }),
+            backend_num: 7,
+            outcome: proto::QueryTerminalFragmentOutcome::Succeeded as i32,
+            load_stats: Some(proto::QueryTerminalLoadStats::default()),
+            profile: Some(proto::FragmentTerminalProfileTelemetry {
+                telemetry: Some(
+                    proto::fragment_terminal_profile_telemetry::Telemetry::Unavailable(
+                        proto::TerminalTelemetryUnavailable {
+                            stage: "test".into(),
+                            code: "UNAVAILABLE".into(),
+                        },
+                    ),
+                ),
+            }),
+            ..Default::default()
+        };
+        let snapshot = QueryTerminalSnapshot::seal(proto::QueryTerminalSnapshot {
+            version: 1,
+            execution_id: Some(execution_id.into()),
+            backend: Some(backend.clone()),
+            init_digest: vec![3; 32],
+            fragments: vec![fragment],
+            profile_contribution: Some(proto::QueryTerminalProfileContributionTelemetry {
+                telemetry: Some(
+                    proto::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(
+                        proto::TerminalTelemetryUnavailable {
+                            stage: "test".into(),
+                            code: "UNAVAILABLE".into(),
+                        },
+                    ),
+                ),
+            }),
+            ..Default::default()
+        })
+        .expect("terminal snapshot");
+        let proof = TerminalizationProof::seal(proto::TerminalizationProof {
+            version: 1,
+            execution_id: Some(execution_id.into()),
+            backend: Some(backend),
+            init_digest: vec![3; 32],
+            fragments: vec![proto::TerminalizationProofFragment {
+                fragment_instance_id: Some(common::UniqueId { hi: 1, lo: 2 }),
+                backend_num: 7,
+                outcome: proto::QueryTerminalFragmentOutcome::Succeeded as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .expect("terminal proof");
+        ParticipantTerminalOutcome::parse(proto::ParticipantTerminalOutcome {
+            outcome: Some(proto::participant_terminal_outcome::Outcome::Proof(
+                proof.as_proto().clone(),
+            )),
+            snapshot: Some(snapshot.as_proto().clone()),
+        })
+        .expect("participant terminal outcome")
     }
 
     #[test]
@@ -848,10 +889,7 @@ mod tests {
 
         assert!(
             !registry
-                .report_query_terminal(
-                    ParticipantTerminalOutcome::proof(terminal_snapshot(execution_id))
-                        .expect("terminal proof outcome"),
-                )
+                .report_query_terminal(terminal_outcome(execution_id))
                 .expect("retained ingress accepts duplicate terminal delivery")
         );
         assert_eq!(control.reports.load(Ordering::SeqCst), 1);

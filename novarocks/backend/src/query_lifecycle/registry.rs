@@ -62,7 +62,7 @@ use super::entry::{QueryLifecycleEntry, QueryLifecyclePhase};
 use super::protocol_adapter::{
     legacy_abort_request, legacy_control_attach, legacy_init_request, legacy_stage_request,
     legacy_start_request, protocol_execution_id, protocol_init_ack, protocol_stage_ack,
-    protocol_start_ack, protocol_termination_ack,
+    protocol_start_ack, protocol_terminal_outcome, protocol_termination_ack,
 };
 use super::{
     BackendQueryControl, QueryControlAttachment, QueryLifecycleIngress,
@@ -578,11 +578,7 @@ impl QueryTerminalFallbackTransport for GrpcQueryTerminalFallbackTransport {
         let response = client
             .blocking_report_query_terminal_with_timeout(
                 novarocks_protocol::novarocks::ReportQueryTerminalRequest {
-                    outcome: Some(
-                        novarocks::query_execution::lifecycle::encode_participant_terminal_outcome(
-                            &outcome,
-                        ),
-                    ),
+                    outcome: Some(protocol_terminal_outcome(&outcome).as_proto().clone()),
                 },
                 timeout,
             )
@@ -605,7 +601,8 @@ impl QueryTerminalFallbackTransport for GrpcQueryTerminalFallbackTransport {
                 QueryTerminalReportOutcome::RejectedGone
             }
         };
-        Ok(QueryTerminalReportAck::new(outcome, response.detail))
+        QueryTerminalReportAck::new(outcome, response.detail)
+            .map_err(|error| QueryTerminalFallbackTransportError::unavailable(error.to_string()))
     }
 }
 
@@ -3188,8 +3185,8 @@ impl QueryLifecycleRegistry {
                         Ok(ack)
                             if matches!(
                                 ack.outcome(),
-                                QueryTerminalReportOutcome::Accepted
-                                    | QueryTerminalReportOutcome::AlreadyAccepted
+                                Ok(QueryTerminalReportOutcome::Accepted)
+                                    | Ok(QueryTerminalReportOutcome::AlreadyAccepted)
                             ) =>
                         {
                             registry.increment_terminal_metric(|metrics| {
@@ -3203,7 +3200,7 @@ impl QueryLifecycleRegistry {
                                     format_execution_id(outcome.execution_id()),
                                     registry.local_backend_id().unwrap_or_default(),
                                     attempt + 1,
-                                    ack.outcome(),
+                                    ack.outcome().expect("validated terminal fallback acknowledgement"),
                                 );
                             }
                             let _ = registry.terminal_ack_from_control(
@@ -3230,14 +3227,14 @@ impl QueryLifecycleRegistry {
                             warn!(
                                 target: "novarocks::query_lifecycle",
                                 attempt,
-                                outcome = ?ack.outcome(),
+                                outcome = ?ack.outcome().expect("validated terminal fallback acknowledgement"),
                                 detail = %ack.detail(),
                                 "query terminal fallback was rejected"
                             );
                             if matches!(
                                 ack.outcome(),
-                                QueryTerminalReportOutcome::RejectedConflict
-                                    | QueryTerminalReportOutcome::RejectedGone
+                                Ok(QueryTerminalReportOutcome::RejectedConflict)
+                                    | Ok(QueryTerminalReportOutcome::RejectedGone)
                             ) {
                                 registry.discard_terminal_record(
                                     &entry,

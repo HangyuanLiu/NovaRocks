@@ -311,6 +311,16 @@ pub struct QueryTerminalReportAck {
 }
 
 impl QueryTerminalReportAck {
+    pub fn new(
+        outcome: QueryTerminalReportOutcome,
+        detail: impl Into<String>,
+    ) -> Result<Self, ContractError> {
+        Self::parse(novarocks::ReportQueryTerminalResponse {
+            outcome: outcome as i32,
+            detail: detail.into(),
+        })
+    }
+
     pub fn parse(raw: novarocks::ReportQueryTerminalResponse) -> Result<Self, ContractError> {
         parse_terminal_report_outcome(raw.outcome)?;
         Ok(Self { raw })

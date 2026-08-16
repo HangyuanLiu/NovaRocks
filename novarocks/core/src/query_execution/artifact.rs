@@ -600,7 +600,10 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
         options: QueryInitOptions,
         barrier: &dyn QueryInitBarrier,
     ) -> Result<ControlReadyDistributedQuery, DistributedQueryError> {
-        if options.execution_id() != self.schedule.execution_id {
+        if options.execution_id().query_id() != self.schedule.execution_id.query_id()
+            || options.execution_id().attempt_id().get()
+                != self.schedule.execution_id.attempt_id().get()
+        {
             return Err(contract_error(
                 "query initialization execution id does not match validated schedule",
             ));
@@ -609,7 +612,7 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
             .runtime_filter_contributions
             .into_iter()
             .map(|(backend_idx, contribution)| {
-                RuntimeFilterContribution::from_wire(contribution)
+                novarocks_protocol::lifecycle::RuntimeFilterContribution::parse(contribution)
                     .map(|contribution| (backend_idx, contribution))
                     .map_err(|error| contract_error(error.to_string()))
             })

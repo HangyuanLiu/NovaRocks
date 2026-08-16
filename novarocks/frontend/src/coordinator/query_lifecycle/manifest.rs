@@ -18,9 +18,9 @@
 use std::net::{IpAddr, SocketAddr};
 
 use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use novarocks::query_execution::lifecycle::{
-    ParticipantManifestDigest, ParticipantRole, QueryExecutionId, QueryInitPlan, QueryInitRequest,
-};
+use novarocks::query_execution::lifecycle::{QueryExecutionId, QueryInitPlan};
+use novarocks_protocol::lifecycle::{ParticipantManifestDigest, ParticipantRole, QueryInitRequest};
+use novarocks_protocol::novarocks as protocol_wire;
 
 use super::QueryLifecycleTarget;
 
@@ -46,6 +46,11 @@ pub(super) fn materialize(
         let (backend_idx, backend, manifest, digest) = participant.into_parts();
         let endpoint_ip = backend
             .endpoint()
+            .map_err(|error| {
+                contract_error(format!(
+                    "query lifecycle backend {backend_idx} endpoint is invalid: {error}"
+                ))
+            })?
             .host()
             .parse::<IpAddr>()
             .map_err(|error| {
@@ -55,13 +60,32 @@ pub(super) fn materialize(
             })?;
         let target = QueryLifecycleTarget::new(
             backend_idx,
-            SocketAddr::new(endpoint_ip, backend.endpoint().port()),
+            SocketAddr::new(
+                endpoint_ip,
+                backend
+                    .endpoint()
+                    .map_err(|error| {
+                        contract_error(format!(
+                            "query lifecycle backend {backend_idx} endpoint is invalid: {error}"
+                        ))
+                    })?
+                    .port(),
+            ),
             backend.start_epoch(),
         );
         let fragment_participant = manifest
             .roles()
+            .map_err(|error| {
+                contract_error(format!(
+                    "query lifecycle backend {backend_idx} manifest is invalid: {error}"
+                ))
+            })?
             .contains(&ParticipantRole::FragmentExecutor);
-        let request = QueryInitRequest::new(manifest, digest).map_err(|error| {
+        let request = QueryInitRequest::parse(protocol_wire::InitQueryRequest {
+            manifest: Some(manifest.as_proto().clone()),
+            init_digest: digest.as_bytes().to_vec(),
+        })
+        .map_err(|error| {
             contract_error(format!(
                 "query lifecycle backend {backend_idx} request is invalid: {error}"
             ))
@@ -74,9 +98,23 @@ pub(super) fn materialize(
         });
     }
     Ok(MaterializedQueryInit {
-        execution_id,
+        execution_id: core_execution_id(execution_id)?,
         participants,
     })
+}
+
+/// Core retains the lease/registry orchestration identity in CLS-R1, while
+/// the Init plan and every neutral wire carrier are Protocol-owned. This is a
+/// role-local handoff into the existing Frontend orchestration API, not a
+/// lifecycle codec or a second wire representation.
+fn core_execution_id(
+    execution_id: novarocks_protocol::lifecycle::QueryExecutionId,
+) -> Result<QueryExecutionId, DistributedQueryError> {
+    let attempt =
+        novarocks::query_execution::lifecycle::AttemptId::new(execution_id.attempt_id().get())
+            .map_err(|error| contract_error(error.to_string()))?;
+    QueryExecutionId::new(execution_id.query_id(), attempt)
+        .map_err(|error| contract_error(error.to_string()))
 }
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {

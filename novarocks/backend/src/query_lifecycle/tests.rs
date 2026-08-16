@@ -127,7 +127,8 @@ impl QueryTerminalFallbackTransport for RejectedTerminalFallback {
         Ok(QueryTerminalReportAck::new(
             QueryTerminalReportOutcome::RejectedConflict,
             "injected terminal conflict",
-        ))
+        )
+        .expect("fixed rejected-conflict terminal ack is valid"))
     }
 }
 
@@ -143,7 +144,8 @@ impl QueryTerminalFallbackTransport for GoneTerminalFallback {
         Ok(QueryTerminalReportAck::new(
             QueryTerminalReportOutcome::RejectedGone,
             "injected stale terminal ingress",
-        ))
+        )
+        .expect("fixed rejected-gone terminal ack is valid"))
     }
 }
 
@@ -175,7 +177,8 @@ impl QueryTerminalFallbackTransport for AcceptedTerminalFallback {
         Ok(QueryTerminalReportAck::new(
             QueryTerminalReportOutcome::Accepted,
             "accepted injected unary fallback",
-        ))
+        )
+        .expect("fixed accepted terminal ack is valid"))
     }
 }
 

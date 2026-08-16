@@ -94,7 +94,10 @@ impl ResolvedQueryOptions {
         }
     }
 
-    pub(crate) fn runtime_options(&self) -> &QueryOptions {
+    /// Frozen execution options exposed to the Frontend only for its
+    /// role-owned native wire projection.  This does not provide lifecycle
+    /// construction or a mutable execution handle.
+    pub fn runtime_options(&self) -> &QueryOptions {
         &self.runtime
     }
 }
