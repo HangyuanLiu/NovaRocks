@@ -7,7 +7,7 @@ supersedes: []
 superseded-by: null
 date: 2026-08-16
 provenance:
-  - "PR: pending — frontend durable record budget contract"
+  - "PR: https://github.com/NovaRocks/NovaRocks/pull/906"
   - "discussion: 2026-08-16 canonical encoding budget acceptance"
 code-anchors:
   - "novarocks/frontend/src/durable/mod.rs (DurableRecordStore)"
