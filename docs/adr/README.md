@@ -179,6 +179,14 @@ admission 一律 fail closed，不存在内存 fallback 或 legacy 双写。
 
 - ADR-0066 — 外部 catalog attachment 为何由 StateStore 单一持久化、各 FE 只派生只读投影（active）
 
+### frontend-durable-records
+
+领域哲学：Frontend durable record 的正确性以最终可持久化的完整表示为准，而不是以 wire payload 或字段的局部长度为准。
+不透明字节必须有界、使用单一 canonical 表示并在日志中脱敏；所有记录写入在外部副作用前经过实际编码预算校验。
+StateStore 的全局单值限制保持公共契约，record owner 负责自己的 schema、状态机与错误映射，索引和控制值保持独立小值路径。
+
+- ADR-0074 — Frontend durable record 为何统一采用有界 canonical 编码与整记录预算（active）
+
 ### frontend-dml
 
 领域哲学：frontend 拥有 DML 的 statement application flow、durable operation lifecycle 与 production routing；

@@ -22,6 +22,8 @@
 //! module, so callers cannot accidentally replace the checked value with a
 //! fresh JSON encoding at the final `put` boundary.
 
+// Design: ADR-0074 (docs/adr/ADR-0074-frontend-durable-record-budget-contract.md)
+
 use std::fmt;
 use std::sync::Arc;
 
