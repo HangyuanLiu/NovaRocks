@@ -43,7 +43,7 @@ config_file="${NOVA_ENV_CONFIG_FILE:-$SCRIPT_DIR/shared.env}"
 prepare_only=false
 caller_fenced_catalog_is_set=false
 caller_fenced_catalog=""
-if [[ -v NOVA_ENV_FENCED_CATALOG ]]; then
+if [[ "${NOVA_ENV_FENCED_CATALOG+x}" == "x" ]]; then
   caller_fenced_catalog_is_set=true
   caller_fenced_catalog="$NOVA_ENV_FENCED_CATALOG"
 fi
