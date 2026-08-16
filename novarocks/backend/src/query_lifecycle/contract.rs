@@ -23,15 +23,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use novarocks::query_execution::lifecycle::{
-    FragmentLiveObservation, ParticipantTerminalOutcome, QueryControlEndpoint, QueryControlEvent,
-    QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalAck, QueryTerminalReportAck,
-    QueryTerminationReason,
-};
+use novarocks::query_execution::lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_protocol::lifecycle::{
-    QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest, QueryStageAck,
+    FragmentLiveObservation, ParticipantTerminalOutcome, QueryAbortRequest, QueryControlAttach,
+    QueryControlEndpoint, QueryControlEvent, QueryInitAck, QueryInitRequest, QueryStageAck,
     QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome, QueryStartRequest,
-    QueryTerminationAck,
+    QueryTerminalAck, QueryTerminalReportAck, QueryTerminationAck, QueryTerminationReason,
 };
 
 pub(crate) trait BackendQueryControl: Send + Sync + 'static {

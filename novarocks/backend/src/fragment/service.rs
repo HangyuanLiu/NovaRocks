@@ -26,7 +26,6 @@ use novarocks::connector::ConnectorRegistry;
 use novarocks::novarocks_logging::error;
 #[cfg(test)]
 use novarocks::novarocks_logging::warn;
-use novarocks::query_execution::lifecycle::StageFragment;
 use novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use novarocks::runtime::sink_commit::{ConfiguredCoreSinkCommitPort, CoreSinkCommitPort};
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
@@ -39,7 +38,7 @@ use novarocks_execution::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
 };
 use novarocks_execution::runtime::profile::Profiler;
-use novarocks_protocol::lifecycle::QueryExecutionId;
+use novarocks_protocol::lifecycle::{QueryExecutionId, StageFragment};
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorRequestContext,
     WriteCommitEvidenceLimits,
@@ -56,7 +55,6 @@ use crate::native::decode::NativeFragmentRequest;
 use crate::native::ingress::{
     NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
 };
-use crate::query_lifecycle::protocol_adapter::legacy_execution_id;
 use crate::query_lifecycle::{QueryLifecycleRegistry, stage::StartGate};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -304,12 +302,7 @@ impl NativeFragmentService {
                 fragment.plan().clone(),
                 fragment.instance_params().clone(),
                 Arc::clone(&self.connector_registry),
-                Arc::new(
-                    self.execution_host
-                        .resolver_for(legacy_execution_id(execution_id).expect(
-                            "Protocol execution id must convert for legacy connector host",
-                        )),
-                ),
+                Arc::new(self.execution_host.resolver_for(execution_id)),
                 self.queries
                     .connector_cancellation_for_execution(execution_id),
                 std::time::Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
@@ -325,17 +318,15 @@ impl NativeFragmentService {
         gate: Arc<StartGate>,
     ) -> Result<(), NativeFragmentIngressError> {
         let execution_id = request.execution_id();
-        let legacy_execution_id = legacy_execution_id(execution_id)
-            .expect("Protocol execution id must convert for legacy lifecycle registry");
         let fragment_instance_id = request.fragment_instance_id();
         let lifecycle_permit = self
             .lifecycle
-            .admit_fragment(legacy_execution_id, fragment_instance_id)
+            .admit_fragment(execution_id, fragment_instance_id)
             .map_err(NativeFragmentIngressError::new)?;
         let runtime_filter = self
             .lifecycle
             .runtime_filter_session_for_fragment(
-                legacy_execution_id,
+                execution_id,
                 fragment_instance_id,
                 request.has_runtime_filter_bindings(),
             )
@@ -363,7 +354,7 @@ impl NativeFragmentService {
         let failure_injection_eligible = true;
         let event_sink = crate::fragment::lifecycle_fragment_event_sink(
             Arc::clone(&self.lifecycle),
-            legacy_execution_id,
+            execution_id,
             fragment_instance_id,
             profiler.clone(),
         );
@@ -475,17 +466,15 @@ impl NativeFragmentService {
     fn submit(&self, request: NativeFragmentRequest) -> Result<(), NativeFragmentIngressError> {
         let query_id = request.query_id();
         let execution_id = request.execution_id();
-        let legacy_execution_id = legacy_execution_id(execution_id)
-            .expect("Protocol execution id must convert for legacy lifecycle registry");
         let fragment_instance_id = request.fragment_instance_id();
         let lifecycle_permit = self
             .lifecycle
-            .admit_fragment(legacy_execution_id, fragment_instance_id)
+            .admit_fragment(execution_id, fragment_instance_id)
             .map_err(NativeFragmentIngressError::new)?;
         let runtime_filter = self
             .lifecycle
             .runtime_filter_session_for_fragment(
-                legacy_execution_id,
+                execution_id,
                 fragment_instance_id,
                 request.has_runtime_filter_bindings(),
             )
@@ -514,7 +503,7 @@ impl NativeFragmentService {
         let failure_injection_eligible = !request.uses_result_sink();
         let event_sink = crate::fragment::lifecycle_fragment_event_sink(
             Arc::clone(&self.lifecycle),
-            legacy_execution_id,
+            execution_id,
             fragment_instance_id,
             profiler.clone(),
         );
@@ -645,7 +634,7 @@ impl NativeFragmentService {
 impl NativeFragmentIngress for NativeFragmentService {
     fn ensure_connector_execution_binding(
         &self,
-        execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
+        execution_id: QueryExecutionId,
         declaration: ConnectorExecutionDeclaration,
         context: ConnectorRequestContext,
     ) -> Result<(), NativeFragmentIngressError> {
@@ -760,13 +749,7 @@ fn consume_terminal_fact(
     let sink = novarocks::runtime::sink_commit::report_snapshot(fragment_instance_id)
         .with_connector_staged_report_frames(running.take_connector_staged_report_frames());
     // QLC terminal facts are transferred before local runtime cleanup.
-    lifecycle.record_fragment_terminal_fact(
-        legacy_execution_id(execution_id)
-            .expect("Protocol execution id must convert for legacy lifecycle registry"),
-        fact,
-        backend_num,
-        sink,
-    );
+    lifecycle.record_fragment_terminal_fact(execution_id, fact, backend_num, sink);
     queries.unregister_fragment_execution(execution_id, fragment_instance_id);
     queries.finish_fragment(execution_id);
     // Publish the terminal report before this fact can fail-close the local
@@ -828,15 +811,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks::connector::ConnectorRegistry;
-    use novarocks::query_execution::lifecycle::{
-        AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
-        ParticipantRole, QueryControlAttach, QueryControlEndpoint, QueryInitOutcome,
-        QueryInitRequest, StageFragment,
-    };
     use novarocks_execution::runtime::fragment::{
         DormantFragmentHandle, FragmentOutcome, prepare_fragment,
     };
     use novarocks_protocol as proto;
+    use novarocks_protocol::lifecycle::{
+        AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantRole,
+        QueryControlAttach, QueryControlEndpoint, QueryInitOutcome, QueryInitRequest, QueryOptions,
+        StageFragment,
+    };
     use novarocks_protocol::lifecycle::{AttemptId as ProtocolAttemptId, QueryExecutionId};
     use novarocks_types::QueryId as ExecutionQueryId;
     use novarocks_types::QueryId;
@@ -847,7 +830,6 @@ mod tests {
         FRAGMENT_EXECUTOR_FAILURE_MESSAGE, start_with_fragment_failure_trigger,
     };
     use crate::native::ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
-    use crate::query_lifecycle::protocol_adapter::legacy_execution_id;
     use crate::query_lifecycle::{QueryControlAttachment, stage::StartGate};
 
     use super::{
@@ -1000,10 +982,8 @@ mod tests {
         expected_fragments: impl IntoIterator<Item = UniqueId>,
     ) -> QueryControlAttachment {
         let execution_id = request.execution_id();
-        let legacy_execution_id = legacy_execution_id(execution_id)
-            .expect("Protocol execution id must convert for the legacy lifecycle registry");
         let manifest = ParticipantManifest::new(
-            legacy_execution_id,
+            execution_id,
             ParticipantBackendIdentity::new(
                 7,
                 QueryControlEndpoint::new("127.0.0.1", 19030).expect("control endpoint"),
@@ -1011,10 +991,14 @@ mod tests {
             )
             .expect("backend identity"),
             [ParticipantRole::FragmentExecutor],
-            expected_fragments,
-            ParticipantQueryOptions::new(
-                novarocks_execution::runtime::query_options::QueryOptions::default(),
-            ),
+            expected_fragments
+                .into_iter()
+                .map(|id| proto::common::UniqueId {
+                    hi: id.high(),
+                    lo: id.low(),
+                }),
+            QueryOptions::parse(proto::novarocks::QueryOptions::default())
+                .expect("valid default query options"),
             u64::MAX,
             [],
             None,
@@ -1024,20 +1008,29 @@ mod tests {
         .expect("fragment participant manifest");
         let init = QueryInitRequest::from_manifest(manifest);
         assert_eq!(
-            service.lifecycle.init_query(init.clone()).outcome(),
+            service
+                .lifecycle
+                .init_query(init.clone())
+                .outcome()
+                .expect("valid init acknowledgement"),
             QueryInitOutcome::Applied
         );
         let mut attachment = service
             .lifecycle
             .attach_control(
-                QueryControlAttach::new(legacy_execution_id, init.digest(), 1)
+                QueryControlAttach::new(execution_id, init.digest().expect("valid init digest"), 1)
                     .expect("control attachment"),
             )
             .expect("control attaches");
-        assert_eq!(
-            attachment.events.try_recv().expect("ControlReady"),
-            novarocks::query_execution::lifecycle::QueryControlEvent::ControlReady
-        );
+        assert!(matches!(
+            attachment
+                .events
+                .try_recv()
+                .expect("ControlReady")
+                .as_proto()
+                .event,
+            Some(novarocks_protocol::novarocks::query_control_response::Event::ControlReady(_))
+        ));
         attachment
     }
 
@@ -1046,8 +1039,6 @@ mod tests {
         request: NativeFragmentRequest,
     ) -> DormantFragmentHandle {
         let execution_id = request.execution_id();
-        let legacy_execution_id = legacy_execution_id(execution_id)
-            .expect("Protocol execution id must convert for the legacy lifecycle registry");
         let fragment_instance_id = request.fragment_instance_id();
         let (delivery_expire, query_expire) = request.query_expire_durations();
         let admission = service
@@ -1070,7 +1061,7 @@ mod tests {
                     Arc::clone(&service.result_writer),
                     crate::fragment::lifecycle_fragment_event_sink(
                         Arc::clone(&service.lifecycle),
-                        legacy_execution_id,
+                        execution_id,
                         fragment_instance_id,
                         None,
                     ),

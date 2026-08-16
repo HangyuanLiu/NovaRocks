@@ -19,7 +19,7 @@
 
 use std::fmt;
 
-use novarocks::query_execution::lifecycle::QueryExecutionId;
+use novarocks_protocol::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorRequestContext,
 };

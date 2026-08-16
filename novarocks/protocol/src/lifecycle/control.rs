@@ -17,6 +17,38 @@ pub use novarocks::QueryTerminationReason;
 /// The generated enum is the sole terminal-report outcome representation.
 pub use novarocks::ReportQueryTerminalOutcome as QueryTerminalReportOutcome;
 
+impl QueryInitOutcome {
+    #[allow(non_upper_case_globals)]
+    pub const Applied: Self = Self::QueryInitApplied;
+    #[allow(non_upper_case_globals)]
+    pub const AlreadyApplied: Self = Self::QueryInitAlreadyApplied;
+    #[allow(non_upper_case_globals)]
+    pub const RejectedConflict: Self = Self::QueryInitRejectedConflict;
+    #[allow(non_upper_case_globals)]
+    pub const RejectedStaleBackend: Self = Self::QueryInitRejectedStaleBackend;
+    #[allow(non_upper_case_globals)]
+    pub const RejectedCapacity: Self = Self::QueryInitRejectedCapacity;
+    #[allow(non_upper_case_globals)]
+    pub const RejectedInvalidManifest: Self = Self::QueryInitRejectedInvalidManifest;
+    #[allow(non_upper_case_globals)]
+    pub const RejectedTerminated: Self = Self::QueryInitRejectedTerminated;
+}
+
+impl QueryTerminationReason {
+    #[allow(non_upper_case_globals)]
+    pub const CoordinatorAbort: Self = Self::QueryTerminationCoordinatorAbort;
+    #[allow(non_upper_case_globals)]
+    pub const CoordinatorFinalize: Self = Self::QueryTerminationCoordinatorFinalize;
+    #[allow(non_upper_case_globals)]
+    pub const CoordinatorStreamLost: Self = Self::QueryTerminationCoordinatorStreamLost;
+    #[allow(non_upper_case_globals)]
+    pub const CoordinatorHeartbeatTimeout: Self = Self::QueryTerminationCoordinatorHeartbeatTimeout;
+    #[allow(non_upper_case_globals)]
+    pub const LocalFailure: Self = Self::QueryTerminationLocalFailure;
+    #[allow(non_upper_case_globals)]
+    pub const PreStartTimeout: Self = Self::QueryTerminationPreStartTimeout;
+}
+
 /// A validated `InitQueryRequest`, including its descriptor-derived manifest
 /// digest fence.
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +57,18 @@ pub struct QueryInitRequest {
 }
 
 impl QueryInitRequest {
+    /// Frames one validated generated manifest with its canonical digest.
+    pub fn from_manifest(manifest: ParticipantManifest) -> Self {
+        let digest = manifest
+            .digest()
+            .expect("validated participant manifest has a canonical digest");
+        Self::parse(novarocks::InitQueryRequest {
+            manifest: Some(manifest.as_proto().clone()),
+            init_digest: digest.as_bytes().to_vec(),
+        })
+        .expect("validated participant manifest forms a valid InitQuery request")
+    }
+
     pub fn parse(raw: novarocks::InitQueryRequest) -> Result<Self, ContractError> {
         let manifest = required_manifest(&raw.manifest)?;
         let digest = manifest_digest(&raw.init_digest)?;
@@ -56,6 +100,18 @@ pub struct QueryInitAck {
 }
 
 impl QueryInitAck {
+    pub fn new(
+        execution_id: QueryExecutionId,
+        digest: ParticipantManifestDigest,
+        outcome: QueryInitOutcome,
+    ) -> Self {
+        Self::parse(novarocks::InitQueryResponse {
+            execution_id: Some(execution_id.to_proto()),
+            init_digest: digest.as_bytes().to_vec(),
+            outcome: outcome as i32,
+        })
+        .expect("validated lifecycle identities form a valid InitQuery acknowledgement")
+    }
     pub fn parse(raw: novarocks::InitQueryResponse) -> Result<Self, ContractError> {
         required_execution_id(&raw.execution_id, "query execution id is required")?;
         manifest_digest(&raw.init_digest)?;
@@ -88,6 +144,18 @@ pub struct QueryControlAttach {
 }
 
 impl QueryControlAttach {
+    pub fn new(
+        execution_id: QueryExecutionId,
+        digest: ParticipantManifestDigest,
+        frontend_owner_epoch: u64,
+    ) -> Result<Self, ContractError> {
+        Self::parse(novarocks::QueryControlAttach {
+            execution_id: Some(execution_id.to_proto()),
+            init_digest: digest.as_bytes().to_vec(),
+            frontend_owner_epoch,
+        })
+    }
+
     pub fn parse(raw: novarocks::QueryControlAttach) -> Result<Self, ContractError> {
         required_execution_id(&raw.execution_id, "query execution id is required")?;
         manifest_digest(&raw.init_digest)?;
@@ -209,6 +277,18 @@ pub struct QueryAbortRequest {
 }
 
 impl QueryAbortRequest {
+    pub fn new(
+        execution_id: QueryExecutionId,
+        digest: ParticipantManifestDigest,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::parse(novarocks::AbortQueryRequest {
+            execution_id: Some(execution_id.to_proto()),
+            init_digest: digest.as_bytes().to_vec(),
+            reason: reason.into(),
+        })
+        .expect("caller must provide a nonempty abort reason")
+    }
     pub fn parse(raw: novarocks::AbortQueryRequest) -> Result<Self, ContractError> {
         required_execution_id(&raw.execution_id, "query execution id is required")?;
         manifest_digest(&raw.init_digest)?;
@@ -244,6 +324,13 @@ pub struct QueryTerminationAck {
 }
 
 impl QueryTerminationAck {
+    pub fn new(execution_id: QueryExecutionId, reason: QueryTerminationReason) -> Self {
+        Self::parse(novarocks::AbortQueryResponse {
+            execution_id: Some(execution_id.to_proto()),
+            accepted_reason: reason as i32,
+        })
+        .expect("validated lifecycle identity and reason form a valid abort acknowledgement")
+    }
     pub fn parse(raw: novarocks::AbortQueryResponse) -> Result<Self, ContractError> {
         required_execution_id(&raw.execution_id, "query execution id is required")?;
         parse_termination_reason(raw.accepted_reason)?;

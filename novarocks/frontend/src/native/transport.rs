@@ -459,6 +459,7 @@ impl QueryLifecycleTransport for LifecycleTransport {
         let commands = Arc::new(Mutex::new(ControlCommands {
             sender: Some(tx),
             pending: VecDeque::new(),
+            accepted_termination: None,
             terminal: None,
         }));
         let bridge_commands = Arc::clone(&commands);
@@ -606,6 +607,11 @@ struct ControlSession {
 struct ControlCommands {
     sender: Option<mpsc::Sender<novarocks_protocol::novarocks::QueryControlRequest>>,
     pending: VecDeque<Pending>,
+    /// The single terminal reason already accepted on this stream.  A later
+    /// coordinator Abort cannot change a completed Finalize, but the BE may
+    /// legitimately replay that immutable Finalize acknowledgement while it
+    /// drains the terminal record for unary fallback.
+    accepted_termination: Option<QueryTerminationReason>,
     terminal: Option<QueryLifecycleTransportError>,
 }
 #[derive(Clone, Copy, Debug)]
@@ -782,6 +788,21 @@ fn validate_control_event(
                     Some(Pending::Finalize),
                     QueryTerminationReason::QueryTerminationCoordinatorFinalize,
                 ) => true,
+                // Finalize is first-wins at the BE. If FE later begins abort
+                // cleanup (for example after a different participant's
+                // control stream drops), a replayed Finalize acknowledgement
+                // is the only valid answer for that already-finalized
+                // participant. This is intentionally narrower than accepting
+                // arbitrary mismatched termination reasons: the same stream
+                // must already have accepted Finalize.
+                (
+                    Some(Pending::Abort),
+                    QueryTerminationReason::QueryTerminationCoordinatorFinalize,
+                ) if commands.accepted_termination
+                    == Some(QueryTerminationReason::QueryTerminationCoordinatorFinalize) =>
+                {
+                    true
+                }
                 (None, _) => {
                     commands
                         .pending
@@ -799,6 +820,7 @@ fn validate_control_event(
                 .pending
                 .retain(|command| !matches!(command, Pending::Heartbeat(_)));
             commands.pending.pop_front();
+            commands.accepted_termination = Some(reason);
             Ok(())
         }
         _ => Ok(()),

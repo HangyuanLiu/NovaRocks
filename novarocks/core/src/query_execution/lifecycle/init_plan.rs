@@ -34,11 +34,7 @@ use novarocks_protocol::lifecycle::{
 };
 use novarocks_protocol::novarocks;
 
-use super::{
-    QueryLifecycleTarget, QueryTerminalSet, StageParticipantBinding,
-    identity::{AttemptId, QueryExecutionId as CoreQueryExecutionId},
-    manifest::ParticipantRole as CoreParticipantRole,
-};
+use super::{QueryLifecycleTarget, QueryTerminalSet, StageParticipantBinding};
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
@@ -87,17 +83,9 @@ fn protocol_unique_id(id: crate::common::types::UniqueId) -> common::UniqueId {
 }
 
 fn protocol_exchange_route(
-    route: &super::manifest::ExchangeRouteManifest,
+    route: &novarocks_protocol::lifecycle::ExchangeRouteManifest,
 ) -> novarocks::ExchangeRouteManifest {
-    novarocks::ExchangeRouteManifest {
-        source_fragment_instance_id: Some(protocol_unique_id(route.source_fragment_instance_id())),
-        destination_fragment_instance_id: Some(protocol_unique_id(
-            route.destination_fragment_instance_id(),
-        )),
-        destination_node_id: route.destination_node_id(),
-        sender_ordinal: route.sender_ordinal(),
-        sender_count: route.sender_count(),
-    }
+    route.as_proto().clone()
 }
 
 fn duration_millis(duration: Duration) -> Result<u64, DistributedQueryError> {
@@ -106,38 +94,21 @@ fn duration_millis(duration: Duration) -> Result<u64, DistributedQueryError> {
     })
 }
 
-fn core_execution_id(
-    execution_id: QueryExecutionId,
-) -> Result<CoreQueryExecutionId, DistributedQueryError> {
-    let attempt = AttemptId::new(execution_id.attempt_id().get())
-        .map_err(|error| contract_error(error.to_string()))?;
-    CoreQueryExecutionId::new(execution_id.query_id(), attempt)
-        .map_err(|error| contract_error(error.to_string()))
-}
-
-fn core_participant_role(role: ParticipantRole) -> CoreParticipantRole {
-    match role {
-        ParticipantRole::FragmentExecutor => CoreParticipantRole::FragmentExecutor,
-        ParticipantRole::RuntimeFilterService => CoreParticipantRole::RuntimeFilterService,
-        ParticipantRole::Unspecified => unreachable!("Protocol validates participant roles"),
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct QueryInitPlanHeader {
-    execution_id: CoreQueryExecutionId,
+    execution_id: QueryExecutionId,
     query_deadline_unix_ms: u64,
 }
 
 impl QueryInitPlanHeader {
-    const fn new(execution_id: CoreQueryExecutionId, query_deadline_unix_ms: u64) -> Self {
+    const fn new(execution_id: QueryExecutionId, query_deadline_unix_ms: u64) -> Self {
         Self {
             execution_id,
             query_deadline_unix_ms,
         }
     }
 
-    pub(crate) const fn execution_id(self) -> CoreQueryExecutionId {
+    pub(crate) const fn execution_id(self) -> QueryExecutionId {
         self.execution_id
     }
 }
@@ -301,20 +272,16 @@ impl QueryInitPlan {
                         SocketAddr::new(endpoint_ip, endpoint.port()),
                         participant.backend().start_epoch(),
                     ),
-                    super::manifest::ParticipantManifestDigest::new(
-                        *participant.digest().as_bytes(),
-                    ),
+                    participant.digest(),
                     participant
                         .manifest()
                         .roles()
-                        .map_err(protocol_contract_error)?
-                        .into_iter()
-                        .map(core_participant_role),
+                        .map_err(protocol_contract_error)?,
                     participant
                         .manifest()
                         .expected_fragment_instance_ids()
                         .into_iter()
-                        .map(|id| crate::common::types::UniqueId::new(id.hi, id.lo)),
+                        .map(|id| novarocks_types::UniqueId::new(id.hi, id.lo)),
                 )
                 .map_err(|error| {
                     contract_error(format!(
@@ -603,10 +570,7 @@ pub(crate) fn compile_query_init_plan(
             digest,
         });
     }
-    let header = QueryInitPlanHeader::new(
-        core_execution_id(options.execution_id)?,
-        options.query_deadline_unix_ms,
-    );
+    let header = QueryInitPlanHeader::new(options.execution_id, options.query_deadline_unix_ms);
     fragments.freeze_query_init_header(header)?;
     Ok(QueryInitPlan {
         execution_id: options.execution_id,

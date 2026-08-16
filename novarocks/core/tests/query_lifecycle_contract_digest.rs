@@ -19,15 +19,14 @@
 
 use std::time::Duration;
 
-use novarocks::query_execution::lifecycle::contract::{
-    QueryInitRequest, decode_query_init_request, encode_query_init_request,
+use novarocks_protocol::{
+    lifecycle::{
+        AttemptId, ContractErrorCode, ParticipantBackendIdentity, ParticipantManifest,
+        ParticipantRole, QueryControlEndpoint, QueryExecutionId, QueryInitRequest, QueryOptions,
+        RuntimeFilterContribution,
+    },
+    novarocks,
 };
-use novarocks::query_execution::lifecycle::{
-    AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
-    ParticipantRole, QueryControlEndpoint, QueryExecutionId, QueryLifecycleErrorCode,
-    RuntimeFilterContribution,
-};
-use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_types::QueryId;
 
 fn request_with_runtime_filter() -> QueryInitRequest {
@@ -36,8 +35,12 @@ fn request_with_runtime_filter() -> QueryInitRequest {
         AttemptId::new(7).expect("nonzero attempt"),
     )
     .expect("nonzero query id");
-    let contribution = RuntimeFilterContribution::empty_for_contract_test(execution_id, 3)
-        .expect("valid contribution");
+    let contribution = RuntimeFilterContribution::parse(novarocks::RuntimeFilterContribution {
+        participant_id: 3,
+        contribution_digest: vec![0; 32],
+        ..Default::default()
+    })
+    .expect("valid contribution");
     let manifest = ParticipantManifest::new(
         execution_id,
         ParticipantBackendIdentity::new(
@@ -48,7 +51,7 @@ fn request_with_runtime_filter() -> QueryInitRequest {
         .expect("valid backend"),
         [ParticipantRole::RuntimeFilterService],
         [],
-        ParticipantQueryOptions::new(QueryOptions::default()),
+        QueryOptions::parse(novarocks::QueryOptions::default()).expect("valid query options"),
         10_000,
         [],
         Some(contribution),
@@ -62,18 +65,23 @@ fn request_with_runtime_filter() -> QueryInitRequest {
 #[test]
 fn runtime_filter_contribution_digest_round_trips_canonical_payload() {
     let request = request_with_runtime_filter();
-    let wire = encode_query_init_request(&request).expect("request encodes");
+    let wire = request.as_proto().clone();
 
-    let decoded = decode_query_init_request(&wire).expect("canonical request decodes");
+    let decoded = QueryInitRequest::parse(wire).expect("canonical request decodes");
 
-    assert_eq!(decoded.manifest(), request.manifest());
-    assert_eq!(decoded.digest(), request.digest());
+    assert_eq!(
+        decoded.manifest().expect("decoded manifest"),
+        request.manifest().expect("request manifest")
+    );
+    assert_eq!(
+        decoded.digest().expect("decoded digest"),
+        request.digest().expect("request digest")
+    );
 }
 
 #[test]
 fn participant_manifest_digest_rejects_mutated_runtime_filter_digest() {
-    let mut wire =
-        encode_query_init_request(&request_with_runtime_filter()).expect("request encodes");
+    let mut wire = request_with_runtime_filter().as_proto().clone();
     let contribution = wire
         .manifest
         .as_mut()
@@ -83,10 +91,10 @@ fn participant_manifest_digest_rejects_mutated_runtime_filter_digest() {
         .expect("runtime filter contribution");
     contribution.contribution_digest[0] ^= 1;
 
-    let error = decode_query_init_request(&wire)
+    let error = QueryInitRequest::parse(wire)
         .expect_err("mutated runtime filter carrier must not retain the manifest digest");
 
-    assert_eq!(error.code(), QueryLifecycleErrorCode::InvalidManifest);
+    assert_eq!(error.code(), ContractErrorCode::InvalidValue);
     assert_eq!(
         error.detail(),
         "participant manifest digest does not match canonical projection"

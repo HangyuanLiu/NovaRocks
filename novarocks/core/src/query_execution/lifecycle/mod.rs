@@ -16,44 +16,34 @@
 // under the License.
 
 pub mod contract;
-pub mod digest;
-pub mod identity;
 pub mod init_plan;
-pub mod manifest;
 pub mod metrics;
-pub mod query_options_wire;
 pub mod residual;
 pub mod stage;
 pub mod terminal;
 
-pub use contract::{
-    FragmentLiveObservation, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
-    QueryControlEvent, QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryLifecycleError,
-    QueryLifecycleErrorCode, QueryTerminalAck, QueryTerminalIngress, QueryTerminationAck,
-    QueryTerminationReason,
-};
-pub use contract::{
-    decode_participant_terminal_outcome, decode_query_terminal_snapshot,
-    encode_participant_terminal_outcome, encode_query_terminal_snapshot,
-};
-pub use identity::{AttemptId, QueryExecutionId};
+pub use contract::{QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress};
 pub(crate) use init_plan::QueryInitPlanHeader;
 pub use init_plan::{
     QueryInitBarrier, QueryInitOptions, QueryInitParticipant, QueryInitPlan,
     QueryLifecycleAbortOutcome, QueryLifecycleLease, QueryLifecycleLeaseGuard,
 };
-pub use manifest::{
-    ExchangeRouteManifest, ParticipantBackendIdentity, ParticipantManifest,
-    ParticipantManifestDigest, ParticipantQueryOptions, ParticipantRole, QueryControlEndpoint,
-    RuntimeFilterContribution,
+pub use novarocks_protocol::lifecycle::{
+    AttemptId, ExchangeRouteManifest, FragmentLiveObservation, ParticipantBackendIdentity,
+    ParticipantManifest, ParticipantManifestDigest, ParticipantRole, QueryAbortRequest,
+    QueryControlAttach, QueryControlCommand, QueryControlEndpoint, QueryControlEvent,
+    QueryExecutionId, QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryOptions,
+    QueryTerminationAck, QueryTerminationReason, RuntimeFilterContribution,
 };
-pub use novarocks_protocol::lifecycle::{QueryTerminalReportAck, QueryTerminalReportOutcome};
+pub use novarocks_protocol::lifecycle::{
+    QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
+    QueryStartRequest, StageDigest, StageDigestVersion, StageFragment,
+};
+pub use novarocks_protocol::lifecycle::{
+    QueryTerminalAck, QueryTerminalReportAck, QueryTerminalReportOutcome,
+};
 pub use residual::QueryLifecycleTarget;
-pub use stage::{
-    QueryLaunchBarrier, QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck,
-    QueryStartOutcome, QueryStartRequest, StageBatch, StageDigest, StageDigestVersion,
-    StageFragment, StageParticipantBinding,
-};
+pub use stage::{QueryLaunchBarrier, StageBatch, StageParticipantBinding};
 pub use terminal::{
     FragmentTerminalOutcome, FragmentTerminalSnapshot, ImmutableQueryTerminalRecord,
     NegativeAttestation, NegativeAttestationReason, PARTICIPANT_TERMINAL_OUTCOME_VERSION_V1,

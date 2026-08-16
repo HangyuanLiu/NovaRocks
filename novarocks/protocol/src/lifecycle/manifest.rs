@@ -5,6 +5,7 @@
 //! leaves rather than keeping a Core-style parallel representation in sync.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use super::error::ContractError;
 use super::identity::QueryExecutionId;
@@ -27,6 +28,16 @@ pub struct QueryControlEndpoint {
 }
 
 impl QueryControlEndpoint {
+    /// Constructs a generated endpoint before applying the canonical
+    /// lifecycle validation. This is a convenience for role-local assembly
+    /// and tests; the generated message remains the stored representation.
+    pub fn new(host: impl Into<String>, port: u16) -> Result<Self, ContractError> {
+        Self::parse(novarocks::QueryControlEndpoint {
+            host: host.into(),
+            port: u32::from(port),
+        })
+    }
+
     pub fn parse(raw: novarocks::QueryControlEndpoint) -> Result<Self, ContractError> {
         if raw.host.trim().is_empty() {
             return Err(ContractError::invalid_value(
@@ -66,6 +77,20 @@ pub struct ParticipantBackendIdentity {
 }
 
 impl ParticipantBackendIdentity {
+    /// Constructs a validated generated backend identity without a Core
+    /// mirror value.
+    pub fn new(
+        backend_id: u64,
+        endpoint: QueryControlEndpoint,
+        start_epoch: u64,
+    ) -> Result<Self, ContractError> {
+        Self::parse(novarocks::ParticipantBackendIdentity {
+            backend_id,
+            endpoint: Some(endpoint.as_proto().clone()),
+            start_epoch,
+        })
+    }
+
     pub fn parse(raw: novarocks::ParticipantBackendIdentity) -> Result<Self, ContractError> {
         let endpoint = raw.endpoint.clone().ok_or_else(|| {
             ContractError::invalid_value("participant backend endpoint is required")
@@ -106,6 +131,24 @@ pub struct ExchangeRouteManifest {
 }
 
 impl ExchangeRouteManifest {
+    /// Constructs a validated generated exchange route without an execution
+    /// layer DTO.
+    pub fn new(
+        source_fragment_instance_id: common::UniqueId,
+        destination_fragment_instance_id: common::UniqueId,
+        destination_node_id: i32,
+        sender_ordinal: u32,
+        sender_count: u32,
+    ) -> Result<Self, ContractError> {
+        Self::parse(novarocks::ExchangeRouteManifest {
+            source_fragment_instance_id: Some(source_fragment_instance_id),
+            destination_fragment_instance_id: Some(destination_fragment_instance_id),
+            destination_node_id,
+            sender_ordinal,
+            sender_count,
+        })
+    }
+
     pub fn parse(raw: novarocks::ExchangeRouteManifest) -> Result<Self, ContractError> {
         let source = required_unique_id(
             &raw.source_fragment_instance_id,
@@ -230,6 +273,44 @@ pub struct ParticipantManifest {
 }
 
 impl ParticipantManifest {
+    /// Assembles a participant manifest from validated Protocol leaves.
+    ///
+    /// The returned wrapper retains only the generated protobuf message; this
+    /// is intentionally a role-local construction convenience rather than a
+    /// second lifecycle data model.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        execution_id: QueryExecutionId,
+        backend: ParticipantBackendIdentity,
+        roles: impl IntoIterator<Item = ParticipantRole>,
+        expected_fragment_instance_ids: impl IntoIterator<Item = common::UniqueId>,
+        query_options: QueryOptions,
+        query_deadline_unix_ms: u64,
+        exchange_routes: impl IntoIterator<Item = ExchangeRouteManifest>,
+        runtime_filter: Option<RuntimeFilterContribution>,
+        pre_start_timeout: Duration,
+        report_endpoint: QueryControlEndpoint,
+    ) -> Result<Self, ContractError> {
+        let pre_start_timeout_ms = u64::try_from(pre_start_timeout.as_millis()).map_err(|_| {
+            ContractError::invalid_value("pre-start timeout exceeds u64 milliseconds")
+        })?;
+        Self::parse(novarocks::ParticipantManifest {
+            execution_id: Some(execution_id.to_proto()),
+            backend: Some(backend.as_proto().clone()),
+            participant_roles: roles.into_iter().map(|role| role as i32).collect(),
+            expected_fragment_instance_ids: expected_fragment_instance_ids.into_iter().collect(),
+            query_options: Some(query_options.as_proto().clone()),
+            query_deadline_unix_ms,
+            exchange_routes: exchange_routes
+                .into_iter()
+                .map(|route| route.as_proto().clone())
+                .collect(),
+            runtime_filter: runtime_filter.map(|contribution| contribution.as_proto().clone()),
+            pre_start_timeout_ms,
+            report_endpoint: Some(report_endpoint.as_proto().clone()),
+        })
+    }
+
     /// Validates all manifest and leaf invariants without normalizing or
     /// rebuilding the generated message.
     pub fn parse(raw: novarocks::ParticipantManifest) -> Result<Self, ContractError> {

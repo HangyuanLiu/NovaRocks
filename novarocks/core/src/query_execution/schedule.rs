@@ -90,7 +90,20 @@ impl FragmentLifecycleProjection {
         endpoints_by_backend: BTreeMap<usize, RuntimeEndpoint>,
         mut exchange_routes: Vec<ExchangeRouteManifest>,
     ) -> Self {
-        exchange_routes.sort();
+        exchange_routes.sort_by_key(|route| {
+            let route = route.as_proto();
+            let source = route.source_fragment_instance_id.as_ref();
+            let destination = route.destination_fragment_instance_id.as_ref();
+            (
+                source.map_or(0, |id| id.hi),
+                source.map_or(0, |id| id.lo),
+                destination.map_or(0, |id| id.hi),
+                destination.map_or(0, |id| id.lo),
+                route.destination_node_id,
+                route.sender_ordinal,
+                route.sender_count,
+            )
+        });
         Self {
             instances_by_backend,
             endpoints_by_backend,

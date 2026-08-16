@@ -23,20 +23,15 @@ use std::sync::{Mutex, OnceLock};
 
 use tokio_stream::wrappers::ReceiverStream;
 
-use novarocks::query_execution::lifecycle::{
-    QueryControlCommand, QueryControlEvent, QueryLifecycleError, QueryLifecycleErrorCode,
-    QueryTerminationReason,
-};
+use novarocks::query_execution::lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_protocol::lifecycle::{
     ContractError, ContractErrorCode, QueryAbortRequest, QueryControlAttach,
-    QueryControlCommand as ProtocolQueryControlCommand, QueryInitOutcome, QueryInitRequest,
-    QueryStageRequest, QueryStartRequest,
+    QueryControlCommand as ProtocolQueryControlCommand, QueryControlEvent, QueryExecutionId,
+    QueryInitOutcome, QueryInitRequest, QueryStageRequest, QueryStartRequest, QueryTerminalAck,
+    QueryTerminationReason,
 };
 use novarocks_protocol::novarocks as proto;
 
-use crate::query_lifecycle::protocol_adapter::{
-    legacy_control_command, legacy_execution_id, protocol_execution_id, protocol_terminal_outcome,
-};
 use crate::query_lifecycle::{BackendQueryControl, QueryLifecycleIngress};
 
 const CONTROL_STREAM_CAPACITY: usize = 16;
@@ -49,14 +44,11 @@ pub fn handle_init_query(
     request: proto::InitQueryRequest,
 ) -> Result<proto::InitQueryResponse, tonic::Status> {
     let request = QueryInitRequest::parse(request).map_err(status_from_contract_error)?;
-    let execution_id = legacy_execution_id(
-        request
-            .manifest()
-            .map_err(status_from_contract_error)?
-            .execution_id()
-            .map_err(status_from_contract_error)?,
-    )
-    .map_err(status_from_lifecycle_error)?;
+    let execution_id = request
+        .manifest()
+        .map_err(status_from_contract_error)?
+        .execution_id()
+        .map_err(status_from_contract_error)?;
     let ack = ingress.init_query(request);
     if matches!(ack.outcome(), Ok(QueryInitOutcome::QueryInitApplied)) {
         if let Some(scope) =
@@ -119,8 +111,7 @@ pub fn handle_stage_fragments(
     request: proto::StageFragmentsRequest,
 ) -> Result<proto::StageFragmentsResponse, tonic::Status> {
     let request = QueryStageRequest::parse(request).map_err(status_from_contract_error)?;
-    let execution_id =
-        legacy_execution_id(request.execution_id()).map_err(status_from_lifecycle_error)?;
+    let execution_id = request.execution_id();
     let response = ingress.stage_fragments(request);
     if response.outcome().is_staged() {
         if let Some(scope) = claim_backend_fault(
@@ -154,8 +145,7 @@ pub fn handle_start_prepared_query(
     request: proto::StartPreparedQueryRequest,
 ) -> Result<proto::StartPreparedQueryResponse, tonic::Status> {
     let request = QueryStartRequest::parse(request).map_err(status_from_contract_error)?;
-    let execution_id =
-        legacy_execution_id(request.execution_id()).map_err(status_from_lifecycle_error)?;
+    let execution_id = request.execution_id();
     let response = ingress.start_prepared_query(request);
     if response.outcome().is_running()
         && let Some(scope) =
@@ -222,9 +212,7 @@ pub async fn handle_query_control_stream(
         })
         .expect("checked Attach frame must contain attach payload");
     let attach = QueryControlAttach::parse(attach).map_err(status_from_contract_error)?;
-    let execution_id =
-        legacy_execution_id(attach.execution_id().map_err(status_from_contract_error)?)
-            .map_err(status_from_lifecycle_error)?;
+    let execution_id = attach.execution_id().map_err(status_from_contract_error)?;
     for kind in [
         QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
         QueryLifecycleFaultKind::TerminalP0BytesExhausted,
@@ -281,139 +269,6 @@ pub async fn handle_query_control_stream(
     Ok(ReceiverStream::new(outbound_rx))
 }
 
-/// The registry still retains its local event enum, but native egress owns the
-/// generated Protocol frame.  Do not route this role boundary through Core's
-/// retired lifecycle codec.
-fn protocol_control_event(
-    event: &QueryControlEvent,
-) -> novarocks_protocol::lifecycle::QueryControlEvent {
-    use proto::query_control_response::Event;
-
-    let event = match event {
-        QueryControlEvent::ControlReady => Event::ControlReady(proto::QueryControlReady {}),
-        QueryControlEvent::HeartbeatAck { sequence } => {
-            Event::HeartbeatAck(proto::QueryControlHeartbeatAck {
-                sequence: *sequence,
-            })
-        }
-        QueryControlEvent::LocalFailure { code, detail } => {
-            Event::LocalFailure(proto::QueryControlLocalFailure {
-                code: code.clone(),
-                detail: detail.clone(),
-            })
-        }
-        QueryControlEvent::LocalDrained => Event::LocalDrained(proto::QueryControlLocalDrained {}),
-        QueryControlEvent::TerminalOutcome { outcome } => {
-            Event::TerminalOutcome(protocol_terminal_outcome(outcome).as_proto().clone())
-        }
-        QueryControlEvent::TerminationAccepted { reason } => {
-            Event::TerminationAccepted(proto::QueryControlTerminationAccepted {
-                reason: match reason {
-                    QueryTerminationReason::CoordinatorAbort => {
-                        proto::QueryTerminationReason::QueryTerminationCoordinatorAbort as i32
-                    }
-                    QueryTerminationReason::CoordinatorFinalize => {
-                        proto::QueryTerminationReason::QueryTerminationCoordinatorFinalize as i32
-                    }
-                    QueryTerminationReason::CoordinatorStreamLost => {
-                        proto::QueryTerminationReason::QueryTerminationCoordinatorStreamLost as i32
-                    }
-                    QueryTerminationReason::CoordinatorHeartbeatTimeout => {
-                        proto::QueryTerminationReason::QueryTerminationCoordinatorHeartbeatTimeout
-                            as i32
-                    }
-                    QueryTerminationReason::LocalFailure => {
-                        proto::QueryTerminationReason::QueryTerminationLocalFailure as i32
-                    }
-                    QueryTerminationReason::PreStartTimeout => {
-                        proto::QueryTerminationReason::QueryTerminationPreStartTimeout as i32
-                    }
-                },
-            })
-        }
-        QueryControlEvent::FragmentObservation { observation } => {
-            Event::FragmentObservation(proto::FragmentLiveObservation {
-                execution_id: Some(protocol_execution_id(observation.execution_id()).to_proto()),
-                init_digest: observation.init_digest().as_bytes().to_vec(),
-                backend: Some(proto::ParticipantBackendIdentity {
-                    backend_id: observation.backend().backend_id(),
-                    endpoint: Some(proto::QueryControlEndpoint {
-                        host: observation.backend().endpoint().host().to_owned(),
-                        port: u32::from(observation.backend().endpoint().port()),
-                    }),
-                    start_epoch: observation.backend().start_epoch(),
-                }),
-                fragment_instance_id: Some(novarocks_protocol::common::UniqueId {
-                    hi: observation.fragment_instance_id().high(),
-                    lo: observation.fragment_instance_id().low(),
-                }),
-                sequence: observation.sequence(),
-                input_rows: observation.input_rows(),
-                output_rows: observation.output_rows(),
-                elapsed_ms: observation.elapsed_ms(),
-                profile: observation.profile().map(protocol_runtime_profile_tree),
-            })
-        }
-    };
-    novarocks_protocol::lifecycle::QueryControlEvent::parse(proto::QueryControlResponse {
-        event: Some(event),
-    })
-    .expect("registry event must satisfy the Protocol control-event contract")
-}
-
-fn protocol_runtime_profile_tree(
-    tree: &novarocks_execution::runtime::profile::RuntimeProfileTree,
-) -> proto::RuntimeProfileTree {
-    proto::RuntimeProfileTree {
-        root: Some(protocol_profile_node(&tree.root)),
-    }
-}
-
-fn protocol_profile_node(
-    node: &novarocks_execution::runtime::profile::ProfileNode,
-) -> proto::ProfileNode {
-    proto::ProfileNode {
-        name: node.name.clone(),
-        node_id: node.node_id,
-        counters: node
-            .counters
-            .iter()
-            .map(|counter| proto::Counter {
-                name: counter.name.clone(),
-                parent_name: counter.parent_name.clone(),
-                unit: match counter.unit {
-                    novarocks_execution::runtime::profile::ProfileUnit::Unit => {
-                        proto::ProfileUnit::Unit as i32
-                    }
-                    novarocks_execution::runtime::profile::ProfileUnit::CpuTicks => {
-                        proto::ProfileUnit::CpuTicks as i32
-                    }
-                    novarocks_execution::runtime::profile::ProfileUnit::Bytes => {
-                        proto::ProfileUnit::Bytes as i32
-                    }
-                    novarocks_execution::runtime::profile::ProfileUnit::TimeNs => {
-                        proto::ProfileUnit::TimeNs as i32
-                    }
-                    novarocks_execution::runtime::profile::ProfileUnit::TimeMs => {
-                        proto::ProfileUnit::TimeMs as i32
-                    }
-                    novarocks_execution::runtime::profile::ProfileUnit::TimeS => {
-                        proto::ProfileUnit::TimeS as i32
-                    }
-                    novarocks_execution::runtime::profile::ProfileUnit::None => {
-                        proto::ProfileUnit::None as i32
-                    }
-                },
-                value: counter.value,
-                min_value: counter.min_value,
-                max_value: counter.max_value,
-            })
-            .collect(),
-        info_strings: node.info_strings.clone().into_iter().collect(),
-        children: node.children.iter().map(protocol_profile_node).collect(),
-    }
-}
-
 async fn run_attached_control_stream(
     mut inbound: tonic::Streaming<proto::QueryControlRequest>,
     mut lease: CoordinatorLease,
@@ -424,7 +279,7 @@ async fn run_attached_control_stream(
     terminal_snapshot_stream_drop: Option<QueryLifecycleFaultScope>,
     terminal_proof_stream_drop: Option<QueryLifecycleFaultScope>,
     terminal_attestation_stream_drop: Option<QueryLifecycleFaultScope>,
-    execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
+    execution_id: QueryExecutionId,
 ) {
     let first_event = tokio::select! {
         biased;
@@ -442,7 +297,10 @@ async fn run_attached_control_stream(
         .await;
         return;
     };
-    if first_event != QueryControlEvent::ControlReady {
+    if !matches!(
+        first_event.as_proto().event,
+        Some(proto::query_control_response::Event::ControlReady(_))
+    ) {
         let _ = send_control_response(
             &outbound,
             Err(tonic::Status::internal(
@@ -453,13 +311,7 @@ async fn run_attached_control_stream(
         .await;
         return;
     }
-    if !send_control_response(
-        &outbound,
-        Ok(protocol_control_event(&first_event).as_proto().clone()),
-        &mut shutdown,
-    )
-    .await
-    {
+    if !send_control_response(&outbound, Ok(first_event.as_proto().clone()), &mut shutdown).await {
         return;
     }
 
@@ -503,7 +355,6 @@ async fn run_attached_control_stream(
                 }
                 let command = match ProtocolQueryControlCommand::parse(request)
                     .map_err(status_from_contract_error)
-                    .and_then(|command| legacy_control_command(command).map_err(status_from_lifecycle_error))
                 {
                     Ok(command) => command,
                     Err(error) => {
@@ -516,9 +367,12 @@ async fn run_attached_control_stream(
                         break;
                     }
                 };
-                let terminal_ack = matches!(command, QueryControlCommand::TerminalAck { .. });
-                let result = match command {
-                    QueryControlCommand::Heartbeat { sequence, .. } => {
+                let terminal_ack = matches!(
+                    command.as_proto().command,
+                    Some(proto::query_control_request::Command::TerminalAck(_))
+                );
+                let result = match command.as_proto().command.as_ref() {
+                    Some(proto::query_control_request::Command::Heartbeat(heartbeat)) => {
                         if let Some(scope) = heartbeat_stop
                             .as_ref()
                             .cloned()
@@ -539,28 +393,33 @@ async fn run_attached_control_stream(
                             }
                             Ok(())
                         } else {
-                            lease.control().heartbeat(sequence)
+                            lease.control().heartbeat(heartbeat.sequence)
                         }
                     }
-                    QueryControlCommand::Abort { reason } => {
+                    Some(proto::query_control_request::Command::Abort(abort)) => {
                         awaiting_graceful_termination = true;
-                        let result = lease.control().abort(reason);
+                        let result = lease.control().abort(abort.reason.clone());
                         if result.is_ok() {
                             emit_query_lifecycle_abort_marker();
                         }
                         result
                     }
-                    QueryControlCommand::Finalize => {
+                    Some(proto::query_control_request::Command::Finalize(_)) => {
                         awaiting_graceful_termination = true;
                         lease.control().finalize()
                     }
-                    QueryControlCommand::TerminalAck { ack } => {
+                    Some(proto::query_control_request::Command::TerminalAck(ack)) => {
+                        let ack = QueryTerminalAck::parse(ack.clone())
+                            .expect("validated Protocol command contains a terminal acknowledgement");
                         let result = lease.control().terminal_ack(ack);
                         if result.is_ok() {
                             lease.mark_graceful();
                         }
                         result
                     }
+                    Some(proto::query_control_request::Command::Attach(_)) | None => unreachable!(
+                        "validated Protocol command excludes Attach and empty control frames"
+                    ),
                 };
                 if let Err(error) = result {
                     let _ = send_control_response(
@@ -584,17 +443,22 @@ async fn run_attached_control_stream(
                 let Some(event) = event else {
                     break;
                 };
-                let terminal_stream_drop = match &event {
-                    QueryControlEvent::TerminalOutcome {
-                        outcome: novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::Proof { .. },
-                    } => terminal_proof_stream_drop
-                        .as_ref()
-                        .or(terminal_snapshot_stream_drop.as_ref()),
-                    QueryControlEvent::TerminalOutcome {
-                        outcome: novarocks::query_execution::lifecycle::ParticipantTerminalOutcome::NegativeAttestation(_),
-                    } => terminal_attestation_stream_drop
-                        .as_ref()
-                        .or(terminal_snapshot_stream_drop.as_ref()),
+                let terminal_stream_drop = match event.as_proto().event.as_ref() {
+                    Some(proto::query_control_response::Event::TerminalOutcome(outcome)) => {
+                        match outcome.outcome.as_ref() {
+                            Some(proto::participant_terminal_outcome::Outcome::Proof(_)) => {
+                                terminal_proof_stream_drop
+                                    .as_ref()
+                                    .or(terminal_snapshot_stream_drop.as_ref())
+                            }
+                            Some(proto::participant_terminal_outcome::Outcome::NegativeAttestation(_)) => {
+                                terminal_attestation_stream_drop
+                                    .as_ref()
+                                    .or(terminal_snapshot_stream_drop.as_ref())
+                            }
+                            None => None,
+                        }
+                    }
                     _ => None,
                 };
                 if let Some(scope) = terminal_stream_drop {
@@ -610,11 +474,13 @@ async fn run_attached_control_stream(
                     );
                     break;
                 }
-                let termination_accepted =
-                    matches!(event, QueryControlEvent::TerminationAccepted { .. });
+                let termination_accepted = matches!(
+                    event.as_proto().event,
+                    Some(proto::query_control_response::Event::TerminationAccepted(_))
+                );
                 if !send_control_response(
                     &outbound,
-                    Ok(protocol_control_event(&event).as_proto().clone()),
+                    Ok(event.as_proto().clone()),
                     &mut shutdown,
                 )
                 .await
@@ -666,27 +532,23 @@ fn register_staged_heartbeat_stop(scope: QueryLifecycleFaultScope) {
 fn register_staged_heartbeat_stop(_scope: QueryLifecycleFaultScope) {}
 
 #[cfg(debug_assertions)]
-fn staged_heartbeat_stop(
-    execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
-) -> Option<QueryLifecycleFaultScope> {
+fn staged_heartbeat_stop(execution_id: QueryExecutionId) -> Option<QueryLifecycleFaultScope> {
     staged_heartbeat_stops()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&protocol_execution_id(execution_id))
+        .get(&execution_id)
         .cloned()
 }
 
 #[cfg(not(debug_assertions))]
-fn staged_heartbeat_stop(
-    _execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
-) -> Option<QueryLifecycleFaultScope> {
+fn staged_heartbeat_stop(_execution_id: QueryExecutionId) -> Option<QueryLifecycleFaultScope> {
     None
 }
 
 #[cfg(debug_assertions)]
 fn claim_backend_fault(
     kind: QueryLifecycleFaultKind,
-    execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
+    execution_id: QueryExecutionId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
     let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(None);
@@ -705,7 +567,7 @@ fn claim_backend_fault(
     claim_matching_fault(
         &root,
         kind,
-        protocol_execution_id(execution_id),
+        execution_id,
         backend_index,
         backend_id,
         novarocks::runtime::start_epoch::start_epoch(),
@@ -749,7 +611,7 @@ fn wait_for_runner_owned_restart(_scope: &QueryLifecycleFaultScope) {}
 #[cfg(debug_assertions)]
 fn observe_backend_fault(
     kind: QueryLifecycleFaultKind,
-    execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
+    execution_id: QueryExecutionId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
     let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(None);
@@ -768,7 +630,7 @@ fn observe_backend_fault(
     observe_matching_fault(
         &root,
         kind,
-        protocol_execution_id(execution_id),
+        execution_id,
         backend_index,
         backend_id,
         novarocks::runtime::start_epoch::start_epoch(),
@@ -779,7 +641,7 @@ fn observe_backend_fault(
 #[cfg(not(debug_assertions))]
 fn claim_backend_fault(
     _kind: QueryLifecycleFaultKind,
-    _execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
+    _execution_id: QueryExecutionId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
     Ok(None)
 }
@@ -787,7 +649,7 @@ fn claim_backend_fault(
 #[cfg(not(debug_assertions))]
 fn observe_backend_fault(
     _kind: QueryLifecycleFaultKind,
-    _execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
+    _execution_id: QueryExecutionId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
     Ok(None)
 }
@@ -848,7 +710,7 @@ impl Drop for CoordinatorLease {
         if !self.graceful {
             let _ = self
                 .control
-                .coordinator_lost(QueryTerminationReason::CoordinatorStreamLost);
+                .coordinator_lost(QueryTerminationReason::QueryTerminationCoordinatorStreamLost);
         }
     }
 }

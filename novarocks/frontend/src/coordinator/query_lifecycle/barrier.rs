@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 use novarocks::query_execution::cancellation::QueryCancellationView;
 use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use novarocks::query_execution::lifecycle::{
-    QueryExecutionId, QueryInitBarrier, QueryInitPlan, QueryLaunchBarrier, QueryLifecycleLease,
-    StageBatch,
+    AttemptId as CoreAttemptId, QueryExecutionId, QueryInitBarrier, QueryInitPlan,
+    QueryLaunchBarrier, QueryLifecycleLease, StageBatch,
 };
 use novarocks_protocol::lifecycle::{
     AttemptId as ProtocolAttemptId, QueryControlAttach, QueryInitOutcome, QueryStageAck,
@@ -459,29 +459,32 @@ fn stage_one(
     config: FrontendQueryLifecycleConfig,
 ) -> Result<(), (usize, String)> {
     let target = batch.binding().target();
-    let request = protocol_stage_request(batch.request()).map_err(|error| {
-        (
-            target.backend_idx(),
-            format!(
-                "backend {} StageFragments request is invalid: {error}",
-                target.backend_idx()
-            ),
-        )
-    })?;
-    let first = transport.stage_fragments(target, &request, config.stage_rpc_timeout());
+    let request = batch.request();
+    let first = transport.stage_fragments(target, request, config.stage_rpc_timeout());
     let ack = match first {
         Ok(ack) => ack,
         Err(error) if error.is_unknown_stage_or_start_outcome() => transport
-            .stage_fragments(target, &request, config.stage_rpc_timeout())
-            .map_err(|retry| (target.backend_idx(), format!(
+            .stage_fragments(target, request, config.stage_rpc_timeout())
+            .map_err(|retry| {
+                (
+                    target.backend_idx(),
+                    format!(
                 "backend {} StageFragments retry failed after unknown outcome ({error}): {retry}",
                 target.backend_idx()
-            )))?,
-        Err(error) => return Err((target.backend_idx(), format!(
-            "backend {} StageFragments failed: {error}", target.backend_idx()
-        ))),
+            ),
+                )
+            })?,
+        Err(error) => {
+            return Err((
+                target.backend_idx(),
+                format!(
+                    "backend {} StageFragments failed: {error}",
+                    target.backend_idx()
+                ),
+            ))
+        }
     };
-    validate_stage_ack(target.backend_idx(), &request, &ack)
+    validate_stage_ack(target.backend_idx(), request, &ack)
 }
 
 fn start_one(
@@ -490,15 +493,7 @@ fn start_one(
     config: FrontendQueryLifecycleConfig,
 ) -> Result<(), (usize, String)> {
     let target = batch.binding().target();
-    let request = protocol_start_request(&batch.start_request()).map_err(|error| {
-        (
-            target.backend_idx(),
-            format!(
-                "backend {} StartPreparedQuery request is invalid: {error}",
-                target.backend_idx()
-            ),
-        )
-    })?;
+    let request = batch.start_request();
     let first = transport.start_prepared_query(target, &request, config.start_rpc_timeout());
     let ack = match first {
         Ok(ack) => ack,
@@ -569,43 +564,6 @@ fn validate_start_ack(
     Ok(())
 }
 
-/// The coordinator still receives the Core-owned stage batching model while
-/// CLS-R1 retires it. The FE owns this one-way projection into the canonical
-/// Protocol carrier immediately before transport; it deliberately does not
-/// route through a Core lifecycle codec.
-fn protocol_stage_request(
-    request: &novarocks::query_execution::lifecycle::QueryStageRequest,
-) -> Result<QueryStageRequest, String> {
-    QueryStageRequest::parse(protocol_wire::StageFragmentsRequest {
-        execution_id: Some(protocol_execution_id(request.execution_id())?.to_proto()),
-        init_digest: request.init_digest().as_bytes().to_vec(),
-        stage_digest_version: request.digest_version().get(),
-        stage_digest: request.digest().as_bytes().to_vec(),
-        fragments: request
-            .fragments()
-            .iter()
-            .map(|fragment| protocol_wire::StageFragment {
-                plan: Some(fragment.plan().clone()),
-                instance_params: Some(fragment.instance_params().clone()),
-            })
-            .collect(),
-    })
-    .map_err(|error| error.to_string())
-}
-
-/// See [`protocol_stage_request`]. Start has no fragments but must preserve
-/// the same execution and stage-digest fence before it reaches transport.
-fn protocol_start_request(
-    request: &novarocks::query_execution::lifecycle::QueryStartRequest,
-) -> Result<QueryStartRequest, String> {
-    QueryStartRequest::parse(protocol_wire::StartPreparedQueryRequest {
-        execution_id: Some(protocol_execution_id(request.execution_id())?.to_proto()),
-        stage_digest_version: request.digest_version().get(),
-        stage_digest: request.digest().as_bytes().to_vec(),
-    })
-    .map_err(|error| error.to_string())
-}
-
 fn protocol_execution_id(
     execution_id: QueryExecutionId,
 ) -> Result<novarocks_protocol::lifecycle::QueryExecutionId, String> {
@@ -633,7 +591,11 @@ fn record_lifecycle_phase_marker(
     let Some(execution_id) = batches.first().map(|batch| batch.request().execution_id()) else {
         return Ok(());
     };
-    record_lifecycle_phase_marker_for_execution(phase, execution_id)
+    let attempt = CoreAttemptId::new(execution_id.attempt_id().get())
+        .map_err(|error| contract_error(error.to_string()))?;
+    let core_execution_id = QueryExecutionId::new(execution_id.query_id(), attempt)
+        .map_err(|error| contract_error(error.to_string()))?;
+    record_lifecycle_phase_marker_for_execution(phase, core_execution_id)
 }
 
 /// Runner-only lifecycle barrier.  The terminal snapshot reader uses this
