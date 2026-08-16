@@ -19,7 +19,6 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
 use novarocks_spi::state_store::{
     CommitResolution, Direction, KeyRange, Precondition, RangeRequest, StateRecord, StateStore,
@@ -29,7 +28,11 @@ use novarocks_state_store::metrics::StateStoreMetrics;
 use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
 use uuid::Uuid;
 
-use super::codec::{StoredCatalogAttachment, StoredProperty, decode, encode};
+use crate::durable::{DurableRecordError, DurableRecordStore};
+
+use super::codec::{
+    CATALOG_ATTACHMENT_SCHEMA_VERSION, StoredCatalogAttachment, StoredProperty, decode, encode,
+};
 use super::key::{attachment_key, attachment_prefix};
 
 const DEFAULT_ATTACHMENT_SCAN_PAGE_SIZE: usize = 256;
@@ -92,12 +95,14 @@ impl std::error::Error for CatalogAttachmentError {}
 #[derive(Clone)]
 pub struct CatalogAttachmentRepository {
     store: Arc<dyn StateStore>,
+    durable: DurableRecordStore,
     metrics: Arc<StateStoreMetrics>,
 }
 
 impl CatalogAttachmentRepository {
     pub async fn open(store: Arc<dyn StateStore>) -> Result<Self, CatalogAttachmentError> {
         let repository = Self {
+            durable: DurableRecordStore::new(Arc::clone(&store)),
             metrics: Arc::new(StateStoreMetrics::new(
                 novarocks_spi::state_store::StateStoreProviderId::new("frontend-catalog"),
             )),
@@ -201,7 +206,7 @@ impl CatalogAttachmentRepository {
         attachment: CatalogAttachment,
     ) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
         let key = attachment_key(&attachment.instance_id).map_err(invalid)?;
-        let value = Bytes::from(encode(&stored_from(&attachment)).map_err(corruption)?);
+        let value = encode(&self.durable, &stored_from(&attachment)).map_err(durable_record)?;
         let outcome = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -210,9 +215,10 @@ impl CatalogAttachmentRepository {
             |transaction| {
                 let key = key.clone();
                 let value = value.clone();
+                let durable = self.durable.clone();
                 Box::pin(async move {
-                    transaction
-                        .put(key, value.try_into()?, Precondition::Absent)
+                    durable
+                        .put_record(transaction, key, value, Precondition::Absent)
                         .await?;
                     Ok(())
                 })
@@ -533,6 +539,7 @@ fn decode_record(
 
 fn stored_from(attachment: &CatalogAttachment) -> StoredCatalogAttachment {
     StoredCatalogAttachment {
+        schema_version: CATALOG_ATTACHMENT_SCHEMA_VERSION,
         attachment_id: attachment.attachment_id.to_string(),
         instance_id: attachment.instance_id.as_str().to_string(),
         provider_id: attachment.provider_id.as_str().to_string(),
@@ -622,6 +629,19 @@ fn invalid(message: impl Into<String>) -> CatalogAttachmentError {
 
 fn corruption(message: impl Into<String>) -> CatalogAttachmentError {
     CatalogAttachmentError::new(CatalogAttachmentErrorKind::Corruption, message)
+}
+
+fn durable_record(error: DurableRecordError) -> CatalogAttachmentError {
+    let kind = match error {
+        DurableRecordError::BudgetExceeded { .. }
+        | DurableRecordError::OpaqueBytesOutOfBounds { .. }
+        | DurableRecordError::SmallValueBudgetExceeded { .. } => {
+            CatalogAttachmentErrorKind::InvalidRequest
+        }
+        DurableRecordError::EncodingFailed { .. } => CatalogAttachmentErrorKind::Corruption,
+        DurableRecordError::Store(_) => CatalogAttachmentErrorKind::Unavailable,
+    };
+    CatalogAttachmentError::new(kind, error.to_string())
 }
 
 fn store(error: StateStoreError) -> CatalogAttachmentError {
@@ -760,6 +780,76 @@ mod tests {
                 .expect_err("stale exact delete must conflict")
                 .kind(),
             CatalogAttachmentErrorKind::Conflict
+        );
+
+        drop(repository);
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
+    }
+
+    #[tokio::test]
+    async fn create_rejects_an_over_budget_attachment_without_writing_a_record() {
+        let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
+        let registry =
+            builtin_state_store_provider_registry().expect("builtin StateStore registry");
+        let mut host = StateStoreHost::open(
+            &registry,
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    store: StateStoreConfig {
+                        cluster_id: "catalog-attachment-budget-test".to_string(),
+                        limits: StateStoreLimitOverrides {
+                            max_value_bytes: Some(256),
+                            ..StateStoreLimitOverrides::default()
+                        },
+                        provider: StateStoreProviderConfig::Sqlite {
+                            path: directory.path().join("state-store.sqlite"),
+                            deployment_owner: "catalog-attachment-budget-test".to_string(),
+                        },
+                    },
+                    mysql_client: None,
+                },
+                foundationdb_client: None,
+            },
+            FeDeploymentView {
+                active_fe_count: NonZeroUsize::new(1).expect("non-zero FE count"),
+                topology_revision: Bytes::from_static(b"catalog-attachment-budget-r1"),
+            },
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("open SQLite StateStore");
+        let store = host.state_store().expect("ready StateStore");
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open catalog attachment repository");
+
+        let mut requested = attachment(vec![("type".into(), "iceberg".into())]);
+        requested.display_name = "opaque-display-name-must-not-leak-".repeat(16);
+        let error = repository
+            .create(requested)
+            .await
+            .expect_err("over-budget attachment must fail before beginning a write");
+        assert_eq!(error.kind(), CatalogAttachmentErrorKind::InvalidRequest);
+        assert!(
+            error
+                .to_string()
+                .contains("catalog-attachment schema version 1")
+        );
+        assert!(error.to_string().contains("256-byte budget"));
+        assert!(
+            !error
+                .to_string()
+                .contains("opaque-display-name-must-not-leak")
+        );
+        assert!(
+            repository
+                .list()
+                .await
+                .expect("list after rejected create")
+                .is_empty()
         );
 
         drop(repository);

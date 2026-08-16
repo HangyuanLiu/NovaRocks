@@ -16,32 +16,29 @@
 // under the License.
 
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use novarocks_spi::connector::{ExternalMutationEvidence, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES};
+use novarocks_spi::connector::ExternalMutationEvidence;
 use novarocks_spi::state_store::{
     CommitOutcome, Direction, Key, KeyRange, Precondition, RangeRequest, ReadTransaction,
     StateStore, StateStoreError, StateStoreErrorKind, TransactionId, Value, VersionToken,
     WriteTransaction,
 };
-use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
+use crate::durable::{DurableOpaqueBytes, DurableRecordError, DurableRecordStore};
+
 use super::model::{
-    STATISTICS_JOB_SCHEMA_VERSION, StatisticsJob, StatisticsJobCreate, StatisticsJobError,
-    StatisticsJobState, StoredStatisticsJobV2,
+    MAX_DURABLE_STATISTICS_PUBLICATION_EVIDENCE_BYTES, MAX_STATISTICS_ERROR_MESSAGE_BYTES,
+    MAX_STATISTICS_METRIC_NAME_BYTES, MAX_STATISTICS_METRIC_NAMES,
+    MAX_STATISTICS_TARGET_COMPONENT_BYTES, STATISTICS_JOB_SCHEMA_VERSION, StatisticsJob,
+    StatisticsJobCreate, StatisticsJobError, StatisticsJobState, StoredStatisticsJobV2,
 };
 
 const JOB_PREFIX: &str = "novarocks/frontend/statistics/v2/jobs/";
-const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
-const MAX_METRIC_NAMES: usize = 128;
-const MAX_METRIC_NAME_BYTES: usize = 256;
-const MAX_TARGET_COMPONENT_BYTES: usize = 1024;
-const MAX_PUBLICATION_EVIDENCE_WIRE_BYTES: usize = MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES + 1024;
+const STATISTICS_JOB_STATE_INDEX_VALUE_BYTES: usize = 36;
 // A create has unique job and state-index keys, so a SQLite snapshot conflict
 // is never a semantic duplicate. Retry the same durable identity instead of
 // exposing storage contention as an ANALYZE failure.
@@ -63,13 +60,23 @@ pub enum StatisticsJobRepositoryErrorKind {
     InvalidTransition,
     Corruption,
     CommitUnknown,
+    BudgetExceeded,
     Store,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatisticsJobRecordBudget {
+    pub record_kind: &'static str,
+    pub schema_version: u8,
+    pub actual_bytes: usize,
+    pub limit_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsJobRepositoryError {
     kind: StatisticsJobRepositoryErrorKind,
     message: String,
+    budget: Option<StatisticsJobRecordBudget>,
 }
 
 impl StatisticsJobRepositoryError {
@@ -77,15 +84,43 @@ impl StatisticsJobRepositoryError {
         self.kind
     }
 
+    pub const fn budget(&self) -> Option<StatisticsJobRecordBudget> {
+        self.budget
+    }
+
     fn new(kind: StatisticsJobRepositoryErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
+            budget: None,
         }
     }
 
     fn corruption(message: impl Into<String>) -> Self {
         Self::new(StatisticsJobRepositoryErrorKind::Corruption, message)
+    }
+
+    fn durable(error: DurableRecordError) -> Self {
+        match error {
+            DurableRecordError::BudgetExceeded {
+                record_kind,
+                schema_version,
+                actual_bytes,
+                limit_bytes,
+            } => Self {
+                kind: StatisticsJobRepositoryErrorKind::BudgetExceeded,
+                message: format!(
+                    "statistics durable record {record_kind} schema version {schema_version} encoded to {actual_bytes} bytes, exceeding its {limit_bytes}-byte budget"
+                ),
+                budget: Some(StatisticsJobRecordBudget {
+                    record_kind,
+                    schema_version,
+                    actual_bytes,
+                    limit_bytes,
+                }),
+            },
+            other => Self::corruption(other.to_string()),
+        }
     }
 }
 
@@ -102,6 +137,7 @@ type RepositoryResult<T> = Result<T, StatisticsJobRepositoryError>;
 #[derive(Clone)]
 pub struct StatisticsJobRepository {
     store: Arc<dyn StateStore>,
+    durable_records: DurableRecordStore,
 }
 
 impl fmt::Debug for StatisticsJobRepository {
@@ -114,7 +150,10 @@ impl fmt::Debug for StatisticsJobRepository {
 
 impl StatisticsJobRepository {
     pub async fn open(store: Arc<dyn StateStore>) -> RepositoryResult<Self> {
-        let repository = Self { store };
+        let repository = Self {
+            durable_records: DurableRecordStore::new(Arc::clone(&store)),
+            store,
+        };
         repository.list().await?;
         Ok(repository)
     }
@@ -135,30 +174,21 @@ impl StatisticsJobRepository {
         validate_create(&request)?;
         let job_id = Uuid::now_v7();
         let operation_id = Uuid::now_v7();
-        let stored = StoredStatisticsJobV2 {
-            schema_version: STATISTICS_JOB_SCHEMA_VERSION,
-            job_id,
-            operation_id,
-            target: request.target,
-            table_pin: request.table_pin,
-            metric_names: request.metric_names,
-            state: StatisticsJobState::Submitted,
-            attempt: 0,
-            retry_not_before_ms: None,
-            publication_evidence: None,
-            cancel_requested: false,
-            error: None,
-            submitted_at_ms: request.submitted_at_ms,
-            updated_at_ms: request.submitted_at_ms,
-            completed_at_ms: None,
-        };
+        let stored = StoredStatisticsJobV2::try_new(job_id, operation_id, request)
+            .map_err(StatisticsJobRepositoryError::durable)?;
         for retry in 0..=CREATE_CONFLICT_RETRY_LIMIT {
             let mut transaction = self.begin_write("create frontend statistics job").await?;
             validate_fence(fence, transaction.as_mut()).await?;
-            transaction
-                .put(
+            let record = self
+                .durable_records
+                .encode(&stored)
+                .map_err(StatisticsJobRepositoryError::durable)?;
+            let state_index = self.index_value(job_id)?;
+            self.durable_records
+                .put_record(
+                    transaction.as_mut(),
                     job_key(job_id)?,
-                    encode_json(&stored, "statistics job")?,
+                    record,
                     Precondition::Absent,
                 )
                 .await
@@ -166,7 +196,7 @@ impl StatisticsJobRepository {
             transaction
                 .put(
                     state_key(StatisticsJobState::Submitted, job_id)?,
-                    index_value(job_id)?,
+                    state_index,
                     Precondition::Absent,
                 )
                 .await
@@ -340,13 +370,8 @@ impl StatisticsJobRepository {
         publication_evidence: Bytes,
         fence: &FenceValidator,
     ) -> RepositoryResult<StatisticsJob> {
-        if publication_evidence.is_empty()
-            || publication_evidence.len() > MAX_PUBLICATION_EVIDENCE_WIRE_BYTES
-        {
-            return Err(StatisticsJobRepositoryError::corruption(
-                "statistics publication evidence is empty or exceeds the bound",
-            ));
-        }
+        let publication_evidence = DurableOpaqueBytes::try_new(publication_evidence.to_vec())
+            .map_err(StatisticsJobRepositoryError::durable)?;
         self.transition_with_fence(
             job_id,
             StatisticsJobState::Running,
@@ -356,7 +381,7 @@ impl StatisticsJobRepository {
             Some(fence),
             false,
             None,
-            Some(publication_evidence.to_vec()),
+            Some(publication_evidence),
         )
         .await
     }
@@ -425,10 +450,15 @@ impl StatisticsJobRepository {
         let mut stored = versioned.stored;
         stored.cancel_requested = true;
         stored.updated_at_ms = now_ms;
-        transaction
-            .put(
+        let record = self
+            .durable_records
+            .encode(&stored)
+            .map_err(StatisticsJobRepositoryError::durable)?;
+        self.durable_records
+            .put_record(
+                transaction.as_mut(),
                 job_key(job_id)?,
-                encode_json(&stored, "statistics job")?,
+                record,
                 Precondition::Version(versioned.version),
             )
             .await
@@ -509,7 +539,9 @@ impl StatisticsJobRepository {
         fence: Option<&FenceValidator>,
         increment_attempt: bool,
         retry_not_before_ms: Option<i64>,
-        publication_evidence: Option<Vec<u8>>,
+        publication_evidence: Option<
+            DurableOpaqueBytes<MAX_DURABLE_STATISTICS_PUBLICATION_EVIDENCE_BYTES>,
+        >,
     ) -> RepositoryResult<StatisticsJob> {
         if !expected.can_transition_to(next) {
             return Err(invalid_transition(job_id, expected, next));
@@ -562,10 +594,16 @@ impl StatisticsJobRepository {
             })?;
         }
         stored.completed_at_ms = next.is_terminal().then_some(now_ms);
-        transaction
-            .put(
+        let record = self
+            .durable_records
+            .encode(&stored)
+            .map_err(StatisticsJobRepositoryError::durable)?;
+        let next_state_index = self.index_value(job_id)?;
+        self.durable_records
+            .put_record(
+                transaction.as_mut(),
                 job_key(job_id)?,
-                encode_json(&stored, "statistics job")?,
+                record,
                 Precondition::Version(versioned.version),
             )
             .await
@@ -577,7 +615,7 @@ impl StatisticsJobRepository {
         transaction
             .put(
                 state_key(next, job_id)?,
-                index_value(job_id)?,
+                next_state_index,
                 Precondition::Absent,
             )
             .await
@@ -715,7 +753,7 @@ fn validate_create(request: &StatisticsJobCreate) -> RepositoryResult<()> {
         &request.target.namespace,
         &request.target.table,
     ] {
-        if component.is_empty() || component.len() > MAX_TARGET_COMPONENT_BYTES {
+        if component.is_empty() || component.len() > MAX_STATISTICS_TARGET_COMPONENT_BYTES {
             return Err(StatisticsJobRepositoryError::corruption(
                 "statistics job target components must be non-empty and bounded",
             ));
@@ -726,7 +764,7 @@ fn validate_create(request: &StatisticsJobCreate) -> RepositoryResult<()> {
             "invalid statistics job table pin: {error}"
         ))
     })?;
-    if request.metric_names.is_empty() || request.metric_names.len() > MAX_METRIC_NAMES {
+    if request.metric_names.is_empty() || request.metric_names.len() > MAX_STATISTICS_METRIC_NAMES {
         return Err(StatisticsJobRepositoryError::corruption(
             "statistics job metric names must be non-empty and bounded",
         ));
@@ -734,7 +772,7 @@ fn validate_create(request: &StatisticsJobCreate) -> RepositoryResult<()> {
     if request
         .metric_names
         .iter()
-        .any(|metric| metric.is_empty() || metric.len() > MAX_METRIC_NAME_BYTES)
+        .any(|metric| metric.is_empty() || metric.len() > MAX_STATISTICS_METRIC_NAME_BYTES)
     {
         return Err(StatisticsJobRepositoryError::corruption(
             "statistics job metric name is empty or exceeds the bound",
@@ -745,7 +783,7 @@ fn validate_create(request: &StatisticsJobCreate) -> RepositoryResult<()> {
 
 fn validate_error(error: Option<&StatisticsJobError>) -> RepositoryResult<()> {
     if error.is_some_and(|error| {
-        error.message.is_empty() || error.message.len() > MAX_ERROR_MESSAGE_BYTES
+        error.message.is_empty() || error.message.len() > MAX_STATISTICS_ERROR_MESSAGE_BYTES
     }) {
         return Err(StatisticsJobRepositoryError::corruption(
             "statistics job error message is empty or exceeds the bound",
@@ -762,7 +800,7 @@ fn validate_stored(stored: &StoredStatisticsJobV2) -> RepositoryResult<()> {
     }
     validate_create(&StatisticsJobCreate {
         target: stored.target.clone(),
-        table_pin: stored.table_pin.clone(),
+        table_pin: (&stored.table_pin).into(),
         metric_names: stored.metric_names.clone(),
         submitted_at_ms: stored.submitted_at_ms,
     })?;
@@ -770,9 +808,7 @@ fn validate_stored(stored: &StoredStatisticsJobV2) -> RepositoryResult<()> {
     if stored
         .publication_evidence
         .as_ref()
-        .is_some_and(|evidence| {
-            evidence.is_empty() || evidence.len() > MAX_PUBLICATION_EVIDENCE_WIRE_BYTES
-        })
+        .is_some_and(|evidence| evidence.as_bytes().is_empty())
     {
         return Err(StatisticsJobRepositoryError::corruption(
             "statistics job publication evidence is empty or exceeds the bound",
@@ -784,11 +820,12 @@ fn validate_stored(stored: &StoredStatisticsJobV2) -> RepositoryResult<()> {
         ));
     }
     if let Some(wire) = &stored.publication_evidence {
-        let evidence = ExternalMutationEvidence::try_from_wire_v1(wire).map_err(|error| {
-            StatisticsJobRepositoryError::corruption(format!(
-                "statistics job publication evidence is invalid: {error}"
-            ))
-        })?;
+        let evidence =
+            ExternalMutationEvidence::try_from_wire_v1(wire.as_bytes()).map_err(|error| {
+                StatisticsJobRepositoryError::corruption(format!(
+                    "statistics job publication evidence is invalid: {error}"
+                ))
+            })?;
         if evidence.operation_id().to_bytes() != *stored.operation_id.as_bytes() {
             return Err(StatisticsJobRepositoryError::corruption(
                 "statistics job publication evidence operation ID does not match its job",
@@ -827,8 +864,16 @@ fn state_key(state: StatisticsJobState, job_id: Uuid) -> RepositoryResult<Key> {
     key(format!("{}{job_id}", state_prefix(state)))
 }
 
-fn index_value(job_id: Uuid) -> RepositoryResult<Value> {
-    Value::try_from(Bytes::from(job_id.to_string())).map_err(store_error)
+impl StatisticsJobRepository {
+    fn index_value(&self, job_id: Uuid) -> RepositoryResult<Value> {
+        self.durable_records
+            .encode_small_value(
+                "statistics job state index",
+                Bytes::from(job_id.to_string()),
+                STATISTICS_JOB_STATE_INDEX_VALUE_BYTES,
+            )
+            .map_err(StatisticsJobRepositoryError::durable)
+    }
 }
 
 fn decode_index_value(value: &Value) -> RepositoryResult<Uuid> {
@@ -836,13 +881,6 @@ fn decode_index_value(value: &Value) -> RepositoryResult<Uuid> {
         .map_err(|_| StatisticsJobRepositoryError::corruption("statistics job index is not UTF-8"))?
         .parse()
         .map_err(|_| StatisticsJobRepositoryError::corruption("statistics job index is not a UUID"))
-}
-
-fn encode_json<T: Serialize>(value: &T, context: &str) -> RepositoryResult<Value> {
-    let bytes = serde_json::to_vec(value).map_err(|error| {
-        StatisticsJobRepositoryError::corruption(format!("encode {context} failed: {error}"))
-    })?;
-    Value::try_from(Bytes::from(bytes)).map_err(store_error)
 }
 
 fn decode_json<T: DeserializeOwned>(bytes: &[u8], context: &str) -> RepositoryResult<T> {

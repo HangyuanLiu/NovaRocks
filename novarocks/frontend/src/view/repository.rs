@@ -23,8 +23,8 @@ use bytes::Bytes;
 use novarocks::view::ViewSqlDialect;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::state_store::{
-    Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore, Value,
-    WriteTransaction,
+    Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore,
+    StateStoreLimits, Value, WriteTransaction,
 };
 use novarocks_state_store::metrics::StateStoreMetrics;
 use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
@@ -35,8 +35,11 @@ use sqlparser::parser::Parser;
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
+use crate::durable::{DurableRecord, DurableRecordStore};
+
 const SCHEMA_VERSION: u8 = 1;
 const VIEW_PREFIX: &[u8] = b"novarocks/frontend/views/v1/";
+const VIEW_RECORD_ENCODED_LIMIT: usize = 60 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StoredDatabaseViewsV1 {
@@ -46,6 +49,15 @@ pub struct StoredDatabaseViewsV1 {
     pub last_operation_id: Uuid,
     #[serde(deserialize_with = "deserialize_views")]
     pub views: BTreeMap<String, String>,
+}
+
+impl DurableRecord for StoredDatabaseViewsV1 {
+    const RECORD_KIND: &'static str = "frontend-view-database";
+    const SCHEMA_VERSION: u8 = SCHEMA_VERSION;
+    // View SQL and names are variable-length, so the full encoded candidate is
+    // the authority. Reserve headroom below the StateStore 64 KiB ceiling for
+    // a stable record budget rather than accepting values at the transport cap.
+    const ENCODED_LIMIT: usize = VIEW_RECORD_ENCODED_LIMIT;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,6 +76,7 @@ pub enum DatabaseMutation {
 #[derive(Clone)]
 pub struct ViewRepository {
     store: Arc<dyn StateStore>,
+    durable: DurableRecordStore,
     runtime: Handle,
     metrics: Arc<StateStoreMetrics>,
 }
@@ -82,6 +95,7 @@ impl ViewRepository {
         let provider_id = store.metrics_snapshot().provider;
         let repository = Self {
             metrics: Arc::new(StateStoreMetrics::new(provider_id)),
+            durable: DurableRecordStore::new(Arc::clone(&store)),
             store,
             runtime,
         };
@@ -163,9 +177,11 @@ impl ViewRepository {
                 let catalog = catalog.clone();
                 let database = database.clone();
                 let mutation = mutation.clone();
+                let durable = self.durable.clone();
                 Box::pin(async move {
                     apply_mutation(
                         transaction,
+                        &durable,
                         &key,
                         operation_id,
                         &catalog,
@@ -225,18 +241,14 @@ pub fn database_key(catalog: &str, database: &str) -> Result<Key, String> {
 
 pub fn encode_record(record: StoredDatabaseViewsV1) -> Result<Value, String> {
     validate_record(&record)?;
-    let bytes = serde_json::to_vec(&record).map_err(|error| {
-        format!(
-            "encode frontend view database {}.{} failed: {error}",
-            record.catalog, record.database
-        )
-    })?;
-    Value::try_from(Bytes::from(bytes)).map_err(|error| {
-        format!(
-            "encode frontend view database {}.{} failed: {error}",
-            record.catalog, record.database
-        )
-    })
+    DurableRecordStore::with_limits(StateStoreLimits::default())
+        .encode_compat_value(&record)
+        .map_err(|error| {
+            format!(
+                "encode frontend view database {}.{} failed: {error}",
+                record.catalog, record.database
+            )
+        })
 }
 
 pub fn decode_record(key: Key, value: Value) -> Result<StoredDatabaseViewsV1, String> {
@@ -391,6 +403,7 @@ fn prepare_mutation(mutation: DatabaseMutation) -> Result<DatabaseMutation, Stri
 
 async fn apply_mutation(
     transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
     key: &Key,
     operation_id: OperationId,
     catalog: &str,
@@ -439,11 +452,21 @@ async fn apply_mutation(
         DatabaseMutation::DropDatabase => record.views.clear(),
     }
     record.last_operation_id = *operation_id.as_uuid();
-    let value = match encode_record(record.clone()) {
-        Ok(value) => value,
-        Err(error) => return Ok(Err(error)),
+    if let Err(error) = validate_record(&record) {
+        return Ok(Err(error));
+    }
+    let encoded = match durable.encode(&record) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            return Ok(Err(format!(
+                "encode frontend view database {}.{} failed: {error}",
+                record.catalog, record.database
+            )));
+        }
     };
-    transaction.put(key.clone(), value, precondition).await?;
+    durable
+        .put_record(transaction, key.clone(), encoded, precondition)
+        .await?;
     Ok(Ok(record))
 }
 
