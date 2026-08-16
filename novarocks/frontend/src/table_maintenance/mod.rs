@@ -557,6 +557,23 @@ impl FrontendTableMaintenanceService {
             .map_err(|error| format!("persist orphan cleanup prepared batch failed: {error}"))?;
             match engine.execute_cleanup_batch(&session, prepared)? {
                 CleanupBatchExecution::Receipt(receipt) => {
+                    if claim_cleanup_fault(CleanupFaultKind::DropDeleteResponse)
+                        .map_err(|error| format!("claim cleanup response-loss fault: {error}"))?
+                    {
+                        self.block_on(repository.mark_reconcile_pending_fenced(
+                            durable_id,
+                            now_unix_millis(),
+                            authority.clone(),
+                            Arc::clone(&validator),
+                        ))
+                        .map_err(|store| {
+                            format!("persist orphan cleanup uncertain dispatch failed: {store}")
+                        })?;
+                        return Err(
+                            "orphan cleanup dispatch outcome is unknown: debug provider response lost"
+                                .to_string(),
+                        );
+                    }
                     let checkpoint = cleanup_receipt_checkpoint(prepared_checkpoint, &receipt);
                     if claim_cleanup_fault(CleanupFaultKind::CheckpointFailed)
                         .map_err(|error| format!("claim cleanup checkpoint fault: {error}"))?

@@ -49,12 +49,16 @@ id	v
 1	one
 2	two
 
--- query 54
+-- query 49
+n
+0
+
+-- query 55
 id	v
 1	row1
 2	row2
 3	row3
 
--- query 55
+-- query 56
 n
 3

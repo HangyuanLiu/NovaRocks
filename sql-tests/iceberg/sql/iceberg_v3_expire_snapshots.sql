@@ -292,11 +292,15 @@ SELECT id, v FROM ${case_db}.t9 ORDER BY id;
 -- query 47
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t10 (id INT, v VARCHAR(16))
-TBLPROPERTIES ("format-version" = "2");
+TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
 
 -- query 48
 -- @expect_error=duplicate
 ALTER TABLE ${case_db}.t10 EXPIRE SNAPSHOTS OLDER THAN '2026-01-01 00:00:00' OLDER THAN '2026-02-01 00:00:00';
+
+-- query 49
+-- A syntax rejection must not remove the target table.
+SELECT COUNT(*) AS n FROM ${case_db}.t10;
 
 -- ---------------------------------------------------------------------------
 -- Case 11: After EXPIRE, table still readable + INSERT works
@@ -304,33 +308,33 @@ ALTER TABLE ${case_db}.t10 EXPIRE SNAPSHOTS OLDER THAN '2026-01-01 00:00:00' OLD
 -- adds new data correctly.
 -- ---------------------------------------------------------------------------
 
--- query 49
+-- query 50
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t11 (id INT, v VARCHAR(16))
 TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
 
--- query 50
+-- query 51
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t11 VALUES (1, 'row1');
 
--- query 51
+-- query 52
 -- @skip_result_check=true
 INSERT INTO ${case_db}.t11 VALUES (2, 'row2');
 
--- query 52
+-- query 53
 -- @skip_result_check=true
 -- EXPIRE noop: all snapshots live.
 ALTER TABLE ${case_db}.t11 EXPIRE SNAPSHOTS OLDER THAN '2099-01-01 00:00:00';
 
--- query 53
+-- query 54
 -- @skip_result_check=true
 -- INSERT after EXPIRE proves snapshot parent chain is healthy.
 INSERT INTO ${case_db}.t11 VALUES (3, 'row3');
 
--- query 54
+-- query 55
 -- All 3 rows visible: pre-EXPIRE rows plus the post-EXPIRE INSERT.
 SELECT id, v FROM ${case_db}.t11 ORDER BY id;
 
--- query 55
+-- query 56
 -- Total row count confirms no data loss.
 SELECT COUNT(*) AS n FROM ${case_db}.t11;

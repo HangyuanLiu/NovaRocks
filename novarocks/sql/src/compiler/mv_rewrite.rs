@@ -897,7 +897,6 @@ impl SqlImvPartitionFacts {
         fields: Vec<SqlImvPartitionFieldFacts>,
     ) -> Result<Self, String> {
         if target_spec_id < 0
-            || fields.is_empty()
             || fields.iter().enumerate().any(|(index, field)| {
                 fields[..index].iter().any(|other| {
                     other
@@ -2420,6 +2419,15 @@ mod tests {
 
     struct CandidateCatalog {
         resolutions: AtomicUsize,
+    }
+
+    #[test]
+    fn partition_facts_accept_unpartitioned_spec() {
+        let facts = SqlImvPartitionFacts::try_new(0, Vec::new())
+            .expect("unpartitioned Iceberg spec must be valid partition facts");
+
+        assert_eq!(facts.inner.target_spec_id, 0);
+        assert!(facts.inner.fields.is_empty());
     }
 
     impl CandidateCatalog {

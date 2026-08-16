@@ -139,11 +139,32 @@ pub struct CrossProcessRuntime {
     pub fe_mysql_port: u16,
 }
 
+/// Explicit child-only environment configured by a harness consumer.
+///
+/// The harness treats these values as opaque launch inputs. They are applied
+/// after its own invariant process environment, and the per-BE map overrides
+/// the common BE map for a single backend index.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrossProcessChildEnvironment {
+    pub fe: BTreeMap<String, String>,
+    pub be: BTreeMap<String, String>,
+    pub be_by_index: BTreeMap<usize, BTreeMap<String, String>>,
+}
+
+/// Consumer-provided TOML fragments applied after role and port rendering.
+///
+/// Harness-owned role, endpoint, topology and StateStore keys are rejected;
+/// the harness reapplies those values after the fragment is merged.
+#[derive(Debug, Clone, Default)]
+pub struct CrossProcessConfigOverlay {
+    pub fe: Option<String>,
+    pub be: Option<String>,
+}
+
 /// Typed inputs for one ephemeral 1FE+NBE cross-process cluster.
 ///
 /// Consumers resolve environment and runner-specific configuration before
 /// constructing this value. The harness owns only the distributed runtime.
-// Design: ADR-0071 (docs/adr/ADR-0071-distributed-test-orchestration-has-one-cluster-harness.md)
 #[derive(Debug, Clone)]
 pub struct CrossProcessClusterOptions {
     pub binary: PathBuf,
@@ -153,6 +174,11 @@ pub struct CrossProcessClusterOptions {
     pub query_lifecycle_faults_enabled: bool,
     pub cleanup_faults_enabled: bool,
     pub startup_timeout: Duration,
+    pub child_environment: CrossProcessChildEnvironment,
+    pub config_overlay: CrossProcessConfigOverlay,
+    /// `None` preserves the normal all-BE seed list; `Some` selects the FE
+    /// startup seed subset for dynamic-membership scenarios.
+    pub initial_backend_seeds: Option<Vec<usize>>,
 }
 
 /// Lifecycle boundaries accepted by the distributed fault controls.
@@ -506,13 +532,13 @@ where
 fn wait_for_live_backend_topology(
     mysql_user: &str,
     runtime: &CrossProcessRuntime,
+    expected_ports: &[u16],
     fe_config_path: &Path,
     be_config_paths: &[PathBuf],
     fe_process: &mut ManagedProcess,
     be_processes: &mut [ManagedProcess],
     timeout: Duration,
 ) -> Result<()> {
-    let expected_ports = runtime.be.iter().map(|be| be.grpc).collect::<Vec<_>>();
     let expected = expected_ports.len();
     let host = "127.0.0.1";
     let port = runtime.fe_mysql_port;
@@ -965,6 +991,8 @@ fn render_cross_process_launch_config(
     runtime_dir: &Path,
     query_lifecycle_faults_enabled: bool,
     cleanup_faults_enabled: bool,
+    overlay: Option<&str>,
+    initial_backend_seeds: &[usize],
 ) -> Result<String> {
     let rendered = render_cross_process_config(base_config, role, be_index, runtime)?;
     let mut value = rendered
@@ -973,6 +1001,24 @@ fn render_cross_process_launch_config(
     let root = value
         .as_table_mut()
         .context("rendered cross-process launch config root must be a TOML table")?;
+    if let Some(overlay) = overlay {
+        merge_safe_config_overlay(root, overlay)?;
+    }
+    if role == ClusterProcessRole::Fe {
+        let cluster = root
+            .get_mut("cluster")
+            .and_then(Value::as_table_mut)
+            .context("rendered cross-process FE config requires [cluster]")?;
+        cluster.insert(
+            "backends".to_string(),
+            Value::Array(
+                initial_backend_seeds
+                    .iter()
+                    .map(|index| Value::String(format!("127.0.0.1:{}", runtime.be[*index].grpc)))
+                    .collect(),
+            ),
+        );
+    }
     // `role = fe` persists backend membership in StateStore. Every ephemeral
     // SQL-test FE needs its own store so it cannot restore membership rows
     // whose dynamically allocated BE endpoints belong to another launch.
@@ -1377,6 +1423,9 @@ pub struct CrossProcessServerHandle {
     be_log_history: Vec<String>,
     fe_log_history: String,
     startup_timeout: Duration,
+    fe_environment: BTreeMap<String, String>,
+    be_environments: Vec<BTreeMap<String, String>>,
+    retain_runtime_artifacts: bool,
 }
 
 struct RuntimeDirGuard {
@@ -1418,7 +1467,18 @@ impl CrossProcessServerHandle {
             query_lifecycle_faults_enabled,
             cleanup_faults_enabled,
             startup_timeout,
+            child_environment,
+            config_overlay,
+            initial_backend_seeds,
         } = options;
+        let fe_environment = child_environment.fe;
+        let be_environments = resolve_be_environments(
+            &child_environment.be,
+            &child_environment.be_by_index,
+            cluster_size,
+        )?;
+        let initial_backend_seeds =
+            resolve_initial_backend_seeds(initial_backend_seeds.as_deref(), cluster_size)?;
         let runtime_dir = RuntimeDirGuard::new(create_runtime_dir(&runtime_root)?);
         let reserved = ReservedRuntimePorts::new(cluster_size)?;
         let query_lifecycle_fault_files = QueryLifecycleFaultFiles::new(
@@ -1443,6 +1503,10 @@ impl CrossProcessServerHandle {
             fe_grpc_port: reserved.fe_grpc_port.port(),
             fe_mysql_port: reserved.fe_mysql_port.port(),
         };
+        let initial_backend_seed_ports = initial_backend_seeds
+            .iter()
+            .map(|index| runtime.be[*index].grpc)
+            .collect::<Vec<_>>();
 
         let base_config = fs::read_to_string(&base_config_path).with_context(|| {
             format!(
@@ -1471,6 +1535,11 @@ impl CrossProcessServerHandle {
                 runtime_dir.path(),
                 query_lifecycle_faults_enabled,
                 cleanup_faults_enabled,
+                match role {
+                    ClusterProcessRole::Fe => config_overlay.fe.as_deref(),
+                    ClusterProcessRole::Be => config_overlay.be.as_deref(),
+                },
+                &initial_backend_seeds,
             )
         };
 
@@ -1517,6 +1586,7 @@ impl CrossProcessServerHandle {
                 query_lifecycle_fault_scope: query_lifecycle_faults_enabled
                     .then_some((query_lifecycle_fault_files.root(), Some(i))),
                 cleanup_fault_dir: None,
+                child_environment: &be_environments[i],
             })?;
             println!(
                 "started cross-process BE[{i}] pid={} grpc_port={} config={}",
@@ -1542,6 +1612,7 @@ impl CrossProcessServerHandle {
             query_lifecycle_fault_scope: query_lifecycle_faults_enabled
                 .then_some((query_lifecycle_fault_files.root(), None)),
             cleanup_fault_dir: cleanup_fault_files.as_ref().map(CleanupFaultFiles::root),
+            child_environment: &fe_environment,
         })?;
         println!(
             "started cross-process FE pid={} mysql_port={} config={}",
@@ -1552,6 +1623,7 @@ impl CrossProcessServerHandle {
         wait_for_live_backend_topology(
             &mysql_user,
             &runtime,
+            &initial_backend_seed_ports,
             &fe_config_path,
             &be_config_paths,
             &mut fe_process,
@@ -1582,7 +1654,63 @@ impl CrossProcessServerHandle {
             be_log_history: vec![String::new(); cluster_size],
             fe_log_history: String::new(),
             startup_timeout,
+            fe_environment,
+            be_environments,
+            retain_runtime_artifacts: false,
         })
+    }
+
+    /// Frozen runtime ports and endpoints for this launched cluster.
+    pub fn runtime(&self) -> &CrossProcessRuntime {
+        &self.runtime
+    }
+
+    /// Directory containing generated process config and captured logs.
+    pub fn runtime_dir(&self) -> &Path {
+        &self.runtime_dir
+    }
+
+    /// MySQL user parsed from the supplied base config.
+    pub fn mysql_user(&self) -> &str {
+        &self.mysql_user
+    }
+
+    /// Keep generated config and logs when the handle is dropped.
+    pub fn retain_runtime_artifacts(&mut self) {
+        self.retain_runtime_artifacts = true;
+    }
+
+    /// A bounded process and log diagnostic suitable for scenario failures.
+    pub fn diagnostics(&self) -> String {
+        self.query_execution_resource_diagnostics_impl()
+    }
+
+    /// Stop this cluster explicitly. Retained artifacts remain available.
+    pub fn shutdown(&mut self) -> Result<()> {
+        let mut failures = Vec::new();
+        if let Err(error) = self.fe_process.stop() {
+            failures.push(format!("stop cross-process FE: {error:#}"));
+        }
+        for (index, process) in self.be_processes.iter_mut().enumerate() {
+            if let Err(error) = process.stop() {
+                failures.push(format!("stop cross-process BE[{index}]: {error:#}"));
+            }
+        }
+        if !self.retain_runtime_artifacts {
+            if let Err(error) = fs::remove_dir_all(&self.runtime_dir) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    failures.push(format!(
+                        "remove cross-process runtime {}: {error}",
+                        self.runtime_dir.display()
+                    ));
+                }
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            bail!(failures.join("; "))
+        }
     }
 
     fn ensure_be_index(&self, index: usize) -> Result<()> {
@@ -2318,6 +2446,7 @@ impl ServerHandle for CrossProcessServerHandle {
                     index.to_string(),
                 );
         }
+        apply_child_environment(&mut command, &self.be_environments[index]);
         let log_path = self.runtime_dir.join(format!("be_{index}.log"));
         let be_process = self
             .be_processes
@@ -2340,6 +2469,7 @@ impl ServerHandle for CrossProcessServerHandle {
         wait_for_live_backend_topology(
             &self.mysql_user,
             &self.runtime,
+            &self.runtime.be.iter().map(|be| be.grpc).collect::<Vec<_>>(),
             &self.fe_config_path,
             &self.be_config_paths,
             &mut self.fe_process,
@@ -2423,6 +2553,7 @@ impl ServerHandle for CrossProcessServerHandle {
                 .expect("cleanup fault scope enabled");
             command.env("NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR", files.root());
         }
+        apply_child_environment(&mut command, &self.fe_environment);
         self.fe_process
             .restart(
                 command,
@@ -2440,6 +2571,7 @@ impl ServerHandle for CrossProcessServerHandle {
         wait_for_live_backend_topology(
             &self.mysql_user,
             &self.runtime,
+            &self.runtime.be.iter().map(|be| be.grpc).collect::<Vec<_>>(),
             &self.fe_config_path,
             &self.be_config_paths,
             &mut self.fe_process,
@@ -2477,15 +2609,15 @@ impl ServerHandle for CrossProcessServerHandle {
         println!("executed KILL QUERY {connection_id} through a separate control session");
         Ok(())
     }
+
+    fn shutdown(&mut self) -> Result<()> {
+        Self::shutdown(self)
+    }
 }
 
 impl Drop for CrossProcessServerHandle {
     fn drop(&mut self) {
-        let _ = self.fe_process.stop();
-        for be_process in &mut self.be_processes {
-            let _ = be_process.stop();
-        }
-        let _ = fs::remove_dir_all(&self.runtime_dir);
+        let _ = self.shutdown();
     }
 }
 
@@ -2572,6 +2704,7 @@ struct ProcessLaunch<'a> {
     fragment_failure_trigger: Option<&'a Path>,
     query_lifecycle_fault_scope: Option<(&'a Path, Option<usize>)>,
     cleanup_fault_dir: Option<&'a Path>,
+    child_environment: &'a BTreeMap<String, String>,
 }
 
 fn spawn_novarocks_process(launch: ProcessLaunch<'_>) -> Result<ManagedProcess> {
@@ -2585,6 +2718,7 @@ fn spawn_novarocks_process(launch: ProcessLaunch<'_>) -> Result<ManagedProcess> 
         fragment_failure_trigger,
         query_lifecycle_fault_scope,
         cleanup_fault_dir,
+        child_environment,
     } = launch;
     let mut command = build_novarocks_command(binary, role, config_path);
     if let Some(trigger_path) = fragment_failure_trigger {
@@ -2605,6 +2739,7 @@ fn spawn_novarocks_process(launch: ProcessLaunch<'_>) -> Result<ManagedProcess> 
     if let Some(fault_dir) = cleanup_fault_dir {
         command.env("NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR", fault_dir);
     }
+    apply_child_environment(&mut command, child_environment);
     let result = ManagedProcess::spawn(
         "novarocks".to_string(),
         command,
@@ -2616,6 +2751,96 @@ fn spawn_novarocks_process(launch: ProcessLaunch<'_>) -> Result<ManagedProcess> 
         Ok(process) => Ok(process),
         Err(error) => Err(map_novarocks_process_error(binary, role, marker, error)),
     }
+}
+
+fn apply_child_environment(command: &mut Command, environment: &BTreeMap<String, String>) {
+    command.envs(environment);
+}
+
+fn merge_safe_config_overlay(
+    root: &mut toml::map::Map<String, Value>,
+    overlay: &str,
+) -> Result<()> {
+    let overlay = overlay
+        .parse::<Value>()
+        .context("parse cross-process config overlay")?;
+    let overlay = overlay
+        .as_table()
+        .context("cross-process config overlay root must be a TOML table")?;
+    for key in ["server", "cluster", "state_store"] {
+        if overlay.contains_key(key) {
+            bail!("cross-process config overlay cannot modify [{key}]");
+        }
+    }
+    if overlay
+        .get("standalone_server")
+        .and_then(Value::as_table)
+        .is_some_and(|table| table.contains_key("mysql_port"))
+    {
+        bail!("cross-process config overlay cannot modify standalone_server.mysql_port");
+    }
+    merge_toml_table(root, overlay);
+    Ok(())
+}
+
+fn merge_toml_table(
+    target: &mut toml::map::Map<String, Value>,
+    overlay: &toml::map::Map<String, Value>,
+) {
+    for (key, value) in overlay {
+        match (target.get_mut(key), value) {
+            (Some(Value::Table(target)), Value::Table(overlay)) => {
+                merge_toml_table(target, overlay);
+            }
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn resolve_be_environments(
+    common: &BTreeMap<String, String>,
+    overrides: &BTreeMap<usize, BTreeMap<String, String>>,
+    cluster_size: usize,
+) -> Result<Vec<BTreeMap<String, String>>> {
+    for index in overrides.keys() {
+        if *index >= cluster_size {
+            bail!(
+                "BE environment override index {index} is out of bounds for cross-process cluster with {cluster_size} BE(s)"
+            );
+        }
+    }
+    Ok((0..cluster_size)
+        .map(|index| {
+            let mut environment = common.clone();
+            if let Some(index_overrides) = overrides.get(&index) {
+                environment.extend(index_overrides.clone());
+            }
+            environment
+        })
+        .collect())
+}
+
+fn resolve_initial_backend_seeds(
+    configured: Option<&[usize]>,
+    cluster_size: usize,
+) -> Result<Vec<usize>> {
+    let seeds = configured
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| (0..cluster_size).collect());
+    let mut seen = std::collections::BTreeSet::new();
+    for index in &seeds {
+        if *index >= cluster_size {
+            bail!(
+                "initial backend seed index {index} is out of bounds for cross-process cluster with {cluster_size} BE(s)"
+            );
+        }
+        if !seen.insert(*index) {
+            bail!("initial backend seed index {index} is duplicated");
+        }
+    }
+    Ok(seeds)
 }
 
 fn next_fragment_failure_token(index: usize) -> String {
@@ -3361,6 +3586,8 @@ enable_path_style_access = true
             first_runtime,
             false,
             false,
+            None,
+            &[0],
         )
         .unwrap()
         .parse::<Value>()
@@ -3373,6 +3600,8 @@ enable_path_style_access = true
             second_runtime,
             false,
             false,
+            None,
+            &[0],
         )
         .unwrap()
         .parse::<Value>()
@@ -3629,6 +3858,72 @@ enable_path_style_access = true
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn child_environment_applies_common_be_values_and_index_overrides() {
+        let common = BTreeMap::from([
+            ("COMMON".to_string(), "yes".to_string()),
+            ("OVERRIDE".to_string(), "common".to_string()),
+        ]);
+        let overrides = BTreeMap::from([(
+            1,
+            BTreeMap::from([("OVERRIDE".to_string(), "be-1".to_string())]),
+        )]);
+        let environments =
+            resolve_be_environments(&common, &overrides, 3).expect("resolve BE environments");
+        assert_eq!(environments.len(), 3);
+        assert_eq!(environments[0]["OVERRIDE"], "common");
+        assert_eq!(environments[1]["OVERRIDE"], "be-1");
+        assert_eq!(environments[2]["COMMON"], "yes");
+    }
+
+    #[test]
+    fn child_environment_rejects_out_of_range_be_override() {
+        let overrides = BTreeMap::from([(
+            2,
+            BTreeMap::from([("MARKER".to_string(), "value".to_string())]),
+        )]);
+        let error = resolve_be_environments(&BTreeMap::new(), &overrides, 2)
+            .expect_err("out of range override must fail");
+        assert!(format!("{error:#}").contains("out of bounds"));
+    }
+
+    #[test]
+    fn initial_backend_seeds_default_to_every_backend_and_allow_empty() {
+        assert_eq!(
+            resolve_initial_backend_seeds(None, 3).expect("default seeds"),
+            vec![0, 1, 2]
+        );
+        assert!(
+            resolve_initial_backend_seeds(Some(&[]), 3)
+                .expect("empty dynamic membership seeds")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn initial_backend_seeds_reject_invalid_or_duplicate_indices() {
+        assert!(resolve_initial_backend_seeds(Some(&[3]), 3).is_err());
+        assert!(resolve_initial_backend_seeds(Some(&[1, 1]), 3).is_err());
+    }
+
+    #[test]
+    fn config_overlay_merges_allowed_tables_and_rejects_harness_owned_values() {
+        let mut config: Value = BASE_CONFIG.parse().expect("parse base config");
+        let root = config.as_table_mut().expect("config root");
+        merge_safe_config_overlay(
+            root,
+            "[standalone_server]\nmv_refresh_scheduler_enabled = true\n[runtime]\nexchange_wait_ms = 42\n",
+        )
+        .expect("merge safe overlay");
+        assert_eq!(
+            root["standalone_server"]["mv_refresh_scheduler_enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(root["runtime"]["exchange_wait_ms"].as_integer(), Some(42));
+        assert!(merge_safe_config_overlay(root, "[cluster]\nrole = 'be'\n").is_err());
+        assert!(merge_safe_config_overlay(root, "[standalone_server]\nmysql_port = 1\n").is_err());
     }
 
     #[test]

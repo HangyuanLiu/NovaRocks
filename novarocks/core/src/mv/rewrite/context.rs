@@ -1222,15 +1222,18 @@ pub(crate) mod tests_support {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
     use std::sync::Arc;
 
     use crate::mv::refresh::pin::RefreshSnapshotPin;
     use mv_schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        BranchIdColumnContract, BranchUnionContract,
+        BranchIdColumnContract, BranchUnionContract, MvPartitionContract,
     };
     use novarocks_catalog::identifier::TableIdentity;
-    use novarocks_sql::planning::mv::SqlMvApplyKeySourceFacts;
+    use novarocks_sql::{
+        binding::SqlTableBindingAllocator, planning::mv::SqlMvApplyKeySourceFacts,
+    };
 
     const BRANCH_ID_COLUMN_NAME: &str = "__branch_id__";
 
@@ -1285,6 +1288,51 @@ mod tests {
         assert!(Arc::ptr_eq(&ctx.target_arrow_schema, &schema));
         assert_eq!(ctx.target_field_ids.as_ref(), field_ids.as_ref());
         assert!(Arc::ptr_eq(&ctx.schema_contract, &contract));
+    }
+
+    #[test]
+    fn unpartitioned_contract_projects_to_sql_rewrite_snapshot() {
+        let target = make_target();
+        let mut definition = make_mv_definition();
+        let mut contract = make_schema_contract();
+        contract.target.partition = Some(MvPartitionContract {
+            target_spec_id: 0,
+            fields: Vec::new(),
+        });
+        definition.schema_contract = Some(contract.clone());
+        let mv_def = Arc::new(definition);
+        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
+        let (schema, field_ids) = make_target_schema();
+
+        let ctx = IcebergMvRewriteContext::from_definition_parts(
+            target,
+            42,
+            None,
+            "db".to_string(),
+            mv_def,
+            query,
+            base_refs,
+            pin,
+            Some(99),
+            "uuid-tgt".to_string(),
+            schema,
+            field_ids,
+            Some(Arc::new(contract)),
+        )
+        .expect("unpartitioned schema contract must build rewrite context");
+
+        let mut bindings = SqlTableBindingAllocator::try_new(
+            NonZeroU64::new(1).expect("test binding scope must be nonzero"),
+        )
+        .expect("test binding allocator must be valid");
+        let target_binding = bindings
+            .allocate()
+            .expect("test target binding must be allocated");
+
+        ctx.to_sql_rewrite_snapshot(target_binding)
+            .expect("unpartitioned schema contract must project to SQL rewrite snapshot");
     }
 
     #[test]

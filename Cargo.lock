@@ -3504,6 +3504,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-system-test-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mysql",
+ "novarocks-cluster-harness",
+]
+
+[[package]]
 name = "novarocks-test-support"
 version = "0.1.0"
 dependencies = [

@@ -2831,7 +2831,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
                 );
             }
             let _guard = stdout_lock.lock().unwrap();
-            println!("[{}] ❌ suite init failed: {}", ctx.suite_name, exc);
+            println!("[{}] ❌ suite init failed: {exc:#}", ctx.suite_name);
             let outcomes: Vec<CaseOutcome> = ps
                 .cases
                 .iter()
