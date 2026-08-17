@@ -46,7 +46,8 @@ use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorMutationOperationId,
     ConnectorRefAction, ConnectorRefKind, ConnectorRefreshPublicationGuard,
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorWriteReceipt, CreateOrReplacePolicy,
-    DropPolicy, ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    DropPolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome,
 };
 use novarocks_sql::planning::mv::MvRefreshFinalizeFacts;
 use sha2::{Digest, Sha256};
@@ -440,7 +441,7 @@ fn execute_data_refresh(
     let completion = completion.ok_or_else(|| {
         invalid("MV refresh distributed write completed without connector terminal reports")
     })?;
-    let receipt = resolve_write_commit(
+    let CommittedWrite { effect, receipt } = resolve_write_commit(
         repository,
         attempt.refresh_id,
         attempt.write_operation_id.to_bytes(),
@@ -455,7 +456,15 @@ fn execute_data_refresh(
 
     recovery_phase_barrier("write-committed")?;
 
-    let publication_version = if atomic_repartition {
+    // A no-op write staged nothing, so the staging branch still points at the
+    // target head and there is no snapshot to fast-forward onto main. Issuing
+    // the publication anyway would ask the provider to promote a snapshot that
+    // carries no marker for this refresh, which fails closed. Record the phase
+    // as proof-only and let the unchanged version carry through to finalize,
+    // exactly as the atomic-repartition path does when the write already
+    // published itself.
+    let published_by_write = atomic_repartition || matches!(effect, ExternalMutationEffect::NoOp);
+    let publication_version = if published_by_write {
         record_proof_only_phase(
             repository,
             attempt.refresh_id,
@@ -649,13 +658,25 @@ fn table_identity(
     }
 }
 
+/// A committed write terminal, kept together with the effect the provider
+/// reported for it.
+///
+/// The effect decides whether a publication is still owed: a provider that
+/// resolved an empty delta through its declared no-external-commit disposition
+/// leaves the staging branch exactly where the target already was, so there is
+/// nothing to fast-forward.
+struct CommittedWrite {
+    effect: ExternalMutationEffect,
+    receipt: ConnectorWriteReceipt,
+}
+
 fn resolve_write_commit(
     repository: &dyn MvRepository,
     refresh_id: i64,
     operation_id: [u8; 16],
     completion: &ConnectorWriteCompletion,
     context: ConnectorRequestContext,
-) -> Result<ConnectorWriteReceipt, MvApplicationError> {
+) -> Result<CommittedWrite, MvApplicationError> {
     let outcome = completion
         .session()
         .commit(context.clone())
@@ -681,12 +702,12 @@ fn resolve_write_outcome(
     outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
     context: ConnectorRequestContext,
     allow_reconcile: bool,
-) -> Result<ConnectorWriteReceipt, MvApplicationError> {
+) -> Result<CommittedWrite, MvApplicationError> {
     match outcome {
         ExternalMutationOutcome::KnownCommitted {
+            effect,
             receipt,
             finalization,
-            ..
         } => {
             let committed_version = receipt.committed_version().ok_or_else(|| {
                 invalid("MV refresh connector write committed without a provider version")
@@ -706,7 +727,7 @@ fn resolve_write_outcome(
                 matches!(finalization, ExternalMutationFinalization::Complete),
             )?;
             match finalization {
-                ExternalMutationFinalization::Complete => Ok(receipt),
+                ExternalMutationFinalization::Complete => Ok(CommittedWrite { effect, receipt }),
                 ExternalMutationFinalization::Failed(failure) => Err(MvApplicationError::new(
                     MvApplicationErrorKind::KnownCommittedFinalizeFailed,
                     failure.to_string(),

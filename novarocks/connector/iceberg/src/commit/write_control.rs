@@ -1257,7 +1257,7 @@ impl IcebergWriteControl {
             .filter(|file| file.content == crate::iceberg::spec::DataContentType::Data)
             .fold(0_u64, |total, file| total.saturating_add(file.record_count));
 
-        if staged_data_rows == 0
+        if cohorts_stage_nothing(&decoded)
             && matches!(
                 &active.activation_intent,
                 ConnectorWriteActivationIntent::ManagedPublication(intent)
@@ -1265,28 +1265,59 @@ impl IcebergWriteControl {
                         == ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit
             )
         {
-            let files = decoded
-                .iter()
-                .flat_map(|cohort| cohort.files.iter().cloned())
-                .collect::<Vec<_>>();
+            // The caller declared this disposition, so terminating without an
+            // external commit is the policy resolving as asked rather than a
+            // failure: no snapshot is created and the target ref keeps the head
+            // it was activated against. Report that as a no-op terminal, so the
+            // refresh records the unchanged version and advances its watermark
+            // instead of failing a refresh that simply had nothing to publish.
+            //
+            // A pending partition replacement is the one case that still fails
+            // closed: the caller asked for a metadata transition that this path
+            // would silently drop, and no committed partitioning exists to report.
+            if active.partition_replacement.is_none()
+                && let Some(outcome) = unchanged_version_no_op(&metadata, &active.target)?
+            {
+                return Ok(outcome);
+            }
             let cleanup = self
-                .cleanup_files(&files)
+                .cleanup_files(&[])
                 .map_err(CommitServiceError::invalid_input)?;
             return Err(CommitServiceError::known_uncommitted(
                 "managed Iceberg publication produced empty input".to_string(),
                 cleanup,
             ));
         }
-        if decoded.iter().all(|cohort| cohort.files.is_empty())
+        if cohorts_stage_nothing(&decoded)
             && matches!(
                 active.activation_intent,
                 ConnectorWriteActivationIntent::Ordinary
             )
             && !replaces_every_live_row(&decoded)
         {
-            return Err(CommitServiceError::invalid_input(
-                "known-empty Iceberg writes must terminate through provider abort".to_string(),
-            ));
+            // An ordinary write that added to what is already live and staged
+            // nothing has no snapshot to publish. That is the write resolving
+            // to "changed nothing", not a caller mistake, so it terminates as a
+            // no-op on the version the target already held. Callers that keep a
+            // journal record this exactly as they record an execution that never
+            // reached the sink at all.
+            //
+            // A target with no snapshot yet has no version to report either, and
+            // an ordinary caller does not need one: it records a no-op terminal
+            // without a receipt. So the version-less marker is the honest
+            // receipt there, where a managed publication would still need a real
+            // version and keeps failing closed above.
+            if let Some(outcome) = unchanged_version_no_op(&metadata, &active.target)? {
+                return Ok(outcome);
+            }
+            return Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
+                receipt: ConnectorWriteReceipt::try_new(Bytes::from_static(
+                    b"iceberg-write-noop-no-snapshot",
+                ))
+                .map_err(|error| CommitServiceError::invalid_input(error.to_string()))?,
+                finalization: ExternalMutationFinalization::Complete,
+            });
         }
 
         let (op_kind, cow_update_rewrite) = commit_shape(active, &decoded)?;
@@ -2641,6 +2672,15 @@ fn cohorts_carry_data_only(cohorts: &[DecodedCohort]) -> bool {
         .all(|file| file.content == crate::iceberg::spec::DataContentType::Data)
 }
 
+/// Whether a decoded cohort set carries nothing to publish.
+///
+/// Emptiness is about files, never about data rows: a delta made purely of
+/// position or equality deletes stages zero data rows while still holding real
+/// deletions, so counting rows would classify it as empty and drop them.
+fn cohorts_stage_nothing(cohorts: &[DecodedCohort]) -> bool {
+    cohorts.iter().all(|cohort| cohort.files.is_empty())
+}
+
 /// Whether an ordinary write that staged no files still has a snapshot to
 /// publish. A full overwrite replaces every live row, so staging nothing means
 /// "replace all rows with nothing" and must commit; `OverwriteCommit` degrades
@@ -3263,6 +3303,54 @@ fn find_operation_marker_snapshot<'a>(
         }
     }
     Ok(matched)
+}
+
+/// A terminal for a write that resolved to changing nothing.
+///
+/// No snapshot was created, so the honest committed version is the head the
+/// target ref was activated against and the honest row count is that snapshot's
+/// own. `None` when the ref has no snapshot at all: there is no version to
+/// report, so the caller keeps failing closed rather than inventing one.
+fn unchanged_version_no_op(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    target: &ActiveTarget,
+) -> Result<Option<ExternalMutationOutcome<ConnectorWriteReceipt>>, CommitServiceError> {
+    let Some(unchanged_snapshot_id) = target.base_snapshot_id else {
+        return Ok(None);
+    };
+    let receipt = crate::write_codec::connector_write_receipt_with_partitioning(
+        unchanged_snapshot_id,
+        snapshot_total_records(metadata, unchanged_snapshot_id)?,
+        None,
+    )
+    .map_err(CommitServiceError::invalid_input)?;
+    Ok(Some(ExternalMutationOutcome::KnownCommitted {
+        effect: ExternalMutationEffect::NoOp,
+        receipt,
+        finalization: ExternalMutationFinalization::Complete,
+    }))
+}
+
+/// The `total-records` fact a snapshot already carries in loaded metadata.
+///
+/// Unlike `table_snapshot_row_count` this reloads nothing and never claims a
+/// commit happened, so it is the reader for paths that report an unchanged
+/// version rather than a newly written one.
+fn snapshot_total_records(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    snapshot_id: i64,
+) -> Result<Option<u64>, CommitServiceError> {
+    metadata
+        .snapshot_by_id(snapshot_id)
+        .and_then(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .get("total-records")
+                .map(|value| value.parse::<u64>())
+        })
+        .transpose()
+        .map_err(|error| CommitServiceError::invalid_input(error.to_string()))
 }
 
 fn table_snapshot_row_count(
@@ -5299,5 +5387,163 @@ mod tests {
             .activations
             .release(operation_id)
             .expect("release probe reservation");
+    }
+
+    fn active_target_for(metadata: &crate::iceberg::spec::TableMetadata) -> ActiveTarget {
+        ActiveTarget {
+            namespace: "db".to_string(),
+            table: "t".to_string(),
+            target_ref: "main".to_string(),
+            table_uuid: metadata.uuid().to_string(),
+            base_snapshot_id: metadata.current_snapshot_id(),
+            schema_id: metadata.current_schema_id(),
+            partition_spec_id: metadata.default_partition_spec_id(),
+            location: metadata.location().to_string(),
+        }
+    }
+
+    /// Add one snapshot carrying `total_records` and return its id.
+    fn metadata_with_snapshot(
+        metadata: crate::iceberg::spec::TableMetadata,
+        total_records: u64,
+    ) -> (crate::iceberg::spec::TableMetadata, i64) {
+        let snapshot_id = 4_242;
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(snapshot_id)
+            .with_sequence_number(metadata.last_sequence_number() + 1)
+            .with_timestamp_ms(metadata.last_updated_ms() + 1)
+            .with_manifest_list("file:///warehouse/db/t/metadata/noop.avro".to_string())
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: [("total-records".to_string(), total_records.to_string())]
+                    .into_iter()
+                    .collect(),
+            })
+            .with_schema_id(metadata.current_schema_id())
+            .build();
+        let metadata = TableMetadataBuilder::new_from_metadata(metadata, None)
+            .add_snapshot(snapshot)
+            .expect("add snapshot")
+            .build()
+            .expect("rebuild metadata")
+            .metadata;
+        (metadata, snapshot_id)
+    }
+
+    fn staged_file(content: crate::iceberg::spec::DataContentType, rows: u64) -> WrittenFile {
+        WrittenFile {
+            path: "s3://bucket/db/t/data/f.parquet".to_string(),
+            format: crate::iceberg::spec::DataFileFormat::Parquet,
+            content,
+            partition_values: crate::iceberg::spec::Struct::empty(),
+            partition_spec_id: 0,
+            record_count: rows,
+            file_size_in_bytes: 6,
+            split_offsets: Vec::new(),
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: None,
+            first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
+        }
+    }
+
+    fn cohort(files: Vec<WrittenFile>) -> DecodedCohort {
+        DecodedCohort {
+            cohort_id: ConnectorWriteCohortId::from_bytes([7; 32]),
+            intent: ConnectorWriteIntent::Append,
+            files,
+        }
+    }
+
+    #[test]
+    fn a_delete_only_delta_stages_something_even_with_no_data_rows() {
+        let deletes = cohort(vec![
+            staged_file(crate::iceberg::spec::DataContentType::PositionDeletes, 0),
+            staged_file(crate::iceberg::spec::DataContentType::EqualityDeletes, 0),
+        ]);
+
+        assert!(
+            !cohorts_stage_nothing(std::slice::from_ref(&deletes)),
+            "a delta holding only deletes has real deletions to publish, so it \
+             must not be classified as empty input and discarded"
+        );
+        assert!(cohorts_stage_nothing(&[cohort(Vec::new())]));
+        assert!(cohorts_stage_nothing(&[]));
+        assert!(!cohorts_stage_nothing(&[cohort(vec![staged_file(
+            crate::iceberg::spec::DataContentType::Data,
+            1,
+        )])]));
+    }
+
+    #[test]
+    fn a_no_op_terminal_reports_the_unchanged_version_and_its_row_count() {
+        let (_executor, _warehouse, _control, table) = control_with_empty_table();
+        let metadata = table.metadata().clone();
+        let mut target = active_target_for(&metadata);
+        // An empty fixture table has no snapshot, so there is no version to
+        // report and the caller has to keep failing closed.
+        target.base_snapshot_id = None;
+        assert!(
+            unchanged_version_no_op(&metadata, &target)
+                .expect("no-op projection")
+                .is_none()
+        );
+
+        let (metadata, snapshot_id) = metadata_with_snapshot(metadata, 41);
+        let target = ActiveTarget {
+            base_snapshot_id: Some(snapshot_id),
+            ..active_target_for(&metadata)
+        };
+
+        let outcome = unchanged_version_no_op(&metadata, &target)
+            .expect("no-op projection")
+            .expect("a target with a snapshot has a version to report");
+        let ExternalMutationOutcome::KnownCommitted {
+            effect,
+            receipt,
+            finalization,
+        } = outcome
+        else {
+            panic!("an empty write resolves as a known terminal, not a failure");
+        };
+        assert_eq!(effect, ExternalMutationEffect::NoOp);
+        assert_eq!(finalization, ExternalMutationFinalization::Complete);
+        assert_eq!(
+            receipt
+                .committed_version()
+                .and_then(|version| version.snapshot_id()),
+            Some(snapshot_id),
+            "a no-op leaves the ref where it was, so that is the committed version"
+        );
+        assert_eq!(receipt.resulting_row_count(), Some(41));
+        assert!(
+            receipt.committed_partitioning().is_none(),
+            "nothing was repartitioned"
+        );
+    }
+
+    #[test]
+    fn snapshot_total_records_reads_only_facts_that_exist() {
+        let (_executor, _warehouse, _control, table) = control_with_empty_table();
+        let (metadata, snapshot_id) = metadata_with_snapshot(table.metadata().clone(), 9);
+
+        assert_eq!(
+            snapshot_total_records(&metadata, snapshot_id).expect("row count"),
+            Some(9)
+        );
+        assert_eq!(
+            snapshot_total_records(&metadata, snapshot_id + 1_000).expect("row count"),
+            None,
+            "an absent snapshot carries no row-count fact to report"
+        );
     }
 }
