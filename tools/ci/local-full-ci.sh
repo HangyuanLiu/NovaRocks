@@ -26,6 +26,7 @@ source "$SCRIPT_DIR/lib/command.sh"
 source "$SCRIPT_DIR/lib/sql_suites.sh"
 source "$SCRIPT_DIR/lib/known_failures.sh"
 source "$SCRIPT_DIR/lib/server.sh"
+source "$SCRIPT_DIR/lib/system_scenarios.sh"
 
 STABLE_SUITES_FILE="$SCRIPT_DIR/suites/stable-sql-suites.txt"
 KNOWN_FAILURES_FILE="$SCRIPT_DIR/baselines/known-failures.toml"
@@ -35,6 +36,10 @@ CI_FROM_RUN_DIR=""
 ALL_DISCOVERED_REQUESTED="false"
 KEEP_RUNTIME="false"
 SKIP_CARGO_TEST="false"
+SKIP_SYSTEM_SCENARIOS="false"
+SYSTEM_SCENARIO_BASE_CONFIG="$SCRIPT_DIR/fixtures/system-scenarios-base.toml"
+SYSTEM_SCENARIO_CLUSTER_SIZE="${NOVA_CI_SYSTEM_CLUSTER_SIZE:-3}"
+SYSTEM_SCENARIO_TIMEOUT_SECS="${NOVA_CI_SYSTEM_TIMEOUT_SECS:-300}"
 REQUESTED_SUITES=()
 CI_RUNTIME_PREPARED="false"
 NOVA_CI_CARGO_PROFILE="${NOVA_CI_CARGO_PROFILE:-dev-opt}"
@@ -78,7 +83,11 @@ Options:
   --suite <name>        Run only the named SQL suite. May be repeated.
   --tier <name>         Stable tier: smoke, targeted, or full. Default: full.
   --from <run-dir>      Reclassify an existing logs/ci-full run without rerun.
-  --skip-cargo-test     Skip cargo test. Intended only for runner debugging.
+  --skip-cargo-test     Skip the Rust test stages. Only for runner debugging.
+  --skip-system-scenarios
+                        Skip the native 1FE+3BE System Scenario stage. Only for
+                        runner debugging; the stable default runs every
+                        registered scenario and records a skip as SKIP.
   --cluster-mode <mode> SQL runner cluster mode. Default: cross-process.
   --cluster-size <n>    Number of BE processes. Default: 3, or 1 for all-in-one.
   --keep-runtime        Keep this worktree's docker/iceberg-rest runtime entry.
@@ -159,6 +168,10 @@ parse_args() {
         ;;
       --skip-cargo-test)
         SKIP_CARGO_TEST="true"
+        shift
+        ;;
+      --skip-system-scenarios)
+        SKIP_SYSTEM_SCENARIOS="true"
         shift
         ;;
       --cluster-mode)
@@ -398,15 +411,82 @@ run_cargo_gates() {
   run_fail_fast_stage "generated artifact hygiene" "generated-artifact-hygiene.log" \
     tools/ci/check-generated-artifacts.sh
   run_fail_fast_stage "cargo fmt" "cargo-fmt.log" cargo fmt --check
-  run_fail_fast_stage "cargo clippy" "cargo-clippy.log" cargo clippy --all-targets
-  run_fail_fast_stage "cargo build" "cargo-build.log" cargo build --profile "$NOVA_CI_CARGO_PROFILE"
+  # `--workspace` is load-bearing. Without it Cargo falls back to
+  # `default-members = ["novarocks-server"]`, so the lint/build/test gates
+  # silently covered one package and every other workspace member's tests
+  # never ran.
+  run_fail_fast_stage "cargo clippy" "cargo-clippy.log" \
+    cargo clippy --workspace --all-targets
+  run_fail_fast_stage "cargo build" "cargo-build.log" \
+    cargo build --workspace --profile "$NOVA_CI_CARGO_PROFILE"
 
   if [ "$SKIP_CARGO_TEST" = "true" ]; then
-    ci_record_stage "cargo test" "SKIP" "0" ""
+    ci_record_stage "workspace component tests" "SKIP" "0" ""
+    ci_record_stage "server owner tests" "SKIP" "0" ""
+    ci_record_stage "server binary smoke" "SKIP" "0" ""
     ci_render_summary "RUNNING"
-  else
-    run_fail_fast_stage "cargo test" "cargo-test.log" cargo test --profile "$NOVA_CI_CARGO_PROFILE" -- --test-threads=1
+    return 0
   fi
+
+  # Each Cargo target belongs to exactly one stage below, so no test runs
+  # twice and a failure names its own layer:
+  #   - component: every workspace member except the server package;
+  #   - server owner: the server lib, its bin (`main.rs` carries unit tests)
+  #     and the direct-call config/composition target;
+  #   - server smoke: the child-process binary target only.
+  run_fail_fast_stage "workspace component tests" "cargo-test-component.log" \
+    cargo test --workspace --exclude novarocks-server \
+    --profile "$NOVA_CI_CARGO_PROFILE" -- --test-threads=1
+  run_fail_fast_stage "server owner tests" "cargo-test-server-owner.log" \
+    cargo test -p novarocks-server --lib --bins --test state_store_app_config \
+    --profile "$NOVA_CI_CARGO_PROFILE" -- --test-threads=1
+  run_fail_fast_stage "server binary smoke" "cargo-test-server-smoke.log" \
+    cargo test -p novarocks-server --test server_binary_smoke \
+    --profile "$NOVA_CI_CARGO_PROFILE" -- --test-threads=1
+}
+
+run_system_scenarios_stage() {
+  if [ "$SKIP_SYSTEM_SCENARIOS" = "true" ]; then
+    ci_record_stage "system scenarios" "SKIP" "0" ""
+    ci_record_system_scenario "<all>" "SKIP" "0" "" "-"
+    ci_render_summary "RUNNING"
+    return 0
+  fi
+
+  local runner="target/$NOVA_CI_CARGO_PROFILE/novarocks-system-tests"
+  local binary="target/$NOVA_CI_CARGO_PROFILE/novarocks"
+  local start
+  local code
+  local duration
+
+  # The workspace build above already produced both binaries; failing loudly
+  # here beats silently skipping the production-topology layer.
+  if [ ! -x "$runner" ] || [ ! -x "$binary" ]; then
+    ci_record_stage "system scenarios" "FAIL" "0" ""
+    ci_render_summary "FAIL"
+    echo "error: system scenario stage needs $runner and $binary" >&2
+    exit 1
+  fi
+
+  start="$(ci_epoch)"
+  ci_run_system_scenarios \
+    "$runner" \
+    "$binary" \
+    "$SYSTEM_SCENARIO_BASE_CONFIG" \
+    "$CI_RUN_DIR/system/artifacts" \
+    "$SYSTEM_SCENARIO_CLUSTER_SIZE" \
+    "$SYSTEM_SCENARIO_TIMEOUT_SECS"
+  code=$?
+  duration=$(($(ci_epoch) - start))
+
+  if [ "$code" -ne 0 ]; then
+    ci_record_stage "system scenarios" "FAIL" "$duration" ""
+    ci_render_summary "FAIL"
+    exit "$code"
+  fi
+
+  ci_record_stage "system scenarios" "PASS" "$duration" ""
+  ci_render_summary "RUNNING"
 }
 
 start_server_stage() {
@@ -1045,6 +1125,11 @@ main() {
 
   prepare_runtime
   run_cargo_gates
+  # System Scenarios run before the SQL suites so a topology, readiness,
+  # restart, fault or cleanup break surfaces before the much longer SQL tier.
+  # The stage needs no Docker fixture: every registered scenario builds its
+  # Iceberg warehouse on the local filesystem.
+  run_system_scenarios_stage
   reset_frontend_state_store_stage
   if [ "$SQL_CLUSTER_MODE" = "all-in-one" ]; then
     start_server_stage
