@@ -241,4 +241,90 @@ mod tests {
         .expect_err("absent attachment must block an external table target");
         assert_eq!(error, "unknown catalog `warehouse`");
     }
+
+    #[test]
+    fn persistent_table_target_without_current_catalog_is_rejected() {
+        let admission = TestCatalogAdmission {
+            application: Arc::new(AbsentCatalogApplication),
+        };
+
+        let error = resolve_table_target(
+            &admission,
+            &ObjectName {
+                parts: vec!["t_no_catalog".to_string()],
+            },
+            None,
+            "default_db",
+        )
+        .expect_err("CREATE TABLE without a current Iceberg catalog must fail");
+        assert_eq!(
+            error,
+            "CREATE TABLE requires an Iceberg catalog; create an external Iceberg catalog and SET catalog before using persistent tables"
+        );
+
+        let error = resolve_namespace_target(
+            &admission,
+            &ObjectName {
+                parts: vec!["db_no_catalog".to_string()],
+            },
+            None,
+        )
+        .expect_err("CREATE DATABASE without a current Iceberg catalog must fail");
+        assert_eq!(
+            error,
+            "CREATE DATABASE requires an Iceberg catalog; create an external Iceberg catalog and SET catalog before using persistent tables"
+        );
+    }
+
+    #[test]
+    fn default_catalog_is_not_a_user_table_catalog() {
+        let admission = TestCatalogAdmission {
+            application: Arc::new(AbsentCatalogApplication),
+        };
+        let expected = "default_catalog is not a user table catalog; create an external Iceberg catalog and SET catalog before using persistent tables";
+
+        // Qualified by name, regardless of the session catalog.
+        let error = resolve_table_target(
+            &admission,
+            &ObjectName {
+                parts: vec![
+                    "default_catalog".to_string(),
+                    "db1".to_string(),
+                    "t_default_catalog".to_string(),
+                ],
+            },
+            None,
+            "default_db",
+        )
+        .expect_err("a default_catalog-qualified table must be rejected");
+        assert_eq!(error, expected);
+
+        // Selected through the session, with an unqualified name.
+        let error = resolve_table_target(
+            &admission,
+            &ObjectName {
+                parts: vec!["t_default_catalog".to_string()],
+            },
+            Some("default_catalog"),
+            "db1",
+        )
+        .expect_err("a session on default_catalog must be rejected");
+        assert_eq!(error, expected);
+
+        // The name check is case-insensitive, so casing cannot bypass it.
+        let error = resolve_existing_table_target(
+            &admission,
+            &ObjectName {
+                parts: vec![
+                    "DEFAULT_CATALOG".to_string(),
+                    "db1".to_string(),
+                    "t_default_catalog".to_string(),
+                ],
+            },
+            None,
+            "default_db",
+        )
+        .expect_err("default_catalog rejection must ignore casing");
+        assert_eq!(error, expected);
+    }
 }
