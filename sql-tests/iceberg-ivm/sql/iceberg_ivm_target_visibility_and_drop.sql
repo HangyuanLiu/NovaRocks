@@ -72,7 +72,11 @@ SELECT COUNT(*) FROM target_mv;
 DROP MATERIALIZED VIEW target_mv;
 
 -- query 6
--- @expect_error=no metadata files
+-- The drop removes the target from the Iceberg catalog, so name resolution is
+-- what fails. The older "no metadata files" wording described a weaker drop
+-- that left the catalog entry behind with its metadata purged; asserting it
+-- would now pin that weaker behavior instead of objective 3.
+-- @expect_error=unknown table
 SELECT COUNT(*) FROM target_mv;
 
 -- query 7

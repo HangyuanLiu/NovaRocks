@@ -219,7 +219,7 @@ impl MvRepository for FakeRepository {
     fn drop_by_target(&self, _: &MvTarget) -> Result<bool, MvRepositoryError> {
         unused_repository_method!()
     }
-    fn set_rebuilt_refresh_watermark(
+    fn initialize_rebuilt_refresh_watermark(
         &self,
         _: i64,
         _: BTreeMap<String, i64>,

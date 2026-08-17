@@ -266,7 +266,7 @@ pub(crate) fn rebuild_one_lake_package_if_missing_with_repository(
         )
         .map_err(|e| format!("rebuild iceberg MV repository metadata failed: {e}"))?;
     repository
-        .set_rebuilt_refresh_watermark(
+        .initialize_rebuilt_refresh_watermark(
             definition.mv_id,
             rebuilt.last_refresh_snapshots,
             rebuilt.last_refresh_table_uuids,

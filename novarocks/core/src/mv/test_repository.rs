@@ -308,7 +308,7 @@ impl MvRepository for InMemoryMvRepository {
         request: RebuildMvRepositoryRequest,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
         let definition = self.create(operation_id, request.create)?;
-        self.set_rebuilt_refresh_watermark(
+        self.initialize_rebuilt_refresh_watermark(
             definition.mv_id,
             request.base_snapshots,
             request.base_table_uuids,
@@ -358,7 +358,7 @@ impl MvRepository for InMemoryMvRepository {
             .map(|definition| definition.mv_id);
         id.map_or(Ok(false), |mv_id| self.drop_by_id(mv_id))
     }
-    fn set_rebuilt_refresh_watermark(
+    fn initialize_rebuilt_refresh_watermark(
         &self,
         mv_id: i64,
         base_snapshots: BTreeMap<String, i64>,
