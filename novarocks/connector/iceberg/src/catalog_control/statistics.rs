@@ -48,7 +48,8 @@ use crate::statistics_codec::{
     statistics_metric_column,
 };
 use crate::stats_assembler::{
-    puffin_path_for_statistics_operation, write_puffin_with_provider_statistics,
+    StatisticsCoverageMark, puffin_path_for_statistics_operation,
+    write_puffin_with_provider_statistics,
 };
 use crate::theta_sketch::ThetaSketchHandle;
 
@@ -400,11 +401,11 @@ impl StatisticsCollection for IcebergControlProvider {
             .runtime()
             .load_table(&table.namespace, &table.table)
             .map_err(unavailable)?;
-        ensure_current_version(physical.table.metadata(), &expected)?;
-        let snapshot_id = physical
-            .table
-            .metadata()
-            .current_snapshot_id()
+        // The path is derived from the snapshot the collection measured, not
+        // from whatever is current now, so a table that advances between
+        // preparation and publication still produces the same evidence.
+        let snapshot_id = info
+            .current_snapshot_id
             .ok_or_else(|| invalid("cannot publish statistics for a table without a snapshot"))?;
         let path = puffin_path_for_statistics_operation(
             physical.table.metadata(),
@@ -449,16 +450,27 @@ impl StatisticsCollection for IcebergControlProvider {
             .load_table(&table.namespace, &table.table)
             .map_err(unavailable)?;
         let metadata = physical.table.metadata();
-        if let Err(error) = ensure_current_version(metadata, &expected) {
-            return Ok(known_uncommitted(error));
-        }
-        let snapshot = metadata.current_snapshot().ok_or_else(|| {
+        // Statistics belong to the snapshot they measured. Requiring that
+        // snapshot to still be current is what made ANALYZE fail on any table
+        // that took a write while it ran; the ancestry walk on the read side is
+        // what makes an older target readable.
+        let snapshot_id = info.current_snapshot_id.ok_or_else(|| {
             invalid("cannot publish statistics for a table without a current snapshot")
         })?;
-        let snapshot_id = snapshot.snapshot_id();
+        let Some(snapshot) = metadata.snapshot_by_id(snapshot_id) else {
+            // The measured snapshot expired while the collection ran; there is
+            // nothing left to attach the result to.
+            return Ok(known_uncommitted(invalid(
+                "the snapshot these statistics measured is no longer present in table metadata",
+            )));
+        };
         let sequence_number = snapshot.sequence_number();
-        let field_ids = metadata
-            .current_schema()
+        let measured_schema = snapshot.schema(metadata).map_err(|error| {
+            corrupt(format!(
+                "resolve the schema of the measured Iceberg snapshot: {error}"
+            ))
+        })?;
+        let field_ids = measured_schema
             .as_struct()
             .fields()
             .iter()
@@ -501,6 +513,9 @@ impl StatisticsCollection for IcebergControlProvider {
                     sequence_number,
                     &sketches,
                     Some(&provider_statistics),
+                    // ANALYZE scanned every visible row, which is what gives it
+                    // precedence over an incremental entry on the same snapshot.
+                    StatisticsCoverageMark::AllVisibleRows,
                 )
                 .await
             })
@@ -527,21 +542,32 @@ impl StatisticsCollection for IcebergControlProvider {
                     &table_for_commit,
                     catalog.as_ref(),
                     statistics_file,
+                    StatisticsCoverageMark::AllVisibleRows,
                 )
                 .await
             });
         match committed {
-            Ok(Ok(())) => {
+            Ok(Ok(outcome)) => {
                 self.runtime()
                     .control_state()
                     .invalidate_table(&table.namespace, &table.table);
+                let effect = match outcome {
+                    crate::commit::statistics::StatisticsCommitOutcome::Registered => {
+                        ExternalMutationEffect::Applied
+                    }
+                    // A fuller entry already covers this snapshot. Nothing was
+                    // written, and nothing needed to be.
+                    crate::commit::statistics::StatisticsCommitOutcome::YieldedToFullerCoverage => {
+                        ExternalMutationEffect::NoOp
+                    }
+                };
                 statistics_receipt(
                     self,
                     request.operation_id,
                     expected,
                     request.result.evidence.evidence_revision().clone(),
                     Bytes::from(path),
-                    ExternalMutationEffect::Applied,
+                    effect,
                 )
             }
             Ok(Err(error)) | Err(error) => Ok(ExternalMutationOutcome::CommitUnknown {
@@ -588,9 +614,8 @@ impl StatisticsCollection for IcebergControlProvider {
             .runtime()
             .load_table(&evidence.namespace, &evidence.table)
             .map_err(unavailable)?;
-        if let Err(error) = ensure_current_version(physical.table.metadata(), &expected) {
-            return Ok(known_uncommitted(error));
-        }
+        // Whether the artifact is registered is the authoritative answer, and it
+        // stays authoritative however far the table has moved since.
         if physical
             .table
             .metadata()
@@ -646,20 +671,6 @@ fn pinned_data_version(
             .ok_or_else(|| corrupt("Iceberg table payload is missing its table UUID"))?,
         info.current_snapshot_id,
     )
-}
-
-fn ensure_current_version(
-    metadata: &crate::iceberg::spec::TableMetadata,
-    expected: &StatisticsDataVersion,
-) -> Result<(), ConnectorError> {
-    let current =
-        statistics_data_version(&metadata.uuid().to_string(), metadata.current_snapshot_id())?;
-    if &current != expected {
-        return Err(invalid(
-            "Iceberg table changed while statistics evidence was being processed",
-        ));
-    }
-    Ok(())
 }
 
 fn statistics_scan_layout(

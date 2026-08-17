@@ -130,7 +130,7 @@ mod tests {
         FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
         SortOrder, StatisticsFile, Summary, TableMetadataBuilder, Type,
     };
-    use crate::stats_assembler::write_puffin_with_provider_statistics;
+    use crate::stats_assembler::{StatisticsCoverageMark, write_puffin_with_provider_statistics};
     use crate::theta_sketch::ThetaSketchHandle;
 
     use super::*;
@@ -210,6 +210,7 @@ mod tests {
             snapshot_id,
             &sketches,
             None,
+            StatisticsCoverageMark::AllVisibleRows,
         )
         .await
         .expect("write puffin")

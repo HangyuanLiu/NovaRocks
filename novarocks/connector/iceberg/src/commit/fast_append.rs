@@ -163,9 +163,13 @@ pub(crate) async fn register_puffin_stats(
     .await
     {
         Ok(Some(stats_file)) => {
-            if let Err(err) =
-                crate::commit::statistics::commit_statistics_file(table_after, catalog, stats_file)
-                    .await
+            if let Err(err) = crate::commit::statistics::commit_statistics_file(
+                table_after,
+                catalog,
+                stats_file,
+                crate::stats_assembler::StatisticsCoverageMark::IncrementalUnion,
+            )
+            .await
             {
                 tracing::warn!(
                     new_snapshot_id,
@@ -214,8 +218,12 @@ pub(crate) async fn carry_forward_puffin_stats(
     for blob in entry.blob_metadata.iter_mut() {
         blob.snapshot_id = new_snapshot_id;
     }
+    // Carrying an entry forward preserves whatever it already claimed; it is a
+    // re-registration of the same artifact, not a new measurement.
+    let coverage = crate::stats_assembler::StatisticsCoverageMark::of(&entry);
     if let Err(err) =
-        crate::commit::statistics::commit_statistics_file(table_after, catalog, entry).await
+        crate::commit::statistics::commit_statistics_file(table_after, catalog, entry, coverage)
+            .await
     {
         tracing::warn!(
             new_snapshot_id,

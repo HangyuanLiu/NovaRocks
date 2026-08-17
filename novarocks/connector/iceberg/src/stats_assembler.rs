@@ -326,6 +326,9 @@ pub async fn write_puffin(
         sequence_number,
         sketches,
         None,
+        // The only caller is the write-path assembler, which unions new data
+        // into the parent's sketches rather than rescanning the table.
+        StatisticsCoverageMark::IncrementalUnion,
     )
     .await
 }
@@ -334,6 +337,53 @@ pub async fn write_puffin(
 /// one opaque provider evidence blob.  The optional blob is not used for
 /// Iceberg catalog mutation semantics; it merely preserves the exact scalar
 /// evidence that was collected for this snapshot and operation.
+/// Blob property recording how the statistics in a file were produced.
+///
+/// Iceberg keeps at most one statistics file per snapshot and `set_statistics`
+/// replaces it, so two writers targeting the same snapshot need a way to tell
+/// whose result is worth more. Without this marker the arbitration cannot run
+/// and the last writer would silently win.
+pub const STATISTICS_COVERAGE_PROPERTY: &str = "novarocks.statistics.coverage";
+pub const STATISTICS_COVERAGE_ALL_VISIBLE_ROWS: &str = "all-visible-rows";
+pub const STATISTICS_COVERAGE_INCREMENTAL_UNION: &str = "incremental-union";
+
+/// How completely a registered statistics entry covers its snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatisticsCoverageMark {
+    /// Produced by scanning every visible row of the snapshot.
+    AllVisibleRows,
+    /// Produced by merging new data into the parent's sketches.
+    IncrementalUnion,
+}
+
+impl StatisticsCoverageMark {
+    fn as_property(self) -> &'static str {
+        match self {
+            Self::AllVisibleRows => STATISTICS_COVERAGE_ALL_VISIBLE_ROWS,
+            Self::IncrementalUnion => STATISTICS_COVERAGE_INCREMENTAL_UNION,
+        }
+    }
+
+    /// Reads the mark off a registered entry.
+    ///
+    /// An entry without the property predates the marker or came from another
+    /// engine; treating it as incremental is the conservative reading, since it
+    /// only ever makes this side yield.
+    pub fn of(file: &StatisticsFile) -> Self {
+        file.blob_metadata
+            .iter()
+            .find_map(|blob| blob.properties.get(STATISTICS_COVERAGE_PROPERTY))
+            .map(|value| {
+                if value == STATISTICS_COVERAGE_ALL_VISIBLE_ROWS {
+                    Self::AllVisibleRows
+                } else {
+                    Self::IncrementalUnion
+                }
+            })
+            .unwrap_or(Self::IncrementalUnion)
+    }
+}
+
 pub async fn write_puffin_with_provider_statistics(
     file_io: &FileIO,
     puffin_path: &str,
@@ -341,7 +391,12 @@ pub async fn write_puffin_with_provider_statistics(
     sequence_number: i64,
     sketches: &HashMap<i32, ThetaSketchHandle>,
     provider_statistics: Option<&[u8]>,
+    coverage: StatisticsCoverageMark,
 ) -> Result<Option<StatisticsFile>, String> {
+    let coverage_property = HashMap::from([(
+        STATISTICS_COVERAGE_PROPERTY.to_string(),
+        coverage.as_property().to_string(),
+    )]);
     let output_file = file_io
         .new_output(puffin_path)
         .map_err(|e| format!("open output puffin {puffin_path}: {e}"))?;
@@ -367,7 +422,7 @@ pub async fn write_puffin_with_provider_statistics(
             .snapshot_id(snapshot_id)
             .sequence_number(sequence_number)
             .data(data)
-            .properties(HashMap::new())
+            .properties(coverage_property.clone())
             .build();
         writer
             .add(blob, crate::iceberg::puffin::CompressionCodec::None)
@@ -379,7 +434,7 @@ pub async fn write_puffin_with_provider_statistics(
             snapshot_id,
             sequence_number,
             fields: vec![field_id],
-            properties: HashMap::new(),
+            properties: coverage_property.clone(),
         });
     }
     if let Some(provider_statistics) = provider_statistics {
@@ -389,7 +444,7 @@ pub async fn write_puffin_with_provider_statistics(
             .snapshot_id(snapshot_id)
             .sequence_number(sequence_number)
             .data(provider_statistics.to_vec())
-            .properties(HashMap::new())
+            .properties(coverage_property.clone())
             .build();
         writer
             .add(blob, crate::iceberg::puffin::CompressionCodec::None)
@@ -400,7 +455,7 @@ pub async fn write_puffin_with_provider_statistics(
             snapshot_id,
             sequence_number,
             fields: Vec::new(),
-            properties: HashMap::new(),
+            properties: coverage_property.clone(),
         });
     }
     writer
@@ -653,6 +708,7 @@ mod tests {
             1,
             &sketches,
             Some(payload),
+            StatisticsCoverageMark::AllVisibleRows,
         )
         .await
         .expect("write provider statistics")
