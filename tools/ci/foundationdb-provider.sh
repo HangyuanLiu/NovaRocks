@@ -63,11 +63,28 @@ cargo check -p novarocks-spi --no-default-features
 cargo test -p novarocks-state-store --lib
 cargo test -p novarocks-state-store --test state_store_contract
 cargo test -p novarocks-state-store --test state_store_sqlite -- --test-threads=1
-cargo test -p novarocks --test state_store_app_config
+cargo test -p novarocks-server --test state_store_app_config
 cargo build -p novarocks-server --profile dev-opt
 cargo test -p novarocks-state-store --features foundationdb-provider,state-store-test-hooks --test state_store_foundationdb_runtime foundationdb_runtime_lifecycle -- --nocapture --test-threads=1
 cargo test -p novarocks-state-store --features foundationdb-provider,state-store-test-hooks --test state_store_foundationdb foundationdb_suite -- --nocapture --test-threads=1
 cargo test -p novarocks-state-store --features foundationdb-provider,state-store-test-hooks --test state_store_foundationdb_cross_process -- --nocapture --test-threads=1
 cargo build -p novarocks-server --profile dev-opt --features foundationdb-provider
-cargo test -p novarocks-server --test cluster_mvp cross_process_three_be_state_store_baseline -- --exact --nocapture
+
+# Feature-binary coexistence smoke, NOT provider runtime evidence.
+#
+# This proves only that a FoundationDB-feature-enabled `novarocks` binary still
+# completes a standard native 1FE+3BE topology, query and cleanup. It runs on
+# the provider-neutral SQLite base config, so it says nothing about whether a
+# query used the FoundationDB StateStore. Provider correctness is established
+# above by the provider contract, runtime and cross-process tests.
+cargo build -p novarocks-system-test-runner --profile dev-opt
+FDB_BASELINE_ARTIFACTS="$(mktemp -d)"
+trap 'rm -rf "$FDB_BASELINE_ARTIFACTS"' EXIT
+target/dev-opt/novarocks-system-tests \
+  --binary target/dev-opt/novarocks \
+  --config tools/ci/fixtures/system-scenarios-base.toml \
+  --artifact-root "$FDB_BASELINE_ARTIFACTS" \
+  --cluster-size 3 \
+  --timeout-secs 300 \
+  --only query-lifecycle/distributed-baseline
 git diff --check
