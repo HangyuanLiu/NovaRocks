@@ -67,6 +67,7 @@ pub mod row_mutation_payload;
 pub mod scan_model;
 pub mod schema_facts;
 pub mod schema_mapping;
+pub mod statistics_ancestry;
 pub mod statistics_basis;
 pub mod statistics_codec;
 pub mod stats_assembler;
