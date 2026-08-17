@@ -26,7 +26,7 @@
 //! A mismatched evidence-level data version is still fatal here: the provider
 //! answered about a different table state than the one being planned.  Whether
 //! an individual *metric* may be used is not decided at this boundary — that is
-//! per metric, via `StatisticsMetricObservation::describes_version`, so that one
+//! per metric, via `StatisticsMetricObservation::describes_queried_rows`, so that one
 //! degraded metric cannot disqualify the rest of the answer.
 
 use std::collections::HashMap;

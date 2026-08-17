@@ -192,7 +192,7 @@ fn evidence_to_base_statistics(
     let admitted = |metric: StatisticsMetric| -> Option<&StatisticsMetricObservation> {
         match evidence.metrics().get(&metric) {
             Some(StatisticsMetricState::Available(observation))
-                if observation.describes_version(evidence.data_version()) =>
+                if observation.describes_queried_rows() =>
             {
                 Some(observation)
             }
