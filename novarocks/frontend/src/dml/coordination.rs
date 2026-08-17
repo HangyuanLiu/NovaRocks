@@ -58,6 +58,16 @@ use crate::dml::model::{
 };
 use crate::dml::now_unix_millis;
 
+/// How many definite acquire conflicts to absorb before giving up. Each one
+/// proves the acquire did not happen, so retrying is safe; the bound keeps a
+/// genuinely contended record from spinning.
+const ACQUIRE_CONFLICT_RETRIES: u8 = 3;
+
+/// How many definite release conflicts to absorb. Swallowing a release failure
+/// strands this operation's record for a whole lease duration and reports a
+/// failure for work that already finished.
+const RELEASE_CONFLICT_RETRIES: u8 = 3;
+
 #[derive(Clone)]
 // Design: ADR-0054 (docs/adr/ADR-0054-frontend-dml-operation-authority-boundary.md)
 pub(crate) struct DmlCoordinator {
@@ -121,23 +131,41 @@ impl DmlCoordinator {
             )
             .with_operation_id(operation.operation_id));
         }
-        let attempt_uuid = Uuid::now_v7();
-        let attempt = AttemptId::try_from(attempt_uuid).map_err(map_coordination_error)?;
-        let acquire_operation_uuid = Uuid::now_v7();
-        let acquire_operation_id = OperationId::from(acquire_operation_uuid);
         let resource = dml_operation_resource_key(operation.operation_id)?;
         let manager = self.frontend.lease_manager();
-        let outcome = self.blocking(async {
-            match manager
-                .acquire(resource.clone(), attempt, acquire_operation_id)
-                .await
-            {
-                Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => manager
-                    .recover_acquire(resource, attempt, acquire_operation_id)
+        let (attempt_uuid, outcome) = self.blocking(async {
+            let mut remaining = ACQUIRE_CONFLICT_RETRIES;
+            loop {
+                let attempt_uuid = Uuid::now_v7();
+                let attempt = AttemptId::try_from(attempt_uuid).map_err(map_coordination_error)?;
+                let acquire_operation_id = OperationId::new_v7();
+                match manager
+                    .acquire(resource.clone(), attempt, acquire_operation_id)
                     .await
-                    .map_err(map_coordination_error),
-                Ok(outcome) => Ok(outcome),
-                Err(error) => Err(map_coordination_error(error)),
+                {
+                    Ok(outcome) => return Ok((attempt_uuid, outcome)),
+                    Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
+                        return manager
+                            .recover_acquire(resource.clone(), attempt, acquire_operation_id)
+                            .await
+                            .map(|outcome| (attempt_uuid, outcome))
+                            .map_err(map_coordination_error);
+                    }
+                    // A definite transaction conflict: the acquire provably did
+                    // not take effect, so nothing is half-done and a fresh
+                    // attempt and operation ID may simply try again. Statements
+                    // arrive back to back and each release races the next
+                    // acquire, so surfacing this would fail a statement that
+                    // only lost a version race. Table maintenance already
+                    // absorbs it the same way.
+                    Err(error)
+                        if error.kind() == CoordinationErrorKind::OperationNotCommitted
+                            && remaining > 0 =>
+                    {
+                        remaining -= 1;
+                    }
+                    Err(error) => return Err(map_coordination_error(error)),
+                }
             }
         })?;
         let guard = match outcome {
@@ -727,14 +755,31 @@ impl DmlOperationAuthority {
         if let Some(renewal) = renewal {
             let _ = renewal.await;
         }
-        let operation_id = OperationId::new_v7();
         let result = {
             let mut guard = self.inner.guard.lock().await;
-            match guard.release(operation_id).await {
-                Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
-                    guard.recover_release(operation_id).await
+            let mut remaining = RELEASE_CONFLICT_RETRIES;
+            loop {
+                let operation_id = OperationId::new_v7();
+                let result = match guard.release(operation_id).await {
+                    Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
+                        guard.recover_release(operation_id).await
+                    }
+                    result => result,
+                };
+                match result {
+                    // A definite conflict leaves the guard active and clears its
+                    // recovery state, so releasing under a fresh operation ID is
+                    // safe. Giving up here would strand this operation's record
+                    // until its lease expires, and report a failure for an
+                    // operation whose work already finished.
+                    Err(error)
+                        if error.kind() == CoordinationErrorKind::OperationNotCommitted
+                            && remaining > 0 =>
+                    {
+                        remaining -= 1;
+                    }
+                    result => break result,
                 }
-                result => result,
             }
         };
         if let Some(active) = self.active.upgrade() {
