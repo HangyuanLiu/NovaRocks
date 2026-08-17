@@ -3505,43 +3505,43 @@ fn run() -> Result<i32> {
 
         let target_host = launched_target_host
             .or_else(|| cli.host.clone())
-            .or_else(|| env_optional("STARUST_TEST_HOST"))
+            .or_else(|| env_optional("NOVAROCKS_SQL_TEST_HOST"))
             .or_else(|| runner_config.cluster.get("host").cloned())
             .unwrap_or_else(|| "127.0.0.1".to_string());
         let target_user = cli
             .user
             .clone()
-            .or_else(|| env_optional("STARUST_TEST_USER"))
+            .or_else(|| env_optional("NOVAROCKS_SQL_TEST_USER"))
             .or_else(|| runner_config.cluster.get("user").cloned())
             .unwrap_or_else(|| "root".to_string());
         let target_password = cli
             .password
             .clone()
-            .or_else(|| env_optional("STARUST_TEST_PASSWORD"))
+            .or_else(|| env_optional("NOVAROCKS_SQL_TEST_PASSWORD"))
             .or_else(|| runner_config.cluster.get("password").cloned());
         let target_mysql_bin = cli
             .mysql
             .clone()
-            .unwrap_or_else(|| env_or_default("STARUST_TEST_MYSQL", "mysql"));
+            .unwrap_or_else(|| env_or_default("NOVAROCKS_SQL_TEST_MYSQL", "mysql"));
 
         let ref_host = cli
             .ref_host
             .clone()
-            .or_else(|| env_optional("STARUST_REF_HOST"))
+            .or_else(|| env_optional("NOVAROCKS_SQL_TEST_REF_HOST"))
             .unwrap_or_else(|| "127.0.0.1".to_string());
         let ref_user = cli
             .ref_user
             .clone()
-            .or_else(|| env_optional("STARUST_REF_USER"))
+            .or_else(|| env_optional("NOVAROCKS_SQL_TEST_REF_USER"))
             .unwrap_or_else(|| "root".to_string());
         let ref_password = cli
             .ref_password
             .clone()
-            .or_else(|| env_optional("STARUST_REF_PASSWORD"));
+            .or_else(|| env_optional("NOVAROCKS_SQL_TEST_REF_PASSWORD"));
         let ref_mysql_bin = cli
             .ref_mysql
             .clone()
-            .unwrap_or_else(|| env_or_default("STARUST_REF_MYSQL", "mysql"));
+            .unwrap_or_else(|| env_or_default("NOVAROCKS_SQL_TEST_REF_MYSQL", "mysql"));
 
         let verify_enabled_override = verify_override(&cli);
         let actual_artifact_dir = resolve_path(cli.write_actual_dir.as_deref(), &base_dir);
@@ -3616,7 +3616,7 @@ fn run() -> Result<i32> {
 
             let verify_enabled = verify_enabled_override.unwrap_or(suite.verify_default);
             let query_timeout = cli.query_timeout.unwrap_or_else(|| {
-                env_optional("STARUST_TEST_TIMEOUT")
+                env_optional("NOVAROCKS_SQL_TEST_TIMEOUT")
                     .and_then(|raw| raw.parse().ok())
                     .unwrap_or_else(|| suite_default_query_timeout(&suite.name))
             });

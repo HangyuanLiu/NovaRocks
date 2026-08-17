@@ -2929,6 +2929,7 @@ dependencies = [
  "novarocks-fs",
  "novarocks-protocol",
  "novarocks-spi",
+ "novarocks-sql",
  "novarocks-state-store",
  "novarocks-types",
  "novarocks-version",
@@ -3104,6 +3105,7 @@ version = "0.1.0"
 dependencies = [
  "apache-avro",
  "arrow",
+ "arrow-buffer",
  "async-trait",
  "axum",
  "bytes",
@@ -3116,6 +3118,7 @@ dependencies = [
  "novarocks-fs",
  "novarocks-protocol",
  "novarocks-spi",
+ "novarocks-sql",
  "novarocks-state-store",
  "novarocks-types",
  "prost 0.13.5",
@@ -3153,9 +3156,13 @@ dependencies = [
 name = "novarocks-protocol"
 version = "0.1.0"
 dependencies = [
+ "novarocks-types",
+ "once_cell",
  "prost 0.13.5",
  "prost-build",
+ "prost-reflect",
  "protoc-bin-vendored",
+ "sha2",
 ]
 
 [[package]]
@@ -3193,6 +3200,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-sql"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "base64 0.22.1",
+ "chrono",
+ "hex",
+ "md-5",
+ "novarocks-catalog",
+ "novarocks-spi",
+ "novarocks-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlparser",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "novarocks-state-store"
 version = "0.1.0"
 dependencies = [
@@ -3211,6 +3238,21 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "novarocks-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "novarocks",
+ "novarocks-fs",
+ "novarocks-server",
+ "opendal",
+ "parquet",
+ "tokio",
 ]
 
 [[package]]
@@ -5048,21 +5090,6 @@ dependencies = [
  "libc",
  "psm",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "starust-tools"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "futures",
- "novarocks",
- "novarocks-fs",
- "novarocks-server",
- "opendal",
- "parquet",
- "tokio",
 ]
 
 [[package]]

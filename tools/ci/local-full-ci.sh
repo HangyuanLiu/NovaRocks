@@ -410,6 +410,10 @@ run_fail_fast_stage() {
 run_cargo_gates() {
   run_fail_fast_stage "generated artifact hygiene" "generated-artifact-hygiene.log" \
     tools/ci/check-generated-artifacts.sh
+  run_fail_fast_stage "legacy branding" "legacy-branding.log" \
+    tools/ci/check-legacy-branding.sh
+  run_fail_fast_stage "legacy branding tests" "legacy-branding-test.log" \
+    tools/ci/tests/legacy-branding-test.sh
   run_fail_fast_stage "cargo fmt" "cargo-fmt.log" cargo fmt --check
   # `--workspace` is load-bearing. Without it Cargo falls back to
   # `default-members = ["novarocks-server"]`, so the lint/build/test gates

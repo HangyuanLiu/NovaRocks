@@ -65,7 +65,7 @@ pub fn resolve_config_path(cli_path: Option<&str>, base_dir: &Path) -> Option<Pa
     if let Some(path) = resolve_path(cli_path, base_dir) {
         return Some(path);
     }
-    if let Some(raw) = env_optional("STARUST_TEST_CONFIG") {
+    if let Some(raw) = env_optional("NOVAROCKS_SQL_TEST_CONFIG") {
         return resolve_path(Some(&raw), base_dir).or_else(|| Some(PathBuf::from(raw)));
     }
     detect_default_config(base_dir)
@@ -360,7 +360,7 @@ pub fn resolve_target_port(cli_port: Option<&str>, runner_config: &RunnerConfig)
     if let Some(port) = cli_port.filter(|v| !v.trim().is_empty()) {
         return Ok(port.trim().to_string());
     }
-    if let Some(port) = env_optional("STARUST_TEST_PORT") {
+    if let Some(port) = env_optional("NOVAROCKS_SQL_TEST_PORT") {
         return Ok(port);
     }
     if let Some(port) = runner_config
@@ -371,7 +371,7 @@ pub fn resolve_target_port(cli_port: Option<&str>, runner_config: &RunnerConfig)
         return Ok(port.trim().to_string());
     }
     bail!(
-        "target port is not set; provide --port or STARUST_TEST_PORT, or configure tests/sql-test-runner/conf/sr.conf with [cluster].port"
+        "target port is not set; provide --port or NOVAROCKS_SQL_TEST_PORT, or configure tests/sql-test-runner/conf/sr.conf with [cluster].port"
     );
 }
 
@@ -399,11 +399,11 @@ pub fn resolve_reference_port(
     if let Some(port) = cli_ref_port.filter(|v| !v.trim().is_empty()) {
         return Ok(port.trim().to_string());
     }
-    if let Some(port) = env_optional("STARUST_REF_PORT") {
+    if let Some(port) = env_optional("NOVAROCKS_SQL_TEST_REF_PORT") {
         return Ok(port);
     }
     if reference_required {
-        bail!("reference port is required for this mode; provide --ref-port or STARUST_REF_PORT");
+        bail!("reference port is required for this mode; provide --ref-port or NOVAROCKS_SQL_TEST_REF_PORT");
     }
     Ok(target_port.to_string())
 }

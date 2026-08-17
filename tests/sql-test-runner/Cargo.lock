@@ -1782,6 +1782,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-sql-test-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "mysql",
+ "novarocks-cluster-harness",
+ "opendal",
+ "rayon",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "novarocks-test-support"
 version = "0.1.0"
 dependencies = [
@@ -2713,28 +2735,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "starust-sql-tests"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "mysql",
- "novarocks-cluster-harness",
- "opendal",
- "rayon",
- "regex",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "toml",
-]
 
 [[package]]
 name = "static_assertions"

@@ -24,7 +24,7 @@
 [workspace]
 
 [package]
-name = "starust-sql-tests"
+name = "novarocks-sql-test-runner"
 version = "0.1.0"
 edition = "2024"
 
