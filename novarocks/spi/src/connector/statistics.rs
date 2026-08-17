@@ -17,6 +17,7 @@
 
 //! FE-only provider-neutral statistics contract.
 //! Design: ADR-0022 (docs/adr/ADR-0022-connector-statistics-capability.md)
+//! Design: ADR-0080 (docs/adr/ADR-0080-statistics-evidence-four-dimension-model.md)
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -133,17 +134,49 @@ impl StatisticsMetricRequest {
     }
 }
 
+/// Collection-level fact: whether this measurement observed every visible row
+/// of its basis. It is deliberately independent of how accurate the resulting
+/// numbers are — a scan can cover every visible row and still report an
+/// approximate sketch value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StatisticsCoverage {
-    Full,
-    Subset,
-    Superset,
+pub enum StatisticsRowCoverage {
+    AllVisibleRows,
+    PartialRows,
 }
 
+/// Per-metric fact: which kind of artifact the value was read from.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum StatisticsMetricSource {
+    CurrentManifest,
+    ProviderArtifact,
+    VisibleRowScan,
+    Provider(Arc<str>),
+}
+
+/// Per-metric fact: how the value relates to the true value **on its own
+/// basis**. It says nothing about how that basis relates to the queried
+/// version; that is `StatisticsBasisRelation`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StatisticsAccuracy {
+pub enum StatisticsNumericNature {
     Exact,
-    Approximate,
+    UpperBound,
+    LowerBound,
+    /// Estimated in both directions. Sketch-derived values such as Theta NDV
+    /// are always this, even when their basis is the queried version.
+    TwoSidedApproximate,
+}
+
+/// Per-metric fact: how the metric's basis row set relates to the row set of
+/// the queried version. It says nothing about whether the value is accurate on
+/// that basis; that is `StatisticsNumericNature`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatisticsBasisRelation {
+    Identical,
+    BasisIsSubset,
+    BasisIsSuperset,
+    /// The provider could not prove any of the above. Providers must return
+    /// this rather than guessing.
+    Incomparable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -164,14 +197,6 @@ impl StatisticsInterval {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum StatisticsProvenance {
-    ProviderArtifact,
-    Manifest,
-    VisibleRows,
-    Provider(Arc<str>),
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum StatisticsMetricValue {
     U64(u64),
@@ -186,6 +211,77 @@ impl StatisticsMetricValue {
             bytes,
             "statistics metric value",
         )?))
+    }
+}
+
+/// One provided metric value together with the three per-metric facts that
+/// describe it. Keeping them on the value rather than on the whole evidence is
+/// what lets one answer carry an exact current row count, a directional bound,
+/// and an approximate ancestor NDV without any of them polluting the others.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatisticsMetricObservation {
+    value: StatisticsMetricValue,
+    basis_version: StatisticsDataVersion,
+    source: StatisticsMetricSource,
+    numeric_nature: StatisticsNumericNature,
+    basis_relation: StatisticsBasisRelation,
+    interval: Option<StatisticsInterval>,
+}
+
+impl StatisticsMetricObservation {
+    pub fn new(
+        value: StatisticsMetricValue,
+        basis_version: StatisticsDataVersion,
+        source: StatisticsMetricSource,
+        numeric_nature: StatisticsNumericNature,
+        basis_relation: StatisticsBasisRelation,
+    ) -> Self {
+        Self {
+            value,
+            basis_version,
+            source,
+            numeric_nature,
+            basis_relation,
+            interval: None,
+        }
+    }
+
+    /// Attaches a confidence interval. No producer fills one today; the setter
+    /// exists so a future estimator does not have to reshape the observation.
+    pub fn with_interval(mut self, interval: StatisticsInterval) -> Self {
+        self.interval = Some(interval);
+        self
+    }
+
+    pub fn value(&self) -> &StatisticsMetricValue {
+        &self.value
+    }
+    pub fn basis_version(&self) -> &StatisticsDataVersion {
+        &self.basis_version
+    }
+    pub fn source(&self) -> &StatisticsMetricSource {
+        &self.source
+    }
+    pub const fn numeric_nature(&self) -> StatisticsNumericNature {
+        self.numeric_nature
+    }
+    pub const fn basis_relation(&self) -> StatisticsBasisRelation {
+        self.basis_relation
+    }
+    pub const fn interval(&self) -> Option<StatisticsInterval> {
+        self.interval
+    }
+
+    /// Whether this value describes the row set of `version` itself.
+    ///
+    /// This is the admission question for a consumer: a value measured on some
+    /// other basis, or on a basis whose relation the provider could not prove,
+    /// is not a statement about the rows `version` contains. Numeric nature is
+    /// deliberately not part of it — a bound or a sketch estimate still
+    /// describes the right rows, and how far to trust it is a separate,
+    /// consumer-owned confidence decision.
+    pub fn describes_version(&self, version: &StatisticsDataVersion) -> bool {
+        self.basis_relation == StatisticsBasisRelation::Identical && self.basis_version == *version
     }
 }
 
@@ -220,22 +316,89 @@ pub struct StatisticsMetricError {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StatisticsMetricState {
-    Available(StatisticsMetricValue),
+    Available(StatisticsMetricObservation),
     Missing(StatisticsMissing),
     Error(StatisticsMetricError),
 }
 
 /// One immutable statistics answer. It has no table client, runtime handle, or
 /// executable artifact, so callers may cache it using the explicit version pair.
+///
+/// Fields are private because two of its invariants cannot be restored after
+/// the fact: a sketch-derived metric must never claim to be exact, and there
+/// must be no evidence-level accuracy or provenance that can disagree with the
+/// per-metric facts. `try_new` is the only way to build one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatisticsEvidence {
-    pub data_version: StatisticsDataVersion,
-    pub evidence_revision: StatisticsEvidenceRevision,
-    pub coverage: StatisticsCoverage,
-    pub accuracy: StatisticsAccuracy,
-    pub interval: Option<StatisticsInterval>,
-    pub provenance: StatisticsProvenance,
-    pub metrics: BTreeMap<StatisticsMetric, StatisticsMetricState>,
+    data_version: StatisticsDataVersion,
+    evidence_revision: StatisticsEvidenceRevision,
+    row_coverage: StatisticsRowCoverage,
+    metrics: BTreeMap<StatisticsMetric, StatisticsMetricState>,
+}
+
+impl StatisticsEvidence {
+    pub fn try_new(
+        data_version: StatisticsDataVersion,
+        evidence_revision: StatisticsEvidenceRevision,
+        row_coverage: StatisticsRowCoverage,
+        metrics: BTreeMap<StatisticsMetric, StatisticsMetricState>,
+    ) -> Result<Self, ConnectorError> {
+        let evidence = Self {
+            data_version,
+            evidence_revision,
+            row_coverage,
+            metrics,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    /// Rejects evidence whose per-metric facts contradict themselves.
+    ///
+    /// `try_new` is the only constructor and the fields are private, so no
+    /// provider — in this crate or outside it — can produce evidence that
+    /// skipped this check.
+    fn validate(&self) -> Result<(), ConnectorError> {
+        for (metric, state) in &self.metrics {
+            let StatisticsMetricState::Available(observation) = state else {
+                continue;
+            };
+            if matches!(metric, StatisticsMetric::ThetaNdv { .. })
+                && observation.numeric_nature() != StatisticsNumericNature::TwoSidedApproximate
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Theta NDV is a two-sided estimate and cannot be reported as an exact or one-sided value",
+                ));
+            }
+            let identical_basis = *observation.basis_version() == self.data_version;
+            if identical_basis
+                != (observation.basis_relation() == StatisticsBasisRelation::Identical)
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "statistics metric basis relation contradicts its basis version",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn data_version(&self) -> &StatisticsDataVersion {
+        &self.data_version
+    }
+    pub fn evidence_revision(&self) -> &StatisticsEvidenceRevision {
+        &self.evidence_revision
+    }
+    pub const fn row_coverage(&self) -> StatisticsRowCoverage {
+        self.row_coverage
+    }
+    pub fn metrics(&self) -> &BTreeMap<StatisticsMetric, StatisticsMetricState> {
+        &self.metrics
+    }
+    pub fn into_metrics(self) -> BTreeMap<StatisticsMetric, StatisticsMetricState> {
+        self.metrics
+    }
 }
 
 #[derive(Clone)]
@@ -600,8 +763,8 @@ impl ConnectorStatisticsLease {
     ) -> Result<StatisticsEvidence, ConnectorError> {
         self.validate_table(&request.table)?;
         let evidence = self.statistics.read_statistics(request)?;
-        if evidence.data_version.as_bytes().is_empty()
-            || evidence.evidence_revision.as_bytes().is_empty()
+        if evidence.data_version().as_bytes().is_empty()
+            || evidence.evidence_revision().as_bytes().is_empty()
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
@@ -808,4 +971,202 @@ fn redacted_debug(
         .field("len", &bytes.len())
         .field("digest", &digest)
         .finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data_version(token: &'static [u8]) -> StatisticsDataVersion {
+        StatisticsDataVersion::try_new(Bytes::from_static(token)).expect("data version")
+    }
+
+    fn revision() -> StatisticsEvidenceRevision {
+        StatisticsEvidenceRevision::try_new(Bytes::from_static(b"rev-1")).expect("revision")
+    }
+
+    fn theta() -> StatisticsMetric {
+        StatisticsMetric::ThetaNdv {
+            column: Arc::from("k"),
+        }
+    }
+
+    fn observation(
+        basis: StatisticsDataVersion,
+        nature: StatisticsNumericNature,
+        relation: StatisticsBasisRelation,
+    ) -> StatisticsMetricObservation {
+        StatisticsMetricObservation::new(
+            StatisticsMetricValue::F64(7.0),
+            basis,
+            StatisticsMetricSource::ProviderArtifact,
+            nature,
+            relation,
+        )
+    }
+
+    fn evidence(
+        metrics: BTreeMap<StatisticsMetric, StatisticsMetricState>,
+    ) -> Result<StatisticsEvidence, ConnectorError> {
+        StatisticsEvidence::try_new(
+            data_version(b"data-v1"),
+            revision(),
+            StatisticsRowCoverage::AllVisibleRows,
+            metrics,
+        )
+    }
+
+    #[test]
+    fn theta_ndv_cannot_be_reported_as_exact_even_on_the_queried_version() {
+        for nature in [
+            StatisticsNumericNature::Exact,
+            StatisticsNumericNature::UpperBound,
+            StatisticsNumericNature::LowerBound,
+        ] {
+            let error = evidence(BTreeMap::from([(
+                theta(),
+                StatisticsMetricState::Available(observation(
+                    data_version(b"data-v1"),
+                    nature,
+                    StatisticsBasisRelation::Identical,
+                )),
+            )]))
+            .expect_err("sketch-derived NDV must not claim a non-approximate nature");
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        }
+
+        evidence(BTreeMap::from([(
+            theta(),
+            StatisticsMetricState::Available(observation(
+                data_version(b"data-v1"),
+                StatisticsNumericNature::TwoSidedApproximate,
+                StatisticsBasisRelation::Identical,
+            )),
+        )]))
+        .expect("two-sided approximate Theta NDV is the only admissible labelling");
+    }
+
+    #[test]
+    fn basis_relation_must_agree_with_the_basis_version() {
+        let ancestor_basis_claiming_identity = evidence(BTreeMap::from([(
+            StatisticsMetric::RowCount,
+            StatisticsMetricState::Available(observation(
+                data_version(b"data-v0"),
+                StatisticsNumericNature::Exact,
+                StatisticsBasisRelation::Identical,
+            )),
+        )]));
+        assert!(ancestor_basis_claiming_identity.is_err());
+
+        let same_basis_claiming_divergence = evidence(BTreeMap::from([(
+            StatisticsMetric::RowCount,
+            StatisticsMetricState::Available(observation(
+                data_version(b"data-v1"),
+                StatisticsNumericNature::Exact,
+                StatisticsBasisRelation::BasisIsSuperset,
+            )),
+        )]));
+        assert!(same_basis_claiming_divergence.is_err());
+
+        evidence(BTreeMap::from([(
+            StatisticsMetric::RowCount,
+            StatisticsMetricState::Available(observation(
+                data_version(b"data-v0"),
+                StatisticsNumericNature::Exact,
+                StatisticsBasisRelation::BasisIsSuperset,
+            )),
+        )]))
+        .expect("an older basis paired with a non-identical relation is the normal ancestor case");
+    }
+
+    #[test]
+    fn one_evidence_carries_exact_bounded_and_ancestor_metrics_without_cross_contamination() {
+        let evidence = evidence(BTreeMap::from([
+            (
+                StatisticsMetric::RowCount,
+                StatisticsMetricState::Available(observation(
+                    data_version(b"data-v1"),
+                    StatisticsNumericNature::Exact,
+                    StatisticsBasisRelation::Identical,
+                )),
+            ),
+            (
+                StatisticsMetric::Maximum {
+                    column: Arc::from("k"),
+                },
+                StatisticsMetricState::Available(observation(
+                    data_version(b"data-v1"),
+                    StatisticsNumericNature::UpperBound,
+                    StatisticsBasisRelation::Identical,
+                )),
+            ),
+            (
+                theta(),
+                StatisticsMetricState::Available(observation(
+                    data_version(b"data-v0"),
+                    StatisticsNumericNature::TwoSidedApproximate,
+                    StatisticsBasisRelation::BasisIsSuperset,
+                )),
+            ),
+        ]))
+        .expect("mixed-provenance evidence is the point of the per-metric model");
+
+        let metrics = evidence.metrics();
+        let nature = |metric: &StatisticsMetric| match metrics.get(metric) {
+            Some(StatisticsMetricState::Available(observation)) => observation.numeric_nature(),
+            _ => panic!("metric must be available"),
+        };
+        assert_eq!(
+            nature(&StatisticsMetric::RowCount),
+            StatisticsNumericNature::Exact
+        );
+        assert_eq!(
+            nature(&StatisticsMetric::Maximum {
+                column: Arc::from("k")
+            }),
+            StatisticsNumericNature::UpperBound
+        );
+        assert_eq!(
+            nature(&theta()),
+            StatisticsNumericNature::TwoSidedApproximate
+        );
+        assert_eq!(
+            evidence.row_coverage(),
+            StatisticsRowCoverage::AllVisibleRows
+        );
+    }
+
+    #[test]
+    fn only_the_basis_decides_admission_never_the_numeric_nature() {
+        let queried = data_version(b"data-v1");
+
+        for nature in [
+            StatisticsNumericNature::Exact,
+            StatisticsNumericNature::UpperBound,
+            StatisticsNumericNature::LowerBound,
+            StatisticsNumericNature::TwoSidedApproximate,
+        ] {
+            assert!(
+                observation(queried.clone(), nature, StatisticsBasisRelation::Identical)
+                    .describes_version(&queried),
+                "{nature:?} measured on the queried version still describes it"
+            );
+        }
+
+        for relation in [
+            StatisticsBasisRelation::BasisIsSubset,
+            StatisticsBasisRelation::BasisIsSuperset,
+            StatisticsBasisRelation::Incomparable,
+        ] {
+            assert!(
+                !observation(
+                    data_version(b"data-v0"),
+                    StatisticsNumericNature::Exact,
+                    relation
+                )
+                .describes_version(&queried),
+                "an exact value on a {relation:?} basis still describes other rows"
+            );
+        }
+    }
 }

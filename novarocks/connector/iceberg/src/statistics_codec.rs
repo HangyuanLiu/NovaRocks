@@ -27,9 +27,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, StatisticsAccuracy, StatisticsCoverage,
-    StatisticsDataVersion, StatisticsEvidence, StatisticsMetric, StatisticsMetricState,
-    StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind, StatisticsProvenance,
+    ConnectorError, ConnectorErrorKind, StatisticsBasisRelation, StatisticsDataVersion,
+    StatisticsEvidence, StatisticsMetric, StatisticsMetricObservation, StatisticsMetricSource,
+    StatisticsMetricState, StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind,
+    StatisticsNumericNature, StatisticsRowCoverage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -58,29 +59,49 @@ pub fn statistics_metric_column(metric: &StatisticsMetric) -> Option<&str> {
     }
 }
 
+/// Rejects evidence that did not come from a complete scan of the pinned
+/// table's visible rows.
+///
+/// This deliberately says nothing about numeric exactness. A full visible-row
+/// collection legitimately contains a Theta sketch, which is never exact; the
+/// property that makes it publishable is that it observed every visible row.
+pub fn ensure_publishable_visible_row_evidence(
+    evidence: &StatisticsEvidence,
+) -> Result<(), ConnectorError> {
+    if evidence.row_coverage() != StatisticsRowCoverage::AllVisibleRows {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg provider statistics require a collection covering all visible rows",
+        ));
+    }
+    for state in evidence.metrics().values() {
+        if let StatisticsMetricState::Available(observation) = state
+            && *observation.source() != StatisticsMetricSource::VisibleRowScan
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg provider statistics require every published metric to come from a visible-row scan",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn encode_provider_statistics(
     evidence: &StatisticsEvidence,
 ) -> Result<Vec<u8>, ConnectorError> {
-    if evidence.coverage != StatisticsCoverage::Full
-        || evidence.accuracy != StatisticsAccuracy::Exact
-        || evidence.provenance != StatisticsProvenance::VisibleRows
-    {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "Iceberg provider statistics require Full Exact visible-row evidence",
-        ));
-    }
+    ensure_publishable_visible_row_evidence(evidence)?;
     let metrics = evidence
-        .metrics
+        .metrics()
         .iter()
         .map(|(metric, state)| {
-            let StatisticsMetricState::Available(value) = state else {
+            let StatisticsMetricState::Available(observation) = state else {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
                     "Iceberg provider statistics cannot persist unavailable metrics",
                 ));
             };
-            let value = match value {
+            let value = match observation.value() {
                 StatisticsMetricValue::U64(value) => IcebergStatisticValueV1::U64(*value),
                 StatisticsMetricValue::I64(value) => IcebergStatisticValueV1::I64(*value),
                 StatisticsMetricValue::F64(value) => IcebergStatisticValueV1::F64(*value),
@@ -117,7 +138,7 @@ pub fn encode_provider_statistics(
         .collect::<Result<Vec<_>, _>>()?;
     serde_json::to_vec(&IcebergProviderStatisticsV1 {
         version: ICEBERG_PROVIDER_STATISTICS_VERSION,
-        data_version: evidence.data_version.as_bytes().to_vec(),
+        data_version: evidence.data_version().as_bytes().to_vec(),
         metrics,
     })
     .map_err(|error| {
@@ -199,8 +220,21 @@ pub fn decode_provider_statistics(
                 StatisticsMetricValue::try_bytes(Bytes::from(value))?
             }
         };
+        let observation = StatisticsMetricObservation::new(
+            value,
+            expected_data_version.clone(),
+            StatisticsMetricSource::ProviderArtifact,
+            provider_artifact_numeric_nature(&metric),
+            // The artifact is keyed by the data version it was measured on, and
+            // the caller already rejected a mismatch above, so this artifact
+            // describes exactly the queried row set. Reading a statistics file
+            // published against an *ancestor* snapshot is STAT-2C's ancestor
+            // walk; when that lands it must derive the relation via
+            // `statistics_basis::basis_relation` rather than assume identity.
+            StatisticsBasisRelation::Identical,
+        );
         if available
-            .insert(metric, StatisticsMetricState::Available(value))
+            .insert(metric, StatisticsMetricState::Available(observation))
             .is_some()
         {
             return Err(ConnectorError::new(
@@ -224,6 +258,20 @@ pub fn decode_provider_statistics(
             (metric.clone(), state)
         })
         .collect())
+}
+
+/// A published artifact records values measured by a full visible-row scan, so
+/// every metric is exact on its basis — except a Theta sketch, which estimates
+/// in both directions no matter how completely it was fed.
+fn provider_artifact_numeric_nature(metric: &StatisticsMetric) -> StatisticsNumericNature {
+    match metric {
+        StatisticsMetric::ThetaNdv { .. } => StatisticsNumericNature::TwoSidedApproximate,
+        StatisticsMetric::RowCount
+        | StatisticsMetric::NullCount { .. }
+        | StatisticsMetric::Minimum { .. }
+        | StatisticsMetric::Maximum { .. }
+        | StatisticsMetric::AverageSize { .. } => StatisticsNumericNature::Exact,
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -275,35 +323,68 @@ mod tests {
     use super::*;
     use novarocks_spi::connector::{StatisticsEvidenceRevision, StatisticsMetricRequest};
 
+    fn theta() -> StatisticsMetric {
+        StatisticsMetric::ThetaNdv {
+            column: Arc::from("k"),
+        }
+    }
+
+    fn visible_row_observation(
+        value: StatisticsMetricValue,
+        version: &StatisticsDataVersion,
+        nature: StatisticsNumericNature,
+    ) -> StatisticsMetricState {
+        StatisticsMetricState::Available(StatisticsMetricObservation::new(
+            value,
+            version.clone(),
+            StatisticsMetricSource::VisibleRowScan,
+            nature,
+            StatisticsBasisRelation::Identical,
+        ))
+    }
+
+    fn visible_row_evidence(version: &StatisticsDataVersion) -> StatisticsEvidence {
+        StatisticsEvidence::try_new(
+            version.clone(),
+            StatisticsEvidenceRevision::try_new(Bytes::from_static(b"run-v1")).expect("revision"),
+            StatisticsRowCoverage::AllVisibleRows,
+            BTreeMap::from([
+                (
+                    StatisticsMetric::RowCount,
+                    visible_row_observation(
+                        StatisticsMetricValue::U64(3),
+                        version,
+                        StatisticsNumericNature::Exact,
+                    ),
+                ),
+                (
+                    theta(),
+                    visible_row_observation(
+                        StatisticsMetricValue::F64(3.0),
+                        version,
+                        StatisticsNumericNature::TwoSidedApproximate,
+                    ),
+                ),
+            ]),
+        )
+        .expect("evidence")
+    }
+
+    fn observation(state: Option<&StatisticsMetricState>) -> &StatisticsMetricObservation {
+        match state {
+            Some(StatisticsMetricState::Available(observation)) => observation,
+            other => panic!("expected an available metric, got {other:?}"),
+        }
+    }
+
     #[test]
     fn provider_artifact_round_trips_only_requested_metrics() {
         let version =
             StatisticsDataVersion::try_new(Bytes::from_static(b"table-v1")).expect("version");
-        let theta = StatisticsMetric::ThetaNdv {
-            column: Arc::from("k"),
-        };
-        let evidence = StatisticsEvidence {
-            data_version: version.clone(),
-            evidence_revision: StatisticsEvidenceRevision::try_new(Bytes::from_static(b"run-v1"))
-                .expect("revision"),
-            coverage: StatisticsCoverage::Full,
-            accuracy: StatisticsAccuracy::Exact,
-            interval: None,
-            provenance: StatisticsProvenance::VisibleRows,
-            metrics: BTreeMap::from([
-                (
-                    StatisticsMetric::RowCount,
-                    StatisticsMetricState::Available(StatisticsMetricValue::U64(3)),
-                ),
-                (
-                    theta.clone(),
-                    StatisticsMetricState::Available(StatisticsMetricValue::F64(3.0)),
-                ),
-            ]),
-        };
+        let evidence = visible_row_evidence(&version);
         let requested = StatisticsMetricRequest::try_new(vec![
             StatisticsMetric::RowCount,
-            theta.clone(),
+            theta(),
             StatisticsMetric::NullCount {
                 column: Arc::from("k"),
             },
@@ -316,18 +397,39 @@ mod tests {
             &requested,
         )
         .expect("decode");
+
+        let row_count = observation(decoded.get(&StatisticsMetric::RowCount));
+        assert_eq!(row_count.value(), &StatisticsMetricValue::U64(3));
         assert_eq!(
+            row_count.numeric_nature(),
+            StatisticsNumericNature::Exact,
+            "a published artifact records a full visible-row measurement"
+        );
+
+        let ndv = observation(decoded.get(&theta()));
+        assert_eq!(ndv.value(), &StatisticsMetricValue::F64(3.0));
+        assert_eq!(
+            ndv.numeric_nature(),
+            StatisticsNumericNature::TwoSidedApproximate,
+            "a Theta sketch stays approximate even after a full scan"
+        );
+
+        for state in [
             decoded.get(&StatisticsMetric::RowCount),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::U64(3)
-            ))
-        );
-        assert_eq!(
-            decoded.get(&theta),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::F64(3.0)
-            ))
-        );
+            decoded.get(&theta()),
+        ] {
+            let observation = observation(state);
+            assert_eq!(
+                observation.source(),
+                &StatisticsMetricSource::ProviderArtifact
+            );
+            assert_eq!(observation.basis_version(), &version);
+            assert_eq!(
+                observation.basis_relation(),
+                StatisticsBasisRelation::Identical
+            );
+        }
+
         assert!(matches!(
             decoded.get(&StatisticsMetric::NullCount {
                 column: Arc::from("k")
@@ -337,5 +439,54 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn a_full_visible_row_collection_containing_a_theta_sketch_is_publishable() {
+        let version =
+            StatisticsDataVersion::try_new(Bytes::from_static(b"table-v1")).expect("version");
+        encode_provider_statistics(&visible_row_evidence(&version))
+            .expect("numeric exactness is no longer a publication precondition");
+    }
+
+    #[test]
+    fn partial_coverage_or_a_non_scan_source_cannot_be_published() {
+        let version =
+            StatisticsDataVersion::try_new(Bytes::from_static(b"table-v1")).expect("version");
+        let metrics = BTreeMap::from([(
+            StatisticsMetric::RowCount,
+            visible_row_observation(
+                StatisticsMetricValue::U64(3),
+                &version,
+                StatisticsNumericNature::Exact,
+            ),
+        )]);
+
+        let partial = StatisticsEvidence::try_new(
+            version.clone(),
+            StatisticsEvidenceRevision::try_new(Bytes::from_static(b"run-v1")).expect("revision"),
+            StatisticsRowCoverage::PartialRows,
+            metrics.clone(),
+        )
+        .expect("evidence");
+        assert!(encode_provider_statistics(&partial).is_err());
+
+        let manifest_derived = StatisticsEvidence::try_new(
+            version.clone(),
+            StatisticsEvidenceRevision::try_new(Bytes::from_static(b"run-v1")).expect("revision"),
+            StatisticsRowCoverage::AllVisibleRows,
+            BTreeMap::from([(
+                StatisticsMetric::RowCount,
+                StatisticsMetricState::Available(StatisticsMetricObservation::new(
+                    StatisticsMetricValue::U64(3),
+                    version,
+                    StatisticsMetricSource::CurrentManifest,
+                    StatisticsNumericNature::Exact,
+                    StatisticsBasisRelation::Identical,
+                )),
+            )]),
+        )
+        .expect("evidence");
+        assert!(encode_provider_statistics(&manifest_derived).is_err());
     }
 }

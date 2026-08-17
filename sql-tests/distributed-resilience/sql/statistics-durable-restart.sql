@@ -59,11 +59,19 @@ ANALYZE TABLE ${case_db}.statistics_recovery;
 SHOW ANALYZE JOBS;
 
 -- query 7
+-- The published artifact came from a full visible-row scan, so its counts are
+-- exact on the snapshot it measured. Its Theta sketch is not, and must not be
+-- presented as though it were: publication is gated on row coverage, never on
+-- numeric exactness.
 -- @retry_count=20
 -- @retry_interval_ms=500
 -- @result_contains=row_count
 -- @result_contains=3
 -- @result_contains=AVAILABLE
+-- @result_contains=PROVIDER_ARTIFACT
+-- @result_contains=EXACT
+-- @result_contains=APPROXIMATE
+-- @result_contains=IDENTICAL
 -- @skip_result_check=true
 SHOW TABLE STATS ${case_db}.statistics_recovery;
 

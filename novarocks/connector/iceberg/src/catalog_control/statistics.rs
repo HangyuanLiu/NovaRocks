@@ -24,13 +24,14 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorStatistics, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsAccuracy,
+    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsBasisRelation,
     StatisticsCollection, StatisticsCollectionPlan, StatisticsCollectionRequest,
-    StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
-    StatisticsMetric, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
-    StatisticsMissingKind, StatisticsProvenance, StatisticsPublishPreparationRequest,
-    StatisticsPublishRequest, StatisticsReadRequest, StatisticsReader, StatisticsReceipt,
-    StatisticsReconcileRequest, StatisticsScanColumn,
+    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric,
+    StatisticsMetricObservation, StatisticsMetricSource, StatisticsMetricState,
+    StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind, StatisticsNumericNature,
+    StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
+    StatisticsReader, StatisticsReceipt, StatisticsReconcileRequest, StatisticsRowCoverage,
+    StatisticsScanColumn,
 };
 
 use crate::control_provider::{IcebergControlProvider, IcebergTablePayload};
@@ -40,8 +41,8 @@ use crate::reconcile_payload::{
     encode_statistics_evidence,
 };
 use crate::statistics_codec::{
-    decode_provider_statistics, encode_provider_statistics, statistics_data_version,
-    statistics_metric_column,
+    decode_provider_statistics, encode_provider_statistics,
+    ensure_publishable_visible_row_evidence, statistics_data_version, statistics_metric_column,
 };
 use crate::stats_assembler::{
     puffin_path_for_statistics_operation, read_provider_statistics_blob,
@@ -113,15 +114,15 @@ impl StatisticsReader for IcebergControlProvider {
                 .map_err(unavailable)?
                 .map_err(corrupt)?;
             if let Some(artifact) = artifact {
-                return Ok(StatisticsEvidence {
-                    data_version: expected.clone(),
-                    evidence_revision: revision,
-                    coverage: StatisticsCoverage::Full,
-                    accuracy: StatisticsAccuracy::Exact,
-                    interval: None,
-                    provenance: StatisticsProvenance::ProviderArtifact,
-                    metrics: decode_provider_statistics(&artifact, &expected, &request.metrics)?,
-                });
+                // The artifact was produced by a complete visible-row scan, so
+                // the collection covered every row; the codec attaches each
+                // metric's own source, basis and numeric nature.
+                return StatisticsEvidence::try_new(
+                    expected.clone(),
+                    revision,
+                    StatisticsRowCoverage::AllVisibleRows,
+                    decode_provider_statistics(&artifact, &expected, &request.metrics)?,
+                );
             }
         }
 
@@ -163,36 +164,58 @@ impl StatisticsReader for IcebergControlProvider {
             .iter()
             .map(|field| (field.name().to_ascii_lowercase(), field.data_type().clone()))
             .collect::<HashMap<_, _>>();
-        let manifest_complete = files
-            .iter()
-            .all(|file| file.record_count.is_some() && file.delete_files.is_empty());
+        // Two independent questions that used to share one boolean. Whether the
+        // manifest accounts for every row is a coverage fact; whether delete
+        // files make a summed number an over-count is a per-metric numeric
+        // fact, and it only bends the metrics it actually affects.
+        let row_coverage = if files.iter().all(|file| file.record_count.is_some()) {
+            StatisticsRowCoverage::AllVisibleRows
+        } else {
+            StatisticsRowCoverage::PartialRows
+        };
+        let has_deletes = files.iter().any(|file| !file.delete_files.is_empty());
         let metrics = request
             .metrics
             .metrics()
             .iter()
             .cloned()
             .map(|metric| {
-                let state = manifest_metric(&metric, &files, &data_types, &field_ids, &ndv);
+                let state = manifest_metric(
+                    &metric,
+                    &files,
+                    &data_types,
+                    &field_ids,
+                    &ndv,
+                    has_deletes,
+                    &expected,
+                );
                 (metric, state)
             })
             .collect();
-        Ok(StatisticsEvidence {
-            data_version: expected,
-            evidence_revision: revision,
-            coverage: if manifest_complete {
-                StatisticsCoverage::Full
-            } else {
-                StatisticsCoverage::Subset
-            },
-            accuracy: if manifest_complete {
-                StatisticsAccuracy::Exact
-            } else {
-                StatisticsAccuracy::Approximate
-            },
-            interval: None,
-            provenance: StatisticsProvenance::Manifest,
-            metrics,
-        })
+        StatisticsEvidence::try_new(expected, revision, row_coverage, metrics)
+    }
+}
+
+/// Direction of a manifest-derived value against the truth on the queried
+/// snapshot.
+///
+/// Manifest sums do not subtract rows removed by delete files, so with deletes
+/// present a count over-reports and the bounds widen — each in its own
+/// direction. A Theta sketch is approximate regardless.
+fn manifest_numeric_nature(
+    metric: &StatisticsMetric,
+    has_deletes: bool,
+) -> StatisticsNumericNature {
+    match metric {
+        StatisticsMetric::ThetaNdv { .. } => StatisticsNumericNature::TwoSidedApproximate,
+        _ if !has_deletes => StatisticsNumericNature::Exact,
+        StatisticsMetric::RowCount
+        | StatisticsMetric::NullCount { .. }
+        | StatisticsMetric::Maximum { .. } => StatisticsNumericNature::UpperBound,
+        StatisticsMetric::Minimum { .. } => StatisticsNumericNature::LowerBound,
+        // A ratio of two sums that deletes shrink independently; neither
+        // direction is provable.
+        StatisticsMetric::AverageSize { .. } => StatisticsNumericNature::TwoSidedApproximate,
     }
 }
 
@@ -267,7 +290,7 @@ impl StatisticsCollection for IcebergControlProvider {
         let table = self.table_payload(&request.table)?;
         let info = base_table_info(&table, "statistics publication")?;
         let expected = pinned_data_version(info)?;
-        if request.result.evidence.data_version != expected {
+        if *request.result.evidence.data_version() != expected {
             return Err(invalid(
                 "Iceberg statistics publication does not match its resolved table pin",
             ));
@@ -301,14 +324,16 @@ impl StatisticsCollection for IcebergControlProvider {
             Err(error) => return Ok(known_uncommitted(error)),
         };
         let expected = pinned_data_version(info)?;
-        if request.result.evidence.data_version != expected
-            || request.result.evidence.coverage != StatisticsCoverage::Full
-            || request.result.evidence.accuracy != StatisticsAccuracy::Exact
-            || request.result.evidence.provenance != StatisticsProvenance::VisibleRows
-        {
+        if *request.result.evidence.data_version() != expected {
             return Ok(known_uncommitted(invalid(
-                "Iceberg statistics publication requires Full Exact visible-row evidence for the pinned table",
+                "Iceberg statistics publication does not match its resolved table pin",
             )));
+        }
+        // Publishable means "this measurement saw every visible row of the
+        // pinned table", not "every number is exact" — the collection always
+        // carries a Theta sketch, which is never exact.
+        if let Err(error) = ensure_publishable_visible_row_evidence(&request.result.evidence) {
+            return Ok(known_uncommitted(error));
         }
         let provider_statistics = encode_provider_statistics(&request.result.evidence)?;
         let (artifact_version, theta) =
@@ -385,7 +410,7 @@ impl StatisticsCollection for IcebergControlProvider {
                 self,
                 request.operation_id,
                 expected,
-                request.result.evidence.evidence_revision,
+                request.result.evidence.evidence_revision().clone(),
                 Bytes::from(path),
                 ExternalMutationEffect::NoOp,
             );
@@ -413,7 +438,7 @@ impl StatisticsCollection for IcebergControlProvider {
                     self,
                     request.operation_id,
                     expected,
-                    request.result.evidence.evidence_revision,
+                    request.result.evidence.evidence_revision().clone(),
                     Bytes::from(path),
                     ExternalMutationEffect::Applied,
                 )
@@ -585,14 +610,27 @@ fn manifest_metric(
     data_types: &HashMap<String, DataType>,
     field_ids: &HashMap<String, i32>,
     ndv: &HashMap<i32, f64>,
+    has_deletes: bool,
+    basis_version: &StatisticsDataVersion,
 ) -> StatisticsMetricState {
+    // Every manifest-derived value describes the queried snapshot itself, so
+    // the basis relation is identity; only the numeric direction varies.
+    let available = |value: StatisticsMetricValue| {
+        StatisticsMetricState::Available(StatisticsMetricObservation::new(
+            value,
+            basis_version.clone(),
+            StatisticsMetricSource::CurrentManifest,
+            manifest_numeric_nature(metric, has_deletes),
+            StatisticsBasisRelation::Identical,
+        ))
+    };
     match metric {
         StatisticsMetric::RowCount => files
             .iter()
             .try_fold(0_u64, |total, file| {
                 total.checked_add(u64::try_from(file.record_count?).ok()?)
             })
-            .map(|value| StatisticsMetricState::Available(StatisticsMetricValue::U64(value)))
+            .map(|value| available(StatisticsMetricValue::U64(value)))
             .unwrap_or_else(|| incomplete("Iceberg manifest does not report every row count")),
         StatisticsMetric::NullCount { column } => files
             .iter()
@@ -600,10 +638,10 @@ fn manifest_metric(
                 let count = column_stats(file, column)?.null_count?;
                 total.checked_add(u64::try_from(count).ok()?)
             })
-            .map(|value| StatisticsMetricState::Available(StatisticsMetricValue::U64(value)))
+            .map(|value| available(StatisticsMetricValue::U64(value)))
             .unwrap_or_else(|| {
                 incomplete(format!(
-                    "Iceberg manifest does not report an exact null count for `{column}`"
+                    "Iceberg manifest does not report a null count for `{column}`"
                 ))
             }),
         StatisticsMetric::AverageSize { column } => {
@@ -614,13 +652,11 @@ fn manifest_metric(
                 total.checked_add(u64::try_from(column_stats(file, column)?.column_size?).ok()?)
             });
             match (total_rows, total_size) {
-                (Some(rows), Some(size)) => {
-                    StatisticsMetricState::Available(StatisticsMetricValue::F64(if rows == 0 {
-                        0.0
-                    } else {
-                        size as f64 / rows as f64
-                    }))
-                }
+                (Some(rows), Some(size)) => available(StatisticsMetricValue::F64(if rows == 0 {
+                    0.0
+                } else {
+                    size as f64 / rows as f64
+                })),
                 _ => missing_column(column),
             }
         }
@@ -648,7 +684,7 @@ fn manifest_metric(
                 _ => None,
             });
             match reduced.flatten() {
-                Some(value) => StatisticsMetricState::Available(StatisticsMetricValue::F64(value)),
+                Some(value) => available(StatisticsMetricValue::F64(value)),
                 None => missing_column(column),
             }
         }
@@ -657,7 +693,7 @@ fn manifest_metric(
             .and_then(|field_id| ndv.get(field_id))
             .copied()
             .filter(|value| value.is_finite() && *value >= 0.0)
-            .map(|value| StatisticsMetricState::Available(StatisticsMetricValue::F64(value)))
+            .map(|value| available(StatisticsMetricValue::F64(value)))
             .unwrap_or_else(|| missing_column(column)),
     }
 }
@@ -1014,13 +1050,26 @@ mod tests {
         assert!(decode_theta_partial(&bytes).is_err());
     }
 
-    #[test]
-    fn manifest_row_count_requires_every_file() {
-        let files = vec![DataFileWithStats {
+    fn manifest_file(
+        record_count: Option<i64>,
+        column: &str,
+        has_deletes: bool,
+    ) -> DataFileWithStats {
+        DataFileWithStats {
             path: "data.parquet".to_string(),
-            size: 1,
-            record_count: None,
-            column_stats: None,
+            size: 64,
+            record_count,
+            column_stats: Some(HashMap::from([(
+                column.to_string(),
+                crate::scan_model::IcebergColumnStats {
+                    field_id: Some(1),
+                    null_count: Some(0),
+                    value_count: record_count,
+                    column_size: Some(32),
+                    lower_bound: Some(1_i32.to_le_bytes().to_vec()),
+                    upper_bound: Some(9_i32.to_le_bytes().to_vec()),
+                },
+            )])),
             partition_spec_id: None,
             partition_key: None,
             partition_values: None,
@@ -1028,8 +1077,55 @@ mod tests {
             partition_field_values: Vec::new(),
             first_row_id: None,
             data_sequence_number: None,
-            delete_files: Vec::new(),
-        }];
+            delete_files: if has_deletes {
+                vec![crate::scan_model::IcebergDeleteFileInfo {
+                    path: "delete.parquet".to_string(),
+                    file_format: crate::scan_model::IcebergDeleteFileFormat::Parquet,
+                    file_content: crate::scan_model::IcebergDeleteFileContent::Position,
+                    length: None,
+                    content_offset: None,
+                    content_size_in_bytes: None,
+                    sequence_number: None,
+                    partition_spec_id: None,
+                    partition_key: None,
+                    equality_column_names: Vec::new(),
+                    equality_field_ids: Vec::new(),
+                }]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn manifest_nature(
+        metric: &StatisticsMetric,
+        has_deletes: bool,
+    ) -> Option<StatisticsNumericNature> {
+        let files = vec![manifest_file(Some(4), "k", has_deletes)];
+        let data_types = HashMap::from([("k".to_string(), DataType::Int32)]);
+        let field_ids = HashMap::from([("k".to_string(), 1_i32)]);
+        let ndv = HashMap::from([(1_i32, 3.0_f64)]);
+        let basis =
+            StatisticsDataVersion::try_new(Bytes::from_static(b"table-v1")).expect("data version");
+        match manifest_metric(
+            metric,
+            &files,
+            &data_types,
+            &field_ids,
+            &ndv,
+            has_deletes,
+            &basis,
+        ) {
+            StatisticsMetricState::Available(observation) => Some(observation.numeric_nature()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn manifest_row_count_requires_every_file() {
+        let files = vec![manifest_file(None, "k", false)];
+        let basis =
+            StatisticsDataVersion::try_new(Bytes::from_static(b"table-v1")).expect("data version");
         assert!(matches!(
             manifest_metric(
                 &StatisticsMetric::RowCount,
@@ -1037,9 +1133,98 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
+                false,
+                &basis,
             ),
             StatisticsMetricState::Missing(_)
         ));
+    }
+
+    #[test]
+    fn without_delete_files_every_manifest_metric_but_the_sketch_is_exact() {
+        let column: Arc<str> = Arc::from("k");
+        for metric in [
+            StatisticsMetric::RowCount,
+            StatisticsMetric::NullCount {
+                column: Arc::clone(&column),
+            },
+            StatisticsMetric::Minimum {
+                column: Arc::clone(&column),
+            },
+            StatisticsMetric::Maximum {
+                column: Arc::clone(&column),
+            },
+            StatisticsMetric::AverageSize {
+                column: Arc::clone(&column),
+            },
+        ] {
+            assert_eq!(
+                manifest_nature(&metric, false),
+                Some(StatisticsNumericNature::Exact),
+                "{metric:?} is exact when no rows are hidden by delete files"
+            );
+        }
+        assert_eq!(
+            manifest_nature(
+                &StatisticsMetric::ThetaNdv {
+                    column: Arc::clone(&column)
+                },
+                false
+            ),
+            Some(StatisticsNumericNature::TwoSidedApproximate),
+            "a Theta sketch is approximate even with no delete files"
+        );
+    }
+
+    #[test]
+    fn delete_files_bend_each_manifest_metric_in_its_own_direction() {
+        let column: Arc<str> = Arc::from("k");
+        // Sums do not subtract deleted rows, so they over-report.
+        assert_eq!(
+            manifest_nature(&StatisticsMetric::RowCount, true),
+            Some(StatisticsNumericNature::UpperBound)
+        );
+        assert_eq!(
+            manifest_nature(
+                &StatisticsMetric::NullCount {
+                    column: Arc::clone(&column)
+                },
+                true
+            ),
+            Some(StatisticsNumericNature::UpperBound)
+        );
+        // The true minimum can only rise and the true maximum can only fall
+        // when rows disappear, so the bounds stay valid in opposite directions.
+        assert_eq!(
+            manifest_nature(
+                &StatisticsMetric::Minimum {
+                    column: Arc::clone(&column)
+                },
+                true
+            ),
+            Some(StatisticsNumericNature::LowerBound)
+        );
+        assert_eq!(
+            manifest_nature(
+                &StatisticsMetric::Maximum {
+                    column: Arc::clone(&column)
+                },
+                true
+            ),
+            Some(StatisticsNumericNature::UpperBound)
+        );
+    }
+
+    #[test]
+    fn delete_files_do_not_reduce_manifest_row_coverage() {
+        // Coverage answers "did the measurement account for every visible row",
+        // which a full manifest read does whether or not deletes exist. The
+        // delete-file effect belongs to numeric nature, not to coverage.
+        let files = vec![manifest_file(Some(4), "k", true)];
+        assert!(
+            files.iter().all(|file| file.record_count.is_some()),
+            "the coverage predicate must not consult delete files"
+        );
     }
 
     #[test]

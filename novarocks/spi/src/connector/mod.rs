@@ -313,14 +313,16 @@ pub use staged_publication_recovery::{
 };
 pub use statistics::{
     ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
-    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, StatisticsAccuracy,
-    StatisticsCollection, StatisticsCollectionPlan, StatisticsCollectionRequest,
-    StatisticsCollectionResult, StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence,
-    StatisticsEvidenceRevision, StatisticsInterval, StatisticsMetric, StatisticsMetricError,
-    StatisticsMetricErrorKind, StatisticsMetricRequest, StatisticsMetricState,
-    StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind, StatisticsProvenance,
+    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
+    StatisticsBasisRelation, StatisticsCollection, StatisticsCollectionPlan,
+    StatisticsCollectionRequest, StatisticsCollectionResult, StatisticsDataVersion,
+    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsInterval, StatisticsMetric,
+    StatisticsMetricError, StatisticsMetricErrorKind, StatisticsMetricObservation,
+    StatisticsMetricRequest, StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
+    StatisticsMissing, StatisticsMissingKind, StatisticsNumericNature,
     StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
-    StatisticsReader, StatisticsReceipt, StatisticsReconcileRequest, StatisticsScanColumn,
+    StatisticsReader, StatisticsReceipt, StatisticsReconcileRequest, StatisticsRowCoverage,
+    StatisticsScanColumn,
 };
 pub use view_metadata::{
     ConnectorListViewsRequest, ConnectorViewMetadata, ConnectorViewMetadataValue,

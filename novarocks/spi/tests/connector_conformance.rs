@@ -45,8 +45,11 @@ use novarocks_spi::connector::{
     ConnectorStaticPredicateKind, ConnectorStatistics, ConnectorTableHandle,
     ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest, ConnectorViewIdentity,
     ConnectorViewMetadata, ConnectorViewMetadataValue, ConnectorViewRequest,
-    ExternalMutationOutcome, StatisticsEvidence, StatisticsReadRequest,
-    normalize_predicate_dispositions, validate_static_predicates,
+    ExternalMutationOutcome, StatisticsBasisRelation, StatisticsDataVersion, StatisticsEvidence,
+    StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricObservation,
+    StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue, StatisticsNumericNature,
+    StatisticsReadRequest, StatisticsRowCoverage, normalize_predicate_dispositions,
+    validate_static_predicates,
 };
 
 struct OwnerExecution {
@@ -710,6 +713,54 @@ impl novarocks_spi::connector::StatisticsReader for OwnerStatistics {
 }
 
 impl ConnectorStatistics for OwnerStatistics {}
+
+/// A sketch-derived NDV is an estimate in both directions, so no provider may
+/// present one as exact or as a one-sided bound. The check lives in the only
+/// constructor and the fields are private, so this holds for any provider
+/// outside the SPI crate — which is what this test, in a separate crate,
+/// demonstrates.
+#[test]
+fn no_provider_can_present_a_theta_sketch_as_an_exact_value() {
+    let data_version = StatisticsDataVersion::try_new(bytes::Bytes::from_static(b"data-v1"))
+        .expect("data version");
+    let revision =
+        StatisticsEvidenceRevision::try_new(bytes::Bytes::from_static(b"rev-1")).expect("revision");
+    let theta = StatisticsMetric::ThetaNdv {
+        column: Arc::from("k"),
+    };
+    let labelled = |nature| {
+        StatisticsEvidence::try_new(
+            data_version.clone(),
+            revision.clone(),
+            StatisticsRowCoverage::AllVisibleRows,
+            std::collections::BTreeMap::from([(
+                theta.clone(),
+                StatisticsMetricState::Available(StatisticsMetricObservation::new(
+                    StatisticsMetricValue::F64(3.0),
+                    data_version.clone(),
+                    StatisticsMetricSource::VisibleRowScan,
+                    nature,
+                    StatisticsBasisRelation::Identical,
+                )),
+            )]),
+        )
+    };
+
+    for nature in [
+        StatisticsNumericNature::Exact,
+        StatisticsNumericNature::UpperBound,
+        StatisticsNumericNature::LowerBound,
+    ] {
+        assert_eq!(
+            labelled(nature)
+                .expect_err("a Theta sketch must not be labelled {nature:?}")
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
+    labelled(StatisticsNumericNature::TwoSidedApproximate)
+        .expect("two-sided approximate is the only admissible labelling");
+}
 
 #[test]
 fn control_binding_rejects_statistics_owned_by_another_generation() {

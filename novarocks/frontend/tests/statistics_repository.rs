@@ -837,6 +837,10 @@ impl TableStatisticsReader for StaticTableStatistics {
             ),
             value: Some("1".to_string()),
             status: "AVAILABLE".to_string(),
+            basis_version: "SAME".to_string(),
+            source: "PROVIDER_ARTIFACT".to_string(),
+            numeric_nature: "EXACT".to_string(),
+            basis_relation: "IDENTICAL".to_string(),
         }])
     }
 }

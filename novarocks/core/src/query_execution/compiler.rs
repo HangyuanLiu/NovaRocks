@@ -1717,9 +1717,27 @@ pub(crate) fn statistics_application_result(
                 .collect(),
         ),
         StatisticsApplicationResult::TableStats(rows) => statistics_string_result(
-            &["metric", "value", "status"],
+            &[
+                "metric",
+                "value",
+                "status",
+                "basis_version",
+                "source",
+                "numeric_nature",
+                "basis_relation",
+            ],
             rows.into_iter()
-                .map(|row| vec![Some(row.metric), row.value, Some(row.status)])
+                .map(|row| {
+                    vec![
+                        Some(row.metric),
+                        row.value,
+                        Some(row.status),
+                        Some(row.basis_version),
+                        Some(row.source),
+                        Some(row.numeric_nature),
+                        Some(row.basis_relation),
+                    ]
+                })
                 .collect(),
         ),
     }
@@ -3275,7 +3293,11 @@ mod tests {
                         StatisticsTableStatView {
                             metric: "row_count".into(),
                             value: Some("42".into()),
-                            status: "FULL_EXACT".into(),
+                            status: "AVAILABLE".into(),
+                            basis_version: "SAME".into(),
+                            source: "PROVIDER_ARTIFACT".into(),
+                            numeric_nature: "EXACT".into(),
+                            basis_relation: "IDENTICAL".into(),
                         },
                     ]))
                 }

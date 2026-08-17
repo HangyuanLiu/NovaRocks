@@ -22,6 +22,12 @@
 //! exact data-version returned by the same table-resolution operation that
 //! planned the scan.  The resulting evidence is immutable and cacheable only
 //! by its explicit evidence revision.
+//!
+//! A mismatched evidence-level data version is still fatal here: the provider
+//! answered about a different table state than the one being planned.  Whether
+//! an individual *metric* may be used is not decided at this boundary — that is
+//! per metric, via `StatisticsMetricObservation::describes_version`, so that one
+//! degraded metric cannot disqualify the rest of the answer.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -29,9 +35,8 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorRequestContext,
-    ConnectorStatistics, ConnectorTableHandle, StatisticsAccuracy, StatisticsCoverage,
-    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric,
-    StatisticsMetricRequest, StatisticsReadRequest,
+    ConnectorStatistics, ConnectorTableHandle, StatisticsDataVersion, StatisticsEvidence,
+    StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricRequest, StatisticsReadRequest,
 };
 
 /// Application-side classification of a statistics read that cannot be
@@ -117,7 +122,7 @@ impl UnifiedStatisticsResolver {
                 }
                 _ => StatisticsResolutionFailure::Connector(error),
             })?;
-        if evidence.data_version != table.data_version {
+        if *evidence.data_version() != table.data_version {
             return Err(StatisticsResolutionFailure::DataVersionMismatch);
         }
         let artifact_key = ArtifactCacheKey {
@@ -125,7 +130,7 @@ impl UnifiedStatisticsResolver {
             incarnation: key.incarnation,
             table_payload: key.table_payload.clone(),
             data_version: key.data_version.clone(),
-            evidence_revision: evidence.evidence_revision.clone(),
+            evidence_revision: evidence.evidence_revision().clone(),
             metrics: key.metrics.clone(),
         };
         let evidence = {
@@ -140,25 +145,6 @@ impl UnifiedStatisticsResolver {
         };
         Ok(evidence)
     }
-
-    /// Optimizer input is allowed only when the provider proved the evidence
-    /// covers the pinned table and every value is exact. Subset/Superset and
-    /// approximate responses intentionally force normal missing-stat fallback.
-    pub(crate) fn optimizer_usable(evidence: &StatisticsEvidence) -> bool {
-        evidence.coverage == StatisticsCoverage::Full
-            && evidence.accuracy == StatisticsAccuracy::Exact
-    }
-
-    #[cfg(test)]
-    pub(crate) fn cache_sizes(&self) -> (usize, usize) {
-        (
-            0,
-            self.artifacts
-                .lock()
-                .expect("unified statistics artifact cache lock")
-                .len(),
-        )
-    }
 }
 
 #[cfg(test)]
@@ -170,23 +156,31 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorProviderId, StatisticsEvidenceRevision, StatisticsProvenance, StatisticsReader,
+        ConnectorProviderId, StatisticsEvidenceRevision, StatisticsMetricState, StatisticsReader,
+        StatisticsRowCoverage,
     };
 
     use super::*;
 
-    fn evidence(coverage: StatisticsCoverage, accuracy: StatisticsAccuracy) -> StatisticsEvidence {
-        StatisticsEvidence {
-            data_version: StatisticsDataVersion::try_new(Bytes::from_static(b"data-v1"))
-                .expect("bounded data version"),
-            evidence_revision: StatisticsEvidenceRevision::try_new(Bytes::from_static(b"rev-1"))
+    fn data_version(token: &'static [u8]) -> StatisticsDataVersion {
+        StatisticsDataVersion::try_new(Bytes::from_static(token)).expect("bounded data version")
+    }
+
+    fn evidence_with(
+        metrics: BTreeMap<StatisticsMetric, StatisticsMetricState>,
+    ) -> StatisticsEvidence {
+        StatisticsEvidence::try_new(
+            data_version(b"data-v1"),
+            StatisticsEvidenceRevision::try_new(Bytes::from_static(b"rev-1"))
                 .expect("bounded evidence revision"),
-            coverage,
-            accuracy,
-            interval: None,
-            provenance: StatisticsProvenance::Manifest,
-            metrics: BTreeMap::new(),
-        }
+            StatisticsRowCoverage::AllVisibleRows,
+            metrics,
+        )
+        .expect("evidence")
+    }
+
+    fn evidence() -> StatisticsEvidence {
+        evidence_with(BTreeMap::new())
     }
 
     struct NeverCancelled;
@@ -260,22 +254,6 @@ mod tests {
     }
 
     #[test]
-    fn subset_or_approximate_evidence_cannot_upgrade_optimizer_input() {
-        assert!(!UnifiedStatisticsResolver::optimizer_usable(&evidence(
-            StatisticsCoverage::Subset,
-            StatisticsAccuracy::Exact,
-        )));
-        assert!(!UnifiedStatisticsResolver::optimizer_usable(&evidence(
-            StatisticsCoverage::Full,
-            StatisticsAccuracy::Approximate,
-        )));
-        assert!(UnifiedStatisticsResolver::optimizer_usable(&evidence(
-            StatisticsCoverage::Full,
-            StatisticsAccuracy::Exact,
-        )));
-    }
-
-    #[test]
     fn resolver_fails_closed_for_owner_incarnation_and_data_version_mismatch() {
         let resolver = UnifiedStatisticsResolver::default();
         let incarnation = ConnectorInstanceIncarnation::from_bytes([1; 16]);
@@ -284,7 +262,7 @@ mod tests {
         let owner_mismatch = TestStatistics {
             descriptor: descriptor("ice.foreign"),
             incarnation,
-            evidence: evidence(StatisticsCoverage::Full, StatisticsAccuracy::Exact),
+            evidence: evidence(),
         };
         assert_eq!(
             resolver.resolve(&table, &owner_mismatch, metric_request(), request_context(),),
@@ -294,7 +272,7 @@ mod tests {
         let incarnation_mismatch = TestStatistics {
             descriptor: descriptor("ice.main"),
             incarnation: ConnectorInstanceIncarnation::from_bytes([2; 16]),
-            evidence: evidence(StatisticsCoverage::Full, StatisticsAccuracy::Exact),
+            evidence: evidence(),
         };
         assert_eq!(
             resolver.resolve(
@@ -306,10 +284,14 @@ mod tests {
             Err(StatisticsResolutionFailure::IncarnationMismatch)
         );
 
-        let mut foreign_evidence = evidence(StatisticsCoverage::Full, StatisticsAccuracy::Exact);
-        foreign_evidence.data_version =
-            StatisticsDataVersion::try_new(Bytes::from_static(b"data-v2"))
-                .expect("foreign data version");
+        let foreign_evidence = StatisticsEvidence::try_new(
+            data_version(b"data-v2"),
+            StatisticsEvidenceRevision::try_new(Bytes::from_static(b"rev-1"))
+                .expect("bounded evidence revision"),
+            StatisticsRowCoverage::AllVisibleRows,
+            BTreeMap::new(),
+        )
+        .expect("foreign evidence");
         let data_version_mismatch = TestStatistics {
             descriptor: descriptor("ice.main"),
             incarnation,

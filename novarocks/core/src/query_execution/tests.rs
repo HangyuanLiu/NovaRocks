@@ -450,21 +450,43 @@ fn statistics_result(
     >,
 ) -> novarocks_spi::connector::StatisticsCollectionResult {
     novarocks_spi::connector::StatisticsCollectionResult::try_new(
-        novarocks_spi::connector::StatisticsEvidence {
+        novarocks_spi::connector::StatisticsEvidence::try_new(
             data_version,
-            evidence_revision: novarocks_spi::connector::StatisticsEvidenceRevision::try_new(
-                Bytes::from_static(b"evidence-1"),
-            )
+            novarocks_spi::connector::StatisticsEvidenceRevision::try_new(Bytes::from_static(
+                b"evidence-1",
+            ))
             .expect("revision"),
-            coverage: novarocks_spi::connector::StatisticsCoverage::Full,
-            accuracy: novarocks_spi::connector::StatisticsAccuracy::Exact,
-            interval: None,
-            provenance: novarocks_spi::connector::StatisticsProvenance::VisibleRows,
+            novarocks_spi::connector::StatisticsRowCoverage::AllVisibleRows,
             metrics,
-        },
+        )
+        .expect("evidence"),
         program.plan().provider_payload().clone(),
     )
     .expect("result")
+}
+
+/// One value produced by a visible-row scan of `data_version` itself. A Theta
+/// sketch stays approximate; anything else a full scan counts is exact.
+fn scanned(
+    data_version: &novarocks_spi::connector::StatisticsDataVersion,
+    metric: &novarocks_spi::connector::StatisticsMetric,
+    value: novarocks_spi::connector::StatisticsMetricValue,
+) -> novarocks_spi::connector::StatisticsMetricState {
+    let nature = match metric {
+        novarocks_spi::connector::StatisticsMetric::ThetaNdv { .. } => {
+            novarocks_spi::connector::StatisticsNumericNature::TwoSidedApproximate
+        }
+        _ => novarocks_spi::connector::StatisticsNumericNature::Exact,
+    };
+    novarocks_spi::connector::StatisticsMetricState::Available(
+        novarocks_spi::connector::StatisticsMetricObservation::new(
+            value,
+            data_version.clone(),
+            novarocks_spi::connector::StatisticsMetricSource::VisibleRowScan,
+            nature,
+            novarocks_spi::connector::StatisticsBasisRelation::Identical,
+        ),
+    )
 }
 
 #[test]
@@ -476,7 +498,9 @@ fn statistics_outcome_is_typed_and_never_carries_query_rows() {
         program.plan().data_version.clone(),
         std::collections::BTreeMap::from([(
             metric.clone(),
-            novarocks_spi::connector::StatisticsMetricState::Available(
+            scanned(
+                &program.plan().data_version,
+                &metric,
                 novarocks_spi::connector::StatisticsMetricValue::U64(7),
             ),
         )]),
@@ -489,11 +513,15 @@ fn statistics_outcome_is_typed_and_never_carries_query_rows() {
         .into_statistics()
         .expect("statistics outcome variant")
         .into_collection_result();
+    let observation = match collection.evidence.metrics().get(&metric) {
+        Some(novarocks_spi::connector::StatisticsMetricState::Available(observation)) => {
+            observation
+        }
+        other => panic!("expected an available row count, got {other:?}"),
+    };
     assert_eq!(
-        collection.evidence.metrics.get(&metric),
-        Some(&novarocks_spi::connector::StatisticsMetricState::Available(
-            novarocks_spi::connector::StatisticsMetricValue::U64(7)
-        ))
+        observation.value(),
+        &novarocks_spi::connector::StatisticsMetricValue::U64(7)
     );
 }
 
@@ -505,12 +533,15 @@ fn statistics_sink_rejects_version_drift_and_metric_expansion() {
         Bytes::from_static(b"snapshot-43"),
     )
     .expect("drifted data version");
+    let drifted_basis = drifted_version.clone();
     let drifted = statistics_result(
         &program,
         drifted_version,
         std::collections::BTreeMap::from([(
             novarocks_spi::connector::StatisticsMetric::RowCount,
-            novarocks_spi::connector::StatisticsMetricState::Available(
+            scanned(
+                &drifted_basis,
+                &novarocks_spi::connector::StatisticsMetric::RowCount,
                 novarocks_spi::connector::StatisticsMetricValue::U64(7),
             ),
         )]),
@@ -528,7 +559,9 @@ fn statistics_sink_rejects_version_drift_and_metric_expansion() {
         std::collections::BTreeMap::from([
             (
                 novarocks_spi::connector::StatisticsMetric::RowCount,
-                novarocks_spi::connector::StatisticsMetricState::Available(
+                scanned(
+                    &program.plan().data_version,
+                    &novarocks_spi::connector::StatisticsMetric::RowCount,
                     novarocks_spi::connector::StatisticsMetricValue::U64(7),
                 ),
             ),
@@ -536,7 +569,11 @@ fn statistics_sink_rejects_version_drift_and_metric_expansion() {
                 novarocks_spi::connector::StatisticsMetric::ThetaNdv {
                     column: Arc::from("id"),
                 },
-                novarocks_spi::connector::StatisticsMetricState::Available(
+                scanned(
+                    &program.plan().data_version,
+                    &novarocks_spi::connector::StatisticsMetric::ThetaNdv {
+                        column: Arc::from("id"),
+                    },
                     novarocks_spi::connector::StatisticsMetricValue::U64(7),
                 ),
             ),
