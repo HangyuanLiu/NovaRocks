@@ -62,6 +62,11 @@ use novarocks::mv::repository::{MvRepositoryError, MvRepositoryErrorKind};
 /// resource in the same StateStore.
 const MV_REFRESH_RESOURCE_PREFIX: &[u8] = b"novarocks/mv/refresh/v1/";
 
+/// How many definite acquire conflicts to absorb before giving up. Each one
+/// proves the acquire did not happen, so retrying is safe; the bound keeps a
+/// genuinely contended target from spinning.
+const ACQUIRE_CONFLICT_RETRIES: u8 = 3;
+
 /// Builds the per-target lease resource key from the stable target identity.
 ///
 /// Only the provider ID and the immutable target table UUID contribute. A
@@ -108,24 +113,41 @@ impl MvRefreshCoordination {
     /// attempt. Minting a new attempt would let one logical acquisition appear
     /// twice in the lease record and defeat the fence it is supposed to
     /// establish.
+    ///
+    /// A definite conflict is the opposite case and takes the opposite action: it
+    /// proves the acquire never landed, so there is nothing to recover and a
+    /// fresh attempt is the correct move. The resource key is per target, so
+    /// refreshes of one MV arriving back to back race their predecessor's
+    /// release on the same record; without this the loser is reported as
+    /// another frontend owning the target, which it does not.
     pub(crate) async fn acquire(
         &self,
         resource: &ConnectorMvRefreshResourceIdentity,
     ) -> Result<AcquireOutcome, CoordinationError> {
         let key = mv_refresh_resource_key(resource)?;
-        let attempt = AttemptId::try_from(Uuid::now_v7())?;
-        let operation_id = OperationId::new_v7();
-        match self
-            .manager
-            .acquire(key.clone(), attempt, operation_id)
-            .await
-        {
-            Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
-                self.manager
-                    .recover_acquire(key, attempt, operation_id)
-                    .await
+        let mut remaining = ACQUIRE_CONFLICT_RETRIES;
+        loop {
+            let attempt = AttemptId::try_from(Uuid::now_v7())?;
+            let operation_id = OperationId::new_v7();
+            match self
+                .manager
+                .acquire(key.clone(), attempt, operation_id)
+                .await
+            {
+                Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
+                    return self
+                        .manager
+                        .recover_acquire(key, attempt, operation_id)
+                        .await;
+                }
+                Err(error)
+                    if error.kind() == CoordinationErrorKind::OperationNotCommitted
+                        && remaining > 0 =>
+                {
+                    remaining -= 1;
+                }
+                result => return result,
             }
-            result => result,
         }
     }
 
@@ -656,6 +678,258 @@ mod tests {
             Uuid::from_u128(uuid),
         )
         .unwrap()
+    }
+
+    /// Wraps a store and refuses the next `armed` commits with a definite
+    /// conflict, dropping their writes. That is what losing a version race looks
+    /// like from above: nothing landed, so the loser may simply try again.
+    struct ConflictingStore {
+        inner: Arc<dyn StateStore>,
+        armed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct ConflictingTransaction {
+        inner: Option<Box<dyn novarocks_spi::state_store::WriteTransaction>>,
+        armed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ConflictingTransaction {
+        fn inner(&mut self) -> &mut dyn novarocks_spi::state_store::WriteTransaction {
+            self.inner.as_mut().expect("transaction is active").as_mut()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl novarocks_spi::state_store::ReadTransaction for ConflictingTransaction {
+        async fn get(
+            &mut self,
+            key: &novarocks_spi::state_store::Key,
+        ) -> Result<
+            Option<novarocks_spi::state_store::StateRecord>,
+            novarocks_spi::state_store::StateStoreError,
+        > {
+            self.inner().get(key).await
+        }
+
+        async fn range(
+            &mut self,
+            request: &novarocks_spi::state_store::RangeRequest,
+        ) -> Result<
+            novarocks_spi::state_store::RangePage,
+            novarocks_spi::state_store::StateStoreError,
+        > {
+            self.inner().range(request).await
+        }
+
+        async fn abort(
+            mut self: Box<Self>,
+        ) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+            self.inner
+                .take()
+                .expect("transaction is active")
+                .abort()
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl novarocks_spi::state_store::WriteTransaction for ConflictingTransaction {
+        fn transaction_id(&self) -> &novarocks_spi::state_store::TransactionId {
+            self.inner
+                .as_ref()
+                .expect("transaction is active")
+                .transaction_id()
+        }
+
+        async fn put(
+            &mut self,
+            key: novarocks_spi::state_store::Key,
+            value: novarocks_spi::state_store::Value,
+            precondition: novarocks_spi::state_store::Precondition,
+        ) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+            self.inner().put(key, value, precondition).await
+        }
+
+        async fn delete(
+            &mut self,
+            key: novarocks_spi::state_store::Key,
+            precondition: novarocks_spi::state_store::Precondition,
+        ) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+            self.inner().delete(key, precondition).await
+        }
+
+        async fn commit(mut self: Box<Self>) -> novarocks_spi::state_store::CommitOutcome {
+            use std::sync::atomic::Ordering;
+            if self
+                .armed
+                // `checked_sub` is the whole point: `then_some(armed - 1)`
+                // evaluates its argument eagerly and underflows at zero.
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |armed| {
+                    armed.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return novarocks_spi::state_store::CommitOutcome::Conflict(
+                    novarocks_spi::state_store::StateStoreError::new(
+                        novarocks_spi::state_store::StateStoreErrorKind::Conflict,
+                        "injected definite conflict",
+                    ),
+                );
+            }
+            self.inner
+                .take()
+                .expect("transaction is active")
+                .commit()
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateStore for ConflictingStore {
+        fn limits(&self) -> &novarocks_spi::state_store::StateStoreLimits {
+            self.inner.limits()
+        }
+
+        fn metrics_snapshot(&self) -> novarocks_spi::state_store::StateStoreMetricsSnapshot {
+            self.inner.metrics_snapshot()
+        }
+
+        async fn begin_read(
+            &self,
+        ) -> Result<
+            Box<dyn novarocks_spi::state_store::ReadTransaction>,
+            novarocks_spi::state_store::StateStoreError,
+        > {
+            self.inner.begin_read().await
+        }
+
+        async fn begin_write(
+            &self,
+            transaction_id: novarocks_spi::state_store::TransactionId,
+            purpose: &str,
+        ) -> Result<
+            Box<dyn novarocks_spi::state_store::WriteTransaction>,
+            novarocks_spi::state_store::StateStoreError,
+        > {
+            Ok(Box::new(ConflictingTransaction {
+                inner: Some(self.inner.begin_write(transaction_id, purpose).await?),
+                armed: Arc::clone(&self.armed),
+            }))
+        }
+
+        async fn poll_changes(
+            &self,
+            request: &novarocks_spi::state_store::ChangePollRequest,
+        ) -> Result<
+            novarocks_spi::state_store::ChangePage,
+            novarocks_spi::state_store::StateStoreError,
+        > {
+            self.inner.poll_changes(request).await
+        }
+
+        async fn identity(
+            &self,
+        ) -> Result<
+            novarocks_spi::state_store::StoreIdentity,
+            novarocks_spi::state_store::StateStoreError,
+        > {
+            self.inner.identity().await
+        }
+
+        async fn resolve_commit(
+            &self,
+            transaction_id: &novarocks_spi::state_store::TransactionId,
+        ) -> Result<
+            novarocks_spi::state_store::CommitResolution,
+            novarocks_spi::state_store::StateStoreError,
+        > {
+            self.inner.resolve_commit(transaction_id).await
+        }
+    }
+
+    async fn conflicting_coordination(
+        path: &std::path::Path,
+        armed: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> MvRefreshCoordination {
+        let registry = novarocks_state_store::builtin_state_store_provider_registry()
+            .expect("built-in provider registry");
+        let inner = novarocks_state_store::StateStoreHost::open(
+            &registry,
+            novarocks_state_store::StateStoreHostConfig {
+                state_store: novarocks_state_store::StateStoreAppConfig {
+                    store: novarocks_state_store::StateStoreConfig {
+                        cluster_id: "mv-refresh-lease-conflict".to_string(),
+                        limits: novarocks_state_store::StateStoreLimitOverrides::default(),
+                        provider: novarocks_state_store::StateStoreProviderConfig::Sqlite {
+                            path: path.to_path_buf(),
+                            deployment_owner: "mv-refresh-lease-conflict-fe".to_string(),
+                        },
+                    },
+                    mysql_client: None,
+                },
+                foundationdb_client: None,
+            },
+            novarocks_spi::state_store::FeDeploymentView {
+                active_fe_count: std::num::NonZeroUsize::new(1).unwrap(),
+                topology_revision: Bytes::from_static(b"mv-refresh-lease-conflict"),
+            },
+            std::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("open SQLite state store")
+        .state_store()
+        .expect("SQLite state store exposure");
+        let store = Arc::new(ConflictingStore {
+            inner,
+            armed: Arc::clone(armed),
+        }) as Arc<dyn StateStore>;
+        // Arm only after open, so the bootstrap writes are not the refused ones.
+        MvRefreshCoordination::open(store)
+            .await
+            .expect("open MV refresh coordination")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_definite_acquire_conflict_is_absorbed_rather_than_refusing_the_caller() {
+        use std::sync::atomic::Ordering;
+        let temp = tempfile::TempDir::new().expect("temporary directory");
+        let armed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let coordination =
+            conflicting_coordination(&temp.path().join("state.sqlite"), &armed).await;
+        armed.store(2, Ordering::Release);
+
+        let outcome = coordination
+            .acquire(&resource(0x5eed))
+            .await
+            .expect("a definite conflict proves nothing landed, so the acquire retries");
+
+        assert!(
+            matches!(outcome, AcquireOutcome::Acquired(_)),
+            "the retry has to end in a real lease: the caller turns anything else \
+             into another frontend owning the target, which it does not"
+        );
+        assert_eq!(
+            armed.load(Ordering::Acquire),
+            0,
+            "both injected conflicts should have been consumed by retries"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conflicts_past_the_retry_bound_still_surface() {
+        use std::sync::atomic::Ordering;
+        let temp = tempfile::TempDir::new().expect("temporary directory");
+        let armed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let coordination =
+            conflicting_coordination(&temp.path().join("state.sqlite"), &armed).await;
+        // A record that never settles must stop retrying rather than spin.
+        armed.store(64, Ordering::Release);
+
+        let error = coordination
+            .acquire(&resource(0x5eed))
+            .await
+            .expect_err("the retry bound has to hold");
+        assert_eq!(error.kind(), CoordinationErrorKind::OperationNotCommitted);
     }
 
     #[test]
