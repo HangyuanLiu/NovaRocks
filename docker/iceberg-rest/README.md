@@ -75,7 +75,7 @@ Important generated files (under the runtime entry):
 - `README.md` — human-readable summary of the active environment.
 - `standalone.toml` — NovaRocks standalone config.
 - `standalone-scheduler.toml` — the same fixture with the MV refresh scheduler enabled.
-- `sql-test.conf` — SQL test runner config.
+- `sql-test.toml` — SQL test runner config.
 - `ice-rest-catalog.sql` — REST catalog DDL for this workspace.
 - `spark-defaults.conf` — Spark catalog config for REST Catalog + MinIO.
 - `spark-iceberg-v3-smoke.sql` — Spark SQL that creates and writes a format-v3 Iceberg row-lineage table.
@@ -114,15 +114,15 @@ source docker/iceberg-rest/runtime/current/env.sh
 NO_PROXY=127.0.0.1,localhost \
 cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG"
 
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg --mode verify
 
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-compatibility --mode verify
 
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-rest --mode verify
 ```
@@ -266,11 +266,11 @@ grep -q '^NOVAROCKS_READY ' "$SERVER_LOG" || {
   exit 1
 }
 
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-compatibility --mode verify
 
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-rest --mode verify
 ```
@@ -332,7 +332,7 @@ error instead of silently absorbing or overwriting the foreign change.
 
 ### Verifying with Spark
 
-`sql-tests/iceberg-compatibility/sql/novarocks_rest_minio_mv_table_read_by_spark.sql`
+`tests/sql/suites/iceberg-compatibility/sql/novarocks_rest_minio_mv_table_read_by_spark.sql`
 is the CI-gated recipe for this contract: NovaRocks creates and refreshes an
 Iceberg MV in the REST `ice_rest`-backed catalog, then two Spark `spark-sql.sh`
 steps read the MV table's visible materialized columns and verify that
@@ -342,7 +342,7 @@ with the rest of the suite:
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
 docker/iceberg-rest/up.sh
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-compatibility --only novarocks_rest_minio_mv_table_read_by_spark \
   --mode verify

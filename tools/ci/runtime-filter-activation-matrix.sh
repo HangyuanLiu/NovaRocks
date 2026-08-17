@@ -62,7 +62,7 @@ run_matrix_side() {
                 --rewrite-explain-contains-as-not-contains "expr = (t2.k)"
             )
         fi
-        cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+        cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
             --config "$NOVAROCKS_SQL_TEST_CONFIG" \
             --suite "$suite" \
             --only "$only" \

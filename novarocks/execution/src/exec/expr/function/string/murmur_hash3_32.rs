@@ -261,11 +261,11 @@ mod tests {
     /// NovaRocks treats embedded NUL bytes as content, not C-string
     /// terminators — so an 8-byte all-zero string and an empty string hash
     /// to different values, and `'\0\0\0\0\0\0\0\0'` round-trips through
-    /// `<=>` joins. The sql-tests case `join_fixed_size_string` step 30
+    /// `<=>` joins. The SQL test case `join_fixed_size_string` step 30
     /// (join on `c_str8 <=> c_str8` with `'\0'×8` rows in both sides)
     /// relies on this property. Pin the exact value so a future regression
     /// (e.g. silently calling `strlen` on the byte slice) is caught
-    /// without needing the 60K-row sql-tests fixture.
+    /// without needing the 60K-row SQL test fixture.
     #[test]
     fn null_bytes_are_content_not_terminator() {
         assert_eq!(murmur_hash3_32(b"", MURMUR3_32_SEED), 3329588566);

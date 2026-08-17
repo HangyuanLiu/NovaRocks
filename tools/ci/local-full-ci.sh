@@ -66,7 +66,7 @@ usage() {
 Usage: tools/ci/local-full-ci.sh [options]
 
 Runs NovaRocks local full CI with local logs under logs/ci-full/<timestamp>/.
-SQL suites are executed with sql-tests -j 1 because parallel case execution is
+SQL suites are executed with novarocks-sql-test -j 1 because parallel case execution is
 not stable in the current local environment.
 Rust tests are executed with --test-threads=1 for the same reason.
 Cargo build/test/run stages use NOVA_CI_CARGO_PROFILE, defaulting to dev-opt.
@@ -79,7 +79,7 @@ full-suite matrix, and NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED=1 to make failures
 in an appended matrix fail CI.
 
 Options:
-  --all-discovered      Run every suite discovered from sql-tests/*/sql.
+  --all-discovered      Run every suite discovered from tests/sql/suites/*/sql.
   --suite <name>        Run only the named SQL suite. May be repeated.
   --tier <name>         Stable tier: smoke, targeted, or full. Default: full.
   --from <run-dir>      Reclassify an existing logs/ci-full run without rerun.
@@ -888,7 +888,7 @@ run_sql_suites() {
     ci_run_logged "$log_path" \
       env NO_PROXY=127.0.0.1,localhost \
       NOVAROCKS_BIN="$novarocks_bin" \
-      cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests --profile "$NOVA_CI_CARGO_PROFILE" -- \
+      cargo run --manifest-path tests/sql/runner/Cargo.toml --profile "$NOVA_CI_CARGO_PROFILE" -- \
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \
         --mode verify \
@@ -1020,7 +1020,7 @@ run_native_cross_process_sql_suites() {
     ci_run_logged "$log_path" \
       env NO_PROXY=127.0.0.1,localhost \
       NOVAROCKS_BIN="$novarocks_bin" \
-      cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests --profile "$NOVA_CI_CARGO_PROFILE" -- \
+      cargo run --manifest-path tests/sql/runner/Cargo.toml --profile "$NOVA_CI_CARGO_PROFILE" -- \
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \
         --mode verify \

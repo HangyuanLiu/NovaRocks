@@ -1199,7 +1199,7 @@ fn format_function_display_name(function: &sqlast::Function) -> String {
     }
     // `element_at(container, key)` is rendered as `container[key]` to match
     // the subscript-syntax variant — the two forms are semantically identical
-    // and downstream consumers (sql-tests, MySQL clients reading column
+    // and downstream consumers (SQL test, MySQL clients reading column
     // headers) expect a single canonical name regardless of which spelling
     // the user wrote.
     if canonical_name == "element_at"

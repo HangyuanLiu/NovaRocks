@@ -100,6 +100,13 @@ choose_port() {
   printf '%s\n' "$port"
 }
 
+toml_string() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
 choose_port_in_range() {
   local base="$1"
   local range="$2"
@@ -333,7 +340,7 @@ EOF
 fi
 
 iceberg_warehouse="s3://novarocks/$env_id/iceberg-catalog"
-iceberg_test_warehouse="s3://novarocks/$env_id/sql-tests-iceberg-extra"
+iceberg_test_warehouse="s3://novarocks/$env_id/novarocks-sql-test-iceberg-extra"
 rest_warehouse="s3://warehouse/$env_id/rest"
 shared_rest_warehouse="${NOVA_ENV_SHARED_REST_WAREHOUSE_URI:-s3://warehouse/shared/rest}"
 compose_rest_warehouse="$rest_warehouse"
@@ -429,30 +436,45 @@ region = "us-east-1"
 enable_path_style_access = true
 EOF
 
-cat > "$runtime_dir/sql-test.conf" <<EOF
+toml_cluster_host="$(toml_string '127.0.0.1')"
+toml_cluster_port="$(toml_string "$mysql_port")"
+toml_cluster_user="$(toml_string 'root')"
+toml_env_url="$(toml_string 'http://127.0.0.1:8030')"
+toml_oss_ak="$(toml_string "$minio_user")"
+toml_oss_sk="$(toml_string "$minio_password")"
+toml_oss_endpoint="$(toml_string "$minio_endpoint")"
+toml_iceberg_catalog_type="$(toml_string 'hadoop')"
+toml_iceberg_catalog_warehouse="$(toml_string "$iceberg_warehouse")"
+toml_iceberg_test_warehouse="$(toml_string "$iceberg_test_warehouse")"
+toml_iceberg_rest_uri="$(toml_string "$rest_uri")"
+toml_iceberg_rest_warehouse="$(toml_string "$rest_warehouse")"
+toml_fenced_suites="$(toml_string 'ctas-takeover')"
+toml_fenced_sqlite_path="$(toml_string "$runtime_dir/fenced-catalog.sqlite")"
+
+cat > "$runtime_dir/sql-test.toml" <<EOF
 [cluster]
-host = 127.0.0.1
-port = $mysql_port
-user = root
-password =
+host = $toml_cluster_host
+port = $toml_cluster_port
+user = $toml_cluster_user
+password = ""
 
 [env]
-url = http://127.0.0.1:8030
-oss_ak = $minio_user
-oss_sk = $minio_password
-oss_endpoint = $minio_endpoint
-iceberg_catalog_type = hadoop
-iceberg_catalog_warehouse = $iceberg_warehouse
-iceberg_test_warehouse = $iceberg_test_warehouse
-iceberg_rest_uri = $rest_uri
-iceberg_rest_warehouse = $rest_warehouse
+url = $toml_env_url
+oss_ak = $toml_oss_ak
+oss_sk = $toml_oss_sk
+oss_endpoint = $toml_oss_endpoint
+iceberg_catalog_type = $toml_iceberg_catalog_type
+iceberg_catalog_warehouse = $toml_iceberg_catalog_warehouse
+iceberg_test_warehouse = $toml_iceberg_test_warehouse
+iceberg_rest_uri = $toml_iceberg_rest_uri
+iceberg_rest_warehouse = $toml_iceberg_rest_warehouse
 
 [fenced_catalog]
 # Test-only catalog-native CTAS protocol proxy. It is never composed into a
 # NovaRocks production process and remains disabled for ordinary REST suites.
 enabled = $configured_fenced_catalog
-suites = ctas-takeover
-sqlite_path = $runtime_dir/fenced-catalog.sqlite
+suites = $toml_fenced_suites
+sqlite_path = $toml_fenced_sqlite_path
 EOF
 
 cat > "$runtime_dir/ice-rest-catalog.sql" <<EOF
@@ -554,7 +576,7 @@ export NOVAROCKS_ICEBERG_REST_WAREHOUSE="$rest_warehouse"
 export NOVAROCKS_STANDALONE_CONFIG="$runtime_dir/standalone.toml"
 export NOVAROCKS_STANDALONE_SCHEDULER_CONFIG="$runtime_dir/standalone-scheduler.toml"
 export NOVAROCKS_STATE_STORE_PATH="$runtime_dir/frontend-state.sqlite"
-export NOVAROCKS_SQL_TEST_CONFIG="$runtime_dir/sql-test.conf"
+export NOVAROCKS_SQL_TEST_CONFIG="$runtime_dir/sql-test.toml"
 export NOVA_ENV_FENCED_CATALOG="$configured_fenced_catalog"
 export NOVAROCKS_FENCED_CATALOG_STATE="$runtime_dir/fenced-catalog.sqlite"
 export NOVAROCKS_ICE_REST_CATALOG_SQL="$runtime_dir/ice-rest-catalog.sql"
@@ -611,7 +633,7 @@ cat > "$manifest_file" <<EOF
     "standalone_config": "$runtime_dir/standalone.toml",
     "standalone_scheduler_config": "$runtime_dir/standalone-scheduler.toml",
     "state_store_path": "$runtime_dir/frontend-state.sqlite",
-    "sql_test_config": "$runtime_dir/sql-test.conf",
+    "sql_test_config": "$runtime_dir/sql-test.toml",
     "ice_rest_catalog_sql": "$runtime_dir/ice-rest-catalog.sql",
     "iceberg_catalog_warehouse": "$iceberg_warehouse",
     "iceberg_test_warehouse": "$iceberg_test_warehouse"
@@ -646,7 +668,7 @@ Do not guess ports.
 - Standalone config: \`$runtime_dir/standalone.toml\`
 - Scheduler-enabled standalone config: \`$runtime_dir/standalone-scheduler.toml\`
 - Frontend StateStore: \`$runtime_dir/frontend-state.sqlite\`
-- SQL test config: \`$runtime_dir/sql-test.conf\`
+- SQL test config: \`$runtime_dir/sql-test.toml\`
 - Additional Iceberg test warehouse: \`$iceberg_test_warehouse\`
 - REST catalog SQL: \`$runtime_dir/ice-rest-catalog.sql\`
 - Spark defaults: \`$spark_defaults_file\`
@@ -663,9 +685,9 @@ source "$current_link/env.sh"
 docker/iceberg-rest/up.sh  # start or reuse shared Docker services when needed
 cargo run -p novarocks-server -- standalone --config "\$NOVAROCKS_STANDALONE_CONFIG"
 cargo run -p novarocks-server -- standalone --config "\$NOVAROCKS_STANDALONE_SCHEDULER_CONFIG"
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-mv-scheduler --mode verify
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-mv-scheduler --mode verify
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify
 docker/iceberg-rest/spark-sql.sh "\$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 \`\`\`
 EOF
@@ -731,8 +753,8 @@ Use:
 $docker_start_hint
   cargo run -p novarocks-server -- standalone --config "\$NOVAROCKS_STANDALONE_CONFIG"
   cargo run -p novarocks-server -- standalone --config "\$NOVAROCKS_STANDALONE_SCHEDULER_CONFIG"
-  cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
-  cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-mv-scheduler --mode verify
-  cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify
+  cargo run --manifest-path tests/sql/runner/Cargo.toml -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
+  cargo run --manifest-path tests/sql/runner/Cargo.toml -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-mv-scheduler --mode verify
+  cargo run --manifest-path tests/sql/runner/Cargo.toml -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify
   docker/iceberg-rest/spark-sql.sh "\$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 EOF

@@ -472,7 +472,7 @@ Run SQL tests with the generated runner config:
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
 docker/iceberg-rest/up.sh
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg --mode verify
 ```
@@ -483,7 +483,7 @@ Catalog + MinIO and NovaRocks reads the table:
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
 docker/iceberg-rest/up.sh
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-compatibility --mode verify
 ```
@@ -494,7 +494,7 @@ writes and reads):
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
 docker/iceberg-rest/up.sh
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-rest --mode verify
 ```
@@ -565,7 +565,8 @@ only for performance measurement and benchmarks.
 
 ### 8.4 SQL Regression Tests
 
-Unified runner under `sql-tests`. It requires a running NovaRocks
+The unified runner is under `tests/sql/runner`, with suites under `tests/sql/suites`.
+It requires a running NovaRocks
 MySQL-compatible standalone server. Do not assume a fixed port in Codex
 workspaces; source `docker/iceberg-rest/runtime/current/env.sh` when that
 entry exists.
@@ -594,7 +595,7 @@ config so its configured MySQL port cannot collide with another worktree.
 **Run test suites:**
 
 ```bash
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --suite <suite> --mode <verify|record|diff> [--query-timeout 60] [-j 4]
 ```
 
@@ -602,7 +603,7 @@ With a generated runner config:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg --mode verify
 ```
@@ -614,7 +615,7 @@ no suite owns an alternate server runtime.
 **Run specific cases:**
 
 ```bash
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --suite tpc-ds --only q10,q35,q69 --mode verify
 ```
 
@@ -652,7 +653,7 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   follow-up. Verbose/Costs/Analyze append a stable `stats={rows=N}`
   trailer to each physical node. `SET disable_optimizer_rules = 'RuleA,RuleB'`
   (alias `cbo_disabled_rules`) bisects optimizer rules at session level;
-  see `src/sql/optimizer/options.rs`. Use the `sql-tests/optimizer/` suite
+  see `src/sql/optimizer/options.rs`. Use the `tests/sql/suites/optimizer/` suite
   for plan-golden cases, and `-- @explain_contains=<substr>` /
   `-- @normalize_explain_timing` in any sql-test case to assert plan-shape
   facts alongside the result golden.
@@ -662,7 +663,7 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   bucketing predicts a real row-count reduction. White-list functions
   are SUM/MIN/MAX/COUNT(col). Disable via
   `SET disable_optimizer_rules = 'AggregatePushdown'`. Plan-shape
-  cases live under `sql-tests/optimizer/aggregate_pushdown_*.sql`. The
+  cases live under `tests/sql/suites/optimizer/aggregate_pushdown_*.sql`. The
   idempotency guard is `AggregateNode::already_pushed` — other rules
   must preserve the flag when cloning.
 

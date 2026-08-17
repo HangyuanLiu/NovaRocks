@@ -3415,8 +3415,8 @@ mod tests {
     static BASE_CONFIG: &str = r#"
 [state_store]
 provider = "sqlite"
-cluster_id = "sql-tests-cross-process"
-path = "tmp/sql-tests-state-store.sqlite"
+cluster_id = "novarocks-sql-test-cross-process"
+path = "tmp/novarocks-sql-test-state-store.sqlite"
 deployment_owner = "fe-1"
 
 [standalone_server]
@@ -3443,7 +3443,7 @@ enable_path_style_access = true
 
         assert_eq!(
             fe_value["state_store"]["path"].as_str(),
-            Some("tmp/sql-tests-state-store.sqlite")
+            Some("tmp/novarocks-sql-test-state-store.sqlite")
         );
         assert!(
             fe_value.get("metadata").is_none(),
@@ -3800,7 +3800,7 @@ enable_path_style_access = true
     #[test]
     fn fragment_failure_token_publish_is_complete_and_does_not_clobber_an_existing_arm() {
         let repo_root = std::env::current_dir().expect("current dir");
-        let runtime_root = repo_root.join("tests/sql-test-runner/.test-runtime");
+        let runtime_root = repo_root.join("tests/sql/.runtime/unit");
         fs::create_dir_all(&runtime_root).expect("create runtime root");
         let dir = runtime_root.join(format!(
             "fragment_failure_publish_{}_{}",

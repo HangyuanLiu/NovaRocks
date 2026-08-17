@@ -169,7 +169,7 @@ fn emit_standalone_ready(bind_addr: SocketAddr, user: &str) {
     // mysql port alone cannot distinguish a freshly-bound server from a
     // pre-existing process that already owned the port. The keyword
     // `NOVAROCKS_READY` is the wait-for-ready contract — do not change it
-    // without updating callers (CLAUDE.md, sql-tests harness, etc.).
+    // without updating callers (CLAUDE.md, SQL test harness, etc.).
     println!(
         "NOVAROCKS_READY mysql_port={} pid={}",
         bind_addr.port(),

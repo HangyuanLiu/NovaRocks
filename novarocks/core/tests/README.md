@@ -37,11 +37,11 @@ tests/
 ## Quick Entry
 
 - Rust tests: `cargo test`
-- SQL tests guide: `sql-tests/README.md`
+- SQL tests guide: `tests/sql/suites/README.md`
 
 - StateStore provider and contract tests: `../../state-store/tests/README.md`
 
 ## About Rust Target Discovery
 
 Cargo auto-discovers `tests/*.rs`.  
-Data-dependent SSB checks are maintained as SQL+result cases under `sql-tests/ssb/sql/`.
+Data-dependent SSB checks are maintained as SQL+result cases under `tests/sql/suites/ssb/sql/`.

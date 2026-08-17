@@ -261,25 +261,25 @@ unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 
 ## 5) SQL 端到端测试
 
-### 使用 sql-test-runner（推荐）
+### 使用 novarocks-sql-test（推荐）
 
 ```bash
 cd "${NOVAROCKS_ROOT}"
 
 # 运行单个 case
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --suite <suite> \
   --only <case_name> \
   --mode verify
 
 # 运行整个 suite
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --suite <suite> \
   -j 4 \
   --mode verify
 
 # 运行多个 suite
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --suite iceberg,mv-on-iceberg \
   -j 4 \
   --mode verify
@@ -290,7 +290,7 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
 Record 模式需要 `--ref-port`（参考 FE 端口，通常是另一个未修改的 FE）：
 
 ```bash
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --suite <suite> \
   --only <case_name> \
   --mode record \
@@ -347,7 +347,7 @@ CREATE DATABASE iceberg_cat_${suite_uuid0}.my_db_${uuid0};
 
 6. 运行测试验证
    └─ cd ${NOVAROCKS_ROOT}
-   └─ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+   └─ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
         --suite mv-on-iceberg --mode verify
 
 7. 如果测试不过，检查 FE 日志

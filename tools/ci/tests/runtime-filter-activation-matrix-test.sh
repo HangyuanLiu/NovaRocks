@@ -44,7 +44,7 @@ run_matrix() {
     shift
     mkdir -p "$FAKE_CARGO_LOG"
     PATH="$fake_bin:$PATH" \
-        NOVAROCKS_SQL_TEST_CONFIG="$tmpdir/sql-test.conf" \
+        NOVAROCKS_SQL_TEST_CONFIG="$tmpdir/sql-test.toml" \
         bash "$repo_root/tools/ci/runtime-filter-activation-matrix.sh" \
         --suite "suite-with-value" \
         --only "case_a,case_b" \

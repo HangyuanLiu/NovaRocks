@@ -267,7 +267,7 @@ docker/iceberg-rest/up.sh
 docker/iceberg-hive/up.sh
 source docker/iceberg-rest/runtime/current/env.sh
 source docker/iceberg-hive/runtime/current/env.sh
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-hms --mode verify
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-hms --mode verify
 docker/iceberg-rest/spark-sql.sh /path/to/hms-catalog-query.sql
 \`\`\`
 EOF
@@ -342,6 +342,6 @@ $docker_state
 Use:
   source "$current_link/env.sh"
 $docker_start_hint
-  cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-hms --mode verify
-  cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-hms-compatibility --mode verify
+  cargo run --manifest-path tests/sql/runner/Cargo.toml -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-hms --mode verify
+  cargo run --manifest-path tests/sql/runner/Cargo.toml -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-hms-compatibility --mode verify
 EOF

@@ -1,0 +1,47 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+
+-- Migrated from dev/test/sql/test_agg_function/R/test_bitmap_union_int
+-- Test Objective:
+-- Preserve legacy aggregate coverage in a self-contained SQL test case.
+-- query 1
+-- @skip_result_check=true
+USE ${case_db};
+
+-- name: test_bitmap_union_int
+-- query 2
+-- @skip_result_check=true
+USE ${case_db};
+CREATE TABLE t1 (
+    c1 int,
+    c2 int
+    )
+TBLPROPERTIES ("format-version" = "3");
+
+-- query 3
+-- @skip_result_check=true
+USE ${case_db};
+INSERT INTO t1 values
+    (-1, -1),
+    (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9),
+    (10, 10), (11, 11), (12, 12), (13, 13), (14, 14), (15, 15), (16, 16), (17, 17), (18, 18), (19, 19),
+    (20, 20), (21, 21), (22, 22), (23, 23), (24, 24), (25, 25), (26, 26), (27, 27), (28, 28), (29, 29),
+    (30, 30), (31, 31), (32, 32), (33, 33), (34, 34), (35, 35), (36, 36), (37, 37), (38, 38), (39, -1);
+
+-- query 4
+USE ${case_db};
+select bitmap_union_int(c2) from t1;

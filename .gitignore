@@ -4,20 +4,19 @@
 /novarocks.log
 /novarocks.pid
 /novarocks.toml
-/sql-tests/target/
+/tests/sql/runner/target/
 /target
 /thirdparty/src
 /thirdparty/build/
 /.idea
 /dev
 /output
-/sql-tests/bootstrap/cache/
-/sql-tests/bootstrap/generated/
-/sql-tests/bootstrap/parquet/
-/sql-tests/.sql_test_catalog
+/tests/sql/fixtures/benchmarks/cache/
+/tests/sql/fixtures/benchmarks/generated/
+/tests/sql/fixtures/benchmarks/parquet/
+/tests/sql/suites/.sql_test_catalog
 /tools/target
 /logs/ci-full/
-/tests/sql-test-runner/target
 /vendor/*/target/
 thirdparty/installed
 .DS_Store
@@ -42,4 +41,4 @@ novarocks-server/log/
 # Scratch runtimes written by the test harnesses. A successful run removes its
 # own contents, but a failed one deliberately retains artifacts for diagnosis.
 novarocks-server/.server-binary-smoke-runtime/
-/.sql-test-runner-runtime/
+/tests/sql/.runtime/

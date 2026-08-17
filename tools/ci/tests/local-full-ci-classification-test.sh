@@ -46,7 +46,7 @@ reason = "synthetic commit unknown"
 EOF
 
 cat >"$run_dir/sql/tpc-ds.log" <<'EOF'
-[sql-tests] suite=tpc-ds mode=verify
+[novarocks-sql-test] suite=tpc-ds mode=verify
   [tpc-ds] q94 (steps=1)
     engine_error_code=CommitUnknown target execute failed: ERROR 1105 (HY000): [CommitUnknown] commit outcome unavailable
 case timings (all):
@@ -84,12 +84,12 @@ grep -qx "optimizer-dist" <<<"$targeted_suites"
 
 resolve_root="$tmpdir/resolve-malformed"
 mkdir -p \
-  "$resolve_root/sql-tests/a-valid/sql" \
-  "$resolve_root/sql-tests/z-malformed/sql"
+  "$resolve_root/tests/sql/suites/a-valid/sql" \
+  "$resolve_root/tests/sql/suites/z-malformed/sql"
 printf '%s\n' 'explicit_only = false' \
-  >"$resolve_root/sql-tests/a-valid/suite.toml"
+  >"$resolve_root/tests/sql/suites/a-valid/suite.toml"
 printf '%s\n' 'explicit_only = "false"' \
-  >"$resolve_root/sql-tests/z-malformed/suite.toml"
+  >"$resolve_root/tests/sql/suites/z-malformed/suite.toml"
 resolve_status=0
 (
   REPO_ROOT="$resolve_root"

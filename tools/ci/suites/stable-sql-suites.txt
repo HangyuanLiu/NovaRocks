@@ -1,6 +1,6 @@
 # Stable SQL suites for tools/ci/local-full-ci.sh default daily mode.
 # Keep this list conservative. Add a suite only after a serial local run
-# (`sql-tests -j 1`) has passed in the current environment.
+# (`novarocks-sql-test -j 1`) has passed in the current environment.
 filter
 limit
 project
