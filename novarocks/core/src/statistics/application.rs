@@ -30,9 +30,11 @@ use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
     ConnectorStatisticsResolver, ConnectorTableResolution, ExternalMutationEvidence,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_METRICS,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsMetric, StatisticsMetricRequest,
-    StatisticsMetricState, StatisticsMetricValue, StatisticsReadRequest,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsBasisRelation, StatisticsDataVersion,
+    StatisticsMetric, StatisticsMetricRequest, StatisticsMetricSource, StatisticsMetricState,
+    StatisticsMetricValue, StatisticsNumericNature, StatisticsReadRequest,
 };
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -273,10 +275,11 @@ impl StatisticsTableReader for ConnectorStatisticsTableReader {
                 context,
             })
             .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+        let queried_version = evidence.data_version().clone();
         Ok(evidence
-            .metrics
+            .into_metrics()
             .into_iter()
-            .map(|(metric, state)| statistics_table_stat_view(metric, state))
+            .map(|(metric, state)| statistics_table_stat_view(metric, state, &queried_version))
             .collect())
     }
 }
@@ -291,9 +294,13 @@ fn statistics_request_context() -> Result<ConnectorRequestContext, StatisticsApp
     .map_err(|error| StatisticsApplicationError::new(error.to_string()))
 }
 
+/// Placeholder for the per-metric columns of a row that has no measured value.
+const NO_OBSERVATION: &str = "-";
+
 fn statistics_table_stat_view(
     metric: StatisticsMetric,
     state: StatisticsMetricState,
+    queried_version: &StatisticsDataVersion,
 ) -> StatisticsTableStatView {
     let metric = match metric {
         StatisticsMetric::RowCount => "row_count".to_string(),
@@ -303,18 +310,74 @@ fn statistics_table_stat_view(
         StatisticsMetric::AverageSize { column } => format!("average_size:{column}"),
         StatisticsMetric::ThetaNdv { column } => format!("theta_ndv:{column}"),
     };
-    let (value, status) = match state {
-        StatisticsMetricState::Available(value) => {
-            (Some(statistics_metric_value(value)), "AVAILABLE".into())
+    let observation = match state {
+        StatisticsMetricState::Available(observation) => observation,
+        StatisticsMetricState::Missing(missing) => {
+            return unobserved_stat_view(metric, format!("MISSING:{:?}", missing.kind));
         }
-        StatisticsMetricState::Missing(missing) => (None, format!("MISSING:{:?}", missing.kind)),
-        StatisticsMetricState::Error(error) => (None, format!("ERROR:{:?}", error.kind)),
+        StatisticsMetricState::Error(error) => {
+            return unobserved_stat_view(metric, format!("ERROR:{:?}", error.kind));
+        }
     };
     StatisticsTableStatView {
         metric,
-        value,
-        status,
+        value: Some(statistics_metric_value(observation.value().clone())),
+        status: "AVAILABLE".into(),
+        basis_version: statistics_basis_version(observation.basis_version(), queried_version),
+        source: match observation.source() {
+            StatisticsMetricSource::CurrentManifest => "CURRENT_MANIFEST".into(),
+            StatisticsMetricSource::ProviderArtifact => "PROVIDER_ARTIFACT".into(),
+            StatisticsMetricSource::VisibleRowScan => "VISIBLE_ROW_SCAN".into(),
+            StatisticsMetricSource::Provider(name) => format!("PROVIDER:{name}"),
+        },
+        numeric_nature: match observation.numeric_nature() {
+            StatisticsNumericNature::Exact => "EXACT",
+            StatisticsNumericNature::UpperBound => "UPPER_BOUND",
+            StatisticsNumericNature::LowerBound => "LOWER_BOUND",
+            StatisticsNumericNature::TwoSidedApproximate => "APPROXIMATE",
+        }
+        .into(),
+        basis_relation: match observation.basis_relation() {
+            StatisticsBasisRelation::Identical => "IDENTICAL",
+            StatisticsBasisRelation::BasisIsSubset => "BASIS_IS_SUBSET",
+            StatisticsBasisRelation::BasisIsSuperset => "BASIS_IS_SUPERSET",
+            StatisticsBasisRelation::Incomparable => "INCOMPARABLE",
+        }
+        .into(),
     }
+}
+
+fn unobserved_stat_view(metric: String, status: String) -> StatisticsTableStatView {
+    StatisticsTableStatView {
+        metric,
+        value: None,
+        status,
+        basis_version: NO_OBSERVATION.into(),
+        source: NO_OBSERVATION.into(),
+        numeric_nature: NO_OBSERVATION.into(),
+        basis_relation: NO_OBSERVATION.into(),
+    }
+}
+
+/// Renders which table state a value was measured on without leaking the
+/// provider's private version encoding through SQL.
+///
+/// `SAME` is the common case and the one users need to distinguish; when the
+/// basis differs, a stable digest is enough to see *that* it differs and to
+/// tell two bases apart, while `basis_relation` says how it differs.
+fn statistics_basis_version(
+    basis: &StatisticsDataVersion,
+    queried: &StatisticsDataVersion,
+) -> String {
+    if basis == queried {
+        return "SAME".to_string();
+    }
+    let digest: [u8; 32] = Sha256::digest(basis.as_bytes()).into();
+    let mut rendered = String::from("sha256:");
+    for byte in &digest[..8] {
+        rendered.push_str(&format!("{byte:02x}"));
+    }
+    rendered
 }
 
 fn statistics_metric_value(value: StatisticsMetricValue) -> String {
@@ -365,6 +428,13 @@ pub struct StatisticsTableStatView {
     pub metric: String,
     pub value: Option<String>,
     pub status: String,
+    /// Which table state the value was measured on, relative to the one being
+    /// shown. `SAME` when they are the same state; otherwise a digest, because
+    /// the version token is a provider-private encoding.
+    pub basis_version: String,
+    pub source: String,
+    pub numeric_nature: String,
+    pub basis_relation: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

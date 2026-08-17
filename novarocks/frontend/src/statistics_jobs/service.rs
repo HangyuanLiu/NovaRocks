@@ -81,6 +81,10 @@ pub struct StatisticsTableStatRow {
     pub metric_name: String,
     pub value: Option<String>,
     pub status: String,
+    pub basis_version: String,
+    pub source: String,
+    pub numeric_nature: String,
+    pub basis_relation: String,
 }
 
 /// Read-only statistics data may exist without a StateStore. This port is
@@ -138,6 +142,10 @@ impl TableStatisticsReader for CoreStatisticsTableReaderAdapter {
                         metric_name: row.metric,
                         value: row.value,
                         status: row.status,
+                        basis_version: row.basis_version,
+                        source: row.source,
+                        numeric_nature: row.numeric_nature,
+                        basis_relation: row.basis_relation,
                     })
                     .collect()
             })
@@ -763,6 +771,10 @@ fn map_core_result(
                         metric: row.metric_name,
                         value: row.value,
                         status: row.status,
+                        basis_version: row.basis_version,
+                        source: row.source,
+                        numeric_nature: row.numeric_nature,
+                        basis_relation: row.basis_relation,
                     })
                     .collect(),
             )

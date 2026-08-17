@@ -228,7 +228,6 @@ fn project_binding_statistics(
         binding: binding_id,
         label: label.to_string(),
         columns: facts.columns().to_vec(),
-        optimizer_usable: UnifiedStatisticsResolver::optimizer_usable(&evidence),
         evidence: (*evidence).clone(),
     })
 }

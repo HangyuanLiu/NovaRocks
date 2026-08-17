@@ -38,10 +38,11 @@ use datasketches::theta::ThetaSketch;
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorControlPlanningLease,
     ConnectorControlResolver, ConnectorReadSelector, ConnectorRequestContext,
-    ConnectorSplitPlanningRequest, StatisticsCollectionPlan, StatisticsCollectionResult,
-    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric,
-    StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
-    StatisticsMissingKind, StatisticsProvenance,
+    ConnectorSplitPlanningRequest, StatisticsBasisRelation, StatisticsCollectionPlan,
+    StatisticsCollectionResult, StatisticsDataVersion, StatisticsEvidence,
+    StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricObservation,
+    StatisticsMetricRequest, StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
+    StatisticsMissing, StatisticsMissingKind, StatisticsNumericNature, StatisticsRowCoverage,
 };
 
 use crate::query_execution::backend::BackendTopologySnapshot;
@@ -527,13 +528,13 @@ impl StatisticsResultSink {
             ));
         }
         let evidence = &result.evidence;
-        if evidence.data_version != self.data_version {
+        if *evidence.data_version() != self.data_version {
             return Err(contract_violation(
                 "statistics collection result does not match its pinned data version",
             ));
         }
         let expected = self.metrics.metrics().iter().collect::<BTreeSet<_>>();
-        let actual = evidence.metrics.keys().collect::<BTreeSet<_>>();
+        let actual = evidence.metrics().keys().collect::<BTreeSet<_>>();
         if actual != expected {
             return Err(contract_violation(
                 "statistics collection result does not match its requested metric set",
@@ -692,7 +693,7 @@ impl StatisticsScalarPartial {
     pub fn metric_values(
         &self,
         metrics: impl IntoIterator<Item = StatisticsMetric>,
-    ) -> Result<BTreeMap<StatisticsMetric, StatisticsMetricState>, DistributedQueryError> {
+    ) -> Result<BTreeMap<StatisticsMetric, StatisticsMetricValue>, DistributedQueryError> {
         let mut output = BTreeMap::new();
         for metric in metrics {
             let value = match &metric {
@@ -715,7 +716,7 @@ impl StatisticsScalarPartial {
                     .metric_value(),
                 StatisticsMetric::ThetaNdv { .. } => continue,
             };
-            output.insert(metric, StatisticsMetricState::Available(value));
+            output.insert(metric, value);
         }
         Ok(output)
     }
@@ -1253,16 +1254,21 @@ impl StatisticsCollectionFinalizer {
         })
     }
 
+    /// Labels each collected value with the per-metric facts of a visible-row
+    /// scan: the scan measured `data_version` itself, so every value's basis is
+    /// the queried version. Only the numeric nature varies — a Theta sketch
+    /// estimates in both directions no matter how completely it was fed.
     pub fn metric_states(
         &self,
         metrics: &StatisticsMetricRequest,
+        data_version: &StatisticsDataVersion,
     ) -> BTreeMap<StatisticsMetric, StatisticsMetricState> {
         metrics
             .metrics()
             .iter()
             .cloned()
             .map(|metric| {
-                let state = match &metric {
+                let observed = match &metric {
                     StatisticsMetric::RowCount => self.table.as_ref().and_then(|partial| {
                         partial
                             .metric_values([metric.clone()])
@@ -1280,18 +1286,23 @@ impl StatisticsCollectionFinalizer {
                                 .remove(&metric)
                         })
                     }
-                    StatisticsMetric::ThetaNdv { column } => {
-                        self.theta.get(column).map(|partial| {
-                            StatisticsMetricState::Available(StatisticsMetricValue::F64(
-                                partial.finalize().estimate(),
-                            ))
-                        })
-                    }
+                    StatisticsMetric::ThetaNdv { column } => self
+                        .theta
+                        .get(column)
+                        .map(|partial| StatisticsMetricValue::F64(partial.finalize().estimate())),
                 };
-                (
-                    metric.clone(),
-                    state.unwrap_or_else(|| not_collected(&metric)),
-                )
+                let state = observed
+                    .map(|value| {
+                        StatisticsMetricState::Available(StatisticsMetricObservation::new(
+                            value,
+                            data_version.clone(),
+                            StatisticsMetricSource::VisibleRowScan,
+                            visible_row_numeric_nature(&metric),
+                            StatisticsBasisRelation::Identical,
+                        ))
+                    })
+                    .unwrap_or_else(|| not_collected(&metric));
+                (metric.clone(), state)
             })
             .collect()
     }
@@ -1345,7 +1356,7 @@ impl StatisticsCollectionFinalizer {
         evidence_revision: StatisticsEvidenceRevision,
         metrics: &StatisticsMetricRequest,
     ) -> Result<StatisticsCollectionResult, DistributedQueryError> {
-        let metric_states = self.metric_states(metrics);
+        let metric_states = self.metric_states(metrics, &data_version);
         if metric_states
             .values()
             .any(|state| !matches!(state, StatisticsMetricState::Available(_)))
@@ -1355,21 +1366,35 @@ impl StatisticsCollectionFinalizer {
             ));
         }
         let artifact = self.try_visible_row_artifact(&data_version)?;
-        StatisticsCollectionResult::try_new(
-            StatisticsEvidence {
-                data_version,
-                evidence_revision,
-                coverage: novarocks_spi::connector::StatisticsCoverage::Full,
-                accuracy: novarocks_spi::connector::StatisticsAccuracy::Exact,
-                interval: None,
-                provenance: StatisticsProvenance::VisibleRows,
-                metrics: metric_states,
-            },
-            artifact,
+        // The scan read every visible row, which is what makes this
+        // publishable. It is not a claim that every number is exact: the Theta
+        // sketch above never is.
+        let evidence = StatisticsEvidence::try_new(
+            data_version,
+            evidence_revision,
+            StatisticsRowCoverage::AllVisibleRows,
+            metric_states,
         )
         .map_err(|error| {
+            contract_violation(format!("assemble statistics collection evidence: {error}"))
+        })?;
+        StatisticsCollectionResult::try_new(evidence, artifact).map_err(|error| {
             contract_violation(format!("encode statistics collection result: {error}"))
         })
+    }
+}
+
+/// A visible-row scan reads every live row, so its counts and bounds are exact
+/// on the version it measured. A Theta sketch is a two-sided estimate no matter
+/// how complete its input was.
+fn visible_row_numeric_nature(metric: &StatisticsMetric) -> StatisticsNumericNature {
+    match metric {
+        StatisticsMetric::ThetaNdv { .. } => StatisticsNumericNature::TwoSidedApproximate,
+        StatisticsMetric::RowCount
+        | StatisticsMetric::NullCount { .. }
+        | StatisticsMetric::Minimum { .. }
+        | StatisticsMetric::Maximum { .. }
+        | StatisticsMetric::AverageSize { .. } => StatisticsNumericNature::Exact,
     }
 }
 
@@ -1886,6 +1911,21 @@ mod tests {
         }
     }
 
+    /// Stand-in basis for collector tests that only assert on values. The
+    /// collector labels every metric with the version it was handed, so any
+    /// stable token works here; the labelling itself is asserted separately.
+    fn test_data_version() -> StatisticsDataVersion {
+        StatisticsDataVersion::try_new(Bytes::from_static(b"collector-data-v1"))
+            .expect("data version")
+    }
+
+    fn state_value(state: Option<&StatisticsMetricState>) -> Option<&StatisticsMetricValue> {
+        match state {
+            Some(StatisticsMetricState::Available(observation)) => Some(observation.value()),
+            _ => None,
+        }
+    }
+
     fn connector_context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
@@ -2074,21 +2114,15 @@ mod tests {
             .expect("metric values");
         assert_eq!(
             values.get(&StatisticsMetric::RowCount),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::U64(5)
-            ))
+            Some(&StatisticsMetricValue::U64(5))
         );
         assert_eq!(
             values.get(&StatisticsMetric::Minimum { column: "v".into() }),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::F64(1.0)
-            ))
+            Some(&StatisticsMetricValue::F64(1.0))
         );
         assert_eq!(
             values.get(&StatisticsMetric::Maximum { column: "v".into() }),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::F64(9.0)
-            ))
+            Some(&StatisticsMetricValue::F64(9.0))
         );
     }
 
@@ -2143,22 +2177,18 @@ mod tests {
             StatisticsMetric::ThetaNdv { column: "v".into() },
         ])
         .expect("metrics");
-        let states = merged.metric_states(&metrics);
+        let states = merged.metric_states(&metrics, &test_data_version());
         assert_eq!(
-            states.get(&StatisticsMetric::RowCount),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::U64(3)
-            ))
+            state_value(states.get(&StatisticsMetric::RowCount)),
+            Some(&StatisticsMetricValue::U64(3))
         );
         assert_eq!(
-            states.get(&StatisticsMetric::Minimum { column: "v".into() }),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::F64(1.0)
-            ))
+            state_value(states.get(&StatisticsMetric::Minimum { column: "v".into() })),
+            Some(&StatisticsMetricValue::F64(1.0))
         );
         assert!(matches!(
-            states.get(&StatisticsMetric::ThetaNdv { column: "v".into() }),
-            Some(StatisticsMetricState::Available(StatisticsMetricValue::F64(value))) if *value >= 3.0
+            state_value(states.get(&StatisticsMetric::ThetaNdv { column: "v".into() })),
+            Some(StatisticsMetricValue::F64(value)) if *value >= 3.0
         ));
     }
 
@@ -2184,16 +2214,14 @@ mod tests {
         let result = program
             .finish_fragment_payloads([payload])
             .expect("final collection result");
-        assert_eq!(result.evidence.data_version, program.plan().data_version);
+        assert_eq!(*result.evidence.data_version(), program.plan().data_version);
         assert_eq!(
-            result.evidence.evidence_revision,
+            *result.evidence.evidence_revision(),
             *program.plan().evidence_revision()
         );
         assert_eq!(
-            result.evidence.metrics.get(&StatisticsMetric::RowCount),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::U64(4)
-            ))
+            state_value(result.evidence.metrics().get(&StatisticsMetric::RowCount)),
+            Some(&StatisticsMetricValue::U64(4))
         );
     }
 
@@ -2228,39 +2256,46 @@ mod tests {
         let states = collector
             .finish()
             .expect("finish collector")
-            .metric_states(&metrics);
+            .metric_states(&metrics, &test_data_version());
         assert_eq!(
-            states.get(&StatisticsMetric::RowCount),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::U64(3)
-            ))
+            state_value(states.get(&StatisticsMetric::RowCount)),
+            Some(&StatisticsMetricValue::U64(3))
         );
         assert_eq!(
-            states.get(&StatisticsMetric::NullCount { column: "v".into() }),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::U64(1)
-            ))
+            state_value(states.get(&StatisticsMetric::NullCount { column: "v".into() })),
+            Some(&StatisticsMetricValue::U64(1))
         );
         assert_eq!(
-            states.get(&StatisticsMetric::Minimum { column: "v".into() }),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::F64(1.0)
-            ))
+            state_value(states.get(&StatisticsMetric::Minimum { column: "v".into() })),
+            Some(&StatisticsMetricValue::F64(1.0))
         );
         assert_eq!(
-            states.get(&StatisticsMetric::Maximum { column: "v".into() }),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::F64(3.0)
-            ))
+            state_value(states.get(&StatisticsMetric::Maximum { column: "v".into() })),
+            Some(&StatisticsMetricValue::F64(3.0))
         );
         assert!(matches!(
-            states.get(&StatisticsMetric::AverageSize { column: "v".into() }),
-            Some(StatisticsMetricState::Available(StatisticsMetricValue::F64(value))) if *value > 0.0
+            state_value(states.get(&StatisticsMetric::AverageSize { column: "v".into() })),
+            Some(StatisticsMetricValue::F64(value)) if *value > 0.0
         ));
         assert!(matches!(
-            states.get(&StatisticsMetric::ThetaNdv { column: "v".into() }),
-            Some(StatisticsMetricState::Available(StatisticsMetricValue::F64(value))) if *value >= 2.0
+            state_value(states.get(&StatisticsMetric::ThetaNdv { column: "v".into() })),
+            Some(StatisticsMetricValue::F64(value)) if *value >= 2.0
         ));
+
+        // Same scan, same basis, different numeric nature: a counted value is
+        // exact while the sketch beside it is not.
+        let nature = |metric: StatisticsMetric| match states.get(&metric) {
+            Some(StatisticsMetricState::Available(observation)) => observation.numeric_nature(),
+            other => panic!("expected an available metric, got {other:?}"),
+        };
+        assert_eq!(
+            nature(StatisticsMetric::RowCount),
+            StatisticsNumericNature::Exact
+        );
+        assert_eq!(
+            nature(StatisticsMetric::ThetaNdv { column: "v".into() }),
+            StatisticsNumericNature::TwoSidedApproximate
+        );
     }
 
     #[test]
@@ -2300,19 +2335,19 @@ mod tests {
             .expect("encode LARGEINT fragment");
         let restored = StatisticsCollectionFinalizer::try_from_fragment_payload(&payload)
             .expect("decode LARGEINT fragment");
-        let states = restored.metric_states(&metrics);
+        let states = restored.metric_states(&metrics, &test_data_version());
 
         assert_eq!(
-            states.get(&StatisticsMetric::Minimum { column: "k".into() }),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::Bytes(Bytes::copy_from_slice(&i128::MIN.to_be_bytes()),)
-            ))
+            state_value(states.get(&StatisticsMetric::Minimum { column: "k".into() })),
+            Some(&StatisticsMetricValue::Bytes(Bytes::copy_from_slice(
+                &i128::MIN.to_be_bytes()
+            )))
         );
         assert_eq!(
-            states.get(&StatisticsMetric::Maximum { column: "k".into() }),
-            Some(&StatisticsMetricState::Available(
-                StatisticsMetricValue::Bytes(Bytes::copy_from_slice(&i128::MAX.to_be_bytes()),)
-            ))
+            state_value(states.get(&StatisticsMetric::Maximum { column: "k".into() })),
+            Some(&StatisticsMetricValue::Bytes(Bytes::copy_from_slice(
+                &i128::MAX.to_be_bytes()
+            )))
         );
     }
 
@@ -2356,10 +2391,10 @@ mod tests {
         let states = collector
             .finish()
             .expect("finish collector")
-            .metric_states(&metrics);
+            .metric_states(&metrics, &test_data_version());
         assert!(matches!(
-            states.get(&StatisticsMetric::ThetaNdv { column: "v".into() }),
-            Some(StatisticsMetricState::Available(StatisticsMetricValue::F64(value))) if *value > 9_000.0
+            state_value(states.get(&StatisticsMetric::ThetaNdv { column: "v".into() })),
+            Some(StatisticsMetricValue::F64(value)) if *value > 9_000.0
         ));
     }
 
@@ -2374,12 +2409,10 @@ mod tests {
         .expect("metrics");
         let states = StatisticsCollectionFinalizer::default()
             .with_table(StatisticsScalarPartial::try_new(3, 0, 12, None, None).expect("scalar"))
-            .metric_states(&metrics);
+            .metric_states(&metrics, &test_data_version());
         assert!(matches!(
-            states.get(&StatisticsMetric::RowCount),
-            Some(StatisticsMetricState::Available(
-                StatisticsMetricValue::U64(3)
-            ))
+            state_value(states.get(&StatisticsMetric::RowCount)),
+            Some(StatisticsMetricValue::U64(3))
         ));
         assert!(matches!(
             states.get(&StatisticsMetric::ThetaNdv {
@@ -2436,17 +2469,32 @@ mod tests {
             )
             .finish_visible_row(data_version.clone(), revision.clone(), &metrics)
             .expect("finalize");
-        assert_eq!(result.evidence.data_version, data_version);
-        assert_eq!(result.evidence.evidence_revision, revision);
+        assert_eq!(*result.evidence.data_version(), data_version);
+        assert_eq!(*result.evidence.evidence_revision(), revision);
         assert_eq!(
-            result.evidence.provenance,
-            StatisticsProvenance::VisibleRows
+            result.evidence.row_coverage(),
+            StatisticsRowCoverage::AllVisibleRows
         );
+        // The scan saw every visible row, but its Theta sketch is still an
+        // estimate. Coverage and numeric nature must be able to say both.
+        let ndv = match result.evidence.metrics().get(&StatisticsMetric::ThetaNdv {
+            column: "customer_id".into(),
+        }) {
+            Some(StatisticsMetricState::Available(observation)) => observation.clone(),
+            other => panic!("expected an available NDV, got {other:?}"),
+        };
+        assert_eq!(*ndv.source(), StatisticsMetricSource::VisibleRowScan);
+        assert_eq!(
+            ndv.numeric_nature(),
+            StatisticsNumericNature::TwoSidedApproximate
+        );
+        assert_eq!(ndv.basis_relation(), StatisticsBasisRelation::Identical);
+        assert_eq!(*ndv.basis_version(), data_version);
         assert_eq!(
             decode_visible_row_artifact(result.provider_payload())
                 .expect("decode artifact")
                 .0,
-            result.evidence.data_version
+            *result.evidence.data_version()
         );
     }
 }

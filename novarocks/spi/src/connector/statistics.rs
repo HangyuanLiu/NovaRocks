@@ -270,6 +270,18 @@ impl StatisticsMetricObservation {
     pub const fn interval(&self) -> Option<StatisticsInterval> {
         self.interval
     }
+
+    /// Whether this value describes the row set of `version` itself.
+    ///
+    /// This is the admission question for a consumer: a value measured on some
+    /// other basis, or on a basis whose relation the provider could not prove,
+    /// is not a statement about the rows `version` contains. Numeric nature is
+    /// deliberately not part of it — a bound or a sketch estimate still
+    /// describes the right rows, and how far to trust it is a separate,
+    /// consumer-owned confidence decision.
+    pub fn describes_version(&self, version: &StatisticsDataVersion) -> bool {
+        self.basis_relation == StatisticsBasisRelation::Identical && self.basis_version == *version
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,11 +352,12 @@ impl StatisticsEvidence {
         Ok(evidence)
     }
 
-    /// Rejects evidence whose per-metric facts contradict themselves. This runs
-    /// both at construction and again at the consumer boundary, because a
-    /// provider can decode an artifact straight into the struct's fields
-    /// without passing through `try_new`.
-    pub(crate) fn validate(&self) -> Result<(), ConnectorError> {
+    /// Rejects evidence whose per-metric facts contradict themselves.
+    ///
+    /// `try_new` is the only constructor and the fields are private, so no
+    /// provider — in this crate or outside it — can produce evidence that
+    /// skipped this check.
+    fn validate(&self) -> Result<(), ConnectorError> {
         for (metric, state) in &self.metrics {
             let StatisticsMetricState::Available(observation) = state else {
                 continue;
@@ -757,7 +770,6 @@ impl ConnectorStatisticsLease {
                 "connector statistics reader returned an empty version token",
             ));
         }
-        evidence.validate()?;
         Ok(evidence)
     }
     pub fn prepare_collection(
@@ -1121,5 +1133,39 @@ mod tests {
             evidence.row_coverage(),
             StatisticsRowCoverage::AllVisibleRows
         );
+    }
+
+    #[test]
+    fn only_the_basis_decides_admission_never_the_numeric_nature() {
+        let queried = data_version(b"data-v1");
+
+        for nature in [
+            StatisticsNumericNature::Exact,
+            StatisticsNumericNature::UpperBound,
+            StatisticsNumericNature::LowerBound,
+            StatisticsNumericNature::TwoSidedApproximate,
+        ] {
+            assert!(
+                observation(queried.clone(), nature, StatisticsBasisRelation::Identical)
+                    .describes_version(&queried),
+                "{nature:?} measured on the queried version still describes it"
+            );
+        }
+
+        for relation in [
+            StatisticsBasisRelation::BasisIsSubset,
+            StatisticsBasisRelation::BasisIsSuperset,
+            StatisticsBasisRelation::Incomparable,
+        ] {
+            assert!(
+                !observation(
+                    data_version(b"data-v0"),
+                    StatisticsNumericNature::Exact,
+                    relation
+                )
+                .describes_version(&queried),
+                "an exact value on a {relation:?} basis still describes other rows"
+            );
+        }
     }
 }

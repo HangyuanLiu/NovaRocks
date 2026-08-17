@@ -48,8 +48,8 @@ use novarocks_spi::connector::{
     ConnectorWriteActivation, ConnectorWriteAttemptCompletion, ConnectorWriteCommitRequest,
     ConnectorWriteControl, ConnectorWritePlan, ConnectorWritePlanningRequest,
     ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ExternalMutationOutcome,
-    StatisticsAccuracy, StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence,
-    StatisticsEvidenceRevision, StatisticsProvenance, StatisticsReadRequest, StatisticsReader,
+    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsReadRequest,
+    StatisticsReader, StatisticsRowCoverage,
 };
 
 struct TestControl {
@@ -554,17 +554,12 @@ impl StatisticsReader for TestStatistics {
         &self,
         _request: StatisticsReadRequest,
     ) -> Result<StatisticsEvidence, ConnectorError> {
-        Ok(StatisticsEvidence {
-            data_version: StatisticsDataVersion::try_new(Bytes::from_static(b"data-v1"))?,
-            evidence_revision: StatisticsEvidenceRevision::try_new(Bytes::from_static(
-                b"evidence-v1",
-            ))?,
-            coverage: StatisticsCoverage::Full,
-            accuracy: StatisticsAccuracy::Exact,
-            interval: None,
-            provenance: StatisticsProvenance::ProviderArtifact,
-            metrics: Default::default(),
-        })
+        StatisticsEvidence::try_new(
+            StatisticsDataVersion::try_new(Bytes::from_static(b"data-v1"))?,
+            StatisticsEvidenceRevision::try_new(Bytes::from_static(b"evidence-v1"))?,
+            StatisticsRowCoverage::AllVisibleRows,
+            Default::default(),
+        )
     }
 }
 

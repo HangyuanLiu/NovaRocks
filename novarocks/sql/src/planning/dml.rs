@@ -40,7 +40,6 @@ pub enum DmlStatisticsEvidence {
         label: String,
         columns: Vec<novarocks_catalog::schema::ColumnDef>,
         evidence: novarocks_spi::connector::StatisticsEvidence,
-        optimizer_usable: bool,
     },
     Missing {
         binding: crate::binding::SqlTableBindingId,
@@ -101,16 +100,11 @@ impl DmlStatisticsSnapshot {
                     label,
                     columns,
                     evidence,
-                    optimizer_usable,
                 } => snapshot.insert(
                     binding,
                     SqlTableStatisticsEvidence {
                         label,
-                        statistics: evidence_to_base_statistics(
-                            &evidence,
-                            &columns,
-                            optimizer_usable,
-                        ),
+                        statistics: evidence_to_base_statistics(&evidence, &columns),
                     },
                 ),
                 DmlStatisticsEvidence::Missing {
@@ -151,54 +145,79 @@ fn match_failure(
     }
 }
 
+/// Maps one connector answer into optimizer input, metric by metric.
+///
+/// Nothing here can discard the whole answer. Each metric is admitted only if
+/// it describes the queried version's rows, and its numeric nature becomes a
+/// confidence rather than a veto: a value that bounds the truth, or estimates
+/// it in both directions, is still better input than the missing-stats
+/// fallback. What it must never do is claim to be exact.
 fn evidence_to_base_statistics(
     evidence: &novarocks_spi::connector::StatisticsEvidence,
     columns: &[novarocks_catalog::schema::ColumnDef],
-    optimizer_usable: bool,
 ) -> crate::optimizer::stats_input::BaseTableStatistics {
     use crate::optimizer::statistics::Confidence;
     use crate::optimizer::stats_input::{
         BaseColumnStatistics, BaseTableStatistics, StatValue, StatsMissingReason, StatsSource,
     };
     use novarocks_spi::connector::{
-        StatisticsMetric, StatisticsMetricState, StatisticsMetricValue, StatisticsProvenance,
+        StatisticsMetric, StatisticsMetricObservation, StatisticsMetricSource,
+        StatisticsMetricState, StatisticsMetricValue, StatisticsNumericNature,
     };
 
-    if !optimizer_usable {
-        return BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
-            "connector evidence is not Full+Exact for the pinned table version".to_string(),
-        ));
+    fn metric_source(source: &StatisticsMetricSource) -> StatsSource {
+        match source {
+            StatisticsMetricSource::ProviderArtifact => StatsSource::IcebergPuffin,
+            StatisticsMetricSource::CurrentManifest => StatsSource::IcebergManifest,
+            StatisticsMetricSource::VisibleRowScan | StatisticsMetricSource::Provider(_) => {
+                StatsSource::ConnectorEstimate
+            }
+        }
     }
-    let source = match evidence.provenance {
-        StatisticsProvenance::ProviderArtifact => StatsSource::IcebergPuffin,
-        StatisticsProvenance::Manifest => StatsSource::IcebergManifest,
-        StatisticsProvenance::VisibleRows | StatisticsProvenance::Provider(_) => {
-            StatsSource::ConnectorEstimate
+
+    /// Only a value that is exact on a basis identical to the queried version
+    /// earns `Exact`. Bounds and sketch estimates are real but inexact, which
+    /// is precisely what `Estimated` means here.
+    fn metric_confidence(observation: &StatisticsMetricObservation) -> Confidence {
+        match observation.numeric_nature() {
+            StatisticsNumericNature::Exact => Confidence::Exact,
+            StatisticsNumericNature::UpperBound
+            | StatisticsNumericNature::LowerBound
+            | StatisticsNumericNature::TwoSidedApproximate => Confidence::Estimated,
+        }
+    }
+
+    // Admission is per metric: a value measured on another basis describes
+    // other rows, so it is skipped without touching its neighbours.
+    let admitted = |metric: StatisticsMetric| -> Option<&StatisticsMetricObservation> {
+        match evidence.metrics().get(&metric) {
+            Some(StatisticsMetricState::Available(observation))
+                if observation.describes_version(evidence.data_version()) =>
+            {
+                Some(observation)
+            }
+            _ => None,
         }
     };
-    let metric_u64 = |state: Option<&StatisticsMetricState>| match state {
-        Some(StatisticsMetricState::Available(StatisticsMetricValue::U64(value))) => Some(*value),
-        Some(StatisticsMetricState::Available(StatisticsMetricValue::I64(value))) => {
-            u64::try_from(*value).ok()
-        }
-        Some(StatisticsMetricState::Available(StatisticsMetricValue::F64(value)))
+    let metric_u64 = |observation: Option<&StatisticsMetricObservation>| match observation
+        .map(StatisticsMetricObservation::value)
+    {
+        Some(StatisticsMetricValue::U64(value)) => Some(*value),
+        Some(StatisticsMetricValue::I64(value)) => u64::try_from(*value).ok(),
+        Some(StatisticsMetricValue::F64(value))
             if value.is_finite() && *value >= 0.0 && *value <= u64::MAX as f64 =>
         {
             Some(*value as u64)
         }
         _ => None,
     };
-    let metric_f64 = |state: Option<&StatisticsMetricState>,
+    let metric_f64 = |observation: Option<&StatisticsMetricObservation>,
                       data_type: Option<&arrow::datatypes::DataType>| {
-        let value = match state {
-            Some(StatisticsMetricState::Available(StatisticsMetricValue::U64(value))) => {
-                *value as f64
-            }
-            Some(StatisticsMetricState::Available(StatisticsMetricValue::I64(value))) => {
-                *value as f64
-            }
-            Some(StatisticsMetricState::Available(StatisticsMetricValue::F64(value))) => *value,
-            Some(StatisticsMetricState::Available(StatisticsMetricValue::Bytes(value)))
+        let value = match observation.map(StatisticsMetricObservation::value) {
+            Some(StatisticsMetricValue::U64(value)) => *value as f64,
+            Some(StatisticsMetricValue::I64(value)) => *value as f64,
+            Some(StatisticsMetricValue::F64(value)) => *value,
+            Some(StatisticsMetricValue::Bytes(value))
                 if matches!(data_type, Some(arrow::datatypes::DataType::FixedSizeBinary(width)) if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
                     && value.len()
                         == usize::try_from(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
@@ -210,56 +229,81 @@ fn evidence_to_base_statistics(
         };
         value.is_finite().then_some(value)
     };
+    // The table-level source label reports where the row count came from; each
+    // column value still carries its own confidence below.
+    let row_count_observation = admitted(StatisticsMetric::RowCount);
+    let source = row_count_observation
+        .map(|observation| metric_source(observation.source()))
+        .unwrap_or(StatsSource::ConnectorEstimate);
 
-    let row_count = metric_u64(evidence.metrics.get(&StatisticsMetric::RowCount));
-    let row_count_stat = row_count
-        .map(|value| StatValue::known(value, Confidence::Exact, source))
-        .unwrap_or_else(|| {
-            StatValue::missing(StatsMissingReason::ColumnNotReported("row_count".into()))
-        });
+    let row_count = metric_u64(row_count_observation);
+    let row_count_stat = match (row_count, row_count_observation) {
+        (Some(value), Some(observation)) => StatValue::known(
+            value,
+            metric_confidence(observation),
+            metric_source(observation.source()),
+        ),
+        _ => StatValue::missing(StatsMissingReason::ColumnNotReported("row_count".into())),
+    };
     let mut base_columns = std::collections::HashMap::new();
     for column in columns {
         let name = column.name.to_ascii_lowercase();
         let key = std::sync::Arc::<str>::from(column.name.as_str());
         let missing = || StatsMissingReason::ColumnNotReported(name.clone());
-        let null_count = metric_u64(evidence.metrics.get(&StatisticsMetric::NullCount {
+        // A derived value is only as trustworthy as its weakest input, so the
+        // nulls fraction takes the lower confidence of the two counts it
+        // divides.
+        let null_count_observation = admitted(StatisticsMetric::NullCount {
             column: std::sync::Arc::clone(&key),
-        }));
-        let nulls_fraction = match (null_count, row_count) {
-            (Some(nulls), Some(rows)) if rows > 0 => {
-                StatValue::known(nulls as f64 / rows as f64, Confidence::Exact, source)
-            }
-            (Some(0), Some(0)) => StatValue::known(0.0, Confidence::Exact, source),
+        });
+        let null_count = metric_u64(null_count_observation);
+        let nulls_fraction = match (null_count, null_count_observation, row_count) {
+            (Some(nulls), Some(observation), Some(rows)) if rows > 0 => StatValue::known(
+                nulls as f64 / rows as f64,
+                metric_confidence(observation).min(row_count_stat.confidence()),
+                metric_source(observation.source()),
+            ),
+            (Some(0), Some(observation), Some(0)) => StatValue::known(
+                0.0,
+                metric_confidence(observation).min(row_count_stat.confidence()),
+                metric_source(observation.source()),
+            ),
             _ => StatValue::missing(missing()),
         };
+        let column_stat =
+            |metric: StatisticsMetric, data_type: Option<&arrow::datatypes::DataType>| {
+                let observation = admitted(metric);
+                match (metric_f64(observation, data_type), observation) {
+                    (Some(value), Some(observation)) => StatValue::known(
+                        value,
+                        metric_confidence(observation),
+                        metric_source(observation.source()),
+                    ),
+                    _ => StatValue::missing(missing()),
+                }
+            };
         base_columns.insert(
             name.clone(),
             BaseColumnStatistics {
                 nulls_fraction,
-                average_row_size: metric_f64(
-                    evidence.metrics.get(&StatisticsMetric::AverageSize {
+                average_row_size: column_stat(
+                    StatisticsMetric::AverageSize {
                         column: std::sync::Arc::clone(&key),
-                    }),
+                    },
                     None,
-                )
-                .map(|value| StatValue::known(value, Confidence::Exact, source))
-                .unwrap_or_else(|| StatValue::missing(missing())),
-                min_value: metric_f64(
-                    evidence.metrics.get(&StatisticsMetric::Minimum {
+                ),
+                min_value: column_stat(
+                    StatisticsMetric::Minimum {
                         column: std::sync::Arc::clone(&key),
-                    }),
+                    },
                     Some(&column.data_type),
-                )
-                .map(|value| StatValue::known(value, Confidence::Exact, source))
-                .unwrap_or_else(|| StatValue::missing(missing())),
-                max_value: metric_f64(
-                    evidence.metrics.get(&StatisticsMetric::Maximum {
+                ),
+                max_value: column_stat(
+                    StatisticsMetric::Maximum {
                         column: std::sync::Arc::clone(&key),
-                    }),
+                    },
                     Some(&column.data_type),
-                )
-                .map(|value| StatValue::known(value, Confidence::Exact, source))
-                .unwrap_or_else(|| StatValue::missing(missing())),
+                ),
                 ndv: StatValue::missing(StatsMissingReason::ColumnNotReported(format!(
                     "approximate Theta NDV for `{name}` is not an exact optimizer statistic"
                 ))),
@@ -1386,10 +1430,137 @@ pub fn build_statistics_connector_plan(
 mod tests {
     use super::{
         DmlStatisticsSnapshot, StatisticsCommand, dml_change_stream_optimizer_settings,
-        optimizer_settings_stable_digest_material, parse_statistics_command,
-        parse_truncate_command,
+        evidence_to_base_statistics, optimizer_settings_stable_digest_material,
+        parse_statistics_command, parse_truncate_command,
     };
     use crate::compiler::SessionOptimizerSettings;
+    use crate::optimizer::statistics::Confidence;
+    use crate::optimizer::stats_input::StatsSource;
+    use novarocks_spi::connector::{
+        StatisticsBasisRelation, StatisticsDataVersion, StatisticsEvidence,
+        StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricObservation,
+        StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
+        StatisticsNumericNature, StatisticsRowCoverage,
+    };
+
+    fn version(token: &'static [u8]) -> StatisticsDataVersion {
+        StatisticsDataVersion::try_new(bytes::Bytes::from_static(token)).expect("data version")
+    }
+
+    fn observed(
+        value: StatisticsMetricValue,
+        basis: StatisticsDataVersion,
+        nature: StatisticsNumericNature,
+        relation: StatisticsBasisRelation,
+    ) -> StatisticsMetricState {
+        StatisticsMetricState::Available(StatisticsMetricObservation::new(
+            value,
+            basis,
+            StatisticsMetricSource::CurrentManifest,
+            nature,
+            relation,
+        ))
+    }
+
+    fn column(name: &str) -> novarocks_catalog::schema::ColumnDef {
+        novarocks_catalog::schema::ColumnDef {
+            name: name.to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        }
+    }
+
+    /// One answer can mix an exact count, a directional bound, and a value
+    /// measured on an older basis. None of them may change how the others are
+    /// admitted or labelled, and the whole answer must survive.
+    #[test]
+    fn a_mixed_answer_is_admitted_per_metric_without_cross_contamination() {
+        let queried = version(b"data-v1");
+        let evidence = StatisticsEvidence::try_new(
+            queried.clone(),
+            StatisticsEvidenceRevision::try_new(bytes::Bytes::from_static(b"rev-1"))
+                .expect("revision"),
+            StatisticsRowCoverage::AllVisibleRows,
+            std::collections::BTreeMap::from([
+                (
+                    StatisticsMetric::RowCount,
+                    observed(
+                        StatisticsMetricValue::U64(100),
+                        queried.clone(),
+                        StatisticsNumericNature::Exact,
+                        StatisticsBasisRelation::Identical,
+                    ),
+                ),
+                (
+                    StatisticsMetric::Maximum {
+                        column: std::sync::Arc::from("k"),
+                    },
+                    observed(
+                        StatisticsMetricValue::F64(9.0),
+                        queried.clone(),
+                        StatisticsNumericNature::UpperBound,
+                        StatisticsBasisRelation::Identical,
+                    ),
+                ),
+                (
+                    StatisticsMetric::Minimum {
+                        column: std::sync::Arc::from("k"),
+                    },
+                    observed(
+                        StatisticsMetricValue::F64(1.0),
+                        version(b"data-v0"),
+                        StatisticsNumericNature::Exact,
+                        StatisticsBasisRelation::BasisIsSuperset,
+                    ),
+                ),
+            ]),
+        )
+        .expect("evidence");
+
+        let statistics = evidence_to_base_statistics(&evidence, &[column("k")]);
+
+        // The exact current count keeps full confidence...
+        assert_eq!(statistics.row_count.known_value(), Some(&100));
+        assert_eq!(statistics.row_count.confidence(), Confidence::Exact);
+        assert_eq!(statistics.source, StatsSource::IcebergManifest);
+
+        let k = statistics.columns.get("k").expect("column statistics");
+        // ...the bound beside it is admitted but not called exact...
+        assert_eq!(k.max_value.known_value(), Some(&9.0));
+        assert_eq!(k.max_value.confidence(), Confidence::Estimated);
+        // ...and the one measured on another basis is skipped, without
+        // taking the rest of the answer down with it.
+        assert_eq!(k.min_value.known_value(), None);
+    }
+
+    /// The old whole-evidence gate dropped every metric as soon as delete files
+    /// made one of them inexact. Bounds must now reach the optimizer.
+    #[test]
+    fn an_inexact_answer_is_no_longer_discarded_wholesale() {
+        let queried = version(b"data-v1");
+        let evidence = StatisticsEvidence::try_new(
+            queried.clone(),
+            StatisticsEvidenceRevision::try_new(bytes::Bytes::from_static(b"rev-1"))
+                .expect("revision"),
+            StatisticsRowCoverage::AllVisibleRows,
+            std::collections::BTreeMap::from([(
+                StatisticsMetric::RowCount,
+                observed(
+                    StatisticsMetricValue::U64(100),
+                    queried,
+                    StatisticsNumericNature::UpperBound,
+                    StatisticsBasisRelation::Identical,
+                ),
+            )]),
+        )
+        .expect("evidence");
+
+        let statistics = evidence_to_base_statistics(&evidence, &[]);
+        assert_eq!(statistics.row_count.known_value(), Some(&100));
+        assert_eq!(statistics.row_count.confidence(), Confidence::Estimated);
+    }
 
     #[test]
     fn optimizer_settings_digest_material_is_stable_across_rule_order_and_duplicates() {

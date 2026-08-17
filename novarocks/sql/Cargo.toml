@@ -41,3 +41,6 @@ sha2 = "0.10"
 sqlparser = "0.61.0"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
+
+[dev-dependencies]
+bytes = "1"
