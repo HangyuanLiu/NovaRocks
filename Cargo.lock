@@ -3437,7 +3437,6 @@ dependencies = [
  "novarocks-state-store",
  "novarocks-test-support",
  "novarocks-types",
- "reqwest",
  "serde",
  "tempfile",
  "tokio",
