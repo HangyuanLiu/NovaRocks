@@ -550,14 +550,18 @@ async fn read_footer_size(
     Ok(MAGIC_LENGTH + payload_length + FOOTER_STRUCT_LENGTH)
 }
 
-/// Canonical Puffin path for a given snapshot id, relative to the table
-/// location's metadata folder. Spark/Trino/Iceberg reference engines use the
-/// same `snap-<id>-<seq>-<uuid>.stats` pattern, but for NovaRocks we keep
-/// things deterministic with a fixed suffix that is recoverable from the
-/// snapshot id alone.
+/// Puffin path for one incremental registration attempt against a snapshot.
+///
+/// Unreferenced files are left to the existing orphan cleanup, exactly as the
+/// reference engines do with their own `snap-<id>-<seq>-<uuid>.stats` names.
 pub fn puffin_path_for_snapshot(table_metadata: &TableMetadata, snapshot_id: i64) -> String {
     let location = table_metadata.location().trim_end_matches('/');
-    format!("{location}/metadata/snap-{snapshot_id}-statistics.puffin")
+    // Distinct per attempt. A path fixed by snapshot id alone is only safe
+    // while one writer can target a snapshot: two concurrent incremental
+    // registrations would otherwise write different bytes to the same object
+    // while the loser of the commit race is still reading it.
+    let attempt = uuid::Uuid::new_v4();
+    format!("{location}/metadata/snap-{snapshot_id}-statistics-incremental-{attempt}.puffin")
 }
 
 /// Operation-specific Puffin location for an explicit statistics collection.

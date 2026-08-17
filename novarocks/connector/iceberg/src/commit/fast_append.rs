@@ -163,7 +163,7 @@ pub(crate) async fn register_puffin_stats(
     .await
     {
         Ok(Some(stats_file)) => {
-            if let Err(err) = crate::commit::statistics::commit_statistics_file(
+            match crate::commit::statistics::commit_statistics_file(
                 table_after,
                 catalog,
                 stats_file,
@@ -171,11 +171,23 @@ pub(crate) async fn register_puffin_stats(
             )
             .await
             {
-                tracing::warn!(
-                    new_snapshot_id,
-                    error = %err,
-                    "iceberg puffin stats commit failed; snapshot committed without stats",
-                );
+                Ok(crate::commit::statistics::StatisticsCommitOutcome::Registered) => {}
+                Ok(crate::commit::statistics::StatisticsCommitOutcome::YieldedToFullerCoverage) => {
+                    // An ANALYZE already covered this snapshot by scanning every
+                    // visible row. Standing down is the correct outcome, not a
+                    // degradation worth warning about.
+                    tracing::debug!(
+                        new_snapshot_id,
+                        "iceberg puffin stats yielded to an all-visible-rows entry",
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        new_snapshot_id,
+                        error = %err,
+                        "iceberg puffin stats commit failed; snapshot committed without stats",
+                    );
+                }
             }
         }
         Ok(None) => {
