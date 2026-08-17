@@ -15,6 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Thin smoke coverage for the `novarocks` server binary.
+//!
+//! This target owns exactly two closures, and nothing else:
+//!
+//! 1. all-in-one composition/readiness: the binary wires the FE/BE application
+//!    boundary and the MySQL protocol entrypoint together;
+//! 2. BE signal/exit/restart: the binary honours SIGINT, releases its ports and
+//!    restarts from the same frozen config.
+//!
+//! Everything else belongs to a lower canonical owner:
+//!
+//! - real 1FE+NBE topology, restart, faults and artifacts live in
+//!   `novarocks-cluster-harness`, driven by `novarocks-system-test-runner`;
+//! - SQL, result, expected-error and plan-shape contracts live in the SQL suites;
+//! - Frontend/Backend/Connector/StateStore state machines live in their own
+//!   owner-local component tests;
+//! - process, readiness, log and TCP-port mechanics live in
+//!   `novarocks-test-support`.
+//!
+//! The helpers below exist only to serve these two smoke closures. They must not
+//! grow into a second cluster lifecycle owner.
+
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,20 +48,23 @@ use mysql::{Conn as MysqlConn, OptsBuilder};
 use novarocks_test_support::{ManagedProcess, ReadyMarker, ReservedTcpPort};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
-static CLUSTER_MVP_TEST_LOCK: Mutex<()> = Mutex::new(());
+static SERVER_BINARY_SMOKE_LOCK: Mutex<()> = Mutex::new(());
 
-fn lock_cluster_mvp() -> MutexGuard<'static, ()> {
-    CLUSTER_MVP_TEST_LOCK
+fn lock_server_binary_smoke() -> MutexGuard<'static, ()> {
+    SERVER_BINARY_SMOKE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn runtime_dir() -> PathBuf {
-    let dir = PathBuf::from(".cluster_mvp_runtime");
-    std::fs::create_dir_all(&dir).expect("create cluster mvp runtime dir");
+    let dir = PathBuf::from(".server-binary-smoke-runtime");
+    std::fs::create_dir_all(&dir).expect("create server binary smoke runtime dir");
     dir
 }
 
+/// Freeze a port through the canonical reservation owner. The reservation is
+/// released before the child spawns; the mechanics themselves are asserted by
+/// `novarocks-test-support`, not here.
 fn reserve_port() -> ReservedTcpPort {
     ReservedTcpPort::new().expect("reserve TCP port")
 }
@@ -59,19 +84,12 @@ const PROCESS_READY_TIMEOUT: Duration = Duration::from_secs(30);
 fn spawn_novarocks(
     config_path: &Path,
     ready_marker: &str,
-    backend_index: Option<usize>,
     debug_env: &[(&str, &str)],
 ) -> ManagedProcess {
     let mut command = Command::new(env!("CARGO_BIN_EXE_novarocks"));
     command.arg("standalone").arg("--config").arg(config_path);
     for (name, value) in debug_env {
         command.env(name, value);
-    }
-    if let Some(backend_index) = backend_index {
-        command.env(
-            "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
-            backend_index.to_string(),
-        );
     }
     ManagedProcess::spawn(
         format!("novarocks {}", config_path.display()),
@@ -105,10 +123,7 @@ fn connect_mysql(port: u16) -> MysqlConn {
     }
 }
 
-fn start_all_in_one_with_debug_env(
-    extra: &str,
-    debug_env: &[(&str, &str)],
-) -> (ManagedProcess, u16) {
+fn start_all_in_one_with_debug_env(debug_env: &[(&str, &str)]) -> (ManagedProcess, u16) {
     let mysql = reserve_port();
     let http = reserve_port();
     let grpc = reserve_port();
@@ -129,35 +144,29 @@ mysql_port = {mysql_port}
 
 [cluster]
 role = "all-in-one"
-
-{extra}
 "#
         ),
     );
     let _ = mysql.release();
     let _ = http.release();
     let _ = grpc.release();
-    let process = spawn_novarocks(
-        config.path(),
-        "NOVAROCKS_READY mysql_port=",
-        None,
-        debug_env,
-    );
+    let process = spawn_novarocks(config.path(), "NOVAROCKS_READY mysql_port=", debug_env);
     (process, mysql_port)
 }
 
+/// Smoke closure 1: the binary composes FE and BE into one process, publishes the
+/// ready marker, answers a minimal query over the public MySQL entrypoint, and
+/// reaches the native typed gRPC fetch path.
 #[test]
 fn all_in_one_loopback_stage_start_select_succeeds() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
     if !binary.exists() {
         return;
     }
-    let _lock = lock_cluster_mvp();
+    let _lock = lock_server_binary_smoke();
 
-    let (mut srv, mysql_port) = start_all_in_one_with_debug_env(
-        "",
-        &[("NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER", "1")],
-    );
+    let (mut srv, mysql_port) =
+        start_all_in_one_with_debug_env(&[("NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER", "1")]);
     let mut conn = connect_mysql(mysql_port);
     let rows: Vec<i64> = conn.query("SELECT 1").expect("SELECT 1");
     assert_eq!(rows, vec![1]);
@@ -165,6 +174,8 @@ fn all_in_one_loopback_stage_start_select_succeeds() {
         .expect("wait for typed gRPC fetch marker");
 }
 
+/// Smoke closure 2: `role=be` reaches readiness, shuts down cleanly on SIGINT,
+/// frees its gRPC port immediately, and restarts from the same frozen config.
 #[cfg(unix)]
 #[test]
 fn native_be_signal_shutdown_releases_port_for_restart() {
@@ -172,7 +183,7 @@ fn native_be_signal_shutdown_releases_port_for_restart() {
     if !binary.exists() {
         return;
     }
-    let _lock = lock_cluster_mvp();
+    let _lock = lock_server_binary_smoke();
 
     let grpc = reserve_port();
     let grpc_port = grpc.port();
@@ -195,7 +206,7 @@ role = "be"
 
     let _ = grpc.release();
     let _ = http.release();
-    let mut first = spawn_novarocks(config.path(), "NOVAROCKS_READY role=be", None, &[]);
+    let mut first = spawn_novarocks(config.path(), "NOVAROCKS_READY role=be", &[]);
     first
         .interrupt_and_wait(Duration::from_secs(10))
         .expect("shut down first BE cleanly");
@@ -204,21 +215,8 @@ role = "be"
         .expect("native BE gRPC port must be reusable immediately after SIGINT shutdown");
     drop(rebound);
 
-    let mut restarted = spawn_novarocks(config.path(), "NOVAROCKS_READY role=be", None, &[]);
+    let mut restarted = spawn_novarocks(config.path(), "NOVAROCKS_READY role=be", &[]);
     restarted
         .interrupt_and_wait(Duration::from_secs(10))
         .expect("shut down restarted BE cleanly");
-}
-
-#[test]
-fn reserved_port_blocks_rebinding_until_release() {
-    let port = reserve_port();
-    let addr = ("127.0.0.1", port.port());
-
-    assert!(
-        std::net::TcpListener::bind(addr).is_err(),
-        "reserved port must remain bound until release"
-    );
-
-    assert_eq!(port.release(), addr.1);
 }

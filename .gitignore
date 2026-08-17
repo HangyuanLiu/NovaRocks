@@ -38,3 +38,6 @@ __pycache__/
 # Per-crate log dirs written by integration tests (the root /log rule misses these).
 novarocks/*/log/
 novarocks-server/log/
+
+# Scratch runtime written by the server binary smoke target.
+novarocks-server/.server-binary-smoke-runtime/
