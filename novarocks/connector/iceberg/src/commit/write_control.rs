@@ -2753,13 +2753,23 @@ fn commit_shape(
         ));
     }
 
+    commit_shape_for_intents(cohorts).map(|kind| (kind, None))
+}
+
+/// The commit action a sealed cohort set's intents and content call for.
+///
+/// Split out from `commit_shape` so the mapping can be pinned directly: every
+/// arm has to agree with what its action accepts, and a mismatch does not fail
+/// as a shape error but as an ambiguous commit that reconciles to "marker is
+/// absent" — a diagnosis that says nothing about the real cause.
+fn commit_shape_for_intents(cohorts: &[DecodedCohort]) -> Result<CommitOpKind, CommitServiceError> {
     let intents = cohorts
         .iter()
         .map(|cohort| cohort.intent)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let kind = match intents.as_slice() {
+    Ok(match intents.as_slice() {
         [novarocks_spi::connector::ConnectorWriteIntent::Append] => {
             // A caller that collapses a multi-route mutation onto one sealed
             // cohort publishes the whole delta through that cohort, so an
@@ -2776,12 +2786,22 @@ fn commit_shape(
             CommitOpKind::OverwritePartitions
         }
         [novarocks_spi::connector::ConnectorWriteIntent::RowDelta] => {
+            let has_files = cohorts.iter().any(|cohort| !cohort.files.is_empty());
             if cohorts
                 .iter()
                 .flat_map(|cohort| &cohort.files)
                 .any(|file| file.format == crate::iceberg::spec::DataFileFormat::Puffin)
             {
                 CommitOpKind::RowDeltaDvFromFiles
+            } else if has_files && cohorts_carry_data_only(cohorts) {
+                // A row delta that adds rows and deletes nothing describes an
+                // append, and `RowDelta` rejects data content outright. This is
+                // reached when an incremental refresh recreates a group whose
+                // rows were all deleted earlier: there is no prior row to
+                // delete, so the apply is an insert. Content decides the shape
+                // here for the same reason it decides the Append arm above;
+                // file format only distinguishes how deletions are represented.
+                CommitOpKind::FastAppend
             } else {
                 CommitOpKind::RowDelta
             }
@@ -2795,8 +2815,7 @@ fn commit_shape(
                 "Iceberg operation has an unsupported sealed cohort intent combination".to_string(),
             ));
         }
-    };
-    Ok((kind, None))
+    })
 }
 
 fn prepare_partition_replacement(
@@ -5537,11 +5556,85 @@ mod tests {
     }
 
     fn cohort(files: Vec<WrittenFile>) -> DecodedCohort {
+        cohort_with_intent(ConnectorWriteIntent::Append, files)
+    }
+
+    fn cohort_with_intent(intent: ConnectorWriteIntent, files: Vec<WrittenFile>) -> DecodedCohort {
         DecodedCohort {
             cohort_id: ConnectorWriteCohortId::from_bytes([7; 32]),
-            intent: ConnectorWriteIntent::Append,
+            intent,
             files,
         }
+    }
+
+    fn puffin_delete_file() -> WrittenFile {
+        WrittenFile {
+            format: crate::iceberg::spec::DataFileFormat::Puffin,
+            ..staged_file(crate::iceberg::spec::DataContentType::PositionDeletes, 0)
+        }
+    }
+
+    /// Every arm has to name an action that accepts the content it routes.
+    /// `RowDelta` rejects data content outright, so routing a data-only delta
+    /// there fails the action's own assertion — and because that failure is a
+    /// bare string, it is classified as an ambiguous commit and reconciles to
+    /// "Iceberg write operation marker is absent", which names neither the
+    /// content nor the shape that disagreed.
+    #[test]
+    fn a_data_only_row_delta_commits_as_an_append() {
+        let data = staged_file(crate::iceberg::spec::DataContentType::Data, 1);
+
+        assert_eq!(
+            commit_shape_for_intents(&[cohort_with_intent(
+                ConnectorWriteIntent::RowDelta,
+                vec![data.clone()]
+            )])
+            .expect("shape"),
+            CommitOpKind::FastAppend,
+            "an incremental refresh that recreates a deleted group has a row to \
+             insert and none to delete"
+        );
+
+        // Delete-only stays a row delta, and Puffin deletion vectors keep
+        // routing to the DV action whether or not data rides along.
+        assert_eq!(
+            commit_shape_for_intents(&[cohort_with_intent(
+                ConnectorWriteIntent::RowDelta,
+                vec![staged_file(
+                    crate::iceberg::spec::DataContentType::PositionDeletes,
+                    0
+                )]
+            )])
+            .expect("shape"),
+            CommitOpKind::RowDelta
+        );
+        assert_eq!(
+            commit_shape_for_intents(&[cohort_with_intent(
+                ConnectorWriteIntent::RowDelta,
+                vec![puffin_delete_file()]
+            )])
+            .expect("shape"),
+            CommitOpKind::RowDeltaDvFromFiles
+        );
+        assert_eq!(
+            commit_shape_for_intents(&[cohort_with_intent(
+                ConnectorWriteIntent::RowDelta,
+                vec![puffin_delete_file(), data]
+            )])
+            .expect("shape"),
+            CommitOpKind::RowDeltaDvFromFiles
+        );
+
+        // An empty row delta keeps reaching `RowDelta`, which resolves it
+        // against the target ref rather than inventing an append snapshot.
+        assert_eq!(
+            commit_shape_for_intents(&[cohort_with_intent(
+                ConnectorWriteIntent::RowDelta,
+                Vec::new()
+            )])
+            .expect("shape"),
+            CommitOpKind::RowDelta
+        );
     }
 
     #[test]
