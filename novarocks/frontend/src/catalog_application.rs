@@ -333,12 +333,32 @@ impl FrontendCatalogApplicationPort {
                     "catalog projection lock is poisoned",
                 )
             })?
-            .keys()
-            .filter(|instance_id| !desired.contains_key(*instance_id))
-            .cloned()
+            .iter()
+            .filter(|(instance_id, _)| !desired.contains_key(*instance_id))
+            .map(|(instance_id, projection)| (instance_id.clone(), projection.attachment_id()))
             .collect::<Vec<_>>();
-        for instance_id in stale {
-            self.retire_projection(&instance_id);
+        // A projection missing from the scan is not proof that its attachment is
+        // gone: `create_catalog` commits the attachment and only then installs
+        // the projection, so a catalog created after `list` began is present
+        // locally and absent from `desired`. Retiring on that alone made the
+        // statement right after CREATE EXTERNAL CATALOG fail with
+        // "unknown catalog" whenever a reconcile cycle straddled it.
+        //
+        // Re-reading each candidate closes the window rather than narrowing it:
+        // the projection can only exist because the attachment was already
+        // committed, so a read issued after observing the projection sees it.
+        for (instance_id, attachment_id) in stale {
+            match repository.get(&instance_id).await {
+                Ok(Some(versioned)) if versioned.attachment.attachment_id == attachment_id => {}
+                Ok(_) => self.retire_projection(&instance_id),
+                // Keep serving and retry next cycle: the read failed, so nothing
+                // was proven about the attachment either way.
+                Err(error) => tracing::warn!(
+                    %error,
+                    catalog = instance_id.as_str(),
+                    "catalog attachment re-read failed while retiring a projection absent from the scan",
+                ),
+            }
         }
 
         let mut workers = tokio::task::JoinSet::new();

@@ -541,6 +541,158 @@ mod tests {
         }
     }
 
+    /// A store whose range scan silently omits every attachment, modelling a
+    /// scan that read before a concurrent CREATE committed. Targeted `get`
+    /// reads are untouched, exactly as a real snapshot boundary behaves.
+    struct ScanMissesAttachmentsStore {
+        inner: Arc<dyn StateStore>,
+        hide_from_scan: AtomicBool,
+    }
+
+    struct ScanMissesAttachmentsRead {
+        inner: Box<dyn ReadTransaction>,
+        hide_from_scan: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ReadTransaction for ScanMissesAttachmentsRead {
+        async fn get(
+            &mut self,
+            key: &novarocks_spi::state_store::Key,
+        ) -> Result<Option<novarocks_spi::state_store::StateRecord>, StateStoreError> {
+            self.inner.get(key).await
+        }
+
+        async fn range(
+            &mut self,
+            request: &novarocks_spi::state_store::RangeRequest,
+        ) -> Result<novarocks_spi::state_store::RangePage, StateStoreError> {
+            let mut page = self.inner.range(request).await?;
+            if self.hide_from_scan {
+                page.records.clear();
+            }
+            Ok(page)
+        }
+
+        async fn abort(self: Box<Self>) -> Result<(), StateStoreError> {
+            self.inner.abort().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateStore for ScanMissesAttachmentsStore {
+        fn limits(&self) -> &StateStoreLimits {
+            self.inner.limits()
+        }
+
+        fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
+            self.inner.metrics_snapshot()
+        }
+
+        async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
+            Ok(Box::new(ScanMissesAttachmentsRead {
+                inner: self.inner.begin_read().await?,
+                hide_from_scan: self.hide_from_scan.load(Ordering::Acquire),
+            }))
+        }
+
+        async fn begin_write(
+            &self,
+            transaction_id: TransactionId,
+            purpose: &str,
+        ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
+            self.inner.begin_write(transaction_id, purpose).await
+        }
+
+        async fn poll_changes(
+            &self,
+            request: &ChangePollRequest,
+        ) -> Result<ChangePage, StateStoreError> {
+            self.inner.poll_changes(request).await
+        }
+
+        async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
+            self.inner.identity().await
+        }
+
+        async fn resolve_commit(
+            &self,
+            transaction_id: &TransactionId,
+        ) -> Result<CommitResolution, StateStoreError> {
+            self.inner.resolve_commit(transaction_id).await
+        }
+    }
+
+    /// A reconcile whose scan began before a CREATE committed must not retire
+    /// that catalog's projection.
+    ///
+    /// `create_catalog` commits the attachment and only then installs the
+    /// projection, so a projection can exist while the in-flight scan has not
+    /// observed its attachment. Treating "absent from the scan" as proof the
+    /// attachment is gone made the statement right after
+    /// CREATE EXTERNAL CATALOG fail with "unknown catalog" whenever a reconcile
+    /// cycle straddled it — a create that reported success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconcile_scan_that_missed_a_fresh_create_keeps_its_projection() {
+        let (_directory, mut host, inner) = open_store().await;
+        let scanning = Arc::new(ScanMissesAttachmentsStore {
+            inner: Arc::clone(&inner),
+            hide_from_scan: AtomicBool::new(false),
+        });
+        let store = Arc::clone(&scanning) as Arc<dyn StateStore>;
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open attachment repository");
+        let (_control, port) = projection(repository);
+
+        let command = create_command(false);
+        let instance_id = command.instance_id.clone();
+        port.create_catalog(command).expect("create catalog");
+        assert!(
+            matches!(port.admit_catalog(&instance_id), CatalogAdmission::Ready(_)),
+            "CREATE installs the projection synchronously"
+        );
+
+        // From here the scan behaves as though it read before the commit.
+        scanning.hide_from_scan.store(true, Ordering::Release);
+        port.reconcile_with_page_size(256, 1)
+            .await
+            .expect("reconcile");
+
+        match port.admit_catalog(&instance_id) {
+            CatalogAdmission::Ready(_) => {}
+            other => panic!(
+                "a scan that did not observe the attachment is not proof it is gone;                  retiring on that alone is what surfaces as `unknown catalog`: {other:?}"
+            ),
+        }
+
+        // A genuinely dropped attachment is still retired: the targeted reread
+        // is what distinguishes the two, so it must not blanket-preserve.
+        scanning.hide_from_scan.store(false, Ordering::Release);
+        port.drop_catalog(CatalogDropCommand {
+            instance_id: instance_id.clone(),
+            if_exists: false,
+        })
+        .expect("drop catalog");
+        port.reconcile_with_page_size(256, 1)
+            .await
+            .expect("reconcile after drop");
+        assert!(matches!(
+            port.admit_catalog(&instance_id),
+            CatalogAdmission::Absent
+        ));
+
+        // The provider cannot close while this test still holds store handles.
+        drop(port);
+        drop(_control);
+        drop(store);
+        drop(scanning);
+        drop(inner);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("state store shutdown");
+    }
+
     async fn open_store() -> (tempfile::TempDir, StateStoreHost, Arc<dyn StateStore>) {
         let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
         let registry =
