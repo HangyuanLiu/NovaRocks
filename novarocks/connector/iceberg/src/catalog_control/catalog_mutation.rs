@@ -1066,7 +1066,7 @@ fn reserved_property(key: &str) -> Option<&'static str> {
         return None;
     }
     key.starts_with("novarocks.")
-        .then_some("novarocks.* is reserved for engine-owned properties")
+        .then_some("novarocks.* namespace is reserved for engine-owned properties")
 }
 
 /// Is `key` in the engine's own property namespace?

@@ -400,6 +400,14 @@ fn project_from_sealed_parts(
             binding.binding_id.get()
         ));
     }
+    // The walk above appends in plan-tree order, so a fragment whose upper node
+    // carries the larger binding id emits its bindings out of numeric order. The
+    // wire contract keys bindings by a strictly increasing id, so canonicalize
+    // here: `attached` already rejected duplicates, which makes the sorted order
+    // strictly increasing rather than merely non-decreasing.
+    for fragment_bindings in bindings.values_mut() {
+        fragment_bindings.sort_by_key(|binding| binding.binding_id);
+    }
     let channels = graph.channels().map(channel_facts).collect();
     let deployment_bindings = graph.bindings().map(deployment_binding_facts).collect();
     let join_progress = join_progress(graph, progress);
@@ -819,9 +827,16 @@ mod tests {
     }
 
     fn graph() -> RuntimeFilterGraph {
+        graph_with_binding_ids(2, 3)
+    }
+
+    /// The producer always sits at parent node 10 and the consumer at child
+    /// node 11, so passing a producer id above the consumer id builds a plan
+    /// whose tree walk visits binding ids in decreasing order.
+    fn graph_with_binding_ids(producer: u32, consumer: u32) -> RuntimeFilterGraph {
         let channel_id = ChannelId::new(1);
-        let producer_id = BindingId::new(2);
-        let consumer_id = BindingId::new(3);
+        let producer_id = BindingId::new(producer);
+        let consumer_id = BindingId::new(consumer);
         let location = |node_id| PlanLocation {
             fragment_id: PlanFragmentId::new(7),
             node_id: PlanNodeId::new(node_id),
@@ -904,10 +919,14 @@ mod tests {
     }
 
     fn attached_fragments() -> Vec<PlanFragment> {
+        attached_fragments_with_binding_ids(2, 3)
+    }
+
+    fn attached_fragments_with_binding_ids(producer: u32, consumer: u32) -> Vec<PlanFragment> {
         vec![fragment(node(
             10,
-            vec![BindingId::new(2)],
-            vec![node(11, vec![BindingId::new(3)], Vec::new())],
+            vec![BindingId::new(producer)],
+            vec![node(11, vec![BindingId::new(consumer)], Vec::new())],
         ))]
     }
 
@@ -920,6 +939,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("has no node attachment"), "{error}");
+    }
+
+    #[test]
+    fn projection_orders_fragment_bindings_by_id_not_plan_tree_order() {
+        // Nested-join shape: the parent node carries the larger binding id, so
+        // the plan-tree walk appends 3 before 2. The wire encoder keys bindings
+        // by a strictly increasing id and rejects anything else, so the
+        // projection owns the canonical order.
+        let draft = project_from_sealed_parts(
+            &graph_with_binding_ids(3, 2),
+            &attached_fragments_with_binding_ids(3, 2),
+            &JoinBuildProgressCatalog::new(),
+        )
+        .unwrap();
+
+        let ids = draft.bindings[&7]
+            .iter()
+            .map(|binding| binding.binding_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![2, 3]);
     }
 
     #[test]
