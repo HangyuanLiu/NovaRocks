@@ -50,10 +50,21 @@ FROM probe_5m_wide p JOIN build_500k b ON p.k = b.k;
 -- distributed planning contract strict without pinning those incidental bytes.
 -- @result_contains=TABLE STATS ref=0
 -- @result_contains=rows=5000000 confidence=Exact source=IcebergManifest
+-- ref=1 has been analyzed, but its row count still comes from the manifest of
+-- the snapshot being queried. A published artifact reports whatever snapshot
+-- ANALYZE measured, which is not necessarily this one; Puffin is consulted only
+-- for the distinct counts it alone holds.
 -- @result_contains=TABLE STATS ref=1
--- @result_contains=rows=500000 confidence=Exact source=IcebergPuffin
+-- @result_contains=rows=500000 confidence=Exact source=IcebergManifest
 -- @result_contains=HASH JOIN (BROADCAST, INNER
--- @result_contains=bcast={build=8.6MB ht=18.3MB be=3 fanout=51.6MB budget=256MB risk_mult=2.0x}
+-- Manifest-derived average row size differs from what a full scan reports, so
+-- the build estimate moved with it (was 8.6MB/18.3MB when this came from the
+-- published artifact). Fanout is that estimate times the backend count, whose
+-- last decimal place tracks unrounded bytes; pin its magnitude, not that digit.
+-- @result_contains=bcast={build=9.2MB
+-- @result_contains=ht=19.2MB
+-- @result_contains=be=3 fanout=55.
+-- @result_contains=budget=256MB risk_mult=2.0x}
 -- @result_not_contains=HASH JOIN (PARTITIONED
 -- @skip_result_check=true
 EXPLAIN COSTS
