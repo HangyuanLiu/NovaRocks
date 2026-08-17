@@ -32,10 +32,12 @@ mysql-state-store-provider = ["novarocks-state-store/mysql-state-store-provider"
 mv-first-refresh-staging-test-support = []
 
 [dev-dependencies]
-# E2E tests that spawn the `novarocks` binary and drive it over MySQL / HTTP.
+# `server_binary_smoke` spawns the real `novarocks` binary and drives it over
+# MySQL; `state_store_app_config` asserts config/composition by direct call.
+# Domain behaviour belongs to its owner crate, the SQL suites or the system
+# scenarios — not to this package.
 bytes = "1"
 mysql = "25"
 novarocks-state-store = { path = "../novarocks/state-store" }
 novarocks-test-support = { path = "../tests/test-support" }
 tempfile = "3"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
