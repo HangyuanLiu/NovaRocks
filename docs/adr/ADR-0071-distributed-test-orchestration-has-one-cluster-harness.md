@@ -78,7 +78,10 @@ orchestration 的唯一 owner。
    留回 consumer。
 2. 当 system scenarios 需要一种稳定的、非 SQL 的故障描述语言时：以 typed scenario API 扩展 harness，并以至少两个
    frontend consumer 的真实需求证明它，而非直接复用 SQL directive 文本。
-3. 当 `cluster_mvp` 的既定迁移完成时：删除其重复 lifecycle owner，并确认没有第三套启动/重启实现。
+3. ~~当 `cluster_mvp` 的既定迁移完成时：删除其重复 lifecycle owner，并确认没有第三套启动/重启实现。~~
+   **已兑现（TST-8）**：`cluster_mvp` target 已删除，Server 只保留 `server_binary_smoke` 的两条 binary 闭环；
+   仓库中 1FE+NBE 的启动 / 重启实现只剩 `novarocks-cluster-harness` 一套，SQL runner 与 system runner 都是它的
+   consumer。本条不再是待办触发条件，仅保留为历史记录。
 4. 当 Cargo 的 root member 与 SQL 独立 workspace 无法同时表达所需 profile 或 target dependency 时：优先调整包边界或
    workspace metadata，不用 source-shape scanner 掩盖图上的问题。
 5. 当生产拓扑增加 multi-FE、外部 scheduler 或远程 backend provisioner 时：重新审视 harness 的 launch contract；不能

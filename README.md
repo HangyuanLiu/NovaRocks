@@ -302,10 +302,14 @@ crates without a StarRocks server toolchain.
 
 ```bash
 cargo fmt --all
-cargo clippy --all-targets
-cargo build
-cargo test
+cargo clippy --workspace --all-targets
+cargo build --workspace
+cargo test --workspace
 ```
+
+`--workspace` matters: the root manifest sets `default-members =
+["novarocks-server"]`, so without it these commands cover only the server
+package and every other member's tests are skipped.
 
 Use targeted package tests while iterating on a native crate:
 
@@ -315,12 +319,15 @@ cargo test -p novarocks-backend
 cargo test -p novarocks-server
 ```
 
-For focused native validation:
+Tests are layered by owner. Pick the layer that owns what you changed:
 
-```bash
-cargo test --test standalone_cli
-cargo test --test standalone_mysql_server
-```
+| Layer | Entry point |
+| --- | --- |
+| Owner-local component tests | `cargo test -p <crate>` |
+| SQL / result / plan-shape contracts | `sql-tests` runner, see `sql-tests/README.md` |
+| Real 1FE+3BE lifecycle, faults, recovery | `cargo run -p novarocks-system-test-runner -- --list` |
+| Server binary composition, readiness, signal | `cargo test -p novarocks-server --test server_binary_smoke` |
+| Process, log and TCP-port mechanics | `cargo test -p novarocks-test-support` |
 
 ## License
 
