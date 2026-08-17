@@ -71,6 +71,18 @@ impl StatsLoader {
         }
     }
 
+    /// Reads one statistics file's Theta blobs into `field_id -> NDV`.
+    ///
+    /// Exposed for the ancestor walk, which resolves statistics files itself
+    /// and must distinguish "this ancestor has no usable file" from "this
+    /// ancestor has statistics for some other column".
+    pub(crate) async fn load_ndv_from_file(
+        puffin_path: &str,
+        file_io: &FileIO,
+    ) -> Result<HashMap<i32, f64>, String> {
+        Self::load_ndv_inner(puffin_path, file_io).await
+    }
+
     async fn load_ndv_inner(
         puffin_path: &str,
         file_io: &FileIO,

@@ -22,19 +22,21 @@
 //! prevents SQL/optimizer types from becoming part of a persisted provider
 //! artifact.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, StatisticsBasisRelation, StatisticsDataVersion,
-    StatisticsEvidence, StatisticsMetric, StatisticsMetricObservation, StatisticsMetricSource,
-    StatisticsMetricState, StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind,
-    StatisticsNumericNature, StatisticsRowCoverage,
+    ConnectorError, ConnectorErrorKind, StatisticsDataVersion, StatisticsEvidence,
+    StatisticsMetric, StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
+    StatisticsRowCoverage,
 };
 use serde::{Deserialize, Serialize};
 
-const ICEBERG_PROVIDER_STATISTICS_VERSION: u16 = 1;
+/// Bumped to 2 when the artifact moved from column names to stable field ids.
+/// A version-1 payload is unreadable rather than name-matched: once statistics
+/// can be read across snapshots, matching by name would silently attach a
+/// column's statistics to whatever now bears its name.
+const ICEBERG_PROVIDER_STATISTICS_VERSION: u16 = 2;
 
 pub fn statistics_data_version(
     table_uuid: &str,
@@ -87,10 +89,26 @@ pub fn ensure_publishable_visible_row_evidence(
     Ok(())
 }
 
+/// Encodes the published artifact, keying every column metric by the stable
+/// field id it had in the measured snapshot's schema.
 pub fn encode_provider_statistics(
     evidence: &StatisticsEvidence,
+    field_ids: &HashMap<String, i32>,
 ) -> Result<Vec<u8>, ConnectorError> {
     ensure_publishable_visible_row_evidence(evidence)?;
+    let field_id = |column: &str| -> Result<i32, ConnectorError> {
+        field_ids
+            .get(&column.to_ascii_lowercase())
+            .copied()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!(
+                        "Iceberg statistics column `{column}` is absent from the measured schema"
+                    ),
+                )
+            })
+    };
     let metrics = evidence
         .metrics()
         .iter()
@@ -102,41 +120,41 @@ pub fn encode_provider_statistics(
                 ));
             };
             let value = match observation.value() {
-                StatisticsMetricValue::U64(value) => IcebergStatisticValueV1::U64(*value),
-                StatisticsMetricValue::I64(value) => IcebergStatisticValueV1::I64(*value),
-                StatisticsMetricValue::F64(value) => IcebergStatisticValueV1::F64(*value),
+                StatisticsMetricValue::U64(value) => IcebergStatisticValueV2::U64(*value),
+                StatisticsMetricValue::I64(value) => IcebergStatisticValueV2::I64(*value),
+                StatisticsMetricValue::F64(value) => IcebergStatisticValueV2::F64(*value),
                 StatisticsMetricValue::Bytes(value) => {
-                    IcebergStatisticValueV1::Bytes(value.to_vec())
+                    IcebergStatisticValueV2::Bytes(value.to_vec())
                 }
             };
             Ok(match metric {
-                StatisticsMetric::RowCount => IcebergProviderStatisticV1::RowCount { value },
-                StatisticsMetric::NullCount { column } => IcebergProviderStatisticV1::NullCount {
-                    column: column.to_string(),
+                StatisticsMetric::RowCount => IcebergProviderStatisticV2::RowCount { value },
+                StatisticsMetric::NullCount { column } => IcebergProviderStatisticV2::NullCount {
+                    field_id: field_id(column)?,
                     value,
                 },
-                StatisticsMetric::Minimum { column } => IcebergProviderStatisticV1::Minimum {
-                    column: column.to_string(),
+                StatisticsMetric::Minimum { column } => IcebergProviderStatisticV2::Minimum {
+                    field_id: field_id(column)?,
                     value,
                 },
-                StatisticsMetric::Maximum { column } => IcebergProviderStatisticV1::Maximum {
-                    column: column.to_string(),
+                StatisticsMetric::Maximum { column } => IcebergProviderStatisticV2::Maximum {
+                    field_id: field_id(column)?,
                     value,
                 },
                 StatisticsMetric::AverageSize { column } => {
-                    IcebergProviderStatisticV1::AverageSize {
-                        column: column.to_string(),
+                    IcebergProviderStatisticV2::AverageSize {
+                        field_id: field_id(column)?,
                         value,
                     }
                 }
-                StatisticsMetric::ThetaNdv { column } => IcebergProviderStatisticV1::ThetaNdv {
-                    column: column.to_string(),
+                StatisticsMetric::ThetaNdv { column } => IcebergProviderStatisticV2::ThetaNdv {
+                    field_id: field_id(column)?,
                     value,
                 },
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    serde_json::to_vec(&IcebergProviderStatisticsV1 {
+    serde_json::to_vec(&IcebergProviderStatisticsV2 {
         version: ICEBERG_PROVIDER_STATISTICS_VERSION,
         data_version: evidence.data_version().as_bytes().to_vec(),
         metrics,
@@ -149,169 +167,163 @@ pub fn encode_provider_statistics(
     })
 }
 
+/// Decodes a published artifact, matching column metrics by the stable field id
+/// they were written under.
+///
+/// `field_ids` maps each requested column name to its field id **in the schema
+/// of the snapshot being queried**. Matching through it is what keeps a renamed
+/// column's statistics attached to the column rather than to the name.
+///
+/// Returns plain values: the basis version and relation belong to whoever
+/// resolved this artifact, since the same bytes read from an ancestor snapshot
+/// describe a different row set than when read from the queried one.
+///
+/// A payload written under an older artifact version yields no metrics at all
+/// rather than an error — unreadable statistics are missing statistics, not a
+/// failed query.
 pub fn decode_provider_statistics(
     payload: &[u8],
-    expected_data_version: &StatisticsDataVersion,
+    field_ids: &HashMap<String, i32>,
     requested: &novarocks_spi::connector::StatisticsMetricRequest,
-) -> Result<BTreeMap<StatisticsMetric, StatisticsMetricState>, ConnectorError> {
-    let artifact: IcebergProviderStatisticsV1 =
+) -> Result<BTreeMap<StatisticsMetric, StatisticsMetricValue>, ConnectorError> {
+    let artifact: IcebergProviderStatisticsV2 =
         serde_json::from_slice(payload).map_err(|error| {
             ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
                 format!("decode Iceberg provider statistics: {error}"),
             )
         })?;
-    if artifact.version != ICEBERG_PROVIDER_STATISTICS_VERSION
-        || artifact.data_version.as_slice() != expected_data_version.as_bytes().as_ref()
-    {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::CorruptData,
-            "Iceberg provider statistics do not match the pinned table version",
-        ));
+    if artifact.version != ICEBERG_PROVIDER_STATISTICS_VERSION {
+        return Ok(BTreeMap::new());
     }
-    let mut available = BTreeMap::new();
+
+    // Keyed by (metric kind, field id) so a renamed column still matches.
+    let mut available: BTreeMap<(MetricKind, Option<i32>), IcebergStatisticValueV2> =
+        BTreeMap::new();
     for metric in artifact.metrics {
-        let (metric, value) = match metric {
-            IcebergProviderStatisticV1::RowCount { value } => (StatisticsMetric::RowCount, value),
-            IcebergProviderStatisticV1::NullCount { column, value } => (
-                StatisticsMetric::NullCount {
-                    column: Arc::from(column),
-                },
-                value,
-            ),
-            IcebergProviderStatisticV1::Minimum { column, value } => (
-                StatisticsMetric::Minimum {
-                    column: Arc::from(column),
-                },
-                value,
-            ),
-            IcebergProviderStatisticV1::Maximum { column, value } => (
-                StatisticsMetric::Maximum {
-                    column: Arc::from(column),
-                },
-                value,
-            ),
-            IcebergProviderStatisticV1::AverageSize { column, value } => (
-                StatisticsMetric::AverageSize {
-                    column: Arc::from(column),
-                },
-                value,
-            ),
-            IcebergProviderStatisticV1::ThetaNdv { column, value } => (
-                StatisticsMetric::ThetaNdv {
-                    column: Arc::from(column),
-                },
-                value,
-            ),
-        };
-        let value = match value {
-            IcebergStatisticValueV1::U64(value) => StatisticsMetricValue::U64(value),
-            IcebergStatisticValueV1::I64(value) => StatisticsMetricValue::I64(value),
-            IcebergStatisticValueV1::F64(value) if value.is_finite() => {
-                StatisticsMetricValue::F64(value)
+        let (kind, field_id, value) = match metric {
+            IcebergProviderStatisticV2::RowCount { value } => (MetricKind::RowCount, None, value),
+            IcebergProviderStatisticV2::NullCount { field_id, value } => {
+                (MetricKind::NullCount, Some(field_id), value)
             }
-            IcebergStatisticValueV1::F64(_) => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "Iceberg provider statistics contain a non-finite value",
-                ));
+            IcebergProviderStatisticV2::Minimum { field_id, value } => {
+                (MetricKind::Minimum, Some(field_id), value)
             }
-            IcebergStatisticValueV1::Bytes(value) => {
-                StatisticsMetricValue::try_bytes(Bytes::from(value))?
+            IcebergProviderStatisticV2::Maximum { field_id, value } => {
+                (MetricKind::Maximum, Some(field_id), value)
+            }
+            IcebergProviderStatisticV2::AverageSize { field_id, value } => {
+                (MetricKind::AverageSize, Some(field_id), value)
+            }
+            IcebergProviderStatisticV2::ThetaNdv { field_id, value } => {
+                (MetricKind::ThetaNdv, Some(field_id), value)
             }
         };
-        let observation = StatisticsMetricObservation::new(
-            value,
-            expected_data_version.clone(),
-            StatisticsMetricSource::ProviderArtifact,
-            provider_artifact_numeric_nature(&metric),
-            // The artifact is keyed by the data version it was measured on, and
-            // the caller already rejected a mismatch above, so this artifact
-            // describes exactly the queried row set. Reading a statistics file
-            // published against an *ancestor* snapshot is STAT-2C's ancestor
-            // walk; when that lands it must derive the relation via
-            // `statistics_basis::basis_relation` rather than assume identity.
-            StatisticsBasisRelation::Identical,
-        );
-        if available
-            .insert(metric, StatisticsMetricState::Available(observation))
-            .is_some()
-        {
+        if available.insert((kind, field_id), value).is_some() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
                 "Iceberg provider statistics contain a duplicate metric",
             ));
         }
     }
-    Ok(requested
-        .metrics()
-        .iter()
-        .map(|metric| {
-            let state = available.get(metric).cloned().unwrap_or_else(|| {
-                StatisticsMetricState::Missing(StatisticsMissing {
-                    kind: StatisticsMissingKind::NotCollected,
-                    message: Arc::from(
-                        "metric was not present in the published statistics artifact",
-                    ),
-                })
-            });
-            (metric.clone(), state)
-        })
-        .collect())
+
+    let mut decoded = BTreeMap::new();
+    for metric in requested.metrics() {
+        let kind = MetricKind::of(metric);
+        let field_id = match statistics_metric_column(metric) {
+            // The column does not exist in the queried schema, so no artifact
+            // entry can be about it.
+            Some(column) => match field_ids.get(&column.to_ascii_lowercase()) {
+                Some(field_id) => Some(*field_id),
+                None => continue,
+            },
+            None => None,
+        };
+        let Some(value) = available.get(&(kind, field_id)) else {
+            continue;
+        };
+        let value = match value {
+            IcebergStatisticValueV2::U64(value) => StatisticsMetricValue::U64(*value),
+            IcebergStatisticValueV2::I64(value) => StatisticsMetricValue::I64(*value),
+            IcebergStatisticValueV2::F64(value) if value.is_finite() => {
+                StatisticsMetricValue::F64(*value)
+            }
+            IcebergStatisticValueV2::F64(_) => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg provider statistics contain a non-finite value",
+                ));
+            }
+            IcebergStatisticValueV2::Bytes(value) => {
+                StatisticsMetricValue::try_bytes(Bytes::from(value.clone()))?
+            }
+        };
+        decoded.insert(metric.clone(), value);
+    }
+    Ok(decoded)
 }
 
-/// A published artifact records values measured by a full visible-row scan, so
-/// every metric is exact on its basis — except a Theta sketch, which estimates
-/// in both directions no matter how completely it was fed.
-fn provider_artifact_numeric_nature(metric: &StatisticsMetric) -> StatisticsNumericNature {
-    match metric {
-        StatisticsMetric::ThetaNdv { .. } => StatisticsNumericNature::TwoSidedApproximate,
-        StatisticsMetric::RowCount
-        | StatisticsMetric::NullCount { .. }
-        | StatisticsMetric::Minimum { .. }
-        | StatisticsMetric::Maximum { .. }
-        | StatisticsMetric::AverageSize { .. } => StatisticsNumericNature::Exact,
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum MetricKind {
+    RowCount,
+    NullCount,
+    Minimum,
+    Maximum,
+    AverageSize,
+    ThetaNdv,
+}
+
+impl MetricKind {
+    fn of(metric: &StatisticsMetric) -> Self {
+        match metric {
+            StatisticsMetric::RowCount => Self::RowCount,
+            StatisticsMetric::NullCount { .. } => Self::NullCount,
+            StatisticsMetric::Minimum { .. } => Self::Minimum,
+            StatisticsMetric::Maximum { .. } => Self::Maximum,
+            StatisticsMetric::AverageSize { .. } => Self::AverageSize,
+            StatisticsMetric::ThetaNdv { .. } => Self::ThetaNdv,
+        }
     }
 }
 
 #[derive(Deserialize, Serialize)]
-struct IcebergProviderStatisticsV1 {
+struct IcebergProviderStatisticsV2 {
     version: u16,
     data_version: Vec<u8>,
-    metrics: Vec<IcebergProviderStatisticV1>,
+    metrics: Vec<IcebergProviderStatisticV2>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "metric", rename_all = "snake_case")]
-enum IcebergProviderStatisticV1 {
+enum IcebergProviderStatisticV2 {
     RowCount {
-        value: IcebergStatisticValueV1,
+        value: IcebergStatisticValueV2,
     },
     NullCount {
-        column: String,
-        value: IcebergStatisticValueV1,
+        field_id: i32,
+        value: IcebergStatisticValueV2,
     },
     Minimum {
-        column: String,
-        value: IcebergStatisticValueV1,
+        field_id: i32,
+        value: IcebergStatisticValueV2,
     },
     Maximum {
-        column: String,
-        value: IcebergStatisticValueV1,
+        field_id: i32,
+        value: IcebergStatisticValueV2,
     },
     AverageSize {
-        column: String,
-        value: IcebergStatisticValueV1,
+        field_id: i32,
+        value: IcebergStatisticValueV2,
     },
     ThetaNdv {
-        column: String,
-        value: IcebergStatisticValueV1,
+        field_id: i32,
+        value: IcebergStatisticValueV2,
     },
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
-enum IcebergStatisticValueV1 {
+enum IcebergStatisticValueV2 {
     U64(u64),
     I64(i64),
     F64(f64),
@@ -320,8 +332,13 @@ enum IcebergStatisticValueV1 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use novarocks_spi::connector::{StatisticsEvidenceRevision, StatisticsMetricRequest};
+    use novarocks_spi::connector::{
+        StatisticsBasisRelation, StatisticsEvidenceRevision, StatisticsMetricObservation,
+        StatisticsMetricRequest, StatisticsNumericNature,
+    };
 
     fn theta() -> StatisticsMetric {
         StatisticsMetric::ThetaNdv {
@@ -329,7 +346,11 @@ mod tests {
         }
     }
 
-    fn visible_row_observation(
+    fn version() -> StatisticsDataVersion {
+        StatisticsDataVersion::try_new(Bytes::from_static(b"table-v1")).expect("version")
+    }
+
+    fn scanned(
         value: StatisticsMetricValue,
         version: &StatisticsDataVersion,
         nature: StatisticsNumericNature,
@@ -351,7 +372,7 @@ mod tests {
             BTreeMap::from([
                 (
                     StatisticsMetric::RowCount,
-                    visible_row_observation(
+                    scanned(
                         StatisticsMetricValue::U64(3),
                         version,
                         StatisticsNumericNature::Exact,
@@ -359,7 +380,7 @@ mod tests {
                 ),
                 (
                     theta(),
-                    visible_row_observation(
+                    scanned(
                         StatisticsMetricValue::F64(3.0),
                         version,
                         StatisticsNumericNature::TwoSidedApproximate,
@@ -370,92 +391,140 @@ mod tests {
         .expect("evidence")
     }
 
-    fn observation(state: Option<&StatisticsMetricState>) -> &StatisticsMetricObservation {
-        match state {
-            Some(StatisticsMetricState::Available(observation)) => observation,
-            other => panic!("expected an available metric, got {other:?}"),
-        }
+    /// `k` is field 7 in the schema that produced the artifact.
+    fn measured_schema() -> HashMap<String, i32> {
+        HashMap::from([("k".to_string(), 7)])
+    }
+
+    fn request(metrics: Vec<StatisticsMetric>) -> StatisticsMetricRequest {
+        StatisticsMetricRequest::try_new(metrics).expect("request")
     }
 
     #[test]
     fn provider_artifact_round_trips_only_requested_metrics() {
-        let version =
-            StatisticsDataVersion::try_new(Bytes::from_static(b"table-v1")).expect("version");
-        let evidence = visible_row_evidence(&version);
-        let requested = StatisticsMetricRequest::try_new(vec![
-            StatisticsMetric::RowCount,
-            theta(),
-            StatisticsMetric::NullCount {
-                column: Arc::from("k"),
-            },
-        ])
-        .expect("request");
+        let version = version();
+        let payload =
+            encode_provider_statistics(&visible_row_evidence(&version), &measured_schema())
+                .expect("encode");
 
         let decoded = decode_provider_statistics(
-            &encode_provider_statistics(&evidence).expect("encode"),
-            &version,
-            &requested,
+            &payload,
+            &measured_schema(),
+            &request(vec![
+                StatisticsMetric::RowCount,
+                theta(),
+                StatisticsMetric::NullCount {
+                    column: Arc::from("k"),
+                },
+            ]),
         )
         .expect("decode");
 
-        let row_count = observation(decoded.get(&StatisticsMetric::RowCount));
-        assert_eq!(row_count.value(), &StatisticsMetricValue::U64(3));
         assert_eq!(
-            row_count.numeric_nature(),
-            StatisticsNumericNature::Exact,
-            "a published artifact records a full visible-row measurement"
-        );
-
-        let ndv = observation(decoded.get(&theta()));
-        assert_eq!(ndv.value(), &StatisticsMetricValue::F64(3.0));
-        assert_eq!(
-            ndv.numeric_nature(),
-            StatisticsNumericNature::TwoSidedApproximate,
-            "a Theta sketch stays approximate even after a full scan"
-        );
-
-        for state in [
             decoded.get(&StatisticsMetric::RowCount),
+            Some(&StatisticsMetricValue::U64(3))
+        );
+        assert_eq!(
             decoded.get(&theta()),
-        ] {
-            let observation = observation(state);
-            assert_eq!(
-                observation.source(),
-                &StatisticsMetricSource::ProviderArtifact
-            );
-            assert_eq!(observation.basis_version(), &version);
-            assert_eq!(
-                observation.basis_relation(),
-                StatisticsBasisRelation::Identical
-            );
-        }
-
-        assert!(matches!(
-            decoded.get(&StatisticsMetric::NullCount {
+            Some(&StatisticsMetricValue::F64(3.0))
+        );
+        assert!(
+            !decoded.contains_key(&StatisticsMetric::NullCount {
                 column: Arc::from("k")
             }),
-            Some(StatisticsMetricState::Missing(StatisticsMissing {
-                kind: StatisticsMissingKind::NotCollected,
-                ..
-            }))
-        ));
+            "a metric absent from the artifact is simply not decoded"
+        );
+    }
+
+    /// The point of keying by field id: the column can be renamed between
+    /// publication and the read, and its statistics must follow the column.
+    #[test]
+    fn a_renamed_column_still_matches_its_own_statistics() {
+        let version = version();
+        let payload =
+            encode_provider_statistics(&visible_row_evidence(&version), &measured_schema())
+                .expect("encode");
+
+        // Same field id 7, now called `renamed`.
+        let queried_schema = HashMap::from([("renamed".to_string(), 7)]);
+        let decoded = decode_provider_statistics(
+            &payload,
+            &queried_schema,
+            &request(vec![StatisticsMetric::ThetaNdv {
+                column: Arc::from("renamed"),
+            }]),
+        )
+        .expect("decode");
+
+        assert_eq!(
+            decoded.get(&StatisticsMetric::ThetaNdv {
+                column: Arc::from("renamed")
+            }),
+            Some(&StatisticsMetricValue::F64(3.0))
+        );
+    }
+
+    /// A column added after publication has a field id the artifact never saw.
+    /// It must decode to nothing rather than borrow another column's value.
+    #[test]
+    fn a_column_added_after_publication_has_no_statistics() {
+        let version = version();
+        let payload =
+            encode_provider_statistics(&visible_row_evidence(&version), &measured_schema())
+                .expect("encode");
+
+        let queried_schema = HashMap::from([("k".to_string(), 7), ("added".to_string(), 9)]);
+        let decoded = decode_provider_statistics(
+            &payload,
+            &queried_schema,
+            &request(vec![StatisticsMetric::ThetaNdv {
+                column: Arc::from("added"),
+            }]),
+        )
+        .expect("decode");
+
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn an_artifact_from_an_older_format_yields_no_metrics_rather_than_an_error() {
+        let stale = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "data_version": [1, 2, 3],
+            "metrics": [],
+        }))
+        .expect("stale payload");
+
+        let decoded = decode_provider_statistics(
+            &stale,
+            &measured_schema(),
+            &request(vec![StatisticsMetric::RowCount]),
+        )
+        .expect("an unreadable artifact is missing statistics, not a failure");
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn a_column_absent_from_the_measured_schema_cannot_be_published() {
+        let version = version();
+        assert!(
+            encode_provider_statistics(&visible_row_evidence(&version), &HashMap::new()).is_err()
+        );
     }
 
     #[test]
     fn a_full_visible_row_collection_containing_a_theta_sketch_is_publishable() {
-        let version =
-            StatisticsDataVersion::try_new(Bytes::from_static(b"table-v1")).expect("version");
-        encode_provider_statistics(&visible_row_evidence(&version))
+        let version = version();
+        encode_provider_statistics(&visible_row_evidence(&version), &measured_schema())
             .expect("numeric exactness is no longer a publication precondition");
     }
 
     #[test]
     fn partial_coverage_or_a_non_scan_source_cannot_be_published() {
-        let version =
-            StatisticsDataVersion::try_new(Bytes::from_static(b"table-v1")).expect("version");
+        let version = version();
         let metrics = BTreeMap::from([(
             StatisticsMetric::RowCount,
-            visible_row_observation(
+            scanned(
                 StatisticsMetricValue::U64(3),
                 &version,
                 StatisticsNumericNature::Exact,
@@ -466,10 +535,10 @@ mod tests {
             version.clone(),
             StatisticsEvidenceRevision::try_new(Bytes::from_static(b"run-v1")).expect("revision"),
             StatisticsRowCoverage::PartialRows,
-            metrics.clone(),
+            metrics,
         )
         .expect("evidence");
-        assert!(encode_provider_statistics(&partial).is_err());
+        assert!(encode_provider_statistics(&partial, &measured_schema()).is_err());
 
         let manifest_derived = StatisticsEvidence::try_new(
             version.clone(),
@@ -487,6 +556,6 @@ mod tests {
             )]),
         )
         .expect("evidence");
-        assert!(encode_provider_statistics(&manifest_derived).is_err());
+        assert!(encode_provider_statistics(&manifest_derived, &measured_schema()).is_err());
     }
 }

@@ -192,7 +192,7 @@ fn evidence_to_base_statistics(
     let admitted = |metric: StatisticsMetric| -> Option<&StatisticsMetricObservation> {
         match evidence.metrics().get(&metric) {
             Some(StatisticsMetricState::Available(observation))
-                if observation.describes_version(evidence.data_version()) =>
+                if observation.describes_queried_rows() =>
             {
                 Some(observation)
             }
@@ -304,9 +304,17 @@ fn evidence_to_base_statistics(
                     },
                     Some(&column.data_type),
                 ),
-                ndv: StatValue::missing(StatsMissingReason::ColumnNotReported(format!(
-                    "approximate Theta NDV for `{name}` is not an exact optimizer statistic"
-                ))),
+                // A Theta NDV is approximate by construction, which is what
+                // `Estimated` is for — it is not a reason to withhold the only
+                // distinct-count evidence the table has. Admission still runs
+                // first, so a value whose basis rows differ from the queried
+                // ones never arrives here.
+                ndv: column_stat(
+                    StatisticsMetric::ThetaNdv {
+                        column: std::sync::Arc::clone(&key),
+                    },
+                    None,
+                ),
             },
         );
     }
@@ -1533,6 +1541,96 @@ mod tests {
         // ...and the one measured on another basis is skipped, without
         // taking the rest of the answer down with it.
         assert_eq!(k.min_value.known_value(), None);
+    }
+
+    /// A distinct count is the one statistic Puffin actually owns, and it is
+    /// always approximate. Withholding it left the optimizer with no NDV at all
+    /// for lake tables; `Estimated` is the honest way to hand it over.
+    #[test]
+    fn an_approximate_distinct_count_reaches_the_optimizer_as_estimated() {
+        let queried = version(b"data-v1");
+        let evidence = StatisticsEvidence::try_new(
+            queried.clone(),
+            StatisticsEvidenceRevision::try_new(bytes::Bytes::from_static(b"rev-1"))
+                .expect("revision"),
+            StatisticsRowCoverage::AllVisibleRows,
+            std::collections::BTreeMap::from([(
+                StatisticsMetric::ThetaNdv {
+                    column: std::sync::Arc::from("k"),
+                },
+                observed(
+                    StatisticsMetricValue::F64(42.0),
+                    queried,
+                    StatisticsNumericNature::TwoSidedApproximate,
+                    StatisticsBasisRelation::Identical,
+                ),
+            )]),
+        )
+        .expect("evidence");
+
+        let statistics = evidence_to_base_statistics(&evidence, &[column("k")]);
+        let k = statistics.columns.get("k").expect("column statistics");
+        assert_eq!(k.ndv.known_value(), Some(&42.0));
+        assert_eq!(k.ndv.confidence(), Confidence::Estimated);
+    }
+
+    /// A sketch measured on rows the query will not read is not evidence about
+    /// this query, however recent it is.
+    #[test]
+    fn a_distinct_count_measured_on_other_rows_is_not_admitted() {
+        let queried = version(b"data-v1");
+        let evidence = StatisticsEvidence::try_new(
+            queried,
+            StatisticsEvidenceRevision::try_new(bytes::Bytes::from_static(b"rev-1"))
+                .expect("revision"),
+            StatisticsRowCoverage::AllVisibleRows,
+            std::collections::BTreeMap::from([(
+                StatisticsMetric::ThetaNdv {
+                    column: std::sync::Arc::from("k"),
+                },
+                observed(
+                    StatisticsMetricValue::F64(42.0),
+                    version(b"data-v0"),
+                    StatisticsNumericNature::TwoSidedApproximate,
+                    StatisticsBasisRelation::BasisIsSubset,
+                ),
+            )]),
+        )
+        .expect("evidence");
+
+        let statistics = evidence_to_base_statistics(&evidence, &[column("k")]);
+        let k = statistics.columns.get("k").expect("column statistics");
+        assert_eq!(k.ndv.known_value(), None);
+    }
+
+    /// A compaction changes the snapshot without changing the rows, so its
+    /// statistics still describe what the query will read.
+    #[test]
+    fn a_distinct_count_from_a_rewrite_only_ancestor_is_admitted() {
+        let queried = version(b"data-v1");
+        let evidence = StatisticsEvidence::try_new(
+            queried,
+            StatisticsEvidenceRevision::try_new(bytes::Bytes::from_static(b"rev-1"))
+                .expect("revision"),
+            StatisticsRowCoverage::AllVisibleRows,
+            std::collections::BTreeMap::from([(
+                StatisticsMetric::ThetaNdv {
+                    column: std::sync::Arc::from("k"),
+                },
+                observed(
+                    StatisticsMetricValue::F64(42.0),
+                    version(b"data-v0"),
+                    StatisticsNumericNature::TwoSidedApproximate,
+                    StatisticsBasisRelation::Identical,
+                ),
+            )]),
+        )
+        .expect("evidence");
+
+        let statistics = evidence_to_base_statistics(&evidence, &[column("k")]);
+        let k = statistics.columns.get("k").expect("column statistics");
+        assert_eq!(k.ndv.known_value(), Some(&42.0));
+        assert_eq!(k.ndv.confidence(), Confidence::Estimated);
     }
 
     /// The old whole-evidence gate dropped every metric as soon as delete files

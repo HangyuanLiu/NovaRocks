@@ -272,16 +272,20 @@ impl StatisticsMetricObservation {
         self.interval
     }
 
-    /// Whether this value describes the row set of `version` itself.
+    /// Whether this value describes the row set the caller is asking about.
     ///
-    /// This is the admission question for a consumer: a value measured on some
-    /// other basis, or on a basis whose relation the provider could not prove,
-    /// is not a statement about the rows `version` contains. Numeric nature is
-    /// deliberately not part of it — a bound or a sketch estimate still
-    /// describes the right rows, and how far to trust it is a separate,
+    /// This is the admission question for a consumer, and `Identical` is
+    /// exactly the claim it needs: the basis holds the same rows. That can be
+    /// true of a *different* snapshot — a compaction rewrites files without
+    /// changing which rows exist — so this deliberately does not also require
+    /// the basis version to match. Requiring it would re-tie "same version" to
+    /// "same rows", which is the conflation this model exists to remove.
+    ///
+    /// Numeric nature is likewise not part of it: a bound or a sketch estimate
+    /// still describes the right rows, and how far to trust it is a separate,
     /// consumer-owned confidence decision.
-    pub fn describes_version(&self, version: &StatisticsDataVersion) -> bool {
-        self.basis_relation == StatisticsBasisRelation::Identical && self.basis_version == *version
+    pub fn describes_queried_rows(&self) -> bool {
+        self.basis_relation == StatisticsBasisRelation::Identical
     }
 }
 
@@ -371,13 +375,16 @@ impl StatisticsEvidence {
                     "Theta NDV is a two-sided estimate and cannot be reported as an exact or one-sided value",
                 ));
             }
-            let identical_basis = *observation.basis_version() == self.data_version;
-            if identical_basis
-                != (observation.basis_relation() == StatisticsBasisRelation::Identical)
+            // A value measured on the queried version itself cannot claim its
+            // rows differ from that version's. The converse does not hold: a
+            // compaction produces a new snapshot over the same logical rows, so
+            // an older basis may legitimately be `Identical`.
+            if *observation.basis_version() == self.data_version
+                && observation.basis_relation() != StatisticsBasisRelation::Identical
             {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
-                    "statistics metric basis relation contradicts its basis version",
+                    "statistics metric measured on the queried version cannot claim a different row set",
                 ));
             }
         }
@@ -1047,17 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn basis_relation_must_agree_with_the_basis_version() {
-        let ancestor_basis_claiming_identity = evidence(BTreeMap::from([(
-            StatisticsMetric::RowCount,
-            StatisticsMetricState::Available(observation(
-                data_version(b"data-v0"),
-                StatisticsNumericNature::Exact,
-                StatisticsBasisRelation::Identical,
-            )),
-        )]));
-        assert!(ancestor_basis_claiming_identity.is_err());
-
+    fn a_metric_measured_on_the_queried_version_cannot_claim_different_rows() {
         let same_basis_claiming_divergence = evidence(BTreeMap::from([(
             StatisticsMetric::RowCount,
             StatisticsMetricState::Available(observation(
@@ -1077,6 +1074,33 @@ mod tests {
             )),
         )]))
         .expect("an older basis paired with a non-identical relation is the normal ancestor case");
+    }
+
+    /// A compaction writes new files over the same logical rows. Such a basis is
+    /// an older version whose row set is nonetheless identical, so the model has
+    /// to be able to say both things at once — tying `Identical` to version
+    /// equality would make this case inexpressible.
+    #[test]
+    fn an_older_basis_may_still_hold_the_same_rows() {
+        let rewritten = evidence(BTreeMap::from([(
+            theta(),
+            StatisticsMetricState::Available(observation(
+                data_version(b"data-v0"),
+                StatisticsNumericNature::TwoSidedApproximate,
+                StatisticsBasisRelation::Identical,
+            )),
+        )]))
+        .expect("a rewrite-only ancestor basis is identical in rows, not in version");
+
+        let Some(StatisticsMetricState::Available(observation)) = rewritten.metrics().get(&theta())
+        else {
+            panic!("metric must be available");
+        };
+        assert_ne!(observation.basis_version(), rewritten.data_version());
+        assert!(
+            observation.describes_queried_rows(),
+            "an identical row set is admissible however old the snapshot is"
+        );
     }
 
     #[test]
@@ -1148,7 +1172,7 @@ mod tests {
         ] {
             assert!(
                 observation(queried.clone(), nature, StatisticsBasisRelation::Identical)
-                    .describes_version(&queried),
+                    .describes_queried_rows(),
                 "{nature:?} measured on the queried version still describes it"
             );
         }
@@ -1164,7 +1188,7 @@ mod tests {
                     StatisticsNumericNature::Exact,
                     relation
                 )
-                .describes_version(&queried),
+                .describes_queried_rows(),
                 "an exact value on a {relation:?} basis still describes other rows"
             );
         }

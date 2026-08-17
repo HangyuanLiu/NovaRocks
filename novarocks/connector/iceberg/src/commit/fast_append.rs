@@ -163,15 +163,31 @@ pub(crate) async fn register_puffin_stats(
     .await
     {
         Ok(Some(stats_file)) => {
-            if let Err(err) =
-                crate::commit::statistics::commit_statistics_file(table_after, catalog, stats_file)
-                    .await
+            match crate::commit::statistics::commit_statistics_file(
+                table_after,
+                catalog,
+                stats_file,
+                crate::stats_assembler::StatisticsCoverageMark::IncrementalUnion,
+            )
+            .await
             {
-                tracing::warn!(
-                    new_snapshot_id,
-                    error = %err,
-                    "iceberg puffin stats commit failed; snapshot committed without stats",
-                );
+                Ok(crate::commit::statistics::StatisticsCommitOutcome::Registered) => {}
+                Ok(crate::commit::statistics::StatisticsCommitOutcome::YieldedToFullerCoverage) => {
+                    // An ANALYZE already covered this snapshot by scanning every
+                    // visible row. Standing down is the correct outcome, not a
+                    // degradation worth warning about.
+                    tracing::debug!(
+                        new_snapshot_id,
+                        "iceberg puffin stats yielded to an all-visible-rows entry",
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        new_snapshot_id,
+                        error = %err,
+                        "iceberg puffin stats commit failed; snapshot committed without stats",
+                    );
+                }
             }
         }
         Ok(None) => {
@@ -214,8 +230,12 @@ pub(crate) async fn carry_forward_puffin_stats(
     for blob in entry.blob_metadata.iter_mut() {
         blob.snapshot_id = new_snapshot_id;
     }
+    // Carrying an entry forward preserves whatever it already claimed; it is a
+    // re-registration of the same artifact, not a new measurement.
+    let coverage = crate::stats_assembler::StatisticsCoverageMark::of(&entry);
     if let Err(err) =
-        crate::commit::statistics::commit_statistics_file(table_after, catalog, entry).await
+        crate::commit::statistics::commit_statistics_file(table_after, catalog, entry, coverage)
+            .await
     {
         tracing::warn!(
             new_snapshot_id,
