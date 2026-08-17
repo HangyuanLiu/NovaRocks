@@ -842,7 +842,9 @@ fn group_data_files(
                 delete.file_content == IcebergDeleteFileContent::Position
                     && delete.file_format == IcebergDeleteFileFormat::Parquet
             }) {
-                return Err(invalid("V2 Parquet position delete rewrite is unsupported"));
+                return Err(invalid(
+                    "V2 Parquet position delete rewrite is not supported",
+                ));
             }
             let selected = file
                 .delete_files

@@ -1039,6 +1039,14 @@ fn sanitize_operator_total_time(mut metrics: ActualMetrics) -> ActualMetrics {
     metrics
 }
 
+/// The plan-node id encoded in a profile node name, when the operator has one.
+///
+/// A negative value is the explicit "this operator has no plan node" sentinel,
+/// not a plan-node id: the result-buffer sink is a runtime bridge that stays
+/// anonymous by design, and a scan whose op template carries no node id names
+/// itself `plan_node_id=-1` after warning. Reporting either as node `-1` would
+/// invent a plan node that no renderer can key by, so they are filtered here
+/// rather than handed to the EXPLAIN ANALYZE operator-facts contract.
 fn parse_plan_node_id(name: &str) -> Option<i32> {
     let key = if name.contains("plan_node_id=") {
         "plan_node_id="
@@ -1050,7 +1058,8 @@ fn parse_plan_node_id(name: &str) -> Option<i32> {
     let end = rest
         .find(|c: char| !c.is_ascii_digit() && c != '-')
         .unwrap_or(rest.len());
-    rest[..end].parse().ok()
+    let node_id: i32 = rest[..end].parse().ok()?;
+    (node_id >= 0).then_some(node_id)
 }
 
 #[cfg(test)]
@@ -1443,6 +1452,33 @@ mod tests {
         assert_eq!(metrics.dict_hydrated_rows, 21);
         assert_eq!(metrics.dict_hydrated_columns, 2);
         assert_eq!(metrics.dict_unsupported_columns, 5);
+    }
+
+    #[test]
+    fn collect_actuals_skips_the_anonymous_plan_node_sentinel() {
+        let profiler = Profiler::new("query");
+        let driver = profiler
+            .child("Pipeline (id=0)")
+            .child("PipelineDriver (id=0)");
+        add_operator_metrics(&driver, "SCAN (plan_node_id=2)", 10, 5, 64);
+        // The result-buffer sink is a runtime bridge with no plan node, and a
+        // scan whose op template carries no node id names itself the same way.
+        add_operator_metrics(&driver, "RESULT_BUFFER_SINK (plan_node_id=-1)", 10, 3, 32);
+        let tree = novarocks_execution::runtime::profile::merge_pipeline_profiles(&profiler)
+            .to_native_tree();
+
+        let actuals = collect_actuals_by_plan_node_id_from_profile_trees(&[tree]);
+
+        assert!(
+            actuals.contains_key(&2),
+            "real plan nodes stay collected: {:?}",
+            actuals.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !actuals.contains_key(&-1),
+            "the anonymous sentinel must not be reported as plan node -1, which \
+             EXPLAIN ANALYZE operator facts reject outright"
+        );
     }
 
     #[test]
