@@ -17,6 +17,7 @@
 
 //! FE-only provider-neutral statistics contract.
 //! Design: ADR-0022 (docs/adr/ADR-0022-connector-statistics-capability.md)
+//! Design: ADR-0080 (docs/adr/ADR-0080-statistics-evidence-four-dimension-model.md)
 
 use std::collections::BTreeMap;
 use std::fmt;
