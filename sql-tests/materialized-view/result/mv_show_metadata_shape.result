@@ -1,0 +1,2 @@
+-- query 2
+Name	Database	StorageEngine	RefreshMode	LastRefreshTime	LastRefreshRows	BaseTables	SelectText	Dependencies	RefreshPaused	NextRefreshTime	LastSchedulerError	MaxStalenessMs	RefreshState	RetryAfterTime
