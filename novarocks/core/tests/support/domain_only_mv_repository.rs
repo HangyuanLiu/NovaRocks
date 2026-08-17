@@ -102,7 +102,7 @@ impl MvRepository for DomainOnlyMvRepository {
         Ok(false)
     }
 
-    fn set_rebuilt_refresh_watermark(
+    fn initialize_rebuilt_refresh_watermark(
         &self,
         _mv_id: i64,
         _base_snapshots: BTreeMap<String, i64>,

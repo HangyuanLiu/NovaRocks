@@ -567,9 +567,7 @@ impl StateStoreMvRepository {
                         let definition_key =
                             definition_by_id_key(mv_id).map_err(invalid_state_store)?;
                         if transaction.get(&definition_key).await?.is_some() {
-                            return Err(conflict_state_store(format!(
-                                "mv definition {mv_id} already exists"
-                            )));
+                            return Err(conflict_state_store("mv definition already exists"));
                         }
                         let definition = definition_from_request(mv_id, &request);
                         let sequence_value = encode_record(
@@ -773,9 +771,7 @@ impl StateStoreMvRepository {
                     let definition_key =
                         definition_by_id_key(mv_id).map_err(invalid_state_store)?;
                     if transaction.get(&definition_key).await?.is_some() {
-                        return Err(conflict_state_store(format!(
-                            "mv definition {mv_id} already exists"
-                        )));
+                        return Err(conflict_state_store("mv definition already exists"));
                     }
                     let key = sequence_key().map_err(invalid_state_store)?;
                     let current = transaction.get(&key).await?;
@@ -1076,9 +1072,9 @@ impl StateStoreMvRepository {
                         .map_err(invalid_state_store)?
                         .value;
                     if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
-                        return Err(conflict_state_store(format!(
-                            "mv definition {mv_id} has refresh in progress"
-                        )));
+                        return Err(conflict_state_store(
+                            "mv definition has refresh in progress",
+                        ));
                     }
                     if let Some(target) = definition_target(&definition)
                         .map_err(|_| invalid_state_store("MV definition has an invalid target"))?
@@ -1196,7 +1192,7 @@ impl StateStoreMvRepository {
         .await
     }
 
-    async fn set_rebuilt_refresh_watermark_async(
+    async fn initialize_rebuilt_refresh_watermark_async(
         &self,
         mv_id: i64,
         base_snapshots: BTreeMap<String, i64>,
@@ -1205,20 +1201,28 @@ impl StateStoreMvRepository {
         self.require_definition_async(mv_id).await?;
         let operation_id = Uuid::now_v7();
         let store = Arc::clone(&self.store);
-        let refresh_fence = self.refresh_fence_for(mv_id)?;
+        // Deliberately unfenced: see the port's contract. This only ever fills
+        // an absent watermark, so it cannot roll a refresh back, and it has to
+        // work during startup restore where no refresh owner exists yet.
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
             operation_id,
-            "set rebuilt MV refresh watermark",
+            "initialize rebuilt MV refresh watermark",
             move |transaction| {
                 let base_snapshots = base_snapshots.clone();
                 let base_table_uuids = base_table_uuids.clone();
-                let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
-                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (record, mut definition) =
                         load_definition_transaction(transaction, mv_id).await?;
+                    if !definition.last_refresh_snapshots.is_empty()
+                        || !definition.last_refresh_table_uuids.is_empty()
+                    {
+                        // A refresh, or a racing rebuild, already established a
+                        // watermark. Lake truth is the weaker fact of the two, so
+                        // leave what is there.
+                        return Ok(definition);
+                    }
                     definition.last_refresh_snapshots = base_snapshots;
                     definition.last_refresh_table_uuids = base_table_uuids;
                     put_definition_transaction(
@@ -1351,9 +1355,9 @@ impl StateStoreMvRepository {
                     let (definition_record, mut definition) =
                         load_definition_transaction(transaction, mv_id).await?;
                     if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
-                        return Err(conflict_state_store(format!(
-                            "mv definition {mv_id} already has refresh in progress"
-                        )));
+                        return Err(conflict_state_store(
+                            "mv definition already has refresh in progress",
+                        ));
                     }
                     let refresh_id =
                         allocate_refresh_id(transaction, operation_id, page_size).await?;
@@ -1405,10 +1409,9 @@ impl StateStoreMvRepository {
                     let (definition_record, mut definition) =
                         load_definition_transaction(transaction, request.mv_id).await?;
                     if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
-                        return Err(conflict_state_store(format!(
-                            "mv definition {} already has refresh in progress",
-                            request.mv_id
-                        )));
+                        return Err(conflict_state_store(
+                            "mv definition already has refresh in progress",
+                        ));
                     }
                     let refresh_id =
                         allocate_refresh_id(transaction, operation_id, page_size).await?;
@@ -1489,10 +1492,9 @@ impl StateStoreMvRepository {
                     let (definition_record, mut definition) =
                         load_definition_transaction(transaction, request.mv_id).await?;
                     if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
-                        return Err(conflict_state_store(format!(
-                            "mv definition {} already has refresh in progress",
-                            request.mv_id
-                        )));
+                        return Err(conflict_state_store(
+                            "mv definition already has refresh in progress",
+                        ));
                     }
                     let refresh_id = request.refresh_id;
                     definition.refresh_in_progress = true;
@@ -1587,18 +1589,14 @@ impl StateStoreMvRepository {
                     let (record, mut refresh) =
                         load_refresh_transaction(transaction, refresh_id).await?;
                     if refresh.lifecycle_owner != MvRefreshLifecycleOwner::FrontendCurrent {
-                        return Err(conflict_state_store(format!(
-                            "mv refresh {refresh_id} is not frontend-owned"
-                        )));
+                        return Err(conflict_state_store("mv refresh is not frontend-owned"));
                     }
                     let ledger = refresh.frontend_ledger.as_mut().ok_or_else(|| {
                         invalid_state_store("frontend-owned MV refresh has no v3 ledger")
                     })?;
                     let expected_operation_id = frontend_action_operation_id(ledger, &action.phase);
                     if action.operation_id.as_slice() != expected_operation_id {
-                        return Err(conflict_state_store(format!(
-                            "mv refresh {refresh_id} action does not use its preallocated operation ID"
-                        )));
+                        return Err(conflict_state_store("mv refresh action does not use its preallocated operation ID"));
                     }
                     let Some(existing_index) = ledger
                         .actions
@@ -1617,21 +1615,13 @@ impl StateStoreMvRepository {
                     if ledger.actions.iter().any(|existing| {
                         existing.state == FrontendMvRefreshActionState::CommitUnknown
                     }) {
-                        return Err(conflict_state_store(format!(
-                            "mv refresh {refresh_id} has a commit-unknown action and cannot advance"
-                        )));
+                        return Err(conflict_state_store("mv refresh has a commit-unknown action and cannot advance"));
                     }
                     if existing.state != FrontendMvRefreshActionState::Prepared {
-                        return Err(conflict_state_store(format!(
-                            "mv refresh {refresh_id} action {:?} conflicts with persisted outcome",
-                            action.phase
-                        )));
+                        return Err(conflict_state_store("mv refresh action conflicts with persisted outcome"));
                     }
                     if action.state == FrontendMvRefreshActionState::Prepared {
-                        return Err(conflict_state_store(format!(
-                            "mv refresh {refresh_id} action {:?} cannot replace its prepared intent",
-                            action.phase
-                        )));
+                        return Err(conflict_state_store("mv refresh action cannot replace its prepared intent"));
                     }
                     ensure_frontend_action_prerequisites(ledger, &action)
                         .map_err(invalid_state_store)?;
@@ -1718,10 +1708,9 @@ impl StateStoreMvRepository {
                         {
                             return Ok(());
                         }
-                        return Err(conflict_state_store(format!(
-                            "mv refresh {} staging commit differs from recorded value",
-                            request.refresh_id
-                        )));
+                        return Err(conflict_state_store(
+                            "mv refresh staging commit differs from recorded value",
+                        ));
                     }
                     expect_refresh_state(&refresh, MvRefreshState::IntentCreated)?;
                     refresh.state = MvRefreshState::StagingCommitted;
@@ -1768,10 +1757,9 @@ impl StateStoreMvRepository {
                         {
                             return Ok(());
                         }
-                        return Err(conflict_state_store(format!(
-                            "mv refresh {} publish commit differs from recorded value",
-                            request.refresh_id
-                        )));
+                        return Err(conflict_state_store(
+                            "mv refresh publish commit differs from recorded value",
+                        ));
                     }
                     expect_refresh_state(&refresh, MvRefreshState::StagingCommitted)?;
                     refresh.state = MvRefreshState::PublishCommitted;
@@ -2064,10 +2052,9 @@ impl StateStoreMvRepository {
                         let (refresh_record, mut refresh) =
                             load_refresh_transaction(transaction, refresh_id).await?;
                         if refresh.state == MvRefreshState::CommitUnknown {
-                            return Err(conflict_state_store(format!(
-                                "mv definition {} active refresh {} is commit-unknown",
-                                definition.mv_id, refresh_id
-                            )));
+                            return Err(conflict_state_store(
+                                "mv definition active refresh is commit-unknown",
+                            ));
                         }
                         if !matches!(
                             refresh.state,
@@ -2181,24 +2168,22 @@ impl StateStoreMvRepository {
                 let request = request.clone();
                 let refresh_fence = refresh_fence.clone();
                 Box::pin(async move {
-                        validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
+                    validate_refresh_fence(transaction, refresh_fence.as_ref()).await?;
                     let (record, mut refresh) =
                         load_refresh_transaction(transaction, request.refresh_id).await?;
                     if refresh.lifecycle_owner != MvRefreshLifecycleOwner::FrontendCurrent {
-                        return Err(conflict_state_store(format!(
-                            "mv refresh {} is not frontend-owned",
-                            request.refresh_id
-                        )));
+                        return Err(conflict_state_store("mv refresh is not frontend-owned"));
                     }
                     let mut recovery = refresh.frontend_recovery.take().unwrap_or(
-                        FrontendMvRefreshRecoveryLedger::pending(request.cleanup_operation_id.clone())
-                            .map_err(invalid_state_store)?,
+                        FrontendMvRefreshRecoveryLedger::pending(
+                            request.cleanup_operation_id.clone(),
+                        )
+                        .map_err(invalid_state_store)?,
                     );
                     if recovery.cleanup_operation_id != request.cleanup_operation_id {
-                        return Err(conflict_state_store(format!(
-                            "mv refresh {} recovery cleanup operation differs from the recorded value",
-                            request.refresh_id
-                        )));
+                        return Err(conflict_state_store(
+                            "mv refresh recovery cleanup operation differs from the recorded value",
+                        ));
                     }
                     recovery.status = FrontendMvRefreshRecoveryStatus::Inspecting;
                     recovery.cycle_id = Some(request.cycle_id);
@@ -2250,10 +2235,9 @@ impl StateStoreMvRepository {
                         conflict_state_store("frontend MV recovery has not begun")
                     })?;
                     if recovery.status != FrontendMvRefreshRecoveryStatus::Inspecting {
-                        return Err(conflict_state_store(format!(
-                            "mv refresh {} is not awaiting a recovery observation",
-                            request.refresh_id
-                        )));
+                        return Err(conflict_state_store(
+                            "mv refresh is not awaiting a recovery observation",
+                        ));
                     }
                     if let Some(existing) = &recovery.observation {
                         if existing.digest == request.observation.digest
@@ -2261,10 +2245,9 @@ impl StateStoreMvRepository {
                         {
                             return Ok(());
                         }
-                        return Err(conflict_state_store(format!(
-                            "mv refresh {} recovery observation conflicts with the recorded proof",
-                            request.refresh_id
-                        )));
+                        return Err(conflict_state_store(
+                            "mv refresh recovery observation conflicts with the recorded proof",
+                        ));
                     }
                     recovery.observation = Some(request.observation);
                     recovery.validate().map_err(invalid_state_store)?;
@@ -2579,10 +2562,9 @@ impl StateStoreMvRepository {
                         let (refresh_record, mut refresh) =
                             load_refresh_transaction(transaction, refresh_id).await?;
                         if refresh.state == MvRefreshState::CommitUnknown {
-                            return Err(conflict_state_store(format!(
-                                "mv definition {} active refresh {} is commit-unknown",
-                                definition.mv_id, refresh_id
-                            )));
+                            return Err(conflict_state_store(
+                                "mv definition active refresh is commit-unknown",
+                            ));
                         }
                         refresh.state = MvRefreshState::Finalized;
                         put_refresh_transaction(
@@ -2923,13 +2905,13 @@ impl MvRepository for StateStoreMvRepository {
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
         self.blocking(self.list_dependencies_upstream_async(upstream))
     }
-    fn set_rebuilt_refresh_watermark(
+    fn initialize_rebuilt_refresh_watermark(
         &self,
         mv_id: i64,
         base_snapshots: BTreeMap<String, i64>,
         base_table_uuids: BTreeMap<String, String>,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        self.blocking(self.set_rebuilt_refresh_watermark_async(
+        self.blocking(self.initialize_rebuilt_refresh_watermark_async(
             mv_id,
             base_snapshots,
             base_table_uuids,
@@ -3695,18 +3677,16 @@ async fn finalize_refresh_transaction(
     expect_refresh_state(&refresh, MvRefreshState::PublishCommitted)?;
     let persisted_snapshot = persisted_publish_target_snapshot(&refresh);
     if persisted_snapshot != request.target_snapshot_id {
-        return Err(conflict_state_store(format!(
-            "mv refresh {} target snapshot is {:?}, expected published snapshot {:?}",
-            request.refresh_id, request.target_snapshot_id, persisted_snapshot
-        )));
+        return Err(conflict_state_store(
+            "mv refresh target snapshot is , expected published snapshot",
+        ));
     }
     let (definition_record, mut definition) =
         load_definition_transaction(transaction, refresh.mv_id).await?;
     if definition.active_refresh_id != Some(request.refresh_id) {
-        return Err(conflict_state_store(format!(
-            "mv definition {} active refresh is {:?}, expected {}",
-            refresh.mv_id, definition.active_refresh_id, request.refresh_id
-        )));
+        return Err(conflict_state_store(
+            "mv definition active refresh is , expected",
+        ));
     }
     definition.last_refresh_rows = Some(request.rows);
     definition.last_refresh_snapshots = request.base_snapshots;
@@ -3768,19 +3748,17 @@ async fn finalize_frontend_refresh_without_external_actions_transaction(
             .as_ref()
             .is_none_or(|ledger| !ledger.actions.is_empty())
     {
-        return Err(conflict_state_store(format!(
-            "mv refresh {} is not a frontend no-external-action attempt",
-            request.refresh_id
-        )));
+        return Err(conflict_state_store(
+            "mv refresh is not a frontend no-external-action attempt",
+        ));
     }
     expect_refresh_state(&refresh, MvRefreshState::IntentCreated)?;
     let (definition_record, mut definition) =
         load_definition_transaction(transaction, refresh.mv_id).await?;
     if definition.active_refresh_id != Some(request.refresh_id) {
-        return Err(conflict_state_store(format!(
-            "mv definition {} active refresh is {:?}, expected {}",
-            refresh.mv_id, definition.active_refresh_id, request.refresh_id
-        )));
+        return Err(conflict_state_store(
+            "mv definition active refresh is , expected",
+        ));
     }
     definition.last_refresh_rows = Some(request.rows);
     definition.last_refresh_snapshots = request.base_snapshots;
@@ -3846,12 +3824,9 @@ fn expect_refresh_state(
     if refresh.state == expected {
         return Ok(());
     }
-    Err(conflict_state_store(format!(
-        "mv refresh {} is {}, expected {}",
-        refresh.refresh_id,
-        refresh.state.as_str(),
-        expected.as_str()
-    )))
+    Err(conflict_state_store(
+        "mv refresh is not in the state this transition expects",
+    ))
 }
 
 fn persisted_publish_target_snapshot(refresh: &StoredMvRefresh) -> Option<i64> {
@@ -4115,11 +4090,20 @@ fn invalid_state_store(_message: impl Into<String>) -> novarocks_spi::state_stor
         "invalid MV StateStore request",
     )
 }
-fn conflict_state_store(
-    _message: impl Into<String>,
-) -> novarocks_spi::state_store::StateStoreError {
+/// A conflict this repository decided on itself, carrying its reason.
+///
+/// Every caller authors an MV-application fact here — "already exists", "has
+/// refresh in progress", "catalog has a materialized view target" — none of
+/// which is a provider internal. Collapsing them into one opaque line told a
+/// user that something conflicted without saying what, and hid the only
+/// diagnostic that explains why the statement was refused.
+///
+/// `StateStoreError` carries static text by contract, so a reason names the
+/// condition and not the specific id involved. The id is the part a caller
+/// already knows from the statement it just ran; the condition is not.
+fn conflict_state_store(reason: &'static str) -> novarocks_spi::state_store::StateStoreError {
     novarocks_spi::state_store::StateStoreError::new(
         novarocks_spi::state_store::StateStoreErrorKind::Conflict,
-        "MV StateStore transaction conflict",
+        reason,
     )
 }

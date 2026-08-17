@@ -618,9 +618,13 @@ pub(crate) fn alter_mv_with_kernel(
             unreachable!("repartition and properties returned before metadata update")
         }
     };
+    // SET REFRESH, PAUSE and RESUME are user-owned configuration, not a refresh
+    // lifecycle transition, so they go through the definition-DDL write. Using
+    // the lifecycle write would put them inside the refresh fence domain and
+    // fail closed whenever another frontend happened to own the active refresh.
     kernel
         .repository()
-        .update_refresh_metadata(req.clone())
+        .update_definition_refresh_metadata(req.clone())
         .map_err(|e| format!("update MV refresh metadata failed: {e}"))?;
     let ports = crate::mv::iceberg_refresh::IcebergMvCorePorts::new(
         Arc::clone(kernel.catalog_service()),

@@ -70,8 +70,10 @@ use crate::scan_model::{
 use crate::schema_facts::{iceberg_schema_def, row_lineage_enabled};
 
 const LOGICAL_TYPE_PROPERTY_PREFIX: &str = "novarocks.logical_type.";
-const APPLY_KEY_COLUMN_PROPERTY: &str = "novarocks.mv.apply-key-column";
-const HIDDEN_COLUMNS_PROPERTY: &str = "novarocks.mv.hidden-columns";
+use novarocks_spi::connector::{
+    CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY as APPLY_KEY_COLUMN_PROPERTY,
+    CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY as HIDDEN_COLUMNS_PROPERTY,
+};
 
 #[derive(Clone)]
 pub struct IcebergControlProvider {
@@ -2583,6 +2585,42 @@ fn classified_control_error((kind, message): (ConnectorErrorKind, String)) -> Co
     match kind {
         ConnectorErrorKind::Unavailable => unavailable(message),
         kind => ConnectorError::new(kind, message),
+    }
+}
+
+#[cfg(test)]
+mod hidden_column_tests {
+    use std::collections::HashMap;
+
+    use super::{APPLY_KEY_COLUMN_PROPERTY, HIDDEN_COLUMNS_PROPERTY, hidden_internal_columns};
+
+    #[test]
+    fn an_mv_targets_apply_key_and_state_columns_are_hidden_from_sql() {
+        let properties = HashMap::from([
+            (
+                APPLY_KEY_COLUMN_PROPERTY.to_string(),
+                "__nova_base_row_id".to_string(),
+            ),
+            (
+                HIDDEN_COLUMNS_PROPERTY.to_string(),
+                "__sum_state_v1, __count_state_v1".to_string(),
+            ),
+            ("comment".to_string(), "not hidden".to_string()),
+        ]);
+
+        let hidden = hidden_internal_columns(&properties);
+
+        assert_eq!(
+            hidden,
+            vec!["__nova_base_row_id", "__sum_state_v1", "__count_state_v1"],
+            "the apply key comes first and both property lists contribute; missing \
+             either one leaks an engine-owned column into every SELECT * on the target"
+        );
+    }
+
+    #[test]
+    fn a_plain_table_hides_nothing() {
+        assert!(hidden_internal_columns(&HashMap::new()).is_empty());
     }
 }
 

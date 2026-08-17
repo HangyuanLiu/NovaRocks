@@ -33,6 +33,17 @@ use super::{
 /// admission omits it from SQL-owned write shaping.
 pub const CONNECTOR_FIELD_HIDDEN_FROM_SQL: &str = "novarocks.connector.hidden_from_sql";
 
+/// Table-property keys naming the engine-owned columns of a materialized-view
+/// target, so the owner that writes them and the provider that hides them from
+/// SQL agree on the spelling by construction.
+///
+/// These have to live on the neutral contract: the MV owner and the provider
+/// depend on this crate and not on each other, so two private literals can
+/// silently drift apart, and a drifted key does not fail loudly — it just stops
+/// hiding the column and leaks it into every `SELECT *` on the target.
+pub const CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY: &str = "novarocks.mv.apply-key.column";
+pub const CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY: &str = "novarocks.mv.hidden-columns";
+
 /// Upper bounds for the provider-neutral facts returned together with one
 /// connector table schema. These facts are request-local metadata, not a
 /// durable connector contract or a table-handle payload.
@@ -1386,6 +1397,22 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+
+    #[test]
+    fn materialized_view_target_property_keys_are_durable_spellings() {
+        // These land in the target table's own metadata, so a rename does not
+        // fail loudly on an existing table: the provider simply stops
+        // recognizing the key and leaks the engine-owned column into SQL.
+        // Change these only with a migration for tables already carrying them.
+        assert_eq!(
+            CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY,
+            "novarocks.mv.apply-key.column"
+        );
+        assert_eq!(
+            CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY,
+            "novarocks.mv.hidden-columns"
+        );
+    }
 
     struct NeverCancelled;
 
