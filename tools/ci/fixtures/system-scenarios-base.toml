@@ -1,0 +1,42 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Provider-neutral base configuration for native 1FE+3BE system scenarios.
+#
+# `novarocks-cluster-harness` owns the real launch contract and rewrites the
+# volatile parts of this file per process: it inserts `[cluster] role`, the BE
+# endpoint list, every port, and a per-run `[state_store] path`. Only the
+# provider-neutral, non-volatile fields belong here.
+#
+# Deliberately absent:
+#
+# - `[connector.object_store]`: every registered scenario creates its Iceberg
+#   warehouse on the local filesystem under the harness runtime directory, so
+#   the system stage needs neither MinIO nor the iceberg-rest Docker fixture.
+# - FoundationDB / MySQL StateStore settings: this baseline stays on SQLite so a
+#   feature-enabled binary running it proves coexistence only, never that a
+#   query used a specific StateStore provider.
+
+[state_store]
+provider = "sqlite"
+cluster_id = "novarocks-system-scenarios"
+path = "tmp/system-scenarios-state-store.sqlite"
+deployment_owner = "fe-1"
+
+[standalone_server]
+mysql_port = 9030
+user = "root"

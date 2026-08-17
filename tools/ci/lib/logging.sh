@@ -31,6 +31,7 @@ ci_init_summary_state() {
   CI_STAGE_ROWS=""
   CI_SQL_ROWS=""
   CI_SQL_CASE_ROWS=""
+  CI_SYSTEM_ROWS=""
   CI_KNOWN_FAILURE_ROWS=""
   CI_FAILURE_TAIL=""
   CI_REPO_PATH=""
@@ -131,6 +132,20 @@ ci_record_sql_case_timings() {
   done <"$log_path"
 }
 
+ci_record_system_scenario() {
+  local scenario="$1"
+  local status="$2"
+  local duration="$3"
+  local log_path="$4"
+  local artifact_path="$5"
+  local rel_log
+  local rel_artifact
+  rel_log="$(ci_rel_log "$log_path")"
+  rel_artifact="$(ci_rel_log "$artifact_path")"
+  CI_SYSTEM_ROWS="${CI_SYSTEM_ROWS}| ${scenario} | ${status} | ${duration}s | ${rel_log} | ${rel_artifact} |
+"
+}
+
 ci_record_sql_classification() {
   local suite="$1"
   local case_name="$2"
@@ -198,6 +213,14 @@ ci_render_summary() {
     printf "| --- | --- | --- | --- |\n"
     if [ -n "$CI_STAGE_ROWS" ]; then
       printf "%s" "$CI_STAGE_ROWS"
+    fi
+    printf "\n"
+
+    printf "## System Scenarios\n\n"
+    printf "| Scenario | Status | Duration | Log | Artifact |\n"
+    printf "| --- | --- | --- | --- | --- |\n"
+    if [ -n "$CI_SYSTEM_ROWS" ]; then
+      printf "%s" "$CI_SYSTEM_ROWS"
     fi
     printf "\n"
 
