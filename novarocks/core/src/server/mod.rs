@@ -613,6 +613,84 @@ mod protocol_api_tests {
 
         assert!(cancelled.load(Ordering::SeqCst));
     }
+
+    /// A shim whose session factory must never be reached. Every assertion below
+    /// is a rejection, and rejection happens strictly before a session is opened.
+    fn rejecting_shim() -> FrontendMysqlShim {
+        FrontendMysqlShim::new(
+            ROOT_USER.to_string(),
+            1,
+            Arc::new(CancellationProbeFactory {
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }),
+            Arc::new(OnceLock::new()),
+            ClientDisconnectWatcher { join_handle: None },
+        )
+    }
+
+    async fn authenticate(
+        shim: &FrontendMysqlShim,
+        auth_plugin: &str,
+        username: &[u8],
+        auth_data: &[u8],
+    ) -> bool {
+        AsyncMysqlShim::<tokio::io::Sink>::authenticate(
+            shim,
+            auth_plugin,
+            username,
+            b"0123456789abcdefghij",
+            auth_data,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn authenticate_rejects_other_users() {
+        let shim = rejecting_shim();
+
+        assert!(
+            !authenticate(&shim, "mysql_native_password", b"other", b"").await,
+            "only the configured user may authenticate"
+        );
+        assert!(
+            !authenticate(&shim, "mysql_native_password", b"", b"").await,
+            "an empty user name must not authenticate"
+        );
+        assert!(
+            !authenticate(&shim, "mysql_native_password", b"ROOT", b"").await,
+            "the user name comparison is exact, not case-insensitive"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticate_rejects_non_empty_credentials() {
+        let shim = rejecting_shim();
+
+        assert!(
+            !authenticate(
+                &shim,
+                "mysql_native_password",
+                ROOT_USER.as_bytes(),
+                b"secret"
+            )
+            .await,
+            "a non-empty scramble must not authenticate against the empty password"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticate_rejects_other_auth_plugins() {
+        let shim = rejecting_shim();
+
+        assert!(
+            !authenticate(&shim, "caching_sha2_password", ROOT_USER.as_bytes(), b"").await,
+            "only mysql_native_password is supported"
+        );
+        assert!(
+            !authenticate(&shim, "", ROOT_USER.as_bytes(), b"").await,
+            "an absent auth plugin must not authenticate"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -3925,6 +3925,86 @@ mod tests {
             .count()
     }
 
+    /// Count the provider-private fence markers.
+    fn fence_marker_count(table: &crate::iceberg::table::Table) -> usize {
+        table
+            .metadata()
+            .snapshots()
+            .filter(|snapshot| {
+                crate::commit::write_fence::is_fence_marker_snapshot(snapshot.summary())
+            })
+            .count()
+    }
+
+    #[test]
+    fn establishing_a_fence_is_its_own_catalog_commit_and_publishes_no_data() {
+        // ADR-0068 makes the fence the catalog linearization point: it is
+        // raised as a separate commit *before* the data snapshot, never folded
+        // into it. That separation is why one connector write advances the
+        // Hadoop metadata version twice — once for the fence, once for the
+        // data. Assert the provider-level invariant rather than counting files
+        // on disk, so the check survives a catalog layout change.
+        let (executor, _warehouse, control, table) = control_with_empty_table();
+        let operation_id = ConnectorWriteOperationId::from_bytes([37; 16]);
+        let catalog = Arc::clone(control.runtime.catalog());
+        let file_io = table.file_io().clone();
+
+        assert_eq!(fence_marker_count(&table), 0, "a fresh table has no fence");
+        assert_eq!(data_snapshot_count(&table), 0, "a fresh table has no data");
+
+        let facts =
+            crate::commit::write_fence::fence_facts_from_spi(&fence_at(operation_id, 1, 1, 1));
+        let after_fence = executor.block_on(async {
+            crate::commit::write_fence::establish_fence(catalog.as_ref(), &table, &file_io, &facts)
+                .await
+                .expect("establish the fence");
+            catalog
+                .load_table(table.identifier())
+                .await
+                .expect("reload after establish")
+        });
+
+        assert_eq!(
+            fence_marker_count(&after_fence),
+            1,
+            "establishing the fence must publish exactly one fence marker"
+        );
+        assert_eq!(
+            data_snapshot_count(&after_fence),
+            0,
+            "the fence commit must not publish a data snapshot of its own"
+        );
+
+        // Raising the fence for a later attempt is likewise its own commit and
+        // still publishes nothing readable.
+        let newer =
+            crate::commit::write_fence::fence_facts_from_spi(&fence_at(operation_id, 1, 1, 2));
+        let after_raise = executor.block_on(async {
+            crate::commit::write_fence::raise_fence(
+                catalog.as_ref(),
+                &after_fence,
+                &file_io,
+                &newer,
+            )
+            .await
+            .expect("raise the fence");
+            catalog
+                .load_table(table.identifier())
+                .await
+                .expect("reload after raise")
+        });
+
+        assert!(
+            fence_marker_count(&after_raise) > fence_marker_count(&after_fence),
+            "raising the fence must advance the marker rather than rewrite it in place"
+        );
+        assert_eq!(
+            data_snapshot_count(&after_raise),
+            0,
+            "raising the fence must not publish a data snapshot either"
+        );
+    }
+
     #[test]
     fn a_raised_fence_makes_an_older_attempt_fail_at_the_catalog() {
         let (executor, _warehouse, control, table) = control_with_empty_table();

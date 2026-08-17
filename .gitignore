@@ -38,3 +38,8 @@ __pycache__/
 # Per-crate log dirs written by integration tests (the root /log rule misses these).
 novarocks/*/log/
 novarocks-server/log/
+
+# Scratch runtimes written by the test harnesses. A successful run removes its
+# own contents, but a failed one deliberately retains artifacts for diagnosis.
+novarocks-server/.server-binary-smoke-runtime/
+/.sql-test-runner-runtime/

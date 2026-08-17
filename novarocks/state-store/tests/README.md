@@ -91,9 +91,28 @@ provider-neutral coordination conformance in one explicit runtime lifecycle.
 `state_store_foundationdb_cross_process` starts two independent helper
 processes against the same generated cluster and keyspace. Those helpers are
 FDB clients, not FEs, so this test must not be described as a real two-FE
-deployment. `cross_process_three_be_state_store_baseline` remains the real
-1FE+3BE query baseline, but it intentionally leaves FoundationDB disabled; its
-role is regression and no-fallback evidence.
+deployment.
+
+The native 1FE+3BE baseline is the `query-lifecycle/distributed-baseline`
+system scenario, run by the provider gate against the feature-enabled binary:
+
+```bash
+cargo build -p novarocks-server --profile dev-opt --features foundationdb-provider
+cargo build -p novarocks-system-test-runner --profile dev-opt
+target/dev-opt/novarocks-system-tests \
+  --binary target/dev-opt/novarocks \
+  --config tools/ci/fixtures/system-scenarios-base.toml \
+  --artifact-root "$(mktemp -d)" \
+  --cluster-size 3 --timeout-secs 300 \
+  --only query-lifecycle/distributed-baseline
+```
+
+Read that result narrowly. It is a **feature-binary coexistence smoke**: it
+proves the feature-enabled binary still completes a standard native topology,
+query and cleanup. It runs on the provider-neutral SQLite base config, so it is
+**not** evidence that any query used the FoundationDB or MySQL StateStore.
+Provider correctness comes only from the provider contract, runtime and
+cross-process tests above.
 
 Commit-state native error logs may contain only the canonical UUID
 `transaction_id`, `phase`, `native_error_code`, and `category` in addition to

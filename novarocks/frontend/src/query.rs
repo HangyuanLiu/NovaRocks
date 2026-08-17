@@ -2068,4 +2068,70 @@ mod tests {
                 .contains("[UnsupportedDistributedDmlShape]")
         );
     }
+
+    #[test]
+    fn sql_batch_splits_on_statement_boundaries() {
+        let statements = split_sql_statements(
+            "DROP DATABASE IF EXISTS db1 FORCE;\
+             CREATE DATABASE db1;\
+             USE db1;\
+             CREATE TABLE tbl (id int, name string);\
+             INSERT INTO tbl VALUES (1, 'a'), (2, 'b');\
+             SELECT name FROM tbl WHERE id = 2;",
+        )
+        .expect("split a well-formed batch");
+
+        assert_eq!(statements.len(), 6);
+        assert_eq!(statements[0], "DROP DATABASE IF EXISTS db1 FORCE");
+        assert_eq!(statements[5], "SELECT name FROM tbl WHERE id = 2");
+    }
+
+    #[test]
+    fn sql_batch_ignores_semicolons_inside_quotes_and_comments() {
+        // A `;` inside a literal, identifier or comment must not split the
+        // batch. Getting this wrong silently truncates a statement instead of
+        // failing, so each quoting form is pinned separately.
+        let cases = [
+            "INSERT INTO t VALUES ('a;b')",
+            "INSERT INTO t VALUES (\"a;b\")",
+            "SELECT `weird;column` FROM t",
+            "SELECT 1 -- trailing ; comment\n",
+            "SELECT 1 # trailing ; comment\n",
+            "SELECT /* inline ; comment */ 1",
+        ];
+        for sql in cases {
+            let statements =
+                split_sql_statements(sql).unwrap_or_else(|error| panic!("split {sql:?}: {error}"));
+            assert_eq!(statements.len(), 1, "{sql:?} must stay one statement");
+        }
+    }
+
+    #[test]
+    fn sql_batch_drops_empty_fragments_and_keeps_an_unterminated_tail() {
+        assert!(
+            split_sql_statements("").expect("empty batch").is_empty(),
+            "an empty batch has no statements"
+        );
+        assert!(
+            split_sql_statements(" ;; ; ")
+                .expect("separator-only batch")
+                .is_empty(),
+            "separators alone contribute no statements"
+        );
+
+        let statements =
+            split_sql_statements("SELECT 1;;SELECT 2").expect("split around an empty fragment");
+        assert_eq!(statements, vec!["SELECT 1", "SELECT 2"]);
+    }
+
+    #[test]
+    fn sql_batch_rejects_an_unterminated_quote() {
+        let error = split_sql_statements("SELECT 'unterminated")
+            .expect_err("an unterminated literal must fail closed");
+        assert_eq!(error.kind(), QueryServiceErrorKind::Parse);
+        assert!(
+            error.to_string().contains("unterminated quoted string"),
+            "unexpected error: {error}"
+        );
+    }
 }
