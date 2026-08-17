@@ -114,14 +114,46 @@ impl StatisticsReader for IcebergControlProvider {
                 .map_err(unavailable)?
                 .map_err(corrupt)?;
             if let Some(artifact) = artifact {
+                let field_ids = metadata
+                    .current_schema()
+                    .as_struct()
+                    .fields()
+                    .iter()
+                    .map(|field| (field.name.to_ascii_lowercase(), field.id))
+                    .collect::<HashMap<_, _>>();
+                let values = decode_provider_statistics(&artifact, &field_ids, &request.metrics)?;
+                let metrics = request
+                    .metrics
+                    .metrics()
+                    .iter()
+                    .map(|metric| {
+                        let state = match values.get(metric) {
+                            Some(value) => {
+                                StatisticsMetricState::Available(StatisticsMetricObservation::new(
+                                    value.clone(),
+                                    expected.clone(),
+                                    StatisticsMetricSource::ProviderArtifact,
+                                    provider_artifact_numeric_nature(metric),
+                                    StatisticsBasisRelation::Identical,
+                                ))
+                            }
+                            None => StatisticsMetricState::Missing(StatisticsMissing {
+                                kind: StatisticsMissingKind::NotCollected,
+                                message: Arc::from(
+                                    "metric was not present in the published statistics artifact",
+                                ),
+                            }),
+                        };
+                        (metric.clone(), state)
+                    })
+                    .collect();
                 // The artifact was produced by a complete visible-row scan, so
-                // the collection covered every row; the codec attaches each
-                // metric's own source, basis and numeric nature.
+                // the collection covered every row.
                 return StatisticsEvidence::try_new(
                     expected.clone(),
                     revision,
                     StatisticsRowCoverage::AllVisibleRows,
-                    decode_provider_statistics(&artifact, &expected, &request.metrics)?,
+                    metrics,
                 );
             }
         }
@@ -193,6 +225,20 @@ impl StatisticsReader for IcebergControlProvider {
             })
             .collect();
         StatisticsEvidence::try_new(expected, revision, row_coverage, metrics)
+    }
+}
+
+/// A published artifact records values measured by a full visible-row scan, so
+/// every metric is exact on its basis — except a Theta sketch, which estimates
+/// in both directions no matter how completely it was fed.
+fn provider_artifact_numeric_nature(metric: &StatisticsMetric) -> StatisticsNumericNature {
+    match metric {
+        StatisticsMetric::ThetaNdv { .. } => StatisticsNumericNature::TwoSidedApproximate,
+        StatisticsMetric::RowCount
+        | StatisticsMetric::NullCount { .. }
+        | StatisticsMetric::Minimum { .. }
+        | StatisticsMetric::Maximum { .. }
+        | StatisticsMetric::AverageSize { .. } => StatisticsNumericNature::Exact,
     }
 }
 
@@ -335,7 +381,6 @@ impl StatisticsCollection for IcebergControlProvider {
         if let Err(error) = ensure_publishable_visible_row_evidence(&request.result.evidence) {
             return Ok(known_uncommitted(error));
         }
-        let provider_statistics = encode_provider_statistics(&request.result.evidence)?;
         let (artifact_version, theta) =
             decode_visible_row_artifact(request.result.provider_payload())?;
         if artifact_version != expected {
@@ -364,6 +409,7 @@ impl StatisticsCollection for IcebergControlProvider {
             .iter()
             .map(|field| (field.name.to_ascii_lowercase(), field.id))
             .collect::<HashMap<_, _>>();
+        let provider_statistics = encode_provider_statistics(&request.result.evidence, &field_ids)?;
         let mut sketches = HashMap::new();
         for (column, sketch) in theta {
             let field_id = field_ids.get(&column.to_ascii_lowercase()).ok_or_else(|| {
