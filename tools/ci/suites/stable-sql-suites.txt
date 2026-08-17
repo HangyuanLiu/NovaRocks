@@ -34,6 +34,7 @@ iceberg-mv-apply
 iceberg-rest
 distributed-resilience
 materialized-view
+session
 
 # The suites below are not part of default daily mode yet.
 # iceberg-mv-scheduler passes 4/4 but only when the standalone-server runs with the MV-refresh
