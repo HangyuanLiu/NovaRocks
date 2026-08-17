@@ -16,6 +16,7 @@
 // under the License.
 
 //! Finds each column's most recent NDV by walking a snapshot's ancestry.
+//! Design: ADR-0081 (docs/adr/ADR-0081-statistics-are-versioned-and-may-be-stale.md)
 //!
 //! Statistics are published against the snapshot they were measured on, and the
 //! table keeps moving afterwards, so the newest statistics file is rarely the

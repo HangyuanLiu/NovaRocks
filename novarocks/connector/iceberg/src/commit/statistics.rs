@@ -16,6 +16,7 @@
 // under the License.
 
 //! Shared metadata-only commit for an iceberg Puffin StatisticsFile.
+//! Design: ADR-0082 (docs/adr/ADR-0082-same-snapshot-statistics-publication-arbitration.md)
 
 use crate::iceberg::spec::StatisticsFile;
 use crate::iceberg::table::Table;
