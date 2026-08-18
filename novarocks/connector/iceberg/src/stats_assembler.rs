@@ -27,8 +27,8 @@
 //! | CommitType | Behavior                                       |
 //! |------------|-----------------------------------------------|
 //! | Append     | union(previous aggregate, new file sketches)   |
-//! | Delete     | reuse previous Puffin (returns `None`)         |
-//! | Rewrite    | reuse previous Puffin (returns `None`)         |
+//! | Delete     | no new statistics file (returns `None`)        |
+//! | Rewrite    | no new statistics file (returns `None`)        |
 //! | Overwrite  | aggregate of new file sketches (first-commit shape) |
 //!
 //! "First commit" with no prior Puffin follows the Overwrite path: the new
@@ -40,6 +40,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::iceberg::io::FileIO;
 use crate::iceberg::puffin::{APACHE_DATASKETCHES_THETA_V1, Blob, PuffinReader, PuffinWriter};
@@ -53,6 +54,8 @@ use crate::theta_sketch::ThetaSketchHandle;
 /// Puffin file, so other Iceberg readers can retain the StatisticsFile even
 /// when they do not interpret NovaRocks' optional statistics payload.
 pub const NOVAROCKS_STATISTICS_V1: &str = "novarocks.statistics.v1";
+/// Per-table switch for best-effort write-path statistics maintenance.
+pub const COLLECT_ON_WRITE_PROPERTY: &str = "novarocks.statistics.collect-on-write";
 
 /// The kind of commit being performed. Determines how the assembler combines
 /// new file sketches with the previous snapshot's aggregate Puffin.
@@ -61,14 +64,13 @@ pub enum CommitType {
     /// Append-only commit (e.g. INSERT, fast_append). Aggregate is
     /// `previous_aggregate ∪ union(new_file_sketches)`.
     Append,
-    /// Delete-only commit (position-delete, equality-delete). NDV is an upper
-    /// bound and remains valid; the assembler returns `None` so the caller
-    /// reuses the previous Puffin entry.
+    /// Delete-only commit (position-delete, equality-delete). The assembler
+    /// returns `None` and does not create a statistics entry for this snapshot.
     Delete,
     /// INSERT OVERWRITE / REPLACE. Requires a full rescan; deferred for now.
     Overwrite,
     /// Compaction or other rewrite-data-files action that does not change
-    /// logical row content. Reuse the previous Puffin.
+    /// logical row content. The assembler does not create a statistics entry.
     Rewrite,
 }
 
@@ -82,13 +84,34 @@ pub struct FileSketchSet {
 /// Orchestrates Puffin statistics assembly during a snapshot commit.
 pub struct StatsAssembler;
 
+/// Typed stage at which collect-on-write statistics assembly failed.
+///
+/// The write path keeps this error local to post-commit maintenance: data is
+/// already durable when it is observed, but the stage is still needed for a
+/// stable diagnostic instead of inferring it from a formatted error message.
+#[derive(Debug)]
+pub enum StatisticsAssemblyFailure {
+    SketchAssembly(String),
+    ParentStatisticsRead(String),
+    PuffinWrite(String),
+}
+
+impl fmt::Display for StatisticsAssemblyFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SketchAssembly(error)
+            | Self::ParentStatisticsRead(error)
+            | Self::PuffinWrite(error) => formatter.write_str(error),
+        }
+    }
+}
+
 impl StatsAssembler {
     /// Assemble the Puffin statistics file for the current commit.
     ///
     /// Returns `Some(StatisticsFile)` when a fresh Puffin was written and
-    /// should be registered with the metadata. Returns `None` when the caller
-    /// should either skip the registration (no prior Puffin) or carry forward
-    /// the previous snapshot's Puffin entry unchanged.
+    /// should be registered with the metadata. Returns `None` when no
+    /// statistics file should be registered for this snapshot.
     ///
     /// `current_snapshot_id` / `current_sequence_number` describe the snapshot
     /// being committed. `prev_snapshot_id`, when `Some`, identifies the
@@ -101,13 +124,10 @@ impl StatsAssembler {
         current_sequence_number: i64,
         prev_snapshot_id: Option<i64>,
         file_io: &FileIO,
-    ) -> Result<Option<StatisticsFile>, String> {
+    ) -> Result<Option<StatisticsFile>, StatisticsAssemblyFailure> {
         match commit_type {
             CommitType::Delete | CommitType::Rewrite => {
-                // Reuse the previous Puffin entry — NDV remains a valid upper
-                // bound. The caller is responsible for re-registering the
-                // previous StatisticsFile against the new snapshot id if
-                // desired.
+                // DELETE and REWRITE do not produce a new statistics file.
                 Ok(None)
             }
             CommitType::Append => {
@@ -148,7 +168,7 @@ impl StatsAssembler {
         current_sequence_number: i64,
         prev_snapshot_id: Option<i64>,
         file_io: &FileIO,
-    ) -> Result<Option<StatisticsFile>, String> {
+    ) -> Result<Option<StatisticsFile>, StatisticsAssemblyFailure> {
         // 1. Aggregate the new file sketches per field id.
         let per_column = aggregate_per_column(new_file_sketches);
         if per_column.is_empty() {
@@ -157,15 +177,22 @@ impl StatsAssembler {
             return Ok(None);
         }
 
-        // 2. If a previous Puffin exists, union its sketches into the running
-        //    aggregate.
-        let merged = if let Some(prev_id) = prev_snapshot_id {
-            let previous_sketches =
-                read_previous_sketches(table.metadata(), prev_id, file_io).await?;
-            merge_with_previous(per_column, previous_sketches)
-        } else {
-            per_column
-        };
+        // 2. Retain a field only when the parent proves that its aggregate
+        //    covers the pre-append rows. A missing parent field must not turn
+        //    a sketch over only this append into a table-wide NDV.
+        let parent_sketches = read_previous_sketches(table.metadata(), prev_snapshot_id, file_io)
+            .await
+            .map_err(StatisticsAssemblyFailure::ParentStatisticsRead)?;
+        let merged = merge_with_parent(
+            per_column,
+            parent_sketches,
+            parent_snapshot_is_proven_empty(table.metadata(), prev_snapshot_id),
+        );
+        if merged.is_empty() {
+            // The parent has rows that are not covered by statistics for any
+            // field written by this append. Do not create a partial Puffin.
+            return Ok(None);
+        }
 
         // 3. Serialize and write the Puffin file.
         let puffin_path = puffin_path_for_snapshot(table.metadata(), current_snapshot_id);
@@ -177,6 +204,7 @@ impl StatsAssembler {
             &merged,
         )
         .await
+        .map_err(StatisticsAssemblyFailure::PuffinWrite)
     }
 
     /// OVERWRITE / first-commit path.
@@ -191,15 +219,14 @@ impl StatsAssembler {
     ///
     /// If the caller supplies an empty `new_file_sketches` (e.g. INSERT
     /// OVERWRITE of zero rows or a table with no primitive columns) we
-    /// return `None` so the caller can carry forward the previous entry or
-    /// skip registration.
+    /// return `None` and skip statistics registration for this snapshot.
     async fn assemble_overwrite(
         table: &Table,
         new_file_sketches: Vec<FileSketchSet>,
         current_snapshot_id: i64,
         current_sequence_number: i64,
         file_io: &FileIO,
-    ) -> Result<Option<StatisticsFile>, String> {
+    ) -> Result<Option<StatisticsFile>, StatisticsAssemblyFailure> {
         let per_column = aggregate_per_column(new_file_sketches);
         if per_column.is_empty() {
             return Ok(None);
@@ -213,6 +240,7 @@ impl StatsAssembler {
             &per_column,
         )
         .await
+        .map_err(StatisticsAssemblyFailure::PuffinWrite)
     }
 }
 
@@ -238,37 +266,74 @@ fn aggregate_per_column(new_file_sketches: Vec<FileSketchSet>) -> HashMap<i32, T
     out
 }
 
-/// Merge the previous snapshot's aggregate sketches into the per-column
-/// aggregate from this commit. Columns only present in the previous Puffin
-/// are kept; columns only present in the new commit are kept; overlapping
-/// columns are unioned.
+/// The direct parent's statistics state. An empty `Present` map is distinct
+/// from the absence of a statistics file: an existing Puffin was successfully
+/// read, even if it did not contain a Theta blob for any field.
+enum ParentSketches {
+    /// There is no parent snapshot, so the new files are the whole table.
+    NoParent,
+    /// The parent snapshot has a readable statistics file.
+    Present(HashMap<i32, ThetaSketchHandle>),
+    /// The parent snapshot exists but has no statistics file.
+    NoStatisticsFile,
+}
+
+/// Select the fields that still have whole-table coverage after an append.
+///
+/// A proven-empty parent is equivalent to no parent for this purpose. For a
+/// nonempty parent, every published field must occur in both the parent and
+/// the new append, so `merge_with_previous` deliberately drops fields unique
+/// to either side.
+fn merge_with_parent(
+    new_per_column: HashMap<i32, ThetaSketchHandle>,
+    parent: ParentSketches,
+    parent_is_proven_empty: bool,
+) -> HashMap<i32, ThetaSketchHandle> {
+    match parent {
+        ParentSketches::NoParent => new_per_column,
+        ParentSketches::Present(_) | ParentSketches::NoStatisticsFile if parent_is_proven_empty => {
+            new_per_column
+        }
+        ParentSketches::Present(previous) => merge_with_previous(new_per_column, previous),
+        ParentSketches::NoStatisticsFile => HashMap::new(),
+    }
+}
+
+/// Merge only fields covered by both the previous snapshot's aggregate and
+/// this append. Keeping either side's unique fields would publish an NDV over
+/// a strict subset of a nonempty table.
 fn merge_with_previous(
-    mut new_per_column: HashMap<i32, ThetaSketchHandle>,
+    new_per_column: HashMap<i32, ThetaSketchHandle>,
     previous: HashMap<i32, ThetaSketchHandle>,
 ) -> HashMap<i32, ThetaSketchHandle> {
-    for (field_id, prev_sketch) in previous {
-        match new_per_column.remove(&field_id) {
-            Some(new_sketch) => {
-                let merged = ThetaSketchHandle::union(&[&new_sketch, &prev_sketch]);
-                new_per_column.insert(field_id, merged);
-            }
-            None => {
-                new_per_column.insert(field_id, prev_sketch);
-            }
-        }
-    }
     new_per_column
+        .into_iter()
+        .filter_map(|(field_id, new_sketch)| {
+            previous.get(&field_id).map(|previous_sketch| {
+                (
+                    field_id,
+                    ThetaSketchHandle::union(&[&new_sketch, previous_sketch]),
+                )
+            })
+        })
+        .collect()
 }
 
 /// Read the previous snapshot's Puffin and decode each Theta blob.
-/// Returns an empty map if the snapshot has no statistics entry.
+///
+/// A missing parent and a parent without a statistics entry are intentionally
+/// separate states. Artifact I/O and decode failures remain errors so callers
+/// never silently treat damaged evidence as an empty parent.
 async fn read_previous_sketches(
     table_metadata: &TableMetadata,
-    prev_snapshot_id: i64,
+    prev_snapshot_id: Option<i64>,
     file_io: &FileIO,
-) -> Result<HashMap<i32, ThetaSketchHandle>, String> {
+) -> Result<ParentSketches, String> {
+    let Some(prev_snapshot_id) = prev_snapshot_id else {
+        return Ok(ParentSketches::NoParent);
+    };
     let Some(prev_stats) = table_metadata.statistics_for_snapshot(prev_snapshot_id) else {
-        return Ok(HashMap::new());
+        return Ok(ParentSketches::NoStatisticsFile);
     };
 
     let input_file = file_io
@@ -308,7 +373,30 @@ async fn read_previous_sketches(
             }
         }
     }
-    Ok(sketches)
+    Ok(ParentSketches::Present(sketches))
+}
+
+/// Returns true only when the direct parent explicitly records zero rows.
+/// Missing snapshots, missing summaries, malformed summaries, and negative
+/// values all remain conservative nonempty cases.
+fn parent_snapshot_is_proven_empty(
+    table_metadata: &TableMetadata,
+    prev_snapshot_id: Option<i64>,
+) -> bool {
+    let total_records = prev_snapshot_id
+        .and_then(|snapshot_id| table_metadata.snapshot_by_id(snapshot_id))
+        .and_then(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .get("total-records")
+        })
+        .map(String::as_str);
+    total_records_is_zero(total_records)
+}
+
+fn total_records_is_zero(total_records: Option<&str>) -> bool {
+    total_records.and_then(|records| records.parse::<u64>().ok()) == Some(0)
 }
 
 /// Write a new Puffin file holding one Theta blob per primitive column.
@@ -629,12 +717,42 @@ mod tests {
     }
 
     #[test]
-    fn merge_with_previous_unions_overlapping_fields() {
+    fn merge_with_parent_without_parent_keeps_new_fields() {
+        let new_map = HashMap::from([
+            (1, make_sketch_with_values(0, 100)),
+            (2, make_sketch_with_values(100, 100)),
+        ]);
+
+        let merged = merge_with_parent(new_map, ParentSketches::NoParent, false);
+
+        assert_eq!(merged.len(), 2);
+        assert!(merged.contains_key(&1));
+        assert!(merged.contains_key(&2));
+    }
+
+    #[test]
+    fn merge_with_parent_keeps_new_fields_when_parent_is_proven_empty() {
+        let new_map = HashMap::from([
+            (1, make_sketch_with_values(0, 100)),
+            (2, make_sketch_with_values(100, 100)),
+        ]);
+        let parent =
+            ParentSketches::Present(HashMap::from([(1, make_sketch_with_values(500, 100))]));
+
+        let merged = merge_with_parent(new_map, parent, true);
+
+        assert_eq!(merged.len(), 2);
+        assert!(merged.contains_key(&1));
+        assert!(merged.contains_key(&2));
+    }
+
+    #[test]
+    fn merge_with_parent_unions_overlapping_fields() {
         let mut new_map = HashMap::new();
         new_map.insert(1, make_sketch_with_values(0, 5000));
         let mut prev_map = HashMap::new();
         prev_map.insert(1, make_sketch_with_values(3000, 5000));
-        let merged = merge_with_previous(new_map, prev_map);
+        let merged = merge_with_parent(new_map, ParentSketches::Present(prev_map), false);
         let est = merged.get(&1).expect("field 1 present").estimate();
         // Union of [0,4999] and [3000,7999] = [0,7999] ≈ 8000 distinct.
         assert!(
@@ -644,15 +762,50 @@ mod tests {
     }
 
     #[test]
-    fn merge_with_previous_keeps_unique_previous_fields() {
-        let mut new_map = HashMap::new();
-        new_map.insert(1, make_sketch_with_values(0, 100));
-        let mut prev_map = HashMap::new();
-        prev_map.insert(2, make_sketch_with_values(0, 200));
-        let merged = merge_with_previous(new_map, prev_map);
-        assert_eq!(merged.len(), 2);
+    fn merge_with_parent_omits_fields_missing_from_nonempty_parent() {
+        let new_map = HashMap::from([
+            (1, make_sketch_with_values(0, 100)),
+            (2, make_sketch_with_values(100, 100)),
+        ]);
+        let parent = ParentSketches::Present(HashMap::from([
+            (1, make_sketch_with_values(500, 100)),
+            (3, make_sketch_with_values(1_000, 100)),
+        ]));
+
+        let merged = merge_with_parent(new_map, parent, false);
+
+        assert_eq!(merged.len(), 1);
         assert!(merged.contains_key(&1));
-        assert!(merged.contains_key(&2));
+        assert!(!merged.contains_key(&2));
+        assert!(!merged.contains_key(&3));
+    }
+
+    #[test]
+    fn merge_with_parent_without_parent_statistics_skips_nonempty_parent() {
+        let new_map = HashMap::from([(1, make_sketch_with_values(0, 100))]);
+
+        let merged = merge_with_parent(new_map, ParentSketches::NoStatisticsFile, false);
+
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn merge_with_parent_without_parent_statistics_keeps_new_fields_when_empty() {
+        let new_map = HashMap::from([(1, make_sketch_with_values(0, 100))]);
+
+        let merged = merge_with_parent(new_map, ParentSketches::NoStatisticsFile, true);
+
+        assert_eq!(merged.len(), 1);
+        assert!(merged.contains_key(&1));
+    }
+
+    #[test]
+    fn total_records_is_zero_requires_an_explicit_parseable_zero() {
+        assert!(total_records_is_zero(Some("0")));
+        assert!(!total_records_is_zero(None));
+        assert!(!total_records_is_zero(Some("1")));
+        assert!(!total_records_is_zero(Some("-1")));
+        assert!(!total_records_is_zero(Some("not-a-record-count")));
     }
 
     /// Round-trip: write a Puffin file via `write_puffin` for one field with

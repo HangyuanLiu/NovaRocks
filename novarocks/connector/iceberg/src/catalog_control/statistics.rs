@@ -570,7 +570,14 @@ impl StatisticsCollection for IcebergControlProvider {
                     effect,
                 )
             }
-            Ok(Err(error)) | Err(error) => Ok(ExternalMutationOutcome::CommitUnknown {
+            Ok(Err(error)) => Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Internal,
+                    format!("commit Iceberg statistics: {error}"),
+                ),
+                evidence: request.evidence,
+            }),
+            Err(error) => Ok(ExternalMutationOutcome::CommitUnknown {
                 failure: ConnectorMutationFailure::new(
                     ConnectorMutationFailureKind::Internal,
                     format!("commit Iceberg statistics: {error}"),

@@ -57,9 +57,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
-use super::fast_append::{
-    carry_forward_puffin_stats, commit_empty_iceberg_mv_snapshot, register_puffin_stats,
-};
+use super::fast_append::{commit_empty_iceberg_mv_snapshot, register_puffin_stats};
 use super::helpers::{
     FencedSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
     metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary,
@@ -127,9 +125,9 @@ impl IcebergCommitAction for RowDeltaDvCommit {
                     "RowDeltaDv",
                 )?;
                 let new_sequence_number = table_after.metadata().last_sequence_number();
-                // MOR UPDATE writes new data files alongside the DV; treat as Append
-                // so the new NDV reflects both the carried-forward sketches and the
-                // new file sketches. Pure DELETE has no new files — carry forward.
+                // MOR UPDATE writes new data files alongside the DV; treat it as
+                // Append so the new NDV combines prior sketches with new-file
+                // sketches. Pure DELETE emits no statistics entry for this snapshot.
                 if has_new_data_files {
                     register_puffin_stats(
                         &table_after,
@@ -142,9 +140,6 @@ impl IcebergCommitAction for RowDeltaDvCommit {
                         prev_snapshot_id,
                     )
                     .await;
-                } else if let Some(prev) = prev_snapshot_id {
-                    carry_forward_puffin_stats(&table_after, ctx.catalog, new_snapshot_id, prev)
-                        .await;
                 }
                 Ok(CommitOutcome {
                     new_snapshot_id,
