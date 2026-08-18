@@ -73,7 +73,7 @@ ci_native_cross_process_suites() {
 ci_suite_is_explicit_only() {
   local repo_root="$1"
   local suite="$2"
-  local manifest="$repo_root/sql-tests/$suite/suite.toml"
+  local manifest="$repo_root/tests/sql/suites/$suite/suite.toml"
   local explicit_only
   local status
 
@@ -148,7 +148,7 @@ ci_discover_sql_suites() {
   local status
   local -a suites=()
 
-  for dir in "$repo_root"/sql-tests/*/sql; do
+  for dir in "$repo_root"/tests/sql/suites/*/sql; do
     [ -d "$dir" ] || continue
     suite="${dir%/sql}"
     suite="${suite##*/}"
@@ -178,5 +178,5 @@ ci_suite_exists() {
       ;;
   esac
 
-  [ -d "$repo_root/sql-tests/$suite/sql" ]
+  [ -d "$repo_root/tests/sql/suites/$suite/sql" ]
 }

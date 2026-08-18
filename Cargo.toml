@@ -26,9 +26,9 @@ members = ["novarocks/backend", "novarocks/catalog", "novarocks/connector/iceber
 default-members = ["novarocks-server"]
 # Existing standalone crates under the workspace tree are excluded rather than
 # pulled in as members: they run independently via `--manifest-path`, and
-# tests/sql-test-runner defines its own [profile.*] that a workspace root would
+# tests/sql/runner defines its own [profile.*] that a workspace root would
 # otherwise override. Excluding keeps their build behavior exactly as-is.
-exclude = ["vendor", "tools", "tests/sql-test-runner"]
+exclude = ["vendor", "tools", "tests/sql/runner"]
 
 [profile.dev]
 opt-level = 0

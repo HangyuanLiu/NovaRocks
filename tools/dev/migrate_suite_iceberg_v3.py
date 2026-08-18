@@ -17,14 +17,14 @@
 # under the License.
 
 """One-off migration helper: rewrite StarRocks `CREATE TABLE` statements in a
-sql-tests suite into Iceberg-v3 form.
+SQL suite into Iceberg-v3 form.
 
 For each `CREATE TABLE name (col_list) <tail>;` it strips native storage
 clauses from <tail> and appends/merges TBLPROPERTIES("format-version"="3").
 `CREATE TABLE ... AS SELECT` is left untouched. Every change is printed for
 human diff review; the record/verify gate is the real safety net.
 
-Usage:  python3 tools/dev/migrate_suite_iceberg_v3.py sql-tests/<suite>/sql
+Usage:  python3 tools/dev/migrate_suite_iceberg_v3.py tests/sql/suites/<suite>/sql
 """
 import re
 import sys

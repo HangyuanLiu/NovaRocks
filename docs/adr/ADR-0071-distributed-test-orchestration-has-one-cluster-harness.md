@@ -11,7 +11,7 @@ provenance:
   - "PR: https://github.com/NovaRocks/NovaRocks/pull/897"
 code-anchors:
   - "tests/cluster-harness/src/lib.rs (CrossProcessClusterOptions, CrossProcessServerHandle::launch)"
-  - "tests/sql-test-runner/src/cluster.rs (launch_server)"
+  - "tests/sql/runner/src/cluster.rs (launch_server)"
 ---
 
 ## 问题

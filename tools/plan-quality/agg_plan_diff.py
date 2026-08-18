@@ -88,7 +88,7 @@ def repo_root() -> Path:
 
 def case_to_sql_path(case_id: str) -> Path:
     suite, case = case_id.split("/", 1)
-    return repo_root() / "sql-tests" / suite / "sql" / f"{case}.sql"
+    return repo_root() / "tests" / "sql" / "suites" / suite / "sql" / f"{case}.sql"
 
 
 def case_default_database(case_id: str) -> str | None:

@@ -6424,7 +6424,7 @@ mod tests {
 
     #[test]
     fn test_group_by_grouping_sets_single_column_resolves() {
-        // Reduced from sql-tests/aggregate/agg_grouping_sets_v1 query 5:
+        // Reduced from tests/sql/suites/aggregate/agg_grouping_sets_v1 query 5:
         //     GROUP BY GROUPING SETS((), (k1))
         // Failed in standalone server with "Column 'k1' cannot be resolved.".
         let sql = "SELECT o_orderstatus, count(*) AS cnt \

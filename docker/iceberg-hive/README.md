@@ -65,7 +65,7 @@ The SQL test runner picks up HMS placeholders from environment variables, so
 source both runtime files before running HMS suites:
 
 ```bash
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-hms --mode verify
 ```

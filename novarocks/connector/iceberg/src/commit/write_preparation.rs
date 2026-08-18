@@ -688,7 +688,7 @@ mod tests {
     ///
     /// The `INSERT OVERWRITE` evolved-partition-spec and
     /// pre-existing-equality-delete denials are covered end to end by
-    /// `sql-tests/iceberg-ddl/sql/partition_evolution_unsupported.sql`, which
+    /// `tests/sql/suites/iceberg-ddl/sql/partition_evolution_unsupported.sql`, which
     /// asserts their messages through `@expect_error`.
     #[test]
     fn spi5m_branch_write_on_a_pre_v3_table_is_denied_by_write_preparation() {

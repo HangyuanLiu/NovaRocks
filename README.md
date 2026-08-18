@@ -260,7 +260,7 @@ Run the cross-engine Iceberg compatibility SQL suite:
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
 docker/iceberg-rest/up.sh
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-compatibility --mode verify
 ```
@@ -273,7 +273,7 @@ full guide, including required Docker images and a CI integration example.
 The SQL test runner expects a MySQL-compatible NovaRocks standalone server.
 
 ```bash
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --suite <suite> \
   --mode <verify|record|diff> \
   --query-timeout 60 \
@@ -284,7 +284,7 @@ When using the generated local environment:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg \
   --mode verify
@@ -324,7 +324,7 @@ Tests are layered by owner. Pick the layer that owns what you changed:
 | Layer | Entry point |
 | --- | --- |
 | Owner-local component tests | `cargo test -p <crate>` |
-| SQL / result / plan-shape contracts | `sql-tests` runner, see `sql-tests/README.md` |
+| SQL / result / plan-shape contracts | `novarocks-sql-test` runner, see `tests/sql/README.md` |
 | Real 1FE+3BE lifecycle, faults, recovery | `cargo run -p novarocks-system-test-runner -- --list` |
 | Server binary composition, readiness, signal | `cargo test -p novarocks-server --test server_binary_smoke` |
 | Process, log and TCP-port mechanics | `cargo test -p novarocks-test-support` |

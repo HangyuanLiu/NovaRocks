@@ -1,0 +1,18 @@
+[cluster]
+host = "127.0.0.1"
+port = "9030"
+user = "root"
+password = ""
+http_port = "8030"
+
+[env]
+url = "http://127.0.0.1:8030"
+
+[env.oss]
+oss_ak = "admin"
+oss_sk = "admin123"
+oss_endpoint = "http://127.0.0.1:9000"
+
+[env.iceberg]
+iceberg_catalog_type = "hadoop"
+iceberg_catalog_warehouse = "oss://novarocks/iceberg-catalog/"

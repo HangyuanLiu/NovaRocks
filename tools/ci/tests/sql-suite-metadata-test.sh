@@ -25,13 +25,13 @@ assert_metadata_error() {
 }
 
 duplicate_root="$tmpdir/duplicate"
-mkdir -p "$duplicate_root/sql-tests/duplicate/sql"
-printf '%s\n' 'explicit_only = true' 'explicit_only = false' >"$duplicate_root/sql-tests/duplicate/suite.toml"
+mkdir -p "$duplicate_root/tests/sql/suites/duplicate/sql"
+printf '%s\n' 'explicit_only = true' 'explicit_only = false' >"$duplicate_root/tests/sql/suites/duplicate/suite.toml"
 assert_metadata_error "$duplicate_root" duplicate
 
 unknown_field_root="$tmpdir/unknown-field"
-mkdir -p "$unknown_field_root/sql-tests/unknown-field/sql"
-printf '%s\n' 'server_mode = "native"' >"$unknown_field_root/sql-tests/unknown-field/suite.toml"
+mkdir -p "$unknown_field_root/tests/sql/suites/unknown-field/sql"
+printf '%s\n' 'server_mode = "native"' >"$unknown_field_root/tests/sql/suites/unknown-field/suite.toml"
 assert_metadata_error "$unknown_field_root" unknown-field
 
 echo "sql-suite-metadata-test: PASS"
