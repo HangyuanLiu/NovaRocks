@@ -805,7 +805,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         name_parts: &[String],
         context: MaintenanceRequestContext<'_>,
     ) -> Result<MaintenanceTarget, String> {
-        let target = novarocks::catalog_application::resolver::resolve_existing_table_target(
+        let target = crate::catalog_application::resolver::resolve_existing_table_target(
             &self.kernel,
             &novarocks_sql::syntax::ObjectName {
                 parts: name_parts.to_vec(),
@@ -856,12 +856,14 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
                     .to_string(),
             );
         }
-        if self
-            .kernel
-            .mv_storage_observation()
-            .observe_lake_package(&exact_lease, &metadata, self.connector_context.clone())
-            .map_err(|error| format!("observe Iceberg MV package for mutation guard: {error}"))?
-            .is_some()
+        if crate::mv::domain::storage_observation::observe_lake_package(
+            self.kernel.mv_storage_observation().as_ref(),
+            &exact_lease,
+            &metadata,
+            self.connector_context.clone(),
+        )
+        .map_err(|error| format!("observe Iceberg MV package for mutation guard: {error}"))?
+        .is_some()
         {
             return Err(format!(
                 "table {}.{}.{} is a materialized view; use ALTER MATERIALIZED VIEW or DROP MATERIALIZED VIEW",
@@ -1501,9 +1503,8 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         context.clone(),
     )
     .map_err(|error| format!("plan frozen rewrite source: {error}"))?;
-    let table_bindings = Arc::new(
-        novarocks::catalog_application::query_bindings::QueryTableBindingStore::try_new()?,
-    );
+    let table_bindings =
+        Arc::new(crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()?);
     let source_binding =
         crate::query_execution::distributed_rewrite::admit_frozen_rewrite_scan_binding(
             table_bindings.as_ref(),
