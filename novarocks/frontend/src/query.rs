@@ -138,6 +138,7 @@ impl CoreCommandRoute for TypedCommandRoute {
                 sql,
                 context.session().current_catalog(),
                 context.session().current_database(),
+                Some(context.execution()),
             )? {
                 Some(result) => Ok(result),
                 None => match self.backend.try_execute(sql, context.execution().role())? {

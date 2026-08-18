@@ -30,21 +30,21 @@ use crate::common::backend_topology::BackendTopologyService;
 use crate::query_execution::service::QueryExecutionService;
 use crate::statistics_jobs::application::{
     StatisticsApplicationError, StatisticsAttemptExecutor, StatisticsAttemptRequest,
-    StatisticsCollectedAttempt,
+    StatisticsCollectedAttempt, StatisticsColumnIntent, rebind_table_object,
 };
-use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorControlRegistry, ConnectorMutationOperationId, ConnectorRequestContext,
     ConnectorStatisticsLease, ConnectorTableHandle, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsCollectionRequest, StatisticsDataVersion,
-    StatisticsMetric, StatisticsMetricRequest, StatisticsPublishPreparationRequest,
-    StatisticsPublishRequest, StatisticsReconcileRequest,
+    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    StatisticsCollectionRequest, StatisticsMetric, StatisticsMetricRequest,
+    StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReconcileRequest,
 };
 
 /// Exact Frontend composition leaves retained by the durable ANALYZE worker.
-/// Each collection takes a fresh live topology snapshot, while the table and
-/// version pin are the immutable submission facts persisted by the worker.
+/// Each collection takes a fresh live topology snapshot. The worker persists
+/// only a logical target and physical object ID; a current binding, its data
+/// version, and schema columns are attempt-local facts.
 #[derive(Clone)]
 pub(crate) struct StatisticsAttemptExecutionPorts {
     execution_role: novarocks_types::ClusterRole,
@@ -90,33 +90,59 @@ impl FrontendStatisticsAttemptExecutor {
         .map_err(|error| StatisticsApplicationError::new(error.to_string()))
     }
 
-    fn table_and_version(
+    fn resolve_columns(
         request: &StatisticsAttemptRequest,
-    ) -> Result<(ConnectorTableHandle, StatisticsDataVersion), StatisticsApplicationError> {
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(
-            &request.table_pin.connector_instance_id,
-        )
-        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let table = ConnectorTableHandle::try_new(
-            instance_id,
-            Bytes::copy_from_slice(&request.table_pin.table_handle),
-        )
-        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let version =
-            StatisticsDataVersion::try_new(Bytes::copy_from_slice(&request.table_pin.data_version))
-                .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        Ok((table, version))
+        bound_columns: &[String],
+    ) -> Result<Vec<String>, StatisticsApplicationError> {
+        match &request.columns {
+            StatisticsColumnIntent::AllColumns => Ok(bound_columns.to_vec()),
+            StatisticsColumnIntent::Explicit(requested_columns) => {
+                let mut resolved = Vec::with_capacity(requested_columns.len());
+                for requested in requested_columns {
+                    let mut matches = bound_columns
+                        .iter()
+                        .filter(|bound| bound.eq_ignore_ascii_case(requested));
+                    let Some(column) = matches.next() else {
+                        return Err(StatisticsApplicationError::new(format!(
+                            "ANALYZE requested column '{requested}' does not exist on the rebound table"
+                        )));
+                    };
+                    if matches.next().is_some() {
+                        return Err(StatisticsApplicationError::new(format!(
+                            "ANALYZE requested column '{requested}' matches multiple rebound table columns"
+                        )));
+                    }
+                    if resolved
+                        .iter()
+                        .any(|existing: &String| existing.eq_ignore_ascii_case(column))
+                    {
+                        return Err(StatisticsApplicationError::new(format!(
+                            "ANALYZE requested column '{requested}' is duplicated"
+                        )));
+                    }
+                    resolved.push(column.clone());
+                }
+                Ok(resolved)
+            }
+        }
     }
 
-    fn metrics(
-        request: &StatisticsAttemptRequest,
-    ) -> Result<StatisticsMetricRequest, StatisticsApplicationError> {
+    fn metrics(columns: &[String]) -> Result<StatisticsMetricRequest, StatisticsApplicationError> {
+        let requested_metric_count = columns
+            .len()
+            .checked_mul(5)
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| {
+                StatisticsApplicationError::new(
+                    "ANALYZE requested too many connector statistics metrics",
+                )
+            })?;
+        if requested_metric_count > MAX_CONNECTOR_STATISTICS_METRICS {
+            return Err(StatisticsApplicationError::new(format!(
+                "ANALYZE requires {requested_metric_count} metrics, exceeding the connector statistics limit of {MAX_CONNECTOR_STATISTICS_METRICS}",
+            )));
+        }
         let mut metrics = vec![StatisticsMetric::RowCount];
-        let columns = if request.metric_names.is_empty() {
-            &request.table_pin.columns
-        } else {
-            &request.metric_names
-        };
         for column in columns {
             let column: Arc<str> = Arc::from(column.as_str());
             metrics.extend([
@@ -143,9 +169,9 @@ impl FrontendStatisticsAttemptExecutor {
         ConnectorMutationOperationId::from_bytes(*request.operation_id.as_bytes())
     }
 
-    fn collected<'a>(
-        collected: &'a dyn StatisticsCollectedAttempt,
-    ) -> Result<&'a FrontendStatisticsCollectedAttempt, StatisticsApplicationError> {
+    fn collected(
+        collected: &dyn StatisticsCollectedAttempt,
+    ) -> Result<&FrontendStatisticsCollectedAttempt, StatisticsApplicationError> {
         collected
             .as_any()
             .downcast_ref::<FrontendStatisticsCollectedAttempt>()
@@ -181,6 +207,7 @@ impl FrontendStatisticsAttemptExecutor {
 struct FrontendStatisticsCollectedAttempt {
     lease: ConnectorStatisticsLease,
     table: ConnectorTableHandle,
+    data_version: novarocks_spi::connector::StatisticsDataVersion,
     result: novarocks_spi::connector::StatisticsCollectionResult,
     context: ConnectorRequestContext,
 }
@@ -189,6 +216,10 @@ impl StatisticsCollectedAttempt for FrontendStatisticsCollectedAttempt {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn basis_data_version(&self) -> &novarocks_spi::connector::StatisticsDataVersion {
+        &self.data_version
+    }
 }
 
 impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
@@ -196,21 +227,29 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
         &self,
         request: &StatisticsAttemptRequest,
     ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsApplicationError> {
-        let (table, data_version) = Self::table_and_version(request)?;
-        let metrics = Self::metrics(request)?;
         let context = Self::collection_context()?;
+        let instance_id =
+            novarocks_spi::connector::ConnectorInstanceId::parse(&request.connector_instance_id)
+                .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
         let planning_lease = self
             .ports
             .connector_control
-            .acquire_current(table.owner())
+            .acquire_current(&instance_id)
             .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
+        // Rebinding and collection preparation intentionally share one current
+        // connector generation. Do not translate this error: its typed physical
+        // object binding classification must reach the durable worker unchanged.
+        let binding = rebind_table_object(&planning_lease, context.clone(), request)?;
+        let columns = Self::resolve_columns(request, &binding.sql_columns)?;
+        let metrics = Self::metrics(&columns)?;
         let lease = planning_lease
             .derive_statistics_lease()
             .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
+        let data_version = binding.data_version.clone();
         let plan = lease
             .prepare_collection(StatisticsCollectionRequest {
                 operation_id: Self::operation_id(request),
-                table: table.clone(),
+                table: binding.table.clone(),
                 data_version,
                 metrics,
                 context: context.clone(),
@@ -265,7 +304,8 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
             .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
         Ok(Box::new(FrontendStatisticsCollectedAttempt {
             lease,
-            table,
+            table: binding.table,
+            data_version: binding.data_version,
             result,
             context,
         }))

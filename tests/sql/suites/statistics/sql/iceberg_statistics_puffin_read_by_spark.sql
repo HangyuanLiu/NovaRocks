@@ -44,6 +44,9 @@ SPARK_SQL
 printf 'SPARK_STATISTICS_SOURCE_READY\n'
 
 -- query 2
+-- ANALYZE is synchronous: collection has completed before this statement
+-- returns, so the 1FE+3BE evidence belongs to this step rather than SHOW.
+-- @be_log_be_count_at_least=NOVAROCKS_STATISTICS_FRAGMENT_COLLECTED,3
 -- @skip_result_check=true
 ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.puffin_spark_${uuid0};
 
@@ -51,7 +54,6 @@ ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.puffin_
 -- @retry_count=60
 -- @retry_interval_ms=1000
 -- @result_contains=SUCCEEDED
--- @be_log_be_count_at_least=NOVAROCKS_STATISTICS_FRAGMENT_COLLECTED,3
 -- @skip_result_check=true
 SHOW ANALYZE JOBS;
 

@@ -25,15 +25,19 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use novarocks_spi::connector::{
-    CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorCancellation, ConnectorControlRegistry,
-    ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
-    ConnectorTableRequest, ConnectorTableResolution, ExternalMutationEvidence,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_METRICS,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsBasisRelation, StatisticsDataVersion,
-    StatisticsMetric, StatisticsMetricRequest, StatisticsMetricSource, StatisticsMetricState,
-    StatisticsMetricValue, StatisticsNumericNature, StatisticsReadRequest,
+    CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorCancellation, ConnectorControlPlanningLease,
+    ConnectorControlRegistry, ConnectorError, ConnectorInstanceId, ConnectorRequestContext,
+    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableObjectBinding,
+    ConnectorTableObjectBindingFailure, ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
+    ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableRequest,
+    ConnectorTableResolution, ExternalMutationEvidence, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsBasisRelation,
+    StatisticsDataVersion, StatisticsMetric, StatisticsMetricRequest, StatisticsMetricSource,
+    StatisticsMetricState, StatisticsMetricValue, StatisticsNumericNature, StatisticsReadRequest,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -44,28 +48,56 @@ pub struct StatisticsTableTarget {
     pub table: String,
 }
 
-/// Portable immutable table/version pin that the frontend may persist in a
-/// durable ANALYZE job. It contains opaque provider bytes only—never a reader,
-/// scan artifact, sketch, or executable runtime object.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StatisticsTablePin {
-    pub connector_instance_id: String,
-    pub table_handle: Vec<u8>,
-    pub data_version: Vec<u8>,
-    /// Resolved base-table column names from the same metadata snapshot as
-    /// the handle/data-version pair. Empty `ANALYZE TABLE` uses this list;
-    /// the worker must never load latest schema merely to expand `*`.
-    pub columns: Vec<String>,
+/// Column-selection intent retained by a durable ANALYZE job.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum StatisticsColumnIntent {
+    /// The attempt expands all SQL-visible columns from its freshly rebound schema.
+    AllColumns,
+    /// Explicit SQL column names supplied by the statement.
+    Explicit(Vec<String>),
 }
 
-/// The frontend resolves a logical ANALYZE target exactly once. The frontend invokes
-/// this before creating a job and persists the returned pin; background work
-/// has no latest-name resolution capability.
+/// Submission-time observation of an ANALYZE target.
+///
+/// `sql_columns` is only for immediate statement validation. It must never be
+/// persisted: an attempt derives its own column set after identity-gated rebind.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatisticsTargetCapture {
+    pub connector_instance_id: String,
+    pub namespace: String,
+    pub table: String,
+    pub object_id: Vec<u8>,
+    pub sql_columns: Vec<String>,
+}
+
+/// One durable-worker request. It carries only logical identity, physical
+/// object identity, and collection intent; provider handles and versions are
+/// strictly attempt-local.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatisticsAttemptRequest {
+    pub operation_id: Uuid,
+    pub connector_instance_id: String,
+    pub namespace: String,
+    pub table: String,
+    pub object_id: Vec<u8>,
+    pub columns: StatisticsColumnIntent,
+}
+
+/// Identity-gated current binding retained only within one attempt and its
+/// planning lease lifetime. It must never be stored in StateStore.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatisticsAttemptBinding {
+    pub table: novarocks_spi::connector::ConnectorTableHandle,
+    pub data_version: StatisticsDataVersion,
+    pub sql_columns: Vec<String>,
+}
+
+/// The frontend captures a logical ANALYZE target before durable job creation.
 pub trait StatisticsTargetResolver: Send + Sync {
-    fn resolve_table_pin(
+    fn capture_table_object(
         &self,
         target: &StatisticsTableTarget,
-    ) -> Result<StatisticsTablePin, StatisticsApplicationError>;
+    ) -> Result<StatisticsTargetCapture, StatisticsApplicationError>;
 }
 
 /// Frontend composition sink installed before engine open. Frontend composition calls it once
@@ -98,21 +130,15 @@ pub trait StatisticsTableReaderSink: Send + Sync {
     ) -> Result<(), String>;
 }
 
-/// Durable worker input expressed without any frontend repository type.  The
-/// table/version pin was fixed at ANALYZE submission; the worker must not turn this
-/// back into a name lookup when an attempt eventually runs.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StatisticsAttemptRequest {
-    pub operation_id: Uuid,
-    pub table_pin: StatisticsTablePin,
-    pub metric_names: Vec<String>,
-}
-
 /// Attempt-local material retained only by the execution/publish boundary.
 /// It is deliberately opaque to the durable frontend: StateStore persists
 /// just the separately prepared reconciliation evidence.
 pub trait StatisticsCollectedAttempt: Send + Sync {
     fn as_any(&self) -> &dyn Any;
+
+    /// The rebound provider version collected by this exact attempt. It is
+    /// retained only until the worker atomically records the publish boundary.
+    fn basis_data_version(&self) -> &StatisticsDataVersion;
 }
 
 /// Frontend-owned implementation of provider-native collection and
@@ -166,10 +192,10 @@ impl ConnectorStatisticsTargetResolver {
 }
 
 impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
-    fn resolve_table_pin(
+    fn capture_table_object(
         &self,
         target: &StatisticsTableTarget,
-    ) -> Result<StatisticsTablePin, StatisticsApplicationError> {
+    ) -> Result<StatisticsTargetCapture, StatisticsApplicationError> {
         let context = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
             Arc::new(NeverCancelled),
@@ -177,38 +203,89 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
         .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let metadata = load_statistics_table_metadata(
-            self.controls.as_ref(),
-            context,
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-            ConnectorTableResolution::StrictBaseTable,
-        )
-        .map_err(StatisticsApplicationError::new)?;
-        let data_version = metadata.statistics_data_version.clone().ok_or_else(|| {
-            StatisticsApplicationError::new(
-                "connector metadata did not provide a statistics data-version pin",
-            )
-        })?;
-        Ok(StatisticsTablePin {
-            connector_instance_id: metadata.table.owner().as_str().to_string(),
-            table_handle: metadata.table.payload().to_vec(),
-            data_version: data_version.as_bytes().to_vec(),
-            columns: metadata
-                .schema
-                .fields()
-                .iter()
-                .filter(|field| {
-                    field
-                        .metadata()
-                        .get(CONNECTOR_FIELD_HIDDEN_FROM_SQL)
-                        .is_none_or(|value| !value.eq_ignore_ascii_case("true"))
-                })
-                .map(|field| field.name().to_string())
-                .collect(),
+        let instance_id = ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+        let lease = self
+            .controls
+            .acquire_current(&instance_id)
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+        let captured = lease
+            .binding()
+            .metadata()
+            .capture_table_object_binding(ConnectorTableObjectCaptureRequest {
+                table: ConnectorTableIdentity {
+                    instance_id,
+                    namespace: Arc::from(target.namespace.as_str()),
+                    table: Arc::from(target.table.as_str()),
+                },
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                selector: ConnectorTableObjectSelector::Current,
+                context,
+            })
+            .map_err(StatisticsApplicationError::from_connector_error)?;
+        Ok(StatisticsTargetCapture {
+            connector_instance_id: captured.metadata.table.owner().as_str().to_string(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            object_id: captured.object_id.as_bytes().to_vec(),
+            sql_columns: sql_visible_columns(&captured.metadata.schema),
         })
     }
+}
+
+/// Rebind a durable request through the caller's existing planning lease.
+///
+/// This keeps metadata rebinding and statistics preparation in one connector
+/// generation, and the returned provider facts remain attempt-local.
+pub(crate) fn rebind_table_object(
+    lease: &ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    request: &StatisticsAttemptRequest,
+) -> Result<StatisticsAttemptBinding, StatisticsApplicationError> {
+    let instance_id = ConnectorInstanceId::parse(&request.connector_instance_id)
+        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+    let expected_object_id =
+        ConnectorTableObjectId::try_new(Bytes::copy_from_slice(&request.object_id))
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+    let ConnectorTableObjectBinding { metadata, .. } = lease
+        .binding()
+        .metadata()
+        .rebind_table_object_binding(ConnectorTableObjectRebindRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(request.namespace.as_str()),
+                table: Arc::from(request.table.as_str()),
+            },
+            expected_object_id,
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context,
+        })
+        .map_err(StatisticsApplicationError::from_connector_error)?;
+    let data_version = metadata.statistics_data_version.clone().ok_or_else(|| {
+        StatisticsApplicationError::new(
+            "connector metadata did not provide a statistics data-version for rebound table",
+        )
+    })?;
+    Ok(StatisticsAttemptBinding {
+        table: metadata.table,
+        data_version,
+        sql_columns: sql_visible_columns(&metadata.schema),
+    })
+}
+
+fn sql_visible_columns(schema: &arrow::datatypes::SchemaRef) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .filter(|field| {
+            field
+                .metadata()
+                .get(CONNECTOR_FIELD_HIDDEN_FROM_SQL)
+                .is_none_or(|value| !value.eq_ignore_ascii_case("true"))
+        })
+        .map(|field| field.name().to_string())
+        .collect()
 }
 
 pub struct ConnectorStatisticsTableReader {
@@ -241,20 +318,8 @@ impl StatisticsTableReader for ConnectorStatisticsTableReader {
                 "connector metadata did not provide a statistics data-version pin",
             )
         })?;
-        let requested_metric_count = 1usize.saturating_add(
-            metadata
-                .schema
-                .fields()
-                .iter()
-                .filter(|field| {
-                    field
-                        .metadata()
-                        .get(CONNECTOR_FIELD_HIDDEN_FROM_SQL)
-                        .is_none_or(|value| !value.eq_ignore_ascii_case("true"))
-                })
-                .count()
-                .saturating_mul(5),
-        );
+        let sql_columns = sql_visible_columns(&metadata.schema);
+        let requested_metric_count = 1usize.saturating_add(sql_columns.len().saturating_mul(5));
         if requested_metric_count > MAX_CONNECTOR_STATISTICS_METRICS {
             return Err(StatisticsApplicationError::new(format!(
                 "SHOW TABLE STATS requires {requested_metric_count} metrics, exceeding the connector statistics limit of {MAX_CONNECTOR_STATISTICS_METRICS}",
@@ -262,13 +327,8 @@ impl StatisticsTableReader for ConnectorStatisticsTableReader {
         }
         let mut metrics = Vec::with_capacity(requested_metric_count);
         metrics.push(StatisticsMetric::RowCount);
-        for field in metadata.schema.fields().iter().filter(|field| {
-            field
-                .metadata()
-                .get(CONNECTOR_FIELD_HIDDEN_FROM_SQL)
-                .is_none_or(|value| !value.eq_ignore_ascii_case("true"))
-        }) {
-            let name: Arc<str> = Arc::from(field.name().as_str());
+        for column in sql_columns {
+            let name: Arc<str> = Arc::from(column);
             metrics.extend([
                 StatisticsMetric::NullCount {
                     column: Arc::clone(&name),
@@ -457,7 +517,7 @@ impl ConnectorCancellation for NeverCancelled {
 pub enum StatisticsApplicationCommand {
     AnalyzeTable {
         target: StatisticsTableTarget,
-        columns: Vec<String>,
+        columns: StatisticsColumnIntent,
     },
     ShowAnalyzeJobs,
     CancelAnalyze {
@@ -475,6 +535,8 @@ pub struct StatisticsJobView {
     pub state: String,
     pub attempt: u32,
     pub target: StatisticsTableTarget,
+    pub error_kind: Option<String>,
+    pub error_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -503,6 +565,7 @@ pub trait StatisticsApplicationPort: Send + Sync {
     fn execute(
         &self,
         command: StatisticsApplicationCommand,
+        execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     ) -> Result<StatisticsApplicationResult, StatisticsApplicationError>;
 }
 
@@ -513,6 +576,7 @@ impl StatisticsApplicationPort for UnavailableStatisticsApplicationPort {
     fn execute(
         &self,
         _command: StatisticsApplicationCommand,
+        _execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     ) -> Result<StatisticsApplicationResult, StatisticsApplicationError> {
         Err(StatisticsApplicationError::new(
             "unified statistics application service is not installed",
@@ -525,6 +589,7 @@ pub struct StatisticsApplicationError {
     message: String,
     retryable: bool,
     requires_reconcile: bool,
+    target_binding_failure: Option<ConnectorTableObjectBindingFailure>,
 }
 
 impl StatisticsApplicationError {
@@ -533,6 +598,7 @@ impl StatisticsApplicationError {
             message: message.into(),
             retryable: false,
             requires_reconcile: false,
+            target_binding_failure: None,
         }
     }
 
@@ -541,6 +607,7 @@ impl StatisticsApplicationError {
             message: message.into(),
             retryable: true,
             requires_reconcile: false,
+            target_binding_failure: None,
         }
     }
 
@@ -549,6 +616,25 @@ impl StatisticsApplicationError {
             message: message.into(),
             retryable: false,
             requires_reconcile: true,
+            target_binding_failure: None,
+        }
+    }
+
+    fn from_connector_error(error: ConnectorError) -> Self {
+        let target_binding_failure = error.table_object_binding_failure();
+        let retryable = target_binding_failure.is_none()
+            && (error.retryable_before_progress()
+                || matches!(
+                    error.kind(),
+                    novarocks_spi::connector::ConnectorErrorKind::Unavailable
+                        | novarocks_spi::connector::ConnectorErrorKind::DeadlineExceeded
+                        | novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted
+                ));
+        Self {
+            message: error.to_string(),
+            retryable,
+            requires_reconcile: false,
+            target_binding_failure,
         }
     }
 
@@ -558,6 +644,10 @@ impl StatisticsApplicationError {
 
     pub const fn requires_reconcile(&self) -> bool {
         self.requires_reconcile
+    }
+
+    pub const fn target_binding_failure(&self) -> Option<ConnectorTableObjectBindingFailure> {
+        self.target_binding_failure
     }
 }
 

@@ -101,11 +101,16 @@ impl StatisticsAttemptError {
 /// only the separately prepared reconciliation evidence is durable.
 pub trait StatisticsCollectedAttempt: Send + Sync {
     fn as_any(&self) -> &dyn Any;
+    fn basis_data_version(&self) -> &[u8];
 }
 
 impl StatisticsCollectedAttempt for () {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn basis_data_version(&self) -> &[u8] {
+        b"unit-test-basis"
     }
 }
 
@@ -582,7 +587,13 @@ async fn process_submitted(
             .try_to_wire_v1()
             .map_err(|error| format!("encode statistics publication evidence: {error}"))?;
         let publishing = repository
-            .begin_publishing(running.job_id, now_unix_millis(), evidence_wire, fence)
+            .begin_publishing(
+                running.job_id,
+                now_unix_millis(),
+                evidence_wire,
+                Bytes::copy_from_slice(collected.basis_data_version()),
+                fence,
+            )
             .await
             .map_err(|error| {
                 format!(
@@ -650,6 +661,30 @@ async fn resolve_collection_error(
     error: StatisticsAttemptError,
     fence: &FenceValidator,
 ) -> Result<(), String> {
+    if matches!(
+        error.kind,
+        StatisticsJobErrorKind::TargetReplaced | StatisticsJobErrorKind::TargetMissing
+    ) {
+        // A typed binding failure means the persisted physical target was
+        // replaced or disappeared, so retrying could attach ANALYZE to another table.
+        repository
+            .transition(
+                job.job_id,
+                StatisticsJobState::Running,
+                StatisticsJobState::Stale,
+                now_unix_millis(),
+                Some(job_error(&error)),
+                fence,
+            )
+            .await
+            .map_err(|repository_error| {
+                format!(
+                    "record stale statistics job {} failed: {repository_error}",
+                    job.job_id
+                )
+            })?;
+        return Ok(());
+    }
     if error.transient && job.attempt < MAX_STATISTICS_ATTEMPTS {
         let now_ms = now_unix_millis();
         repository

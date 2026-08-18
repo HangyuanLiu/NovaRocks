@@ -22,9 +22,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use novarocks_frontend::statistics_jobs::application::{
+    StatisticsColumnIntent, StatisticsTargetCapture,
+};
 use novarocks_frontend::statistics_jobs::model::{
     StatisticsJobCreate, StatisticsJobError, StatisticsJobErrorKind, StatisticsJobState,
-    StatisticsJobTablePin, StatisticsJobTarget,
+    StatisticsJobTarget,
 };
 use novarocks_frontend::statistics_jobs::repository::{
     FenceValidator, StatisticsJobRepository, StatisticsJobRepositoryErrorKind,
@@ -131,13 +134,9 @@ fn request(table: &str, submitted_at_ms: i64) -> StatisticsJobCreate {
             namespace: "db".to_string(),
             table: table.to_string(),
         },
-        table_pin: StatisticsJobTablePin {
-            connector_instance_id: "ice".to_string(),
-            table_handle: format!("table:{table}").into_bytes(),
-            data_version: b"snapshot:1".to_vec(),
-            columns: vec!["v".to_string()],
-        },
-        metric_names: vec!["row_count".to_string(), "ndv".to_string()],
+        connector_instance_id: "ice".to_string(),
+        object_id: format!("object:{table}").into_bytes(),
+        columns: StatisticsColumnIntent::Explicit(vec!["v".to_string()]),
         submitted_at_ms,
     }
 }
@@ -222,9 +221,12 @@ async fn records_are_versioned_durable_and_identical_analyze_requests_remain_dis
 
     assert_ne!(first.job_id, second.job_id);
     assert_ne!(first.operation_id, second.operation_id);
-    assert_eq!(first.table_pin.connector_instance_id, "ice");
-    assert_eq!(first.table_pin.table_handle, b"table:orders");
-    assert_eq!(first.table_pin.data_version, b"snapshot:1");
+    assert_eq!(first.connector_instance_id, "ice");
+    assert_eq!(first.object_id, b"object:orders");
+    assert_eq!(
+        first.columns,
+        StatisticsColumnIntent::Explicit(vec!["v".to_string()])
+    );
     assert_eq!(first.job_id.get_version_num(), 7);
     assert_eq!(first.operation_id.get_version_num(), 7);
     assert_eq!(
@@ -240,11 +242,39 @@ async fn records_are_versioned_durable_and_identical_analyze_requests_remain_dis
     assert!(
         payloads
             .iter()
-            .any(|payload| payload.contains("\"schema_version\":2"))
+            .any(|payload| payload.contains("\"schema_version\":3"))
     );
-    for forbidden in ["artifact", "sketch", "runtime_handle", "record_batch"] {
+    for forbidden in [
+        "artifact",
+        "sketch",
+        "runtime_handle",
+        "record_batch",
+        "table_handle",
+        "\"data_version\"",
+        "sql_columns",
+    ] {
         assert!(payloads.iter().all(|payload| !payload.contains(forbidden)));
     }
+}
+
+#[tokio::test]
+async fn durable_column_intent_preserves_all_columns_and_rejects_empty_explicit_list() {
+    let (_temp, _store, repository) = fixture().await;
+    let mut all_columns = request("all_columns", 10);
+    all_columns.columns = StatisticsColumnIntent::AllColumns;
+    let created = repository
+        .create(all_columns)
+        .await
+        .expect("persist all-columns intent");
+    assert_eq!(created.columns, StatisticsColumnIntent::AllColumns);
+
+    let mut empty_explicit = request("empty_explicit", 11);
+    empty_explicit.columns = StatisticsColumnIntent::Explicit(Vec::new());
+    let error = repository
+        .create(empty_explicit)
+        .await
+        .expect_err("empty explicit intent must not become all-columns");
+    assert_eq!(error.kind(), StatisticsJobRepositoryErrorKind::Corruption);
 }
 
 #[tokio::test]
@@ -265,7 +295,7 @@ async fn record_budget_failure_is_typed_and_leaves_no_job_or_index_write() {
         Some("statistics-job")
     );
     let budget = error.budget().expect("typed record budget details");
-    assert_eq!(budget.schema_version, 2);
+    assert_eq!(budget.schema_version, 3);
     assert!(budget.actual_bytes > budget.limit_bytes);
     assert_eq!(budget.limit_bytes, 1);
     assert!(stored_payloads(store.as_ref()).await.is_empty());
@@ -284,7 +314,10 @@ async fn unsupported_stored_schema_fails_closed() {
         .get(created.job_id)
         .await
         .expect_err("unknown durable schema must not be decoded");
-    assert_eq!(error.kind(), StatisticsJobRepositoryErrorKind::Corruption);
+    assert_eq!(
+        error.kind(),
+        StatisticsJobRepositoryErrorKind::UnsupportedSchemaVersion
+    );
     assert!(error.to_string().contains("unsupported schema version"));
 }
 
@@ -318,6 +351,10 @@ struct SucceedingStatisticsExecutor {
 }
 
 struct TransientlyFailingStatisticsExecutor {
+    attempts: AtomicUsize,
+}
+
+struct ReplacedTargetStatisticsExecutor {
     attempts: AtomicUsize,
 }
 
@@ -399,6 +436,44 @@ impl StatisticsAttemptExecutor for TransientlyFailingStatisticsExecutor {
     }
 }
 
+impl StatisticsAttemptExecutor for ReplacedTargetStatisticsExecutor {
+    fn collect(
+        &self,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+    ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsAttemptError> {
+        self.attempts.fetch_add(1, Ordering::AcqRel);
+        Err(StatisticsAttemptError::permanent(
+            StatisticsJobErrorKind::TargetReplaced,
+            "captured table object was replaced",
+        ))
+    }
+
+    fn prepare_publish(
+        &self,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        _collected: &dyn StatisticsCollectedAttempt,
+    ) -> Result<ExternalMutationEvidence, StatisticsAttemptError> {
+        panic!("replaced target must not enter publish")
+    }
+
+    fn publish(
+        &self,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        _collected: &dyn StatisticsCollectedAttempt,
+        _evidence: &ExternalMutationEvidence,
+    ) -> Result<(), StatisticsAttemptError> {
+        panic!("replaced target must not enter publish")
+    }
+
+    fn reconcile(
+        &self,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        _evidence: &ExternalMutationEvidence,
+    ) -> Result<(), StatisticsAttemptError> {
+        panic!("replaced target must not reconcile")
+    }
+}
+
 impl StatisticsAttemptExecutor for SucceedingStatisticsExecutor {
     fn collect(
         &self,
@@ -475,6 +550,58 @@ async fn worker_claims_collects_and_publishes_under_the_fenced_lease() {
 
     assert_eq!(concrete_executor.collected.load(Ordering::Acquire), 1);
     assert_eq!(concrete_executor.published.load(Ordering::Acquire), 1);
+    let succeeded = repository
+        .get(job.job_id)
+        .await
+        .expect("read succeeded job")
+        .expect("durable succeeded job");
+    assert_eq!(
+        succeeded.basis_data_version,
+        Some(b"unit-test-basis".to_vec())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_marks_typed_replaced_target_stale_without_retrying() {
+    let (_temp, _store, repository) = fixture().await;
+    let job = repository
+        .create(request("replaced_worker_orders", 10))
+        .await
+        .expect("create job");
+    let concrete_executor = Arc::new(ReplacedTargetStatisticsExecutor {
+        attempts: AtomicUsize::new(0),
+    });
+    let executor: Arc<dyn StatisticsAttemptExecutor> = concrete_executor.clone();
+    let mut worker = StatisticsAnalyzeWorker::start(
+        &tokio::runtime::Handle::current(),
+        Arc::new(repository.clone()),
+        executor,
+    )
+    .await
+    .expect("start worker");
+
+    let stale = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = repository
+                .get(job.job_id)
+                .await
+                .expect("read job")
+                .expect("durable job");
+            if current.state == StatisticsJobState::Stale {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("worker must mark replaced target stale");
+    worker.shutdown().expect("shutdown worker");
+
+    assert_eq!(concrete_executor.attempts.load(Ordering::Acquire), 1);
+    assert_eq!(
+        stale.error.map(|error| error.kind),
+        Some(StatisticsJobErrorKind::TargetReplaced)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -587,6 +714,7 @@ async fn worker_reconciles_publishing_without_recollecting() {
             publication_evidence(&created)
                 .try_to_wire_v1()
                 .expect("encode test evidence"),
+            Bytes::from_static(b"basis-v1"),
             &fence,
         )
         .await
@@ -717,6 +845,7 @@ async fn claim_transitions_with_fence_and_cancel_observes_publish_boundary() {
             publication_evidence(&created)
                 .try_to_wire_v1()
                 .expect("encode test evidence"),
+            Bytes::from_static(b"basis-v1"),
             &fence,
         )
         .await
@@ -784,24 +913,25 @@ impl RecordingStatisticsTargetResolver {
 }
 
 impl StatisticsJobTargetResolver for StaticStatisticsTargetResolver {
-    fn resolve_table_pin(
+    fn capture_table_object(
         &self,
         target: &StatisticsJobTarget,
-    ) -> Result<StatisticsJobTablePin, String> {
-        Ok(StatisticsJobTablePin {
+    ) -> Result<StatisticsTargetCapture, String> {
+        Ok(StatisticsTargetCapture {
             connector_instance_id: target.catalog.clone(),
-            table_handle: format!("table:{}:{}", target.namespace, target.table).into_bytes(),
-            data_version: b"snapshot:1".to_vec(),
-            columns: vec!["v".to_string()],
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            object_id: format!("object:{}:{}", target.namespace, target.table).into_bytes(),
+            sql_columns: vec!["v".to_string()],
         })
     }
 }
 
 impl StatisticsJobTargetResolver for RecordingStatisticsTargetResolver {
-    fn resolve_table_pin(
+    fn capture_table_object(
         &self,
         target: &StatisticsJobTarget,
-    ) -> Result<StatisticsJobTablePin, String> {
+    ) -> Result<StatisticsTargetCapture, String> {
         self.calls
             .lock()
             .expect("statistics target calls")
@@ -812,15 +942,16 @@ impl StatisticsJobTargetResolver for RecordingStatisticsTargetResolver {
                 target.catalog, target.namespace, target.table
             ));
         }
-        Ok(StatisticsJobTablePin {
+        Ok(StatisticsTargetCapture {
             connector_instance_id: "statistics-test".to_string(),
-            table_handle: format!(
-                "table:{}:{}:{}",
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            object_id: format!(
+                "object:{}:{}:{}",
                 target.catalog, target.namespace, target.table
             )
             .into_bytes(),
-            data_version: b"snapshot:1".to_vec(),
-            columns: vec!["value".to_string()],
+            sql_columns: vec!["value".to_string()],
         })
     }
 }
@@ -865,7 +996,7 @@ async fn typed_application_never_reparses_sql_and_keeps_reads_available_without_
         .execute(
             StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
                 target: target.clone(),
-                metric_names: Vec::new(),
+                columns: StatisticsColumnIntent::AllColumns,
             }),
             10,
             &table_statistics,
@@ -886,7 +1017,7 @@ async fn typed_application_never_reparses_sql_and_keeps_reads_available_without_
         .execute(
             StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
                 target: target.clone(),
-                metric_names: Vec::new(),
+                columns: StatisticsColumnIntent::AllColumns,
             }),
             11,
             &table_statistics,
@@ -896,7 +1027,7 @@ async fn typed_application_never_reparses_sql_and_keeps_reads_available_without_
     assert!(matches!(
         submitted,
         StatisticsStatementResult::JobSubmitted(ref job)
-            if job.metric_names == vec!["v".to_string()]
+            if job.columns == StatisticsColumnIntent::AllColumns
     ));
     let listed = service
         .execute(
@@ -949,7 +1080,7 @@ async fn sqlx2_application_analyze_target_resolution_preserves_admitted_external
             .execute(
                 StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
                     target: target.clone(),
-                    metric_names: Vec::new(),
+                    columns: StatisticsColumnIntent::AllColumns,
                 }),
                 100 + index as i64,
                 &table_statistics,
@@ -960,10 +1091,10 @@ async fn sqlx2_application_analyze_target_resolution_preserves_admitted_external
             submitted,
             StatisticsStatementResult::JobSubmitted(job)
                 if job.target == target
-                    && job.table_pin.table_handle
-                        == format!("table:{}:{}:{}", target.catalog, target.namespace, target.table)
+                    && job.object_id
+                        == format!("object:{}:{}:{}", target.catalog, target.namespace, target.table)
                             .into_bytes()
-                    && job.metric_names == vec!["value".to_string()]
+                    && job.columns == StatisticsColumnIntent::AllColumns
         ));
     }
 
@@ -993,7 +1124,7 @@ async fn sqlx2_application_analyze_unknown_target_fails_before_durable_job_creat
         .execute(
             StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
                 target: target.clone(),
-                metric_names: Vec::new(),
+                columns: StatisticsColumnIntent::AllColumns,
             }),
             200,
             &table_statistics,

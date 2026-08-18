@@ -115,6 +115,7 @@ code-anchors:
 - ADR-0080 — 统计证据为何拆成 collection 级覆盖度与 per-metric 基准版本/来源/数值性质/集合关系四个独立维度（active）
 - ADR-0081 — 统计为何是带版本、允许陈旧、由读侧逐 metric 决定可用性的估计事实（active）
 - ADR-0082 — 同一快照上的统计发布为何以覆盖度排序、且冲突重试必须重新判定（active）
+- ADR-0084 — durable statistics job 为何持久化逻辑目标、物理对象 ID 与列意图，并在 attempt 时解析当前数据版本（active）
 
 #### 历史
 
