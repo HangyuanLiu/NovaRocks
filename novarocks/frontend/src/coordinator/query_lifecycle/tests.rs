@@ -26,9 +26,9 @@ use crate::native::fragment_transport::{
 use crate::native::transport::new_query_lifecycle_transport;
 use crate::query_execution::contract::DistributedQueryIntent;
 use crate::query_execution::lifecycle_plan::{QueryInitBarrier, QueryInitPlan};
+use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
 use ::novarocks::common::backend_topology::LiveBackendTarget;
 use ::novarocks::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
-use ::novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_protocol::lifecycle as protocol_lifecycle;
 use novarocks_protocol::lifecycle::{
     AttemptId, FragmentLiveObservation, ParticipantBackendIdentity, ParticipantManifest,

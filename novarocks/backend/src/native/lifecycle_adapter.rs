@@ -23,7 +23,6 @@ use std::sync::{Mutex, OnceLock};
 
 use tokio_stream::wrappers::ReceiverStream;
 
-use novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_protocol::lifecycle::{
     ContractError, ContractErrorCode, QueryAbortRequest, QueryControlAttach,
     QueryControlCommand as ProtocolQueryControlCommand, QueryControlEvent, QueryExecutionId,
@@ -32,7 +31,9 @@ use novarocks_protocol::lifecycle::{
 };
 use novarocks_protocol::novarocks as proto;
 
-use crate::query_lifecycle::{BackendQueryControl, QueryLifecycleIngress};
+use crate::query_lifecycle::{
+    BackendQueryControl, QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress,
+};
 
 const CONTROL_STREAM_CAPACITY: usize = 16;
 

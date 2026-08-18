@@ -25,12 +25,12 @@ use std::collections::BTreeSet;
 
 use novarocks_protocol::lifecycle::QueryTerminalSnapshot as ProtocolQueryTerminalSnapshot;
 
+use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
 use ::novarocks::query_lifecycle::terminal::{
     FragmentTerminalOutcome, FragmentTerminalSnapshot, QueryTerminalSnapshot,
     decode_fragment_terminal_profile_telemetry,
     decode_query_terminal_profile_contribution_telemetry,
 };
-use ::novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_protocol::lifecycle::{
     ParticipantBackendIdentity, ParticipantManifestDigest, QueryExecutionId,
 };
@@ -51,7 +51,7 @@ impl QueryTerminalSet {
         });
         let mut identities = BTreeSet::new();
         for snapshot in &snapshots {
-            snapshot.validate()?;
+            snapshot.validate().map_err(map_legacy_terminal_error)?;
             let identity = (
                 snapshot.execution_id(),
                 snapshot.backend().backend_id(),
@@ -171,7 +171,8 @@ fn decode_protocol_terminal_snapshot_projection(
                         "terminal fragment profile telemetry is required",
                     )
                 })?,
-            )?;
+            )
+            .map_err(map_legacy_terminal_error)?;
             FragmentTerminalSnapshot::new_with_profile_telemetry(
                 novarocks_types::UniqueId::new(id.hi, id.lo),
                 fragment.backend_num,
@@ -179,8 +180,11 @@ fn decode_protocol_terminal_snapshot_projection(
                 sink,
                 profile,
             )
+            .map_err(map_legacy_terminal_error)
             .and_then(|snapshot| {
-                snapshot.with_statistics_payload(fragment.statistics_payload.clone())
+                snapshot
+                    .with_statistics_payload(fragment.statistics_payload.clone())
+                    .map_err(map_legacy_terminal_error)
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -190,7 +194,8 @@ fn decode_protocol_terminal_snapshot_projection(
                 "query terminal profile contribution telemetry is required",
             )
         })?,
-    )?;
+    )
+    .map_err(map_legacy_terminal_error)?;
     QueryTerminalSnapshot::new_with_profile_telemetry(
         value
             .execution_id
@@ -215,4 +220,37 @@ fn decode_protocol_terminal_snapshot_projection(
         fragments,
         profile_contribution,
     )
+    .map_err(map_legacy_terminal_error)
+}
+
+/// T2 keeps this conversion private while `terminal_set` still consumes the
+/// legacy Core terminal projection. T4a removes both the projection and this
+/// compatibility edge when it switches the fold to Protocol values.
+fn map_legacy_terminal_error(
+    error: ::novarocks::query_lifecycle::QueryLifecycleError,
+) -> QueryLifecycleError {
+    let code = match error.code() {
+        ::novarocks::query_lifecycle::QueryLifecycleErrorCode::InvalidManifest => {
+            QueryLifecycleErrorCode::InvalidManifest
+        }
+        ::novarocks::query_lifecycle::QueryLifecycleErrorCode::Conflict => {
+            QueryLifecycleErrorCode::Conflict
+        }
+        ::novarocks::query_lifecycle::QueryLifecycleErrorCode::StaleBackend => {
+            QueryLifecycleErrorCode::StaleBackend
+        }
+        ::novarocks::query_lifecycle::QueryLifecycleErrorCode::Capacity => {
+            QueryLifecycleErrorCode::Capacity
+        }
+        ::novarocks::query_lifecycle::QueryLifecycleErrorCode::Terminated => {
+            QueryLifecycleErrorCode::Terminated
+        }
+        ::novarocks::query_lifecycle::QueryLifecycleErrorCode::Transport => {
+            QueryLifecycleErrorCode::Transport
+        }
+        ::novarocks::query_lifecycle::QueryLifecycleErrorCode::Internal => {
+            QueryLifecycleErrorCode::Internal
+        }
+    };
+    QueryLifecycleError::new(code, error.detail())
 }

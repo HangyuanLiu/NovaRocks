@@ -27,7 +27,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime_filter::{
     RuntimeFilterBindOutcome, RuntimeFilterContractViolation, RuntimeFilterContractViolationKind,
@@ -63,6 +62,7 @@ use crate::native::runtime_filter_sender::{
     BackendRuntimeFilterSinkCompletion, BackendRuntimeFilterSinkSubmitOutcome,
     BackendRuntimeFilterUnaryError, GrpcRuntimeFilterEnvelopeSink,
 };
+use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use crate::runtime_filter::artifact_query::BackendRuntimeFilterArtifactQuery;
 use crate::runtime_filter::codec::{artifact as artifact_codec, producer as producer_codec};
 

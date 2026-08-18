@@ -23,13 +23,69 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_protocol::lifecycle::{
     FragmentLiveObservation, ParticipantTerminalOutcome, QueryAbortRequest, QueryControlAttach,
     QueryControlEndpoint, QueryControlEvent, QueryInitAck, QueryInitRequest, QueryStageAck,
     QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome, QueryStartRequest,
     QueryTerminalAck, QueryTerminalReportAck, QueryTerminationAck, QueryTerminationReason,
 };
+
+/// Backend-local lifecycle failure categories.
+///
+/// Protocol owns only structural contract validation. Registry state,
+/// liveness, transport, and admission failures remain Backend concerns and
+/// keep the established native status mapping at the RPC boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueryLifecycleErrorCode {
+    InvalidManifest,
+    Conflict,
+    StaleBackend,
+    Capacity,
+    Terminated,
+    Transport,
+    Internal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QueryLifecycleError {
+    code: QueryLifecycleErrorCode,
+    detail: String,
+}
+
+impl QueryLifecycleError {
+    pub(crate) fn new(code: QueryLifecycleErrorCode, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn invalid_manifest(detail: impl Into<String>) -> Self {
+        Self::new(QueryLifecycleErrorCode::InvalidManifest, detail)
+    }
+
+    pub(crate) const fn code(&self) -> QueryLifecycleErrorCode {
+        self.code
+    }
+
+    pub(crate) fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl std::fmt::Display for QueryLifecycleError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:?}: {}", self.code, self.detail)
+    }
+}
+
+impl std::error::Error for QueryLifecycleError {}
+
+impl From<novarocks_protocol::lifecycle::ContractError> for QueryLifecycleError {
+    fn from(error: novarocks_protocol::lifecycle::ContractError) -> Self {
+        Self::invalid_manifest(error.detail())
+    }
+}
 
 pub(crate) trait BackendQueryControl: Send + Sync + 'static {
     fn heartbeat(&self, sequence: u64) -> Result<(), QueryLifecycleError>;

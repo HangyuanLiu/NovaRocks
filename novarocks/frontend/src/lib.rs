@@ -34,6 +34,7 @@ mod native;
 pub mod query;
 pub mod query_control;
 pub mod query_execution;
+mod query_lifecycle_error;
 pub mod runtime_filter;
 mod server;
 pub mod statistics;
@@ -60,6 +61,7 @@ pub use mysql::{
 };
 pub use native::report_server::FrontendReportServerHandle;
 pub use query::FrontendQueryService;
+pub use query_lifecycle_error::{QueryLifecycleError, QueryLifecycleErrorCode};
 pub use server::{
     FrontendServerConfig, build_frontend_query_session_factory,
     open_frontend_application_for_server, run_frontend_server, run_frontend_server_until_shutdown,

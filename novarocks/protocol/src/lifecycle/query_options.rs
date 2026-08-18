@@ -61,6 +61,8 @@ fn validate_spill_options(raw: &novarocks::QueryOptions) -> Result<(), ContractE
 
 #[cfg(test)]
 mod tests {
+    use prost::Message;
+
     use super::QueryOptions;
     use crate::lifecycle::error::ContractErrorCode;
     use crate::novarocks;
@@ -77,6 +79,10 @@ mod tests {
         let parsed = QueryOptions::parse(raw.clone()).expect("valid wire options");
 
         assert_eq!(parsed.as_proto(), &raw);
+        assert_eq!(
+            parsed.as_proto().encode_to_vec(),
+            [8, 128, 32, 64, 0, 80, 0]
+        );
     }
 
     #[test]
