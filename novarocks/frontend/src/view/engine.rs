@@ -27,7 +27,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::catalog_application::query_catalog::CatalogServiceSource;
 use crate::query_execution::kernels::ViewExecutionKernel;
-use crate::runtime::query_result::QueryResult;
+use ::novarocks::runtime::query_result::QueryResult;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,

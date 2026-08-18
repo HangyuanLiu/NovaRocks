@@ -38,8 +38,8 @@ use crate::catalog_application::query_bindings::{
     QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey, QueryTableBindingStore,
 };
 use crate::catalog_application::query_materializer::QueryLocalTableOverlay;
-use crate::common::backend_topology::BackendTopologySnapshot;
 use crate::query_execution::preparation::scan::PlannedConnectorRead;
+use ::novarocks::common::backend_topology::BackendTopologySnapshot;
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::query_execution::{
     FrozenConnectorScanIdentity, FrozenConnectorScanPlan, build_frozen_connector_scan_plan,
@@ -324,7 +324,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::common::backend_topology::LiveBackendTarget;
+    use ::novarocks::common::backend_topology::LiveBackendTarget;
     use novarocks::connector::scan_model::FixtureScanFile;
 
     fn topology() -> BackendTopologySnapshot {

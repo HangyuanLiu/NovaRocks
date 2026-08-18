@@ -30,7 +30,6 @@ use crate::catalog_application::CatalogApplicationPort;
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::system_catalog::SystemCatalog;
 use crate::catalog_application::{command as catalog_command, iceberg_ref_command};
-use crate::common::backend_topology::BackendTopologyService;
 use crate::mv::domain::application::MvApplicationService;
 use crate::mv::domain::repository::MvRepository;
 use crate::query_execution::backend_command;
@@ -43,6 +42,7 @@ use crate::query_execution::maintenance::{
 };
 use crate::query_execution::service::QueryExecutionService;
 use crate::view::ViewService;
+use ::novarocks::common::backend_topology::BackendTopologyService;
 use novarocks::connector::UnifiedStatisticsResolver;
 use novarocks_spi::connector::MvStorageObservationPort;
 
@@ -694,13 +694,13 @@ pub fn background_maintenance_attempt(
     topology: BackendTopologyService,
 ) -> Result<BackgroundMaintenanceAttempt, String> {
     let topology = topology.snapshot().map_err(|error| error.to_string())?;
-    let cancellation = crate::common::query_cancellation::QueryCancellationSource::new();
-    let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
+    let cancellation = ::novarocks::common::query_cancellation::QueryCancellationSource::new();
+    let execution = ::novarocks::common::admitted_query_context::QueryExecutionContext::new(
         role,
         topology,
         None,
         cancellation.view(),
-        crate::common::admitted_query_context::SessionOptimizerSettings::default(),
+        ::novarocks::common::admitted_query_context::SessionOptimizerSettings::default(),
     );
     let connector_context =
         novarocks::connector::connector_request_context_for_execution(None, &execution)?;

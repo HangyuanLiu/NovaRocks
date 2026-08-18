@@ -103,7 +103,7 @@ impl FrontendMvRefreshProviderActivationPort {
         prepared: PreparedMvRefreshWrite,
         planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
         lease: &novarocks_spi::connector::ConnectorWriteLease,
-        execution: &crate::common::admitted_query_context::QueryExecutionContext,
+        execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
     ) -> Result<PreparedMvNativeWriteAssembly, MvApplicationError> {
         let activation = self
             .activation
@@ -172,7 +172,7 @@ pub(super) fn execute(
     dependencies: &FrontendMvRefreshDependencies,
     refresh: PreparedMvRefresh,
     connector_context: ConnectorRequestContext,
-    execution: &crate::common::admitted_query_context::QueryExecutionContext,
+    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<MvStatementResult, MvApplicationError> {
     // A no-snapshot first observation is deliberately not a durable refresh.
     // It has no external action and no base watermark that can be finalized;
@@ -318,7 +318,7 @@ fn execute_data_refresh(
     prepared: PreparedMvRefreshWrite,
     base_snapshots: BTreeMap<String, i64>,
     connector_context: ConnectorRequestContext,
-    execution: &crate::common::admitted_query_context::QueryExecutionContext,
+    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<MvStatementResult, MvApplicationError> {
     let atomic_repartition = prepared
         .publication_intent()
@@ -1027,7 +1027,7 @@ fn sha256(payload: &[u8]) -> [u8; 32] {
 fn recovery_phase_barrier(phase: &str) -> Result<(), MvApplicationError> {
     use std::time::{Duration, Instant};
 
-    let Some(root) = crate::common::query_lifecycle_fault::configured_root() else {
+    let Some(root) = ::novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(());
     };
     let path = root.join(format!("mv-refresh-at-{phase}.trigger"));
@@ -1105,7 +1105,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use crate::common::admitted_query_context::QueryExecutionContext;
     use crate::mv::domain::persistence::refresh::{
         FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
         FrontendMvRefreshCommittedVersion,
@@ -1117,6 +1116,7 @@ mod tests {
     use crate::query_execution::mv_native_write::{
         MvRefreshProviderActivation, MvRefreshProviderActivationSink, PreparedMvNativeWriteAssembly,
     };
+    use ::novarocks::common::admitted_query_context::QueryExecutionContext;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,
         ConnectorControlPlanningLease, ConnectorManagedPartitionTransform, ConnectorRequestContext,

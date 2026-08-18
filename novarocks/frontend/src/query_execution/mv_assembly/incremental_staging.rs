@@ -9,7 +9,6 @@ use std::sync::Arc;
 use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::mv::domain::application::{
     MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
 };
@@ -17,6 +16,7 @@ use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::PreparedMvIncrementalWrite;
 use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
+use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RewriteMergeRefreshEvidence {
