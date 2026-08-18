@@ -22,7 +22,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks::connector::ConnectorRegistry;
-use novarocks::protocol::FieldPath;
 use novarocks::runtime::scan_range::ScanRangeParams;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::fragment::program::{
@@ -33,6 +32,7 @@ use novarocks_execution::exec::node::ExecPlan;
 use novarocks_execution::runtime::fragment::{
     FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSubmission, ScanAssignments,
 };
+use novarocks_protocol::FieldPath;
 use novarocks_protocol::{novarocks as proto, plan};
 use novarocks_spi::connector::{ConnectorCancellation, ConnectorExecutionResolver};
 
@@ -189,9 +189,9 @@ mod tests {
 
     use arrow::datatypes::DataType;
     use novarocks::connector::ConnectorRegistry;
-    use novarocks::protocol::ProtocolErrorKind;
     use novarocks_execution::exec::fragment::program::FragmentSinkKind;
     use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_protocol::ProtocolErrorKind;
     use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_protocol::{common, expr, novarocks as proto, plan};
     use novarocks_spi::connector::{

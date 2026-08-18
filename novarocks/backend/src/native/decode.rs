@@ -26,9 +26,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks::connector::ConnectorRegistry;
-use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks_execution::runtime::fragment::FragmentSubmission;
 use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
+use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_protocol::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorExecutionResolver;
 use novarocks_types::QueryId as ExecutionQueryId;
@@ -52,7 +52,6 @@ pub(crate) fn decode_native_query_execution_id(
     let query_id = execution_id.query_id.as_ref().ok_or_else(|| {
         NativeFragmentIngressError::new(
             ProtocolError::new(
-                ProtocolFamily::Native,
                 root.clone().field("query_id"),
                 ProtocolErrorKind::MissingField,
                 "native fragment execution_id requires query_id",
@@ -63,7 +62,6 @@ pub(crate) fn decode_native_query_execution_id(
     let attempt_id = AttemptId::new(execution_id.attempt_id).map_err(|error| {
         NativeFragmentIngressError::new(
             ProtocolError::new(
-                ProtocolFamily::Native,
                 root.clone().field("attempt_id"),
                 ProtocolErrorKind::InvalidValue,
                 // Preserve the established native ingress error vocabulary
@@ -77,13 +75,8 @@ pub(crate) fn decode_native_query_execution_id(
     QueryExecutionId::new(ExecutionQueryId::new(query_id.hi, query_id.lo), attempt_id).map_err(
         |error| {
             NativeFragmentIngressError::new(
-                ProtocolError::new(
-                    ProtocolFamily::Native,
-                    root,
-                    ProtocolErrorKind::InvalidValue,
-                    error.to_string(),
-                )
-                .to_string(),
+                ProtocolError::new(root, ProtocolErrorKind::InvalidValue, error.to_string())
+                    .to_string(),
             )
         },
     )

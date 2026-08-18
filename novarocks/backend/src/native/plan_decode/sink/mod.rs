@@ -22,7 +22,6 @@ use std::time::Instant;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use bytes::Bytes;
-use novarocks::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
 use novarocks_execution::exec::fragment::sink::{
@@ -34,6 +33,7 @@ use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoin
 use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
 use novarocks_execution::runtime::query_options::query_expire_durations;
 use novarocks_protocol::novarocks as native_proto;
+use novarocks_protocol::{FieldPath, ProtocolErrorKind};
 use novarocks_protocol::{common, expr, plan};
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
@@ -1078,9 +1078,9 @@ mod tests {
     use arrow::array::{Array, BinaryArray, LargeBinaryArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use novarocks::protocol::ProtocolErrorKind;
     use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
     use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
+    use novarocks_protocol::ProtocolErrorKind;
     use novarocks_protocol::{common, expr, novarocks as proto, plan};
     use novarocks_spi::connector::ConnectorRowMutationEffect;
     use novarocks_types::SlotId;

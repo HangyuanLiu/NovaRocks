@@ -20,10 +20,10 @@
 //! This deliberately sits outside fragment decoding: participant manifests
 //! must be validated before a backend owns or decodes a fragment.
 
-use crate::protocol::common::error::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::query_options::{QueryCacheOptions, QueryOptions};
 use novarocks_protocol::novarocks;
+use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
 
 pub(crate) fn decode_query_options(
     src: &novarocks::QueryOptions,
@@ -127,5 +127,5 @@ fn protocol_error(
     kind: ProtocolErrorKind,
     detail: impl Into<String>,
 ) -> ProtocolError {
-    ProtocolError::new(ProtocolFamily::Native, path, kind, detail)
+    ProtocolError::new(path, kind, detail)
 }

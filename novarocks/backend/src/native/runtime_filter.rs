@@ -19,9 +19,9 @@
 
 use std::collections::BTreeSet;
 
-use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks_execution::exec::fragment::program::{RuntimeFilterContract, RuntimeFilterId};
 use novarocks_protocol::plan;
+use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
 
 pub(crate) fn decode_runtime_filter_contract(
     fragment: &plan::PlanFragment,
@@ -29,7 +29,6 @@ pub(crate) fn decode_runtime_filter_contract(
     let path = FieldPath::root("plan_fragment").field("runtime_filter_bindings");
     let table = fragment.runtime_filter_bindings.as_ref().ok_or_else(|| {
         ProtocolError::new(
-            ProtocolFamily::Native,
             path.clone(),
             ProtocolErrorKind::MissingField,
             "runtime_filter_bindings are required",
@@ -40,7 +39,6 @@ pub(crate) fn decode_runtime_filter_contract(
     for (index, binding) in table.bindings.iter().enumerate() {
         let raw_id = i32::try_from(binding.channel_id).map_err(|_| {
             ProtocolError::new(
-                ProtocolFamily::Native,
                 path.clone()
                     .field("bindings")
                     .index(index)
@@ -58,7 +56,6 @@ pub(crate) fn decode_runtime_filter_contract(
             }
             None => {
                 return Err(ProtocolError::new(
-                    ProtocolFamily::Native,
                     path.clone().field("bindings").index(index).field("role"),
                     ProtocolErrorKind::MissingField,
                     "runtime-filter binding role is required",

@@ -22,11 +22,11 @@ use super::hash_join;
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use crate::native::plan_decode::layout::Layout;
-use novarocks::protocol::common::error::FieldPath;
 use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_protocol::FieldPath;
 use novarocks_protocol::plan;
 
 pub(super) fn lower_nest_loop_join_node(

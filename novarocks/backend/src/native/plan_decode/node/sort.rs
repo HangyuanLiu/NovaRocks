@@ -21,10 +21,10 @@ use super::common::{
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use crate::native::plan_decode::layout::Layout;
-use novarocks::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_protocol::{FieldPath, ProtocolErrorKind};
 use novarocks_protocol::{expr, plan};
 
 pub(super) fn lower_sort_node(

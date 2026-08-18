@@ -32,7 +32,6 @@ use novarocks_spi::connector::{
 };
 
 use novarocks::connector::runtime::{ConnectorBatchTransform, ConnectorReadScanSource};
-use novarocks::protocol::ProtocolErrorKind;
 use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::scan::BoundScanRanges;
@@ -41,6 +40,7 @@ use novarocks_execution::exec::variant_read::{
     ParquetSlotKind, VariantPathSpec, convert_variant_columns, materialize_variant_path_columns,
 };
 use novarocks_execution::runtime::query_options::query_expire_durations;
+use novarocks_protocol::ProtocolErrorKind;
 use novarocks_protocol::plan;
 use novarocks_types::SlotId;
 

@@ -7,6 +7,10 @@
 
 pub const SCHEMA_LEDGER_VERSION: u32 = 1;
 
+// Design: ADR-0085 (docs/adr/ADR-0085-native-protocol-error-contract.md)
+pub mod error;
+pub use error::{FieldPath, FieldPathSegment, ProtocolError, ProtocolErrorKind};
+
 /// File descriptor set generated from the canonical repository-level IDL.
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/novarocks_descriptor.bin"));

@@ -17,9 +17,9 @@
 
 //! Backend-owned native sink-assignment DTO decoding.
 
-use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
+use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_protocol::{novarocks as proto, plan};
 use novarocks_types::UniqueId;
 
@@ -151,21 +151,11 @@ fn decode_stream_destination_list(
 }
 
 fn missing(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
-    ProtocolError::new(
-        ProtocolFamily::Native,
-        path,
-        ProtocolErrorKind::MissingField,
-        detail.into(),
-    )
+    ProtocolError::new(path, ProtocolErrorKind::MissingField, detail.into())
 }
 
 fn invalid_value(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
-    ProtocolError::new(
-        ProtocolFamily::Native,
-        path,
-        ProtocolErrorKind::InvalidValue,
-        detail.into(),
-    )
+    ProtocolError::new(path, ProtocolErrorKind::InvalidValue, detail.into())
 }
 
 #[cfg(test)]

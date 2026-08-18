@@ -20,9 +20,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use novarocks_protocol::common;
+use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_types::SlotId;
 
 use super::type_decode::decode_field_type;
@@ -120,13 +120,13 @@ pub(crate) fn decode_output_layout(
 }
 
 fn error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) -> ProtocolError {
-    ProtocolError::new(ProtocolFamily::Native, path, kind, detail)
+    ProtocolError::new(path, kind, detail)
 }
 
 #[cfg(test)]
 mod tests {
     use super::decode_output_layout;
-    use novarocks::protocol::FieldPath;
+    use novarocks_protocol::FieldPath;
     use novarocks_protocol::common;
     use novarocks_types::SlotId;
 

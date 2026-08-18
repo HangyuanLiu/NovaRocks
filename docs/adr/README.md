@@ -138,6 +138,7 @@ code-anchors:
 - ADR-0047 — catalog/read admission 为何以 exact Connector generation 与中立 native carrier 封存（active）
 - ADR-0078 — Runtime Filter terminal observation 为何只作观测，且以 P0/P1/P2 查询终止契约交付（active）
 - ADR-0079 — IDL/proto 为何是 FE/BE 中立 query lifecycle 契约的规范形式、Protocol 如何同时拥有 schema 与已验证值（active）
+- ADR-0085 — native DTO 的字段路径与验证错误为何由 Protocol 独占、而不保留 Core family 门面（active）
 
 #### 历史
 
@@ -260,6 +261,7 @@ fallback 模糊 owner 和故障语义。
 - ADR-0058 — 架构隔离为何由 crate 边界强制，而不用硬编码的 source-shape guard（active）
 - ADR-0069 — 共享测试机械能力为何使用零产品依赖的独立叶子 crate，而领域断言仍跟随其 owner（active）
 - ADR-0071 — 分布式测试编排为何由唯一 cluster harness 拥有、SQL runner 只作 frontend adapter（active）
+- ADR-0085 — native DTO 的字段路径与验证错误为何由 Protocol 独占、而不保留 Core family 门面（active）
 
 ### configuration
 

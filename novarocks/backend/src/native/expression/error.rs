@@ -17,8 +17,7 @@
 
 use std::fmt;
 
-use novarocks::protocol::common::error::FieldPathSegment;
-use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
+use novarocks_protocol::{FieldPath, FieldPathSegment, ProtocolError, ProtocolErrorKind};
 
 #[derive(Debug)]
 pub(crate) struct NativeExpressionLeafDecodeError {
@@ -70,7 +69,6 @@ impl NativeExpressionLeafDecodeError {
 
     pub(crate) fn into_protocol(self, path: FieldPath) -> ProtocolError {
         ProtocolError::new(
-            ProtocolFamily::Native,
             path.append_segments(self.relative_path),
             self.kind,
             self.detail,
@@ -107,12 +105,7 @@ impl NativeExpressionDecodeError {
         Self::new(path, ProtocolErrorKind::Unsupported, detail)
     }
     fn new(path: FieldPath, kind: ProtocolErrorKind, detail: impl fmt::Display) -> Self {
-        Self(ProtocolError::new(
-            ProtocolFamily::Native,
-            path,
-            kind,
-            detail.to_string(),
-        ))
+        Self(ProtocolError::new(path, kind, detail.to_string()))
     }
     pub(crate) fn into_protocol(self) -> ProtocolError {
         self.0

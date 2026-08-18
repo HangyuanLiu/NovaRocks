@@ -22,9 +22,9 @@ mod variant_path;
 use super::context::NativePlanDecodeContext;
 use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use super::node::DecodedNode;
-use novarocks::protocol::{FieldPath, ProtocolErrorKind};
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_protocol::plan;
+use novarocks_protocol::{FieldPath, ProtocolErrorKind};
 
 pub(crate) fn lower_scan_node(
     node: &plan::DistributedNode,
@@ -102,7 +102,6 @@ mod tests {
     use super::super::node::{decode_node, decode_node_with_runtime_filters};
     use super::super::runtime_filter_binding::NativeRuntimeFilterDecodeLedger;
     use crate::native::type_decode::encode_type;
-    use novarocks::protocol::ProtocolErrorKind;
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::exec::node::scan::ScanMorsel;
@@ -110,6 +109,7 @@ mod tests {
     use novarocks_execution::runtime_filter::{
         RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics,
     };
+    use novarocks_protocol::ProtocolErrorKind;
     use novarocks_protocol::{common, expr, novarocks as native_proto, plan};
 
     struct TestNotCancelled;

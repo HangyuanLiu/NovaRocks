@@ -15,13 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod common;
 /// Native FE-to-BE wire encoding. Frontend application owners assemble their
 /// admitted requests through this boundary; backend-only decoding remains
 /// private to the protocol implementation.
 pub mod native;
-
-pub use common::error::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 
 /// Decode the lifecycle-owned query-options DTO into execution options.
 ///
@@ -30,6 +27,9 @@ pub use common::error::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFam
 /// to the core assembly kernel.
 pub fn decode_native_query_options(
     src: &novarocks_protocol::novarocks::QueryOptions,
-) -> Result<novarocks_execution::runtime::query_options::QueryOptions, ProtocolError> {
+) -> Result<
+    novarocks_execution::runtime::query_options::QueryOptions,
+    novarocks_protocol::ProtocolError,
+> {
     native::query_options_contract::decode_query_options(src)
 }
