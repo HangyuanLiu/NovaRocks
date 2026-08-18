@@ -27,7 +27,9 @@ use prometheus::{
     register_histogram, register_int_counter, register_int_gauge, register_int_gauge_vec,
 };
 
+mod http;
 pub mod query_lifecycle;
+pub(crate) use http::MetricsHttpServer;
 pub use query_lifecycle::FrontendQueryLifecycleMetricsSnapshot;
 
 static FRAGMENT_SCHEDULED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {

@@ -55,6 +55,9 @@ pub struct FrontendServerConfig {
     pub backend_open: ClusterBackendOpenConfig,
     pub report_bind_host: String,
     pub report_grpc_port: u16,
+    /// Dedicated role=fe metrics endpoint. In all-in-one composition the
+    /// Backend-owned listener serves the combined process registry instead.
+    pub metrics_http_port: u16,
     pub mysql_listener: ResolvedMysqlListenerSettings,
     /// Provider-owned FE control factories composed by the server root.
     pub connector_control_factories: Vec<Arc<dyn ConnectorControlFactory>>,
@@ -393,6 +396,21 @@ where
 {
     let mut report_server =
         host.start_report_server_from_host(&config.report_bind_host, config.report_grpc_port)?;
+    let metrics_http_server = match crate::metrics::MetricsHttpServer::start(
+        &config.report_bind_host,
+        config.metrics_http_port,
+    ) {
+        Ok(server) => server,
+        Err(error) => {
+            let report_stop = report_server
+                .stop()
+                .map_err(FrontendApplicationError::server);
+            return combine_server_and_shutdown(
+                Err(FrontendApplicationError::server(error)),
+                report_stop,
+            );
+        }
+    };
     let exchange_port = report_server.bound_addr().port();
     host.coordinator_report_endpoint_sink()
         .set_bound_port(exchange_port);
@@ -409,7 +427,13 @@ where
             let stop_result = report_server
                 .stop()
                 .map_err(FrontendApplicationError::server);
-            return combine_server_and_shutdown(Err(error), stop_result);
+            let metrics_stop = metrics_http_server
+                .stop()
+                .map_err(FrontendApplicationError::server);
+            return combine_server_and_shutdown(
+                combine_server_and_shutdown(Err(error), stop_result),
+                metrics_stop,
+            );
         }
     };
     let server_result =
@@ -419,7 +443,13 @@ where
     let stop_result = report_server
         .stop()
         .map_err(FrontendApplicationError::server);
-    combine_server_and_shutdown(server_result, stop_result)
+    let metrics_stop = metrics_http_server
+        .stop()
+        .map_err(FrontendApplicationError::server);
+    combine_server_and_shutdown(
+        combine_server_and_shutdown(server_result, stop_result),
+        metrics_stop,
+    )
 }
 
 #[cfg(test)]
@@ -642,6 +672,7 @@ mod tests {
             backend_open: frontend_backend_open_config(),
             report_bind_host: "127.0.0.1".to_string(),
             report_grpc_port: 0,
+            metrics_http_port: 0,
             mysql_listener: ResolvedMysqlListenerSettings::new(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
                 "root",

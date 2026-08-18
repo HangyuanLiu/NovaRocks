@@ -538,6 +538,7 @@ pub fn compose_frontend_server_config(
         backend_open,
         report_bind_host: config.server.host.clone(),
         report_grpc_port: config.server.grpc_port,
+        metrics_http_port: config.server.http_port,
         mysql_listener,
         connector_control_factories: compose_frontend_control_factories(config, runtime)?,
         mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
