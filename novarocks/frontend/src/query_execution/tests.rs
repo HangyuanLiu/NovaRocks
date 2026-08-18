@@ -167,12 +167,12 @@ fn real_execution_artifacts() -> (
 ) {
     let plan = native_preparation_plan(NativePreparationFixture::ResultOutput)
         .expect("sealed result execution fixture");
-    let registry = novarocks::connector::ConnectorRegistry::new();
-    let controls = novarocks::connector::FixtureControlResolver::new(registry.clone());
+    let registry = crate::connector::FixtureConnectorRegistry::new();
+    let controls = crate::connector::FixtureControlResolver::new(registry.clone());
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &plan,
         &controls,
-        &novarocks::connector::test_request_context(),
+        &crate::connector::test_request_context(),
         None,
         None,
         crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),

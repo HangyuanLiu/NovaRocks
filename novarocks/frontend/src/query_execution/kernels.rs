@@ -26,6 +26,7 @@ use std::sync::Arc;
 use crate::catalog_application::CatalogApplicationPort;
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::system_catalog::SystemCatalog;
+use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::mv::domain::application::MvApplicationService;
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::repository::MvRepository;
@@ -33,7 +34,6 @@ use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::service::QueryExecutionService;
 use crate::view::ViewService;
 use ::novarocks::common::backend_topology::BackendTopologyService;
-use novarocks::connector::unified_statistics::UnifiedStatisticsResolver;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::MvStorageObservationPort;
 
@@ -542,11 +542,11 @@ impl SessionCatalogResolver {
         catalog_name: &str,
         namespace_name: &str,
     ) -> Result<bool, String> {
-        let context = novarocks::connector::connector_request_context(
+        let context = crate::connector::connector_request_context(
             None,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )?;
-        novarocks::connector::metadata_namespace_exists(
+        crate::connector::metadata_namespace_exists(
             self.connector_control.as_ref(),
             context,
             catalog_name,

@@ -185,7 +185,7 @@ pub(crate) fn execute_request(
     req: &ImvStatelessRebuildRequest,
 ) -> Result<StatementResult, String> {
     let context =
-        novarocks::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
+        crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
     execute_request_with_context(
         connector_control,
         mv_storage_observation,
@@ -211,7 +211,7 @@ fn execute_request_with_context(
         namespace: Arc::from(req.namespace.as_str()),
         table: Arc::from(req.mv.as_str()),
     };
-    let loaded_table = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+    let loaded_table = crate::connector::metadata_load_connector_table_with_planning_lease(
         &exact_lease,
         connector_context.clone(),
         &table.namespace,

@@ -95,7 +95,7 @@ pub fn build_frontend_query_session_factory(
 ) -> Result<Arc<dyn QuerySessionFactory>, FrontendApplicationError> {
     let catalog_service =
         Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
-    let unified_statistics = Arc::new(novarocks::connector::UnifiedStatisticsResolver::default());
+    let unified_statistics = Arc::new(crate::connector::UnifiedStatisticsResolver::default());
     let catalog_application = host.catalog_application_port();
     let catalog_projection = host.catalog_runtime_projection();
     let connector_control = host.connector_control_registry();

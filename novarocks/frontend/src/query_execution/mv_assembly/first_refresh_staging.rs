@@ -77,7 +77,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     let current_catalog = prepared.current_catalog().map(str::to_string);
     let current_database = prepared.current_database().to_string();
     let connector_context =
-        novarocks::connector::connector_request_context_for_execution(None, execution)?;
+        crate::connector::connector_request_context_for_execution(None, execution)?;
     let root_hash_column = prepared.root_hash_column().to_string();
     let template = super::iceberg_activation::activate_first_refresh_connector_write(
         &prepared,

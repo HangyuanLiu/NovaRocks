@@ -119,19 +119,19 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
         })
     );
 
-    let registry = ConnectorRegistry::new();
-    novarocks::connector::scan_model::register_planned_files_fixture(
+    let registry = FixtureConnectorRegistry::new();
+    crate::connector::scan_model::register_planned_files_fixture(
         &registry,
         "ice",
         vec![data_file("s3://sqlx2-coalesce/frozen.parquet")],
         None,
     );
-    let controls = novarocks::connector::FixtureControlResolver::new(registry);
+    let controls = crate::connector::FixtureControlResolver::new(registry);
     let bindings = fixture_query_table_bindings(&distributed, &controls);
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
         &controls,
-        &novarocks::connector::test_request_context(),
+        &crate::connector::test_request_context(),
         Some(&bindings),
         Some(&JoinRefreshDeltaResolver),
         super::super::ScanPreparationOptions::single_backend_fixture(),
@@ -163,10 +163,10 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
 #[test]
 fn scan_preparation_propagates_caller_cancellation() {
     let context =
-        novarocks::connector::connector_request_context(None, Arc::new(AtomicBool::new(true)))
+        crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(true)))
             .expect("cancelled request context");
     let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
-    let controls = novarocks::connector::FixtureControlResolver::new(registry.clone());
+    let controls = crate::connector::FixtureControlResolver::new(registry.clone());
     let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
         .expect("sealed ordinary fixture");
     let query_bindings = fixture_query_table_bindings(&plan, &controls);
@@ -191,7 +191,7 @@ fn scan_preparation_propagates_caller_cancellation() {
 #[test]
 fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring_current() {
     let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
-    let controls = novarocks::connector::FixtureControlResolver::new(registry);
+    let controls = crate::connector::FixtureControlResolver::new(registry);
     let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
         .expect("sealed ordinary fixture");
     let bindings = fixture_query_table_bindings(&plan, &controls);
@@ -199,7 +199,7 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
     let prepared = super::super::prepare_scan_bindings(
         &plan,
         &controls,
-        &novarocks::connector::test_request_context(),
+        &crate::connector::test_request_context(),
         Some(&bindings),
         None,
         super::super::ScanPreparationOptions::single_backend_fixture(),
@@ -233,14 +233,14 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
 #[test]
 fn sqlx1_preparation_rejects_unbound_binding_instead_of_reacquiring_current() {
     let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
-    let controls = novarocks::connector::FixtureControlResolver::new(registry);
+    let controls = crate::connector::FixtureControlResolver::new(registry);
     let bindings = crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
         .expect("binding store");
     let error = match super::super::prepare_scan_bindings(
         &native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
             .expect("sealed ordinary fixture"),
         &controls,
-        &novarocks::connector::test_request_context(),
+        &crate::connector::test_request_context(),
         Some(&bindings),
         None,
         super::super::ScanPreparationOptions::single_backend_fixture(),
@@ -288,8 +288,8 @@ fn duplicate_scan_node_defense_reports_exact_error() {
     let registry = registry(vec![data_file("s3://bucket/explicit.parquet")]);
     let mut seen_scan_node_ids = std::collections::BTreeSet::new();
     let mut bindings = crate::query_execution::preparation::scan::ScanExecutionBindings::default();
-    let context = novarocks::connector::test_request_context();
-    let controls = novarocks::connector::FixtureControlResolver::new(registry.clone());
+    let context = crate::connector::test_request_context();
+    let controls = crate::connector::FixtureControlResolver::new(registry.clone());
     let query_bindings = fixture_query_table_bindings(&plan, &controls);
 
     collect_scan_bindings(
@@ -325,7 +325,7 @@ fn refresh_only_sources_require_resolver_with_kind_and_node_id() {
     let err = match prepare_scan_bindings(
         &native_scan_plan(NativeScanFixture::DeltaForPreparedBinding)
             .expect("sealed delta fixture"),
-        &ConnectorRegistry::new(),
+        &FixtureConnectorRegistry::new(),
         None,
     ) {
         Ok(_) => panic!("SqlDelta without resolver must fail"),
@@ -342,7 +342,7 @@ fn resolver_error_reports_source_kind_node_id_and_cause() {
     let err = match prepare_scan_bindings(
         &native_scan_plan(NativeScanFixture::DeltaForPreparedBinding)
             .expect("sealed delta fixture"),
-        &ConnectorRegistry::new(),
+        &FixtureConnectorRegistry::new(),
         Some(&ErrorResolver),
     ) {
         Ok(_) => panic!("resolver error must fail preparation"),
@@ -360,7 +360,7 @@ fn resolver_ok_none_reports_exact_required_source_error() {
     let err = match prepare_scan_bindings(
         &native_scan_plan(NativeScanFixture::DeltaForPreparedBinding)
             .expect("sealed delta fixture"),
-        &ConnectorRegistry::new(),
+        &FixtureConnectorRegistry::new(),
         Some(&EmptyResolver),
     ) {
         Ok(_) => panic!("empty resolver result must fail preparation"),
@@ -378,7 +378,7 @@ fn resolver_failure_precedes_invalid_physical_projection() {
     let err = match prepare_scan_bindings(
         &native_scan_plan(NativeScanFixture::DeltaWithInvalidProjection)
             .expect("sealed invalid delta fixture"),
-        &ConnectorRegistry::new(),
+        &FixtureConnectorRegistry::new(),
         Some(&ErrorResolver),
     ) {
         Ok(_) => panic!("resolver error must win over physical projection error"),
@@ -400,7 +400,7 @@ fn target_state_and_locator_reject_equality_deletes() {
         let plan = native_scan_plan(fixture).expect("sealed target fixture");
         let mut file = data_file("s3://bucket/target-data.parquet");
         file.deletes = vec![equality_delete_file(Vec::new(), vec![3])];
-        let controls = novarocks::connector::FixtureControlResolver::new(registry(vec![file]));
+        let controls = crate::connector::FixtureControlResolver::new(registry(vec![file]));
         let err = match prepare_scan_bindings_with_controls(&plan, &controls, None) {
             Ok(_) => panic!("{expected_kind} equality-delete scan must fail"),
             Err(err) => err,
@@ -419,7 +419,7 @@ fn resolver_execution_kind_must_match_semantic_source() {
 
     let err = match prepare_scan_bindings(
         &native_scan_plan(NativeScanFixture::ConnectorRead).expect("sealed connector-read fixture"),
-        &ConnectorRegistry::new(),
+        &FixtureConnectorRegistry::new(),
         Some(&resolver),
     ) {
         Ok(_) => panic!("connector scan must reject delta execution"),

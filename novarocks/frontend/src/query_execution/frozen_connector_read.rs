@@ -324,8 +324,8 @@ mod tests {
     };
 
     use super::*;
+    use crate::connector::scan_model::FixtureScanFile;
     use ::novarocks::common::backend_topology::LiveBackendTarget;
-    use novarocks::connector::scan_model::FixtureScanFile;
 
     fn topology() -> BackendTopologySnapshot {
         BackendTopologySnapshot::try_new(
@@ -344,7 +344,7 @@ mod tests {
         novarocks_spi::connector::ConnectorTableMetadata,
         ConnectorRequestContext,
     ) {
-        let binding = novarocks::connector::scan_model::planned_files_fixture_binding(
+        let binding = crate::connector::scan_model::planned_files_fixture_binding(
             "frozen-read",
             HashMap::from([(
                 "orders".to_string(),
@@ -352,7 +352,7 @@ mod tests {
             )]),
             None,
         );
-        let context = novarocks::connector::test_request_context();
+        let context = crate::connector::test_request_context();
         let metadata = binding
             .metadata()
             .load_table(ConnectorTableRequest {

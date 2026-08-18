@@ -37,6 +37,7 @@ use novarocks_frontend::mv::domain::repository::{
     MvRepositoryError, MvRepositoryErrorKind, MvTarget, RebuildMvRepositoryRequest,
     RecordExternalCommitAndFinalizeRequest,
 };
+use novarocks_spi::connector::ConnectorTableObjectId;
 use uuid::Uuid;
 
 pub struct DomainOnlyMvRepository;
@@ -108,7 +109,7 @@ impl MvRepository for DomainOnlyMvRepository {
         &self,
         _mv_id: i64,
         _base_snapshots: BTreeMap<String, i64>,
-        _base_table_uuids: BTreeMap<String, String>,
+        _base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
         unsupported()
     }

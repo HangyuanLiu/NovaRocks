@@ -93,7 +93,7 @@ pub(crate) fn prepare_delete_statement(
             target.backend_name
         ));
     }
-    let target_binding = novarocks::connector::write_target::load_write_target_binding(
+    let target_binding = crate::connector::write_target::load_write_target_binding(
         state.connector_control().as_ref(),
         &target.catalog,
         &target.namespace,

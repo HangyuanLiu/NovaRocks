@@ -65,7 +65,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         return Err("MV incremental write lease drifted from prepared binding".to_string());
     }
     let connector_context =
-        novarocks::connector::connector_request_context_for_execution(None, execution)?;
+        crate::connector::connector_request_context_for_execution(None, execution)?;
     let refresh_rewrite = crate::query_execution::mv_assembly::first_refresh_staging::rebuild_frozen_mv_rewrite_context(
         ports,
         request.current_catalog.as_deref(),
@@ -91,7 +91,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         planning_lease,
         &connector_context,
     )?;
-    let target_metadata = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+    let target_metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         planning_lease,
         connector_context.clone(),
         &target.namespace,

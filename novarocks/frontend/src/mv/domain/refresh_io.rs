@@ -38,11 +38,9 @@ pub(crate) fn observe_current_refresh_base_with_ports(
     table_ref: &TableIdentity,
     connector_context: &ConnectorRequestContext,
 ) -> Result<crate::mv::domain::storage_observation::MvRefreshBaseObservation, String> {
-    let exact_lease = novarocks::connector::acquire_metadata_planning_lease(
-        connector_control,
-        &table_ref.catalog,
-    )?;
-    let metadata = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+    let exact_lease =
+        crate::connector::acquire_metadata_planning_lease(connector_control, &table_ref.catalog)?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &exact_lease,
         connector_context.clone(),
         &table_ref.namespace,

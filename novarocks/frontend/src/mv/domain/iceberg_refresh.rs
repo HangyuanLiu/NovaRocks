@@ -405,7 +405,7 @@ impl MvEngine for StandaloneMvEngine {
             table: Arc::from(prepared.target.table.as_str()),
         };
         let created = require_known_committed_target_mutation(
-            novarocks::connector::mutation::resolve_catalog_mutation_with_lease(
+            crate::connector::mutation::resolve_catalog_mutation_with_lease(
                 &mutation_lease,
                 novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
                     *operation_id.as_bytes(),
@@ -440,7 +440,7 @@ impl MvEngine for StandaloneMvEngine {
                 "materialized view target create unexpectedly returned NoOp".to_string(),
             ));
         }
-        let bootstrap = novarocks::connector::mutation::resolve_catalog_mutation_with_lease(
+        let bootstrap = crate::connector::mutation::resolve_catalog_mutation_with_lease(
             &mutation_lease,
             novarocks_spi::connector::ConnectorMutationOperationId::new(),
             novarocks_spi::connector::ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot {
@@ -454,11 +454,9 @@ impl MvEngine for StandaloneMvEngine {
             self.connector_context.clone(),
         );
         match bootstrap {
-            novarocks::connector::mutation::ResolvedCatalogMutation::KnownUncommitted {
-                failure,
-            } => {
+            crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
                 let cleanup = require_known_committed_target_mutation(
-                    novarocks::connector::mutation::resolve_catalog_mutation_with_lease(
+                    crate::connector::mutation::resolve_catalog_mutation_with_lease(
                         &mutation_lease,
                         novarocks_spi::connector::ConnectorMutationOperationId::new(),
                         novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
@@ -486,7 +484,7 @@ impl MvEngine for StandaloneMvEngine {
         #[cfg(test)]
         run_after_create_target_hook();
         let loaded_target =
-            match novarocks::connector::metadata_load_connector_table_with_planning_lease(
+            match crate::connector::metadata_load_connector_table_with_planning_lease(
                 &planning_lease,
                 self.connector_context.clone(),
                 &table.namespace,
@@ -496,7 +494,7 @@ impl MvEngine for StandaloneMvEngine {
                 Ok(loaded_target) => loaded_target,
                 Err(error) => {
                     let cleanup = require_known_committed_target_mutation(
-                    novarocks::connector::mutation::resolve_catalog_mutation_with_lease(
+                    crate::connector::mutation::resolve_catalog_mutation_with_lease(
                         &mutation_lease,
                         novarocks_spi::connector::ConnectorMutationOperationId::new(),
                         novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
@@ -524,7 +522,7 @@ impl MvEngine for StandaloneMvEngine {
             Ok(observation) => observation,
             Err(error) => {
                 let cleanup = require_known_committed_target_mutation(
-                    novarocks::connector::mutation::resolve_catalog_mutation_with_lease(
+                    crate::connector::mutation::resolve_catalog_mutation_with_lease(
                         &mutation_lease,
                         novarocks_spi::connector::ConnectorMutationOperationId::new(),
                         novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
@@ -616,7 +614,7 @@ impl MvEngine for StandaloneMvEngine {
         // Reached from the MV engine trait, which carries no request context.
         // Use the same bounded, non-cancellable context other context-free
         // connector paths use.
-        let connector_context = novarocks::connector::connector_request_context(
+        let connector_context = crate::connector::connector_request_context(
             None,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
@@ -677,7 +675,7 @@ impl MvEngine for StandaloneMvEngine {
         let instance_id =
             novarocks_spi::connector::ConnectorInstanceId::parse(&prepared.target.catalog)
                 .map_err(|error| engine_target_error(error.to_string()))?;
-        novarocks::connector::mutation::execute_catalog_mutation(
+        crate::connector::mutation::execute_catalog_mutation(
             self.ports.connector_control.as_ref(),
             &instance_id,
             novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
@@ -721,11 +719,11 @@ fn engine_target_error(error: String) -> MvEngineError {
 /// has been re-read successfully. Commit-unknown is likewise propagated as
 /// such, so no cleanup can erase a target whose external truth is unresolved.
 fn require_known_committed_target_mutation(
-    resolution: novarocks::connector::mutation::ResolvedCatalogMutation,
+    resolution: crate::connector::mutation::ResolvedCatalogMutation,
     operation: &str,
-) -> Result<novarocks::connector::mutation::CompletedCatalogMutation, MvEngineError> {
+) -> Result<crate::connector::mutation::CompletedCatalogMutation, MvEngineError> {
     match resolution {
-        novarocks::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
+        crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
             if let novarocks_spi::connector::ExternalMutationFinalization::Failed(failure) =
                 &completed.finalization
             {
@@ -738,20 +736,20 @@ fn require_known_committed_target_mutation(
             }
             Ok(completed)
         }
-        novarocks::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
+        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
             Err(engine_target_error(
                 EngineError::commit_known_uncommitted(format!("{operation}: {failure}"))
                     .to_string(),
             ))
         }
-        novarocks::connector::mutation::ResolvedCatalogMutation::CommitUnknown {
-            failure, ..
-        } => Err(engine_target_error(
-            EngineError::commit_unknown(format!("{operation}: {failure}")).to_string(),
-        )),
-        novarocks::connector::mutation::ResolvedCatalogMutation::ContractFailure {
-            error, ..
-        } => Err(engine_target_error(format!("{operation}: {error}"))),
+        crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
+            Err(engine_target_error(
+                EngineError::commit_unknown(format!("{operation}: {failure}")).to_string(),
+            ))
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { error, .. } => {
+            Err(engine_target_error(format!("{operation}: {error}")))
+        }
     }
 }
 
@@ -858,7 +856,7 @@ fn prepare_iceberg_mv_create_with_ports(
     repository: &dyn crate::mv::domain::repository::MvRepository,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<IcebergMvCreatePreparation, String> {
-    novarocks::connector::validate_request_context(connector_context)?;
+    crate::connector::validate_request_context(connector_context)?;
     let storage_engine = stmt
         .properties
         .iter()
@@ -1103,7 +1101,7 @@ pub(crate) fn create_iceberg_mv_with_ports(
     stmt: &CreateMaterializedViewStmt,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    novarocks::connector::validate_request_context(connector_context)?;
+    crate::connector::validate_request_context(connector_context)?;
     let statement = MvCreateStatement::from(stmt);
     let engine = StandaloneMvEngine::new_with_ports(ports.clone(), connector_context.clone());
     let plan = engine
@@ -1200,7 +1198,7 @@ fn ensure_mv_create_target_absent_with_connector_control(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let lease =
-        novarocks::connector::acquire_metadata_planning_lease(connector_control, &target.catalog)?;
+        crate::connector::acquire_metadata_planning_lease(connector_control, &target.catalog)?;
     if lease.binding().descriptor().provider_id.as_str() != "iceberg" {
         return Err(
             "storage_engine='iceberg' requires current catalog to be an Iceberg catalog"
@@ -1755,11 +1753,11 @@ pub fn sync_iceberg_mv_descriptor_with_ports(
         .target_table
         .as_deref()
         .ok_or_else(|| "Iceberg MV descriptor sync missing target table".to_string())?;
-    let exact_lease = novarocks::connector::acquire_metadata_planning_lease(
+    let exact_lease = crate::connector::acquire_metadata_planning_lease(
         ports.connector_control.as_ref(),
         catalog_name,
     )?;
-    let metadata = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &exact_lease,
         connector_context.clone(),
         namespace,
@@ -1797,7 +1795,7 @@ pub fn sync_iceberg_mv_descriptor_with_ports(
         .derive_mutation_lease()
         .map_err(|error| error.to_string())?;
     require_known_committed_target_mutation(
-        novarocks::connector::mutation::resolve_catalog_mutation_with_lease(
+        crate::connector::mutation::resolve_catalog_mutation_with_lease(
             &mutation_lease,
             novarocks_spi::connector::ConnectorMutationOperationId::new(),
             novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
@@ -3854,7 +3852,7 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
         return Err(RefreshError::user(FULL_REFRESH_DISABLED_MESSAGE));
     }
 
-    novarocks::connector::validate_request_context(connector_context)
+    crate::connector::validate_request_context(connector_context)
         .map_err(RefreshError::pre_commit)?;
     // Preparation only observes the currently admitted catalog and MV facts.
     // Historical v1/v2 recovery stays in the legacy execution adapter; a
@@ -5691,7 +5689,7 @@ pub(crate) fn drop_iceberg_mv_with_ports(
     stmt: &DropMaterializedViewStmt,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    novarocks::connector::validate_request_context(connector_context)?;
+    crate::connector::validate_request_context(connector_context)?;
     let _refresh_guard = acquire_mv_refresh_lock()?;
     let target = resolve_drop_target(current_catalog, current_database, &stmt.name)?;
     if !preflight_iceberg_mv_drop_with_repository(
@@ -5704,7 +5702,7 @@ pub(crate) fn drop_iceberg_mv_with_ports(
 
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| error.to_string())?;
-    novarocks::connector::mutation::execute_catalog_mutation(
+    crate::connector::mutation::execute_catalog_mutation(
         ports.connector_control.as_ref(),
         &instance_id,
         novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {

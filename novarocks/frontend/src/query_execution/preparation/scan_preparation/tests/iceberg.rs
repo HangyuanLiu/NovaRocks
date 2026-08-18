@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use novarocks::connector::scan_model::{FixtureColumnStats, FixturePartitionValue};
+use crate::connector::scan_model::{FixtureColumnStats, FixturePartitionValue};
 
 /// A read unit that carries min/max statistics for `id`. The fixture never
 /// decodes the bounds; they exist so the unit models a statistics-bearing file
@@ -56,7 +56,7 @@ fn planned_data_files(
         .splits
         .iter()
         .map(|split| {
-            novarocks::connector::scan_model::planned_split_file_for_test(split)
+            crate::connector::scan_model::planned_split_file_for_test(split)
                 .expect("decode fixture split")
         })
         .collect()
@@ -168,7 +168,7 @@ fn explicit_files_plan_opaque_connector_splits() {
 fn sqlx2_frozen_snapshot_scan_uses_its_exact_admitted_file_set() {
     let plan =
         native_scan_plan(NativeScanFixture::FrozenSnapshotEleven).expect("sealed frozen fixture");
-    let controls = novarocks::connector::FixtureControlResolver::new(registry(vec![data_file(
+    let controls = crate::connector::FixtureControlResolver::new(registry(vec![data_file(
         "s3://bucket/current.parquet",
     )]));
     let store = fixture_query_table_bindings(&plan, &controls);
@@ -190,7 +190,7 @@ fn sqlx2_frozen_snapshot_scan_uses_its_exact_admitted_file_set() {
     super::super::prepare_scan_bindings(
         &plan,
         &controls,
-        &novarocks::connector::test_request_context(),
+        &crate::connector::test_request_context(),
         Some(&store),
         None,
         super::super::ScanPreparationOptions::single_backend_fixture(),
@@ -200,7 +200,7 @@ fn sqlx2_frozen_snapshot_scan_uses_its_exact_admitted_file_set() {
 
 #[test]
 fn sqlx2_frozen_snapshot_scan_rejects_a_selector_without_admitted_files() {
-    let controls = novarocks::connector::FixtureControlResolver::new(registry(vec![data_file(
+    let controls = crate::connector::FixtureControlResolver::new(registry(vec![data_file(
         "s3://bucket/current.parquet",
     )]));
     let admitted = native_scan_plan(NativeScanFixture::FrozenSnapshotEleven)
@@ -212,7 +212,7 @@ fn sqlx2_frozen_snapshot_scan_rejects_a_selector_without_admitted_files() {
     let error = match super::super::prepare_scan_bindings(
         &plan,
         &controls,
-        &novarocks::connector::test_request_context(),
+        &crate::connector::test_request_context(),
         Some(&store),
         None,
         super::super::ScanPreparationOptions::single_backend_fixture(),
@@ -268,7 +268,7 @@ fn large_plain_file_preserves_provider_owned_split_and_byte_estimate() {
 
     assert_eq!(planned.splits.len(), 1);
     assert_eq!(planned.splits[0].estimated_bytes(), Some(300 * 1024 * 1024));
-    let file = novarocks::connector::scan_model::planned_split_file_for_test(&planned.splits[0])
+    let file = crate::connector::scan_model::planned_split_file_for_test(&planned.splits[0])
         .expect("decode fixture split");
     assert_eq!(file.path, "s3://bucket/large.parquet");
     assert_eq!(file.size, 300 * 1024 * 1024);

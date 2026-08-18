@@ -123,7 +123,7 @@ impl CoreCommandRoute for TypedCommandRoute {
         context: &RequestContext,
         query_options: QueryOptions,
     ) -> Result<StatementResult, String> {
-        let connector_context = novarocks::connector::connector_request_context_for_query(
+        let connector_context = crate::connector::connector_request_context_for_query(
             Some(&query_options),
             context.execution().cancellation().clone(),
         )?;

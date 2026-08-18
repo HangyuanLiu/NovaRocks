@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(any(test, feature = "query-execution-contract-test-support"))]
+#![cfg(test)]
 
 //! Provider-neutral, test-only read fixture connector.
 //!
@@ -773,7 +773,7 @@ pub fn planned_files_fixture_binding(
 }
 
 /// Build the same opaque read fixture under an explicitly selected provider ID.
-#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+#[cfg(test)]
 pub fn planned_files_fixture_binding_for_provider(
     provider_id: ConnectorProviderId,
     catalog: &str,
@@ -808,7 +808,7 @@ pub fn planned_files_fixture_binding_for_provider(
 
 /// Register a fixture that answers for every table name with the same units.
 pub fn register_planned_files_fixture(
-    registry: &crate::connector::ConnectorRegistry,
+    registry: &crate::connector::FixtureConnectorRegistry,
     catalog: &str,
     files: Vec<FixtureScanFile>,
     seen_projections: Option<Arc<Mutex<Vec<Vec<usize>>>>>,
@@ -823,7 +823,7 @@ pub fn register_planned_files_fixture(
 
 /// Register a fixture with per-table prepared units.
 pub fn register_planned_table_files_fixture(
-    registry: &crate::connector::ConnectorRegistry,
+    registry: &crate::connector::FixtureConnectorRegistry,
     catalog: &str,
     files_by_table: HashMap<String, Vec<FixtureScanFile>>,
     seen_projections: Option<Arc<Mutex<Vec<Vec<usize>>>>>,
@@ -1344,7 +1344,7 @@ mod tests {
 
     #[test]
     fn per_table_registration_answers_each_table_with_its_own_units() {
-        let registry = crate::connector::ConnectorRegistry::new();
+        let registry = crate::connector::FixtureConnectorRegistry::new();
         register_planned_table_files_fixture(
             &registry,
             CATALOG,
@@ -1389,7 +1389,7 @@ mod tests {
 
     #[test]
     fn wildcard_registration_answers_an_unknown_table() {
-        let registry = crate::connector::ConnectorRegistry::new();
+        let registry = crate::connector::FixtureConnectorRegistry::new();
         register_planned_files_fixture(
             &registry,
             CATALOG,

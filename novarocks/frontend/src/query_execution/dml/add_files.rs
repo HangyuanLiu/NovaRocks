@@ -32,12 +32,12 @@ use novarocks_spi::connector::{
     ExternalMutationEvidence, ExternalMutationFinalization,
 };
 
-use crate::query_execution::kernels::DmlExecutionKernel;
-use ::novarocks::common::admitted_query_context::QueryExecutionContext;
-use novarocks::connector::data_mutation::{
+use crate::connector::data_mutation::{
     CompletedDataMutation, DataMutationDispatchState, DataMutationIntent, DataMutationSession,
     KnownUncommittedDataMutation, ResolvedDataMutation,
 };
+use crate::query_execution::kernels::DmlExecutionKernel;
+use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_sql::planning::dml::classify_add_files;
 use novarocks_sql::syntax::ObjectName;
@@ -288,7 +288,7 @@ impl AddFilesEngine for DmlExecutionKernel {
             crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Insert,
         )
         .map_err(plan_string_failure)?;
-        let connector_context = novarocks::connector::connector_request_context_for_execution(
+        let connector_context = crate::connector::connector_request_context_for_execution(
             request.query_options.as_ref(),
             &request.execution,
         )

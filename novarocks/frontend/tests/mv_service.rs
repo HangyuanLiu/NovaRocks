@@ -31,6 +31,7 @@ use novarocks_frontend::mv::domain::repository::{
     MvRepositoryAvailability, MvRepositoryError, MvRepositoryErrorKind, MvTarget,
     RebuildMvRepositoryRequest, RecordExternalCommitAndFinalizeRequest, UnavailableMvRepository,
 };
+use novarocks_spi::connector::ConnectorTableObjectId;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use uuid::Uuid;
@@ -225,7 +226,7 @@ impl MvRepository for FakeRepository {
         &self,
         _: i64,
         _: BTreeMap<String, i64>,
-        _: BTreeMap<String, String>,
+        _: BTreeMap<String, ConnectorTableObjectId>,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
         unused_repository_method!()
     }

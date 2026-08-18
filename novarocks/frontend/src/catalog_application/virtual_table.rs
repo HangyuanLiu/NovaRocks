@@ -183,17 +183,15 @@ fn rewrite_table_factor(
                     // Unknown catalogs remain untouched so downstream resolution
                     // preserves its normal error. Every successful admission keeps
                     // one lease for the complete namespace lookup.
-                    let context = novarocks::connector::connector_request_context(
+                    let context = crate::connector::connector_request_context(
                         None,
                         Arc::new(AtomicBool::new(false)),
                     )?;
-                    match novarocks::connector::acquire_metadata_planning_lease(
-                        connector_control,
-                        cat,
-                    ) {
+                    match crate::connector::acquire_metadata_planning_lease(connector_control, cat)
+                    {
                         Ok(lease) => {
                             let namespaces =
-                                novarocks::connector::metadata_list_namespaces_with_planning_lease(
+                                crate::connector::metadata_list_namespaces_with_planning_lease(
                                     lease, context,
                                 )?;
                             let mut databases = namespaces

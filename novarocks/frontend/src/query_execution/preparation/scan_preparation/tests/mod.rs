@@ -23,11 +23,11 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
+use crate::connector::FixtureConnectorRegistry;
+use crate::connector::scan_model::{FixtureDeleteFile, FixtureScanFile};
 use crate::query_execution::preparation::scan::{
     ResolvedReadReason, ResolvedScanExecution, ScanBindingResolver,
 };
-use novarocks::connector::ConnectorRegistry;
-use novarocks::connector::scan_model::{FixtureDeleteFile, FixtureScanFile};
 use novarocks_sql::plan_read::{
     DistributedNode, DistributedNodeKind, DistributedPlan, PlanScanNode,
 };
@@ -39,10 +39,10 @@ use novarocks_sql::test_support::{NativeScanFixture, native_scan_plan};
 
 fn prepare_scan_bindings(
     plan: &DistributedPlan,
-    connectors: &ConnectorRegistry,
+    connectors: &FixtureConnectorRegistry,
     resolver: Option<&dyn ScanBindingResolver>,
 ) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
-    let controls = novarocks::connector::FixtureControlResolver::new(connectors.clone());
+    let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
     prepare_scan_bindings_with_controls(plan, &controls, resolver)
 }
 
@@ -50,14 +50,14 @@ fn prepare_scan_bindings(
 /// tests that must hold the same resolver across admission and preparation.
 fn prepare_scan_bindings_with_controls(
     plan: &DistributedPlan,
-    controls: &novarocks::connector::FixtureControlResolver,
+    controls: &crate::connector::FixtureControlResolver,
     resolver: Option<&dyn ScanBindingResolver>,
 ) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
     let query_bindings = fixture_query_table_bindings(plan, controls);
     super::prepare_scan_bindings(
         plan,
         controls,
-        &novarocks::connector::test_request_context(),
+        &crate::connector::test_request_context(),
         Some(&query_bindings),
         resolver,
         super::ScanPreparationOptions::single_backend_fixture(),
@@ -69,7 +69,7 @@ fn prepare_scan_bindings_with_controls(
 /// only copied scan facts and supplies the provider admission beside that token.
 fn fixture_query_table_bindings(
     plan: &DistributedPlan,
-    controls: &novarocks::connector::FixtureControlResolver,
+    controls: &crate::connector::FixtureControlResolver,
 ) -> crate::catalog_application::query_bindings::QueryTableBindingStore {
     use crate::catalog_application::query_bindings::{
         QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
@@ -157,7 +157,7 @@ fn fixture_query_table_bindings(
                             table: Arc::from(facts.identity().table()),
                         },
                         resolution: ConnectorTableResolution::StrictBaseTable,
-                        context: novarocks::connector::test_request_context(),
+                        context: crate::connector::test_request_context(),
                     })
                     .map_err(|error| error.to_string())?;
                 let scan_materialization = QueryScanMaterialization {
@@ -184,7 +184,7 @@ fn fixture_query_table_bindings(
                                     table: Arc::from(facts.identity().table()),
                                 },
                                 resolution: ConnectorTableResolution::StrictBaseTable,
-                                context: novarocks::connector::test_request_context(),
+                                context: crate::connector::test_request_context(),
                             })
                             .map_err(|error| error.to_string())?;
                         Ok((
@@ -289,9 +289,9 @@ fn equality_delete_file(
     )
 }
 
-fn registry(files: Vec<FixtureScanFile>) -> ConnectorRegistry {
-    let registry = ConnectorRegistry::new();
-    novarocks::connector::scan_model::register_planned_files_fixture(
+fn registry(files: Vec<FixtureScanFile>) -> FixtureConnectorRegistry {
+    let registry = FixtureConnectorRegistry::new();
+    crate::connector::scan_model::register_planned_files_fixture(
         &registry,
         "test_catalog",
         files,
@@ -302,9 +302,11 @@ fn registry(files: Vec<FixtureScanFile>) -> ConnectorRegistry {
 
 /// Register read units per table name, so a test can plan a scan against a
 /// table the fixture deliberately has no units for.
-fn registry_for_tables(files_by_table: HashMap<String, Vec<FixtureScanFile>>) -> ConnectorRegistry {
-    let registry = ConnectorRegistry::new();
-    novarocks::connector::scan_model::register_planned_table_files_fixture(
+fn registry_for_tables(
+    files_by_table: HashMap<String, Vec<FixtureScanFile>>,
+) -> FixtureConnectorRegistry {
+    let registry = FixtureConnectorRegistry::new();
+    crate::connector::scan_model::register_planned_table_files_fixture(
         &registry,
         "test_catalog",
         files_by_table,
@@ -315,10 +317,10 @@ fn registry_for_tables(files_by_table: HashMap<String, Vec<FixtureScanFile>>) ->
 
 fn recording_registry(
     files: Vec<FixtureScanFile>,
-) -> (ConnectorRegistry, Arc<Mutex<Vec<Vec<usize>>>>) {
+) -> (FixtureConnectorRegistry, Arc<Mutex<Vec<Vec<usize>>>>) {
     let seen_projections = Arc::new(Mutex::new(Vec::new()));
-    let registry = ConnectorRegistry::new();
-    novarocks::connector::scan_model::register_planned_files_fixture(
+    let registry = FixtureConnectorRegistry::new();
+    crate::connector::scan_model::register_planned_files_fixture(
         &registry,
         "test_catalog",
         files,
@@ -348,16 +350,14 @@ fn fixture_sealed_change_scan(
     };
 
     let lease = ConnectorControlPlanningLease::new(
-        Arc::new(
-            novarocks::connector::scan_model::planned_files_fixture_binding(
-                catalog,
-                HashMap::new(),
-                None,
-            ),
-        ),
+        Arc::new(crate::connector::scan_model::planned_files_fixture_binding(
+            catalog,
+            HashMap::new(),
+            None,
+        )),
         || {},
     );
-    let context = novarocks::connector::test_request_context();
+    let context = crate::connector::test_request_context();
     let metadata = lease
         .binding()
         .metadata()

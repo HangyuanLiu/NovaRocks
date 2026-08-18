@@ -418,7 +418,7 @@ fn execute_ctas_operation(
         OperationPayload::CtasSaga(saga),
         None,
     )?;
-    let historical_context = novarocks::connector::connector_request_context_for_execution(
+    let historical_context = crate::connector::connector_request_context_for_execution(
         query_options,
         context.execution(),
     )

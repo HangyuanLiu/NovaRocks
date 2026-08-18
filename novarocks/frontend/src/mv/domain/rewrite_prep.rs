@@ -88,15 +88,13 @@ fn freeze_base_table_state(
             .into_iter()
             .next()
             .expect("one table reference produces one parsed identity");
-    let connector_context = novarocks::connector::connector_request_context(
+    let connector_context = crate::connector::connector_request_context(
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )?;
-    let exact_lease = novarocks::connector::acquire_metadata_planning_lease(
-        connector_control,
-        &table_ref.catalog,
-    )?;
-    let metadata = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+    let exact_lease =
+        crate::connector::acquire_metadata_planning_lease(connector_control, &table_ref.catalog)?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &exact_lease,
         connector_context.clone(),
         &table_ref.namespace,
@@ -128,7 +126,7 @@ fn freeze_base_table_state(
             },
         )
         .map_err(|error| format!("capture MV rewrite object ID for {fqn}: {error}"))?;
-    let reference_facts = novarocks::connector::metadata_read_reference_facts_with_planning_lease(
+    let reference_facts = crate::connector::metadata_read_reference_facts_with_planning_lease(
         exact_lease,
         connector_context,
         &table_ref.namespace,

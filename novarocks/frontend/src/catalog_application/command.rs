@@ -322,7 +322,7 @@ fn execute_alter_iceberg_properties(
     };
     let instance_id =
         ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
-    novarocks::connector::mutation::execute_catalog_mutation(
+    crate::connector::mutation::execute_catalog_mutation(
         executor.connector_control.as_ref(),
         &instance_id,
         novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
@@ -443,7 +443,7 @@ fn execute_alter_iceberg_schema(
             comment: Arc::from(comment),
         },
     };
-    novarocks::connector::mutation::execute_catalog_mutation(
+    crate::connector::mutation::execute_catalog_mutation(
         executor.connector_control.as_ref(),
         &instance_id,
         novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterSchema {
@@ -509,7 +509,7 @@ fn execute_alter_partition_spec(
         crate::catalog_application::statement::connector_partition_transform(partition_field);
     let instance_id =
         ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
-    novarocks::connector::mutation::execute_catalog_mutation(
+    crate::connector::mutation::execute_catalog_mutation(
         executor.connector_control.as_ref(),
         &instance_id,
         novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterPartitionSpec {
@@ -545,7 +545,7 @@ fn execute_create_table_like(
         current_catalog,
         current_database,
     )?;
-    let source_table = novarocks::connector::metadata_load_table(
+    let source_table = crate::connector::metadata_load_table(
         executor.connector_control.as_ref(),
         connector_context.clone(),
         &source_target.catalog,

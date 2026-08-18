@@ -20,6 +20,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
+use crate::connector::mutation::{
+    CompletedCatalogMutation, ResolvedCatalogMutation, resolve_catalog_mutation_with_lease,
+};
 use crate::mv::domain::application::{
     MvApplicationError, MvApplicationErrorKind, MvStatementResult,
 };
@@ -45,9 +48,6 @@ use crate::query_execution::mv_native_write::{
 };
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::service::QueryExecutionService;
-use novarocks::connector::mutation::{
-    CompletedCatalogMutation, ResolvedCatalogMutation, resolve_catalog_mutation_with_lease,
-};
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt, ConnectorControlRegistry,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorMutationOperationId,

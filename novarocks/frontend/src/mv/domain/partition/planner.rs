@@ -218,7 +218,7 @@ mod tests {
             has_row_deletes,
             added,
             removed,
-            &novarocks::connector::test_request_context(),
+            &crate::connector::test_request_context(),
         )
         .expect("partition impact")
     }

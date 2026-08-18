@@ -222,8 +222,10 @@ impl TableMaintenanceEngine for FakeMaintenanceEngine {
         &self,
         _target: &MaintenanceTarget,
         plan: ConnectorMetadataMaintenancePlan,
-    ) -> Result<novarocks::connector::metadata_maintenance::CompletedMetadataMaintenance, String>
-    {
+    ) -> Result<
+        novarocks_frontend::connector::metadata_maintenance::CompletedMetadataMaintenance,
+        String,
+    > {
         self.recovered_plans.lock().unwrap().push(plan);
         Err("recorded exact generation is unavailable".to_string())
     }

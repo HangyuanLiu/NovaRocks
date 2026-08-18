@@ -41,15 +41,15 @@ pub(crate) fn execute_with_ports(
     stmt: &AlterIcebergRefStmt,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    novarocks::connector::validate_request_context(connector_context)?;
+    crate::connector::validate_request_context(connector_context)?;
     // 1. Resolve qualified name — must be 3-part (catalog.namespace.table).
     let (catalog_name, namespace, table_name) = resolve_table_parts(&stmt.table)?;
 
     // Retain one exact generation across MV admission and the ref mutation.
     // The application never decodes the provider-owned table handle.
     let exact_lease =
-        novarocks::connector::acquire_metadata_planning_lease(connector_control, &catalog_name)?;
-    let metadata = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+        crate::connector::acquire_metadata_planning_lease(connector_control, &catalog_name)?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &exact_lease,
         connector_context.clone(),
         &namespace,
@@ -89,7 +89,7 @@ pub(crate) fn execute_with_ports(
     let mutation_lease = exact_lease
         .derive_mutation_lease()
         .map_err(|error| error.to_string())?;
-    let outcome = novarocks::connector::mutation::resolve_catalog_mutation_with_lease(
+    let outcome = crate::connector::mutation::resolve_catalog_mutation_with_lease(
         &mutation_lease,
         novarocks_spi::connector::ConnectorMutationOperationId::new(),
         ConnectorCatalogMutationOperation::AlterRef {
@@ -103,7 +103,7 @@ pub(crate) fn execute_with_ports(
         connector_context.clone(),
     );
     match outcome {
-        novarocks::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
+        crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
             if let ExternalMutationFinalization::Failed(failure) = completed.finalization {
                 return Err(
                     novarocks::common::engine_error::EngineError::commit_known_committed_finalize_failed(
@@ -113,7 +113,7 @@ pub(crate) fn execute_with_ports(
                 );
             }
         }
-        novarocks::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
+        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
             return Err(
                 novarocks::common::engine_error::EngineError::commit_known_uncommitted(
                     failure.to_string(),
@@ -121,17 +121,13 @@ pub(crate) fn execute_with_ports(
                 .to_string(),
             );
         }
-        novarocks::connector::mutation::ResolvedCatalogMutation::CommitUnknown {
-            failure, ..
-        } => {
+        crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
             return Err(
                 novarocks::common::engine_error::EngineError::commit_unknown(failure.to_string())
                     .to_string(),
             );
         }
-        novarocks::connector::mutation::ResolvedCatalogMutation::ContractFailure {
-            error, ..
-        } => {
+        crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { error, .. } => {
             return Err(error.to_string());
         }
     }

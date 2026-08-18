@@ -221,7 +221,7 @@ impl novarocks_spi::connector::ConnectorControlFactory for TestConnectorControlF
         novarocks_spi::connector::ConnectorError,
     > {
         let durable_properties = request.properties().to_vec();
-        let binding = novarocks::connector::scan_model::planned_files_fixture_binding_for_provider(
+        let binding = crate::connector::scan_model::planned_files_fixture_binding_for_provider(
             request.provider_id().clone(),
             request.instance_id().as_str(),
             std::collections::HashMap::new(),
@@ -979,7 +979,7 @@ impl TestQueryCompiler {
         context: &::novarocks::common::admitted_query_context::RequestContext,
         query_opts: Option<QueryOptions>,
     ) -> Result<TestPreparedQueryOperation, String> {
-        let connector_context = novarocks::connector::connector_request_context_for_query(
+        let connector_context = crate::connector::connector_request_context_for_query(
             query_opts.as_ref(),
             context.execution().cancellation().clone(),
         )?;
@@ -1476,7 +1476,7 @@ pub(crate) fn prepare_query_as_iceberg_write(
 ) -> Result<PreparedDmlWriteAssembly, String> {
     // This public write helper is also used by non-session transaction executors,
     // so it owns an operation-scoped context when no request signal is available.
-    let connector_context = novarocks::connector::connector_request_context(
+    let connector_context = crate::connector::connector_request_context(
         query_opts.as_ref(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )?;
@@ -1898,7 +1898,7 @@ pub(crate) fn prepare_dml_change_stream_write_with_execution(
     query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
-    novarocks::connector::validate_request_context(connector_context)?;
+    crate::connector::validate_request_context(connector_context)?;
     let (distributed_plan, writer_routes) = plan.into_parts();
     let optimizer_settings = change_stream_write_optimizer_settings();
     let scan_resolver =
@@ -1930,7 +1930,7 @@ pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
 ) -> Result<PreparedMvNativeWriteAssembly, String> {
-    novarocks::connector::validate_request_context(connector_context)?;
+    crate::connector::validate_request_context(connector_context)?;
     let scan_resolver =
         crate::query_execution::planning::delta_scan::QueryTableBindingScanResolver::new(
             query_table_bindings,

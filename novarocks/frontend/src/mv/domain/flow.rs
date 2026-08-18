@@ -182,7 +182,7 @@ pub fn create_mv_with_ports(
     stmt: &CreateMaterializedViewStmt,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    novarocks::connector::validate_request_context(connector_context)?;
+    crate::connector::validate_request_context(connector_context)?;
     if storage_engine_for_create(stmt)? != MvStorageEngine::Iceberg {
         return Err("materialized view backend must be Iceberg".to_string());
     }
@@ -228,7 +228,7 @@ pub fn drop_mv_with_ports(
     stmt: &DropMaterializedViewStmt,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    novarocks::connector::validate_request_context(connector_context)?;
+    crate::connector::validate_request_context(connector_context)?;
     let target = resolve_refresh_target(current_catalog, db, &stmt.name)?;
     if let Some(engine) = existing_mv_storage_engine_by_target(repository, &target)?
         && engine != MvStorageEngine::Iceberg
@@ -258,7 +258,7 @@ pub fn alter_mv_with_ports(
     stmt: &AlterMaterializedViewStmt,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    novarocks::connector::validate_request_context(connector_context)?;
+    crate::connector::validate_request_context(connector_context)?;
     if matches!(stmt.action, AlterMaterializedViewAction::Repartition(_)) {
         return Err(
             "ALTER MATERIALIZED VIEW ... REPARTITION requires the frontend MV lifecycle"
@@ -288,7 +288,7 @@ pub fn alter_mv_with_ports(
         };
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| error.to_string())?;
-        novarocks::connector::mutation::execute_catalog_mutation(
+        crate::connector::mutation::execute_catalog_mutation(
             ports.connector_control(),
             &instance_id,
             novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {

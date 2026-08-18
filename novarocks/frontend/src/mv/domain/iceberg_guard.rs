@@ -96,13 +96,13 @@ pub fn reject_if_iceberg_mv_table_with_ports(
     let exact_lease = ConnectorControlResolver::acquire_current(connector_control, &instance_id)
         .map_err(|error| format!("acquire exact Iceberg generation for MV guard: {error}"))?;
     let context =
-        novarocks::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
+        crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
     let identity = ConnectorTableIdentity {
         instance_id,
         namespace: Arc::from(target.namespace.as_str()),
         table: Arc::from(target.table.as_str()),
     };
-    let metadata = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &exact_lease,
         context.clone(),
         &target.namespace,

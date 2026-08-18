@@ -302,7 +302,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
         request: PrepareMutationRequest<'_>,
     ) -> Result<PreparedMutation, String> {
         let raw = novarocks_sql::planning::dml::parse_raw_statement(request.sql)?;
-        let connector_context = novarocks::connector::connector_request_context_for_execution(
+        let connector_context = crate::connector::connector_request_context_for_execution(
             request.query_options.as_ref(),
             &request.execution,
         )?;
@@ -570,9 +570,7 @@ mod tests {
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::clone(&connector_control),
-            Arc::new(
-                novarocks::connector::unified_statistics::UnifiedStatisticsResolver::default(),
-            ),
+            Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
             crate::query_execution::compiler::test_query_execution_service(),
         )

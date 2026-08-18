@@ -30,6 +30,7 @@ use crate::catalog_application::CatalogApplicationPort;
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::system_catalog::SystemCatalog;
 use crate::catalog_application::{command as catalog_command, iceberg_ref_command};
+use crate::connector::UnifiedStatisticsResolver;
 use crate::mv::domain::application::MvApplicationService;
 use crate::mv::domain::repository::MvRepository;
 use crate::query_execution::backend_command;
@@ -43,7 +44,6 @@ use crate::query_execution::maintenance::{
 use crate::query_execution::service::QueryExecutionService;
 use crate::view::ViewService;
 use ::novarocks::common::backend_topology::BackendTopologyService;
-use novarocks::connector::UnifiedStatisticsResolver;
 use novarocks_spi::connector::MvStorageObservationPort;
 
 use crate::mv::{FrontendMvService, command as mv_command};
@@ -703,7 +703,7 @@ pub fn background_maintenance_attempt(
         ::novarocks::common::admitted_query_context::SessionOptimizerSettings::default(),
     );
     let connector_context =
-        novarocks::connector::connector_request_context_for_execution(None, &execution)?;
+        crate::connector::connector_request_context_for_execution(None, &execution)?;
     Ok(BackgroundMaintenanceAttempt::new(
         execution,
         connector_context,

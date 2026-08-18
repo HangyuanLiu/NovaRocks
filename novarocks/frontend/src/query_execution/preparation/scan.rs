@@ -90,7 +90,7 @@ pub(crate) fn fixture_sealed_change_scan_for_table(
     };
 
     let lease = fixture_planning_lease(instance_id);
-    let context = novarocks::connector::test_request_context();
+    let context = crate::connector::test_request_context();
     let metadata = lease
         .binding()
         .metadata()
@@ -137,13 +137,11 @@ pub(crate) fn fixture_planning_lease(instance_id: &str) -> ConnectorControlPlann
     use std::sync::Arc;
 
     ConnectorControlPlanningLease::new(
-        Arc::new(
-            novarocks::connector::scan_model::planned_files_fixture_binding(
-                instance_id,
-                HashMap::new(),
-                None,
-            ),
-        ),
+        Arc::new(crate::connector::scan_model::planned_files_fixture_binding(
+            instance_id,
+            HashMap::new(),
+            None,
+        )),
         || {},
     )
 }
@@ -169,7 +167,7 @@ pub(crate) fn fixture_query_scan_materialization(instance_id: &str) -> QueryScan
                 table: Arc::from("orders"),
             },
             resolution: ConnectorTableResolution::StrictBaseTable,
-            context: novarocks::connector::test_request_context(),
+            context: crate::connector::test_request_context(),
         })
         .expect("fixture connector read admission");
     QueryScanMaterialization {

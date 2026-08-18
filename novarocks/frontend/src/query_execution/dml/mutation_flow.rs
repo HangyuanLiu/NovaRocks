@@ -167,7 +167,7 @@ std::thread_local! {
 
 impl DmlChangeStreamPreparations {
     fn prepare(
-        target: &novarocks::connector::write_target::ConnectorWriteTargetBinding,
+        target: &crate::connector::write_target::ConnectorWriteTargetBinding,
         target_ref: &str,
         effect_set: DmlRowMutationEffectSet,
         context: novarocks_spi::connector::ConnectorRequestContext,
@@ -779,7 +779,7 @@ pub(crate) fn prepare_update_mutation(
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Update,
     )?;
 
-    let target_binding = novarocks::connector::write_target::load_write_target_binding(
+    let target_binding = crate::connector::write_target::load_write_target_binding(
         state.connector_control().as_ref(),
         &target.catalog,
         &target.namespace,
@@ -933,7 +933,7 @@ pub(crate) fn prepare_merge_mutation(
         &target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Merge,
     )?;
-    let target_binding = novarocks::connector::write_target::load_write_target_binding(
+    let target_binding = crate::connector::write_target::load_write_target_binding(
         state.connector_control().as_ref(),
         &target.catalog,
         &target.namespace,
@@ -4313,9 +4313,7 @@ mod tests {
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::clone(&connector_control),
-            Arc::new(
-                novarocks::connector::unified_statistics::UnifiedStatisticsResolver::default(),
-            ),
+            Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
             crate::query_execution::compiler::test_query_execution_service(),
         )

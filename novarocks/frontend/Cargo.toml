@@ -47,7 +47,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v7", "serde"] }
 
 [dev-dependencies]
-novarocks = { path = "../core", features = ["query-execution-contract-test-support"] }
+novarocks = { path = "../core" }
 novarocks-connector-starrocks = { path = "../connector/starrocks" }
 novarocks-spi = { path = "../spi", features = ["state-store-conformance"] }
 novarocks-sql = { path = "../sql", features = ["test-support"] }

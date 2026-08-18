@@ -664,7 +664,7 @@ pub(crate) fn execute_create_database_statement(
         current_catalog,
     )?;
     let instance_id = mutation_instance_id(&target.catalog)?;
-    novarocks::connector::mutation::execute_catalog_mutation(
+    crate::connector::mutation::execute_catalog_mutation(
         context.connector_control(),
         &instance_id,
         ConnectorCatalogMutationOperation::CreateNamespace {
@@ -764,7 +764,7 @@ pub(crate) fn execute_create_table_statement(
             )?;
             let instance_id = mutation_instance_id(&target.catalog)?;
             let _ = bucket_count;
-            novarocks::connector::mutation::execute_catalog_mutation(
+            crate::connector::mutation::execute_catalog_mutation(
                 context.connector_control(),
                 &instance_id,
                 ConnectorCatalogMutationOperation::CreateTable {
@@ -1080,7 +1080,7 @@ pub(crate) fn execute_drop_database_statement(
             .collect::<Vec<_>>();
         views.sort();
         for table in tables {
-            novarocks::connector::mutation::execute_catalog_mutation(
+            crate::connector::mutation::execute_catalog_mutation(
                 context.connector_control(),
                 &instance_id,
                 ConnectorCatalogMutationOperation::DropTable {
@@ -1106,7 +1106,7 @@ pub(crate) fn execute_drop_database_statement(
             drop_local_table_registration_if_exists(context, &target.namespace, &table)?;
         }
         for view in views {
-            novarocks::connector::mutation::execute_catalog_mutation(
+            crate::connector::mutation::execute_catalog_mutation(
                 context.connector_control(),
                 &instance_id,
                 ConnectorCatalogMutationOperation::DropView {
@@ -1121,7 +1121,7 @@ pub(crate) fn execute_drop_database_statement(
             )?;
         }
     }
-    novarocks::connector::mutation::execute_catalog_mutation(
+    crate::connector::mutation::execute_catalog_mutation(
         context.connector_control(),
         &instance_id,
         ConnectorCatalogMutationOperation::DropNamespace {
@@ -1199,7 +1199,7 @@ pub(crate) fn execute_drop_table_statement(
         .ensure_no_downstream_dependencies(&dependency_ref)
         .map_err(|error| error.to_string())?;
     let instance_id = mutation_instance_id(&target.catalog)?;
-    match novarocks::connector::mutation::execute_catalog_mutation(
+    match crate::connector::mutation::execute_catalog_mutation(
         context.connector_control(),
         &instance_id,
         ConnectorCatalogMutationOperation::DropTable {
@@ -1366,10 +1366,8 @@ fn external_view_exists(
     view: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<bool, String> {
-    let lease = novarocks::connector::acquire_metadata_planning_lease(
-        context.connector_control(),
-        catalog,
-    )?;
+    let lease =
+        crate::connector::acquire_metadata_planning_lease(context.connector_control(), catalog)?;
     let binding = lease.binding();
     let Some(view_metadata) = binding.view_metadata() else {
         return Ok(false);

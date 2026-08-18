@@ -36,7 +36,7 @@ use novarocks_spi::connector::{
     ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
-use crate::common::engine_error::EngineError;
+use novarocks::common::engine_error::EngineError;
 
 /// Statement-level intent before loading a provider-owned table handle on the
 /// exact maintenance lease.

@@ -139,7 +139,7 @@ pub struct LakeRebuildContext<'a> {
 
 pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), String> {
     let context =
-        novarocks::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
+        crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
     // Only catalogs this process currently admits can be scanned: the durable
     // attachment record belongs to the Frontend controller, and an Unavailable
     // projection has no lease to enumerate namespaces with.
