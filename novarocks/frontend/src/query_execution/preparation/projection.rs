@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use arrow::datatypes::DataType;
 
 use super::scan::ScanExecutionBindings;
-use crate::runtime::scan_range::ScanRangeParams;
+use ::novarocks::runtime::scan_range::ScanRangeParams;
 use novarocks_sql::plan_read::{BoundaryContract, ColumnId, CteId, FragmentEdge, FragmentId};
 use novarocks_sql::planning::query_execution::{
     SqlPreparedRuntimeFilterFacts, SqlRuntimeFilterBindingFacts,

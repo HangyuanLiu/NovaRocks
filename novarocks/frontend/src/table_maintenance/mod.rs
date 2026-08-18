@@ -21,11 +21,13 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::common::cleanup_fault::{CleanupFaultKind, claim_configured as claim_cleanup_fault};
 use crate::query_execution::maintenance::{
     HistoricalMaintenanceInspection, MaintenanceActionOutcome, MaintenanceActionRequest,
     MaintenanceAttemptCancellationSource, MaintenanceRequestContext, MaintenanceStatementResult,
     MaintenanceTargetRebind, OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
+};
+use ::novarocks::common::cleanup_fault::{
+    CleanupFaultKind, claim_configured as claim_cleanup_fault,
 };
 use novarocks::connector::cleanup_maintenance::CleanupBatchExecution;
 use novarocks::connector::distributed_rewrite_application::DistributedRewriteIntent;

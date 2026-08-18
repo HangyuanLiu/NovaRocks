@@ -19,10 +19,10 @@ use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::common::backend_topology::LiveBackendTarget;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
+use ::novarocks::common::backend_topology::LiveBackendTarget;
 use novarocks::service::query_lifecycle_metrics::FrontendQueryLifecycleMetricsSnapshot;
 use novarocks_protocol::lifecycle::{ParticipantTerminalOutcome, QueryExecutionId};
 use novarocks_types::QueryId;

@@ -18,7 +18,7 @@
 use arrow::array::{Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
 use arrow::datatypes::DataType;
 
-use novarocks::runtime::query_result::QueryResult;
+use ::novarocks::runtime::query_result::QueryResult;
 use novarocks_sql::syntax::Literal;
 
 /// Convert a scalar query result into SQL that can be substituted for a user variable.

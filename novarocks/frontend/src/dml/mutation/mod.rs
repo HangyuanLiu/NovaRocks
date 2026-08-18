@@ -20,12 +20,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::common::admitted_query_context::RequestContext;
 use crate::query_execution::dml::mutation::{
     MutationAbort, MutationCommit, MutationEngine, MutationNativeFragmentEncoder,
     MutationStageOutcome, MutationStatementKind, PrepareMutationRequest, PreparedMutation,
     parse_merge_statement, parse_update_statement,
 };
+use ::novarocks::common::admitted_query_context::RequestContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 
 use crate::dml::coordination::DmlExternalFenceProposal;
@@ -235,15 +235,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use crate::common::admitted_query_context::{
-        RequestAdmission, RequestContext, SessionOptimizerSettings,
-    };
-    use crate::common::backend_topology::BackendTopologySnapshot;
-    use crate::common::query_cancellation::QueryCancellationSource;
     use crate::query_execution::dml::mutation::{
         MutationEngine, MutationPrepared, MutationStageOutcome, PrepareMutationRequest,
         PreparedMutation,
     };
+    use ::novarocks::common::admitted_query_context::{
+        RequestAdmission, RequestContext, SessionOptimizerSettings,
+    };
+    use ::novarocks::common::backend_topology::BackendTopologySnapshot;
+    use ::novarocks::common::query_cancellation::QueryCancellationSource;
     use novarocks_types::ClusterRole;
 
     use super::*;

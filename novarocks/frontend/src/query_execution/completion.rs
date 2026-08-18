@@ -21,8 +21,8 @@
 //! completion. It cannot construct a replacement completion for a different
 //! query intent or rehydrate planning inputs after admission.
 
-use crate::runtime::query_result::build_string_query_result;
-use crate::runtime::statement_result::StatementResult;
+use ::novarocks::runtime::query_result::build_string_query_result;
+use ::novarocks::runtime::statement_result::StatementResult;
 
 pub enum PreparedQueryOperation {
     Immediate(PreparedImmediateQuery),

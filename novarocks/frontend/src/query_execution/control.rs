@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use novarocks::common::query_cancellation::{QueryCancellationReason, QueryCancellationView};
+use ::novarocks::common::query_cancellation::{QueryCancellationReason, QueryCancellationView};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionIdentity {

@@ -29,10 +29,11 @@ use novarocks_spi::connector::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::common::types::UniqueId;
 use crate::query_execution::artifact::WriterRegistrationSet;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use crate::query_lifecycle::{FragmentTerminalOutcome, FragmentTerminalSnapshot, QueryExecutionId};
+use ::novarocks::common::types::UniqueId;
+use ::novarocks::query_lifecycle::{FragmentTerminalOutcome, FragmentTerminalSnapshot};
+use novarocks_protocol::lifecycle::QueryExecutionId;
 use novarocks_protocol::{common, novarocks};
 
 // This is deliberately a wire-level value rather than an Iceberg enum.  The
@@ -342,7 +343,7 @@ impl WriteTerminalBuilder {
             .sink()
             .connector_staged_report_frames
             .iter()
-            .map(crate::query_lifecycle::terminal::encode_connector_staged_report_frame)
+            .map(::novarocks::query_lifecycle::terminal::encode_connector_staged_report_frame)
             .collect::<Vec<_>>();
         if let Err(error) = validate_connector_staged_report_frames(
             &frames,
@@ -836,11 +837,13 @@ fn query_id_to_be_bytes(execution_id: QueryExecutionId) -> [u8; 16] {
 mod tests {
     use super::*;
     use crate::query_execution::contract::QueryId;
-    use crate::query_lifecycle::{
-        AttemptId, ParticipantBackendIdentity, ParticipantManifestDigest, QueryControlEndpoint,
+    use ::novarocks::query_lifecycle::{
         QueryTerminalProfileContributionV1, QueryTerminalSnapshot, TerminalTelemetry,
     };
-    use crate::runtime::sink_commit::SinkCommitReportSnapshot;
+    use ::novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
+    use novarocks_protocol::lifecycle::{
+        AttemptId, ParticipantBackendIdentity, ParticipantManifestDigest, QueryControlEndpoint,
+    };
     use novarocks_protocol::plan;
     use prost::Message;
 

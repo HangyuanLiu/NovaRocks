@@ -677,6 +677,13 @@ pub fn run_all_in_one(config: NovaRocksConfig, port_override: Option<u16>) -> an
     ))
 }
 
+fn all_in_one_report_bind_addr(backend_endpoint: std::net::SocketAddr) -> std::net::SocketAddr {
+    match backend_endpoint.ip() {
+        std::net::IpAddr::V4(_) => std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        std::net::IpAddr::V6(_) => std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+    }
+}
+
 async fn run_all_in_one_until<F>(
     config: NovaRocksConfig,
     port_override: Option<u16>,
@@ -702,10 +709,7 @@ where
         }
     };
     let endpoint = backend.connectable_native_endpoint();
-    let report_bind_addr = match endpoint.ip() {
-        std::net::IpAddr::V4(_) => std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        std::net::IpAddr::V6(_) => std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
-    };
+    let report_bind_addr = all_in_one_report_bind_addr(endpoint);
     let mut report_server = match frontend.start_report_server(report_bind_addr) {
         Ok(report_server) => report_server,
         Err(error) => {
@@ -873,9 +877,22 @@ fn combine_primary_and_cleanup(
 #[cfg(test)]
 mod tests {
     use super::{
-        combine_primary_and_cleanup, compose_backend_execution_installers,
-        compose_frontend_control_factories,
+        all_in_one_report_bind_addr, combine_primary_and_cleanup,
+        compose_backend_execution_installers, compose_frontend_control_factories,
     };
+
+    #[test]
+    fn all_in_one_report_listener_preserves_the_backend_address_family() {
+        for backend in [
+            std::net::SocketAddr::from(([127, 0, 0, 1], 19000)),
+            std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 19000)),
+        ] {
+            let report = all_in_one_report_bind_addr(backend);
+            assert_eq!(report.is_ipv4(), backend.is_ipv4());
+            assert!(report.ip().is_loopback());
+            assert_eq!(report.port(), 0);
+        }
+    }
 
     #[test]
     fn primary_failure_remains_primary_when_all_cleanup_steps_fail() {

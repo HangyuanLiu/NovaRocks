@@ -1,6 +1,7 @@
 //! Frontend-owned report-only native endpoint.
 
 use std::collections::BTreeMap;
+use std::future::IntoFuture;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -8,7 +9,7 @@ use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
 use crate::coordinator::QueryTerminalIngress;
-use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
+use ::novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use axum::Json;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
@@ -362,9 +363,79 @@ fn report_response_from_ack(
 
 #[cfg(test)]
 mod tests {
-    use super::report_response_from_ack;
-    use novarocks_protocol::lifecycle::{QueryTerminalReportAck, QueryTerminalReportOutcome};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::super::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
+    use super::{FrontendReportServerHandle, report_response_from_ack};
+    use crate::coordinator::{QueryLifecycleConvergenceReader, QueryTerminalIngress};
+    use novarocks_protocol::lifecycle::{
+        AttemptId, NegativeAttestation, ParticipantBackendIdentity, ParticipantTerminalOutcome,
+        QueryExecutionId, QueryTerminalReportAck, QueryTerminalReportOutcome,
+    };
     use novarocks_protocol::novarocks as proto;
+    use novarocks_types::QueryId;
+
+    struct FixedIngress {
+        ack: QueryTerminalReportAck,
+    }
+
+    struct EmptyConvergenceReader;
+
+    impl QueryLifecycleConvergenceReader for EmptyConvergenceReader {
+        fn latest_convergence_snapshot(
+            &self,
+        ) -> Option<crate::coordinator::QueryLifecycleConvergenceSnapshot> {
+            None
+        }
+    }
+
+    impl QueryTerminalIngress for FixedIngress {
+        fn report_query_terminal(
+            &self,
+            _outcome: ParticipantTerminalOutcome,
+        ) -> Result<QueryTerminalReportAck, ::novarocks::query_lifecycle::QueryLifecycleError>
+        {
+            Ok(self.ack.clone())
+        }
+    }
+
+    fn terminal_outcome() -> ParticipantTerminalOutcome {
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(41, 42),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("execution id");
+        let backend = ParticipantBackendIdentity::parse(proto::ParticipantBackendIdentity {
+            backend_id: 7,
+            endpoint: Some(proto::QueryControlEndpoint {
+                host: "127.0.0.1".into(),
+                port: 9030,
+            }),
+            start_epoch: 11,
+        })
+        .expect("backend identity");
+        let attestation = NegativeAttestation::seal(proto::NegativeAttestation {
+            execution_id: Some(execution_id.into()),
+            backend: Some(backend.as_proto().clone()),
+            init_digest: vec![3; 32],
+            reason: proto::NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted as i32,
+            detail: "test terminal report".to_string(),
+            detail_truncated: false,
+            digest: Vec::new(),
+        })
+        .expect("negative attestation");
+        ParticipantTerminalOutcome::parse(proto::ParticipantTerminalOutcome {
+            snapshot: None,
+            outcome: Some(
+                proto::participant_terminal_outcome::Outcome::NegativeAttestation(
+                    attestation.as_proto().clone(),
+                ),
+            ),
+        })
+        .expect("participant terminal outcome")
+    }
 
     #[test]
     fn terminal_report_ack_preserves_every_typed_wire_outcome() {
@@ -380,6 +451,50 @@ mod tests {
             .expect("encode report response");
             assert_eq!(response.outcome, outcome as i32);
             assert_eq!(response.detail, "test");
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_report_grpc_round_trip_preserves_every_typed_wire_outcome() {
+        for outcome in [
+            QueryTerminalReportOutcome::Accepted,
+            QueryTerminalReportOutcome::AlreadyAccepted,
+            QueryTerminalReportOutcome::RejectedConflict,
+            QueryTerminalReportOutcome::RejectedGone,
+        ] {
+            let ingress = Arc::new(FixedIngress {
+                ack: QueryTerminalReportAck::new(outcome, "wire outcome")
+                    .expect("valid report acknowledgement"),
+            });
+            let convergence_reader: Arc<dyn QueryLifecycleConvergenceReader> =
+                Arc::new(EmptyConvergenceReader);
+            let mut server = FrontendReportServerHandle::start(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                ingress,
+                convergence_reader,
+            )
+            .expect("start frontend report server");
+            let mut client = tokio::time::timeout(
+                Duration::from_secs(3),
+                NovaRocksGrpcClient::connect(format!("http://{}", server.bound_addr())),
+            )
+            .await
+            .expect("report client connect timeout")
+            .expect("connect report client");
+            let response = tokio::time::timeout(
+                Duration::from_secs(3),
+                client.report_query_terminal(proto::ReportQueryTerminalRequest {
+                    outcome: Some(terminal_outcome().as_proto().clone()),
+                }),
+            )
+            .await
+            .expect("terminal report RPC timeout")
+            .expect("report terminal outcome")
+            .into_inner();
+            assert_eq!(response.outcome, outcome as i32);
+            assert_eq!(response.detail, "wire outcome");
+            drop(client);
+            server.stop().expect("stop frontend report server");
         }
     }
 }
@@ -448,7 +563,7 @@ impl FrontendReportServerHandle {
                         .enable_all()
                         .worker_threads(8)
                         .thread_stack_size(
-                            crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES,
+                            ::novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES,
                         )
                         .build()
                         .map_err(|error| {
@@ -481,18 +596,20 @@ impl FrontendReportServerHandle {
                             app
                         };
                         let mut shutdown_rx = shutdown_rx;
-                        axum::serve(listener, app)
-                            .with_graceful_shutdown(async move {
+                        let serve = axum::serve(listener, app).into_future();
+                        tokio::pin!(serve);
+                        tokio::select! {
+                            result = &mut serve => result.map_err(|error| {
+                                format!("frontend report endpoint serve future failed: {error}")
+                            }),
+                            _ = async move {
                                 while !*shutdown_rx.borrow() {
                                     if shutdown_rx.changed().await.is_err() {
                                         break;
                                     }
                                 }
-                            })
-                            .await
-                            .map_err(|error| {
-                                format!("frontend report endpoint serve future failed: {error}")
-                            })
+                            } => Ok(()),
+                        }
                     })
                 }));
                 if thread_stop_requested.load(Ordering::Acquire) {

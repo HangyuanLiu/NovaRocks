@@ -22,12 +22,12 @@
 //! frontend only journals bounded provider-neutral facts around execute-once
 //! and the optional same-session reconcile-once call.
 
-use crate::common::admitted_query_context::RequestContext;
 use crate::query_execution::dml::truncate::{
     PlanTruncateRequest, PreparedTruncate, TruncateCommand, TruncateDispatchState, TruncateEffect,
     TruncateEngine, TruncateEvidence, TruncateFailure, TruncateFailureKind, TruncateFinalization,
     TruncateOutcome, TruncatePlanError, TruncatePlanFacts, TruncateReceipt,
 };
+use ::novarocks::common::admitted_query_context::RequestContext;
 use bytes::Bytes;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_spi::connector::{

@@ -21,11 +21,11 @@ mod command;
 mod iceberg;
 mod shaping;
 
-use crate::common::admitted_query_context::RequestContext;
 use crate::query_execution::dml::insert::{
     IcebergInsertSource, InsertEngine, InsertOverwriteMode, InsertTargetName, InsertValue,
     PrepareIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
 };
+use ::novarocks::common::admitted_query_context::RequestContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 
 use crate::dml::error::DmlError;

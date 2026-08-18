@@ -23,7 +23,7 @@ use super::{
     MaintenanceRequestContext, MaintenanceStatementResult, RequestScopedMaintenanceEngine,
     TableMaintenanceService,
 };
-use crate::runtime::statement_result::StatementResult;
+use ::novarocks::runtime::statement_result::StatementResult;
 
 /// Foreground maintenance command capability.  Each invocation creates a
 /// short-lived engine carrying only the Frontend-composed maintenance ports
@@ -44,7 +44,7 @@ impl MaintenanceCommandExecutor {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
-        execution: &crate::common::admitted_query_context::QueryExecutionContext,
+        execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Option<StatementResult>, String> {
         if !super::looks_like_maintenance_statement(sql) {

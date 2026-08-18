@@ -47,8 +47,8 @@ use self::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
     QuerySessionOpenRequest,
 };
-use novarocks::common::query_cancellation::QueryCancellationReason;
-use novarocks::runtime::statement_result::StatementResult;
+use ::novarocks::common::query_cancellation::QueryCancellationReason;
+use ::novarocks::runtime::statement_result::StatementResult;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;

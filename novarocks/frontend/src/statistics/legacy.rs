@@ -21,7 +21,7 @@
 //! the frontend SQL application. They are intentionally independent from the
 //! provider-neutral distributed collection program in Core.
 
-use crate::runtime::query_result::QueryResult;
+use ::novarocks::runtime::query_result::QueryResult;
 use arrow::datatypes::DataType;
 
 pub struct StatisticsRequestContext<'a> {

@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use crate::query_execution::FragmentInstancePlacement;
-use crate::runtime::scan_range;
+use ::novarocks::runtime::scan_range;
 use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::endpoint::FragmentDestination;
 use novarocks_execution::runtime::query_options::QueryOptions;

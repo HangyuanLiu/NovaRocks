@@ -19,20 +19,6 @@ pub mod contract;
 pub mod terminal;
 
 pub use contract::{QueryLifecycleError, QueryLifecycleErrorCode};
-pub use novarocks_protocol::lifecycle::{
-    AttemptId, ExchangeRouteManifest, FragmentLiveObservation, ParticipantBackendIdentity,
-    ParticipantManifest, ParticipantManifestDigest, ParticipantRole, QueryAbortRequest,
-    QueryControlAttach, QueryControlCommand, QueryControlEndpoint, QueryControlEvent,
-    QueryExecutionId, QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryOptions,
-    QueryTerminationAck, QueryTerminationReason, RuntimeFilterContribution,
-};
-pub use novarocks_protocol::lifecycle::{
-    QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
-    QueryStartRequest, StageDigest, StageDigestVersion, StageFragment,
-};
-pub use novarocks_protocol::lifecycle::{
-    QueryTerminalAck, QueryTerminalReportAck, QueryTerminalReportOutcome,
-};
 pub use terminal::{
     FragmentTerminalOutcome, FragmentTerminalSnapshot, ImmutableQueryTerminalRecord,
     NegativeAttestation, NegativeAttestationReason, PARTICIPANT_TERMINAL_OUTCOME_VERSION_V1,

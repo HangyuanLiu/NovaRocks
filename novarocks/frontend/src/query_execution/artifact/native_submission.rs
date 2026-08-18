@@ -26,14 +26,14 @@ use super::{
     ExpectedOutputSchema, FragmentId, RootFetchMetadata, ValidatedNativeSubmission,
     WriterRegistrationSet,
 };
-use crate::common::types::UniqueId;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
-use crate::query_lifecycle::QueryExecutionId;
+use ::novarocks::common::types::UniqueId;
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::ConnectorWriteCohortId;
 use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdge, FragmentId as PlannerFragmentId};
 use std::collections::BTreeMap;
@@ -360,7 +360,7 @@ impl NativeSubmissionAttachment {
 mod tests {
     use super::*;
     use crate::query_execution::contract::QueryId;
-    use crate::query_lifecycle::AttemptId;
+    use novarocks_protocol::lifecycle::AttemptId;
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(

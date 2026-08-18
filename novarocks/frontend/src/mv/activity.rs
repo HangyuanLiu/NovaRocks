@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 
-use crate::common::query_cancellation::{
+use ::novarocks::common::query_cancellation::{
     QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
 };
 use crate::mv::domain::repository::MvTarget;

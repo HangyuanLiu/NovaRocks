@@ -21,9 +21,9 @@ use super::super::instance;
 fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() {
     use std::collections::BTreeMap;
 
-    let mut scan_range = crate::runtime::scan_range::ScanRangeParams::file(
-        crate::runtime::scan_range::FileScanRange {
-            file_format: crate::runtime::scan_range::FileFormat::Parquet,
+    let mut scan_range = ::novarocks::runtime::scan_range::ScanRangeParams::file(
+        ::novarocks::runtime::scan_range::FileScanRange {
+            file_format: ::novarocks::runtime::scan_range::FileFormat::Parquet,
             full_path: Some("s3://bucket/data.parquet".to_string()),
             relative_path: Some("data.parquet".to_string()),
             table_id: Some(99),
@@ -43,8 +43,8 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
             ivm_change_op: Some(novarocks_execution::exec::change_op::CHANGE_OP_DELETE),
             file_pruning_min_max_values: Some(BTreeMap::from([(
                 0,
-                crate::runtime::scan_range::FilePruningMinMaxValue {
-                    value_kind: crate::runtime::scan_range::FilePruningValueKind::Int,
+                ::novarocks::runtime::scan_range::FilePruningMinMaxValue {
+                    value_kind: ::novarocks::runtime::scan_range::FilePruningValueKind::Int,
                     has_null: false,
                     all_null: false,
                     min_int_value: Some(10),

@@ -28,13 +28,13 @@ use crate::common::types::UniqueId;
 use crate::runtime::sink_commit::SinkCommitReportSnapshot;
 use novarocks_execution::runtime::fragment::fact::{FragmentOutcome, FragmentTerminalFact};
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
+use novarocks_protocol::lifecycle::{
+    ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest, QueryExecutionId,
+};
 use novarocks_protocol::{common, novarocks};
 use novarocks_spi::connector::ConnectorWriterTerminalState;
 
-use super::{
-    ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest, QueryExecutionId,
-    QueryLifecycleError,
-};
+use super::QueryLifecycleError;
 
 pub const QUERY_TERMINAL_SNAPSHOT_VERSION_V1: u32 = 1;
 /// Version carried by terminal delivery acknowledgements for both the proof

@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use crate::common::backend_topology::{
+use ::novarocks::common::backend_topology::{
     BackendQueryEvent, BackendQueryEventSink, LiveBackendTarget,
 };
 use novarocks_types::QueryId;

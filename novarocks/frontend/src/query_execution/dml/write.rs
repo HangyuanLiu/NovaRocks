@@ -3,12 +3,12 @@
 //! The binding retains the exact connector operation session created from the
 //! admitted write template. It never reacquires a current connector generation.
 
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::contract::{DistributedQueryOutcome, DistributedQueryRequest};
 use crate::query_execution::outcome::{QueryExecutionResult, WriteExecutionOutcome};
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
+use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 
 pub(crate) struct BoundDistributedWriteRequest {
     pub(crate) request: DistributedQueryRequest,

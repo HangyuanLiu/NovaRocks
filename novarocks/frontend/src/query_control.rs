@@ -20,11 +20,11 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
 use crate::query_execution::control::{
     QueryCancelOutcome, QueryControlError, QueryControlPort, QueryControlService, SessionIdentity,
     SessionToken, StatementFinishOutcome, StatementRegistration, StatementToken,
 };
+use ::novarocks::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
 
 #[derive(Default)]
 pub struct FrontendQueryControl {
@@ -167,10 +167,10 @@ impl QueryControlPort for FrontendQueryControl {
             return QueryCancelOutcome::NoActiveStatement;
         };
         match active.cancellation.request(reason) {
-            crate::common::query_cancellation::QueryCancellationRequestResult::Requested => {
+            ::novarocks::common::query_cancellation::QueryCancellationRequestResult::Requested => {
                 QueryCancelOutcome::Requested
             }
-            crate::common::query_cancellation::QueryCancellationRequestResult::AlreadyRequested(
+            ::novarocks::common::query_cancellation::QueryCancellationRequestResult::AlreadyRequested(
                 reason,
             ) => QueryCancelOutcome::AlreadyRequested(reason),
         }
@@ -199,10 +199,10 @@ impl QueryControlPort for FrontendQueryControl {
             .request(QueryCancellationReason::ExplicitKill {
                 requester_connection_id: requester.connection_id(),
             }) {
-            crate::common::query_cancellation::QueryCancellationRequestResult::Requested => {
+            ::novarocks::common::query_cancellation::QueryCancellationRequestResult::Requested => {
                 QueryCancelOutcome::Requested
             }
-            crate::common::query_cancellation::QueryCancellationRequestResult::AlreadyRequested(
+            ::novarocks::common::query_cancellation::QueryCancellationRequestResult::AlreadyRequested(
                 reason,
             ) => QueryCancelOutcome::AlreadyRequested(reason),
         }

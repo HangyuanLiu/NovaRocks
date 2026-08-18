@@ -24,11 +24,11 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::query_execution::StatementResult;
-use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::statistics_jobs::application::{
     StatisticsApplicationCommand, StatisticsApplicationPort, StatisticsApplicationResult,
     StatisticsColumnIntent, StatisticsTableTarget,
 };
+use ::novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use novarocks_catalog::identifier::normalize_identifier;
 
 #[derive(Clone)]
@@ -170,7 +170,7 @@ impl StatisticsCommandExecutor {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
-        execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
+        execution: Option<&::novarocks::common::admitted_query_context::QueryExecutionContext>,
     ) -> Result<Option<StatementResult>, String> {
         let Some(statement) = novarocks_sql::planning::dml::parse_statistics_command(sql)? else {
             return Ok(None);
@@ -247,7 +247,7 @@ mod tests {
         fn execute(
             &self,
             command: StatisticsApplicationCommand,
-            _execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
+            _execution: Option<&::novarocks::common::admitted_query_context::QueryExecutionContext>,
         ) -> Result<StatisticsApplicationResult, StatisticsApplicationError> {
             self.commands
                 .lock()
@@ -312,7 +312,7 @@ mod tests {
             )
             .expect("show typed table stats")
             .expect("statistics command result");
-        let crate::runtime::statement_result::StatementResult::Query(show_stats) = show_stats
+        let ::novarocks::runtime::statement_result::StatementResult::Query(show_stats) = show_stats
         else {
             panic!("SHOW TABLE STATS must return a query result");
         };

@@ -18,15 +18,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
-use crate::common::backend_topology::LiveBackendTarget;
-#[cfg(debug_assertions)]
-use crate::common::query_lifecycle_fault::{QueryLifecycleFaultKind, arm_path, configured_root};
 use crate::query_execution::artifact::{
     BackendPlacement, FragmentId, FragmentScheduleDraft, FragmentSchedulingView,
     SchedulingStreamKind, ValidatedFragmentSchedule,
 };
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use crate::query_lifecycle::QueryExecutionId;
+use ::novarocks::common::backend_topology::LiveBackendTarget;
+#[cfg(debug_assertions)]
+use ::novarocks::common::query_lifecycle_fault::{
+    QueryLifecycleFaultKind, arm_path, configured_root,
+};
+use novarocks_protocol::lifecycle::QueryExecutionId;
 
 #[derive(Clone)]
 pub struct FrontendBackendSnapshot {
@@ -289,9 +291,9 @@ fn bind_query_lifecycle_fault_scopes(
     execution_id: QueryExecutionId,
     backends: &FrontendBackendSnapshot,
 ) -> Result<(), DistributedQueryError> {
-    use crate::common::query_lifecycle_fault::{QueryLifecycleFaultKind, bind_armed_fault};
+    use ::novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, bind_armed_fault};
 
-    let Some(root) = crate::common::query_lifecycle_fault::configured_root() else {
+    let Some(root) = ::novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(());
     };
     for &(backend_index, _) in &backends.entries {
@@ -427,7 +429,7 @@ fn query_control_fragment_backend_limit(
     execution_id: QueryExecutionId,
     live_backend_count: usize,
 ) -> Result<Option<usize>, DistributedQueryError> {
-    let Some(root) = crate::common::query_lifecycle_fault::configured_root() else {
+    let Some(root) = ::novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(None);
     };
     let path = root.join("fragment-backend-limit.trigger");
@@ -495,7 +497,7 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
 mod tests {
     use super::{FrontendBackendSnapshot, FrontendFragmentScheduler};
     use crate::query_execution::contract::DistributedQueryErrorKind;
-    use crate::query_lifecycle::{AttemptId, QueryExecutionId};
+    use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_types::QueryId;
 
     fn execution_id(attempt: u64) -> QueryExecutionId {

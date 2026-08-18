@@ -1622,9 +1622,11 @@ fn claim_terminal_ack_drop(
     session: &ActiveSession,
     outcome: &ParticipantTerminalOutcome,
 ) -> Result<bool, String> {
-    use crate::common::query_lifecycle_fault::{QueryLifecycleFaultKind, claim_matching_fault};
+    use ::novarocks::common::query_lifecycle_fault::{
+        QueryLifecycleFaultKind, claim_matching_fault,
+    };
 
-    let Some(root) = crate::common::query_lifecycle_fault::configured_root() else {
+    let Some(root) = ::novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(false);
     };
     let backend_index = session.target.backend_idx();
@@ -1659,10 +1661,12 @@ fn claim_terminal_ack_drop(
 fn claim_terminal_snapshot_conflict(
     session: &ActiveSession,
     outcome: &ParticipantTerminalOutcome,
-) -> Result<Option<crate::common::query_lifecycle_fault::QueryLifecycleFaultScope>, String> {
-    use crate::common::query_lifecycle_fault::{QueryLifecycleFaultKind, claim_matching_fault};
+) -> Result<Option<::novarocks::common::query_lifecycle_fault::QueryLifecycleFaultScope>, String> {
+    use ::novarocks::common::query_lifecycle_fault::{
+        QueryLifecycleFaultKind, claim_matching_fault,
+    };
 
-    let Some(root) = crate::common::query_lifecycle_fault::configured_root() else {
+    let Some(root) = ::novarocks::common::query_lifecycle_fault::configured_root() else {
         return Ok(None);
     };
     let backend_index = session.target.backend_idx();
@@ -1688,7 +1692,7 @@ fn protocol_execution_id(execution_id: QueryExecutionId) -> Result<QueryExecutio
 fn claim_terminal_snapshot_conflict(
     _session: &ActiveSession,
     _outcome: &ParticipantTerminalOutcome,
-) -> Result<Option<crate::common::query_lifecycle_fault::QueryLifecycleFaultScope>, String> {
+) -> Result<Option<::novarocks::common::query_lifecycle_fault::QueryLifecycleFaultScope>, String> {
     Ok(None)
 }
 
@@ -1979,10 +1983,10 @@ fn contract_violation(message: impl Into<String>) -> DistributedQueryError {
 /// CLS-R2.
 fn marker_execution_id(
     execution_id: QueryExecutionId,
-) -> Result<crate::query_lifecycle::QueryExecutionId, DistributedQueryError> {
-    let attempt = crate::query_lifecycle::AttemptId::new(execution_id.attempt_id().get())
+) -> Result<novarocks_protocol::lifecycle::QueryExecutionId, DistributedQueryError> {
+    let attempt = novarocks_protocol::lifecycle::AttemptId::new(execution_id.attempt_id().get())
         .map_err(|error| contract_violation(error.to_string()))?;
-    crate::query_lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
+    novarocks_protocol::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
         .map_err(|error| contract_violation(error.to_string()))
 }
 
