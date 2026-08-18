@@ -587,10 +587,10 @@ mod tests {
     use ::novarocks::common::query_cancellation::{
         QueryCancellationReason, QueryCancellationSource,
     };
-    use ::novarocks::common::types::UniqueId;
     use ::novarocks::runtime::query_result::QueryResult;
     use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::ClusterRole;
+    use novarocks_types::UniqueId;
 
     fn cancelled_execution() -> QueryExecutionContext {
         let cancellation = QueryCancellationSource::new();

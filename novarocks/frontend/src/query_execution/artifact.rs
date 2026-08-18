@@ -50,7 +50,6 @@ use crate::query_execution::schedule::{
 use crate::query_execution::write_plan::{ConnectorWriteManifest, ConnectorWritePlanAttachment};
 use crate::query_execution::{RuntimeFilterBindingFactsView, RuntimeFilterDeploymentFactsView};
 use ::novarocks::common::backend_topology::LiveBackendTarget;
-use ::novarocks::common::types::UniqueId;
 use ::novarocks::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
@@ -64,6 +63,7 @@ use novarocks_protocol::plan::RuntimeFilterBindingTable;
 use novarocks_protocol::{common, novarocks};
 use novarocks_sql::plan_read::{FragmentEdgeKind, FragmentStreamKind, PartitionKind};
 use novarocks_types::SlotId;
+use novarocks_types::UniqueId;
 
 pub use crate::query_execution::connector_binding::{
     ConnectorBindingBackendInstallPlan, ConnectorBindingDispatcher, ConnectorBindingInstallBarrier,
@@ -2008,13 +2008,13 @@ mod tests {
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
     use ::novarocks::common::backend_topology::LiveBackendTarget;
-    use ::novarocks::common::types::UniqueId;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_protocol::lifecycle::{AttemptId, ExchangeRouteManifest, QueryExecutionId};
     use novarocks_protocol::{common, novarocks};
     use novarocks_sql::plan_read::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
     };
+    use novarocks_types::UniqueId;
 
     fn placement(
         fragment_id: u32,

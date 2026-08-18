@@ -1,4 +1,5 @@
 mod application;
+mod config;
 pub mod connector;
 mod exchange_receiver;
 mod fragment;

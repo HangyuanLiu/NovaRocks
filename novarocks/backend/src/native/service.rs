@@ -276,7 +276,7 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
         self.query_lifecycle_ingress
             .bind_backend_identity(u64::from(request.assigned_be_id))
             .map_err(status_from_lifecycle_error)?;
-        novarocks::runtime::backend_id::set_backend_id(i64::from(request.assigned_be_id));
+        crate::runtime::backend_id::set_backend_id(i64::from(request.assigned_be_id));
         let num_cores = std::thread::available_parallelism()
             .map(|count| count.get() as u32)
             .unwrap_or(1);

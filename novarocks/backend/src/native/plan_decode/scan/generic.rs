@@ -31,7 +31,7 @@ use novarocks_spi::connector::{
     ConnectorScanHandle, ConnectorSplit,
 };
 
-use novarocks::connector::runtime::{ConnectorBatchTransform, ConnectorReadScanSource};
+use crate::connector::runtime::{ConnectorBatchTransform, ConnectorReadScanSource};
 use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::scan::BoundScanRanges;
@@ -235,7 +235,7 @@ pub(super) fn lower_connector_read_scan(
                 error.to_string(),
             )
         })?;
-    if novarocks::common::config::debug_emit_connector_reader_marker() {
+    if crate::config::debug_emit_connector_reader_marker() {
         println!(
             "NOVAROCKS_CONNECTOR_READ_SOURCE instance={} splits={}",
             instance_id.as_str(),

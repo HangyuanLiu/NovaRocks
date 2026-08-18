@@ -59,6 +59,13 @@ impl ResultBatch {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct FetchResult {
+    pub(crate) packet_seq: i64,
+    pub(crate) eos: bool,
+    pub(crate) result_batch: ResultBatch,
+}
+
 #[cfg(test)]
 mod tests {
     use super::ResultBatch;

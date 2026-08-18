@@ -25,7 +25,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use novarocks::connector::ConnectorRegistry;
+use crate::connector::ConnectorRegistry;
 use novarocks_execution::runtime::fragment::FragmentSubmission;
 use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
 use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
@@ -208,7 +208,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use novarocks::connector::ConnectorRegistry;
+    use crate::connector::ConnectorRegistry;
     use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_protocol::{common, novarocks as proto, plan};
     use novarocks_types::QueryId;

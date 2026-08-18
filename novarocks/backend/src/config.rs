@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-/// Debug and test switches are supplied by the process environment, not the
+/// Backend debug and test switches are supplied by the process environment, not the
 /// application config.
 ///
 /// These knobs are read from deep inside connector, decoder and operator code

@@ -4,7 +4,6 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use novarocks::connector::ConnectorRegistry;
 use novarocks::service::MetricsHttpServer;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_protocol::lifecycle::{
@@ -15,6 +14,7 @@ use novarocks_spi::connector::ConnectorExecutionInstaller;
 use novarocks_types::AdvertiseEndpoint;
 
 use crate::BackendDataRuntime;
+use crate::connector::ConnectorRegistry;
 use crate::exchange_receiver::BackendExchangeReceiverPort;
 use crate::fragment::control::FragmentControlRegistry;
 use crate::fragment::{

@@ -15,11 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 pub mod common;
-pub mod connector;
 pub mod maintenance;
 pub mod runtime;
 pub mod service;
-pub use connector as novarocks_connectors;
 pub use novarocks_version as version;
-
-pub use common::types::FetchResult;

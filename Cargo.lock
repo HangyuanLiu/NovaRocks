@@ -3162,6 +3162,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "hex",
  "novarocks",
  "novarocks-execution",
  "novarocks-failpoint",

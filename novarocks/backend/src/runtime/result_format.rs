@@ -2,7 +2,7 @@ use arrow::array::ArrayRef;
 use novarocks_types::PrimitiveType;
 use novarocks_types::arrow_primitive::arrow_field_to_primitive;
 
-use novarocks::common::result_batch::ResultBatch;
+use crate::runtime::result_batch::ResultBatch;
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_execution::runtime::fragment::io::{ResultPresentation, ResultProjection};
 use novarocks_types::{

@@ -17,7 +17,7 @@
 
 use crate::runtime::query_context::{QueryContextManager, query_context_manager};
 use crate::runtime::result_buffer;
-use novarocks::common::types::UniqueId;
+use novarocks_types::UniqueId;
 use tracing::info;
 
 pub fn cancel_runtime_fragment(finst_id: UniqueId) {
@@ -50,7 +50,7 @@ pub(crate) fn cancel_with_manager(finst_id: UniqueId, mgr: std::sync::Arc<QueryC
 mod tests {
     use super::cancel_runtime_fragment;
     use crate::runtime::query_context::{QueryId, query_context_manager};
-    use novarocks::common::types::UniqueId;
+    use novarocks_types::UniqueId;
 
     #[test]
     fn cancel_fans_out_to_query_fragment_peers() {

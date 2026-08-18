@@ -33,9 +33,9 @@ use novarocks_spi::connector::{
 use sha2::{Digest, Sha256};
 
 use crate::query_execution::schedule::SchedulingPlan;
-use ::novarocks::common::types::UniqueId;
 use novarocks_protocol::lifecycle::QueryExecutionId;
 use novarocks_sql::plan_read::FragmentId;
+use novarocks_types::UniqueId;
 
 /// One exact, placement-frozen writer manifest.  C1 gives each terminal sink
 /// one logical writer, so `sink_ordinal` is zero until a physical fragment can

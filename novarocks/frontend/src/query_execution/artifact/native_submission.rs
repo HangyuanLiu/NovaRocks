@@ -31,11 +31,11 @@ use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
-use ::novarocks::common::types::UniqueId;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::ConnectorWriteCohortId;
 use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdge, FragmentId as PlannerFragmentId};
+use novarocks_types::UniqueId;
 use std::collections::BTreeMap;
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {

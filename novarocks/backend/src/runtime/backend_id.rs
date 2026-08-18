@@ -14,29 +14,15 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use std::sync::atomic::{AtomicI64, Ordering};
 
-pub mod runtime;
+static BACKEND_ID: AtomicI64 = AtomicI64::new(-1);
 
-pub(crate) use novarocks_execution::exec::min_max_predicate::{
-    MinMaxPredicate, MinMaxPredicateValue,
-};
-
-#[cfg(test)]
-mod runtime_test;
-
-/// Temporary production registry shell retained until W4 moves connector
-/// execution ownership to the backend crate.
-#[derive(Clone, Default)]
-pub struct ConnectorRegistry;
-
-impl ConnectorRegistry {
-    pub fn new() -> Self {
-        Self
-    }
+pub(crate) fn set_backend_id(id: i64) {
+    BACKEND_ID.store(id, Ordering::Release);
 }
 
-impl std::fmt::Debug for ConnectorRegistry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnectorRegistry").finish()
-    }
+pub(crate) fn backend_id() -> Option<i64> {
+    let value = BACKEND_ID.load(Ordering::Acquire);
+    (value >= 0).then_some(value)
 }

@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+use crate::connector::ConnectorRegistry;
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use crate::runtime::sink_commit::{BackendSinkCommitPort, ConfiguredBackendSinkCommitPort};
-use novarocks::connector::ConnectorRegistry;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_execution::runtime::fragment::io::{
     ExchangeFrameTransmitter, ExchangeReceiverPort, FragmentCommitPort, FragmentResultWriter,
@@ -805,7 +805,7 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
-    use novarocks::connector::ConnectorRegistry;
+    use crate::connector::ConnectorRegistry;
     use novarocks_execution::runtime::fragment::{
         DormantFragmentHandle, FragmentOutcome, prepare_fragment,
     };

@@ -7,6 +7,7 @@ use novarocks_execution::runtime::fragment::io::{
 
 use crate::BackendDataRuntime;
 use crate::native::client::NativeGrpcClient;
+use crate::runtime::backend_id;
 
 pub(crate) fn grpc_fragment_lookup_client(
     runtime: BackendDataRuntime,
@@ -20,7 +21,7 @@ struct GrpcFragmentLookupClient {
 
 impl FragmentLookupClient for GrpcFragmentLookupClient {
     fn lookup(&self, request: LookupRequest) -> Result<LookupBatch, FragmentIoError> {
-        let local_backend_id = novarocks::runtime::backend_id::backend_id()
+        let local_backend_id = backend_id::backend_id()
             .ok_or_else(|| {
                 lookup_error(
                     FragmentIoErrorKind::Unavailable,

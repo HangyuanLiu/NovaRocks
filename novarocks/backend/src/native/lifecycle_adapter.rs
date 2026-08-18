@@ -101,7 +101,7 @@ pub fn handle_abort_query(
 }
 
 fn emit_query_lifecycle_abort_marker() {
-    if novarocks::common::config::debug_emit_cancel_marker() {
+    if crate::config::debug_emit_cancel_marker() {
         println!("NOVAROCKS_QUERY_LIFECYCLE_ABORT");
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
@@ -562,7 +562,7 @@ fn claim_backend_fault(
                 "invalid lifecycle fault backend index: {error}"
             ))
         })?;
-    let backend_id = novarocks::runtime::backend_id::backend_id()
+    let backend_id = crate::runtime::backend_id::backend_id()
         .and_then(|id| u64::try_from(id).ok())
         .ok_or_else(|| tonic::Status::failed_precondition("backend identity is not bound"))?;
     claim_matching_fault(
@@ -625,7 +625,7 @@ fn observe_backend_fault(
                 "invalid lifecycle fault backend index: {error}"
             ))
         })?;
-    let backend_id = novarocks::runtime::backend_id::backend_id()
+    let backend_id = crate::runtime::backend_id::backend_id()
         .and_then(|id| u64::try_from(id).ok())
         .ok_or_else(|| tonic::Status::failed_precondition("backend identity is not bound"))?;
     observe_matching_fault(

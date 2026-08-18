@@ -487,7 +487,7 @@ fn prepare_units(
                 split.split_id()
             ));
         }
-        if crate::common::config::debug_emit_connector_reader_marker() {
+        if crate::config::debug_emit_connector_reader_marker() {
             let facts = set.facts_summary();
             println!(
                 "NOVAROCKS_CONNECTOR_UNIT_SET_PREPARED instance={} split_id={} unit_count={} shape={} leaf_kind={} membership_digest={} facts_exact_units={} facts_conservative_units={} facts_missing_units={} facts_available_columns={} facts_missing_columns={}",
@@ -1006,16 +1006,15 @@ impl ScanOp for ConnectorReadScanOp {
         if let Some(profile) = profile.as_ref() {
             profile.counter_add("ConnectorUnitReadersOpened", ProfileUnit::Unit, 1);
         }
-        let marker = crate::common::config::debug_emit_connector_reader_marker().then(|| {
-            ConnectorReaderMarker {
+        let marker =
+            crate::config::debug_emit_connector_reader_marker().then(|| ConnectorReaderMarker {
                 provider_id: self.binding.provider_id().to_string(),
                 instance_id: self.binding.instance_id().as_str().to_string(),
                 incarnation: hex::encode(self.binding.incarnation().to_bytes()),
                 split_id: unit.split_id().to_string(),
                 unit_ordinal: unit.ordinal(),
                 membership_digest: hex::encode(unit.membership_digest()),
-            }
-        });
+            });
         let reader = self.reader_group.register(reader, marker)?;
         Ok(Box::new(
             ConnectorBatchReaderIter::with_profile_and_transform(

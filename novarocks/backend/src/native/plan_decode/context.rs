@@ -22,8 +22,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::connector::ConnectorRegistry;
 use crate::native::expression::NativeExpressionInputLayout;
-use novarocks::connector::ConnectorRegistry;
 use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_execution::exec::fragment::program::FragmentNodeId;
 use novarocks_execution::exec::node::scan::BoundScanRanges;

@@ -17,7 +17,7 @@
 
 use std::fmt;
 
-use crate::common::types::UniqueId;
+use novarocks_types::UniqueId;
 
 pub const REPORT_EXEC_STATUS_OK: i32 = 0;
 pub const REPORT_EXEC_STATUS_ERROR: i32 = 1;
