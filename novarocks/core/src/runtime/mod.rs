@@ -16,8 +16,6 @@
 // under the License.
 pub mod backend_id;
 pub mod descriptor_snapshot;
-pub(crate) mod fragment_exec_params;
-pub(crate) mod fragment_output;
 pub mod lookup;
 pub mod native_fragment_query;
 pub(crate) mod profile_codec;
@@ -33,4 +31,3 @@ pub mod result_format;
 pub mod scan_range;
 pub mod sink_commit;
 pub mod start_epoch;
-pub mod thread_cpu_time;

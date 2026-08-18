@@ -17,4 +17,3 @@
 
 pub mod fragment_transport;
 pub(crate) mod query_options_contract;
-pub(crate) mod type_mapping;
