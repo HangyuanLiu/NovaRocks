@@ -42,8 +42,8 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, ConnectorRowMutationActivationRequest,
     ConnectorRowMutationCohortRecipeBody, ConnectorRowMutationExecutionPlan,
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
-    ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest, ConnectorWriteActivation,
-    ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
+    ConnectorTableObjectId, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
+    ConnectorWriteActivation, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
     ConnectorWriteActivationSource, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
     ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteInputShape,
     ConnectorWriteOperationCompletion, ConnectorWriteOperationId, ConnectorWritePlan,
@@ -1086,13 +1086,9 @@ impl IcebergWriteControl {
                     bases: intent
                         .bases()
                         .iter()
-                        .map(|base| super::ProvenanceBase {
-                            table_fqn: base.table.to_string(),
-                            uuid: base.uuid.to_string(),
-                            from_snapshot: base.from_version,
-                            to_snapshot: base.to_version,
-                        })
-                        .collect(),
+                        .map(provenance_base_from_staged_fact)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(invalid)?,
                     definition_fingerprint: intent.definition_fingerprint().to_string(),
                     rows: 0,
                 };
@@ -3080,13 +3076,9 @@ fn managed_snapshot_properties(
         bases: intent
             .bases()
             .iter()
-            .map(|base| super::ProvenanceBase {
-                table_fqn: base.table.to_string(),
-                uuid: base.uuid.to_string(),
-                from_snapshot: base.from_version,
-                to_snapshot: base.to_version,
-            })
-            .collect(),
+            .map(provenance_base_from_staged_fact)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(CommitServiceError::invalid_input)?,
         definition_fingerprint: intent.definition_fingerprint().to_string(),
         rows,
     }
@@ -3105,13 +3097,11 @@ fn managed_provenance_matches(
     let bases = expected
         .bases()
         .iter()
-        .map(|base| super::ProvenanceBase {
-            table_fqn: base.table.to_string(),
-            uuid: base.uuid.to_string(),
-            from_snapshot: base.from_version,
-            to_snapshot: base.to_version,
-        })
-        .collect::<Vec<_>>();
+        .map(provenance_base_from_staged_fact)
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(bases) = bases else {
+        return false;
+    };
     actual.provenance_version == super::MV_PROVENANCE_VERSION
         && actual.refresh_id == expected.refresh_id()
         && actual.mv_id == expected.materialization_id()
@@ -3119,6 +3109,29 @@ fn managed_provenance_matches(
         && actual.technique == technique
         && actual.bases == bases
         && actual.definition_fingerprint == expected.definition_fingerprint()
+}
+
+fn provenance_base_from_staged_fact(
+    base: &novarocks_spi::connector::ConnectorStagedPublicationBaseFact,
+) -> Result<super::ProvenanceBase, String> {
+    Ok(super::ProvenanceBase {
+        table_fqn: base.table.to_string(),
+        uuid: iceberg_uuid_from_object_id(&base.object_id)?,
+        from_snapshot: base.from_version,
+        to_snapshot: base.to_version,
+    })
+}
+
+// Design: ADR-0085 (docs/adr/ADR-0085-durable-base-object-identities-remain-opaque.md)
+fn iceberg_uuid_from_object_id(object_id: &ConnectorTableObjectId) -> Result<String, String> {
+    let uuid = std::str::from_utf8(object_id.as_bytes())
+        .map_err(|error| format!("Iceberg base object ID is not UTF-8: {error}"))?;
+    let parsed = uuid::Uuid::parse_str(uuid)
+        .map_err(|error| format!("Iceberg base object ID is not a UUID: {error}"))?;
+    if parsed.to_string() != uuid {
+        return Err("Iceberg base object ID is not a canonical UUID".to_string());
+    }
+    Ok(uuid.to_string())
 }
 
 pub(crate) fn operation_marker_partitioning(
@@ -5277,7 +5290,10 @@ mod tests {
             ConnectorManagedPublicationTechnique::Full,
             vec![ConnectorStagedPublicationBaseFact {
                 table: Arc::from("ice.db.base"),
-                uuid: Arc::from("base-uuid"),
+                object_id: ConnectorTableObjectId::try_new(Bytes::from_static(
+                    b"00112233-4455-6677-8899-aabbccddeeff",
+                ))
+                .expect("base object ID"),
                 from_version: None,
                 to_version: 1,
             }],
@@ -5475,7 +5491,15 @@ mod tests {
         assert!(
             crate::commit::MvProvenanceV1::from_snapshot_summary(snapshot)
                 .expect("decode provenance")
-                .is_some()
+                .is_some_and(|provenance| {
+                    provenance.bases
+                        == vec![crate::commit::ProvenanceBase {
+                            table_fqn: "ice.db.base".to_string(),
+                            uuid: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
+                            from_snapshot: None,
+                            to_snapshot: 1,
+                        }]
+                })
         );
         let conflicting = activation_request(&owner, operation_id, 99);
         control

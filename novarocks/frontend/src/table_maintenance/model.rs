@@ -18,7 +18,9 @@
 use crate::query_execution::maintenance::OptimizeJobState;
 use bytes::Bytes;
 use novarocks::maintenance::MaintenanceTarget;
-use novarocks_spi::connector::ConnectorWriteExecutionId;
+use novarocks_spi::connector::{
+    ConnectorTableObjectId, ConnectorWriteExecutionId, MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES,
+};
 use novarocks_state_store::coordination::FencingToken;
 use serde::ser::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -26,32 +28,33 @@ use uuid::Uuid;
 
 use crate::durable::{DurableOpaqueBytes, DurableRecord};
 
-pub const OPTIMIZE_JOB_LEGACY_SCHEMA_VERSION: u8 = 1;
-pub const OPTIMIZE_JOB_SCHEMA_VERSION: u8 = 2;
-pub const METADATA_MAINTENANCE_OPERATION_LEGACY_SCHEMA_VERSION: u8 = 2;
-pub const METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION: u8 = 3;
+pub const OPTIMIZE_JOB_SCHEMA_VERSION: u8 = 3;
+pub const METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION: u8 = 4;
 /// A metadata payload contributes at most 24 KiB after lowercase-hex durable
-/// encoding. Together with the 48 KiB full-record budget this leaves more
-/// than 20 KiB for target, owner, digests, lifecycle fields, and JSON framing.
+/// encoding. The ≤256 B physical target identity contributes at most 512 B
+/// plus JSON framing, leaving more than 20 KiB in the 48 KiB full-record
+/// budget for target, owner, digests, lifecycle fields, and JSON framing.
 pub const METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES: usize = 12 * 1024;
 pub const METADATA_MAINTENANCE_RECORD_ENCODED_LIMIT: usize = 48 * 1024;
 /// E2 stores only bounded, credential-free handles in StateStore.  The
 /// provider-owned immutable manifest and reports live in object storage.
-pub const DISTRIBUTED_REWRITE_OPERATION_LEGACY_SCHEMA_VERSION: u8 = 3;
-pub const DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION: u8 = 4;
+pub const DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION: u8 = 5;
 /// A rewrite payload contributes at most 24 KiB after durable encoding.
 /// Operation, payload, attempt, and transaction records each have separate
-/// 56 KiB budgets, leaving room for their fixed identifiers and framing.
+/// 56 KiB budgets. The ≤256 B physical target identity adds at most 512 B
+/// after lowercase-hex encoding plus framing, leaving room for fixed
+/// identifiers and framing.
 pub const DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES: usize = 12 * 1024;
 pub const DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES: usize = 12 * 1024;
 pub const DISTRIBUTED_REWRITE_RECORD_ENCODED_LIMIT: usize = 56 * 1024;
-/// V4 cleanup records retain only bounded, credential-free provider artifact
+/// V6 cleanup records retain only bounded, credential-free provider artifact
 /// handles. Candidate locations and object identities remain provider-owned.
-pub const CLEANUP_OPERATION_LEGACY_SCHEMA_VERSION: u8 = 4;
-pub const CLEANUP_OPERATION_SCHEMA_VERSION: u8 = 5;
+pub const CLEANUP_OPERATION_SCHEMA_VERSION: u8 = 6;
 /// Cleanup plan records contain one handle and batch records can contain two.
 /// A 10 KiB raw handle becomes at most 20 KiB hex, so the two-handle batch
 /// remains below its 56 KiB whole-record budget with fixed metadata included.
+/// The ≤256 B physical target identity adds at most 512 B after durable
+/// encoding plus framing to records that carry a target.
 pub const CLEANUP_MAX_PAYLOAD_BYTES: usize = 10 * 1024;
 pub const CLEANUP_RECORD_ENCODED_LIMIT: usize = 56 * 1024;
 pub const CLEANUP_MAX_BATCHES: u16 = 256;
@@ -141,6 +144,8 @@ impl<'de> Deserialize<'de> for MaintenanceAuthorityV1 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OptimizeJobCreate {
     pub target: MaintenanceTarget,
+    /// Provider-owned identity captured with `target` at submission.
+    pub object_id: ConnectorTableObjectId,
     pub base_snapshot_id: i64,
     pub created_at_ms: i64,
 }
@@ -158,6 +163,8 @@ pub struct OptimizeJobOutcome {
 pub struct OptimizeJob {
     pub job_id: i64,
     pub target: MaintenanceTarget,
+    /// Opaque physical identity restored from the durable target binding.
+    pub object_id: Vec<u8>,
     pub base_snapshot_id: i64,
     pub state: OptimizeJobState,
     pub outcome: Option<OptimizeJobOutcome>,
@@ -175,6 +182,12 @@ pub struct StoredMaintenanceTargetV1 {
     pub catalog: String,
     pub namespace: String,
     pub table: String,
+    /// Provider-owned physical identity captured with the logical target.
+    ///
+    /// The StateStore representation is lowercase hex and is therefore at
+    /// most 512 bytes before JSON framing. It remains opaque outside the SPI:
+    /// Frontend may persist and compare it but must not parse or rewrite it.
+    pub object_id: DurableOpaqueBytes<MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -184,6 +197,27 @@ pub enum StoredOptimizeJobStateV1 {
     Running,
     Finished,
     Failed,
+    TargetReplaced,
+}
+
+impl StoredOptimizeJobStateV1 {
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Finished | Self::Failed | Self::TargetReplaced)
+    }
+
+    pub const fn holds_active_fence(self) -> bool {
+        !self.is_terminal()
+    }
+
+    pub const fn as_key_component(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Finished => "finished",
+            Self::Failed => "failed",
+            Self::TargetReplaced => "target-replaced",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -240,6 +274,7 @@ pub(crate) enum StoredOptimizeOperationActionV1 {
     RecordOutcome,
     Finish,
     Fail,
+    TargetReplaced,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -263,13 +298,25 @@ impl DurableRecord for StoredOptimizeJobV1 {
     const ENCODED_LIMIT: usize = OPTIMIZE_JOB_RECORD_ENCODED_LIMIT;
 }
 
-impl From<&MaintenanceTarget> for StoredMaintenanceTargetV1 {
-    fn from(value: &MaintenanceTarget) -> Self {
-        Self {
-            catalog: value.catalog.clone(),
-            namespace: value.namespace.clone(),
-            table: value.table.clone(),
-        }
+impl StoredMaintenanceTargetV1 {
+    /// Create a durable target from one logical target and the physical object
+    /// identity captured in the same submission observation.
+    ///
+    /// There is deliberately no `From<&MaintenanceTarget>` conversion: a
+    /// logical target alone cannot prove the durable record is bound to the
+    /// physical object that existed at submission time.
+    pub(crate) fn try_new(
+        target: &MaintenanceTarget,
+        object_id: ConnectorTableObjectId,
+    ) -> Result<Self, String> {
+        let object_id = DurableOpaqueBytes::try_new(object_id.as_bytes().to_vec())
+            .map_err(|error| format!("maintenance target object id is invalid: {error}"))?;
+        Ok(Self {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            object_id,
+        })
     }
 }
 
@@ -290,6 +337,7 @@ impl From<OptimizeJobState> for StoredOptimizeJobStateV1 {
             OptimizeJobState::Running => Self::Running,
             OptimizeJobState::Finished => Self::Finished,
             OptimizeJobState::Failed => Self::Failed,
+            OptimizeJobState::TargetReplaced => Self::TargetReplaced,
         }
     }
 }
@@ -301,6 +349,7 @@ impl From<StoredOptimizeJobStateV1> for OptimizeJobState {
             StoredOptimizeJobStateV1::Running => Self::Running,
             StoredOptimizeJobStateV1::Finished => Self::Finished,
             StoredOptimizeJobStateV1::Failed => Self::Failed,
+            StoredOptimizeJobStateV1::TargetReplaced => Self::TargetReplaced,
         }
     }
 }
@@ -334,6 +383,7 @@ impl From<&StoredOptimizeJobV1> for OptimizeJob {
         Self {
             job_id: value.job_id,
             target: value.target.clone().into(),
+            object_id: value.target.object_id.as_bytes().to_vec(),
             base_snapshot_id: value.base_snapshot_id,
             state: value.state.into(),
             outcome: value.outcome.clone().map(Into::into),
@@ -366,11 +416,12 @@ pub enum MetadataMaintenanceOperationState {
     Finished,
     Failed,
     Unresolved,
+    TargetReplaced,
 }
 
 impl MetadataMaintenanceOperationState {
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Finished | Self::Failed)
+        matches!(self, Self::Finished | Self::Failed | Self::TargetReplaced)
     }
 
     pub const fn holds_active_fence(self) -> bool {
@@ -388,6 +439,7 @@ impl MetadataMaintenanceOperationState {
             Self::Finished => "finished",
             Self::Failed => "failed",
             Self::Unresolved => "unresolved",
+            Self::TargetReplaced => "target-replaced",
         }
     }
 }
@@ -396,6 +448,8 @@ impl MetadataMaintenanceOperationState {
 pub struct MetadataMaintenanceOperationCreate {
     pub operation_id: Uuid,
     pub target: MaintenanceTarget,
+    /// Provider-owned identity captured with `target` at submission.
+    pub object_id: ConnectorTableObjectId,
     pub owner: MetadataMaintenanceExactOwner,
     pub kind: MetadataMaintenanceOperationKind,
     pub request_digest: [u8; 32],
@@ -432,6 +486,8 @@ pub struct MetadataMaintenanceOpaquePayload {
 pub struct MetadataMaintenanceOperation {
     pub operation_id: Uuid,
     pub target: MaintenanceTarget,
+    /// Opaque physical identity restored from the durable target binding.
+    pub object_id: Vec<u8>,
     pub owner: MetadataMaintenanceExactOwner,
     pub kind: MetadataMaintenanceOperationKind,
     pub request_digest: [u8; 32],
@@ -483,6 +539,7 @@ pub(crate) enum StoredMetadataMaintenanceTransactionActionV2 {
     Finish,
     Fail,
     Unresolve,
+    TargetReplaced,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -528,6 +585,7 @@ impl From<&StoredMetadataMaintenanceOperationV2> for MetadataMaintenanceOperatio
         Self {
             operation_id: value.operation_id,
             target: value.target.clone().into(),
+            object_id: value.target.object_id.as_bytes().to_vec(),
             owner: value.owner.clone(),
             kind: value.kind,
             request_digest: value.request_digest,
@@ -566,11 +624,12 @@ pub enum DistributedRewriteOperationState {
     Finished,
     Failed,
     Unresolved,
+    TargetReplaced,
 }
 
 impl DistributedRewriteOperationState {
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Finished | Self::Failed)
+        matches!(self, Self::Finished | Self::Failed | Self::TargetReplaced)
     }
 
     pub const fn holds_active_fence(self) -> bool {
@@ -588,6 +647,7 @@ impl DistributedRewriteOperationState {
             Self::Finished => "finished",
             Self::Failed => "failed",
             Self::Unresolved => "unresolved",
+            Self::TargetReplaced => "target-replaced",
         }
     }
 }
@@ -596,6 +656,8 @@ impl DistributedRewriteOperationState {
 pub struct DistributedRewriteOperationCreate {
     pub operation_id: Uuid,
     pub target: MaintenanceTarget,
+    /// Provider-owned identity captured with `target` at submission.
+    pub object_id: ConnectorTableObjectId,
     pub owner: MetadataMaintenanceExactOwner,
     pub kind: DistributedRewriteOperationKind,
     pub request_digest: [u8; 32],
@@ -643,6 +705,8 @@ pub struct DistributedRewriteAttemptCheckpoint {
 pub struct DistributedRewriteOperation {
     pub operation_id: Uuid,
     pub target: MaintenanceTarget,
+    /// Opaque physical identity restored from the durable target binding.
+    pub object_id: Vec<u8>,
     pub owner: MetadataMaintenanceExactOwner,
     pub kind: DistributedRewriteOperationKind,
     pub request_digest: [u8; 32],
@@ -743,6 +807,7 @@ pub(crate) enum StoredDistributedRewriteTransactionActionV3 {
     Finish,
     Fail,
     Unresolve,
+    TargetReplaced,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -765,6 +830,7 @@ impl From<&StoredDistributedRewriteOperationV3> for DistributedRewriteOperation 
         Self {
             operation_id: value.operation_id,
             target: value.target.clone().into(),
+            object_id: value.target.object_id.as_bytes().to_vec(),
             owner: value.owner.clone(),
             kind: value.kind,
             request_digest: value.request_digest,
@@ -795,11 +861,12 @@ pub enum CleanupOperationState {
     Finished,
     Failed,
     Unresolved,
+    TargetReplaced,
 }
 
 impl CleanupOperationState {
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Finished | Self::Failed)
+        matches!(self, Self::Finished | Self::Failed | Self::TargetReplaced)
     }
 
     pub const fn holds_active_fence(self) -> bool {
@@ -815,6 +882,7 @@ impl CleanupOperationState {
             Self::Finished => "finished",
             Self::Failed => "failed",
             Self::Unresolved => "unresolved",
+            Self::TargetReplaced => "target-replaced",
         }
     }
 }
@@ -823,6 +891,8 @@ impl CleanupOperationState {
 pub struct CleanupOperationCreate {
     pub operation_id: Uuid,
     pub target: MaintenanceTarget,
+    /// Provider-owned identity captured with `target` at submission.
+    pub object_id: ConnectorTableObjectId,
     pub owner: MetadataMaintenanceExactOwner,
     pub request_digest: [u8; 32],
     pub older_than_ms: i64,
@@ -861,6 +931,8 @@ pub struct CleanupBatchCheckpoint {
 pub struct CleanupOperation {
     pub operation_id: Uuid,
     pub target: MaintenanceTarget,
+    /// Opaque physical identity restored from the durable target binding.
+    pub object_id: Vec<u8>,
     pub owner: MetadataMaintenanceExactOwner,
     pub request_digest: [u8; 32],
     pub older_than_ms: i64,
@@ -958,6 +1030,7 @@ pub(crate) enum StoredCleanupTransactionActionV4 {
     Finish,
     Fail,
     Unresolve,
+    TargetReplaced,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -980,6 +1053,7 @@ impl From<&StoredCleanupOperationV4> for CleanupOperation {
         Self {
             operation_id: value.operation_id,
             target: value.target.clone().into(),
+            object_id: value.target.object_id.as_bytes().to_vec(),
             owner: value.owner.clone(),
             request_digest: value.request_digest,
             older_than_ms: value.older_than_ms,
@@ -1032,6 +1106,7 @@ mod durable_record_budget_tests {
             catalog: "c".repeat(1024),
             namespace: "n".repeat(1024),
             table: "t".repeat(1024),
+            object_id: opaque(MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES),
         }
     }
 
@@ -1168,7 +1243,7 @@ mod durable_record_budget_tests {
         assert_budget(StoredOptimizeOperationV1 {
             schema_version: OPTIMIZE_JOB_SCHEMA_VERSION,
             operation_id: Uuid::nil(),
-            action: StoredOptimizeOperationActionV1::Fail,
+            action: StoredOptimizeOperationActionV1::TargetReplaced,
             job_id: i64::MAX,
             post_job: StoredOptimizeJobV1 {
                 schema_version: OPTIMIZE_JOB_SCHEMA_VERSION,
@@ -1191,7 +1266,7 @@ mod durable_record_budget_tests {
         assert_budget(StoredMetadataMaintenanceTransactionV2 {
             schema_version: METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION,
             transaction_operation_id: Uuid::nil(),
-            action: StoredMetadataMaintenanceTransactionActionV2::Unresolve,
+            action: StoredMetadataMaintenanceTransactionActionV2::TargetReplaced,
             operation_id: Uuid::nil(),
             post_operation: metadata_operation(),
         });
@@ -1224,7 +1299,7 @@ mod durable_record_budget_tests {
         assert_budget(StoredDistributedRewriteTransactionV3 {
             schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
             transaction_operation_id: Uuid::nil(),
-            action: StoredDistributedRewriteTransactionActionV3::Unresolve,
+            action: StoredDistributedRewriteTransactionActionV3::TargetReplaced,
             operation_id: Uuid::nil(),
             post_operation: rewrite_operation(),
         });
@@ -1259,9 +1334,83 @@ mod durable_record_budget_tests {
         assert_budget(StoredCleanupTransactionV4 {
             schema_version: CLEANUP_OPERATION_SCHEMA_VERSION,
             transaction_operation_id: Uuid::nil(),
-            action: StoredCleanupTransactionActionV4::Unresolve,
+            action: StoredCleanupTransactionActionV4::TargetReplaced,
             operation_id: Uuid::nil(),
             post_operation: cleanup_operation(),
         });
+    }
+
+    #[test]
+    fn target_replaced_is_a_terminal_unfenced_state_in_every_maintenance_family() {
+        const OPTIMIZE: (bool, bool, &str) = (
+            StoredOptimizeJobStateV1::TargetReplaced.is_terminal(),
+            StoredOptimizeJobStateV1::TargetReplaced.holds_active_fence(),
+            StoredOptimizeJobStateV1::TargetReplaced.as_key_component(),
+        );
+        const METADATA: (bool, bool, &str) = (
+            MetadataMaintenanceOperationState::TargetReplaced.is_terminal(),
+            MetadataMaintenanceOperationState::TargetReplaced.holds_active_fence(),
+            MetadataMaintenanceOperationState::TargetReplaced.as_key_component(),
+        );
+        const REWRITE: (bool, bool, &str) = (
+            DistributedRewriteOperationState::TargetReplaced.is_terminal(),
+            DistributedRewriteOperationState::TargetReplaced.holds_active_fence(),
+            DistributedRewriteOperationState::TargetReplaced.as_key_component(),
+        );
+        const CLEANUP: (bool, bool, &str) = (
+            CleanupOperationState::TargetReplaced.is_terminal(),
+            CleanupOperationState::TargetReplaced.holds_active_fence(),
+            CleanupOperationState::TargetReplaced.as_key_component(),
+        );
+
+        assert!(OPTIMIZE.0);
+        assert!(!OPTIMIZE.1);
+        assert_eq!(OPTIMIZE.2, "target-replaced");
+
+        assert!(METADATA.0);
+        assert!(!METADATA.1);
+        assert_eq!(METADATA.2, "target-replaced");
+
+        assert!(REWRITE.0);
+        assert!(!REWRITE.1);
+        assert_eq!(REWRITE.2, "target-replaced");
+
+        assert!(CLEANUP.0);
+        assert!(!CLEANUP.1);
+        assert_eq!(CLEANUP.2, "target-replaced");
+    }
+
+    #[test]
+    fn maintenance_target_object_id_rejects_values_outside_the_spi_durable_bound() {
+        let target = MaintenanceTarget {
+            catalog: "catalog".to_string(),
+            namespace: "namespace".to_string(),
+            table: "table".to_string(),
+        };
+        let object_id = ConnectorTableObjectId::try_new(Bytes::from(vec![
+            0xa5;
+            MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES
+        ]))
+        .expect("the SPI maximum object ID length is valid");
+        let durable = StoredMaintenanceTargetV1::try_new(&target, object_id)
+            .expect("a maximum-length SPI object ID must remain durable");
+        assert_eq!(
+            durable.object_id.as_bytes().len(),
+            MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES
+        );
+
+        let error = DurableOpaqueBytes::<MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES>::try_new(vec![
+            0xa5;
+            MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES
+                + 1
+        ])
+        .expect_err("object IDs beyond the SPI durable bound must be rejected");
+        assert_eq!(
+            error,
+            DurableRecordError::OpaqueBytesOutOfBounds {
+                actual_bytes: MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES + 1,
+                max_bytes: MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES,
+            }
+        );
     }
 }

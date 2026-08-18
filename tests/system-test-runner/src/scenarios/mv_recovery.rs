@@ -6,6 +6,9 @@ use anyhow::{Context, Result, bail};
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, ServerHandle,
 };
+use novarocks_connector_iceberg::catalog_config::parse_catalog_configuration;
+use novarocks_connector_iceberg::catalog_runtime::build_hadoop_catalog;
+use novarocks_connector_iceberg::iceberg::{Catalog, TableIdent};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
@@ -20,6 +23,8 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(MvSchedulerRecovery),
         Box::new(MvStagedPublishedRecovery),
         Box::new(MvFirstRefreshStaging),
+        Box::new(MvBaseIdentityReplacement),
+        Box::new(MvLakePublicationRestartRebuild),
     ]
 }
 
@@ -464,6 +469,132 @@ impl Scenario for MvFirstRefreshStaging {
     }
 }
 
+struct MvBaseIdentityReplacement;
+
+impl Scenario for MvBaseIdentityReplacement {
+    fn name(&self) -> &'static str {
+        "mv/base-identity-replacement"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let catalog = "system_mv_base_identity";
+        let warehouse = context.runtime_dir().join("warehouse");
+        let mut conn = connect(context)?;
+        setup_orders_fixture(context, &mut conn, catalog, &warehouse, true)?;
+        execute(
+            context,
+            &mut conn,
+            "create MV with a durable base-object binding",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+        )?;
+        refresh(context, &mut conn, "orders_mv")?;
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            &[(1, 10), (2, 20)],
+            "read publication before replacing its base table",
+        )?;
+
+        drop(conn);
+        externally_drop_hadoop_table(context, catalog, &warehouse, "ns", "orders")?;
+        let mut conn = connect(context)?;
+        select_catalog_and_database(context, &mut conn, catalog)?;
+        execute(
+            context,
+            &mut conn,
+            "recreate base table under the same logical name",
+            "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "seed replacement base table incarnation",
+            "INSERT INTO orders VALUES (9, 90)",
+        )?;
+        drop(conn);
+
+        restart_frontend(context, "restart FE after same-name base replacement")?;
+        let mut conn = connect(context)?;
+        select_catalog_and_database(context, &mut conn, catalog)?;
+        assert_mv_not_recovered_after_base_replacement(context, &mut conn, "orders_mv")?;
+        context.action(
+            "verified FE restart fail-closed removes the MV rather than bind a same-name replacement base",
+        );
+        Ok(())
+    }
+}
+
+struct MvLakePublicationRestartRebuild;
+
+impl Scenario for MvLakePublicationRestartRebuild {
+    fn name(&self) -> &'static str {
+        "mv/lake-publication-restart-rebuild"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let catalog = "system_mv_lake_rebuild";
+        let warehouse = context.runtime_dir().join("warehouse");
+        let mut conn = connect(context)?;
+        setup_orders_fixture(context, &mut conn, catalog, &warehouse, true)?;
+        execute(
+            context,
+            &mut conn,
+            "create MV with a lake-native descriptor",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+        )?;
+        refresh(context, &mut conn, "orders_mv")?;
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            &[(1, 10), (2, 20)],
+            "read newly published lake-native MV before FE restart",
+        )?;
+        drop(conn);
+
+        restart_frontend(context, "restart FE before lake-native MV cache rebuild")?;
+        let mut conn = connect(context)?;
+        select_catalog_and_database(context, &mut conn, catalog)?;
+        let rows: Vec<Row> = query(
+            context,
+            &mut conn,
+            &format!(
+                "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => 'ns.orders_mv', level => 'full')"
+            ),
+            "clear and rebuild the newly written MV cache from its lake package",
+        )?;
+        let report = rows
+            .first()
+            .context("lake-native rebuild procedure returned no report row")?;
+        let level = report
+            .get::<String, _>(0)
+            .context("lake-native rebuild AvailableLevel column")?;
+        let source = report
+            .get::<String, _>(4)
+            .context("lake-native rebuild RebuildSource column")?;
+        if level != "full" || source != "lake" {
+            bail!(
+                "unexpected lake-native rebuild report level={level:?}, source={source:?}; {}",
+                context.diagnostics()
+            );
+        }
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            &[(1, 10), (2, 20)],
+            "read MV restored from its new-format lake publication",
+        )?;
+        context.action(
+            "verified a post-restart full rebuild restores the new-format descriptor and publication from lake",
+        );
+        Ok(())
+    }
+}
+
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     let be_count = context.handle().be_count();
     if be_count != 3 {
@@ -539,6 +670,42 @@ fn select_catalog_and_database(
     execute(context, conn, "select MV namespace", "USE ns")
 }
 
+fn externally_drop_hadoop_table(
+    context: &mut ScenarioContext,
+    catalog_name: &str,
+    warehouse: &Path,
+    namespace: &str,
+    table: &str,
+) -> Result<()> {
+    context.remaining("drop base table through external Hadoop catalog client")?;
+    context.action("drop original base table through external Hadoop catalog client");
+    let configuration = parse_catalog_configuration(
+        catalog_name,
+        &[
+            ("type".to_string(), "iceberg".to_string()),
+            ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+            (
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.to_string_lossy().into_owned(),
+            ),
+        ],
+    )
+    .map_err(anyhow::Error::msg)
+    .context("configure external Hadoop catalog client")?;
+    let catalog = build_hadoop_catalog(&configuration)
+        .map_err(anyhow::Error::msg)
+        .context("construct external Hadoop catalog client")?;
+    let table = TableIdent::from_strs([namespace, table])
+        .context("construct external Hadoop table identifier")?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("create external Hadoop catalog runtime")?;
+    runtime
+        .block_on(catalog.drop_table(&table))
+        .context("drop original table through external Hadoop catalog client")
+}
+
 fn execute(context: &mut ScenarioContext, conn: &mut Conn, action: &str, sql: &str) -> Result<()> {
     context.remaining(action)?;
     context.action(action);
@@ -564,6 +731,26 @@ fn refresh(context: &mut ScenarioContext, conn: &mut Conn, mv: &str) -> Result<(
         "refresh materialized view",
         &format!("REFRESH MATERIALIZED VIEW {mv}"),
     )
+}
+
+fn assert_mv_not_recovered_after_base_replacement(
+    context: &mut ScenarioContext,
+    conn: &mut Conn,
+    mv: &str,
+) -> Result<()> {
+    context.remaining("verify MV is not recovered after same-name base replacement")?;
+    context.action("verify MV is not recovered after same-name base replacement");
+    let error = conn
+        .query_drop(format!("SELECT k1, v2 FROM {mv} ORDER BY k1"))
+        .expect_err("a recreated base table must not recover the prior MV");
+    let message = error.to_string();
+    if !message.contains(&format!("unknown table: ns.{mv}")) {
+        bail!(
+            "read after same-name base replacement returned unexpected error {message:?}; {}",
+            context.diagnostics()
+        );
+    }
+    Ok(())
 }
 
 fn assert_rows(

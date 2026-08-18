@@ -24,6 +24,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use novarocks_spi::connector::ConnectorTableObjectId;
+
 use crate::binding::SqlTableBindingId;
 use crate::catalog::PlannerTableProvider;
 use crate::column_id::ColumnRefFactory;
@@ -42,22 +44,22 @@ use super::{SqlFunctionCatalog, SqlStatisticsPlan, SqlStatisticsSnapshot};
 pub struct SqlImvBaseSnapshotFacts {
     table: novarocks_catalog::identifier::TableIdentity,
     snapshot_id: i64,
-    table_uuid: String,
+    table_object_id: ConnectorTableObjectId,
 }
 
 impl SqlImvBaseSnapshotFacts {
     pub fn try_new(
         table: novarocks_catalog::identifier::TableIdentity,
         snapshot_id: i64,
-        table_uuid: String,
+        table_object_id: ConnectorTableObjectId,
     ) -> Result<Self, String> {
-        if snapshot_id < 0 || table_uuid.trim().is_empty() {
+        if snapshot_id < 0 || table_object_id.as_bytes().is_empty() {
             return Err("IMV base snapshot facts are incomplete".to_string());
         }
         Ok(Self {
             table,
             snapshot_id,
-            table_uuid,
+            table_object_id,
         })
     }
 
@@ -65,7 +67,7 @@ impl SqlImvBaseSnapshotFacts {
         SqlImvBaseSnapshot {
             table: self.table,
             snapshot_id: self.snapshot_id,
-            table_uuid: self.table_uuid,
+            table_object_id: self.table_object_id,
         }
     }
 }
@@ -232,7 +234,7 @@ impl SqlImvRewriteSnapshotBuilder {
             self.mv_id,
             base_snapshots,
             history.previous_snapshot_ids,
-            history.previous_table_uuids,
+            history.previous_table_object_ids,
             history.target_snapshot_id,
             history.target_table_uuid,
             target_columns,
@@ -279,7 +281,7 @@ impl SqlImvRewriteSnapshotHandle {
 /// handles, leases and catalog callbacks are deliberately excluded.
 pub struct SqlImvRefreshHistoryFacts {
     previous_snapshot_ids: BTreeMap<String, i64>,
-    previous_table_uuids: BTreeMap<String, String>,
+    previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     target_snapshot_id: Option<i64>,
     target_table_uuid: String,
 }
@@ -287,7 +289,7 @@ pub struct SqlImvRefreshHistoryFacts {
 impl SqlImvRefreshHistoryFacts {
     pub fn try_new(
         previous_snapshot_ids: BTreeMap<String, i64>,
-        previous_table_uuids: BTreeMap<String, String>,
+        previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
         target_snapshot_id: Option<i64>,
         target_table_uuid: String,
     ) -> Result<Self, String> {
@@ -296,15 +298,15 @@ impl SqlImvRefreshHistoryFacts {
             || previous_snapshot_ids
                 .iter()
                 .any(|(table, snapshot_id)| table.trim().is_empty() || *snapshot_id < 0)
-            || previous_table_uuids
-                .iter()
-                .any(|(table, uuid)| table.trim().is_empty() || uuid.trim().is_empty())
+            || previous_table_object_ids.iter().any(|(table, object_id)| {
+                table.trim().is_empty() || object_id.as_bytes().is_empty()
+            })
         {
             return Err("IMV refresh history facts are invalid".to_string());
         }
         Ok(Self {
             previous_snapshot_ids,
-            previous_table_uuids,
+            previous_table_object_ids,
             target_snapshot_id,
             target_table_uuid,
         })
@@ -320,7 +322,7 @@ impl SqlImvRefreshHistoryFacts {
 pub(crate) struct SqlImvBaseSnapshot {
     pub(crate) table: novarocks_catalog::identifier::TableIdentity,
     pub(crate) snapshot_id: i64,
-    pub(crate) table_uuid: String,
+    pub(crate) table_object_id: ConnectorTableObjectId,
 }
 
 /// SQL classification of the two physical aggregate-state roles used by the
@@ -1196,7 +1198,7 @@ pub(crate) struct SqlImvRewriteSnapshot {
     pub(crate) mv_id: i64,
     pub(crate) base_snapshots: Arc<[SqlImvBaseSnapshot]>,
     pub(crate) previous_snapshot_ids: BTreeMap<String, i64>,
-    pub(crate) previous_table_uuids: BTreeMap<String, String>,
+    pub(crate) previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     pub(crate) target_snapshot_id: Option<i64>,
     pub(crate) target_table_uuid: String,
     /// SQL-safe target field facts projected by the application.  This avoids
@@ -1219,7 +1221,7 @@ impl SqlImvRewriteSnapshot {
         mv_id: i64,
         base_snapshots: Arc<[SqlImvBaseSnapshot]>,
         previous_snapshot_ids: BTreeMap<String, i64>,
-        previous_table_uuids: BTreeMap<String, String>,
+        previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
         target_snapshot_id: Option<i64>,
         target_table_uuid: String,
         target_columns: Arc<[novarocks_catalog::schema::ColumnDef]>,
@@ -1230,14 +1232,14 @@ impl SqlImvRewriteSnapshot {
             return Err("IMV rewrite snapshot has no base table snapshots".to_string());
         }
         for base in base_snapshots.iter() {
-            if base.table_uuid.trim().is_empty() {
+            if base.table_object_id.as_bytes().is_empty() {
                 return Err(format!(
                     "IMV rewrite snapshot base {} has an empty table UUID",
                     base.table.fqn()
                 ));
             }
-            if let Some(previous_uuid) = previous_table_uuids.get(&base.table.fqn())
-                && previous_uuid != &base.table_uuid
+            if let Some(previous_object_id) = previous_table_object_ids.get(&base.table.fqn())
+                && previous_object_id != &base.table_object_id
             {
                 return Err(format!(
                     "base table identity changed for {}; incremental refresh unsafe, rebuild the MV",
@@ -1254,7 +1256,7 @@ impl SqlImvRewriteSnapshot {
             mv_id,
             base_snapshots,
             previous_snapshot_ids,
-            previous_table_uuids,
+            previous_table_object_ids,
             target_snapshot_id,
             target_table_uuid,
             target_columns,
@@ -1312,6 +1314,12 @@ pub(crate) fn test_target_binding() -> SqlTableBindingId {
     )
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn test_object_id(value: &str) -> ConnectorTableObjectId {
+    ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(value.as_bytes()))
+        .expect("test object ID")
+}
+
 /// SQL-only incremental IMV fixture for rewrite-rule tests that need an
 /// extension payload but do not exercise application persistence conversion.
 ///
@@ -1324,8 +1332,8 @@ pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
     let target = novarocks_catalog::identifier::TableIdentity::new("ice", "db", "mv");
     let mut previous_snapshot_ids = BTreeMap::new();
     previous_snapshot_ids.insert(base.fqn(), 11);
-    let mut previous_table_uuids = BTreeMap::new();
-    previous_table_uuids.insert(base.fqn(), "uuid-b".to_string());
+    let mut previous_table_object_ids = BTreeMap::new();
+    previous_table_object_ids.insert(base.fqn(), test_object_id("object-b"));
     Arc::new(
         SqlImvRewriteSnapshot::from_frozen_parts(
             target,
@@ -1334,10 +1342,10 @@ pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
             Arc::from(vec![SqlImvBaseSnapshot {
                 table: base,
                 snapshot_id: 22,
-                table_uuid: "uuid-b".to_string(),
+                table_object_id: test_object_id("object-b"),
             }]),
             previous_snapshot_ids,
-            previous_table_uuids,
+            previous_table_object_ids,
             Some(1),
             "target-uuid".to_string(),
             Arc::from(vec![novarocks_catalog::schema::ColumnDef {
@@ -1786,18 +1794,18 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
                 SqlImvBaseSnapshot {
                     table: novarocks_catalog::identifier::TableIdentity::new("ice", "db", "l"),
                     snapshot_id: 22,
-                    table_uuid: "uuid-l".to_string(),
+                    table_object_id: test_object_id("object-l"),
                 },
                 SqlImvBaseSnapshot {
                     table: novarocks_catalog::identifier::TableIdentity::new("ice", "db", "r"),
                     snapshot_id: 44,
-                    table_uuid: "uuid-r".to_string(),
+                    table_object_id: test_object_id("object-r"),
                 },
             ]),
             BTreeMap::from([("ice.db.l".to_string(), 11), ("ice.db.r".to_string(), 33)]),
             BTreeMap::from([
-                ("ice.db.l".to_string(), "uuid-l".to_string()),
-                ("ice.db.r".to_string(), "uuid-r".to_string()),
+                ("ice.db.l".to_string(), test_object_id("object-l")),
+                ("ice.db.r".to_string(), test_object_id("object-r")),
             ]),
             Some(99),
             "uuid-tgt".to_string(),
@@ -1977,17 +1985,20 @@ pub struct SqlMvRewriteBaseTableFacts {
 enum SqlMvRewriteBaseTableFactsState {
     Resolved {
         snapshot_id: Option<i64>,
-        table_uuid: Option<String>,
+        table_object_id: Option<ConnectorTableObjectId>,
     },
     Unavailable(String),
 }
 
 impl SqlMvRewriteBaseTableFacts {
-    pub fn resolved(snapshot_id: Option<i64>, table_uuid: Option<String>) -> Self {
+    pub fn resolved(
+        snapshot_id: Option<i64>,
+        table_object_id: Option<ConnectorTableObjectId>,
+    ) -> Self {
         Self {
             state: SqlMvRewriteBaseTableFactsState::Resolved {
                 snapshot_id,
-                table_uuid,
+                table_object_id,
             },
         }
     }
@@ -2002,10 +2013,10 @@ impl SqlMvRewriteBaseTableFacts {
         match self.state {
             SqlMvRewriteBaseTableFactsState::Resolved {
                 snapshot_id,
-                table_uuid,
+                table_object_id,
             } => MvRewriteBaseTableState::Resolved {
                 snapshot_id,
-                table_uuid,
+                table_object_id,
             },
             SqlMvRewriteBaseTableFactsState::Unavailable(message) => {
                 MvRewriteBaseTableState::Unavailable(message)
@@ -2027,7 +2038,7 @@ pub struct SqlMvRewriteDefinitionFacts {
     target_namespace: Option<String>,
     target_table: Option<String>,
     last_refresh_snapshots: BTreeMap<String, i64>,
-    last_refresh_table_uuids: BTreeMap<String, String>,
+    last_refresh_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     base_table_states: BTreeMap<String, SqlMvRewriteBaseTableFacts>,
 }
 
@@ -2042,7 +2053,7 @@ impl SqlMvRewriteDefinitionFacts {
         target_namespace: Option<String>,
         target_table: Option<String>,
         last_refresh_snapshots: BTreeMap<String, i64>,
-        last_refresh_table_uuids: BTreeMap<String, String>,
+        last_refresh_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
         base_table_states: BTreeMap<String, SqlMvRewriteBaseTableFacts>,
     ) -> Result<Self, String> {
         if base_table_states
@@ -2060,7 +2071,7 @@ impl SqlMvRewriteDefinitionFacts {
             target_namespace,
             target_table,
             last_refresh_snapshots,
-            last_refresh_table_uuids,
+            last_refresh_table_object_ids,
             base_table_states,
         })
     }
@@ -2075,7 +2086,7 @@ impl SqlMvRewriteDefinitionFacts {
             target_namespace: self.target_namespace,
             target_table: self.target_table,
             last_refresh_snapshots: self.last_refresh_snapshots,
-            last_refresh_table_uuids: self.last_refresh_table_uuids,
+            last_refresh_table_object_ids: self.last_refresh_table_object_ids,
             base_table_states: self
                 .base_table_states
                 .into_iter()
@@ -2091,7 +2102,7 @@ impl SqlMvRewriteDefinitionFacts {
 enum MvRewriteBaseTableState {
     Resolved {
         snapshot_id: Option<i64>,
-        table_uuid: Option<String>,
+        table_object_id: Option<ConnectorTableObjectId>,
     },
     Unavailable(String),
 }
@@ -2107,7 +2118,7 @@ pub(crate) struct MvRewriteDefinition {
     pub(crate) target_namespace: Option<String>,
     pub(crate) target_table: Option<String>,
     pub(crate) last_refresh_snapshots: BTreeMap<String, i64>,
-    pub(crate) last_refresh_table_uuids: BTreeMap<String, String>,
+    pub(crate) last_refresh_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     /// Per-base-table reads (including failures) captured while admission
     /// froze this definition. The map is keyed by canonical `cat.ns.tbl`.
     pub(crate) base_table_states: BTreeMap<String, MvRewriteBaseTableState>,
@@ -2364,13 +2375,13 @@ fn definition_is_fresh(definition: &MvRewriteDefinition) -> Result<bool, String>
         match definition.base_table_states.get(base) {
             Some(MvRewriteBaseTableState::Resolved {
                 snapshot_id,
-                table_uuid,
+                table_object_id,
             }) => {
                 if *snapshot_id != Some(*pinned_snapshot) {
                     return Ok(false);
                 }
-                if let Some(pinned_uuid) = definition.last_refresh_table_uuids.get(base)
-                    && table_uuid.as_deref() != Some(pinned_uuid.as_str())
+                if let Some(pinned_object_id) = definition.last_refresh_table_object_ids.get(base)
+                    && table_object_id.as_ref() != Some(pinned_object_id)
                 {
                     return Ok(false);
                 }
@@ -2532,7 +2543,10 @@ mod tests {
             Some("db".to_string()),
             Some("mv_target".to_string()),
             BTreeMap::from([("iceberg.db.base".to_string(), 42)]),
-            BTreeMap::from([("iceberg.db.base".to_string(), "original-uuid".to_string())]),
+            BTreeMap::from([(
+                "iceberg.db.base".to_string(),
+                test_object_id("original-object"),
+            )]),
             BTreeMap::from([("iceberg.db.base".to_string(), state)]),
         )
         .expect("valid frozen definition facts")
@@ -2582,18 +2596,18 @@ mod tests {
     }
 
     #[test]
-    fn sqlx2_mv_frozen_snapshot_and_uuid_decide_candidate_freshness() {
+    fn sqlx2_mv_frozen_snapshot_and_object_id_decide_candidate_freshness() {
         let fresh = frozen_definition(SqlMvRewriteBaseTableFacts::resolved(
             Some(42),
-            Some("original-uuid".to_string()),
+            Some(test_object_id("original-object")),
         ));
         let stale = frozen_definition(SqlMvRewriteBaseTableFacts::resolved(
             Some(43),
-            Some("original-uuid".to_string()),
+            Some(test_object_id("original-object")),
         ));
         let recreated = frozen_definition(SqlMvRewriteBaseTableFacts::resolved(
             Some(42),
-            Some("replacement-uuid".to_string()),
+            Some(test_object_id("replacement-object")),
         ));
 
         assert_eq!(definition_is_fresh(&fresh), Ok(true));
@@ -2729,14 +2743,16 @@ mod tests {
             namespace: "db".to_string(),
             table: "base".to_string(),
         };
-        assert!(SqlImvBaseSnapshotFacts::try_new(base.clone(), -1, "uuid".to_string()).is_err());
+        assert!(
+            SqlImvBaseSnapshotFacts::try_new(base.clone(), -1, test_object_id("object")).is_err()
+        );
 
         let mut builder =
             SqlImvRewriteSnapshotBuilder::try_new(target, SqlTableBindingId::new_for_test(1), 7)
                 .expect("valid sealed snapshot builder");
         builder
             .add_base_snapshot(
-                SqlImvBaseSnapshotFacts::try_new(base.clone(), 42, "uuid".to_string())
+                SqlImvBaseSnapshotFacts::try_new(base.clone(), 42, test_object_id("object"))
                     .expect("valid base facts"),
             )
             .expect("first base is accepted");
@@ -2744,7 +2760,7 @@ mod tests {
         assert!(
             builder
                 .add_base_snapshot(
-                    SqlImvBaseSnapshotFacts::try_new(base, 43, "other".to_string())
+                    SqlImvBaseSnapshotFacts::try_new(base, 43, test_object_id("other"))
                         .expect("valid duplicate shape"),
                 )
                 .is_err()
@@ -2761,7 +2777,7 @@ mod tests {
                 .expect("builder");
         builder
             .add_base_snapshot(
-                SqlImvBaseSnapshotFacts::try_new(base, 42, "uuid-base".to_string())
+                SqlImvBaseSnapshotFacts::try_new(base, 42, test_object_id("object-base"))
                     .expect("base snapshot"),
             )
             .expect("base accepted");

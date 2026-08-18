@@ -23,6 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_sql::planning::mv::{
     ApplyKeySource, MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
     MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
@@ -49,7 +50,9 @@ pub struct MvSchemaContract {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaseContract {
     pub table_fqn: String,
-    pub table_uuid: String,
+    /// Opaque provider-owned physical identity captured at MV CREATE time.
+    /// Core persists and compares these bytes, but never decodes them.
+    pub table_object_id: ConnectorTableObjectId,
     #[serde(default)]
     pub alias_at_create: Option<String>,
     pub schema_id_at_create: i32,
@@ -276,7 +279,7 @@ pub enum ContractSelfCheckError {
     UnsupportedAggregateStateLayoutVersion(u16),
     EmptyAggregateStateColumns,
     EmptyJoinPredicates,
-    EmptyBaseTableUuid,
+    EmptyBaseTableObjectId,
     NegativeBaseSchemaId(i32),
     DuplicateBaseFieldIdWithDifferentType {
         field_id: i32,
@@ -404,7 +407,9 @@ impl std::fmt::Display for ContractSelfCheckError {
             Self::EmptyJoinPredicates => {
                 write!(f, "MV contract join predicates must not be empty")
             }
-            Self::EmptyBaseTableUuid => write!(f, "MV contract base.table_uuid is empty"),
+            Self::EmptyBaseTableObjectId => {
+                write!(f, "MV contract base.table_object_id is empty")
+            }
             Self::NegativeBaseSchemaId(id) => {
                 write!(f, "MV contract base.schema_id_at_create is negative: {id}")
             }
@@ -607,8 +612,8 @@ impl MvSchemaContract {
 }
 
 fn validate_base_contract(base: &BaseContract) -> Result<(), ContractSelfCheckError> {
-    if base.table_uuid.is_empty() {
-        return Err(ContractSelfCheckError::EmptyBaseTableUuid);
+    if base.table_object_id.as_bytes().is_empty() {
+        return Err(ContractSelfCheckError::EmptyBaseTableObjectId);
     }
     if base.schema_id_at_create < 0 {
         return Err(ContractSelfCheckError::NegativeBaseSchemaId(
@@ -681,9 +686,15 @@ fn qualified_field_known(bases: &[&BaseContract], field: &QualifiedFieldLineage)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use novarocks_sql::planning::mv::{
         SqlMvApplyKeySourceFacts, SqlMvPersistedApplyKeySourceFacts,
     };
+
+    fn object_id(bytes: &[u8]) -> ConnectorTableObjectId {
+        ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes))
+            .expect("valid opaque table object ID")
+    }
 
     #[test]
     fn persisted_target_vocabulary_is_stable() {
@@ -725,7 +736,7 @@ mod tests {
             contract_version: 1,
             base: BaseContract {
                 table_fqn: "ice.ns.orders".to_string(),
-                table_uuid: "11111111-1111-1111-1111-111111111111".to_string(),
+                table_object_id: object_id(&[0, 0xff, b'o', b'r', b'd', b'e', b'r', b's']),
                 alias_at_create: None,
                 schema_id_at_create: 0,
                 schema_at_create: BaseSchemaSnapshot {
@@ -908,7 +919,7 @@ mod tests {
             "contract_version": 1,
             "base": {
                 "table_fqn": "ice.ns.orders",
-                "table_uuid": "11111111-1111-1111-1111-111111111111",
+                "table_object_id": [0, 255, 1],
                 "schema_id_at_create": 0,
                 "schema_at_create": {
                     "fields": [
@@ -1040,13 +1051,9 @@ mod tests {
     }
 
     #[test]
-    fn self_check_rejects_empty_base_uuid() {
-        let mut c = sample_contract();
-        c.base.table_uuid = String::new();
-        assert!(matches!(
-            c.ensure_self_consistent(),
-            Err(ContractSelfCheckError::EmptyBaseTableUuid)
-        ));
+    fn base_object_id_rejects_empty_bytes_at_construction() {
+        let error = ConnectorTableObjectId::try_new(Bytes::new()).expect_err("empty IDs reject");
+        assert!(error.to_string().contains("must not be empty"));
     }
 
     #[test]
@@ -1274,13 +1281,9 @@ mod tests {
     }
 
     #[test]
-    fn contract_v2_rejects_secondary_base_with_empty_uuid() {
-        let mut contract = sample_join_contract();
-        contract.bases[1].table_uuid = String::new();
-        assert!(matches!(
-            contract.ensure_self_consistent(),
-            Err(ContractSelfCheckError::EmptyBaseTableUuid)
-        ));
+    fn contract_v2_rejects_secondary_base_with_invalid_object_id_at_construction() {
+        let error = ConnectorTableObjectId::try_new(Bytes::new()).expect_err("empty IDs reject");
+        assert!(error.to_string().contains("must not be empty"));
     }
 
     #[test]
@@ -1337,7 +1340,7 @@ mod tests {
             contract_version: 2,
             base: BaseContract {
                 table_fqn: "ice.ns.left".to_string(),
-                table_uuid: "left-uuid".to_string(),
+                table_object_id: object_id(&[0, b'l', b'e', b'f', b't']),
                 alias_at_create: None,
                 schema_id_at_create: 0,
                 schema_at_create: BaseSchemaSnapshot { fields: vec![] },
@@ -1345,7 +1348,7 @@ mod tests {
             bases: vec![
                 BaseContract {
                     table_fqn: "ice.ns.left".to_string(),
-                    table_uuid: "left-uuid".to_string(),
+                    table_object_id: object_id(&[0, b'l', b'e', b'f', b't']),
                     alias_at_create: Some("l".to_string()),
                     schema_id_at_create: 0,
                     schema_at_create: BaseSchemaSnapshot {
@@ -1359,7 +1362,7 @@ mod tests {
                 },
                 BaseContract {
                     table_fqn: "ice.ns.right".to_string(),
-                    table_uuid: "right-uuid".to_string(),
+                    table_object_id: object_id(&0xffu8.to_be_bytes()),
                     alias_at_create: Some("r".to_string()),
                     schema_id_at_create: 0,
                     schema_at_create: BaseSchemaSnapshot {

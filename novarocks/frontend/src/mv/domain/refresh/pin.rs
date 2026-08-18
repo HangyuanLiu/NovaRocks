@@ -18,7 +18,7 @@
 //! Refresh-scoped snapshot pin for iceberg-backed materialized views.
 //!
 //! `RefreshSnapshotPin` stores, for one refresh, the
-//! `current_snapshot_id` and `uuid` of every base table. The pin is the
+//! `current_snapshot_id` and opaque object ID of every base table. The pin is the
 //! single source of truth for snapshot ids during the refresh:
 //!
 //! * provider change-window planning uses pin[base] as its `to_snapshot_id`
@@ -37,6 +37,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_spi::connector::ConnectorTableObjectId;
 
 /// Per-refresh snapshot pin: each base table is pinned to the
 /// `current_snapshot_id` it had at refresh entry time.
@@ -44,19 +45,19 @@ use novarocks_catalog::identifier::TableIdentity;
 #[derive(Clone, Debug, Default)]
 pub struct RefreshSnapshotPin {
     snapshots: BTreeMap<String, i64>,
-    table_uuids: BTreeMap<String, String>,
+    table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
 }
 
 #[allow(dead_code)]
 impl RefreshSnapshotPin {
     pub fn from_captured_entries(
-        entries: impl IntoIterator<Item = (TableIdentity, i64, String)>,
+        entries: impl IntoIterator<Item = (TableIdentity, i64, ConnectorTableObjectId)>,
     ) -> Self {
         let mut pin = RefreshSnapshotPin::default();
-        for (table, snapshot_id, table_uuid) in entries {
+        for (table, snapshot_id, object_id) in entries {
             let fqn = table.fqn();
             pin.snapshots.insert(fqn.clone(), snapshot_id);
-            pin.table_uuids.insert(fqn, table_uuid);
+            pin.table_object_ids.insert(fqn, object_id);
         }
         pin
     }
@@ -65,8 +66,8 @@ impl RefreshSnapshotPin {
         self.snapshots.get(&base.fqn()).copied()
     }
 
-    pub fn uuid(&self, base: &TableIdentity) -> Option<&str> {
-        self.table_uuids.get(&base.fqn()).map(String::as_str)
+    pub fn object_id(&self, base: &TableIdentity) -> Option<&ConnectorTableObjectId> {
+        self.table_object_ids.get(&base.fqn())
     }
 
     pub fn len(&self) -> usize {
@@ -85,19 +86,19 @@ impl RefreshSnapshotPin {
         self.snapshots.clone()
     }
 
-    pub fn to_table_uuid_map(&self) -> BTreeMap<String, String> {
-        self.table_uuids.clone()
+    pub fn to_table_object_id_map(&self) -> BTreeMap<String, ConnectorTableObjectId> {
+        self.table_object_ids.clone()
     }
 }
 
 /// Rejects a refresh when a persisted base-table identity no longer matches
 /// the identity frozen in this attempt's pin.
-pub fn validate_refresh_pin_table_uuids(
+pub fn validate_refresh_pin_table_object_ids(
     mv_definition: &StoredMvDefinition,
     pin: &RefreshSnapshotPin,
     base_refs: &[TableIdentity],
 ) -> Result<(), String> {
-    validate_refresh_pin_table_uuids_for_operation(
+    validate_refresh_pin_table_object_ids_for_operation(
         mv_definition,
         pin,
         base_refs,
@@ -105,24 +106,26 @@ pub fn validate_refresh_pin_table_uuids(
     )
 }
 
-fn validate_refresh_pin_table_uuids_for_operation(
+fn validate_refresh_pin_table_object_ids_for_operation(
     mv_definition: &StoredMvDefinition,
     pin: &RefreshSnapshotPin,
     base_refs: &[TableIdentity],
     unsafe_message: &str,
 ) -> Result<(), String> {
     for base_ref in base_refs {
-        let Some(previous_uuid) = mv_definition.last_refresh_table_uuids.get(&base_ref.fqn())
+        let Some(previous_object_id) = mv_definition
+            .last_refresh_table_object_ids
+            .get(&base_ref.fqn())
         else {
             continue;
         };
-        let current_uuid = pin.uuid(base_ref).ok_or_else(|| {
+        let current_object_id = pin.object_id(base_ref).ok_or_else(|| {
             format!(
-                "refresh pin missing uuid for base {} (this should not happen)",
+                "refresh pin missing object ID for base {} (this should not happen)",
                 base_ref.fqn()
             )
         })?;
-        if previous_uuid != current_uuid {
+        if previous_object_id != current_object_id {
             return Err(format!(
                 "iceberg MV base table identity changed for {}; {unsafe_message}",
                 base_ref.fqn(),
@@ -136,13 +139,16 @@ fn validate_refresh_pin_table_uuids_for_operation(
 impl RefreshSnapshotPin {
     /// Build a pin with explicit entries; for use from other modules' unit
     /// tests that need to construct a `RefreshSnapshotPin` without going
-    /// through `capture`. Each tuple is `(fqn, snapshot_id, table_uuid)`.
-    pub(crate) fn from_entries_for_tests(entries: &[(&str, i64, &str)]) -> Self {
+    /// through `capture`. Each tuple is `(fqn, snapshot_id, object_id_bytes)`.
+    pub(crate) fn from_entries_for_tests(entries: &[(&str, i64, &[u8])]) -> Self {
         let mut pin = RefreshSnapshotPin::default();
-        for (fqn, snapshot_id, uuid) in entries {
+        for (fqn, snapshot_id, object_id) in entries {
             pin.snapshots.insert((*fqn).to_string(), *snapshot_id);
-            pin.table_uuids
-                .insert((*fqn).to_string(), (*uuid).to_string());
+            pin.table_object_ids.insert(
+                (*fqn).to_string(),
+                ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(object_id))
+                    .expect("test object ID is bounded"),
+            );
         }
         pin
     }
@@ -330,12 +336,15 @@ mod tests {
         *query
     }
 
-    fn make_pin(entries: &[(&str, i64, &str)]) -> RefreshSnapshotPin {
+    fn make_pin(entries: &[(&str, i64, &[u8])]) -> RefreshSnapshotPin {
         let mut pin = RefreshSnapshotPin::default();
-        for (fqn, snapshot_id, uuid) in entries {
+        for (fqn, snapshot_id, object_id) in entries {
             pin.snapshots.insert((*fqn).to_string(), *snapshot_id);
-            pin.table_uuids
-                .insert((*fqn).to_string(), (*uuid).to_string());
+            pin.table_object_ids.insert(
+                (*fqn).to_string(),
+                ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(object_id))
+                    .expect("test object ID"),
+            );
         }
         pin
     }
@@ -353,13 +362,31 @@ mod tests {
         let mixed_case = make_ref("IceCase", "DbName", "Orders");
         let lowercase = make_ref("alpha", "db", "customers");
         let pin = RefreshSnapshotPin::from_captured_entries([
-            (lowercase.clone(), 20, "uuid-alpha".to_string()),
-            (mixed_case.clone(), 10, "uuid-old".to_string()),
-            (mixed_case.clone(), 30, "uuid-new".to_string()),
+            (
+                lowercase.clone(),
+                20,
+                ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"object-alpha"))
+                    .expect("test object ID"),
+            ),
+            (
+                mixed_case.clone(),
+                10,
+                ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"object-old"))
+                    .expect("test object ID"),
+            ),
+            (
+                mixed_case.clone(),
+                30,
+                ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"object-new"))
+                    .expect("test object ID"),
+            ),
         ]);
 
         assert_eq!(pin.get(&mixed_case), Some(30));
-        assert_eq!(pin.uuid(&mixed_case), Some("uuid-new"));
+        assert_eq!(
+            pin.object_id(&mixed_case).map(|id| id.as_bytes().as_ref()),
+            Some(b"object-new".as_ref())
+        );
         assert_eq!(pin.get(&lowercase), Some(20));
         assert_eq!(pin.len(), 2);
         assert!(!pin.is_empty());
@@ -376,10 +403,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            pin.to_table_uuid_map().into_iter().collect::<Vec<_>>(),
+            pin.to_table_object_id_map()
+                .into_iter()
+                .map(|(fqn, object_id)| (fqn, object_id.as_bytes().to_vec()))
+                .collect::<Vec<_>>(),
             vec![
-                ("IceCase.DbName.Orders".to_string(), "uuid-new".to_string(),),
-                ("alpha.db.customers".to_string(), "uuid-alpha".to_string()),
+                ("IceCase.DbName.Orders".to_string(), b"object-new".to_vec(),),
+                ("alpha.db.customers".to_string(), b"object-alpha".to_vec()),
             ]
         );
     }
@@ -387,7 +417,7 @@ mod tests {
     #[test]
     fn inject_pin_skips_delta_bearing_base() {
         let mut query = parse_select_for_test("SELECT * FROM ice.db.orders");
-        let pin = make_pin(&[("ice.db.orders", 42, "uuid-orders")]);
+        let pin = make_pin(&[("ice.db.orders", 42, b"object-orders")]);
         let delta_bearing = std::collections::HashSet::from([make_ref("ice", "db", "orders")]);
 
         let count =
@@ -403,8 +433,8 @@ mod tests {
         let mut query =
             parse_select_for_test("SELECT * FROM db.orders JOIN ice.db.customers ON true");
         let pin = make_pin(&[
-            ("ice.db.orders", 42, "uuid-orders"),
-            ("ice.db.customers", 99, "uuid-customers"),
+            ("ice.db.orders", 42, b"object-orders"),
+            ("ice.db.customers", 99, b"object-customers"),
         ]);
         let delta_bearing = std::collections::HashSet::from([make_ref("ice", "db", "orders")]);
 
@@ -424,7 +454,7 @@ mod tests {
         let mut query = parse_select_for_test(
             "WITH recent AS (SELECT * FROM local_db.orders) SELECT * FROM recent JOIN other.db.dim ON true",
         );
-        let pin = make_pin(&[("ice.db.orders", 42, "uuid-orders")]);
+        let pin = make_pin(&[("ice.db.orders", 42, b"object-orders")]);
         let delta_bearing = std::collections::HashSet::new();
 
         let count =
@@ -441,7 +471,7 @@ mod tests {
     #[test]
     fn inject_pin_rejects_existing_for_version_as_of() {
         let mut query = parse_select_for_test("SELECT * FROM ice.db.orders VERSION AS OF 7");
-        let pin = make_pin(&[("ice.db.orders", 42, "uuid-orders")]);
+        let pin = make_pin(&[("ice.db.orders", 42, b"object-orders")]);
         let delta_bearing = std::collections::HashSet::new();
 
         let err =
@@ -457,7 +487,7 @@ mod tests {
     #[test]
     fn inject_pin_rejects_delta_bearing_base_with_existing_for_version_as_of() {
         let mut query = parse_select_for_test("SELECT * FROM ice.db.orders VERSION AS OF 7");
-        let pin = make_pin(&[("ice.db.orders", 42, "uuid-orders")]);
+        let pin = make_pin(&[("ice.db.orders", 42, b"object-orders")]);
         let delta_bearing = std::collections::HashSet::from([make_ref("ice", "db", "orders")]);
 
         let err =
@@ -475,8 +505,8 @@ mod tests {
         let mut query =
             parse_select_for_test("SELECT * FROM (ice.db.orders JOIN ice.db.customers ON true)");
         let pin = make_pin(&[
-            ("ice.db.orders", 42, "uuid-orders"),
-            ("ice.db.customers", 99, "uuid-customers"),
+            ("ice.db.orders", 42, b"object-orders"),
+            ("ice.db.customers", 99, b"object-customers"),
         ]);
         let delta_bearing = std::collections::HashSet::from([make_ref("ice", "db", "orders")]);
 
@@ -494,7 +524,7 @@ mod tests {
     #[test]
     fn inject_pin_skips_table_valued_functions() {
         let mut query = parse_select_for_test("SELECT * FROM __nr_ivm_delta('ice.db.orders')");
-        let pin = make_pin(&[("ice.db.orders", 42, "uuid-orders")]);
+        let pin = make_pin(&[("ice.db.orders", 42, b"object-orders")]);
         let delta_bearing = std::collections::HashSet::new();
 
         let count =

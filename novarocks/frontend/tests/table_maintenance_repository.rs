@@ -33,6 +33,7 @@ use novarocks_frontend::table_maintenance::model::{OptimizeJobCreate, OptimizeJo
 use novarocks_frontend::table_maintenance::repository::{
     OptimizeJobRepository, RepositoryErrorKind,
 };
+use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_spi::state_store::{
     ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Direction,
     FeDeploymentView, Key, KeyRange, Precondition, RangePage, RangeRequest, ReadTransaction,
@@ -106,6 +107,10 @@ fn target(catalog: &str, namespace: &str, table: &str) -> MaintenanceTarget {
     }
 }
 
+fn object_id() -> ConnectorTableObjectId {
+    ConnectorTableObjectId::try_new(Bytes::from_static(b"test-object-id")).unwrap()
+}
+
 fn create_request(
     catalog: &str,
     namespace: &str,
@@ -115,6 +120,7 @@ fn create_request(
 ) -> OptimizeJobCreate {
     OptimizeJobCreate {
         target: target(catalog, namespace, table),
+        object_id: object_id(),
         base_snapshot_id,
         created_at_ms,
     }
@@ -961,12 +967,13 @@ async fn repository_open_fails_fast_on_unknown_job_schema_version() {
     let temp = TempDir::new().unwrap();
     let store = open_sqlite(&temp.path().join("state.sqlite")).await;
     let payload = serde_json::json!({
-        "schema_version": 3,
+        "schema_version": 2,
         "job_id": 1,
         "target": {
             "catalog": "ice",
             "namespace": "db",
-            "table": "t"
+            "table": "t",
+            "object_id": "0102"
         },
         "base_snapshot_id": 10,
         "state": "PENDING",

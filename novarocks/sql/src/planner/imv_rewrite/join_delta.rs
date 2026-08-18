@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
+use novarocks_spi::connector::ConnectorTableObjectId;
 
 use crate::analysis::{ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
 use crate::column_id::ColumnId;
@@ -234,7 +235,7 @@ impl LogicalRewriteRule for RecordJoinRefreshDescriptorRule {
 #[derive(Clone)]
 struct PlanBaseIdentity {
     fqn: String,
-    table_uuid: String,
+    table_object_id: ConnectorTableObjectId,
     source_kind: BranchSourceKind,
 }
 
@@ -432,9 +433,9 @@ fn join_row_key_expr(evidence: &JoinDeltaBranchEvidence) -> TypedExpr {
             volatility: crate::functions::FunctionVolatility::Immutable,
             name: "join_row_key".to_string(),
             args: vec![
-                string_literal(&evidence.left_base.table_uuid),
+                object_id_binary_literal(&evidence.left_base.table_object_id),
                 column_ref_expr(&evidence.left_row_id_column),
-                string_literal(&evidence.right_base.table_uuid),
+                object_id_binary_literal(&evidence.right_base.table_object_id),
                 column_ref_expr(&evidence.right_row_id_column),
             ],
             distinct: false,
@@ -444,10 +445,10 @@ fn join_row_key_expr(evidence: &JoinDeltaBranchEvidence) -> TypedExpr {
     }
 }
 
-fn string_literal(value: &str) -> TypedExpr {
+fn object_id_binary_literal(value: &ConnectorTableObjectId) -> TypedExpr {
     TypedExpr {
-        kind: ExprKind::Literal(LiteralValue::String(value.to_string())),
-        data_type: DataType::Utf8,
+        kind: ExprKind::Literal(LiteralValue::Binary(value.as_bytes().to_vec())),
+        data_type: DataType::Binary,
         nullable: false,
     }
 }
@@ -686,16 +687,16 @@ fn plan_base_identity(
     source_kind: BranchSourceKind,
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
 ) -> Result<PlanBaseIdentity, String> {
-    let table_uuid = snapshot
+    let table_object_id = snapshot
         .base_snapshot_for_parts(
             &source.table.catalog,
             &source.table.namespace,
             &source.table.table,
         )
-        .map(|base| base.table_uuid.clone())
+        .map(|base| base.table_object_id.clone())
         .ok_or_else(|| {
             format!(
-                "join refresh descriptor requires table uuid for {}.{}.{}",
+                "join refresh descriptor requires table object id for {}.{}.{}",
                 source.table.catalog, source.table.namespace, source.table.table
             )
         })?;
@@ -704,7 +705,7 @@ fn plan_base_identity(
             "{}.{}.{}",
             source.table.catalog, source.table.namespace, source.table.table
         ),
-        table_uuid,
+        table_object_id,
         source_kind,
     })
 }
@@ -1584,6 +1585,50 @@ mod tests {
     }
 
     #[test]
+    fn join_row_key_uses_opaque_binary_object_id_literals() {
+        let left_row_id = internal_output_column(2, ImvRowIdColumn::NAME);
+        let right_row_id = internal_output_column(3, ImvRowIdColumn::NAME);
+        let evidence = JoinDeltaBranchEvidence {
+            side: JoinRefreshBranchSide::LeftDeltaRightSnapshot,
+            left_base: PlanBaseIdentity {
+                fqn: "ice.db.left".to_string(),
+                table_object_id: test_object_id(b"left\x00object"),
+                source_kind: BranchSourceKind::Delta,
+            },
+            right_base: PlanBaseIdentity {
+                fqn: "ice.db.right".to_string(),
+                table_object_id: test_object_id(b"right\xffobject"),
+                source_kind: BranchSourceKind::Version,
+            },
+            left_output_columns: vec![left_row_id.clone()],
+            right_output_columns: vec![right_row_id.clone()],
+            left_row_id_column: left_row_id,
+            right_row_id_column: right_row_id,
+        };
+
+        let expr = join_row_key_expr(&evidence);
+        let ExprKind::FunctionCall { args, .. } = expr.kind else {
+            panic!("expected join_row_key call");
+        };
+        assert!(matches!(
+            &args[0],
+            TypedExpr {
+                kind: ExprKind::Literal(crate::analysis::LiteralValue::Binary(bytes)),
+                data_type: DataType::Binary,
+                ..
+            } if bytes == b"left\x00object"
+        ));
+        assert!(matches!(
+            &args[2],
+            TypedExpr {
+                kind: ExprKind::Literal(crate::analysis::LiteralValue::Binary(bytes)),
+                data_type: DataType::Binary,
+                ..
+            } if bytes == b"right\xffobject"
+        ));
+    }
+
+    #[test]
     fn pure_join_delta_matches_imv_delta_over_join_any_root() {
         let rule = RewriteJoinDeltaRule;
         let ctx = build_ctx();
@@ -2383,6 +2428,11 @@ mod tests {
             is_internal: true,
             ..output_column(id, name)
         }
+    }
+
+    fn test_object_id(bytes: &[u8]) -> ConnectorTableObjectId {
+        ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(bytes))
+            .expect("test object id")
     }
 
     fn assert_project_item_reads_column(item: &ProjectItem, expected: ColumnId) {

@@ -254,7 +254,7 @@ pub(super) fn execute(
     };
 
     let base_snapshots = required_base_snapshots(&refresh.finalize)?;
-    let base_table_uuids = refresh.finalize.base_table_uuids.clone();
+    let base_table_object_ids = refresh.finalize.base_table_object_ids.clone();
     let has_external_actions = matches!(&refresh.work, PreparedMvRefreshWork::DataProducing { .. });
     let ledger = new_ledger(&refresh, &planning_lease, has_external_actions)?;
     repository
@@ -267,7 +267,7 @@ pub(super) fn execute(
             staging_branch: refresh.attempt.staging_branch.clone(),
             expected_main_snapshot_id: refresh.finalize.expected_target_snapshot_id,
             base_snapshots: base_snapshots.clone(),
-            base_table_uuids: base_table_uuids.clone(),
+            base_table_object_ids: base_table_object_ids.clone(),
             marker_token: refresh.attempt.marker_token.clone(),
             prepare_external_actions: has_external_actions,
             ledger,
@@ -287,7 +287,7 @@ pub(super) fn execute(
                     refresh_id: attempt.refresh_id,
                     rows: 0,
                     base_snapshots,
-                    base_table_uuids,
+                    base_table_object_ids,
                     target_snapshot_id: finalize.expected_target_snapshot_id,
                     partition_spec: None,
                 })
@@ -585,7 +585,7 @@ fn execute_data_refresh(
             refresh_id: attempt.refresh_id,
             rows: published.committed().resulting_row_count(),
             base_snapshots,
-            base_table_uuids: finalize.base_table_uuids,
+            base_table_object_ids: finalize.base_table_object_ids,
             target_snapshot_id: published_frontend_version.snapshot_id,
             partition_spec,
         })

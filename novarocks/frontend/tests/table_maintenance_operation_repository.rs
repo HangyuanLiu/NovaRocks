@@ -39,6 +39,7 @@ use novarocks_frontend::table_maintenance::repository::{
     cleanup_payload_digest, distributed_rewrite_payload_digest,
     metadata_maintenance_payload_digest,
 };
+use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_spi::state_store::{FeDeploymentView, StateStore};
 use novarocks_state_store::coordination::{ControlPlaneIncarnation, FencingToken, ResourceEpoch};
 use novarocks_state_store::{
@@ -156,11 +157,16 @@ fn target() -> MaintenanceTarget {
     }
 }
 
+fn object_id() -> ConnectorTableObjectId {
+    ConnectorTableObjectId::try_new(Bytes::from_static(b"test-object-id")).unwrap()
+}
+
 fn create(operation_id: Uuid) -> MetadataMaintenanceOperationCreate {
     let request_payload = br#"{"operation":"rewrite-metadata-layout"}"#.to_vec();
     MetadataMaintenanceOperationCreate {
         operation_id,
         target: target(),
+        object_id: object_id(),
         owner: MetadataMaintenanceExactOwner {
             instance_id: "iceberg_rest".to_string(),
             incarnation_id: Uuid::now_v7(),
@@ -200,6 +206,7 @@ fn rewrite_create(operation_id: Uuid) -> DistributedRewriteOperationCreate {
     DistributedRewriteOperationCreate {
         operation_id,
         target: target(),
+        object_id: object_id(),
         owner: MetadataMaintenanceExactOwner {
             instance_id: "iceberg_rest".to_string(),
             incarnation_id: Uuid::now_v7(),
@@ -224,6 +231,7 @@ fn cleanup_create(operation_id: Uuid) -> CleanupOperationCreate {
     CleanupOperationCreate {
         operation_id,
         target: target(),
+        object_id: object_id(),
         owner: MetadataMaintenanceExactOwner {
             instance_id: "iceberg_rest".to_string(),
             incarnation_id: Uuid::now_v7(),
@@ -262,6 +270,101 @@ fn prepared_cleanup_batch() -> CleanupBatchCheckpoint {
         failed_count: 0,
         unknown_count: 0,
     }
+}
+
+#[tokio::test]
+async fn target_replaced_is_fenced_terminal_only_before_dispatch() {
+    let validator: MaintenanceFenceValidator = Arc::new(|_| Box::pin(async { Ok(()) }));
+
+    let (_temp, store, metadata) = fixture().await;
+    let optimize = OptimizeJobRepository::open(Arc::clone(&store))
+        .await
+        .unwrap();
+    let optimize_job = optimize
+        .create(OptimizeJobCreate {
+            target: target(),
+            object_id: object_id(),
+            base_snapshot_id: 1,
+            created_at_ms: 10,
+        })
+        .await
+        .unwrap();
+    optimize
+        .mark_target_replaced_fenced(
+            optimize_job.job_id,
+            11,
+            fenced_authority(),
+            Arc::clone(&validator),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        format!("{:?}", optimize.list().await.unwrap()[0].state),
+        "TargetReplaced"
+    );
+    assert!(optimize.list_pending().await.unwrap().is_empty());
+
+    let metadata_id = Uuid::now_v7();
+    metadata.create(create(metadata_id)).await.unwrap();
+    let metadata_replaced = metadata
+        .mark_target_replaced_fenced(metadata_id, 11, fenced_authority(), Arc::clone(&validator))
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata_replaced.state,
+        MetadataMaintenanceOperationState::TargetReplaced
+    );
+    assert!(!metadata.has_active_target(&target()).await.unwrap());
+
+    let (_temp, _store, rewrite) = rewrite_fixture().await;
+    let rewrite_id = Uuid::now_v7();
+    rewrite.create(rewrite_create(rewrite_id)).await.unwrap();
+    let rewrite_replaced = rewrite
+        .mark_target_replaced_fenced(rewrite_id, 11, fenced_authority(), Arc::clone(&validator))
+        .await
+        .unwrap();
+    assert_eq!(
+        rewrite_replaced.state,
+        DistributedRewriteOperationState::TargetReplaced
+    );
+    assert!(rewrite.list_recovery_candidates().await.unwrap().is_empty());
+
+    let (_temp, _store, cleanup) = cleanup_fixture().await;
+    let cleanup_id = Uuid::now_v7();
+    cleanup.create(cleanup_create(cleanup_id)).await.unwrap();
+    let cleanup_replaced = cleanup
+        .mark_target_replaced_fenced(cleanup_id, 11, fenced_authority(), Arc::clone(&validator))
+        .await
+        .unwrap();
+    assert_eq!(
+        cleanup_replaced.state,
+        CleanupOperationState::TargetReplaced
+    );
+    assert!(cleanup.list_recovery_candidates().await.unwrap().is_empty());
+
+    let blocked_id = Uuid::now_v7();
+    rewrite.create(rewrite_create(blocked_id)).await.unwrap();
+    let plan_payload = b"target-replaced-must-not-erase-plan".to_vec();
+    rewrite
+        .plan(
+            blocked_id,
+            DistributedRewritePlanPayload {
+                plan_digest: [1; 32],
+                manifest_digest: [2; 32],
+                cohort_set_digest: [3; 32],
+                payload_digest: distributed_rewrite_payload_digest(&plan_payload),
+                payload: plan_payload,
+                cohort_count: 1,
+            },
+            12,
+        )
+        .await
+        .unwrap();
+    let error = rewrite
+        .mark_target_replaced_fenced(blocked_id, 13, fenced_authority(), validator)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::InvalidTransition);
 }
 
 #[tokio::test]
@@ -431,6 +534,7 @@ async fn v1_optimize_and_v2_metadata_operations_are_mutually_exclusive() {
     optimize
         .create(OptimizeJobCreate {
             target: target(),
+            object_id: object_id(),
             base_snapshot_id: 1,
             created_at_ms: 10,
         })
@@ -449,6 +553,7 @@ async fn v1_child_rewrite_copies_the_claimed_authority_without_a_second_lease() 
     let parent = optimize
         .create(OptimizeJobCreate {
             target: target(),
+            object_id: object_id(),
             base_snapshot_id: 1,
             created_at_ms: 10,
         })
@@ -663,6 +768,7 @@ async fn distributed_rewrite_and_legacy_maintenance_are_mutually_exclusive() {
     let error = optimize
         .create(OptimizeJobCreate {
             target: target(),
+            object_id: object_id(),
             base_snapshot_id: 1,
             created_at_ms: 10,
         })
@@ -685,6 +791,7 @@ async fn distributed_rewrite_rejects_active_legacy_fences() {
     optimize
         .create(OptimizeJobCreate {
             target: target(),
+            object_id: object_id(),
             base_snapshot_id: 1,
             created_at_ms: 10,
         })
@@ -715,6 +822,7 @@ async fn claimed_running_optimize_job_may_create_only_its_own_rewrite() {
     let job = optimize
         .create(OptimizeJobCreate {
             target: target(),
+            object_id: object_id(),
             base_snapshot_id: 1,
             created_at_ms: 10,
         })

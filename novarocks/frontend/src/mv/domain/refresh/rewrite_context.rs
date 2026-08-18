@@ -16,7 +16,8 @@ use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorChangeWindow, ConnectorChangeWindowAdmission, ConnectorControlRegistry,
-    ConnectorRequestContext, ConnectorScanAdmission, ConnectorTableResolution,
+    ConnectorRequestContext, ConnectorScanAdmission, ConnectorTableObjectId,
+    ConnectorTableResolution,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -57,7 +58,7 @@ pub fn build_neutral_refresh_rewrite_context(
     base_refs: Arc<[TableIdentity]>,
     pin: Arc<RefreshSnapshotPin>,
     previous_snapshot_ids: BTreeMap<String, i64>,
-    previous_table_uuids: BTreeMap<String, String>,
+    previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     target_snapshot_id: Option<i64>,
     target_table_uuid: String,
     retained_target_binding: Option<&crate::mv::domain::refresh::target_binding::MvTargetBinding>,
@@ -103,7 +104,7 @@ pub fn build_neutral_refresh_rewrite_context(
         base_refs,
         pin,
         previous_snapshot_ids,
-        previous_table_uuids,
+        previous_table_object_ids,
         target_snapshot_id,
         target_table_uuid,
         binding.physical_write_schema()?,

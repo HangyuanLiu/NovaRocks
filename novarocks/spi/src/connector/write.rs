@@ -1380,7 +1380,6 @@ impl ConnectorManagedPublicationIntent {
                 > MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES
             || bases.iter().any(|base| {
                 base.table.is_empty()
-                    || base.uuid.is_empty()
                     || base.to_version < 0
                     || base.from_version.is_some_and(|version| version < 0)
             })
@@ -1391,11 +1390,10 @@ impl ConnectorManagedPublicationIntent {
             ));
         }
         let mut tables = BTreeSet::new();
-        let mut uuids = BTreeSet::new();
-        if bases
-            .iter()
-            .any(|base| !tables.insert(base.table.as_ref()) || !uuids.insert(base.uuid.as_ref()))
-        {
+        let mut object_ids = HashSet::new();
+        if bases.iter().any(|base| {
+            !tables.insert(base.table.as_ref()) || !object_ids.insert(base.object_id.clone())
+        }) {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "connector managed publication intent has duplicate base identities",
@@ -1470,7 +1468,9 @@ impl ConnectorManagedPublicationIntent {
         }]);
         for base in &self.bases {
             digest_bytes(&mut hasher, base.table.as_bytes());
-            digest_bytes(&mut hasher, base.uuid.as_bytes());
+            // ConnectorTableObjectId bounds this exact opaque byte frame.
+            // Its bytes are signed directly, never parsed or re-encoded.
+            digest_bytes(&mut hasher, base.object_id.as_bytes());
             hasher.update(base.from_version.unwrap_or(-1).to_be_bytes());
             hasher.update(base.to_version.to_be_bytes());
         }
@@ -3872,6 +3872,7 @@ mod tests {
     use super::*;
     use crate::connector::{
         ConnectorCancellation, ConnectorInstanceId, ConnectorInstanceIncarnation,
+        ConnectorTableObjectId,
     };
 
     struct NotCancelled;
@@ -3905,7 +3906,8 @@ mod tests {
     fn base_facts() -> Vec<super::super::ConnectorStagedPublicationBaseFact> {
         vec![super::super::ConnectorStagedPublicationBaseFact {
             table: Arc::from("db.base"),
-            uuid: Arc::from("base-uuid"),
+            object_id: ConnectorTableObjectId::try_new(Bytes::from_static(b"base-uuid"))
+                .expect("bounded base object ID"),
             from_version: Some(10),
             to_version: 11,
         }]
@@ -4102,6 +4104,41 @@ mod tests {
                 .validate_for_operation(ConnectorWriteOperationId::new())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn managed_publication_signs_opaque_base_identity_bytes() {
+        let ordinary = ConnectorManagedPublicationIntent::try_new(
+            1,
+            2,
+            "marker",
+            ConnectorManagedPublicationTechnique::Full,
+            base_facts(),
+            "definition",
+            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+        )
+        .expect("managed publication");
+        assert!(
+            !format!("{:?}", ordinary.bases()[0].object_id).contains("base-uuid"),
+            "managed publication must not expose a provider-owned identity through Debug"
+        );
+
+        let mut replacement_facts = base_facts();
+        replacement_facts[0].object_id =
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"replacement-object"))
+                .expect("bounded replacement object ID");
+        let replacement = ConnectorManagedPublicationIntent::try_new(
+            1,
+            2,
+            "marker",
+            ConnectorManagedPublicationTechnique::Full,
+            replacement_facts,
+            "definition",
+            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+        )
+        .expect("replacement managed publication");
+
+        assert_ne!(ordinary.digest(), replacement.digest());
     }
 
     #[test]

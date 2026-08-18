@@ -40,10 +40,10 @@ pub(crate) fn frozen_logical_context_from_rewrite(
         base_refs: rewrite.base_refs.to_vec(),
         pin: novarocks_sql::planning::mv::first_refresh::SqlMvSnapshotPin::try_from_maps(
             rewrite.pin.to_snapshot_map(),
-            rewrite.pin.to_table_uuid_map(),
+            rewrite.pin.to_table_object_id_map(),
         )?,
         previous_snapshot_ids: rewrite.previous_snapshot_ids.clone(),
-        previous_table_uuids: rewrite.previous_table_uuids.clone(),
+        previous_table_object_ids: rewrite.previous_table_object_ids.clone(),
         target_table_uuid: rewrite.target_table_uuid.clone(),
         affected_partitions,
         frozen_base_overlays,
@@ -325,13 +325,13 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
                             base.fqn()
                         )
                     })?;
-                    let table_uuid = facts.pin.uuid(base).ok_or_else(|| {
+                    let table_object_id = facts.pin.object_id(base).ok_or_else(|| {
                         format!(
-                            "MV first-refresh logical artifact has no UUID pin for {}",
+                            "MV first-refresh logical artifact has no object-ID pin for {}",
                             base.fqn()
                         )
                     })?;
-                    Ok((base.clone(), snapshot_id, table_uuid.to_string()))
+                    Ok((base.clone(), snapshot_id, table_object_id.clone()))
                 })
                 .collect::<Result<Vec<_>, String>>()?,
         );
@@ -346,7 +346,7 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
         Arc::from(facts.base_refs.clone()),
         Arc::new(application_pin),
         facts.previous_snapshot_ids.clone(),
-        facts.previous_table_uuids.clone(),
+        facts.previous_table_object_ids.clone(),
         expected_target_snapshot_id,
         facts.target_table_uuid.clone(),
         target_binding.physical_write_schema()?,

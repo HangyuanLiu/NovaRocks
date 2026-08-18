@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use novarocks_spi::connector::ConnectorTableObjectId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -152,7 +153,7 @@ pub struct CreateMvRepositoryWithIdRequest {
 pub struct RebuildMvRepositoryRequest {
     pub create: CreateMvRepositoryRequest,
     pub base_snapshots: BTreeMap<String, i64>,
-    pub base_table_uuids: BTreeMap<String, String>,
+    pub base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,7 +182,7 @@ pub struct BeginFrontendMvRefreshIntentRequest {
     pub staging_branch: String,
     pub expected_main_snapshot_id: Option<i64>,
     pub base_snapshots: BTreeMap<String, i64>,
-    pub base_table_uuids: BTreeMap<String, String>,
+    pub base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     pub marker_token: String,
     /// `false` is the explicit no-op/metadata form: it writes the durable v3
     /// intent but does not synthesize writer or staging actions.
@@ -270,7 +271,7 @@ pub trait MvRepository: Send + Sync {
         &self,
         mv_id: i64,
         base_snapshots: BTreeMap<String, i64>,
-        base_table_uuids: BTreeMap<String, String>,
+        base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     ) -> Result<StoredMvDefinition, MvRepositoryError>;
     fn update_refresh_metadata(
         &self,
@@ -518,7 +519,7 @@ impl MvRepository for UnavailableMvRepository {
         &self,
         _mv_id: i64,
         _base_snapshots: BTreeMap<String, i64>,
-        _base_table_uuids: BTreeMap<String, String>,
+        _base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
         unavailable!()
     }

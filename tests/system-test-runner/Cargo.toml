@@ -29,3 +29,5 @@ path = "src/main.rs"
 anyhow = "1"
 mysql = "25.0.1"
 novarocks-cluster-harness = { path = "../cluster-harness" }
+novarocks-connector-iceberg = { path = "../../novarocks/connector/iceberg" }
+tokio = { version = "1", features = ["rt-multi-thread"] }

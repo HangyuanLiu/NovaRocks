@@ -236,7 +236,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                     .into_iter()
                     .map(|base| MvPublishedBaseObservation {
                         table_fqn: base.table_fqn,
-                        table_uuid: base.table_uuid,
+                        object_id: base.object_id,
                         from_snapshot: base.from_snapshot,
                         to_snapshot: base.to_snapshot,
                     })
@@ -271,7 +271,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                 .observe_refresh_base(exact_lease, metadata, context.clone())?;
         MvRefreshBaseObservation::try_new(
             metadata.identity.clone(),
-            observed.table_uuid,
+            observed.object_id,
             observed.current_snapshot_id,
             &context,
         )

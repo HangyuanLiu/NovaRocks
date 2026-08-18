@@ -22,6 +22,7 @@ use crate::mv::domain::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision, decide_refresh,
 };
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_spi::connector::ConnectorTableObjectId;
 
 pub(crate) struct RefreshPlanningInput<'a> {
     pub(crate) snapshot_policy: BaseSnapshotPolicy,
@@ -56,7 +57,7 @@ pub enum RefreshStateBaseline {
     Pinless,
     SnapshotBacked {
         previous_snapshot_ids: BTreeMap<String, i64>,
-        previous_table_uuids: BTreeMap<String, String>,
+        previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
         target_snapshot_id: Option<i64>,
         target_table_uuid: String,
         definition_fingerprint: String,
@@ -93,6 +94,12 @@ mod tests {
         BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
     };
     use novarocks_catalog::identifier::TableIdentity;
+    use novarocks_spi::connector::ConnectorTableObjectId;
+
+    fn object_id(value: &str) -> ConnectorTableObjectId {
+        ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(value.as_bytes()))
+            .expect("test object ID")
+    }
 
     const LABEL: &str = "iceberg MV test";
 
@@ -193,9 +200,9 @@ mod tests {
         let affected_partitions = AffectedTargetPartitions::not_derived("join planning");
         let state_baseline = RefreshStateBaseline::SnapshotBacked {
             previous_snapshot_ids: BTreeMap::from([("ice.db.left".to_string(), 9)]),
-            previous_table_uuids: BTreeMap::from([(
+            previous_table_object_ids: BTreeMap::from([(
                 "ice.db.left".to_string(),
-                "uuid-left".to_string(),
+                object_id("object-left"),
             )]),
             target_snapshot_id: Some(30),
             target_table_uuid: "uuid-target".to_string(),

@@ -1662,9 +1662,9 @@ mod tests {
             infer_scalar_return_type(
                 "join_row_key",
                 &[
-                    DataType::Utf8,
+                    DataType::Binary,
                     DataType::Int64,
-                    DataType::Utf8,
+                    DataType::LargeBinary,
                     DataType::Int64,
                 ],
             ),

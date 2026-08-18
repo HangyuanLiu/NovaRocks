@@ -226,7 +226,7 @@ pub(crate) fn managed_publication_activation_intent(
             .iter()
             .map(|base| ConnectorStagedPublicationBaseFact {
                 table: base.table_fqn().into(),
-                uuid: base.table_uuid().into(),
+                object_id: base.table_object_id().clone(),
                 from_version: base.from_snapshot(),
                 to_version: base.to_snapshot(),
             })

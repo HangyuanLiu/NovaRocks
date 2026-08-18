@@ -14,6 +14,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_spi::connector::ConnectorTableObjectId;
 
 use crate::planner::vocabulary::{BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME};
 
@@ -23,24 +24,24 @@ use crate::planner::vocabulary::{BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SqlMvSnapshotPin {
     snapshots: BTreeMap<String, i64>,
-    table_uuids: BTreeMap<String, String>,
+    table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
 }
 
 impl SqlMvSnapshotPin {
     pub fn try_from_maps(
         snapshots: BTreeMap<String, i64>,
-        table_uuids: BTreeMap<String, String>,
+        table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     ) -> Result<Self, String> {
-        if snapshots.is_empty() || snapshots.len() != table_uuids.len() {
+        if snapshots.is_empty() || snapshots.len() != table_object_ids.len() {
             return Err("MV first-refresh snapshot pin has incomplete identity facts".to_string());
         }
         for (fqn, snapshot_id) in &snapshots {
             if fqn.trim().is_empty() || *snapshot_id < 0 {
                 return Err("MV first-refresh snapshot pin has invalid snapshot facts".to_string());
             }
-            if table_uuids
+            if table_object_ids
                 .get(fqn)
-                .is_none_or(|table_uuid| table_uuid.trim().is_empty())
+                .is_none_or(|object_id| object_id.as_bytes().is_empty())
             {
                 return Err(
                     "MV first-refresh snapshot pin is missing a table incarnation".to_string(),
@@ -49,7 +50,7 @@ impl SqlMvSnapshotPin {
         }
         Ok(Self {
             snapshots,
-            table_uuids,
+            table_object_ids,
         })
     }
 
@@ -62,7 +63,15 @@ impl SqlMvSnapshotPin {
                 .collect(),
             entries
                 .iter()
-                .map(|(fqn, _, uuid)| ((*fqn).to_string(), (*uuid).to_string()))
+                .map(|(fqn, _, object_id)| {
+                    (
+                        (*fqn).to_string(),
+                        ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(
+                            object_id.as_bytes(),
+                        ))
+                        .expect("test object ID"),
+                    )
+                })
                 .collect(),
         )
         .expect("test MV snapshot pin must be valid")
@@ -74,8 +83,8 @@ impl SqlMvSnapshotPin {
     }
 
     /// Return the captured table incarnation for a frozen identity.
-    pub fn uuid(&self, table: &TableIdentity) -> Option<&str> {
-        self.table_uuids.get(&table.fqn()).map(String::as_str)
+    pub fn object_id(&self, table: &TableIdentity) -> Option<&ConnectorTableObjectId> {
+        self.table_object_ids.get(&table.fqn())
     }
 
     pub fn len(&self) -> usize {
@@ -90,8 +99,8 @@ impl SqlMvSnapshotPin {
         &self.snapshots
     }
 
-    pub(super) fn table_uuid_map(&self) -> &BTreeMap<String, String> {
-        &self.table_uuids
+    pub(super) fn table_object_id_map(&self) -> &BTreeMap<String, ConnectorTableObjectId> {
+        &self.table_object_ids
     }
 }
 
@@ -564,8 +573,10 @@ mod tests {
         assert!(sql.contains("__nova_base_row_id"), "{sql}");
         assert_eq!(pin.snapshot_map().get("ice.db.fact"), Some(&42));
         assert_eq!(
-            pin.table_uuid_map().get("ice.db.fact"),
-            Some(&"fact-incarnation".to_string())
+            pin.table_object_id_map()
+                .get("ice.db.fact")
+                .map(|object_id| object_id.as_bytes().as_ref()),
+            Some(b"fact-incarnation".as_ref())
         );
     }
 

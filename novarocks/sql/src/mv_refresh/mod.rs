@@ -115,7 +115,7 @@ pub struct MvRefreshFinalizeFacts {
     pub mv_id: i64,
     pub target: SqlMvTarget,
     pub base_snapshots: BTreeMap<String, Option<i64>>,
-    pub base_table_uuids: BTreeMap<String, String>,
+    pub base_table_object_ids: BTreeMap<String, novarocks_spi::connector::ConnectorTableObjectId>,
     pub expected_target_snapshot_id: Option<i64>,
 }
 

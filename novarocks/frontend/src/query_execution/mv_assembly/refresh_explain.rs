@@ -11,7 +11,7 @@ use crate::mv::domain::refresh::definition::{
     load_iceberg_mv_definition_by_target, parse_mv_select_query,
 };
 use crate::mv::domain::refresh::execution_policy::explain_refresh_full_guard;
-use crate::mv::domain::refresh::pin::validate_refresh_pin_table_uuids;
+use crate::mv::domain::refresh::pin::validate_refresh_pin_table_object_ids;
 use crate::mv::domain::refresh::rewrite_context::build_neutral_refresh_rewrite_context;
 use crate::mv::domain::refresh::schema_contract::validate_aggregate_schema_contract_metadata;
 use crate::mv::domain::refresh::target::{
@@ -68,7 +68,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
         &base_refs,
         connector_context,
     )?;
-    validate_refresh_pin_table_uuids(&mv_definition, &pin, &base_refs)?;
+    validate_refresh_pin_table_object_ids(&mv_definition, &pin, &base_refs)?;
     let rewrite = build_neutral_refresh_rewrite_context(
         ports.connector_control(),
         ports.storage_observation(),
@@ -81,7 +81,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
         Arc::from(base_refs.clone()),
         Arc::new(pin.clone()),
         mv_definition.last_refresh_snapshots.clone(),
-        mv_definition.last_refresh_table_uuids.clone(),
+        mv_definition.last_refresh_table_object_ids.clone(),
         target_binding.current_snapshot_id(),
         target_binding.table_uuid().to_string(),
         None,

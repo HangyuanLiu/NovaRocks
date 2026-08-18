@@ -153,13 +153,8 @@ fn schema_sources() -> &'static [SchemaSource] {
     &[
         SchemaSource {
             subject: "mv.definition",
-            id: 1,
-            raw_schema: include_str!("schemas/mv.definition/0001.avsc"),
-        },
-        SchemaSource {
-            subject: "mv.definition",
-            id: 2,
-            raw_schema: include_str!("schemas/mv.definition/0002.avsc"),
+            id: 3,
+            raw_schema: include_str!("schemas/mv.definition/0003.avsc"),
         },
         SchemaSource {
             subject: "mv.target_lookup",
@@ -168,23 +163,8 @@ fn schema_sources() -> &'static [SchemaSource] {
         },
         SchemaSource {
             subject: "mv.refresh",
-            id: 1,
-            raw_schema: include_str!("schemas/mv.refresh/0001.avsc"),
-        },
-        SchemaSource {
-            subject: "mv.refresh",
-            id: 2,
-            raw_schema: include_str!("schemas/mv.refresh/0002.avsc"),
-        },
-        SchemaSource {
-            subject: "mv.refresh",
-            id: 3,
-            raw_schema: include_str!("schemas/mv.refresh/0003.avsc"),
-        },
-        SchemaSource {
-            subject: "mv.refresh",
-            id: 4,
-            raw_schema: include_str!("schemas/mv.refresh/0004.avsc"),
+            id: 5,
+            raw_schema: include_str!("schemas/mv.refresh/0005.avsc"),
         },
         SchemaSource {
             subject: "mv.partition_state",

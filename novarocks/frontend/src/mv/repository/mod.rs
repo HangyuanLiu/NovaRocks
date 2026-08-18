@@ -48,6 +48,7 @@ use crate::mv::domain::repository::{
     RecordExternalCommitAndFinalizeRequest, RecordFrontendMvRecoveryCleanupOutcomeRequest,
     RecordFrontendMvRecoveryObservationRequest,
 };
+use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_spi::state_store::{
     Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore, WriteTransaction,
 };
@@ -1196,7 +1197,7 @@ impl StateStoreMvRepository {
         &self,
         mv_id: i64,
         base_snapshots: BTreeMap<String, i64>,
-        base_table_uuids: BTreeMap<String, String>,
+        base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
         self.require_definition_async(mv_id).await?;
         let operation_id = Uuid::now_v7();
@@ -1211,12 +1212,12 @@ impl StateStoreMvRepository {
             "initialize rebuilt MV refresh watermark",
             move |transaction| {
                 let base_snapshots = base_snapshots.clone();
-                let base_table_uuids = base_table_uuids.clone();
+                let base_table_object_ids = base_table_object_ids.clone();
                 Box::pin(async move {
                     let (record, mut definition) =
                         load_definition_transaction(transaction, mv_id).await?;
                     if !definition.last_refresh_snapshots.is_empty()
-                        || !definition.last_refresh_table_uuids.is_empty()
+                        || !definition.last_refresh_table_object_ids.is_empty()
                     {
                         // A refresh, or a racing rebuild, already established a
                         // watermark. Lake truth is the weaker fact of the two, so
@@ -1224,7 +1225,7 @@ impl StateStoreMvRepository {
                         return Ok(definition);
                     }
                     definition.last_refresh_snapshots = base_snapshots;
-                    definition.last_refresh_table_uuids = base_table_uuids;
+                    definition.last_refresh_table_object_ids = base_table_object_ids;
                     put_definition_transaction(
                         transaction,
                         operation_id,
@@ -1431,7 +1432,7 @@ impl StateStoreMvRepository {
                         staging_snapshot_id: None,
                         published_snapshot_id: None,
                         target_snapshots: request.base_snapshots,
-                        base_table_uuids: BTreeMap::new(),
+                        base_table_object_ids: BTreeMap::new(),
                         rows: None,
                         marker: Some(RefreshCommitMarker {
                             refresh_id,
@@ -1513,7 +1514,7 @@ impl StateStoreMvRepository {
                         staging_snapshot_id: None,
                         published_snapshot_id: None,
                         target_snapshots: request.base_snapshots,
-                        base_table_uuids: request.base_table_uuids,
+                        base_table_object_ids: request.base_table_object_ids,
                         rows: None,
                         marker: Some(RefreshCommitMarker {
                             refresh_id,
@@ -1704,7 +1705,7 @@ impl StateStoreMvRepository {
                     if refresh.state == MvRefreshState::StagingCommitted {
                         if refresh.staging_snapshot_id == Some(request.staging_snapshot_id)
                             && refresh.rows == Some(request.rows)
-                            && refresh.base_table_uuids == request.base_table_uuids
+                            && refresh.base_table_object_ids == request.base_table_object_ids
                         {
                             return Ok(());
                         }
@@ -1716,7 +1717,7 @@ impl StateStoreMvRepository {
                     refresh.state = MvRefreshState::StagingCommitted;
                     refresh.staging_snapshot_id = Some(request.staging_snapshot_id);
                     refresh.rows = Some(request.rows);
-                    refresh.base_table_uuids = request.base_table_uuids;
+                    refresh.base_table_object_ids = request.base_table_object_ids;
                     put_refresh_transaction(
                         transaction,
                         operation_id,
@@ -2419,7 +2420,8 @@ impl StateStoreMvRepository {
                     if !matches!(refresh.state, MvRefreshState::Finalized) {
                         definition.last_refresh_rows = Some(request.finalize.rows);
                         definition.last_refresh_snapshots = request.finalize.base_snapshots;
-                        definition.last_refresh_table_uuids = request.finalize.base_table_uuids;
+                        definition.last_refresh_table_object_ids =
+                            request.finalize.base_table_object_ids;
                         definition.last_refreshed_iceberg_snapshot_id = request.finalize.target_snapshot_id;
                         if let Some(partition_spec) = request.finalize.partition_spec {
                             let schema = definition.schema_contract.as_mut().ok_or_else(|| {
@@ -2578,7 +2580,7 @@ impl StateStoreMvRepository {
                     definition.last_refresh_ms = Some(request.last_refresh_ms);
                     definition.last_refresh_rows = Some(request.last_refresh_rows);
                     definition.last_refresh_snapshots = request.base_snapshots;
-                    definition.last_refresh_table_uuids = request.base_table_uuids;
+                    definition.last_refresh_table_object_ids = request.base_table_object_ids;
                     definition.refresh_in_progress = false;
                     definition.active_refresh_id = None;
                     definition.refresh_target_snapshots.clear();
@@ -2909,12 +2911,12 @@ impl MvRepository for StateStoreMvRepository {
         &self,
         mv_id: i64,
         base_snapshots: BTreeMap<String, i64>,
-        base_table_uuids: BTreeMap<String, String>,
+        base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
         self.blocking(self.initialize_rebuilt_refresh_watermark_async(
             mv_id,
             base_snapshots,
-            base_table_uuids,
+            base_table_object_ids,
         ))
     }
     fn update_refresh_metadata(
@@ -3135,7 +3137,7 @@ fn definition_from_request(mv_id: i64, request: &CreateMvRepositoryRequest) -> S
         last_refresh_ms: None,
         last_refresh_rows: None,
         last_refresh_snapshots: BTreeMap::new(),
-        last_refresh_table_uuids: BTreeMap::new(),
+        last_refresh_table_object_ids: BTreeMap::new(),
         last_refreshed_iceberg_snapshot_id: None,
         refresh_in_progress: false,
         active_refresh_id: None,
@@ -3690,7 +3692,7 @@ async fn finalize_refresh_transaction(
     }
     definition.last_refresh_rows = Some(request.rows);
     definition.last_refresh_snapshots = request.base_snapshots;
-    definition.last_refresh_table_uuids = request.base_table_uuids;
+    definition.last_refresh_table_object_ids = request.base_table_object_ids;
     definition.last_refreshed_iceberg_snapshot_id = request.target_snapshot_id;
     if let Some(partition_spec) = request.partition_spec {
         let schema = definition.schema_contract.as_mut().ok_or_else(|| {
@@ -3762,7 +3764,7 @@ async fn finalize_frontend_refresh_without_external_actions_transaction(
     }
     definition.last_refresh_rows = Some(request.rows);
     definition.last_refresh_snapshots = request.base_snapshots;
-    definition.last_refresh_table_uuids = request.base_table_uuids;
+    definition.last_refresh_table_object_ids = request.base_table_object_ids;
     definition.last_refreshed_iceberg_snapshot_id = request.target_snapshot_id;
     definition.refresh_in_progress = false;
     definition.active_refresh_id = None;
@@ -3807,7 +3809,7 @@ fn new_refresh(
         staging_snapshot_id: None,
         published_snapshot_id: None,
         target_snapshots,
-        base_table_uuids: BTreeMap::new(),
+        base_table_object_ids: BTreeMap::new(),
         rows: None,
         marker: None,
         external_outcome: None,
@@ -3878,10 +3880,10 @@ fn validate_frontend_refresh_request(
     if request
         .base_snapshots
         .keys()
-        .ne(request.base_table_uuids.keys())
+        .ne(request.base_table_object_ids.keys())
     {
         return Err(invalid(
-            "frontend MV refresh base snapshot and table UUID keys must match exactly",
+            "frontend MV refresh base snapshot and table object-ID keys must match exactly",
         ));
     }
     request.ledger.validate().map_err(invalid)

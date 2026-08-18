@@ -28,9 +28,9 @@ use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorControlResolver, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
-    ConnectorTableResolution, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    MvCreatedTargetObservation as SpiCreatedTargetObservation,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTableObjectId, ConnectorTableRequest, ConnectorTableResolution,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MvCreatedTargetObservation as SpiCreatedTargetObservation,
     MvLakePackageObservation as SpiLakePackageObservation,
     MvLakePublicationObservation as SpiLakePublicationObservation,
     MvMaintenanceMetadataObservation as SpiMaintenanceMetadataObservation,
@@ -111,6 +111,7 @@ impl MvTargetCreationObservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MvSchemaValidationObservation {
     table_uuid: String,
+    table_object_id: Option<ConnectorTableObjectId>,
     schema_id: i32,
     format_v3: bool,
     stored_row_lineage_enabled: bool,
@@ -227,6 +228,7 @@ impl MvSchemaValidationObservation {
 
         Ok(Self {
             table_uuid,
+            table_object_id: None,
             schema_id,
             format_v3,
             stored_row_lineage_enabled,
@@ -237,6 +239,18 @@ impl MvSchemaValidationObservation {
 
     pub fn table_uuid(&self) -> &str {
         &self.table_uuid
+    }
+
+    /// The opaque physical identity captured through the same exact metadata
+    /// lease as this observation. It is absent only in direct unit fixtures;
+    /// production observation assembly always supplies it.
+    pub fn table_object_id(&self) -> Option<&ConnectorTableObjectId> {
+        self.table_object_id.as_ref()
+    }
+
+    pub(crate) fn with_table_object_id(mut self, object_id: ConnectorTableObjectId) -> Self {
+        self.table_object_id = Some(object_id);
+        self
     }
 
     pub const fn schema_id(&self) -> i32 {
@@ -478,17 +492,13 @@ impl MvPublishedLakeFacts {
         }
 
         let mut base_fqns = HashSet::with_capacity(self.bases.len());
-        let mut base_uuids = HashSet::with_capacity(self.bases.len());
+        let mut base_object_ids = HashSet::with_capacity(self.bases.len());
         for base in &self.bases {
             require_non_empty(&base.table_fqn, "published MV base table FQN")?;
-            require_non_empty(&base.table_uuid, "published MV base table UUID")?;
             if !base_fqns.insert(base.table_fqn.as_str())
-                || !base_uuids.insert(base.table_uuid.as_str())
+                || !base_object_ids.insert(&base.object_id)
             {
-                return corrupt(format!(
-                    "published MV lake facts have duplicate base identity `{}` ({})",
-                    base.table_fqn, base.table_uuid
-                ));
+                return corrupt("published MV lake facts have duplicate base identity");
             }
             if base.to_snapshot < 0 || base.from_snapshot.is_some_and(|snapshot| snapshot < 0) {
                 return corrupt(format!(
@@ -505,7 +515,7 @@ impl MvPublishedLakeFacts {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MvPublishedBaseFact {
     pub table_fqn: String,
-    pub table_uuid: String,
+    pub object_id: ConnectorTableObjectId,
     pub from_snapshot: Option<i64>,
     pub to_snapshot: i64,
 }
@@ -520,27 +530,26 @@ pub(crate) enum MvPublishedRefreshTechnique {
 
 /// Exact base-table identity pinned for one MV refresh attempt.
 ///
-/// The UUID and current snapshot come from the same sealed metadata value
+/// The object ID and current snapshot come from the same sealed metadata value
 /// loaded through `table`'s retained exact connector generation. Keeping this
 /// observation narrow prevents base pinning from becoming a general-purpose
 /// provider metadata surface.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MvRefreshBaseObservation {
     table: ConnectorTableIdentity,
-    table_uuid: String,
+    object_id: ConnectorTableObjectId,
     current_snapshot_id: Option<i64>,
 }
 
 impl MvRefreshBaseObservation {
     pub fn try_new(
         table: ConnectorTableIdentity,
-        table_uuid: String,
+        object_id: ConnectorTableObjectId,
         current_snapshot_id: Option<i64>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         validate_request_context(context)?;
         validate_table_identity(&table, "MV refresh base")?;
-        require_non_empty(&table_uuid, "MV refresh base table UUID")?;
         if let Some(snapshot_id) = current_snapshot_id
             && snapshot_id < 0
         {
@@ -548,7 +557,7 @@ impl MvRefreshBaseObservation {
         }
         Ok(Self {
             table,
-            table_uuid,
+            object_id,
             current_snapshot_id,
         })
     }
@@ -557,8 +566,8 @@ impl MvRefreshBaseObservation {
         &self.table
     }
 
-    pub fn table_uuid(&self) -> &str {
-        &self.table_uuid
+    pub const fn object_id(&self) -> &ConnectorTableObjectId {
+        &self.object_id
     }
 
     pub const fn current_snapshot_id(&self) -> Option<i64> {
@@ -1019,7 +1028,7 @@ fn lake_package_from_spi(
                     .iter()
                     .map(|base| MvPublishedBaseFact {
                         table_fqn: base.table_fqn.clone(),
-                        table_uuid: base.table_uuid.clone(),
+                        object_id: base.object_id.clone(),
                         from_snapshot: base.from_snapshot,
                         to_snapshot: base.to_snapshot,
                     })
@@ -1040,7 +1049,7 @@ fn refresh_base_from_spi(
 ) -> Result<MvRefreshBaseObservation, ConnectorError> {
     MvRefreshBaseObservation::try_new(
         observation.table().clone(),
-        observation.table_uuid().to_string(),
+        observation.object_id().clone(),
         observation.current_snapshot_id(),
         context,
     )
@@ -1563,9 +1572,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
-        ConnectorTableIdentity, MvCreatedTargetObservation as SpiCreatedTargetObservation,
+        ConnectorTableIdentity, ConnectorTableObjectId,
+        MvCreatedTargetObservation as SpiCreatedTargetObservation,
         MvLakeDescriptorProjection as SpiLakeDescriptorProjection,
         MvLakePackageObservation as SpiLakePackageObservation,
         MvLakePublicationObservation as SpiLakePublicationObservation,
@@ -1592,6 +1603,10 @@ mod tests {
             namespace: Arc::from("db"),
             table: Arc::from("mv_target"),
         }
+    }
+
+    fn object_id(bytes: &'static [u8]) -> ConnectorTableObjectId {
+        ConnectorTableObjectId::try_new(Bytes::from_static(bytes)).expect("bounded object ID")
     }
 
     fn descriptor() -> MvDescriptorV1 {
@@ -1645,7 +1660,7 @@ mod tests {
             MvPublishedRefreshTechnique::Incremental,
             vec![MvPublishedBaseFact {
                 table_fqn: "iceberg.db.base".to_string(),
-                table_uuid: "base-uuid".to_string(),
+                object_id: object_id(b"base-object"),
                 from_snapshot: Some(8),
                 to_snapshot: 9,
             }],
@@ -1772,13 +1787,13 @@ mod tests {
             vec![
                 MvPublishedBaseFact {
                     table_fqn: "iceberg.db.base".to_string(),
-                    table_uuid: "base-uuid".to_string(),
+                    object_id: object_id(b"base-object"),
                     from_snapshot: None,
                     to_snapshot: 9,
                 },
                 MvPublishedBaseFact {
                     table_fqn: "iceberg.db.base_renamed".to_string(),
-                    table_uuid: "base-uuid".to_string(),
+                    object_id: object_id(b"base-object"),
                     from_snapshot: None,
                     to_snapshot: 10,
                 },
@@ -1962,29 +1977,22 @@ mod tests {
     }
 
     #[test]
-    fn refresh_base_observation_requires_neutral_identity_uuid_and_snapshot() {
+    fn refresh_base_observation_requires_neutral_object_identity_and_snapshot() {
         let observed = MvRefreshBaseObservation::try_new(
             table(),
-            "uuid-1".to_string(),
+            object_id(b"base-object"),
             Some(7),
             &context(4096),
         )
         .unwrap();
         assert_eq!(observed.table(), &table());
-        assert_eq!(observed.table_uuid(), "uuid-1");
+        assert_eq!(observed.object_id(), &object_id(b"base-object"));
+        assert!(!format!("{:?}", observed.object_id()).contains("base-object"));
         assert_eq!(observed.current_snapshot_id(), Some(7));
-
-        let empty_uuid =
-            MvRefreshBaseObservation::try_new(table(), String::new(), None, &context(4096))
-                .unwrap_err();
-        assert_eq!(
-            empty_uuid.kind(),
-            novarocks_spi::connector::ConnectorErrorKind::CorruptData
-        );
 
         let negative_snapshot = MvRefreshBaseObservation::try_new(
             table(),
-            "uuid-1".to_string(),
+            object_id(b"base-object"),
             Some(-1),
             &context(4096),
         )

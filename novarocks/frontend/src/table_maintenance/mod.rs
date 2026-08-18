@@ -25,7 +25,7 @@ use crate::common::cleanup_fault::{CleanupFaultKind, claim_configured as claim_c
 use crate::query_execution::maintenance::{
     HistoricalMaintenanceInspection, MaintenanceActionOutcome, MaintenanceActionRequest,
     MaintenanceAttemptCancellationSource, MaintenanceRequestContext, MaintenanceStatementResult,
-    OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
+    MaintenanceTargetRebind, OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
 };
 use novarocks::connector::cleanup_maintenance::CleanupBatchExecution;
 use novarocks::connector::distributed_rewrite_application::DistributedRewriteIntent;
@@ -456,6 +456,7 @@ impl FrontendTableMaintenanceService {
             .ok_or_else(|| CLEANUP_STATE_STORE_REQUIRED.to_string())?;
         let (admission, attempt) = self.admit_and_acquire(&target)?;
         let (authority, validator) = self.attempt_authority(&attempt)?;
+        let object_id = engine.capture_target_object_id(&target)?;
         let operation_id = ConnectorCleanupOperationId::new();
         let durable_id = uuid::Uuid::from_bytes(operation_id.to_bytes());
         let cancellation = self.attempt_cancellation(&attempt);
@@ -474,6 +475,7 @@ impl FrontendTableMaintenanceService {
             CleanupOperationCreate {
                 operation_id: durable_id,
                 target: target.clone(),
+                object_id: object_id.clone(),
                 owner,
                 request_digest: plan.request_digest(),
                 older_than_ms,
@@ -482,6 +484,51 @@ impl FrontendTableMaintenanceService {
             admission,
         ))
         .map_err(|error| format!("persist orphan cleanup pending operation failed: {error}"))?;
+        match engine.rebind_target_object(&target, &object_id) {
+            Ok(MaintenanceTargetRebind::Bound) => {}
+            Ok(MaintenanceTargetRebind::Replaced) => {
+                self.block_on(repository.mark_target_replaced_fenced(
+                    durable_id,
+                    now_unix_millis(),
+                    authority,
+                    validator,
+                ))
+                .map_err(|error| format!("mark orphan cleanup target replaced failed: {error}"))?;
+                return Err(
+                    "orphan cleanup target was replaced before provider dispatch".to_string(),
+                );
+            }
+            Ok(MaintenanceTargetRebind::Missing) => {
+                self.block_on(repository.fail_before_dispatch_fenced(
+                    durable_id,
+                    "orphan cleanup target is missing before provider dispatch".to_string(),
+                    now_unix_millis(),
+                    authority,
+                    validator,
+                ))
+                .map_err(|error| {
+                    format!("persist missing orphan cleanup target failure failed: {error}")
+                })?;
+                return Err("orphan cleanup target is missing before provider dispatch".to_string());
+            }
+            Err(error) => {
+                self.block_on(repository.fail_before_dispatch_fenced(
+                    durable_id,
+                    format!(
+                        "orphan cleanup target rebind failed before provider dispatch: {error}"
+                    ),
+                    now_unix_millis(),
+                    authority,
+                    validator,
+                ))
+                .map_err(|store| {
+                    format!("persist orphan cleanup rebind failure failed: {store}")
+                })?;
+                return Err(format!(
+                    "orphan cleanup target rebind failed before provider dispatch: {error}"
+                ));
+            }
+        }
         let candidate_count = u32::try_from(plan.summary().candidate_count())
             .map_err(|_| "orphan cleanup candidate count exceeds durable limit".to_string())?;
         let batch_count = u16::try_from(plan.summary().batch_count())
@@ -665,6 +712,7 @@ impl FrontendTableMaintenanceService {
         let (authority, validator) = self.attempt_authority(&attempt)?;
         let operation_id = ConnectorWriteOperationId::new();
         let durable_id = uuid::Uuid::from_bytes(operation_id.to_bytes());
+        let object_id = engine.capture_target_object_id(&target)?;
         let request_payload = distributed_rewrite_request_payload(intent);
         let cancellation = self.attempt_cancellation(&attempt);
         let session = engine.plan_distributed_rewrite_with_attempt_context(
@@ -677,6 +725,7 @@ impl FrontendTableMaintenanceService {
         let create = DistributedRewriteOperationCreate {
             operation_id: durable_id,
             target: target.clone(),
+            object_id: object_id.clone(),
             owner: MetadataMaintenanceExactOwner {
                 instance_id: plan.owner().instance_id.as_str().to_string(),
                 incarnation_id: uuid::Uuid::from_bytes(plan.owner().incarnation.to_bytes()),
@@ -704,6 +753,55 @@ impl FrontendTableMaintenanceService {
         created.map_err(|error| {
             format!("persist distributed rewrite pending operation failed: {error}")
         })?;
+        match engine.rebind_target_object(&target, &object_id) {
+            Ok(MaintenanceTargetRebind::Bound) => {}
+            Ok(MaintenanceTargetRebind::Replaced) => {
+                self.block_on(repository.mark_target_replaced_fenced(
+                    durable_id,
+                    now_unix_millis(),
+                    authority,
+                    validator,
+                ))
+                .map_err(|error| {
+                    format!("mark distributed rewrite target replaced failed: {error}")
+                })?;
+                return Err(
+                    "distributed rewrite target was replaced before provider dispatch".to_string(),
+                );
+            }
+            Ok(MaintenanceTargetRebind::Missing) => {
+                self.block_on(repository.fail_fenced(
+                    durable_id,
+                    "distributed rewrite target is missing before provider dispatch".to_string(),
+                    now_unix_millis(),
+                    authority,
+                    validator,
+                ))
+                .map_err(|error| {
+                    format!("persist missing distributed rewrite target failure failed: {error}")
+                })?;
+                return Err(
+                    "distributed rewrite target is missing before provider dispatch".to_string(),
+                );
+            }
+            Err(error) => {
+                self.block_on(repository.fail_fenced(
+                    durable_id,
+                    format!(
+                        "distributed rewrite target rebind failed before provider dispatch: {error}"
+                    ),
+                    now_unix_millis(),
+                    authority,
+                    validator,
+                ))
+                .map_err(|store| {
+                    format!("persist distributed rewrite rebind failure failed: {store}")
+                })?;
+                return Err(format!(
+                    "distributed rewrite target rebind failed before provider dispatch: {error}"
+                ));
+            }
+        }
         let plan_payload = plan.provider_payload().to_vec();
         self.block_on(
             repository.plan_fenced(
@@ -1026,6 +1124,7 @@ impl FrontendTableMaintenanceService {
         let (admission, attempt) = self.admit_and_acquire(&target)?;
         let operation_id = ConnectorMutationOperationId::new();
         let durable_id = uuid::Uuid::from_bytes(operation_id.to_bytes());
+        let object_id = engine.capture_target_object_id(&target)?;
         let cancellation = self.attempt_cancellation(&attempt);
         let session = engine.plan_metadata_maintenance_with_attempt_context(
             &target,
@@ -1040,6 +1139,7 @@ impl FrontendTableMaintenanceService {
             MetadataMaintenanceOperationCreate {
                 operation_id: durable_id,
                 target: target.clone(),
+                object_id: object_id.clone(),
                 owner: MetadataMaintenanceExactOwner {
                     instance_id: plan.owner().instance_id.as_str().to_string(),
                     incarnation_id: uuid::Uuid::from_bytes(plan.owner().incarnation.to_bytes()),
@@ -1056,8 +1156,53 @@ impl FrontendTableMaintenanceService {
         .map_err(|error| {
             format!("persist metadata maintenance pending operation failed: {error}")
         })?;
-        let plan_payload = plan.provider_payload().to_vec();
         let (authority, validator) = self.attempt_authority(&attempt)?;
+        match engine.rebind_target_object(&target, &object_id) {
+            Ok(MaintenanceTargetRebind::Bound) => {}
+            Ok(MaintenanceTargetRebind::Replaced) => {
+                self.block_on(repository.mark_target_replaced_fenced(
+                    durable_id,
+                    now_unix_millis(),
+                    authority,
+                    validator,
+                ))
+                .map_err(|error| {
+                    format!("mark metadata maintenance target replaced failed: {error}")
+                })?;
+                return Err(
+                    "metadata maintenance target was replaced before provider dispatch".to_string(),
+                );
+            }
+            Ok(MaintenanceTargetRebind::Missing) => {
+                self.block_on(repository.fail_fenced(
+                    durable_id,
+                    "metadata maintenance target is missing before provider dispatch".to_string(),
+                    now_unix_millis(),
+                    authority,
+                    validator,
+                ))
+                .map_err(|error| {
+                    format!("persist missing metadata maintenance target failure failed: {error}")
+                })?;
+                return Err(
+                    "metadata maintenance target is missing before provider dispatch".to_string(),
+                );
+            }
+            Err(error) => {
+                self.block_on(repository.fail_fenced(
+                    durable_id,
+                    format!("metadata maintenance target rebind failed before provider dispatch: {error}"),
+                    now_unix_millis(),
+                    authority,
+                    validator,
+                ))
+                .map_err(|store| format!("persist metadata maintenance rebind failure failed: {store}"))?;
+                return Err(format!(
+                    "metadata maintenance target rebind failed before provider dispatch: {error}"
+                ));
+            }
+        }
+        let plan_payload = plan.provider_payload().to_vec();
         self.block_on(repository.start_fenced(
             durable_id,
             MetadataMaintenancePlanPayload {
@@ -1164,9 +1309,11 @@ impl FrontendTableMaintenanceService {
             .repository
             .as_ref()
             .ok_or_else(|| OPTIMIZE_STATE_STORE_REQUIRED.to_string())?;
+        let object_id = engine.capture_target_object_id(&target)?;
         let base_snapshot_id = engine.current_snapshot_id(&target)?;
         let request = OptimizeJobCreate {
             target: target.clone(),
+            object_id,
             base_snapshot_id,
             created_at_ms: now_unix_millis(),
         };
@@ -1195,11 +1342,13 @@ impl FrontendTableMaintenanceService {
             .repository
             .as_ref()
             .ok_or_else(|| AUTOMATIC_OPTIMIZE_STATE_STORE_REQUIRED.to_string())?;
+        let object_id = engine.capture_target_object_id(&target)?;
         let base_snapshot_id = engine.current_snapshot_id(&target)?;
         let admission = self.admit_intent()?;
         match self.block_on(repository.create_admitted(
             OptimizeJobCreate {
                 target,
+                object_id,
                 base_snapshot_id,
                 created_at_ms: now_unix_millis(),
             },
@@ -2059,11 +2208,13 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .distributed_rewrite_repository
             .as_ref()
             .ok_or_else(|| DISTRIBUTED_REWRITE_STATE_STORE_REQUIRED.to_string())?;
+        let object_id = engine.capture_target_object_id(&target)?;
         let base_snapshot_id = engine.current_snapshot_id(&target)?;
         let (admission, attempt) = self.admit_and_acquire(&target)?;
         let job = match self.block_on(repository.create_admitted(
             OptimizeJobCreate {
                 target: target.clone(),
+                object_id: object_id.clone(),
                 base_snapshot_id,
                 created_at_ms: now_unix_millis(),
             },
@@ -2095,6 +2246,55 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                     job.job_id
                 )
             })?;
+        match engine.rebind_target_object(&target, &object_id) {
+            Ok(MaintenanceTargetRebind::Bound) => {}
+            Ok(MaintenanceTargetRebind::Replaced) => {
+                self.block_on(repository.mark_target_replaced_fenced(
+                    claimed.job_id,
+                    now_unix_millis(),
+                    authority,
+                    validator,
+                ))
+                .map_err(|error| {
+                    format!("mark automatic optimize target replaced failed: {error}")
+                })?;
+                return Err(
+                    "automatic optimize target was replaced before provider dispatch".to_string(),
+                );
+            }
+            Ok(MaintenanceTargetRebind::Missing) => {
+                self.block_on(repository.fail_fenced(
+                    claimed.job_id,
+                    now_unix_millis(),
+                    "automatic optimize target is missing before provider dispatch".to_string(),
+                    authority,
+                    validator,
+                ))
+                .map_err(|error| {
+                    format!("persist missing automatic optimize target failure failed: {error}")
+                })?;
+                return Err(
+                    "automatic optimize target is missing before provider dispatch".to_string(),
+                );
+            }
+            Err(error) => {
+                self.block_on(repository.fail_fenced(
+                    claimed.job_id,
+                    now_unix_millis(),
+                    format!(
+                        "automatic optimize target rebind failed before provider dispatch: {error}"
+                    ),
+                    authority,
+                    validator,
+                ))
+                .map_err(|store| {
+                    format!("persist automatic optimize rebind failure failed: {store}")
+                })?;
+                return Err(format!(
+                    "automatic optimize target rebind failed before provider dispatch: {error}"
+                ));
+            }
+        }
         let outcome = Self::execute_optimize_distributed_rewrite(
             &self.runtime,
             Arc::clone(distributed_rewrite_repository),

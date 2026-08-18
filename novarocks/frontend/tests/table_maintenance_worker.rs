@@ -26,7 +26,7 @@ use bytes::Bytes;
 use novarocks::maintenance::MaintenanceTarget;
 use novarocks_frontend::query_execution::maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
-    OptimizeJobState, TableMaintenanceEngine, TableMaintenanceService,
+    MaintenanceTargetRebind, OptimizeJobState, TableMaintenanceEngine, TableMaintenanceService,
 };
 use novarocks_frontend::table_maintenance::FrontendTableMaintenanceService;
 use novarocks_frontend::table_maintenance::coordination::{
@@ -36,6 +36,7 @@ use novarocks_frontend::table_maintenance::coordination::{
 use novarocks_frontend::table_maintenance::model::{OptimizeJob, OptimizeJobCreate};
 use novarocks_frontend::table_maintenance::repository::OptimizeJobRepository;
 use novarocks_frontend::table_maintenance::worker::{OptimizeJobExecutor, OptimizeWorker};
+use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_spi::state_store::{
     CommitOutcome, FeDeploymentView, Key, Precondition, StateStore, TransactionId, Value,
 };
@@ -98,6 +99,16 @@ struct FakeMaintenanceEngine {
     results: Mutex<VecDeque<Result<MaintenanceActionOutcome, String>>>,
     gate: Option<Arc<ExecutionGate>>,
     dropped: Option<Arc<AtomicBool>>,
+    target_rebind: FakeTargetRebind,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum FakeTargetRebind {
+    #[default]
+    Bound,
+    Replaced,
+    Missing,
+    Unsupported,
 }
 
 impl FakeMaintenanceEngine {
@@ -111,6 +122,7 @@ impl FakeMaintenanceEngine {
             results: Mutex::new(results.into()),
             gate: None,
             dropped: None,
+            target_rebind: FakeTargetRebind::Bound,
         }
     }
 
@@ -120,6 +132,7 @@ impl FakeMaintenanceEngine {
             results: Mutex::new(VecDeque::new()),
             gate: Some(gate),
             dropped: None,
+            target_rebind: FakeTargetRebind::Bound,
         }
     }
 
@@ -129,11 +142,17 @@ impl FakeMaintenanceEngine {
             results: Mutex::new(VecDeque::new()),
             gate: None,
             dropped: Some(dropped),
+            target_rebind: FakeTargetRebind::Bound,
         }
     }
 
     fn requests(&self) -> Vec<MaintenanceActionRequest> {
         self.requests.lock().unwrap().clone()
+    }
+
+    fn with_target_rebind(mut self, rebind: FakeTargetRebind) -> Self {
+        self.target_rebind = rebind;
+        self
     }
 }
 
@@ -167,6 +186,29 @@ impl TableMaintenanceEngine for FakeMaintenanceEngine {
                 "unsupported table name with {} parts",
                 name_parts.len()
             )),
+        }
+    }
+
+    fn capture_target_object_id(
+        &self,
+        _target: &MaintenanceTarget,
+    ) -> Result<ConnectorTableObjectId, String> {
+        ConnectorTableObjectId::try_new(Bytes::from_static(b"fake-worker-target"))
+            .map_err(|error| error.to_string())
+    }
+
+    fn rebind_target_object(
+        &self,
+        _target: &MaintenanceTarget,
+        _expected_object_id: &ConnectorTableObjectId,
+    ) -> Result<MaintenanceTargetRebind, String> {
+        match self.target_rebind {
+            FakeTargetRebind::Bound => Ok(MaintenanceTargetRebind::Bound),
+            FakeTargetRebind::Replaced => Ok(MaintenanceTargetRebind::Replaced),
+            FakeTargetRebind::Missing => Ok(MaintenanceTargetRebind::Missing),
+            FakeTargetRebind::Unsupported => {
+                Err("fake provider does not support target rebinding".to_string())
+            }
         }
     }
 
@@ -225,6 +267,41 @@ fn target(catalog: &str, namespace: &str, table: &str) -> MaintenanceTarget {
         namespace: namespace.to_string(),
         table: table.to_string(),
     }
+}
+
+#[test]
+fn worker_fake_can_model_all_target_rebind_outcomes() {
+    let target = target("ice", "db", "orders");
+    let engine = FakeMaintenanceEngine::succeeding();
+    let object_id = engine
+        .capture_target_object_id(&target)
+        .expect("capture test object id");
+    assert_eq!(
+        engine
+            .rebind_target_object(&target, &object_id)
+            .expect("bound result"),
+        MaintenanceTargetRebind::Bound
+    );
+
+    for (behavior, expected) in [
+        (
+            FakeTargetRebind::Replaced,
+            MaintenanceTargetRebind::Replaced,
+        ),
+        (FakeTargetRebind::Missing, MaintenanceTargetRebind::Missing),
+    ] {
+        let engine = FakeMaintenanceEngine::succeeding().with_target_rebind(behavior);
+        assert_eq!(
+            engine
+                .rebind_target_object(&target, &object_id)
+                .expect("typed rebind result"),
+            expected
+        );
+    }
+
+    let engine =
+        FakeMaintenanceEngine::succeeding().with_target_rebind(FakeTargetRebind::Unsupported);
+    assert!(engine.rebind_target_object(&target, &object_id).is_err());
 }
 
 fn sqlite_config(path: &Path) -> StateStoreConfig {
@@ -367,6 +444,10 @@ async fn create_job_for(
         .create_admitted(
             OptimizeJobCreate {
                 target: target("ice", "db", table),
+                object_id: ConnectorTableObjectId::try_new(Bytes::from_static(
+                    b"fake-worker-target",
+                ))
+                .expect("valid worker test object ID"),
                 base_snapshot_id,
                 created_at_ms,
             },
@@ -427,6 +508,30 @@ async fn wait_for_terminal_jobs(
     })
     .await
     .expect("worker did not terminalize expected jobs")
+}
+
+async fn wait_for_job_state(
+    repository: &OptimizeJobRepository,
+    job_id: i64,
+    expected: OptimizeJobState,
+) -> OptimizeJob {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let job = repository
+                .list()
+                .await
+                .expect("list optimize jobs")
+                .into_iter()
+                .find(|job| job.job_id == job_id)
+                .expect("created job must remain durable");
+            if job.state == expected {
+                return job;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker did not reach expected terminal state")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -554,6 +659,43 @@ async fn execution_failure_fails_the_job_preserves_message_and_keeps_worker_runn
     worker
         .shutdown()
         .expect("persisted job failure is not a worker failure");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pre_dispatch_rebind_never_executes_replaced_missing_or_unsupported_targets() {
+    for (rebind, expected_state, expected_error) in [
+        (
+            FakeTargetRebind::Replaced,
+            OptimizeJobState::TargetReplaced,
+            None,
+        ),
+        (
+            FakeTargetRebind::Missing,
+            OptimizeJobState::Failed,
+            Some("optimize target is missing before provider dispatch"),
+        ),
+        (
+            FakeTargetRebind::Unsupported,
+            OptimizeJobState::Failed,
+            Some(
+                "optimize target rebind failed before provider dispatch: fake provider does not support target rebinding",
+            ),
+        ),
+    ] {
+        let (_temp, store, repository, _service) = fixture().await;
+        let job = create_job(&store, &repository, "rebind", 51, 100).await;
+        let engine = Arc::new(FakeMaintenanceEngine::succeeding().with_target_rebind(rebind));
+        let mut worker = start_test_worker(&store, Arc::clone(&repository), &engine).await;
+
+        let terminal = wait_for_job_state(&repository, job.job_id, expected_state).await;
+        assert_eq!(terminal.error_message.as_deref(), expected_error);
+        assert!(
+            engine.requests().is_empty(),
+            "rebind outcome {rebind:?} dispatched work"
+        );
+        assert!(repository.list_pending().await.unwrap().is_empty());
+        worker.shutdown().expect("shutdown maintenance worker");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

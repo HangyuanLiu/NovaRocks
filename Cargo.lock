@@ -3457,6 +3457,8 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "serde",
+ "serde_json",
  "sha2",
  "tokio",
  "uuid",
@@ -3515,6 +3517,8 @@ dependencies = [
  "anyhow",
  "mysql",
  "novarocks-cluster-harness",
+ "novarocks-connector-iceberg",
+ "tokio",
 ]
 
 [[package]]

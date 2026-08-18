@@ -29,8 +29,10 @@ use crate::mv::domain::storage_observation::{
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
-    ConnectorControlResolver, ConnectorRequestContext, ConnectorTableResolution,
+    ConnectorControlResolver, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
+    ConnectorTableObjectCaptureRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
 };
+use std::sync::Arc;
 
 /// Loads the current schema facts used to validate a persisted MV contract.
 pub(crate) fn observe_schema_validation_for_table(
@@ -48,7 +50,7 @@ pub(crate) fn observe_schema_validation_for_table(
         &table.table,
         ConnectorTableResolution::StrictBaseTable,
     )?;
-    crate::mv::domain::storage_observation::observe_schema_validation(
+    let observation = crate::mv::domain::storage_observation::observe_schema_validation(
         storage_observation,
         &exact_lease,
         &metadata,
@@ -59,7 +61,29 @@ pub(crate) fn observe_schema_validation_for_table(
             "observe MV schema validation facts for {}: {error}",
             table.fqn()
         )
-    })
+    })?;
+    let instance_id = ConnectorInstanceId::parse(&table.catalog)
+        .map_err(|error| format!("parse connector instance for {}: {error}", table.fqn()))?;
+    let captured = exact_lease
+        .binding()
+        .metadata()
+        .capture_table_object_binding(ConnectorTableObjectCaptureRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(table.namespace.as_str()),
+                table: Arc::from(table.table.as_str()),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context: connector_context.clone(),
+        })
+        .map_err(|error| {
+            format!(
+                "capture MV table object binding for {}: {error}",
+                table.fqn()
+            )
+        })?;
+    Ok(observation.with_table_object_id(captured.object_id))
 }
 
 /// Loads the current base-table refresh facts without admitting query assembly

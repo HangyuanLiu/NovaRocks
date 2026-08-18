@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 
 use novarocks::maintenance::MaintenanceTarget;
 use novarocks_frontend::query_execution::maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, OptimizeJobState,
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTargetRebind, OptimizeJobState,
 };
 
 #[test]
@@ -43,7 +43,20 @@ fn typed_action_variants_cannot_mix_unrelated_options() {
         }
     ));
     assert_eq!(OptimizeJobState::Pending.as_str(), "PENDING");
+    assert_eq!(OptimizeJobState::TargetReplaced.as_str(), "TARGET_REPLACED");
     let _: BTreeMap<String, String> = BTreeMap::new();
+}
+
+#[test]
+fn target_rebind_keeps_same_name_replacement_distinct_from_missing() {
+    assert_ne!(
+        MaintenanceTargetRebind::Bound,
+        MaintenanceTargetRebind::Replaced
+    );
+    assert_ne!(
+        MaintenanceTargetRebind::Replaced,
+        MaintenanceTargetRebind::Missing
+    );
 }
 
 #[test]

@@ -44,22 +44,19 @@ use crate::durable::{DurableOpaqueBytes, DurableRecordError, DurableRecordStore,
 
 use super::coordination::MaintenanceFenceValidator;
 use super::model::{
-    CLEANUP_MAX_BATCHES, CLEANUP_MAX_PAYLOAD_BYTES, CLEANUP_OPERATION_LEGACY_SCHEMA_VERSION,
-    CLEANUP_OPERATION_SCHEMA_VERSION, CleanupBatchCheckpoint, CleanupOperation,
-    CleanupOperationCreate, CleanupOperationState, CleanupPlanPayload,
-    DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES, DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES,
-    DISTRIBUTED_REWRITE_OPERATION_LEGACY_SCHEMA_VERSION,
-    DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION, DistributedRewriteAttemptCheckpoint,
-    DistributedRewriteAttemptDisposition, DistributedRewriteOpaquePayload,
-    DistributedRewriteOperation, DistributedRewriteOperationCreate,
-    DistributedRewriteOperationState, DistributedRewritePlanPayload,
-    METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES, METADATA_MAINTENANCE_OPERATION_LEGACY_SCHEMA_VERSION,
+    CLEANUP_MAX_BATCHES, CLEANUP_MAX_PAYLOAD_BYTES, CLEANUP_OPERATION_SCHEMA_VERSION,
+    CleanupBatchCheckpoint, CleanupOperation, CleanupOperationCreate, CleanupOperationState,
+    CleanupPlanPayload, DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES,
+    DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES, DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
+    DistributedRewriteAttemptCheckpoint, DistributedRewriteAttemptDisposition,
+    DistributedRewriteOpaquePayload, DistributedRewriteOperation,
+    DistributedRewriteOperationCreate, DistributedRewriteOperationState,
+    DistributedRewritePlanPayload, METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES,
     METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION, MaintenanceAuthorityV1,
     MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload, MetadataMaintenanceOperation,
     MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationState,
-    MetadataMaintenancePlanPayload, OPTIMIZE_JOB_LEGACY_SCHEMA_VERSION,
-    OPTIMIZE_JOB_SCHEMA_VERSION, OptimizeJob, OptimizeJobCreate, OptimizeJobOutcome,
-    StoredCleanupBatchV4, StoredCleanupOperationV4, StoredCleanupPlanV4,
+    MetadataMaintenancePlanPayload, OPTIMIZE_JOB_SCHEMA_VERSION, OptimizeJob, OptimizeJobCreate,
+    OptimizeJobOutcome, StoredCleanupBatchV4, StoredCleanupOperationV4, StoredCleanupPlanV4,
     StoredCleanupTransactionActionV4, StoredCleanupTransactionV4,
     StoredDistributedRewriteAttemptV3, StoredDistributedRewriteOperationV3,
     StoredDistributedRewritePayloadKindV3, StoredDistributedRewritePayloadV3,
@@ -105,33 +102,19 @@ const CLEANUP_TRANSACTION_PREFIX: &str =
     "novarocks/frontend/table-maintenance/v4/cleanup/transactions/";
 
 fn is_optimize_schema_version(version: u8) -> bool {
-    matches!(
-        version,
-        OPTIMIZE_JOB_LEGACY_SCHEMA_VERSION | OPTIMIZE_JOB_SCHEMA_VERSION
-    )
+    version == OPTIMIZE_JOB_SCHEMA_VERSION
 }
 
 fn is_metadata_schema_version(version: u8) -> bool {
-    matches!(
-        version,
-        METADATA_MAINTENANCE_OPERATION_LEGACY_SCHEMA_VERSION
-            | METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION
-    )
+    version == METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION
 }
 
 fn is_rewrite_schema_version(version: u8) -> bool {
-    matches!(
-        version,
-        DISTRIBUTED_REWRITE_OPERATION_LEGACY_SCHEMA_VERSION
-            | DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION
-    )
+    version == DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION
 }
 
 fn is_cleanup_schema_version(version: u8) -> bool {
-    matches!(
-        version,
-        CLEANUP_OPERATION_LEGACY_SCHEMA_VERSION | CLEANUP_OPERATION_SCHEMA_VERSION
-    )
+    version == CLEANUP_OPERATION_SCHEMA_VERSION
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -671,6 +654,54 @@ impl OptimizeJobRepository {
         .await
     }
 
+    /// Terminalize a pending job when the target object no longer binds before
+    /// any provider work has been authorized. Pending is the only durable
+    /// state that proves no distributed-rewrite child or outcome exists.
+    pub async fn mark_target_replaced_fenced(
+        &self,
+        job_id: i64,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<()> {
+        validate_job_id(job_id, "mark optimize job target replaced")?;
+        validate_authority(&authority)?;
+        let operation_id = OperationId::new_v7();
+        let durable = self.durable.clone();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            operation_id,
+            "mark frontend optimize job target replaced",
+            |transaction| {
+                let authority = authority.clone();
+                let validator = Arc::clone(&validator);
+                let durable = durable.clone();
+                Box::pin(async move {
+                    apply_target_replaced(
+                        transaction,
+                        &durable,
+                        operation_id,
+                        job_id,
+                        now_ms,
+                        &authority,
+                        &validator,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_unit_mutation(
+            result,
+            operation_id,
+            StoredOptimizeOperationActionV1::TargetReplaced,
+            job_id,
+            "mark optimize job target replaced",
+        )
+        .await
+    }
+
     pub async fn record_outcome_fenced(
         &self,
         job_id: i64,
@@ -1178,6 +1209,11 @@ async fn apply_create(
             "maintenance write admission lost: {error}"
         ))));
     }
+    let stored_target =
+        match StoredMaintenanceTargetV1::try_new(&request.target, request.object_id.clone()) {
+            Ok(target) => target,
+            Err(error) => return Ok(Err(RepositoryError::corruption(error))),
+        };
     let active_key = match active_target_key(&request.target) {
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
@@ -1202,7 +1238,7 @@ async fn apply_create(
             }
             Err(error) => return Ok(Err(error)),
         };
-        if active_job.target != StoredMaintenanceTargetV1::from(&request.target)
+        if active_job.target != stored_target
             || !matches!(
                 active_job.state,
                 StoredOptimizeJobStateV1::Pending | StoredOptimizeJobStateV1::Running
@@ -1291,7 +1327,7 @@ async fn apply_create(
     let stored = StoredOptimizeJobV1 {
         schema_version: OPTIMIZE_JOB_SCHEMA_VERSION,
         job_id,
-        target: StoredMaintenanceTargetV1::from(&request.target),
+        target: stored_target,
         base_snapshot_id: request.base_snapshot_id,
         state: StoredOptimizeJobStateV1::Pending,
         outcome: None,
@@ -1634,6 +1670,129 @@ async fn apply_release_undispatched(
             operation_value,
             Precondition::Absent,
         )
+        .await?;
+    Ok(Ok(()))
+}
+
+async fn apply_target_replaced(
+    transaction: &mut dyn WriteTransaction,
+    durable: &DurableRecordStore,
+    operation_id: OperationId,
+    job_id: i64,
+    now_ms: i64,
+    authority: &MaintenanceAuthorityV1,
+    validator: &MaintenanceFenceValidator,
+) -> TransactionResult<()> {
+    let Some(mut job) = (match load_job_from_transaction(transaction, job_id).await? {
+        Ok(job) => job,
+        Err(error) => return Ok(Err(error)),
+    }) else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            format!("mark optimize job target replaced {job_id} failed: job not found"),
+        )));
+    };
+    if job.stored.state == StoredOptimizeJobStateV1::TargetReplaced {
+        if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+            return Ok(Err(error));
+        }
+        return Ok(Ok(()));
+    }
+    if !matches!(
+        job.stored.state,
+        StoredOptimizeJobStateV1::Pending | StoredOptimizeJobStateV1::Running
+    ) || job.stored.outcome.is_some()
+        || job.stored.dispatched_child.is_some()
+    {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "optimize job target replacement requires an undispatched pending or claimed job",
+        )));
+    }
+    let state_prefix = match job.stored.state {
+        StoredOptimizeJobStateV1::Pending => {
+            if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+                return Ok(Err(error));
+            }
+            PENDING_PREFIX
+        }
+        StoredOptimizeJobStateV1::Running => {
+            if let Err(error) = validate_bound_fenced_authority(
+                transaction,
+                job.stored.authority.as_ref(),
+                authority,
+                validator,
+            )
+            .await
+            {
+                return Ok(Err(error));
+            }
+            RUNNING_PREFIX
+        }
+        _ => unreachable!("non-terminal optimize target replacement state is checked above"),
+    };
+    if let Err(error) = require_index(
+        transaction,
+        state_prefix,
+        job_id,
+        "mark optimize job target replaced",
+    )
+    .await?
+    {
+        return Ok(Err(error));
+    }
+    if let Err(error) = require_active_index(
+        transaction,
+        &job.stored,
+        "mark optimize job target replaced",
+    )
+    .await?
+    {
+        return Ok(Err(error));
+    }
+    job.stored.state = StoredOptimizeJobStateV1::TargetReplaced;
+    job.stored.authority = None;
+    job.stored.finished_at_ms = Some(now_ms);
+    job.stored.last_operation_id = *operation_id.as_uuid();
+    let job_key = match job_key(job_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let state_key = match state_key(state_prefix, job_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let active_key = match active_target_key(&job.stored.target.clone().into()) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let (marker_key, marker_value) = match operation_record(
+        durable,
+        operation_id,
+        StoredOptimizeOperationActionV1::TargetReplaced,
+        &job.stored,
+    ) {
+        Ok(record) => record,
+        Err(error) => return Ok(Err(error)),
+    };
+    let value = match encode_job(durable, &job.stored) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    durable
+        .put_record(
+            transaction,
+            job_key,
+            value,
+            Precondition::Version(job.version),
+        )
+        .await?;
+    transaction.delete(state_key, Precondition::Present).await?;
+    transaction
+        .delete(active_key, Precondition::Present)
+        .await?;
+    durable
+        .put_record(transaction, marker_key, marker_value, Precondition::Absent)
         .await?;
     Ok(Ok(()))
 }
@@ -2004,6 +2163,19 @@ fn validate_stored_job(stored: &StoredOptimizeJobV1) -> RepositoryResult<()> {
                 )));
             }
         }
+        StoredOptimizeJobStateV1::TargetReplaced => {
+            if stored.finished_at_ms.is_none()
+                || stored.outcome.is_some()
+                || stored.error_message.is_some()
+                || stored.authority.is_some()
+                || stored.dispatched_child.is_some()
+            {
+                return Err(RepositoryError::corruption(format!(
+                    "target-replaced optimize job {} has invalid lifecycle fields",
+                    stored.job_id
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -2069,6 +2241,7 @@ fn validate_operation_successor(
         }
         StoredOptimizeOperationActionV1::Finish => StoredOptimizeJobStateV1::Finished,
         StoredOptimizeOperationActionV1::Fail => StoredOptimizeJobStateV1::Failed,
+        StoredOptimizeOperationActionV1::TargetReplaced => StoredOptimizeJobStateV1::TargetReplaced,
     };
     if post.state != expected_post_state
         || (marker.action == StoredOptimizeOperationActionV1::Claim && post.outcome.is_some())
@@ -2098,6 +2271,7 @@ fn validate_operation_successor(
             StoredOptimizeJobStateV1::Running
             | StoredOptimizeJobStateV1::Finished
             | StoredOptimizeJobStateV1::Failed => true,
+            StoredOptimizeJobStateV1::TargetReplaced => false,
         },
         StoredOptimizeOperationActionV1::Claim => {
             current.started_at_ms == post.started_at_ms
@@ -2106,7 +2280,8 @@ fn validate_operation_successor(
                         current == post || current.outcome.is_some()
                     }
                     StoredOptimizeJobStateV1::Finished | StoredOptimizeJobStateV1::Failed => true,
-                    StoredOptimizeJobStateV1::Pending => false,
+                    StoredOptimizeJobStateV1::Pending
+                    | StoredOptimizeJobStateV1::TargetReplaced => false,
                 }
         }
         StoredOptimizeOperationActionV1::RecordOutcome => {
@@ -2122,6 +2297,7 @@ fn validate_operation_successor(
         StoredOptimizeOperationActionV1::Finish | StoredOptimizeOperationActionV1::Fail => {
             current == post
         }
+        StoredOptimizeOperationActionV1::TargetReplaced => current == post,
     };
     if !legal {
         return Err(RepositoryError::corruption(format!(
@@ -2749,6 +2925,28 @@ impl MetadataMaintenanceOperationRepository {
         .await
     }
 
+    /// Release the durable fence when the submission-bound target has changed
+    /// before this operation reached any provider-dispatch state.
+    pub async fn mark_target_replaced_fenced(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_authority(&authority)?;
+        self.transition_terminal_fenced(
+            operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::TargetReplaced,
+            None,
+            None,
+            now_ms,
+            authority,
+            validator,
+        )
+        .await
+    }
+
     /// An unresolved operation retains its table fence.  A later incarnation
     /// must not silently turn it into a current-generation operation.
     /// Unfenced base transition. Production owners must use the `_fenced`
@@ -3358,12 +3556,17 @@ async fn apply_metadata_create(
             "maintenance write admission lost: {error}"
         ))));
     }
+    let stored_target =
+        match StoredMaintenanceTargetV1::try_new(&request.target, request.object_id.clone()) {
+            Ok(target) => target,
+            Err(error) => return Ok(Err(RepositoryError::corruption(error))),
+        };
     let existing = match load_metadata_operation(transaction, request.operation_id).await? {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
     if let Some(existing) = existing {
-        if existing.stored.target == StoredMaintenanceTargetV1::from(&request.target)
+        if existing.stored.target == stored_target
             && existing.stored.owner == request.owner
             && existing.stored.kind == request.kind
             && existing.stored.request_digest == request.request_digest
@@ -3441,7 +3644,7 @@ async fn apply_metadata_create(
     let stored = StoredMetadataMaintenanceOperationV2 {
         schema_version: METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION,
         operation_id: request.operation_id,
-        target: StoredMaintenanceTargetV1::from(&request.target),
+        target: stored_target,
         owner: request.owner,
         kind: request.kind,
         request_digest: request.request_digest,
@@ -3807,17 +4010,6 @@ async fn apply_metadata_terminal(
             ),
         )));
     };
-    if let Some((authority, validator)) = fenced
-        && let Err(error) = validate_bound_fenced_authority(
-            transaction,
-            operation.stored.authority.as_ref(),
-            authority,
-            validator,
-        )
-        .await
-    {
-        return Ok(Err(error));
-    }
     let target_state = match action {
         StoredMetadataMaintenanceTransactionActionV2::Finish => {
             MetadataMaintenanceOperationState::Finished
@@ -3825,21 +4017,48 @@ async fn apply_metadata_terminal(
         StoredMetadataMaintenanceTransactionActionV2::Fail => {
             MetadataMaintenanceOperationState::Failed
         }
+        StoredMetadataMaintenanceTransactionActionV2::TargetReplaced => {
+            MetadataMaintenanceOperationState::TargetReplaced
+        }
         _ => {
             return Ok(Err(RepositoryError::corruption(
                 "metadata terminal transition has invalid action",
             )));
         }
     };
+    if let Some((authority, validator)) = fenced {
+        let validation = if target_state == MetadataMaintenanceOperationState::TargetReplaced
+            || (target_state == MetadataMaintenanceOperationState::Failed
+                && operation.stored.state == MetadataMaintenanceOperationState::Pending)
+        {
+            validate_fenced_authority(transaction, authority, validator).await
+        } else {
+            validate_bound_fenced_authority(
+                transaction,
+                operation.stored.authority.as_ref(),
+                authority,
+                validator,
+            )
+            .await
+        };
+        if let Err(error) = validation {
+            return Ok(Err(error));
+        }
+    }
     if operation.stored.state == target_state {
         return Ok(Ok(MetadataMaintenanceOperation::from(&operation.stored)));
     }
-    if !matches!(
-        operation.stored.state,
-        MetadataMaintenanceOperationState::Pending
-            | MetadataMaintenanceOperationState::Running
-            | MetadataMaintenanceOperationState::ReconcilePending
-    ) {
+    let allowed = if target_state == MetadataMaintenanceOperationState::TargetReplaced {
+        operation.stored.state == MetadataMaintenanceOperationState::Pending
+    } else {
+        matches!(
+            operation.stored.state,
+            MetadataMaintenanceOperationState::Pending
+                | MetadataMaintenanceOperationState::Running
+                | MetadataMaintenanceOperationState::ReconcilePending
+        )
+    };
+    if !allowed {
         return Ok(Err(RepositoryError::new(
             RepositoryErrorKind::InvalidTransition,
             format!(
@@ -3867,6 +4086,9 @@ async fn apply_metadata_terminal(
     operation.stored.state = target_state;
     operation.stored.error_message = message;
     operation.stored.finished_at_ms = Some(now_ms);
+    if target_state == MetadataMaintenanceOperationState::TargetReplaced {
+        operation.stored.authority = None;
+    }
     let extra = match receipt {
         Some(receipt) => {
             let key = match metadata_payload_key(
@@ -3995,9 +4217,13 @@ async fn metadata_transition_state(
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
     };
-    let next_state_key = match metadata_state_key(next, operation_id) {
-        Ok(key) => key,
-        Err(error) => return Ok(Err(error)),
+    let next_state_key = if next == MetadataMaintenanceOperationState::TargetReplaced {
+        None
+    } else {
+        match metadata_state_key(next, operation_id) {
+            Ok(key) => Some(key),
+            Err(error) => return Ok(Err(error)),
+        }
     };
     let operation_value = match encode_metadata_operation(durable, &operation.stored) {
         Ok(value) => value,
@@ -4027,9 +4253,11 @@ async fn metadata_transition_state(
     transaction
         .delete(old_state_key, Precondition::Present)
         .await?;
-    transaction
-        .put(next_state_key, index_value, Precondition::Absent)
-        .await?;
+    if let Some(next_state_key) = next_state_key {
+        transaction
+            .put(next_state_key, index_value, Precondition::Absent)
+            .await?;
+    }
     if let Some((key, value)) = payload {
         durable
             .put_record(transaction, key, value, Precondition::Absent)
@@ -4301,6 +4529,18 @@ fn validate_metadata_operation(
             {
                 return Err(RepositoryError::corruption(
                     "unresolved metadata maintenance operation has invalid lifecycle fields",
+                ));
+            }
+        }
+        MetadataMaintenanceOperationState::TargetReplaced => {
+            if stored.plan_digest.is_some()
+                || stored.started_at_ms.is_some()
+                || stored.finished_at_ms.is_none()
+                || stored.error_message.is_some()
+                || stored.authority.is_some()
+            {
+                return Err(RepositoryError::corruption(
+                    "target-replaced metadata maintenance operation has invalid lifecycle fields",
                 ));
             }
         }
@@ -4761,6 +5001,30 @@ impl DistributedRewriteOperationRepository {
             None,
             now_ms,
             Some((authority, validator)),
+        )
+        .await
+    }
+
+    /// Terminalize a rewrite before a plan or staging record can authorize
+    /// provider work. Any later state is conservatively recoverable rather
+    /// than replaceable.
+    pub async fn mark_target_replaced_fenced(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        self.rewrite_transition_fenced(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::TargetReplaced,
+            &[DistributedRewriteOperationState::Pending],
+            DistributedRewriteOperationState::TargetReplaced,
+            None,
+            None,
+            now_ms,
+            authority,
+            validator,
         )
         .await
     }
@@ -5605,12 +5869,17 @@ async fn apply_rewrite_create(
             "maintenance write admission lost: {error}"
         ))));
     }
+    let stored_target =
+        match StoredMaintenanceTargetV1::try_new(&request.target, request.object_id.clone()) {
+            Ok(target) => target,
+            Err(error) => return Ok(Err(RepositoryError::corruption(error))),
+        };
     let existing = match load_rewrite_operation(transaction, request.operation_id).await? {
         Ok(value) => value,
         Err(error) => return Ok(Err(error)),
     };
     if let Some(existing) = existing {
-        if existing.stored.target == StoredMaintenanceTargetV1::from(&request.target)
+        if existing.stored.target == stored_target
             && existing.stored.owner == request.owner
             && existing.stored.kind == request.kind
             && existing.stored.request_digest == request.request_digest
@@ -5658,7 +5927,7 @@ async fn apply_rewrite_create(
         };
         let active_job_version = active_job.version.clone();
         let mut active_job = active_job.stored;
-        if active_job.target != StoredMaintenanceTargetV1::from(&request.target)
+        if active_job.target != stored_target
             || active_job.state != StoredOptimizeJobStateV1::Running
         {
             return Ok(Err(RepositoryError::corruption(format!(
@@ -5724,7 +5993,7 @@ async fn apply_rewrite_create(
     let stored = StoredDistributedRewriteOperationV3 {
         schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
         operation_id: request.operation_id,
-        target: StoredMaintenanceTargetV1::from(&request.target),
+        target: stored_target,
         owner: request.owner,
         kind: request.kind,
         request_digest: request.request_digest,
@@ -5824,7 +6093,11 @@ async fn apply_rewrite_transition(
         )));
     };
     if let Some((authority, validator)) = fenced {
-        if let Some(durable) = operation.stored.authority.as_ref() {
+        if next == DistributedRewriteOperationState::TargetReplaced {
+            if let Err(error) = validate_fenced_authority(transaction, authority, validator).await {
+                return Ok(Err(error));
+            }
+        } else if let Some(durable) = operation.stored.authority.as_ref() {
             if let Err(error) =
                 validate_bound_fenced_authority(transaction, Some(durable), authority, validator)
                     .await
@@ -5875,7 +6148,9 @@ async fn apply_rewrite_transition(
     {
         return Ok(Err(error));
     }
-    if let Some((authority, _)) = fenced {
+    if next == DistributedRewriteOperationState::TargetReplaced {
+        operation.stored.authority = None;
+    } else if let Some((authority, _)) = fenced {
         operation.stored.authority = Some(authority.clone());
     }
     let mut extra = None;
@@ -5927,7 +6202,9 @@ async fn apply_rewrite_transition(
         }
         None => {}
     }
-    if next == DistributedRewriteOperationState::Finished {
+    if next == DistributedRewriteOperationState::Finished
+        || next == DistributedRewriteOperationState::TargetReplaced
+    {
         operation.stored.finished_at_ms = Some(now_ms);
     }
     if (next == DistributedRewriteOperationState::AbortPending
@@ -5970,7 +6247,11 @@ async fn rewrite_transition_state(
     let operation_id = operation.stored.operation_id;
     let operation_key = rewrite_operation_key(operation_id)?;
     let old_state_key = rewrite_state_key(prior, operation_id)?;
-    let next_state_key = rewrite_state_key(next, operation_id)?;
+    let next_state_key = if next == DistributedRewriteOperationState::TargetReplaced {
+        None
+    } else {
+        Some(rewrite_state_key(next, operation_id)?)
+    };
     let (marker_key, marker_value) =
         rewrite_transaction_record(durable, transaction_operation_id, action, &operation.stored)?;
     durable
@@ -5985,13 +6266,15 @@ async fn rewrite_transition_state(
         transaction
             .delete(old_state_key, Precondition::Present)
             .await?;
-        transaction
-            .put(
-                next_state_key,
-                encode_uuid_index_value(durable, operation_id)?,
-                Precondition::Absent,
-            )
-            .await?;
+        if let Some(next_state_key) = next_state_key {
+            transaction
+                .put(
+                    next_state_key,
+                    encode_uuid_index_value(durable, operation_id)?,
+                    Precondition::Absent,
+                )
+                .await?;
+        }
     }
     if let Some((key, value)) = payload {
         durable
@@ -6368,6 +6651,18 @@ fn validate_rewrite_operation(
                 ));
             }
         }
+        DistributedRewriteOperationState::TargetReplaced => {
+            if planned
+                || stored.started_at_ms.is_some()
+                || stored.finished_at_ms.is_none()
+                || stored.error_message.is_some()
+                || stored.authority.is_some()
+            {
+                return Err(RepositoryError::corruption(
+                    "target-replaced distributed rewrite operation has invalid lifecycle fields",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -6734,6 +7029,28 @@ impl CleanupOperationRepository {
                     .await
                 })
             },
+        )
+        .await
+    }
+
+    /// Terminalize the cleanup record before a durable plan or prepared batch
+    /// can authorize a destructive provider call.
+    pub async fn mark_target_replaced_fenced(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+        authority: MaintenanceAuthorityV1,
+        validator: MaintenanceFenceValidator,
+    ) -> RepositoryResult<CleanupOperation> {
+        self.cleanup_transition_fenced(
+            operation_id,
+            StoredCleanupTransactionActionV4::TargetReplaced,
+            &[CleanupOperationState::Pending],
+            CleanupOperationState::TargetReplaced,
+            None,
+            now_ms,
+            authority,
+            validator,
         )
         .await
     }
@@ -7531,8 +7848,13 @@ async fn apply_cleanup_create(
             "maintenance write admission lost: {error}"
         ))));
     }
+    let stored_target =
+        match StoredMaintenanceTargetV1::try_new(&request.target, request.object_id.clone()) {
+            Ok(target) => target,
+            Err(error) => return Ok(Err(RepositoryError::corruption(error))),
+        };
     if let Some(existing) = load_cleanup_operation(transaction, request.operation_id).await?? {
-        if existing.stored.target == StoredMaintenanceTargetV1::from(&request.target)
+        if existing.stored.target == stored_target
             && existing.stored.owner == request.owner
             && existing.stored.request_digest == request.request_digest
             && existing.stored.older_than_ms == request.older_than_ms
@@ -7565,7 +7887,7 @@ async fn apply_cleanup_create(
     let stored = StoredCleanupOperationV4 {
         schema_version: CLEANUP_OPERATION_SCHEMA_VERSION,
         operation_id: request.operation_id,
-        target: StoredMaintenanceTargetV1::from(&request.target),
+        target: stored_target,
         owner: request.owner,
         request_digest: request.request_digest,
         older_than_ms: request.older_than_ms,
@@ -7998,16 +8320,24 @@ async fn apply_cleanup_transition(
             "cleanup operation not found",
         )));
     };
-    if let Some((authority, validator)) = fenced
-        && let Err(error) = validate_bound_fenced_authority(
-            transaction,
-            operation.stored.authority.as_ref(),
-            authority,
-            validator,
-        )
-        .await
-    {
-        return Ok(Err(error));
+    if let Some((authority, validator)) = fenced {
+        let validation = if next == CleanupOperationState::TargetReplaced
+            || (next == CleanupOperationState::Failed
+                && operation.stored.state == CleanupOperationState::Pending)
+        {
+            validate_fenced_authority(transaction, authority, validator).await
+        } else {
+            validate_bound_fenced_authority(
+                transaction,
+                operation.stored.authority.as_ref(),
+                authority,
+                validator,
+            )
+            .await
+        };
+        if let Err(error) = validation {
+            return Ok(Err(error));
+        }
     }
     if operation.stored.state == next {
         return Ok(Ok(CleanupOperation::from(&operation.stored)));
@@ -8041,6 +8371,9 @@ async fn apply_cleanup_transition(
     .await??;
     operation.stored.state = next;
     operation.stored.error_message = error;
+    if next == CleanupOperationState::TargetReplaced {
+        operation.stored.authority = None;
+    }
     if next.is_terminal() || next == CleanupOperationState::Unresolved {
         operation.stored.finished_at_ms = Some(now_ms);
     }
@@ -8085,13 +8418,15 @@ async fn cleanup_write_transition(
                 Precondition::Present,
             )
             .await?;
-        transaction
-            .put(
-                cleanup_state_key(next, operation_id)?,
-                encode_uuid_index_value(durable, operation_id)?,
-                Precondition::Absent,
-            )
-            .await?;
+        if next != CleanupOperationState::TargetReplaced {
+            transaction
+                .put(
+                    cleanup_state_key(next, operation_id)?,
+                    encode_uuid_index_value(durable, operation_id)?,
+                    Precondition::Absent,
+                )
+                .await?;
+        }
     }
     if let Some((key, value, precondition)) = extra {
         durable
@@ -8310,6 +8645,19 @@ fn validate_cleanup_operation(stored: &StoredCleanupOperationV4) -> RepositoryRe
             if !planned || stored.finished_at_ms.is_none() || stored.error_message.is_none() {
                 return Err(RepositoryError::corruption(
                     "unresolved cleanup operation has invalid lifecycle fields",
+                ));
+            }
+        }
+        CleanupOperationState::TargetReplaced => {
+            if planned
+                || stored.started_at_ms.is_some()
+                || stored.finished_at_ms.is_none()
+                || stored.error_message.is_some()
+                || stored.authority.is_some()
+                || stored.next_batch_ordinal != 0
+            {
+                return Err(RepositoryError::corruption(
+                    "target-replaced cleanup operation has invalid lifecycle fields",
                 ));
             }
         }

@@ -44,8 +44,11 @@ use novarocks::connector::metadata_maintenance::{
 use novarocks::maintenance::MaintenanceTarget;
 use novarocks_spi::connector::{
     BatchReceipt, CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupPlan,
-    ConnectorDistributedRewriteAttemptCheckpoint, ConnectorDistributedRewriteReceipt,
-    ConnectorMetadataMaintenancePlan, ConnectorMutationOperationId, ConnectorWriteAbortOutcome,
+    ConnectorControlResolver, ConnectorDistributedRewriteAttemptCheckpoint,
+    ConnectorDistributedRewriteReceipt, ConnectorError, ConnectorMetadataMaintenancePlan,
+    ConnectorMutationOperationId, ConnectorTableObjectBindingFailure,
+    ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
+    ConnectorTableObjectSelector, ConnectorTableResolution, ConnectorWriteAbortOutcome,
     ConnectorWriteCohortId, ConnectorWriteInputShape, ConnectorWriteReceipt,
     ExternalMutationEvidence, ExternalMutationOutcome, PreparedBatch,
 };
@@ -358,6 +361,19 @@ pub enum OptimizeJobState {
     Running,
     Finished,
     Failed,
+    TargetReplaced,
+}
+
+/// Result of rebinding a durable maintenance target to its current table.
+///
+/// `Bound` is the only result that permits an attempt to continue. A missing
+/// target and a same-name replacement are distinct terminal outcomes; provider
+/// capability and transport errors remain errors and must not be reclassified.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaintenanceTargetRebind {
+    Bound,
+    Replaced,
+    Missing,
 }
 
 impl OptimizeJobState {
@@ -367,6 +383,7 @@ impl OptimizeJobState {
             Self::Running => "RUNNING",
             Self::Finished => "FINISHED",
             Self::Failed => "FAILED",
+            Self::TargetReplaced => "TARGET_REPLACED",
         }
     }
 }
@@ -387,6 +404,23 @@ pub trait TableMaintenanceEngine: Send + Sync {
         name_parts: &[String],
         context: MaintenanceRequestContext<'_>,
     ) -> Result<MaintenanceTarget, String>;
+
+    /// Capture the provider-owned physical identity together with submission
+    /// target resolution. Durable callers persist this value with the logical
+    /// target and must rebind it before every future maintenance attempt.
+    fn capture_target_object_id(
+        &self,
+        target: &MaintenanceTarget,
+    ) -> Result<ConnectorTableObjectId, String>;
+
+    /// Rebind the logical target only when it remains the captured physical
+    /// object. This intentionally has no default: silently skipping the
+    /// binding check would allow maintenance work on a replacement table.
+    fn rebind_target_object(
+        &self,
+        target: &MaintenanceTarget,
+        expected_object_id: &ConnectorTableObjectId,
+    ) -> Result<MaintenanceTargetRebind, String>;
 
     fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String>;
 
@@ -717,6 +751,105 @@ impl RequestScopedMaintenanceEngine {
             table: target.table.clone().into(),
         })
     }
+
+    fn capture_target_object_id_with_context(
+        &self,
+        target: &MaintenanceTarget,
+    ) -> Result<ConnectorTableObjectId, String> {
+        capture_target_object_id_with_ports(
+            self.kernel.connector_control().as_ref(),
+            target,
+            self.connector_context.clone(),
+        )
+    }
+
+    fn rebind_target_object_with_context(
+        &self,
+        target: &MaintenanceTarget,
+        expected_object_id: &ConnectorTableObjectId,
+    ) -> Result<MaintenanceTargetRebind, String> {
+        rebind_target_object_with_ports(
+            self.kernel.connector_control().as_ref(),
+            target,
+            expected_object_id,
+            self.connector_context.clone(),
+        )
+    }
+}
+
+fn capture_target_object_id_with_ports(
+    controls: &dyn ConnectorControlResolver,
+    target: &MaintenanceTarget,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<ConnectorTableObjectId, String> {
+    let identity = RequestScopedMaintenanceEngine::target_identity(target)?;
+    let lease = controls
+        .acquire_current(&identity.instance_id)
+        .map_err(|error| {
+            format!("acquire current connector generation for target capture: {error}")
+        })?;
+    let binding = lease
+        .binding()
+        .metadata()
+        .capture_table_object_binding(ConnectorTableObjectCaptureRequest {
+            table: identity,
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context,
+        })
+        .map(|binding| binding.object_id);
+    captured_target_object_id_from_connector_result(binding)
+}
+
+fn rebind_target_object_with_ports(
+    controls: &dyn ConnectorControlResolver,
+    target: &MaintenanceTarget,
+    expected_object_id: &ConnectorTableObjectId,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<MaintenanceTargetRebind, String> {
+    let identity = RequestScopedMaintenanceEngine::target_identity(target)?;
+    let lease = controls
+        .acquire_current(&identity.instance_id)
+        .map_err(|error| {
+            format!("acquire current connector generation for target rebind: {error}")
+        })?;
+    let binding =
+        lease
+            .binding()
+            .metadata()
+            .rebind_table_object_binding(ConnectorTableObjectRebindRequest {
+                table: identity,
+                expected_object_id: expected_object_id.clone(),
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                selector: ConnectorTableObjectSelector::Current,
+                context,
+            });
+    maintenance_target_rebind_from_connector_result(binding.map(|_| ()))
+}
+
+fn captured_target_object_id_from_connector_result(
+    object_id: Result<ConnectorTableObjectId, ConnectorError>,
+) -> Result<ConnectorTableObjectId, String> {
+    object_id.map_err(|error| format!("capture maintenance target object identity: {error}"))
+}
+
+fn maintenance_target_rebind_from_connector_result(
+    binding: Result<(), ConnectorError>,
+) -> Result<MaintenanceTargetRebind, String> {
+    match binding {
+        Ok(_) => Ok(MaintenanceTargetRebind::Bound),
+        Err(error) => match error.table_object_binding_failure() {
+            Some(ConnectorTableObjectBindingFailure::Replaced) => {
+                Ok(MaintenanceTargetRebind::Replaced)
+            }
+            Some(ConnectorTableObjectBindingFailure::Missing) => {
+                Ok(MaintenanceTargetRebind::Missing)
+            }
+            None => Err(format!(
+                "rebind maintenance target object identity: {error}"
+            )),
+        },
+    }
 }
 
 /// One freshly-admitted automatic-maintenance attempt.
@@ -824,6 +957,21 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             namespace: target.namespace,
             table: target.table,
         })
+    }
+
+    fn capture_target_object_id(
+        &self,
+        target: &MaintenanceTarget,
+    ) -> Result<ConnectorTableObjectId, String> {
+        self.capture_target_object_id_with_context(target)
+    }
+
+    fn rebind_target_object(
+        &self,
+        target: &MaintenanceTarget,
+        expected_object_id: &ConnectorTableObjectId,
+    ) -> Result<MaintenanceTargetRebind, String> {
+        self.rebind_target_object_with_context(target, expected_object_id)
     }
 
     fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
@@ -1244,6 +1392,22 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
         self.request_engine()?.resolve_target(name_parts, context)
     }
 
+    fn capture_target_object_id(
+        &self,
+        target: &MaintenanceTarget,
+    ) -> Result<ConnectorTableObjectId, String> {
+        self.request_engine()?.capture_target_object_id(target)
+    }
+
+    fn rebind_target_object(
+        &self,
+        target: &MaintenanceTarget,
+        expected_object_id: &ConnectorTableObjectId,
+    ) -> Result<MaintenanceTargetRebind, String> {
+        self.request_engine()?
+            .rebind_target_object(target, expected_object_id)
+    }
+
     fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
         self.request_engine()?.reject_user_action_on_mv(target)
     }
@@ -1653,10 +1817,20 @@ fn consume_word(parser: &mut Parser<'_>, expected: &str) -> bool {
 
 #[cfg(test)]
 mod maintenance_attempt_context_tests {
+    use bytes::Bytes;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    use super::{MaintenanceAttemptCancellationSource, MaintenanceAttemptContext};
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure,
+        ConnectorTableObjectId,
+    };
+
+    use super::{
+        MaintenanceAttemptCancellationSource, MaintenanceAttemptContext, MaintenanceTargetRebind,
+        OptimizeJobState, captured_target_object_id_from_connector_result,
+        maintenance_target_rebind_from_connector_result,
+    };
 
     #[test]
     fn source_context_and_connector_request_share_one_cancellation_flag() {
@@ -1723,5 +1897,68 @@ mod maintenance_attempt_context_tests {
             .expect("combined connector context");
         assert!(source.cancel());
         assert!(combined.cancellation().is_cancelled());
+    }
+
+    #[test]
+    fn capture_preserves_the_provider_owned_object_id() {
+        let object_id = ConnectorTableObjectId::try_new(Bytes::from_static(b"captured-object"))
+            .expect("valid object id");
+
+        let captured = captured_target_object_id_from_connector_result(Ok(object_id.clone()))
+            .expect("capture succeeds");
+
+        assert_eq!(captured, object_id);
+    }
+
+    #[test]
+    fn rebind_accepts_the_same_physical_object() {
+        assert_eq!(
+            maintenance_target_rebind_from_connector_result(Ok(())).expect("bound"),
+            MaintenanceTargetRebind::Bound
+        );
+    }
+
+    #[test]
+    fn rebind_classifies_replacement_without_reading_the_error_message() {
+        let error = ConnectorError::table_object_binding(
+            ConnectorTableObjectBindingFailure::Replaced,
+            "unrelated provider wording",
+        );
+
+        assert_eq!(
+            maintenance_target_rebind_from_connector_result(Err(error)).expect("replacement"),
+            MaintenanceTargetRebind::Replaced
+        );
+    }
+
+    #[test]
+    fn rebind_classifies_missing_without_reading_the_error_message() {
+        let error = ConnectorError::table_object_binding(
+            ConnectorTableObjectBindingFailure::Missing,
+            "unrelated provider wording",
+        );
+
+        assert_eq!(
+            maintenance_target_rebind_from_connector_result(Err(error)).expect("missing"),
+            MaintenanceTargetRebind::Missing
+        );
+    }
+
+    #[test]
+    fn rebind_keeps_provider_unsupported_as_an_error() {
+        let error = ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "provider does not implement target rebinding",
+        );
+
+        let error = maintenance_target_rebind_from_connector_result(Err(error))
+            .expect_err("unsupported is not replacement");
+
+        assert!(error.contains("Unsupported"));
+    }
+
+    #[test]
+    fn optimize_target_replacement_has_a_stable_show_value() {
+        assert_eq!(OptimizeJobState::TargetReplaced.as_str(), "TARGET_REPLACED");
     }
 }

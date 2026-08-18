@@ -32,8 +32,8 @@ use sha2::{Digest, Sha256};
 use super::{
     ConnectorCommittedPartitioning, ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorMutationOperationId,
-    ConnectorRequestContext, ConnectorTableIdentity, ExternalMutationEvidence,
-    ExternalMutationOutcome,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableObjectId,
+    ExternalMutationEvidence, ExternalMutationOutcome,
 };
 
 pub const MAX_CONNECTOR_STAGED_PUBLICATION_PROOF_BYTES: usize = 64 * 1024;
@@ -69,7 +69,12 @@ pub struct ConnectorHistoricalPublicationAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorStagedPublicationBaseFact {
     pub table: Arc<str>,
-    pub uuid: Arc<str>,
+    /// Provider-owned physical identity for the base table.
+    ///
+    /// This is deliberately opaque to publication lifecycle callers. The
+    /// provider that owns its lake provenance is the only layer allowed to
+    /// render these bytes in a provider-private on-lake representation.
+    pub object_id: ConnectorTableObjectId,
     pub from_version: Option<i64>,
     pub to_version: i64,
 }
@@ -139,7 +144,7 @@ impl ConnectorStagedPublicationDescriptor {
             }
         }
         for base in &bases {
-            if base.table.is_empty() || base.uuid.is_empty() || base.to_version <= 0 {
+            if base.table.is_empty() || base.to_version <= 0 {
                 return Err(invalid(
                     "staged publication descriptor has an invalid base fact",
                 ));
@@ -533,7 +538,10 @@ fn descriptor_digest(
     }
     for base in bases {
         h.update(base.table.as_bytes());
-        h.update(base.uuid.as_bytes());
+        // ConnectorTableObjectId already bounds this opaque byte sequence.
+        // Keep the exact byte contribution stable; its provider-private
+        // rendering must never participate in this neutral digest.
+        h.update(base.object_id.as_bytes());
         h.update(base.from_version.unwrap_or_default().to_be_bytes());
         h.update(base.to_version.to_be_bytes());
     }
@@ -563,7 +571,7 @@ fn observation_digest(
     h.update(rows.unwrap_or_default().to_be_bytes());
     for base in bases {
         h.update(base.table.as_bytes());
-        h.update(base.uuid.as_bytes());
+        h.update(base.object_id.as_bytes());
         h.update(base.from_version.unwrap_or_default().to_be_bytes());
         h.update(base.to_version.to_be_bytes());
     }
@@ -590,6 +598,16 @@ mod tests {
         ConnectorCommittedPartitionField, ConnectorInstanceId, ConnectorInstanceIncarnation,
         ConnectorManagedPartitionTransform,
     };
+
+    fn base_fact(object_id: &'static [u8]) -> ConnectorStagedPublicationBaseFact {
+        ConnectorStagedPublicationBaseFact {
+            table: Arc::from("ice.db.base"),
+            object_id: ConnectorTableObjectId::try_new(Bytes::from_static(object_id))
+                .expect("bounded base object ID"),
+            from_version: Some(9),
+            to_version: 10,
+        }
+    }
 
     #[test]
     fn proof_rejects_empty_or_oversized_payloads_and_redacts_debug() {
@@ -721,12 +739,55 @@ mod tests {
                     evidence_digest: None,
                 },
             ],
-            vec![],
+            vec![base_fact(b"base-object")],
         )
         .unwrap();
         descriptor.validate().unwrap();
+        assert!(
+            !format!("{:?}", descriptor.bases[0].object_id).contains("base-object"),
+            "publication metadata must not expose a provider-owned identity through Debug"
+        );
+
+        let mut corrupted_object_id = descriptor.clone();
+        corrupted_object_id.bases[0].object_id =
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"replacement-object"))
+                .expect("bounded replacement object ID");
+        assert!(corrupted_object_id.validate().is_err());
+
         let mut corrupted = descriptor;
         corrupted.marker_token = Arc::from("other");
         assert!(corrupted.validate().is_err());
+    }
+
+    #[test]
+    fn observation_digest_distinguishes_opaque_base_identity_bytes() {
+        let observation = ConnectorStagedPublicationObservation::try_new(
+            ConnectorStagedPublicationDisposition::KnownUncommitted,
+            None,
+            None,
+            vec![base_fact(b"base-object")],
+            None,
+            None,
+            None,
+            false,
+            ConnectorStagedPublicationProof::try_new(Bytes::from_static(b"proof"))
+                .expect("bounded proof"),
+        )
+        .expect("valid observation");
+        let replacement = ConnectorStagedPublicationObservation::try_new(
+            ConnectorStagedPublicationDisposition::KnownUncommitted,
+            None,
+            None,
+            vec![base_fact(b"replacement-object")],
+            None,
+            None,
+            None,
+            false,
+            ConnectorStagedPublicationProof::try_new(Bytes::from_static(b"proof"))
+                .expect("bounded proof"),
+        )
+        .expect("valid replacement observation");
+
+        assert_ne!(observation.digest(), replacement.digest());
     }
 }

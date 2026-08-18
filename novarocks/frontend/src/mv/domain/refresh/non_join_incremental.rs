@@ -20,14 +20,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::{
     ConnectorChangeWindowAdmission, ConnectorChangeWindowFullRebuildReason,
-    ConnectorChangeWindowReplaceFailure,
+    ConnectorChangeWindowReplaceFailure, ConnectorTableObjectId,
 };
 
 pub struct NonJoinBaseChange<'a> {
     pub base_ref: &'a TableIdentity,
     pub previous_snapshot_id: i64,
     pub current_snapshot_id: i64,
-    pub current_table_uuid: &'a str,
+    pub current_table_object_id: &'a ConnectorTableObjectId,
     pub admission: ConnectorChangeWindowAdmission,
 }
 
@@ -47,14 +47,14 @@ pub enum NonJoinIncrementalChangePlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NonJoinLineage {
     pub snapshots: BTreeMap<String, i64>,
-    pub table_uuids: BTreeMap<String, String>,
+    pub table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
 }
 
 #[derive(Clone)]
 struct PlannedFact {
     base_fqn: String,
     current_snapshot_id: i64,
-    current_table_uuid: String,
+    current_table_object_id: ConnectorTableObjectId,
     admission: ConnectorChangeWindowAdmission,
 }
 
@@ -80,7 +80,7 @@ pub fn plan_non_join_incremental_changes(
         .map(|change| PlannedFact {
             base_fqn: change.base_ref.fqn(),
             current_snapshot_id: change.current_snapshot_id,
-            current_table_uuid: change.current_table_uuid.to_string(),
+            current_table_object_id: change.current_table_object_id.clone(),
             admission: change.admission.clone(),
         })
         .collect();
@@ -95,7 +95,7 @@ fn reduce_non_join_incremental_facts(
     }
 
     let mut snapshots = BTreeMap::new();
-    let mut table_uuids = BTreeMap::new();
+    let mut table_object_ids = BTreeMap::new();
     for fact in &facts {
         if snapshots
             .insert(fact.base_fqn.clone(), fact.current_snapshot_id)
@@ -106,11 +106,11 @@ fn reduce_non_join_incremental_facts(
                 fact.base_fqn
             ));
         }
-        table_uuids.insert(fact.base_fqn.clone(), fact.current_table_uuid.clone());
+        table_object_ids.insert(fact.base_fqn.clone(), fact.current_table_object_id.clone());
     }
     let lineage = NonJoinLineage {
         snapshots,
-        table_uuids,
+        table_object_ids,
     };
 
     let mut has_insert_changes = false;
@@ -197,7 +197,10 @@ mod tests {
         PlannedFact {
             base_fqn: base_fqn.to_string(),
             current_snapshot_id,
-            current_table_uuid: format!("uuid-{base_fqn}"),
+            current_table_object_id: ConnectorTableObjectId::try_new(
+                bytes::Bytes::copy_from_slice(format!("object-{base_fqn}").as_bytes()),
+            )
+            .expect("valid test object ID"),
             admission,
         }
     }
@@ -350,6 +353,9 @@ mod tests {
             ["a.db.t", "z.db.t"]
         );
         assert_eq!(lineage.snapshots["a.db.t"], 2);
-        assert_eq!(lineage.table_uuids["z.db.t"], "uuid-z.db.t");
+        assert_eq!(
+            lineage.table_object_ids["z.db.t"].as_bytes().as_ref(),
+            b"object-z.db.t"
+        );
     }
 }

@@ -227,7 +227,7 @@ impl InMemoryMvRepository {
         })?;
         definition.last_refresh_rows = Some(request.rows);
         definition.last_refresh_snapshots = request.base_snapshots;
-        definition.last_refresh_table_uuids = request.base_table_uuids;
+        definition.last_refresh_table_object_ids = request.base_table_object_ids;
         definition.last_refreshed_iceberg_snapshot_id =
             request.target_snapshot_id.or(refresh.published_snapshot_id);
         definition.refresh_in_progress = false;
@@ -258,7 +258,7 @@ fn definition_from_request(
         last_refresh_ms: None,
         last_refresh_rows: None,
         last_refresh_snapshots: BTreeMap::new(),
-        last_refresh_table_uuids: BTreeMap::new(),
+        last_refresh_table_object_ids: BTreeMap::new(),
         last_refreshed_iceberg_snapshot_id: None,
         refresh_in_progress: false,
         active_refresh_id: None,
@@ -311,7 +311,7 @@ impl MvRepository for InMemoryMvRepository {
         self.initialize_rebuilt_refresh_watermark(
             definition.mv_id,
             request.base_snapshots,
-            request.base_table_uuids,
+            request.base_table_object_ids,
         )
     }
     fn reserve_definition_id(&self, mv_id: i64) -> Result<(), MvRepositoryError> {
@@ -362,7 +362,7 @@ impl MvRepository for InMemoryMvRepository {
         &self,
         mv_id: i64,
         base_snapshots: BTreeMap<String, i64>,
-        base_table_uuids: BTreeMap<String, String>,
+        base_table_object_ids: BTreeMap<String, novarocks_spi::connector::ConnectorTableObjectId>,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
         let mut state = self.state()?;
         let definition = state.definitions.get_mut(&mv_id).ok_or_else(|| {
@@ -372,7 +372,7 @@ impl MvRepository for InMemoryMvRepository {
             )
         })?;
         definition.last_refresh_snapshots = base_snapshots;
-        definition.last_refresh_table_uuids = base_table_uuids;
+        definition.last_refresh_table_object_ids = base_table_object_ids;
         Ok(definition.clone())
     }
     fn update_refresh_metadata(
@@ -455,7 +455,7 @@ impl MvRepository for InMemoryMvRepository {
             staging_snapshot_id: None,
             published_snapshot_id: None,
             target_snapshots,
-            base_table_uuids: BTreeMap::new(),
+            base_table_object_ids: BTreeMap::new(),
             rows: None,
             marker: None,
             external_outcome: None,
@@ -501,7 +501,7 @@ impl MvRepository for InMemoryMvRepository {
             staging_snapshot_id: None,
             published_snapshot_id: None,
             target_snapshots: request.base_snapshots,
-            base_table_uuids: BTreeMap::new(),
+            base_table_object_ids: BTreeMap::new(),
             rows: None,
             marker: Some(RefreshCommitMarker {
                 refresh_id,
@@ -525,7 +525,7 @@ impl MvRepository for InMemoryMvRepository {
         if refresh.state == MvRefreshState::StagingCommitted {
             if refresh.staging_snapshot_id == Some(request.staging_snapshot_id)
                 && refresh.rows == Some(request.rows)
-                && refresh.base_table_uuids == request.base_table_uuids
+                && refresh.base_table_object_ids == request.base_table_object_ids
             {
                 return Ok(());
             }
@@ -541,7 +541,7 @@ impl MvRepository for InMemoryMvRepository {
         refresh.state = MvRefreshState::StagingCommitted;
         refresh.staging_snapshot_id = Some(request.staging_snapshot_id);
         refresh.rows = Some(request.rows);
-        refresh.base_table_uuids = request.base_table_uuids;
+        refresh.base_table_object_ids = request.base_table_object_ids;
         Ok(())
     }
     fn record_publish_commit(
@@ -699,7 +699,7 @@ impl MvRepository for InMemoryMvRepository {
         definition.last_refresh_ms = Some(request.last_refresh_ms);
         definition.last_refresh_rows = Some(request.last_refresh_rows);
         definition.last_refresh_snapshots = request.base_snapshots;
-        definition.last_refresh_table_uuids = request.base_table_uuids;
+        definition.last_refresh_table_object_ids = request.base_table_object_ids;
         Ok(true)
     }
     fn replace_partition_states(

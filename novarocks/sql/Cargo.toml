@@ -29,6 +29,7 @@ test-support = []
 [dependencies]
 arrow = { version = "58.2.0", features = ["prettyprint", "ipc", "ipc_compression"] }
 base64 = "0.22"
+bytes = "1"
 chrono = "0.4"
 hex = "0.4"
 novarocks-catalog = { path = "../catalog" }
@@ -43,4 +44,3 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
-bytes = "1"
