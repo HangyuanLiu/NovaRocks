@@ -5,13 +5,18 @@ use novarocks_execution::runtime::fragment::io::{
     LookupColumn, LookupKind, LookupRequest,
 };
 
+use crate::BackendDataRuntime;
 use crate::native::client::NativeGrpcClient;
 
-pub(crate) fn grpc_fragment_lookup_client() -> Arc<dyn FragmentLookupClient> {
-    Arc::new(GrpcFragmentLookupClient)
+pub(crate) fn grpc_fragment_lookup_client(
+    runtime: BackendDataRuntime,
+) -> Arc<dyn FragmentLookupClient> {
+    Arc::new(GrpcFragmentLookupClient { runtime })
 }
 
-struct GrpcFragmentLookupClient;
+struct GrpcFragmentLookupClient {
+    runtime: BackendDataRuntime,
+}
 
 impl FragmentLookupClient for GrpcFragmentLookupClient {
     fn lookup(&self, request: LookupRequest) -> Result<LookupBatch, FragmentIoError> {
@@ -50,9 +55,13 @@ impl FragmentLookupClient for GrpcFragmentLookupClient {
             )
         })?;
         let request = remote_request(&request)?;
-        let response = NativeGrpcClient::new_host_port(endpoint.host().to_string(), port)
-            .and_then(|client| client.lookup(request))
-            .map_err(|error| lookup_error(FragmentIoErrorKind::Unavailable, error))?;
+        let response = NativeGrpcClient::new_host_port(
+            self.runtime.clone(),
+            endpoint.host().to_string(),
+            port,
+        )
+        .and_then(|client| client.lookup(request))
+        .map_err(|error| lookup_error(FragmentIoErrorKind::Unavailable, error))?;
         decode_response(response)
     }
 }

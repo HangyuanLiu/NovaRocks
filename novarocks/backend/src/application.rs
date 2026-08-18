@@ -14,6 +14,7 @@ use novarocks_protocol::lifecycle::{
 };
 use novarocks_spi::connector::ConnectorExecutionInstaller;
 
+use crate::BackendDataRuntime;
 use crate::exchange_receiver::BackendExchangeReceiverPort;
 use crate::fragment::control::FragmentControlRegistry;
 use crate::fragment::{
@@ -259,6 +260,7 @@ impl Drop for QueryLifecycleSweepTask {
 }
 
 fn compose_backend_application_services(
+    data_runtime: BackendDataRuntime,
     execution_runtime_config: ExecutionRuntimeConfig,
     query_lifecycle_config: QueryLifecycleRegistryConfig,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
@@ -276,7 +278,8 @@ fn compose_backend_application_services(
         Arc::clone(&controls),
         Arc::clone(&execution_host),
     ));
-    let query_lifecycle_registry = QueryLifecycleRegistry::new_unbound(
+    let query_lifecycle_registry = QueryLifecycleRegistry::new_unbound_with_runtime(
+        data_runtime.clone(),
         crate::runtime::start_epoch::start_epoch(),
         local_runtime,
         query_lifecycle_config,
@@ -294,8 +297,8 @@ fn compose_backend_application_services(
     }
     let native_fragment_service = Arc::new(
         NativeFragmentService::new_with_controls(
-            grpc_exchange_transmitter(),
-            grpc_fragment_lookup_client(),
+            grpc_exchange_transmitter(data_runtime.clone()),
+            grpc_fragment_lookup_client(data_runtime),
             native_result_writer(),
             Arc::clone(&controls),
             Arc::clone(&query_lifecycle_registry),
@@ -326,8 +329,11 @@ fn compose_backend_application_services(
 }
 
 impl BackendApplicationHost {
-    pub fn open(config: BackendServerConfig) -> Result<Self, BackendApplicationError> {
-        Self::open_with_readiness_timeout(config, READINESS_TIMEOUT)
+    pub fn open(
+        config: BackendServerConfig,
+        data_runtime: BackendDataRuntime,
+    ) -> Result<Self, BackendApplicationError> {
+        Self::open_with_readiness_timeout(config, data_runtime, READINESS_TIMEOUT)
     }
 
     pub fn ready_marker(&self) -> &str {
@@ -383,6 +389,7 @@ impl BackendApplicationHost {
 
     fn open_with_readiness_timeout(
         config: BackendServerConfig,
+        data_runtime: BackendDataRuntime,
         readiness_timeout: Duration,
     ) -> Result<Self, BackendApplicationError> {
         let BackendServerConfig {
@@ -405,6 +412,7 @@ impl BackendApplicationHost {
                 },
             )?;
         let services = compose_backend_application_services(
+            data_runtime,
             execution_runtime_config,
             query_lifecycle_config,
             write_commit_evidence_limits,
@@ -478,7 +486,7 @@ impl BackendApplicationHost {
 pub fn run_backend_server(config: BackendServerConfig) -> Result<(), BackendApplicationError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
+        .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
         .build()
         .map_err(|error| {
             BackendApplicationError::new(
@@ -486,16 +494,18 @@ pub fn run_backend_server(config: BackendServerConfig) -> Result<(), BackendAppl
                 format!("build backend Tokio runtime failed: {error}"),
             )
         })?;
-    runtime.block_on(run_backend_server_until_signal(config))
+    let data_runtime = BackendDataRuntime::new(runtime.handle().clone());
+    runtime.block_on(run_backend_server_until_signal(config, data_runtime))
 }
 pub async fn run_backend_server_until_shutdown<F>(
     config: BackendServerConfig,
+    data_runtime: BackendDataRuntime,
     shutdown: F,
 ) -> Result<(), BackendApplicationError>
 where
     F: Future<Output = ()> + Send,
 {
-    run_backend_server_until(config, async move {
+    run_backend_server_until(config, data_runtime, async move {
         shutdown.await;
         Ok(())
     })
@@ -504,6 +514,7 @@ where
 
 pub async fn run_backend_server_until_signal(
     config: BackendServerConfig,
+    data_runtime: BackendDataRuntime,
 ) -> Result<(), BackendApplicationError> {
     #[cfg(unix)]
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
@@ -514,7 +525,7 @@ pub async fn run_backend_server_until_signal(
         )
     })?;
 
-    run_backend_server_until(config, async {
+    run_backend_server_until(config, data_runtime, async {
         #[cfg(unix)]
         {
             // Register the OS handler before the host emits its ready marker.
@@ -536,12 +547,13 @@ pub async fn run_backend_server_until_signal(
 
 async fn run_backend_server_until<F>(
     config: BackendServerConfig,
+    data_runtime: BackendDataRuntime,
     shutdown: F,
 ) -> Result<(), BackendApplicationError>
 where
     F: Future<Output = Result<(), BackendApplicationError>> + Send,
 {
-    let mut host = BackendApplicationHost::open(config)?;
+    let mut host = BackendApplicationHost::open(config, data_runtime)?;
     println!("{}", host.ready_marker());
     tokio::pin!(shutdown);
 
@@ -689,6 +701,10 @@ mod tests {
             sink_io_worker_threads: 1,
             sink_io_max_blocking_threads: 1,
         }
+    }
+
+    fn test_data_runtime() -> crate::BackendDataRuntime {
+        crate::native::runtime::test_backend_data_runtime()
     }
 
     fn query_lifecycle_registry_config(
@@ -844,6 +860,7 @@ mod tests {
     #[test]
     fn application_composition_owns_one_query_lifecycle_registry() {
         let services = compose_backend_application_services(
+            test_data_runtime(),
             execution_runtime_config(),
             query_lifecycle_registry_config(Duration::from_millis(5_000)),
             WriteCommitEvidenceLimits::default(),
@@ -866,6 +883,7 @@ mod tests {
         config.advertise_endpoint.host = "127.0.0.2".to_string();
         let error = BackendApplicationHost::open_with_readiness_timeout(
             config,
+            test_data_runtime(),
             std::time::Duration::from_millis(25),
         )
         .expect_err("unreachable advertised endpoint must fail readiness");
@@ -879,8 +897,9 @@ mod tests {
     async fn application_query_control_attachment_live_loopback_round_trip() {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
-        let host = BackendApplicationHost::open(backend_config(grpc_port, grpc_port))
-            .expect("native backend host starts");
+        let host =
+            BackendApplicationHost::open(backend_config(grpc_port, grpc_port), test_data_runtime())
+                .expect("native backend host starts");
         let mut client = connect_live_client(grpc_port).await;
         let heartbeat = client
             .heartbeat(HeartbeatRequest {
@@ -970,7 +989,8 @@ mod tests {
         let mut config = backend_config(grpc_port, grpc_port);
         config.query_lifecycle_sweep_interval = Duration::from_millis(50);
         config.query_lifecycle_config = query_lifecycle_registry_config(Duration::from_millis(250));
-        let host = BackendApplicationHost::open(config).expect("native backend host starts");
+        let host = BackendApplicationHost::open(config, test_data_runtime())
+            .expect("native backend host starts");
         let mut client = connect_live_client(grpc_port).await;
         let heartbeat = client
             .heartbeat(HeartbeatRequest {
@@ -1045,8 +1065,9 @@ mod tests {
     async fn application_shutdown_closes_live_query_control_stream_and_fails_closed() {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
-        let host = BackendApplicationHost::open(backend_config(grpc_port, grpc_port))
-            .expect("native backend host starts");
+        let host =
+            BackendApplicationHost::open(backend_config(grpc_port, grpc_port), test_data_runtime())
+                .expect("native backend host starts");
         let registry = Arc::clone(&host._query_lifecycle_registry);
         let mut client = connect_live_client(grpc_port).await;
         let heartbeat = client
@@ -1137,8 +1158,9 @@ mod tests {
     async fn application_malformed_init_query_returns_invalid_argument() {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
-        let host = BackendApplicationHost::open(backend_config(grpc_port, grpc_port))
-            .expect("native backend host starts");
+        let host =
+            BackendApplicationHost::open(backend_config(grpc_port, grpc_port), test_data_runtime())
+                .expect("native backend host starts");
         let mut client = connect_live_client(grpc_port).await;
 
         let error = client
@@ -1154,8 +1176,9 @@ mod tests {
     async fn application_malformed_abort_query_returns_invalid_argument() {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
-        let host = BackendApplicationHost::open(backend_config(grpc_port, grpc_port))
-            .expect("native backend host starts");
+        let host =
+            BackendApplicationHost::open(backend_config(grpc_port, grpc_port), test_data_runtime())
+                .expect("native backend host starts");
         let mut client = connect_live_client(grpc_port).await;
 
         let error = client
@@ -1171,8 +1194,9 @@ mod tests {
     async fn application_abort_digest_mismatch_is_rejected_without_terminating_entry() {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
-        let host = BackendApplicationHost::open(backend_config(grpc_port, grpc_port))
-            .expect("native backend host starts");
+        let host =
+            BackendApplicationHost::open(backend_config(grpc_port, grpc_port), test_data_runtime())
+                .expect("native backend host starts");
         let mut client = connect_live_client(grpc_port).await;
         let heartbeat = client
             .heartbeat(HeartbeatRequest {

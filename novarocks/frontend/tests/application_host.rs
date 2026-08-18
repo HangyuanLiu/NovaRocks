@@ -51,7 +51,13 @@ fn execution_config() -> FrontendExecutionConfig {
 async fn open_host(
     config: Option<StateStoreHostConfig>,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
-    FrontendApplicationHost::open(config, execution_config(), backend_config()).await
+    FrontendApplicationHost::open(
+        config,
+        execution_config(),
+        backend_config(),
+        tokio::runtime::Handle::current(),
+    )
+    .await
 }
 
 fn backend_config() -> ClusterBackendOpenConfig {
@@ -341,14 +347,20 @@ async fn absent_config_opens_disabled_host() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fe_without_state_store_fails_before_frontend_services_open() {
-    let error =
-        match FrontendApplicationHost::open(None, execution_config(), fe_backend_config()).await {
-            Ok(host) => {
-                host.shutdown().await.expect("shutdown unexpected FE host");
-                panic!("role=fe must not open without StateStore membership authority");
-            }
-            Err(error) => error,
-        };
+    let error = match FrontendApplicationHost::open(
+        None,
+        execution_config(),
+        fe_backend_config(),
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    {
+        Ok(host) => {
+            host.shutdown().await.expect("shutdown unexpected FE host");
+            panic!("role=fe must not open without StateStore membership authority");
+        }
+        Err(error) => error,
+    };
 
     assert_eq!(
         error.kind(),

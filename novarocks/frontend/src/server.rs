@@ -19,6 +19,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
+use tokio::runtime::Handle;
 
 use crate::capabilities as core_capabilities;
 use crate::{QuerySessionFactory, ResolvedMysqlListenerSettings};
@@ -70,12 +71,14 @@ pub struct FrontendServerConfig {
 /// to provide the terminal fallback ingress installed on the native backend endpoint.
 pub async fn open_frontend_application_for_server(
     config: &FrontendServerConfig,
+    data_runtime: Handle,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
     FrontendApplicationHost::open_with_factories(
         config.state_store_host_config.clone(),
         config.execution.clone(),
         config.backend_open.clone(),
         config.connector_control_factories.clone(),
+        data_runtime,
     )
     .await
 }
@@ -331,7 +334,7 @@ pub fn build_frontend_query_session_factory(
 pub fn run_frontend_server(config: FrontendServerConfig) -> Result<(), FrontendApplicationError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(::novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
+        .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
         .build()
         .map_err(|error| {
             FrontendApplicationError::server(format!(
@@ -347,13 +350,14 @@ pub fn run_frontend_server(config: FrontendServerConfig) -> Result<(), FrontendA
 
 pub async fn run_frontend_server_until_shutdown<F>(
     config: FrontendServerConfig,
+    data_runtime: Handle,
     shutdown: F,
 ) -> Result<(), FrontendApplicationError>
 where
     F: Future<Output = ()> + Send,
 {
     let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
-    let host = open_frontend_application_for_server(&config).await?;
+    let host = open_frontend_application_for_server(&config, data_runtime).await?;
     let server_result =
         serve_ready_frontend_session_factory(config, &host, mv_storage_observation, shutdown).await;
     let shutdown_result = host.shutdown().await;
@@ -369,7 +373,7 @@ where
     E: std::fmt::Display + Send + 'static,
 {
     let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
-    let host = open_frontend_application_for_server(&config).await?;
+    let host = open_frontend_application_for_server(&config, Handle::current()).await?;
     let server_result = run_server_until_signal(config, (), signal, |config, (), shutdown| {
         serve_ready_frontend_session_factory(config, &host, mv_storage_observation, shutdown)
     })
@@ -721,6 +725,7 @@ mod tests {
             ),
             frontend_backend_open_config(),
             vec![Arc::new(EchoingControlFactory)],
+            tokio::runtime::Handle::current(),
         )
         .await
         .expect("open frontend application host");
@@ -804,6 +809,7 @@ mod tests {
             None,
             FrontendExecutionConfig::new("127.0.0.1", 0, std::num::NonZeroUsize::new(1).unwrap()),
             frontend_backend_open_config(),
+            tokio::runtime::Handle::current(),
         )
         .await
         .expect("open frontend application host");
@@ -842,6 +848,7 @@ mod tests {
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
             ),
             frontend_backend_open_config(),
+            tokio::runtime::Handle::current(),
         )
         .await
         .expect("open frontend application host");
@@ -893,8 +900,10 @@ mod tests {
         }
 
         accepts_sync_runner(run_frontend_server);
+        let data_runtime = tokio::runtime::Runtime::new().expect("data runtime");
         accepts_async_runner(run_frontend_server_until_shutdown(
             frontend_config(),
+            data_runtime.handle().clone(),
             async {},
         ));
     }

@@ -229,8 +229,12 @@ impl NativeFragmentService {
         let controls = Arc::new(FragmentControlRegistry::default());
         let lifecycle = test_lifecycle_registry(Arc::clone(&controls));
         let mut service = Self::new_with_controls(
-            crate::fragment::grpc_exchange_transmitter(),
-            crate::fragment::grpc_fragment_lookup_client(),
+            crate::fragment::grpc_exchange_transmitter(
+                crate::native::runtime::test_backend_data_runtime(),
+            ),
+            crate::fragment::grpc_fragment_lookup_client(
+                crate::native::runtime::test_backend_data_runtime(),
+            ),
             crate::fragment::native_result_writer(),
             controls,
             lifecycle,
@@ -1260,8 +1264,12 @@ mod tests {
     fn registration_failure_drops_dormant_resources_before_retry() {
         let _service_guard = SERVICE_TEST_LOCK.lock().expect("service test lock");
         let service = NativeFragmentService::new(
-            crate::fragment::grpc_exchange_transmitter(),
-            crate::fragment::grpc_fragment_lookup_client(),
+            crate::fragment::grpc_exchange_transmitter(
+                crate::native::runtime::test_backend_data_runtime(),
+            ),
+            crate::fragment::grpc_fragment_lookup_client(
+                crate::native::runtime::test_backend_data_runtime(),
+            ),
             crate::fragment::native_result_writer(),
             test_lifecycle_registry(Arc::new(FragmentControlRegistry::default())),
             Arc::new(ConnectorRegistry::new()),

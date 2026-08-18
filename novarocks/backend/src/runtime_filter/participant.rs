@@ -51,6 +51,7 @@ use super::domain::{
     BackendTransportEventIdentity, BackendTransportEventKind, BackendTransportFailOpenReason,
 };
 use super::observation::{RuntimeFilterObservationEmitter, RuntimeFilterObservationSnapshot};
+use crate::BackendDataRuntime;
 use crate::native::runtime_filter_adapter::{
     BackendNativeContributionRouteIdentity, BackendNativeDeliveryRouteIdentity,
     BackendNativeProducerInstanceRouteIdentity, BackendNativeRouteIdentity,
@@ -81,8 +82,15 @@ pub(crate) trait RuntimeFilterParticipantFactory: Send + Sync + 'static {
     ) -> Result<Arc<RuntimeFilterParticipant>, QueryLifecycleError>;
 }
 
-#[derive(Default)]
-pub(crate) struct BackendRuntimeFilterParticipantFactory;
+pub(crate) struct BackendRuntimeFilterParticipantFactory {
+    runtime: BackendDataRuntime,
+}
+
+impl BackendRuntimeFilterParticipantFactory {
+    pub(crate) fn new(runtime: BackendDataRuntime) -> Self {
+        Self { runtime }
+    }
+}
 
 impl RuntimeFilterParticipantFactory for BackendRuntimeFilterParticipantFactory {
     // Design: ADR-0044 (docs/adr/ADR-0044-backend-runtime-filter-participant-domain.md)
@@ -163,7 +171,7 @@ impl RuntimeFilterParticipantFactory for BackendRuntimeFilterParticipantFactory 
             producers,
             consumers,
             memory,
-            GrpcRuntimeFilterEnvelopeSink::new(),
+            GrpcRuntimeFilterEnvelopeSink::new(self.runtime.clone()),
         )
     }
 }

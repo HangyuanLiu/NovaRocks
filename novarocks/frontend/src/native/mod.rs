@@ -4,6 +4,7 @@
 //! carrier-neutral ports but does not re-export a role-neutral transport API.
 
 pub(crate) mod codec;
+pub(crate) mod data_runtime;
 pub(crate) mod fragment_encoder;
 pub(crate) mod fragment_transport;
 pub(crate) mod query_lifecycle;

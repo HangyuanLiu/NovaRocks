@@ -24,7 +24,8 @@ use anyhow::Context;
 use novarocks::common::backend_topology::BackendTopologyPort;
 use novarocks::common::network;
 use novarocks_backend::{
-    BackendApplicationHost, BackendServerConfig, BackendStoreSettings, QueryLifecycleRegistryConfig,
+    BackendApplicationHost, BackendDataRuntime, BackendServerConfig, BackendStoreSettings,
+    QueryLifecycleRegistryConfig,
 };
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::control_factory::IcebergControlFactory;
@@ -658,10 +659,14 @@ pub fn state_store_host_config(
         })
 }
 
-pub fn run_all_in_one(config: NovaRocksConfig, port_override: Option<u16>) -> anyhow::Result<()> {
+pub fn run_all_in_one(
+    config: NovaRocksConfig,
+    port_override: Option<u16>,
+    data_runtime: tokio::runtime::Handle,
+) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
+        .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
         .build()
         .context("build all-in-one Tokio runtime")?;
 
@@ -669,6 +674,7 @@ pub fn run_all_in_one(config: NovaRocksConfig, port_override: Option<u16>) -> an
         config,
         port_override,
         runtime.handle().clone(),
+        data_runtime,
         async {
             tokio::signal::ctrl_c()
                 .await
@@ -687,27 +693,33 @@ fn all_in_one_report_bind_addr(backend_endpoint: std::net::SocketAddr) -> std::n
 async fn run_all_in_one_until<F>(
     config: NovaRocksConfig,
     port_override: Option<u16>,
-    runtime: tokio::runtime::Handle,
+    application_runtime: tokio::runtime::Handle,
+    data_runtime: tokio::runtime::Handle,
     shutdown: F,
 ) -> anyhow::Result<()>
 where
     F: Future<Output = Result<(), String>> + Send,
 {
-    let frontend_config = compose_frontend_server_config(&config, port_override, runtime.clone())?;
-    let frontend = novarocks_frontend::open_frontend_application_for_server(&frontend_config)
-        .await
-        .map_err(|error| anyhow::anyhow!("open all-in-one frontend application failed: {error}"))?;
-    let backend_config = compose_backend_server_config(&config, runtime)?;
-    let mut backend = match BackendApplicationHost::open(backend_config) {
-        Ok(backend) => backend,
-        Err(error) => {
-            let frontend_cleanup = frontend.shutdown().await;
-            return Err(anyhow::anyhow!(
-                "open all-in-one backend application failed: {error}; frontend cleanup: {:?}",
-                frontend_cleanup.err()
-            ));
-        }
-    };
+    let frontend_config =
+        compose_frontend_server_config(&config, port_override, application_runtime.clone())?;
+    let frontend = novarocks_frontend::open_frontend_application_for_server(
+        &frontend_config,
+        data_runtime.clone(),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("open all-in-one frontend application failed: {error}"))?;
+    let backend_config = compose_backend_server_config(&config, application_runtime)?;
+    let mut backend =
+        match BackendApplicationHost::open(backend_config, BackendDataRuntime::new(data_runtime)) {
+            Ok(backend) => backend,
+            Err(error) => {
+                let frontend_cleanup = frontend.shutdown().await;
+                return Err(anyhow::anyhow!(
+                    "open all-in-one backend application failed: {error}; frontend cleanup: {:?}",
+                    frontend_cleanup.err()
+                ));
+            }
+        };
     let endpoint = backend.connectable_native_endpoint();
     let report_bind_addr = all_in_one_report_bind_addr(endpoint);
     let mut report_server = match frontend.start_report_server(report_bind_addr) {
@@ -879,6 +891,7 @@ mod tests {
     use super::{
         all_in_one_report_bind_addr, combine_primary_and_cleanup,
         compose_backend_execution_installers, compose_frontend_control_factories,
+        run_all_in_one_until,
     };
 
     #[test]
@@ -956,5 +969,40 @@ mod tests {
                 .contains("object-store credentials missing aws.s3.access_key"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn all_in_one_can_open_shutdown_and_open_again_with_one_data_runtime() {
+        let application_runtime = tokio::runtime::Runtime::new().expect("application runtime");
+        let data_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("novarocks-data-runtime")
+            .build()
+            .expect("data runtime");
+        let mut config = crate::app_config::NovaRocksConfig::default();
+        let grpc_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve gRPC port");
+        config.server.grpc_port = grpc_listener
+            .local_addr()
+            .expect("gRPC listener address")
+            .port();
+        drop(grpc_listener);
+        config.server.http_port = 0;
+        config.standalone_server = Some(crate::app_config::StandaloneServerConfig {
+            mysql_port: 0,
+            ..Default::default()
+        });
+
+        for _ in 0..2 {
+            application_runtime
+                .block_on(run_all_in_one_until(
+                    config.clone(),
+                    Some(0),
+                    application_runtime.handle().clone(),
+                    data_runtime.handle().clone(),
+                    async { Ok(()) },
+                ))
+                .expect("all-in-one open and shutdown");
+        }
     }
 }

@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use novarocks_types::WORKER_STACK_SIZE_BYTES;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
@@ -39,7 +40,6 @@ use crate::runtime::execution_runtime::ExecutionRuntimeConfig;
 
 const SINK_IO_THREAD_NAME: &str = "novarocks-sink-io";
 const SHARED_IO_THREAD_NAME: &str = "novarocks-execution-io";
-const WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Identifies an execution-service class for metrics/logging.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

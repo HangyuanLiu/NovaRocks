@@ -21,44 +21,57 @@
 //! calls and the BE-to-FE terminal fallback.  It shares no transport facade
 //! with Frontend or Core.
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use novarocks::common::network::format_host_for_url;
-use novarocks::runtime::global_async_runtime::data_block_on;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_protocol::{filter, novarocks as proto};
 use novarocks_types::identity::UniqueId;
 use tonic::Request;
 use tonic::transport::Channel;
 
+use super::runtime::BackendDataRuntime;
 use super::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) struct NativeGrpcClient {
+    runtime: BackendDataRuntime,
     host: String,
     port: u16,
 }
 
 impl NativeGrpcClient {
-    pub(crate) fn new_runtime_endpoint(endpoint: &RuntimeEndpoint) -> Result<Self, String> {
+    pub(crate) fn new_runtime_endpoint(
+        runtime: BackendDataRuntime,
+        endpoint: &RuntimeEndpoint,
+    ) -> Result<Self, String> {
         let port = u16::try_from(endpoint.port())
             .map_err(|_| format!("invalid runtime filter endpoint port {}", endpoint.port()))?;
-        Self::new_host_port(endpoint.host().to_string(), port)
+        Self::new_host_port(runtime, endpoint.host().to_string(), port)
     }
 
-    pub(crate) fn new_host_port(host: String, port: u16) -> Result<Self, String> {
+    pub(crate) fn new_host_port(
+        runtime: BackendDataRuntime,
+        host: String,
+        port: u16,
+    ) -> Result<Self, String> {
         channel_endpoint(&host, port)
             .map_err(|error| format!("invalid BE endpoint {host}:{port}: {error}"))?;
-        Ok(Self { host, port })
+        Ok(Self {
+            runtime,
+            host,
+            port,
+        })
     }
 
     fn make_client(&self) -> Result<NovaRocksGrpcClient<Channel>, String> {
         let host = self.host.clone();
         let port = self.port;
-        let channel = data_block_on(async move { get_or_create_channel(&host, port).await })??;
+        let runtime = self.runtime.clone();
+        let channel = runtime
+            .clone()
+            .block_on(async move { get_or_create_channel(&runtime, &host, port).await })?;
         Ok(client_from_channel(channel))
     }
 
@@ -67,11 +80,14 @@ impl NativeGrpcClient {
         operation: &str,
         deadline_at: tokio::time::Instant,
     ) -> Result<NovaRocksGrpcClient<Channel>, String> {
-        tokio::time::timeout_at(deadline_at, get_or_create_channel(&self.host, self.port))
-            .await
-            .map_err(|_| format!("{operation} deadline exceeded during channel acquisition"))?
-            .map(client_from_channel)
-            .map_err(|error| format!("{operation} channel acquisition failed: {error}"))
+        tokio::time::timeout_at(
+            deadline_at,
+            get_or_create_channel(&self.runtime, &self.host, self.port),
+        )
+        .await
+        .map_err(|_| format!("{operation} deadline exceeded during channel acquisition"))?
+        .map(client_from_channel)
+        .map_err(|error| format!("{operation} channel acquisition failed: {error}"))
     }
 
     pub(crate) async fn transmit_runtime_filter_envelope_async(
@@ -106,7 +122,7 @@ impl NativeGrpcClient {
         request: proto::ReportQueryTerminalRequest,
         timeout: Duration,
     ) -> Result<proto::ReportQueryTerminalResponse, String> {
-        data_block_on(async {
+        self.runtime.block_on(async {
             let deadline_at = tokio::time::Instant::now() + timeout;
             let mut client = self
                 .make_deadline_async_client("report_query_terminal", deadline_at)
@@ -127,7 +143,7 @@ impl NativeGrpcClient {
                 })?
                 .map(|response| response.into_inner())
                 .map_err(|error| format!("report_query_terminal rpc failed: {error}"))
-        })?
+        })
     }
 
     pub(crate) fn exchange_unary(
@@ -151,7 +167,7 @@ impl NativeGrpcClient {
             sequence,
             payload,
         };
-        data_block_on(async move {
+        self.runtime.block_on(async move {
             let response = client
                 .exchange_unary(request)
                 .await
@@ -167,7 +183,7 @@ impl NativeGrpcClient {
                 });
             }
             Ok(())
-        })?
+        })
     }
 
     pub(crate) fn lookup(
@@ -179,26 +195,18 @@ impl NativeGrpcClient {
         let mut client = self
             .make_client()
             .map_err(|error| format!("lookup connect failed: dest={host}:{port} error={error}"))?;
-        data_block_on(async move {
-            client
-                .lookup(request)
-                .await
-                .map(|response| response.into_inner())
-                .map_err(|error| format!("lookup request failed: dest={host}:{port} error={error}"))
-        })
-        .map_err(|error| format!("lookup runtime execution failed: {error}"))?
+        self.runtime
+            .block_on(async move {
+                client
+                    .lookup(request)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(|error| {
+                        format!("lookup request failed: dest={host}:{port} error={error}")
+                    })
+            })
+            .map_err(|error| format!("lookup runtime execution failed: {error}"))
     }
-}
-
-#[derive(Default)]
-struct ChannelCache {
-    channels: Mutex<HashMap<String, Channel>>,
-}
-
-static CHANNELS: OnceLock<ChannelCache> = OnceLock::new();
-
-fn channels() -> &'static ChannelCache {
-    CHANNELS.get_or_init(ChannelCache::default)
 }
 
 fn channel_endpoint(
@@ -214,10 +222,14 @@ fn client_from_channel(channel: Channel) -> NovaRocksGrpcClient<Channel> {
         .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
 }
 
-async fn get_or_create_channel(host: &str, port: u16) -> Result<Channel, String> {
+async fn get_or_create_channel(
+    runtime: &BackendDataRuntime,
+    host: &str,
+    port: u16,
+) -> Result<Channel, String> {
     let key = format!("{}:{port}", format_host_for_url(host));
-    if let Some(channel) = channels()
-        .channels
+    if let Some(channel) = runtime
+        .channels()
         .lock()
         .expect("native channel cache lock")
         .get(&key)
@@ -236,8 +248,8 @@ async fn get_or_create_channel(host: &str, port: u16) -> Result<Channel, String>
         .connect()
         .await
         .map_err(|error| format!("connect exchange endpoint failed: {error}"))?;
-    channels()
-        .channels
+    runtime
+        .channels()
         .lock()
         .expect("native channel cache lock")
         .insert(key, channel.clone());

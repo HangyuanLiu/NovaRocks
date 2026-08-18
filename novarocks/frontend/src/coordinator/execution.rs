@@ -63,6 +63,7 @@ use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use crate::connector::{
     ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
 };
+use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::transport::{
@@ -147,7 +148,9 @@ struct FrontendConnectorBindingInstallObserver {
     control: Arc<ConnectorControlHost>,
 }
 
-struct GrpcConnectorControlRetirementSink;
+struct GrpcConnectorControlRetirementSink {
+    data_runtime: FrontendDataRuntime,
+}
 
 impl ConnectorControlRetirementSink for GrpcConnectorControlRetirementSink {
     fn retire(&self, retirement: ConnectorControlRetirement) {
@@ -169,18 +172,19 @@ impl ConnectorControlRetirementSink for GrpcConnectorControlRetirementSink {
                 }
             })
             .collect::<Vec<_>>();
-        let dispatcher = match new_connector_binding_dispatcher(&endpoints) {
-            Ok(dispatcher) => dispatcher,
-            Err(error) => {
-                tracing::warn!(
-                    instance_id = %retirement.key.instance_id.as_str(),
-                    incarnation = ?retirement.key.incarnation,
-                    %error,
-                    "connector execution retirement dispatcher could not be composed"
-                );
-                return;
-            }
-        };
+        let dispatcher =
+            match new_connector_binding_dispatcher(&endpoints, self.data_runtime.clone()) {
+                Ok(dispatcher) => dispatcher,
+                Err(error) => {
+                    tracing::warn!(
+                        instance_id = %retirement.key.instance_id.as_str(),
+                        incarnation = ?retirement.key.incarnation,
+                        %error,
+                        "connector execution retirement dispatcher could not be composed"
+                    );
+                    return;
+                }
+            };
         for (_, endpoint) in endpoints {
             if let Err(error) = dispatcher.retire(endpoint, &retirement.key) {
                 tracing::warn!(
@@ -541,6 +545,7 @@ impl BackendServicesSource {
 
 fn production_backend_services(
     topology: &[LiveBackendTarget],
+    data_runtime: FrontendDataRuntime,
 ) -> Result<QueryBackendServices, DistributedQueryError> {
     let entries = topology
         .iter()
@@ -549,10 +554,12 @@ fn production_backend_services(
     let snapshot = FrontendBackendSnapshot::from_live_targets(topology.to_vec())?;
     Ok(QueryBackendServices {
         scheduler: FrontendFragmentScheduler::new(snapshot),
-        dispatcher: new_fragment_dispatcher(&entries).map_err(failed)?,
-        lifecycle_transport: new_query_lifecycle_transport(topology).map_err(failed)?,
+        dispatcher: new_fragment_dispatcher(&entries, data_runtime.clone()).map_err(failed)?,
+        lifecycle_transport: new_query_lifecycle_transport(topology, data_runtime.clone())
+            .map_err(failed)?,
         live_backends: topology.to_vec(),
-        connector_binding_dispatcher: new_connector_binding_dispatcher(&entries).map_err(failed)?,
+        connector_binding_dispatcher: new_connector_binding_dispatcher(&entries, data_runtime)
+            .map_err(failed)?,
     })
 }
 
@@ -565,6 +572,7 @@ pub struct FrontendDistributedQueryCoordinator {
     query_ids: Arc<dyn QueryIdSource>,
     registry: Arc<FrontendQueryRegistry>,
     connector_control: Arc<ConnectorControlHost>,
+    data_runtime: FrontendDataRuntime,
     /// Validated once at startup from the timeouts the composition root froze;
     /// query admission consumes it rather than re-reading configuration.
     lifecycle_config: FrontendQueryLifecycleConfig,
@@ -598,11 +606,14 @@ impl FrontendDistributedQueryCoordinator {
         query_control_timeouts: crate::application::FrontendQueryControlTimeouts,
         backend_topology: ::novarocks::common::backend_topology::BackendTopologyService,
         connector_control: Arc<ConnectorControlHost>,
+        data_runtime: FrontendDataRuntime,
     ) -> Result<Self, DistributedQueryError> {
         // Reject an unusable `[runtime]` query-control section at startup rather
         // than on the first query that tries to use it.
         let lifecycle_config = build_lifecycle_config(query_control_timeouts)?;
-        connector_control.set_retirement_sink(Arc::new(GrpcConnectorControlRetirementSink));
+        connector_control.set_retirement_sink(Arc::new(GrpcConnectorControlRetirementSink {
+            data_runtime: data_runtime.clone(),
+        }));
         Ok(Self {
             report_endpoint: Arc::new(FrontendReportEndpointBinding::new(
                 advertised_report_host,
@@ -615,6 +626,7 @@ impl FrontendDistributedQueryCoordinator {
             query_ids: Arc::new(UniqueQueryIdSource::default()),
             registry: Arc::new(FrontendQueryRegistry::default()),
             connector_control,
+            data_runtime,
             lifecycle_config,
             pre_start_timeout: Duration::from_millis(query_control_timeouts.pre_start_timeout_ms),
         })
@@ -672,6 +684,7 @@ impl FrontendDistributedQueryCoordinator {
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
             registry: Arc::new(FrontendQueryRegistry::default()),
             connector_control: Arc::new(ConnectorControlHost::new()),
+            data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             lifecycle_config: build_lifecycle_config(test_timeouts)
                 .expect("default query-control timeouts validate"),
             pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
@@ -710,6 +723,7 @@ impl FrontendDistributedQueryCoordinator {
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
             registry: Arc::new(FrontendQueryRegistry::default()),
             connector_control: Arc::new(ConnectorControlHost::new()),
+            data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             lifecycle_config: build_lifecycle_config(test_timeouts)
                 .expect("default query-control timeouts validate"),
             pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
@@ -812,10 +826,13 @@ impl FrontendDistributedQueryCoordinator {
         #[cfg(test)]
         let backend_services = match &self.backend_services {
             Some(services) => services.resolve(parts.topology.targets())?,
-            None => production_backend_services(parts.topology.targets())?,
+            None => {
+                production_backend_services(parts.topology.targets(), self.data_runtime.clone())?
+            }
         };
         #[cfg(not(test))]
-        let backend_services = production_backend_services(parts.topology.targets())?;
+        let backend_services =
+            production_backend_services(parts.topology.targets(), self.data_runtime.clone())?;
         self.dispatch_ready_connector_retires(
             backend_services.connector_binding_dispatcher.as_ref(),
         );

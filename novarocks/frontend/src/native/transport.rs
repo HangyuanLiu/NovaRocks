@@ -1,9 +1,9 @@
 //! Narrow FE-to-BE native transport adapters.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
@@ -18,7 +18,6 @@ use crate::query_execution::artifact::ConnectorBindingDispatcher;
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 use ::novarocks::common::backend_topology::{BeId, HeartbeatOutcome, LiveBackendTarget};
 use ::novarocks::common::network::format_host_for_url;
-use ::novarocks::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
 use novarocks::service::observe_backend_heartbeat_rtt;
 use novarocks_protocol::common::UniqueId as ProtoUniqueId;
 use novarocks_protocol::lifecycle::{
@@ -33,6 +32,7 @@ use novarocks_protocol::novarocks::{
 };
 use novarocks_types::UniqueId;
 
+use super::data_runtime::FrontendDataRuntime;
 use super::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
 use super::query_lifecycle::{
     QueryControlSession, QueryLifecycleTransport, QueryLifecycleTransportError,
@@ -46,13 +46,15 @@ const QUERY_CONTROL_CHANNEL_CAPACITY: usize = 32;
 struct Client {
     host: String,
     port: u16,
+    data_runtime: FrontendDataRuntime,
 }
 
 impl Client {
-    fn new(addr: SocketAddr) -> Result<Self, String> {
+    fn new(addr: SocketAddr, data_runtime: FrontendDataRuntime) -> Result<Self, String> {
         let client = Self {
             host: addr.ip().to_string(),
             port: addr.port(),
+            data_runtime,
         };
         endpoint(&client.host, client.port)
             .map_err(|error| format!("invalid BE endpoint {addr}: {error}"))?;
@@ -61,7 +63,7 @@ impl Client {
 
     async fn grpc(&self) -> Result<NovaRocksGrpcClient<Channel>, String> {
         Ok(
-            NovaRocksGrpcClient::new(channel(&self.host, self.port).await?)
+            NovaRocksGrpcClient::new(channel(&self.data_runtime, &self.host, self.port).await?)
                 .max_encoding_message_size(MAX_MESSAGE_BYTES)
                 .max_decoding_message_size(MAX_MESSAGE_BYTES),
         )
@@ -83,16 +85,13 @@ fn endpoint(host: &str, port: u16) -> Result<tonic::transport::Endpoint, tonic::
     format!("http://{}:{port}", format_host_for_url(host)).parse()
 }
 
-static CHANNELS: OnceLock<Mutex<HashMap<String, Channel>>> = OnceLock::new();
-async fn channel(host: &str, port: u16) -> Result<Channel, String> {
+async fn channel(
+    data_runtime: &FrontendDataRuntime,
+    host: &str,
+    port: u16,
+) -> Result<Channel, String> {
     let key = format!("{}:{port}", format_host_for_url(host));
-    let cache = CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(channel) = cache
-        .lock()
-        .expect("frontend native channel cache lock")
-        .get(&key)
-        .cloned()
-    {
+    if let Some(channel) = data_runtime.cached_channel(&key) {
         return Ok(channel);
     }
     let created = endpoint(host, port)
@@ -106,17 +105,15 @@ async fn channel(host: &str, port: u16) -> Result<Channel, String> {
         .connect()
         .await
         .map_err(|error| format!("connect exchange endpoint failed: {error}"))?;
-    cache
-        .lock()
-        .expect("frontend native channel cache lock")
-        .insert(key, created.clone());
+    data_runtime.cache_channel(key, created.clone());
     Ok(created)
 }
 
 pub(crate) fn new_fragment_dispatcher(
     backends: &[(usize, SocketAddr)],
+    data_runtime: FrontendDataRuntime,
 ) -> Result<Arc<dyn FragmentDispatcher>, String> {
-    Ok(Arc::new(RemoteDispatcher::new(backends)?))
+    Ok(Arc::new(RemoteDispatcher::new(backends, data_runtime)?))
 }
 
 struct RemoteDispatcher {
@@ -124,14 +121,20 @@ struct RemoteDispatcher {
     endpoints: BTreeMap<usize, SocketAddr>,
 }
 impl RemoteDispatcher {
-    fn new(backends: &[(usize, SocketAddr)]) -> Result<Self, String> {
+    fn new(
+        backends: &[(usize, SocketAddr)],
+        data_runtime: FrontendDataRuntime,
+    ) -> Result<Self, String> {
         if backends.is_empty() {
             return Err("RemoteDispatcher requires at least one backend".to_string());
         }
         let mut clients = BTreeMap::new();
         let mut endpoints = BTreeMap::new();
         for (id, endpoint) in backends {
-            if clients.insert(*id, Client::new(*endpoint)?).is_some() {
+            if clients
+                .insert(*id, Client::new(*endpoint, data_runtime.clone())?)
+                .is_some()
+            {
                 return Err(format!("duplicate backend_idx {id}"));
             }
             endpoints.insert(*id, *endpoint);
@@ -161,7 +164,7 @@ impl FragmentDispatcher for RemoteDispatcher {
             }),
             max_wait_ms,
         };
-        let response = data_block_on(async {
+        let response = client.data_runtime.block_on(async {
             let mut grpc = client.grpc().await?;
             grpc.fetch_result(request)
                 .await
@@ -201,22 +204,32 @@ impl FragmentDispatcher for RemoteDispatcher {
 
 pub(crate) fn new_connector_binding_dispatcher(
     backends: &[(usize, SocketAddr)],
+    data_runtime: FrontendDataRuntime,
 ) -> Result<Arc<dyn ConnectorBindingDispatcher>, String> {
-    Ok(Arc::new(ConnectorBindingControl::new(backends)?))
+    Ok(Arc::new(ConnectorBindingControl::new(
+        backends,
+        data_runtime,
+    )?))
 }
 struct ConnectorBindingControl {
     clients: BTreeMap<usize, Client>,
     endpoints: BTreeMap<usize, SocketAddr>,
 }
 impl ConnectorBindingControl {
-    fn new(backends: &[(usize, SocketAddr)]) -> Result<Self, String> {
+    fn new(
+        backends: &[(usize, SocketAddr)],
+        data_runtime: FrontendDataRuntime,
+    ) -> Result<Self, String> {
         if backends.is_empty() {
             return Err("GrpcConnectorBindingControl requires at least one backend".to_string());
         }
         let mut clients = BTreeMap::new();
         let mut endpoints = BTreeMap::new();
         for (id, endpoint) in backends {
-            if clients.insert(*id, Client::new(*endpoint)?).is_some() {
+            if clients
+                .insert(*id, Client::new(*endpoint, data_runtime.clone())?)
+                .is_some()
+            {
                 return Err(format!("duplicate connector binding backend {id}"));
             }
             endpoints.insert(*id, *endpoint);
@@ -256,7 +269,7 @@ impl ConnectorBindingDispatcher for ConnectorBindingControl {
             incarnation: declaration.incarnation().to_bytes().to_vec(),
             declaration_payload: declaration.payload().to_vec(),
         };
-        let response = data_block_on(async {
+        let response = client.data_runtime.block_on(async {
             let mut grpc = client.grpc().await?;
             grpc.ensure_connector_execution_binding(request)
                 .await
@@ -282,7 +295,7 @@ impl ConnectorBindingDispatcher for ConnectorBindingControl {
             instance_id: key.instance_id.as_str().to_string(),
             incarnation: key.incarnation.to_bytes().to_vec(),
         };
-        let response = data_block_on(async {
+        let response = client.data_runtime.block_on(async {
             let mut grpc = client.grpc().await?;
             grpc.retire_connector_execution_binding(request)
                 .await
@@ -300,11 +313,15 @@ impl ConnectorBindingDispatcher for ConnectorBindingControl {
     }
 }
 
-pub(crate) fn heartbeat(be_id: BeId, endpoint: SocketAddr) -> HeartbeatOutcome {
+pub(crate) fn heartbeat(
+    data_runtime: &FrontendDataRuntime,
+    be_id: BeId,
+    endpoint: SocketAddr,
+) -> HeartbeatOutcome {
     let started = Instant::now();
     let outcome = (|| -> Result<_, String> {
-        let client = Client::new(endpoint)?;
-        data_block_on(async {
+        let client = Client::new(endpoint, data_runtime.clone())?;
+        data_runtime.block_on(async {
             let mut grpc = client.grpc().await?;
             grpc.heartbeat(Request::new(
                 novarocks_protocol::novarocks::HeartbeatRequest {
@@ -343,6 +360,7 @@ fn now_millis() -> i64 {
 
 pub(crate) fn new_query_lifecycle_transport(
     backends: &[LiveBackendTarget],
+    data_runtime: FrontendDataRuntime,
 ) -> Result<Arc<dyn QueryLifecycleTransport>, String> {
     if backends.is_empty() {
         return Err("gRPC query lifecycle transport requires at least one backend".to_string());
@@ -358,7 +376,7 @@ pub(crate) fn new_query_lifecycle_transport(
                         backend.endpoint(),
                         backend.start_epoch(),
                     ),
-                    Client::new(backend.endpoint())?,
+                    Client::new(backend.endpoint(), data_runtime.clone())?,
                 ),
             )
             .is_some()
@@ -366,10 +384,14 @@ pub(crate) fn new_query_lifecycle_transport(
             return Err(format!("duplicate backend_idx {}", backend.backend_idx()));
         }
     }
-    Ok(Arc::new(LifecycleTransport { backends: entries }))
+    Ok(Arc::new(LifecycleTransport {
+        backends: entries,
+        data_runtime,
+    }))
 }
 struct LifecycleTransport {
     backends: BTreeMap<usize, (QueryLifecycleTarget, Client)>,
+    data_runtime: FrontendDataRuntime,
 }
 impl LifecycleTransport {
     fn client(
@@ -439,22 +461,24 @@ impl QueryLifecycleTransport for LifecycleTransport {
         })
         .map_err(|error| unavailable(error.to_string()))?;
         let client = self.client(target)?.clone();
-        let stream = data_block_on(async move {
-            let deadline = tokio::time::Instant::now() + timeout;
-            let mut grpc = client
-                .grpc_deadline("query_control_attach", deadline)
+        let stream = self
+            .data_runtime
+            .block_on(async move {
+                let deadline = tokio::time::Instant::now() + timeout;
+                let mut grpc = client
+                    .grpc_deadline("query_control_attach", deadline)
+                    .await
+                    .map_err(unavailable)?;
+                tokio::time::timeout_at(
+                    deadline,
+                    grpc.query_control_stream(Request::new(ReceiverStream::new(rx))),
+                )
                 .await
-                .map_err(unavailable)?;
-            tokio::time::timeout_at(
-                deadline,
-                grpc.query_control_stream(Request::new(ReceiverStream::new(rx))),
-            )
-            .await
-            .map_err(|_| deadline_error("query control attach deadline exceeded"))?
-            .map(|value| value.into_inner())
-            .map_err(status_error)
-        })
-        .map_err(unavailable)??;
+                .map_err(|_| deadline_error("query control attach deadline exceeded"))?
+                .map(|value| value.into_inner())
+                .map_err(status_error)
+            })
+            .map_err(unavailable)??;
         let (events_tx, events_rx) = mpsc::channel(QUERY_CONTROL_CHANNEL_CAPACITY);
         let commands = Arc::new(Mutex::new(ControlCommands {
             sender: Some(tx),
@@ -463,15 +487,14 @@ impl QueryLifecycleTransport for LifecycleTransport {
             terminal: None,
         }));
         let bridge_commands = Arc::clone(&commands);
-        let bridge = data_runtime_handle().map_err(unavailable)?.spawn(bridge(
-            stream,
-            events_tx,
-            bridge_commands,
-        ));
+        let bridge = self
+            .data_runtime
+            .spawn(bridge(stream, events_tx, bridge_commands));
         Ok(Arc::new(ControlSession {
             commands,
             events: Mutex::new(events_rx),
             bridge: Mutex::new(Some(bridge)),
+            data_runtime: self.data_runtime.clone(),
         }))
     }
     fn stage_fragments(
@@ -589,20 +612,23 @@ where
     F: FnOnce(NovaRocksGrpcClient<Channel>, Request<T>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<tonic::Response<R>, tonic::Status>>,
 {
-    data_block_on(call_unary(
-        client.clone(),
-        operation,
-        timeout,
-        request,
-        call,
-    ))
-    .map_err(unavailable)?
+    client
+        .data_runtime
+        .block_on(call_unary(
+            client.clone(),
+            operation,
+            timeout,
+            request,
+            call,
+        ))
+        .map_err(unavailable)?
 }
 
 struct ControlSession {
     commands: Arc<Mutex<ControlCommands>>,
     events: Mutex<mpsc::Receiver<Result<QueryControlEvent, QueryLifecycleTransportError>>>,
     bridge: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    data_runtime: FrontendDataRuntime,
 }
 struct ControlCommands {
     sender: Option<mpsc::Sender<novarocks_protocol::novarocks::QueryControlRequest>>,
@@ -684,13 +710,14 @@ impl QueryControlSession for ControlSession {
             .events
             .lock()
             .map_err(|_| unavailable("query control event lock poisoned"))?;
-        data_block_on(async {
-            tokio::time::timeout(timeout, events.recv())
-                .await
-                .map_err(|_| deadline_error("query control event receive deadline exceeded"))?
-                .ok_or_else(|| closed("query control event stream is closed"))?
-        })
-        .map_err(unavailable)?
+        self.data_runtime
+            .block_on(async {
+                tokio::time::timeout(timeout, events.recv())
+                    .await
+                    .map_err(|_| deadline_error("query control event receive deadline exceeded"))?
+                    .ok_or_else(|| closed("query control event stream is closed"))?
+            })
+            .map_err(unavailable)?
     }
 }
 impl Drop for ControlSession {

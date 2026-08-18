@@ -15,6 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 pub mod backend_id;
-pub mod global_async_runtime;
 pub mod query_result;
 pub mod statement_result;

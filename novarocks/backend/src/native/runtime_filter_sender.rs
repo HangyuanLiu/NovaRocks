@@ -27,10 +27,9 @@ use std::time::Duration;
 
 use tokio::sync::{Notify, mpsc};
 
-use novarocks::novarocks_logging::error;
-use novarocks::runtime::global_async_runtime::data_runtime_handle;
 use novarocks_protocol::filter::RuntimeFilterEnvelopeResponse;
 
+use crate::BackendDataRuntime;
 use crate::native::client::NativeGrpcClient;
 use crate::native::runtime_filter_adapter::{
     BackendNativeRouteIdentity, BackendNativeRuntimeFilterEnvelope,
@@ -142,7 +141,9 @@ pub(crate) trait BackendRuntimeFilterEnvelopeUnaryClient: Send + Sync + 'static 
     ) -> Result<BackendRuntimeFilterUnaryAck, BackendRuntimeFilterUnaryError>;
 }
 
-struct LiveRuntimeFilterEnvelopeUnaryClient;
+struct LiveRuntimeFilterEnvelopeUnaryClient {
+    runtime: BackendDataRuntime,
+}
 
 #[async_trait::async_trait]
 impl BackendRuntimeFilterEnvelopeUnaryClient for LiveRuntimeFilterEnvelopeUnaryClient {
@@ -152,7 +153,7 @@ impl BackendRuntimeFilterEnvelopeUnaryClient for LiveRuntimeFilterEnvelopeUnaryC
         envelope: Arc<BackendNativeRuntimeFilterEnvelope>,
         deadline: Duration,
     ) -> Result<BackendRuntimeFilterUnaryAck, BackendRuntimeFilterUnaryError> {
-        let client = NativeGrpcClient::new_runtime_endpoint(route.endpoint())
+        let client = NativeGrpcClient::new_runtime_endpoint(self.runtime.clone(), route.endpoint())
             .map_err(BackendRuntimeFilterUnaryError::transport)?;
         let response = client
             .transmit_runtime_filter_envelope_async(
@@ -183,12 +184,16 @@ pub(crate) struct GrpcRuntimeFilterEnvelopeSink {
     completions: Mutex<mpsc::Receiver<BackendRuntimeFilterSinkCompletion>>,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
+    worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl GrpcRuntimeFilterEnvelopeSink {
-    pub(crate) fn new() -> Arc<Self> {
+    pub(crate) fn new(runtime: BackendDataRuntime) -> Arc<Self> {
         Self::new_with_client_and_capacities(
-            Arc::new(LiveRuntimeFilterEnvelopeUnaryClient),
+            runtime.clone(),
+            Arc::new(LiveRuntimeFilterEnvelopeUnaryClient {
+                runtime: runtime.clone(),
+            }),
             LIVE_REQUEST_CAPACITY,
             LIVE_COMPLETION_CAPACITY,
         )
@@ -204,6 +209,7 @@ impl GrpcRuntimeFilterEnvelopeSink {
             return Err("runtime filter sink capacities must be nonzero".to_string());
         }
         Ok(Self::new_with_client_and_capacities(
+            crate::native::runtime::test_backend_data_runtime(),
             client,
             request_capacity,
             completion_capacity,
@@ -211,6 +217,7 @@ impl GrpcRuntimeFilterEnvelopeSink {
     }
 
     fn new_with_client_and_capacities(
+        runtime: BackendDataRuntime,
         client: Arc<dyn BackendRuntimeFilterEnvelopeUnaryClient>,
         request_capacity: usize,
         completion_capacity: usize,
@@ -224,25 +231,19 @@ impl GrpcRuntimeFilterEnvelopeSink {
             completions: Mutex::new(completion_rx),
             shutdown: Arc::clone(&shutdown),
             shutdown_notify: Arc::clone(&shutdown_notify),
+            worker: Mutex::new(None),
         });
-        match data_runtime_handle() {
-            Ok(runtime) => {
-                runtime.spawn(run_worker(
-                    request_rx,
-                    completion_tx,
-                    client,
-                    shutdown,
-                    shutdown_notify,
-                ));
-            }
-            Err(runtime_error) => {
-                sink.shutdown.store(true, Ordering::Release);
-                error!(
-                    error = %runtime_error,
-                    "runtime filter envelope worker could not start"
-                );
-            }
-        }
+        let worker = runtime.handle().spawn(run_worker(
+            request_rx,
+            completion_tx,
+            client,
+            shutdown,
+            shutdown_notify,
+        ));
+        *sink
+            .worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(worker);
         sink
     }
 }
@@ -279,6 +280,14 @@ impl BackendRuntimeFilterEnvelopeSink for GrpcRuntimeFilterEnvelopeSink {
         if !self.shutdown.swap(true, Ordering::AcqRel) {
             self.shutdown_notify.notify_waiters();
             self.shutdown_notify.notify_one();
+        }
+        if let Some(worker) = self
+            .worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            worker.abort();
         }
     }
 }
@@ -344,7 +353,11 @@ async fn run_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::decode_runtime_filter_unary_ack;
+    use super::{
+        BackendRuntimeFilterEnvelopeSink, GrpcRuntimeFilterEnvelopeSink,
+        decode_runtime_filter_unary_ack,
+    };
+    use crate::native::runtime::test_backend_data_runtime;
     use crate::runtime_filter::domain::BackendAcceptStatus;
     use novarocks_protocol::filter::{
         RuntimeFilterAcceptStatus, RuntimeFilterContributionRouteIdentity,
@@ -392,5 +405,25 @@ mod tests {
             error,
             super::BackendRuntimeFilterUnaryError::Contract(_)
         ));
+    }
+
+    #[test]
+    fn shutdown_aborts_the_owned_runtime_filter_worker() {
+        let sink = GrpcRuntimeFilterEnvelopeSink::new(test_backend_data_runtime());
+        assert!(
+            sink.worker
+                .lock()
+                .expect("runtime filter worker lock")
+                .is_some()
+        );
+
+        sink.shutdown();
+
+        assert!(
+            sink.worker
+                .lock()
+                .expect("runtime filter worker lock")
+                .is_none()
+        );
     }
 }

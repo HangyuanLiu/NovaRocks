@@ -270,6 +270,7 @@ fallback 模糊 owner 和故障语义。
 debug/test 开关归启动进程环境。跨域 wire section 不因名字相似而整体归某一 kernel crate，Core 不拥有 application schema。
 
 - ADR-0072 — 完整应用配置 wire 为何由 Server 唯一拥有，并投影为各 domain 的 resolved typed input（active）
+- ADR-0087 — 进程 data runtime 为何由 Server 创建并经 role-local adapter 注入 FE/BE（active）
 
 #### 历史
 

@@ -242,13 +242,14 @@ fn dispatch_standalone_role_with_all_in_one(
 fn run_standalone_be_role(
     cfg: novarocks_server::app_config::NovaRocksConfig,
     port_override: Option<u16>,
+    data_runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     if let Some(warn) = be_role_start_warning(port_override) {
         eprintln!("WARN: {warn}");
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
+        .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
         .build()
         .map_err(|error| anyhow::anyhow!("role=be: build Tokio runtime: {error}"))?;
     let backend_config =
@@ -256,8 +257,37 @@ fn run_standalone_be_role(
     runtime
         .block_on(novarocks_backend::run_backend_server_until_signal(
             backend_config,
+            novarocks_backend::BackendDataRuntime::new(data_runtime),
         ))
         .map_err(|error| anyhow::anyhow!("role=be: {error}"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DataRuntimeSizing {
+    worker_threads: usize,
+    max_blocking_threads: usize,
+}
+
+fn data_runtime_sizing(cfg: &novarocks_server::app_config::NovaRocksConfig) -> DataRuntimeSizing {
+    DataRuntimeSizing {
+        worker_threads: cfg.runtime.actual_data_runtime_threads().max(1),
+        max_blocking_threads: cfg.runtime.data_runtime_max_blocking_threads.max(1),
+    }
+}
+
+fn build_data_runtime(
+    cfg: &novarocks_server::app_config::NovaRocksConfig,
+) -> anyhow::Result<tokio::runtime::Runtime> {
+    // Design: ADR-0087 (docs/adr/ADR-0087-server-owned-data-runtime-composition.md)
+    let sizing = data_runtime_sizing(cfg);
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(sizing.worker_threads)
+        .max_blocking_threads(sizing.max_blocking_threads)
+        .thread_name("novarocks-data-runtime")
+        .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
+        .build()
+        .map_err(|error| anyhow::anyhow!("build data Tokio runtime: {error}"))
 }
 
 fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()> {
@@ -278,16 +308,13 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
         },
     );
 
-    // Sizing for the process-wide data runtime is configuration, so it is
-    // installed here rather than read from a global the first time some
-    // connector reaches for the runtime. This must precede role dispatch.
-    novarocks::runtime::global_async_runtime::install_data_runtime_sizing(
-        novarocks::runtime::global_async_runtime::DataRuntimeSizing {
-            worker_threads: cfg.runtime.actual_data_runtime_threads(),
-            max_blocking_threads: cfg.runtime.data_runtime_max_blocking_threads,
-        },
-    )
-    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    // The process composition root owns the one data runtime for the selected
+    // role. It outlives every role host and is dropped synchronously after
+    // role shutdown returns.
+    let data_runtime = build_data_runtime(&cfg)?;
+    let frontend_data_runtime = data_runtime.handle().clone();
+    let backend_data_runtime = data_runtime.handle().clone();
+    let all_in_one_data_runtime = data_runtime.handle().clone();
 
     dispatch_standalone_role_with_all_in_one(
         role,
@@ -296,9 +323,7 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
         move |cfg, port| {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
-                .thread_stack_size(
-                    novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES,
-                )
+                .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
                 .build()
                 .map_err(|error| anyhow::anyhow!("role=fe: build Tokio runtime: {error}"))?;
             let frontend_config =
@@ -306,6 +331,7 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
             runtime
                 .block_on(novarocks_frontend::run_frontend_server_until_shutdown(
                     frontend_config,
+                    frontend_data_runtime,
                     async {
                         tokio::signal::ctrl_c().await.unwrap_or_else(|error| {
                             tracing::warn!(%error, "frontend Ctrl-C listener failed");
@@ -314,8 +340,8 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
                 ))
                 .map_err(|error| anyhow::anyhow!("role=fe: {error}"))
         },
-        run_standalone_be_role,
-        move |cfg, port| composition::run_all_in_one(cfg, port),
+        move |cfg, port| run_standalone_be_role(cfg, port, backend_data_runtime),
+        move |cfg, port| composition::run_all_in_one(cfg, port, all_in_one_data_runtime),
     )
 }
 
@@ -387,6 +413,49 @@ mod tests {
         load_config_and_resolve_role, parse_server_command, parse_standalone_server_args,
         resolve_cluster_role,
     };
+
+    #[test]
+    fn data_runtime_uses_the_configured_worker_budget_and_thread_name() {
+        let mut config = novarocks_server::app_config::NovaRocksConfig::default();
+        config.runtime.data_runtime_worker_threads = 2;
+        config.runtime.data_runtime_max_blocking_threads = 2;
+        assert_eq!(
+            super::data_runtime_sizing(&config),
+            super::DataRuntimeSizing {
+                worker_threads: 2,
+                max_blocking_threads: 2,
+            }
+        );
+        let runtime = super::build_data_runtime(&config).expect("build data runtime");
+        let observations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let tasks = (0..2)
+            .map(|_| {
+                let observations = std::sync::Arc::clone(&observations);
+                runtime.spawn(async move {
+                    observations.lock().expect("observation lock").push(
+                        std::thread::current()
+                            .name()
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                })
+            })
+            .collect::<Vec<_>>();
+        runtime.block_on(async {
+            for task in tasks {
+                task.await.expect("data runtime worker task");
+            }
+        });
+
+        let observations = observations.lock().expect("observation lock");
+        assert_eq!(observations.len(), 2);
+        assert!(
+            observations
+                .iter()
+                .all(|name| name == "novarocks-data-runtime")
+        );
+    }
 
     #[test]
     fn top_level_help_is_side_effect_free_command() {

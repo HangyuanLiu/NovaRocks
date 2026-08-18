@@ -49,6 +49,7 @@ use super::{
     QueryControlAttachment, QueryLifecycleError, QueryLifecycleErrorCode,
     QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
 };
+use crate::native::runtime::test_backend_data_runtime;
 use crate::native::runtime_filter_install::DecodedRuntimeFilterContribution;
 use crate::runtime_filter::participant::{
     BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipantFactory,
@@ -380,8 +381,8 @@ impl RuntimeFilterParticipantFactory for RecordingLocalRuntime {
                 "injected runtime-filter participant install failure",
             ));
         }
-        let participant =
-            BackendRuntimeFilterParticipantFactory.install(execution_id, contribution)?;
+        let participant = BackendRuntimeFilterParticipantFactory::new(test_backend_data_runtime())
+            .install(execution_id, contribution)?;
         let state = Arc::clone(&self.state);
         Ok(
             participant.with_close_hook_for_test(Arc::new(move |_participant, _reason| {

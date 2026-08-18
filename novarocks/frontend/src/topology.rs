@@ -44,6 +44,8 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use uuid::Uuid;
 
+use crate::native::data_runtime::FrontendDataRuntime;
+
 use crate::native::transport::heartbeat as native_heartbeat;
 
 const CLUSTER_BACKENDS_KEY: &[u8] = b"novarocks/frontend/cluster-backends/v1/state";
@@ -488,6 +490,8 @@ pub(crate) struct ClusterBackendService {
     heartbeat_round: Mutex<()>,
     heartbeat_signal: Mutex<HeartbeatSignal>,
     heartbeat_wake: Condvar,
+    #[cfg(test)]
+    _test_runtime_owner: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl ClusterBackendService {
@@ -495,6 +499,7 @@ impl ClusterBackendService {
         config: ClusterBackendOpenConfig,
         state_store: Option<Arc<dyn StateStore>>,
         runtime: Handle,
+        data_runtime: FrontendDataRuntime,
     ) -> Result<Arc<Self>, String> {
         let storage = match config.role() {
             ClusterRole::Fe => MembershipStorage::Durable(ClusterBackendRepository::new(
@@ -507,9 +512,12 @@ impl ClusterBackendService {
                 return Err("role=be must not open ClusterBackendService".to_string());
             }
         };
-        let service = Arc::new(Self::new(storage, runtime, &config, |be_id, endpoint| {
-            native_heartbeat(be_id, endpoint)
-        }));
+        let service = Arc::new(Self::new(
+            storage,
+            runtime,
+            &config,
+            move |be_id, endpoint| native_heartbeat(&data_runtime, be_id, endpoint),
+        ));
         if let MembershipStorage::Durable(repository) = &service.storage {
             let stored = match repository.load().await? {
                 Some(_) => {
@@ -568,6 +576,8 @@ impl ClusterBackendService {
                 stopping: false,
             }),
             heartbeat_wake: Condvar::new(),
+            #[cfg(test)]
+            _test_runtime_owner: None,
         }
     }
 
@@ -581,16 +591,22 @@ impl ClusterBackendService {
             Duration::from_secs(1),
         )
         .expect("valid test topology configuration");
-        let runtime = Handle::try_current().unwrap_or_else(|_| {
-            ::novarocks::runtime::global_async_runtime::data_runtime_handle()
-                .expect("initialize data runtime for topology test")
-        });
-        Self::new(
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("build topology test runtime"),
+        );
+        let handle = runtime.handle().clone();
+        let data_runtime = FrontendDataRuntime::new(handle.clone());
+        let mut service = Self::new(
             MembershipStorage::Transient,
-            runtime,
+            handle,
             &config,
-            |be_id, endpoint| native_heartbeat(be_id, endpoint),
-        )
+            move |be_id, endpoint| native_heartbeat(&data_runtime, be_id, endpoint),
+        );
+        service._test_runtime_owner = Some(runtime);
+        service
     }
 
     #[cfg(test)]
