@@ -33,9 +33,8 @@ use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use novarocks::query_lifecycle::QueryTerminalIngress;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
-use novarocks_protocol::{filter, lifecycle::ParticipantTerminalOutcome, novarocks as proto};
+use novarocks_protocol::{filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
@@ -64,7 +63,6 @@ pub(crate) struct NativeBackendGrpcService {
     native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
     query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     query_control_shutdown: Option<watch::Receiver<bool>>,
-    terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
     data_plane: NativeDataPlaneKernel,
     runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
 }
@@ -73,7 +71,6 @@ impl NativeBackendGrpcService {
     pub(crate) fn new(
         native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
         query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
-        terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
         runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     ) -> Self {
@@ -81,7 +78,6 @@ impl NativeBackendGrpcService {
             native_fragment_ingress,
             query_lifecycle_ingress,
             query_control_shutdown: None,
-            terminal_ingress,
             data_plane: NativeDataPlaneKernel::with_exchange_receiver_port(exchange_receiver_port),
             runtime_filter_ingress,
         }
@@ -369,45 +365,11 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
         &self,
         request: tonic::Request<proto::ReportQueryTerminalRequest>,
     ) -> Result<tonic::Response<proto::ReportQueryTerminalResponse>, tonic::Status> {
-        let Some(ingress) = self.terminal_ingress.clone() else {
-            return Ok(tonic::Response::new(proto::ReportQueryTerminalResponse {
-                outcome: proto::ReportQueryTerminalOutcome::RejectedGone as i32,
-                detail: "query terminal ingress is not installed for this role".to_string(),
-            }));
-        };
-        let outcome = request.into_inner().outcome.ok_or_else(|| {
-            tonic::Status::invalid_argument("ReportQueryTerminalRequest missing outcome")
-        })?;
-        let outcome =
-            ParticipantTerminalOutcome::parse(outcome).map_err(status_from_contract_error)?;
-        let ack = tokio::task::spawn_blocking(move || ingress.report_query_terminal(outcome))
-            .await
-            .map_err(|error| {
-                tonic::Status::internal(format!("query terminal ingress panicked: {error}"))
-            })?
-            .map_err(status_from_lifecycle_error)?;
-        let outcome = match ack.outcome().map_err(status_from_contract_error)? {
-            proto::ReportQueryTerminalOutcome::Accepted => {
-                proto::ReportQueryTerminalOutcome::Accepted
-            }
-            proto::ReportQueryTerminalOutcome::AlreadyAccepted => {
-                proto::ReportQueryTerminalOutcome::AlreadyAccepted
-            }
-            proto::ReportQueryTerminalOutcome::RejectedConflict => {
-                proto::ReportQueryTerminalOutcome::RejectedConflict
-            }
-            proto::ReportQueryTerminalOutcome::RejectedGone => {
-                proto::ReportQueryTerminalOutcome::RejectedGone
-            }
-            proto::ReportQueryTerminalOutcome::Unspecified => {
-                return Err(tonic::Status::internal(
-                    "validated terminal report acknowledgement has an unspecified outcome",
-                ));
-            }
-        };
+        let _ = request;
         Ok(tonic::Response::new(proto::ReportQueryTerminalResponse {
-            outcome: outcome as i32,
-            detail: ack.detail().to_string(),
+            outcome: proto::ReportQueryTerminalOutcome::RejectedGone as i32,
+            detail: "query terminal reports are accepted only by the frontend report endpoint"
+                .to_string(),
         }))
     }
 }

@@ -18,7 +18,7 @@
 pub mod contract;
 pub mod terminal;
 
-pub use contract::{QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress};
+pub use contract::{QueryLifecycleError, QueryLifecycleErrorCode};
 pub use novarocks_protocol::lifecycle::{
     AttemptId, ExchangeRouteManifest, FragmentLiveObservation, ParticipantBackendIdentity,
     ParticipantManifest, ParticipantManifestDigest, ParticipantRole, QueryAbortRequest,

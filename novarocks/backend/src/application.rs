@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use novarocks::common::network::AdvertiseEndpoint;
 use novarocks::connector::ConnectorRegistry;
-use novarocks::query_lifecycle::{QueryLifecycleError, QueryTerminalIngress};
 use novarocks::service::MetricsHttpServer;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_protocol::lifecycle::{
@@ -331,20 +330,6 @@ impl BackendApplicationHost {
         Self::open_with_readiness_timeout(config, READINESS_TIMEOUT)
     }
 
-    /// The combined all-in-one process still delivers terminal facts through
-    /// the generated gRPC service.  The FE-owned ingress is supplied only at
-    /// this composition root; a standalone BE must not accept terminal reports.
-    pub fn open_with_terminal_ingress(
-        config: BackendServerConfig,
-        terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
-    ) -> Result<Self, BackendApplicationError> {
-        Self::open_with_readiness_timeout_and_terminal_ingress(
-            config,
-            READINESS_TIMEOUT,
-            terminal_ingress,
-        )
-    }
-
     pub fn ready_marker(&self) -> &str {
         &self.ready_marker
     }
@@ -400,14 +385,6 @@ impl BackendApplicationHost {
         config: BackendServerConfig,
         readiness_timeout: Duration,
     ) -> Result<Self, BackendApplicationError> {
-        Self::open_with_readiness_timeout_and_terminal_ingress(config, readiness_timeout, None)
-    }
-
-    fn open_with_readiness_timeout_and_terminal_ingress(
-        config: BackendServerConfig,
-        readiness_timeout: Duration,
-        terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
-    ) -> Result<Self, BackendApplicationError> {
         let BackendServerConfig {
             bind_host,
             grpc_port,
@@ -455,7 +432,6 @@ impl BackendApplicationHost {
             NativeBackendGrpcService::new(
                 native_fragment_service.clone(),
                 services.query_lifecycle_ingress.clone(),
-                terminal_ingress,
                 runtime_filter_ingress,
                 Arc::clone(&services.exchange_receiver_port),
             ),
@@ -1279,3 +1255,4 @@ mod tests {
         );
     }
 }
+use novarocks::query_lifecycle::QueryLifecycleError;

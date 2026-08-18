@@ -26,7 +26,6 @@ use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_state_store::StateStoreHostConfig;
 
-use crate::native::report_server::FrontendReportServerHandle;
 use crate::query_execution::maintenance::{
     BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory,
 };
@@ -388,13 +387,8 @@ async fn serve_ready_frontend_session_factory<F>(
 where
     F: Future<Output = ()> + Send,
 {
-    let mut report_server = FrontendReportServerHandle::start(
-        &config.report_bind_host,
-        config.report_grpc_port,
-        host.terminal_ingress(),
-        host.lifecycle_convergence_reader(),
-    )
-    .map_err(FrontendApplicationError::server)?;
+    let mut report_server =
+        host.start_report_server_from_host(&config.report_bind_host, config.report_grpc_port)?;
     let exchange_port = report_server.bound_addr().port();
     host.coordinator_report_endpoint_sink()
         .set_bound_port(exchange_port);
@@ -814,25 +808,25 @@ mod tests {
         .await
         .expect("open frontend application host");
         let report_endpoint = host.coordinator_report_endpoint_sink();
-        let mut report_server = crate::native::report_server::FrontendReportServerHandle::start(
-            "127.0.0.1",
-            0,
-            host.terminal_ingress(),
-            host.lifecycle_convergence_reader(),
-        )
-        .expect("start frontend-owned report endpoint");
-        let grpc_port = report_server.bound_addr().port();
-        report_endpoint.set_bound_port(grpc_port);
-        assert_ne!(
-            grpc_port, 0,
-            "ephemeral report listener selects a real port"
-        );
-        assert_eq!(
-            report_server.poll_failure().expect("poll report listener"),
-            None,
-            "report listener remains live after bind"
-        );
-        report_server.stop().expect("stop frontend report endpoint");
+        for bind_addr in ["127.0.0.1:0".parse().unwrap(), "[::1]:0".parse().unwrap()] {
+            let mut report_server = host
+                .start_report_server(bind_addr)
+                .expect("start frontend-owned report endpoint");
+            let bound_addr = report_server.bound_addr();
+            report_endpoint.set_bound_port(bound_addr.port());
+            assert_ne!(
+                bound_addr.port(),
+                0,
+                "ephemeral report listener selects a real port"
+            );
+            assert_eq!(bound_addr.is_ipv6(), bind_addr.is_ipv6());
+            assert_eq!(
+                report_server.poll_failure().expect("poll report listener"),
+                None,
+                "report listener remains live after bind"
+            );
+            report_server.stop().expect("stop frontend report endpoint");
+        }
         host.shutdown()
             .await
             .expect("shutdown frontend application host");

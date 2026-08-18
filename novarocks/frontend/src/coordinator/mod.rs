@@ -31,5 +31,5 @@ pub(crate) use query_registry::{
     QueryLifecycleConvergenceErrorSource, QueryLifecycleConvergenceReader,
     QueryLifecycleConvergenceSnapshot,
 };
-pub use report::FrontendCoordinatorTerminalIngress;
+pub use report::{FrontendCoordinatorTerminalIngress, QueryTerminalIngress};
 pub use scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};

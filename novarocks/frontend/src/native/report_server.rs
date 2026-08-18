@@ -7,14 +7,16 @@ use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
-use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress};
+use crate::coordinator::QueryTerminalIngress;
+use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use axum::Json;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use novarocks_protocol::lifecycle::{
-    ContractError, ContractErrorCode, ParticipantTerminalOutcome, QueryTerminalReportOutcome,
+    ContractError, ContractErrorCode, ParticipantTerminalOutcome, QueryTerminalReportAck,
+    QueryTerminalReportOutcome,
 };
 use novarocks_protocol::{filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -329,27 +331,56 @@ impl NovaRocksGrpc for FrontendReportService {
                 tonic::Status::internal(format!("query terminal ingress panicked: {error}"))
             })?
             .map_err(status_from_lifecycle_error)?;
-        let outcome = match ack.outcome().map_err(status_from_contract_error)? {
-            QueryTerminalReportOutcome::Accepted => proto::ReportQueryTerminalOutcome::Accepted,
-            QueryTerminalReportOutcome::AlreadyAccepted => {
-                proto::ReportQueryTerminalOutcome::AlreadyAccepted
-            }
-            QueryTerminalReportOutcome::RejectedConflict => {
-                proto::ReportQueryTerminalOutcome::RejectedConflict
-            }
-            QueryTerminalReportOutcome::RejectedGone => {
-                proto::ReportQueryTerminalOutcome::RejectedGone
-            }
-            QueryTerminalReportOutcome::Unspecified => {
-                return Err(tonic::Status::internal(
-                    "validated query terminal report acknowledgement has an unspecified outcome",
-                ));
-            }
-        };
-        Ok(tonic::Response::new(proto::ReportQueryTerminalResponse {
-            outcome: outcome as i32,
-            detail: ack.detail().to_string(),
-        }))
+        let response = report_response_from_ack(ack)?;
+        Ok(tonic::Response::new(response))
+    }
+}
+
+fn report_response_from_ack(
+    ack: QueryTerminalReportAck,
+) -> Result<proto::ReportQueryTerminalResponse, tonic::Status> {
+    let outcome = match ack.outcome().map_err(status_from_contract_error)? {
+        QueryTerminalReportOutcome::Accepted => proto::ReportQueryTerminalOutcome::Accepted,
+        QueryTerminalReportOutcome::AlreadyAccepted => {
+            proto::ReportQueryTerminalOutcome::AlreadyAccepted
+        }
+        QueryTerminalReportOutcome::RejectedConflict => {
+            proto::ReportQueryTerminalOutcome::RejectedConflict
+        }
+        QueryTerminalReportOutcome::RejectedGone => proto::ReportQueryTerminalOutcome::RejectedGone,
+        QueryTerminalReportOutcome::Unspecified => {
+            return Err(tonic::Status::internal(
+                "validated query terminal report acknowledgement has an unspecified outcome",
+            ));
+        }
+    };
+    Ok(proto::ReportQueryTerminalResponse {
+        outcome: outcome as i32,
+        detail: ack.detail().to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::report_response_from_ack;
+    use novarocks_protocol::lifecycle::{QueryTerminalReportAck, QueryTerminalReportOutcome};
+    use novarocks_protocol::novarocks as proto;
+
+    #[test]
+    fn terminal_report_ack_preserves_every_typed_wire_outcome() {
+        for outcome in [
+            QueryTerminalReportOutcome::Accepted,
+            QueryTerminalReportOutcome::AlreadyAccepted,
+            QueryTerminalReportOutcome::RejectedConflict,
+            QueryTerminalReportOutcome::RejectedGone,
+        ] {
+            let response = report_response_from_ack(
+                QueryTerminalReportAck::new(outcome, "test").expect("valid report ack"),
+            )
+            .expect("encode report response");
+            assert_eq!(response.outcome, outcome as i32);
+            assert_eq!(response.detail, "test");
+        }
     }
 }
 
@@ -382,7 +413,7 @@ fn status_from_contract_error(error: ContractError) -> tonic::Status {
 
 /// Instance-owned report listener. The host exposes only lifecycle methods,
 /// never a Tonic service or a Core listener handle.
-pub(crate) struct FrontendReportServerHandle {
+pub struct FrontendReportServerHandle {
     bound_addr: SocketAddr,
     shutdown_tx: Option<watch::Sender<bool>>,
     failure_rx: mpsc::Receiver<String>,
@@ -392,12 +423,10 @@ pub(crate) struct FrontendReportServerHandle {
 
 impl FrontendReportServerHandle {
     pub(crate) fn start(
-        host: &str,
-        port: u16,
+        address: SocketAddr,
         ingress: Arc<dyn QueryTerminalIngress>,
         convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
     ) -> Result<Self, String> {
-        let address = parse_bind_addr(host, port)?;
         let listener = TcpListener::bind(address).map_err(|error| {
             format!("bind frontend report endpoint on {address} failed: {error}")
         })?;
@@ -494,18 +523,27 @@ impl FrontendReportServerHandle {
         })
     }
 
-    pub(crate) const fn bound_addr(&self) -> SocketAddr {
+    pub(crate) fn start_from_host(
+        host: &str,
+        port: u16,
+        ingress: Arc<dyn QueryTerminalIngress>,
+        convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
+    ) -> Result<Self, String> {
+        Self::start(parse_bind_addr(host, port)?, ingress, convergence_reader)
+    }
+
+    pub const fn bound_addr(&self) -> SocketAddr {
         self.bound_addr
     }
 
-    pub(crate) fn poll_failure(&mut self) -> Result<Option<String>, String> {
+    pub fn poll_failure(&mut self) -> Result<Option<String>, String> {
         match self.failure_rx.try_recv() {
             Ok(error) => Ok(Some(error)),
             Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => Ok(None),
         }
     }
 
-    pub(crate) fn stop(&mut self) -> Result<(), String> {
+    pub fn stop(&mut self) -> Result<(), String> {
         self.stop_requested.store(true, Ordering::Release);
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(true);

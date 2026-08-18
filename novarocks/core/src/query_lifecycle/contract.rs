@@ -18,8 +18,8 @@
 //! Core-local lifecycle errors and role traits.
 //!
 //! Lifecycle values and their wire validation belong to `novarocks-protocol`.
-//! Core keeps only orchestration errors and the FE-owned terminal-ingress
-//! trait; it must not mirror the native RPC DTOs or their codecs.
+//! Core keeps only orchestration errors; it must not mirror native RPC DTOs,
+//! their codecs, or Frontend-owned terminal ingress.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryLifecycleErrorCode {
@@ -71,13 +71,4 @@ impl From<novarocks_protocol::lifecycle::ContractError> for QueryLifecycleError 
     fn from(error: novarocks_protocol::lifecycle::ContractError) -> Self {
         Self::invalid_manifest(error.detail())
     }
-}
-
-/// FE-owned ingress for immutable participant terminal outcomes. It is
-/// intentionally distinct from FE-to-BE lifecycle RPCs.
-pub trait QueryTerminalIngress: Send + Sync + 'static {
-    fn report_query_terminal(
-        &self,
-        outcome: novarocks_protocol::lifecycle::ParticipantTerminalOutcome,
-    ) -> Result<novarocks_protocol::lifecycle::QueryTerminalReportAck, QueryLifecycleError>;
 }

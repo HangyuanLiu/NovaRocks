@@ -868,13 +868,41 @@ impl FrontendApplicationHost {
         self.query_control.clone()
     }
 
-    pub fn terminal_ingress(&self) -> Arc<dyn crate::query_lifecycle::QueryTerminalIngress> {
+    pub fn terminal_ingress(&self) -> Arc<dyn crate::coordinator::QueryTerminalIngress> {
         Arc::new(
             self.coordinator
                 .as_ref()
                 .expect("frontend coordinator is installed before host open returns")
                 .terminal_ingress(),
         )
+    }
+
+    pub fn start_report_server(
+        &self,
+        bind_addr: std::net::SocketAddr,
+    ) -> Result<crate::native::report_server::FrontendReportServerHandle, FrontendApplicationError>
+    {
+        crate::native::report_server::FrontendReportServerHandle::start(
+            bind_addr,
+            self.terminal_ingress(),
+            self.lifecycle_convergence_reader(),
+        )
+        .map_err(FrontendApplicationError::server)
+    }
+
+    pub(crate) fn start_report_server_from_host(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<crate::native::report_server::FrontendReportServerHandle, FrontendApplicationError>
+    {
+        crate::native::report_server::FrontendReportServerHandle::start_from_host(
+            host,
+            port,
+            self.terminal_ingress(),
+            self.lifecycle_convergence_reader(),
+        )
+        .map_err(FrontendApplicationError::server)
     }
 
     pub(crate) fn lifecycle_convergence_reader(&self) -> Arc<dyn QueryLifecycleConvergenceReader> {
