@@ -18,7 +18,6 @@
 use std::sync::{Arc, Barrier, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
-use novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks::service::query_lifecycle_metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
@@ -47,7 +46,8 @@ use super::registry::{
     QueryLifecycleRegistryConfig, StageBuildDecision,
 };
 use super::{
-    QueryControlAttachment, QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
+    QueryControlAttachment, QueryLifecycleError, QueryLifecycleErrorCode,
+    QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
 };
 use crate::native::runtime_filter_install::DecodedRuntimeFilterContribution;
 use crate::runtime_filter::participant::{

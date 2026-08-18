@@ -19,7 +19,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_protocol::lifecycle::{
     FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantManifest,
     ParticipantManifestDigest, ParticipantTerminalOutcome, QueryControlEvent, QueryInitOutcome,
@@ -29,6 +28,7 @@ use novarocks_types::UniqueId;
 use prost::Message;
 
 use super::stage::StartGate;
+use super::{QueryLifecycleError, QueryLifecycleErrorCode};
 use crate::runtime_filter::participant::RuntimeFilterParticipant;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

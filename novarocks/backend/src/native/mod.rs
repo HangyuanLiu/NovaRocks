@@ -32,6 +32,7 @@ pub(crate) mod instance;
 pub(crate) mod layout;
 pub(crate) mod lifecycle_adapter;
 pub(crate) mod plan_decode;
+pub(crate) mod query_options;
 pub(crate) mod runtime_filter;
 pub(crate) mod runtime_filter_adapter;
 pub(crate) mod runtime_filter_install;

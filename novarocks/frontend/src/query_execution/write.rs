@@ -32,9 +32,8 @@ use sha2::{Digest, Sha256};
 use crate::query_execution::artifact::WriterRegistrationSet;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use ::novarocks::common::types::UniqueId;
-use ::novarocks::query_lifecycle::{FragmentTerminalOutcome, FragmentTerminalSnapshot};
 use novarocks_protocol::lifecycle::QueryExecutionId;
-use novarocks_protocol::{common, novarocks};
+use novarocks_protocol::novarocks;
 
 // This is deliberately a wire-level value rather than an Iceberg enum.  The
 // SPI's first terminal state is `Staged`; coordinator code must never count a
@@ -311,40 +310,47 @@ impl WriteTerminalBuilder {
 
     pub fn apply_terminal(
         &mut self,
-        fragment: &FragmentTerminalSnapshot,
+        fragment: &novarocks::QueryTerminalFragmentSnapshot,
     ) -> Result<(), DistributedQueryError> {
         let key = WriterKey {
             query_id: self.write_id,
-            fragment_instance_id: fragment.fragment_instance_id(),
-            backend_num: fragment.backend_num(),
+            fragment_instance_id: fragment
+                .fragment_instance_id
+                .as_ref()
+                .map(|id| UniqueId::new(id.hi, id.lo))
+                .expect("validated terminal fragment always has an instance id"),
+            backend_num: fragment.backend_num,
         };
         let Some((writer_id, fragment_id, execution_id, expected_cohort_id)) =
             self.expected.get(&key).copied()
         else {
             return Ok(());
         };
-        if !matches!(fragment.outcome(), FragmentTerminalOutcome::Succeeded) {
-            self.failure
-                .get_or_insert_with(|| match fragment.outcome() {
-                    FragmentTerminalOutcome::Failed { code, detail, .. } => {
-                        format!("native writer failed with {code}: {detail}")
+        if fragment.outcome != novarocks::QueryTerminalFragmentOutcome::Succeeded as i32 {
+            self.failure.get_or_insert_with(|| {
+                match novarocks::QueryTerminalFragmentOutcome::try_from(fragment.outcome) {
+                    Ok(novarocks::QueryTerminalFragmentOutcome::Failed) => {
+                        format!(
+                            "native writer failed with {}: {}",
+                            fragment.error_code, fragment.error_detail
+                        )
                     }
-                    FragmentTerminalOutcome::Cancelled { detail, .. } => {
-                        format!("native writer cancelled: {detail}")
+                    Ok(novarocks::QueryTerminalFragmentOutcome::Cancelled) => {
+                        format!("native writer cancelled: {}", fragment.error_detail)
                     }
-                    FragmentTerminalOutcome::IncompleteDrain { detail, .. } => {
-                        format!("native writer drain was incomplete: {detail}")
+                    Ok(novarocks::QueryTerminalFragmentOutcome::IncompleteDrain) => {
+                        format!(
+                            "native writer drain was incomplete: {}",
+                            fragment.error_detail
+                        )
                     }
-                    FragmentTerminalOutcome::Succeeded => unreachable!(),
-                });
+                    Ok(novarocks::QueryTerminalFragmentOutcome::Succeeded) => unreachable!(),
+                    _ => "native writer reported an invalid terminal outcome".to_string(),
+                }
+            });
             return Ok(());
         }
-        let frames = fragment
-            .sink()
-            .connector_staged_report_frames
-            .iter()
-            .map(::novarocks::query_lifecycle::terminal::encode_connector_staged_report_frame)
-            .collect::<Vec<_>>();
+        let frames = fragment.connector_staged_report_frames.clone();
         if let Err(error) = validate_connector_staged_report_frames(
             &frames,
             key.query_id,
@@ -384,9 +390,21 @@ impl WriteTerminalBuilder {
             writer_key: key.clone(),
             connector_staged_report_frames: frames,
             load_counters: BTreeMap::new(),
-            loaded_rows: fragment.sink().load_stats.loaded_rows,
-            loaded_bytes: fragment.sink().load_stats.loaded_bytes,
-            filtered_rows: fragment.sink().load_stats.filtered_rows,
+            loaded_rows: fragment
+                .load_stats
+                .as_ref()
+                .expect("validated terminal fragment always has load stats")
+                .loaded_rows,
+            loaded_bytes: fragment
+                .load_stats
+                .as_ref()
+                .expect("validated terminal fragment always has load stats")
+                .loaded_bytes,
+            filtered_rows: fragment
+                .load_stats
+                .as_ref()
+                .expect("validated terminal fragment always has load stats")
+                .filtered_rows,
         };
         if let Some(existing) = self.completed.get(&key) {
             if existing == &output {
@@ -837,14 +855,8 @@ fn query_id_to_be_bytes(execution_id: QueryExecutionId) -> [u8; 16] {
 mod tests {
     use super::*;
     use crate::query_execution::contract::QueryId;
-    use ::novarocks::query_lifecycle::{
-        QueryTerminalProfileContributionV1, QueryTerminalSnapshot, TerminalTelemetry,
-    };
-    use ::novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
-    use novarocks_protocol::lifecycle::{
-        AttemptId, ParticipantBackendIdentity, ParticipantManifestDigest, QueryControlEndpoint,
-    };
-    use novarocks_protocol::plan;
+    use novarocks_protocol::lifecycle::{AttemptId, QueryTerminalSnapshot};
+    use novarocks_protocol::{common, plan};
     use prost::Message;
 
     fn query_id() -> UniqueId {
@@ -925,34 +937,49 @@ mod tests {
         }
     }
 
-    fn writer_terminal_fragment() -> FragmentTerminalSnapshot {
-        let staged = decode_connector_staged_report_frame(&frame(b"report", 0, 1, b"report"))
-            .expect("valid staged report frame");
-        FragmentTerminalSnapshot::new(
-            fragment_instance_id(),
-            31,
-            FragmentTerminalOutcome::Succeeded,
-            SinkCommitReportSnapshot::default().with_connector_staged_report_frames(vec![staged]),
-            None,
-        )
-        .expect("writer terminal fragment")
+    fn writer_terminal_fragment() -> novarocks::QueryTerminalFragmentSnapshot {
+        novarocks::QueryTerminalFragmentSnapshot {
+            fragment_instance_id: Some(common::UniqueId {
+                hi: fragment_instance_id().high(),
+                lo: fragment_instance_id().low(),
+            }),
+            backend_num: 31,
+            outcome: novarocks::QueryTerminalFragmentOutcome::Succeeded as i32,
+            connector_staged_report_frames: vec![frame(b"report", 0, 1, b"report")],
+            load_stats: Some(novarocks::QueryTerminalLoadStats::default()),
+            profile: Some(novarocks::FragmentTerminalProfileTelemetry {
+                telemetry: Some(
+                    novarocks::fragment_terminal_profile_telemetry::Telemetry::Unavailable(
+                        novarocks::TerminalTelemetryUnavailable {
+                            stage: "test".to_string(),
+                            code: "UNAVAILABLE".to_string(),
+                        },
+                    ),
+                ),
+            }),
+            ..Default::default()
+        }
     }
 
     fn terminal_snapshot_with_p2(
-        profile_contribution: TerminalTelemetry<QueryTerminalProfileContributionV1>,
+        profile_contribution: novarocks::QueryTerminalProfileContributionTelemetry,
     ) -> QueryTerminalSnapshot {
-        QueryTerminalSnapshot::new_with_profile_telemetry(
-            execution_id(),
-            ParticipantBackendIdentity::new(
-                31,
-                QueryControlEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
-                1,
-            )
-            .expect("backend identity"),
-            ParticipantManifestDigest::new([9; 32]),
-            vec![writer_terminal_fragment()],
-            profile_contribution,
-        )
+        QueryTerminalSnapshot::seal(novarocks::QueryTerminalSnapshot {
+            version: 1,
+            execution_id: Some(execution_id().into()),
+            backend: Some(novarocks::ParticipantBackendIdentity {
+                backend_id: 31,
+                endpoint: Some(novarocks::QueryControlEndpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: 9030,
+                }),
+                start_epoch: 1,
+            }),
+            init_digest: vec![9; 32],
+            fragments: vec![writer_terminal_fragment()],
+            profile_contribution: Some(profile_contribution),
+            ..Default::default()
+        })
         .expect("terminal snapshot")
     }
 
@@ -971,7 +998,7 @@ mod tests {
             failure: None,
         };
         builder
-            .apply_terminal(&snapshot.fragments()[0])
+            .apply_terminal(&snapshot.as_proto().fragments[0])
             .expect("apply writer terminal");
         let (commit, abort) = builder.finish().expect("complete write").into_payloads();
         assert!(abort.is_none(), "P2 telemetry must not abort the write");
@@ -1042,15 +1069,28 @@ mod tests {
 
     #[test]
     fn p2_unavailable_preserves_staged_report_frame_bytes() {
-        let available = terminal_snapshot_with_p2(TerminalTelemetry::Available(
-            QueryTerminalProfileContributionV1::empty(),
-        ));
+        let available =
+            terminal_snapshot_with_p2(novarocks::QueryTerminalProfileContributionTelemetry {
+                telemetry: Some(
+                    novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
+                        novarocks::QueryTerminalProfileContributionV1 {
+                            version: 1,
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            });
         let unavailable = terminal_snapshot_with_p2(
-            TerminalTelemetry::unavailable(
-                "runtime_filter_terminal_capture",
-                "INJECTED_P2_ASSEMBLY_FAILURE",
-            )
-            .expect("typed P2 unavailable"),
+            novarocks::QueryTerminalProfileContributionTelemetry {
+                telemetry: Some(
+                    novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(
+                        novarocks::TerminalTelemetryUnavailable {
+                            stage: "runtime_filter_terminal_capture".to_string(),
+                            code: "INJECTED_P2_ASSEMBLY_FAILURE".to_string(),
+                        },
+                    ),
+                ),
+            },
         );
 
         assert_eq!(

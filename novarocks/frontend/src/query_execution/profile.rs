@@ -23,9 +23,9 @@ use std::collections::HashMap;
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::outcome::FragmentProfileSet;
-use ::novarocks::query_lifecycle::{
-    FragmentTerminalOutcome, FragmentTerminalSnapshot, QueryTerminalSnapshot,
-};
+use crate::query_execution::terminal_codec::decode_runtime_profile_tree;
+use novarocks_protocol::lifecycle::{QueryTerminalProfileContributionV1, QueryTerminalSnapshot};
+use novarocks_protocol::novarocks;
 
 const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
 const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
@@ -55,14 +55,19 @@ impl ProfileTerminalBuilder {
         &mut self,
         snapshot: &QueryTerminalSnapshot,
     ) -> Result<(), DistributedQueryError> {
-        let Some(contribution) = snapshot.profile_contribution() else {
+        let telemetry = snapshot.profile_contribution_telemetry();
+        let Some(contribution) = telemetry.available() else {
             return Ok(());
         };
-        if contribution.is_empty() {
+        if contribution.as_proto().channels.is_empty()
+            && contribution.as_proto().producer_streams.is_empty()
+            && contribution.as_proto().transport_routes.is_empty()
+            && contribution.as_proto().consumers.is_empty()
+        {
             return Ok(());
         }
 
-        let participant_totals = RuntimeFilterProfileTotals::from_contribution(contribution)?;
+        let participant_totals = RuntimeFilterProfileTotals::from_contribution(&contribution)?;
         let execution_totals = self
             .runtime_filter_totals
             .checked_merged(participant_totals)?;
@@ -70,7 +75,7 @@ impl ProfileTerminalBuilder {
 
         self.profiles.push(runtime_filter_profile_tree(
             snapshot,
-            contribution,
+            &contribution,
             participant_totals,
         )?);
         self.runtime_filter_totals = execution_totals;
@@ -81,16 +86,25 @@ impl ProfileTerminalBuilder {
     /// query result or fabricating an empty profile tree.
     pub fn apply_terminal(
         &mut self,
-        fragment: &FragmentTerminalSnapshot,
+        fragment: &novarocks::QueryTerminalFragmentSnapshot,
     ) -> Result<(), DistributedQueryError> {
-        if !matches!(fragment.outcome(), FragmentTerminalOutcome::Succeeded) {
+        if fragment.outcome != novarocks::QueryTerminalFragmentOutcome::Succeeded as i32 {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::Failed,
                 "fragment terminal snapshot reports a non-successful outcome",
             ));
         }
-        if let Some(profile) = fragment.profile().cloned() {
-            self.profiles.push(profile);
+        let telemetry = fragment
+            .profile
+            .as_ref()
+            .expect("validated terminal fragment always has profile telemetry");
+        if let Some(novarocks::fragment_terminal_profile_telemetry::Telemetry::Available(profile)) =
+            telemetry.telemetry.as_ref()
+        {
+            self.profiles
+                .push(decode_runtime_profile_tree(profile).map_err(|error| {
+                    DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
+                })?);
         }
         Ok(())
     }
@@ -141,77 +155,80 @@ struct RuntimeFilterProfileTotals {
 
 impl RuntimeFilterProfileTotals {
     fn from_contribution(
-        contribution: &::novarocks::query_lifecycle::QueryTerminalProfileContributionV1,
+        contribution: &QueryTerminalProfileContributionV1,
     ) -> Result<Self, DistributedQueryError> {
         let mut totals = Self::default();
         for consumer in contribution.consumers() {
-            totals.has_row_evaluation |= consumer.row_evaluations() != 0;
+            totals.has_row_evaluation |= consumer.row_evaluations != 0;
             totals.has_scan_evaluation |=
-                consumer.scan_evaluated() != 0 || consumer.scan_not_evaluated() != 0;
+                consumer.scan_evaluated != 0 || consumer.scan_not_evaluated != 0;
             checked_add_profile_counter(
                 &mut totals.input_rows,
-                consumer.input_rows(),
+                consumer.input_rows,
                 RUNTIME_FILTER_INPUT_ROWS,
             )?;
             checked_add_profile_counter(
                 &mut totals.output_rows,
-                consumer.output_rows(),
+                consumer.output_rows,
                 RUNTIME_FILTER_OUTPUT_ROWS,
             )?;
             checked_add_profile_counter(
                 &mut totals.scan_pruned,
-                consumer.scan_pruned(),
+                consumer.scan_pruned,
                 RUNTIME_FILTER_SCAN_UNITS_PRUNED,
             )?;
             checked_add_profile_counter(
                 &mut totals.scan_kept,
-                consumer.scan_kept(),
+                consumer.scan_kept,
                 RUNTIME_FILTER_SCAN_UNITS_KEPT,
             )?;
             checked_add_profile_counter(
                 &mut totals.scan_not_evaluated,
-                consumer.scan_not_evaluated(),
+                consumer.scan_not_evaluated,
                 RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED,
             )?;
-            let reasons = consumer.scan_not_evaluated_reasons();
+            let reasons = consumer
+                .scan_not_evaluated_reasons
+                .as_ref()
+                .expect("validated runtime-filter consumer has scan reasons");
             checked_add_profile_counter(
                 &mut totals.scan_not_evaluated_unit_facts_missing,
-                reasons.unit_facts_missing(),
+                reasons.unit_facts_missing,
                 RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_UNIT_FACTS_MISSING,
             )?;
             checked_add_profile_counter(
                 &mut totals.scan_not_evaluated_column_facts_missing,
-                reasons.column_facts_missing(),
+                reasons.column_facts_missing,
                 RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_COLUMN_FACTS_MISSING,
             )?;
             checked_add_profile_counter(
                 &mut totals.scan_not_evaluated_data_type_unsupported,
-                reasons.data_type_unsupported(),
+                reasons.data_type_unsupported,
                 RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_DATA_TYPE_UNSUPPORTED,
             )?;
             checked_add_profile_counter(
                 &mut totals.scan_not_evaluated_predicate_capability_unsupported,
-                reasons.predicate_capability_unsupported(),
+                reasons.predicate_capability_unsupported,
                 RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_PREDICATE_CAPABILITY_UNSUPPORTED,
             )?;
             checked_add_profile_counter(
                 &mut totals.scan_not_evaluated_resource_unavailable,
-                reasons.resource_unavailable(),
+                reasons.resource_unavailable,
                 RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_RESOURCE_UNAVAILABLE,
             )?;
             checked_add_profile_counter(
                 &mut totals.scan_not_evaluated_snapshot_unavailable,
-                reasons.snapshot_unavailable(),
+                reasons.snapshot_unavailable,
                 RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_UNAVAILABLE,
             )?;
             checked_add_profile_counter(
                 &mut totals.scan_not_evaluated_snapshot_timed_out,
-                reasons.snapshot_timed_out(),
+                reasons.snapshot_timed_out,
                 RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_TIMED_OUT,
             )?;
             checked_add_profile_counter(
                 &mut totals.scan_not_evaluated_snapshot_not_published,
-                reasons.snapshot_not_published(),
+                reasons.snapshot_not_published,
                 RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_NOT_PUBLISHED,
             )?;
         }
@@ -342,7 +359,7 @@ impl RuntimeFilterProfileTotals {
 
 fn runtime_filter_profile_tree(
     snapshot: &QueryTerminalSnapshot,
-    contribution: &::novarocks::query_lifecycle::QueryTerminalProfileContributionV1,
+    contribution: &QueryTerminalProfileContributionV1,
     totals: RuntimeFilterProfileTotals,
 ) -> Result<RuntimeProfileTree, DistributedQueryError> {
     let execution_id = snapshot.execution_id();
@@ -416,39 +433,46 @@ fn runtime_filter_profile_tree(
     }
 
     for channel in contribution.channels() {
-        let channel_key = channel.key();
         let channel_profile = participant.child(format!(
             "RuntimeFilterChannel (channel_binding_id={}, channel_id={})",
-            channel_key.channel_binding_id(),
-            channel_key.channel_id()
+            channel.channel_binding_id, channel.channel_id
         ));
         channel_profile.add_info_string(
             "LatestPublishedLogicalVersion",
             channel
-                .latest_published_logical_version()
+                .latest_published_logical_version
                 .map_or_else(|| "none".to_string(), |version| version.to_string()),
         );
-        for consumer in contribution
-            .consumers()
-            .iter()
-            .filter(|consumer| consumer.key().channel() == channel_key)
-        {
-            let key = consumer.key();
+        for consumer in contribution.consumers().iter().filter(|consumer| {
+            consumer.channel_binding_id == channel.channel_binding_id
+                && consumer.channel_id == channel.channel_id
+        }) {
             let consumer_profile = channel_profile.child(format!(
                 "RuntimeFilterConsumer (consumer_binding_id={}, fragment_instance_id={})",
-                key.consumer_binding_id(),
-                key.fragment_instance_id()
+                consumer.consumer_binding_id,
+                novarocks_types::UniqueId::new(
+                    consumer
+                        .fragment_instance_id
+                        .as_ref()
+                        .expect("validated runtime-filter consumer has fragment identity")
+                        .hi,
+                    consumer
+                        .fragment_instance_id
+                        .as_ref()
+                        .expect("validated runtime-filter consumer has fragment identity")
+                        .lo,
+                )
             ));
             consumer_profile.add_info_string(
                 "LatestDeliveredLogicalVersion",
                 consumer
-                    .latest_delivered_logical_version()
+                    .latest_delivered_logical_version
                     .map_or_else(|| "none".to_string(), |version| version.to_string()),
             );
             consumer_profile.add_info_string(
                 "LatestAppliedLogicalVersion",
                 consumer
-                    .latest_applied_logical_version()
+                    .latest_applied_logical_version
                     .map_or_else(|| "none".to_string(), |version| version.to_string()),
             );
         }
@@ -1074,19 +1098,9 @@ mod tests {
         collect_per_fragment_profile_summaries, merge_actual_metrics,
     };
     use crate::query_execution::contract::QueryId;
-    use ::novarocks::common::types::UniqueId;
-    use ::novarocks::query_lifecycle::{
-        QueryTerminalProfileContributionV1, QueryTerminalRuntimeFilterChannelInstallStateV1,
-        QueryTerminalRuntimeFilterChannelKeyV1, QueryTerminalRuntimeFilterChannelTerminalStateV1,
-        QueryTerminalRuntimeFilterChannelV1, QueryTerminalRuntimeFilterConsumerKeyV1,
-        QueryTerminalRuntimeFilterConsumerV1, QueryTerminalRuntimeFilterScanNotEvaluatedV1,
-        QueryTerminalRuntimeFilterSubscriptionTerminalV1, QueryTerminalSnapshot,
-    };
     use novarocks_execution::runtime::profile::{ProfileUnit, Profiler, RuntimeProfileTree};
-    use novarocks_protocol::lifecycle::{
-        AttemptId, ParticipantBackendIdentity, ParticipantManifestDigest, QueryControlEndpoint,
-        QueryExecutionId,
-    };
+    use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
+    use novarocks_protocol::{common, novarocks};
 
     fn runtime_filter_snapshot(
         backend_id: u64,
@@ -1094,60 +1108,71 @@ mod tests {
         input_rows: u64,
         output_rows: u64,
     ) -> QueryTerminalSnapshot {
-        let channel_key =
-            QueryTerminalRuntimeFilterChannelKeyV1::new(channel_binding_id, backend_id as u32);
-        let contribution = QueryTerminalProfileContributionV1::try_new(
-            vec![QueryTerminalRuntimeFilterChannelV1::new(
-                channel_key,
-                QueryTerminalRuntimeFilterChannelInstallStateV1::Installed,
-                QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed,
-                Some(1),
-                1,
-                1,
-                0,
-                0,
-            )],
-            Vec::new(),
-            Vec::new(),
-            vec![QueryTerminalRuntimeFilterConsumerV1::new(
-                QueryTerminalRuntimeFilterConsumerKeyV1::new(
-                    channel_key,
-                    channel_binding_id + 100,
-                    UniqueId::new(backend_id as i64, channel_binding_id as i64),
-                ),
-                Some(1),
-                Some(1),
-                QueryTerminalRuntimeFilterSubscriptionTerminalV1::Completed,
-                1,
-                input_rows,
-                output_rows,
-                2,
-                1,
-                1,
-                1,
-                QueryTerminalRuntimeFilterScanNotEvaluatedV1::new(0, 0, 0, 0, 1, 0, 0, 0),
-            )],
-        )
-        .expect("valid runtime-filter contribution");
-        QueryTerminalSnapshot::new_with_profile_contribution(
+        let execution_id =
             QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
-                .expect("execution id"),
-            ParticipantBackendIdentity::new(
+                .expect("execution id");
+        QueryTerminalSnapshot::seal(novarocks::QueryTerminalSnapshot {
+            version: 1,
+            execution_id: Some(execution_id.into()),
+            backend: Some(novarocks::ParticipantBackendIdentity {
                 backend_id,
-                QueryControlEndpoint::new(
-                    "127.0.0.1",
-                    19_000_u16
+                endpoint: Some(novarocks::QueryControlEndpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: 19_000_u16
                         .checked_add(backend_id as u16)
-                        .expect("test port"),
-                )
-                .expect("backend endpoint"),
-                1,
-            )
-            .expect("backend identity"),
-            ParticipantManifestDigest::new([backend_id as u8; 32]),
-            Vec::new(),
-            contribution,
-        )
+                        .expect("test port") as u32,
+                }),
+                start_epoch: 1,
+            }),
+            init_digest: vec![backend_id as u8; 32],
+            fragments: Vec::new(),
+            profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
+                telemetry: Some(
+                    novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
+                        novarocks::QueryTerminalProfileContributionV1 {
+                            version: 1,
+                            channels: vec![novarocks::QueryTerminalRuntimeFilterChannelV1 {
+                                channel_binding_id,
+                                channel_id: backend_id as u32,
+                                install_state: novarocks::QueryTerminalRuntimeFilterChannelInstallStateV1::Installed as i32,
+                                terminal_state: novarocks::QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed as i32,
+                                latest_published_logical_version: Some(1),
+                                published_count: 1,
+                                completed_count: 1,
+                                unavailable_count: 0,
+                                cancelled_count: 0,
+                            }],
+                            producer_streams: Vec::new(),
+                            transport_routes: Vec::new(),
+                            consumers: vec![novarocks::QueryTerminalRuntimeFilterConsumerV1 {
+                                channel_binding_id,
+                                channel_id: backend_id as u32,
+                                consumer_binding_id: channel_binding_id + 100,
+                                fragment_instance_id: Some(common::UniqueId {
+                                    hi: backend_id as i64,
+                                    lo: channel_binding_id as i64,
+                                }),
+                                latest_delivered_logical_version: Some(1),
+                                latest_applied_logical_version: Some(1),
+                                subscription_terminal: novarocks::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Completed as i32,
+                                row_evaluations: 1,
+                                input_rows,
+                                output_rows,
+                                scan_evaluated: 2,
+                                scan_kept: 1,
+                                scan_pruned: 1,
+                                scan_not_evaluated: 1,
+                                scan_not_evaluated_reasons: Some(novarocks::QueryTerminalRuntimeFilterScanNotEvaluatedV1 {
+                                    resource_unavailable: 1,
+                                    ..Default::default()
+                                }),
+                            }],
+                        },
+                    ),
+                ),
+            }),
+            ..Default::default()
+        })
         .expect("terminal snapshot")
     }
 
@@ -1207,18 +1232,34 @@ mod tests {
 
     #[test]
     fn profile_terminal_builder_ignores_canonical_empty_contribution() {
-        let snapshot = QueryTerminalSnapshot::new_without_runtime_filters(
-            QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
-                .expect("execution id"),
-            ParticipantBackendIdentity::new(
-                1,
-                QueryControlEndpoint::new("127.0.0.1", 19_001).expect("backend endpoint"),
-                1,
-            )
-            .expect("backend identity"),
-            ParticipantManifestDigest::new([1; 32]),
-            Vec::new(),
-        )
+        let snapshot = QueryTerminalSnapshot::seal(novarocks::QueryTerminalSnapshot {
+            version: 1,
+            execution_id: Some(
+                QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
+                    .expect("execution id")
+                    .into(),
+            ),
+            backend: Some(novarocks::ParticipantBackendIdentity {
+                backend_id: 1,
+                endpoint: Some(novarocks::QueryControlEndpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: 19_001,
+                }),
+                start_epoch: 1,
+            }),
+            init_digest: vec![1; 32],
+            profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
+                telemetry: Some(
+                    novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
+                        novarocks::QueryTerminalProfileContributionV1 {
+                            version: 1,
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            }),
+            ..Default::default()
+        })
         .expect("terminal snapshot");
         let mut builder = ProfileTerminalBuilder::new();
 

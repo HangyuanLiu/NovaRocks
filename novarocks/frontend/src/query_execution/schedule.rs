@@ -27,9 +27,8 @@ use crate::query_execution::contract::{DistributedQueryError, DistributedQueryEr
 use crate::query_execution::lifecycle_plan::QueryInitPlanHeader;
 use ::novarocks::common::backend_topology::LiveBackendTarget;
 use ::novarocks::common::types::UniqueId;
-use ::novarocks::runtime::scan_range::ScanRangeParams;
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use novarocks_protocol::lifecycle::ExchangeRouteManifest;
+use novarocks_protocol::lifecycle::{ExchangeRouteManifest, ScanRangeParams};
 use novarocks_spi::connector::ConnectorSplit;
 use novarocks_sql::plan_read::FragmentId;
 

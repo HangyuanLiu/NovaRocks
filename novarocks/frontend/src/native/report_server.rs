@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
 use crate::coordinator::QueryTerminalIngress;
-use ::novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
+use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
 use axum::Json;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
@@ -395,8 +395,7 @@ mod tests {
         fn report_query_terminal(
             &self,
             _outcome: ParticipantTerminalOutcome,
-        ) -> Result<QueryTerminalReportAck, ::novarocks::query_lifecycle::QueryLifecycleError>
-        {
+        ) -> Result<QueryTerminalReportAck, crate::QueryLifecycleError> {
             Ok(self.ack.clone())
         }
     }

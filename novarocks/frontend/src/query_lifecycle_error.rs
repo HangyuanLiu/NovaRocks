@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Core-local lifecycle errors and role traits.
+//! Frontend-local lifecycle failure vocabulary.
 //!
-//! Lifecycle values and their wire validation belong to `novarocks-protocol`.
-//! Core keeps only orchestration errors; it must not mirror native RPC DTOs,
-//! their codecs, or Frontend-owned terminal ingress.
+//! Protocol contract validation is converted at the Frontend boundary. Query
+//! admission, coordinator state, and native report transport failures stay in
+//! this role-local vocabulary rather than recreating a Core authority.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryLifecycleErrorCode {

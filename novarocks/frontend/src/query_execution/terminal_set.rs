@@ -23,17 +23,9 @@
 
 use std::collections::BTreeSet;
 
-use novarocks_protocol::lifecycle::QueryTerminalSnapshot as ProtocolQueryTerminalSnapshot;
-
-use ::novarocks::query_lifecycle::terminal::{
-    FragmentTerminalOutcome, FragmentTerminalSnapshot, QueryTerminalSnapshot,
-    decode_fragment_terminal_profile_telemetry,
-    decode_query_terminal_profile_contribution_telemetry,
-};
-use ::novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
-use novarocks_protocol::lifecycle::{
-    ParticipantBackendIdentity, ParticipantManifestDigest, QueryExecutionId,
-};
+use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
+use novarocks_protocol::lifecycle::QueryTerminalSnapshot;
+use novarocks_protocol::novarocks;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryTerminalSet {
@@ -51,7 +43,6 @@ impl QueryTerminalSet {
         });
         let mut identities = BTreeSet::new();
         for snapshot in &snapshots {
-            snapshot.validate()?;
             let identity = (
                 snapshot.execution_id(),
                 snapshot.backend().backend_id(),
@@ -67,152 +58,28 @@ impl QueryTerminalSet {
         Ok(Self { snapshots })
     }
 
-    /// Rebuilds the coordinator-only lease aggregate after Protocol validates
-    /// its canonical snapshot. No RPC boundary carries this projection.
+    /// Protocol has already validated every canonical snapshot at ingress.
     pub fn from_protocol_snapshots(
-        snapshots: Vec<ProtocolQueryTerminalSnapshot>,
+        snapshots: Vec<QueryTerminalSnapshot>,
     ) -> Result<Self, QueryLifecycleError> {
-        snapshots
-            .into_iter()
-            .map(|snapshot| decode_protocol_terminal_snapshot_projection(snapshot.as_proto()))
-            .collect::<Result<Vec<_>, _>>()
-            .and_then(Self::new)
+        Self::new(snapshots)
     }
 
     pub fn snapshots(&self) -> &[QueryTerminalSnapshot] {
         &self.snapshots
     }
 
-    pub fn fragments(
-        &self,
-    ) -> impl Iterator<Item = &::novarocks::query_lifecycle::FragmentTerminalSnapshot> {
+    pub fn fragments(&self) -> impl Iterator<Item = &novarocks::QueryTerminalFragmentSnapshot> {
         self.snapshots
             .iter()
-            .flat_map(QueryTerminalSnapshot::fragments)
+            .flat_map(|snapshot| snapshot.as_proto().fragments.iter())
     }
 
     pub fn is_success(&self) -> bool {
-        self.snapshots.iter().all(QueryTerminalSnapshot::is_success)
-    }
-}
-
-/// Rebuilds the coordinator-only lease aggregate after Protocol validates its
-/// terminal snapshot. No RPC boundary carries this projection.
-fn decode_protocol_terminal_snapshot_projection(
-    value: &novarocks_protocol::novarocks::QueryTerminalSnapshot,
-) -> Result<QueryTerminalSnapshot, QueryLifecycleError> {
-    use ::novarocks::runtime::sink_commit::{
-        SinkCommitReportSnapshot, SinkLoadStats, TabletCommitInfo, TabletFailInfo,
-    };
-
-    let fragments = value
-        .fragments
-        .iter()
-        .map(|fragment| {
-            let id = fragment.fragment_instance_id.as_ref().ok_or_else(|| {
-                QueryLifecycleError::invalid_manifest("terminal fragment instance id is required")
-            })?;
-            let outcome = match fragment.outcome {
-                1 => FragmentTerminalOutcome::Succeeded,
-                2 if !fragment.error_code.trim().is_empty() => FragmentTerminalOutcome::Failed {
-                    code: fragment.error_code.clone(),
-                    detail: fragment.error_detail.clone(),
-                    detail_truncated: fragment.error_detail_truncated,
-                },
-                3 => FragmentTerminalOutcome::Cancelled {
-                    detail: fragment.error_detail.clone(),
-                    detail_truncated: fragment.error_detail_truncated,
-                },
-                4 => FragmentTerminalOutcome::IncompleteDrain {
-                    detail: fragment.error_detail.clone(),
-                    detail_truncated: fragment.error_detail_truncated,
-                },
-                _ => {
-                    return Err(QueryLifecycleError::invalid_manifest(
-                        "invalid terminal fragment outcome",
-                    ));
-                }
-            };
-            let stats = fragment.load_stats.as_ref().ok_or_else(|| {
-                QueryLifecycleError::invalid_manifest("terminal fragment load stats are required")
-            })?;
-            let sink = SinkCommitReportSnapshot {
-                connector_staged_report_frames: fragment
-                    .connector_staged_report_frames
-                    .iter()
-                    .map(crate::query_execution::write::decode_connector_staged_report_frame)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| QueryLifecycleError::invalid_manifest(error.message()))?,
-                tablet_commit_infos: fragment
-                    .tablet_commit_infos
-                    .iter()
-                    .map(|value| TabletCommitInfo {
-                        tablet_id: value.tablet_id,
-                        backend_id: value.backend_id,
-                    })
-                    .collect(),
-                tablet_fail_infos: fragment
-                    .tablet_fail_infos
-                    .iter()
-                    .map(|value| TabletFailInfo {
-                        tablet_id: value.tablet_id,
-                        backend_id: value.backend_id,
-                    })
-                    .collect(),
-                load_stats: SinkLoadStats {
-                    loaded_rows: stats.loaded_rows,
-                    loaded_bytes: stats.loaded_bytes,
-                    filtered_rows: stats.filtered_rows,
-                },
-            };
-            let profile = decode_fragment_terminal_profile_telemetry(
-                fragment.profile.as_ref().ok_or_else(|| {
-                    QueryLifecycleError::invalid_manifest(
-                        "terminal fragment profile telemetry is required",
-                    )
-                })?,
-            )?;
-            FragmentTerminalSnapshot::new_with_profile_telemetry(
-                novarocks_types::UniqueId::new(id.hi, id.lo),
-                fragment.backend_num,
-                outcome,
-                sink,
-                profile,
-            )
-            .and_then(|snapshot| {
-                snapshot.with_statistics_payload(fragment.statistics_payload.clone())
+        self.snapshots.iter().all(|snapshot| {
+            snapshot.fragments().into_iter().all(|fragment| {
+                fragment.outcome() == novarocks::QueryTerminalFragmentOutcome::Succeeded
             })
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    let profile_contribution = decode_query_terminal_profile_contribution_telemetry(
-        value.profile_contribution.as_ref().ok_or_else(|| {
-            QueryLifecycleError::invalid_manifest(
-                "query terminal profile contribution telemetry is required",
-            )
-        })?,
-    )?;
-    QueryTerminalSnapshot::new_with_profile_telemetry(
-        value
-            .execution_id
-            .as_ref()
-            .ok_or_else(|| {
-                QueryLifecycleError::invalid_manifest("terminal execution id is required")
-            })
-            .and_then(|raw| {
-                QueryExecutionId::try_from_proto(raw).map_err(QueryLifecycleError::from)
-            })?,
-        value
-            .backend
-            .clone()
-            .ok_or_else(|| {
-                QueryLifecycleError::invalid_manifest("terminal backend identity is required")
-            })
-            .and_then(|raw| {
-                ParticipantBackendIdentity::parse(raw).map_err(QueryLifecycleError::from)
-            })?,
-        ParticipantManifestDigest::try_from_slice(&value.init_digest)
-            .map_err(QueryLifecycleError::from)?,
-        fragments,
-        profile_contribution,
-    )
+    }
 }

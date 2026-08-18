@@ -7,6 +7,7 @@ pub mod error;
 pub mod identity;
 pub mod manifest;
 pub mod query_options;
+pub mod scan_range;
 pub mod stage;
 pub mod terminal;
 
@@ -23,11 +24,14 @@ pub use manifest::{
     ParticipantManifestDigest, ParticipantRole, QueryControlEndpoint, RuntimeFilterContribution,
 };
 pub use query_options::QueryOptions;
+pub use scan_range::{FileScanRange, ScanRange, ScanRangeParams};
 pub use stage::{
     QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
     QueryStartRequest, StageDigest, StageDigestVersion, StageFragment,
 };
 pub use terminal::{
-    FragmentTerminalSnapshot, NegativeAttestation, ParticipantTerminalOutcome,
-    QueryTerminalProfileContributionV1, QueryTerminalSnapshot, TerminalizationProof,
+    FragmentTerminalOutcome, FragmentTerminalProfileTelemetry, FragmentTerminalSnapshot,
+    NegativeAttestation, ParticipantTerminalOutcome, QueryTerminalProfileContributionTelemetry,
+    QueryTerminalProfileContributionV1, QueryTerminalSnapshot, TerminalTelemetryUnavailable,
+    TerminalizationProof,
 };

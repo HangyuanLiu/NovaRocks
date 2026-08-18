@@ -20,7 +20,6 @@
 use std::collections::HashMap;
 
 use crate::query_execution::FragmentInstancePlacement;
-use ::novarocks::runtime::scan_range;
 use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::endpoint::FragmentDestination;
 use novarocks_execution::runtime::query_options::QueryOptions;
@@ -47,8 +46,8 @@ pub(crate) fn encode_instance_params(
                     wire::ScanRangeList {
                         ranges: ranges
                             .iter()
-                            .map(encode_scan_range_params)
-                            .collect::<Result<Vec<_>, _>>()?,
+                            .map(|range| range.as_proto().clone())
+                            .collect(),
                     },
                 ))
             })
@@ -134,122 +133,6 @@ fn encode_spill_config(src: &SpillConfig) -> wire::SpillOptions {
             .unwrap_or_default(),
         spill_mem_table_size: src.spill_mem_table_size.unwrap_or_default(),
         spill_mem_table_num: src.spill_mem_table_num.unwrap_or_default(),
-    }
-}
-
-fn encode_scan_range_params(
-    src: &scan_range::ScanRangeParams,
-) -> Result<wire::ScanRangeParams, String> {
-    Ok(wire::ScanRangeParams {
-        range: Some(encode_scan_range(&src.range)?),
-        volume_id: src.volume_id,
-        empty: src.empty,
-        has_more: src.has_more,
-    })
-}
-
-fn encode_scan_range(src: &scan_range::ScanRange) -> Result<wire::ScanRange, String> {
-    match src {
-        scan_range::ScanRange::File(file) => Ok(wire::ScanRange {
-            kind: Some(wire::scan_range::Kind::File(encode_file_scan_range(file)?)),
-        }),
-        scan_range::ScanRange::BrokerFile(_) => {
-            Err("native protocol cannot encode a StarRocks broker-file scan range".to_string())
-        }
-        scan_range::ScanRange::SchemaSelection(_) => {
-            Err("native protocol cannot encode a StarRocks schema-scan selection".to_string())
-        }
-    }
-}
-
-fn encode_file_scan_range(src: &scan_range::FileScanRange) -> Result<wire::FileScanRange, String> {
-    Ok(wire::FileScanRange {
-        file_format: src.file_format.as_native_name().to_string(),
-        full_path: src.full_path.clone(),
-        relative_path: src.relative_path.clone(),
-        table_id: src.table_id,
-        offset: src.offset,
-        length: src.length,
-        file_length: src.file_length,
-        delete_files: src
-            .delete_files
-            .iter()
-            .map(encode_iceberg_delete_file)
-            .collect::<Result<Vec<_>, _>>()?,
-        deletion_vector_descriptor: src
-            .deletion_vector_descriptor
-            .as_ref()
-            .map(encode_deletion_vector_descriptor),
-        first_row_id: src.first_row_id,
-        data_sequence_number: src.data_sequence_number,
-        modification_time: src.modification_time,
-        datacache_options: src.datacache_options.as_ref().map(encode_datacache_options),
-        included_positions: src.included_positions.clone(),
-        serialized_split: src.serialized_split.clone(),
-        use_iceberg_jni_metadata_reader: src.use_iceberg_jni_metadata_reader,
-        change_op: src.ivm_change_op.map(i32::from),
-        file_pruning_min_max_values: src
-            .file_pruning_min_max_values
-            .as_ref()
-            .map(|values| {
-                values
-                    .iter()
-                    .map(|(ordinal, value)| (*ordinal, encode_file_pruning_min_max_value(value)))
-                    .collect()
-            })
-            .unwrap_or_default(),
-    })
-}
-
-fn encode_file_pruning_min_max_value(
-    src: &scan_range::FilePruningMinMaxValue,
-) -> wire::FilePruningMinMaxValue {
-    wire::FilePruningMinMaxValue {
-        value_kind: encode_file_pruning_value_kind(src.value_kind),
-        has_null: src.has_null,
-        all_null: src.all_null,
-        min_int_value: src.min_int_value,
-        max_int_value: src.max_int_value,
-        min_float_value: src.min_float_value,
-        max_float_value: src.max_float_value,
-    }
-}
-
-fn encode_file_pruning_value_kind(src: scan_range::FilePruningValueKind) -> i32 {
-    match src {
-        scan_range::FilePruningValueKind::Bool => 1,
-        scan_range::FilePruningValueKind::Int => 2,
-        scan_range::FilePruningValueKind::Float => 3,
-    }
-}
-
-fn encode_iceberg_delete_file(
-    src: &scan_range::IcebergDeleteFile,
-) -> Result<wire::IcebergDeleteFile, String> {
-    Ok(wire::IcebergDeleteFile {
-        full_path: src.full_path.clone(),
-        file_format: src.file_format.as_native_name().to_string(),
-        file_content: src.file_content.as_native_name().to_string(),
-        length: src.length,
-    })
-}
-
-fn encode_deletion_vector_descriptor(
-    src: &scan_range::DeletionVectorDescriptor,
-) -> wire::DeletionVectorDescriptor {
-    wire::DeletionVectorDescriptor {
-        storage_type: src.storage_type.clone(),
-        path_or_inline_dv: src.path_or_inline_dv.clone(),
-        offset: src.offset,
-        size_in_bytes: src.size_in_bytes,
-        cardinality: src.cardinality,
-    }
-}
-
-fn encode_datacache_options(src: &scan_range::DatacacheOptions) -> wire::DatacacheOptions {
-    wire::DatacacheOptions {
-        enable_populate_datacache: src.enable_populate_datacache,
-        priority: src.priority,
     }
 }
 

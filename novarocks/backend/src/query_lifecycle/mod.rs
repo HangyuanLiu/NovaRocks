@@ -22,8 +22,8 @@ mod registry;
 pub(crate) mod stage;
 
 pub(crate) use contract::{
-    BackendQueryControl, QueryControlAttachment, QueryLifecycleIngress,
-    QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
+    BackendQueryControl, QueryControlAttachment, QueryLifecycleError, QueryLifecycleErrorCode,
+    QueryLifecycleIngress, QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
 };
 pub(crate) use local_runtime::NativeQueryLifecycleLocalRuntime;
 pub use registry::QueryLifecycleRegistryConfig;

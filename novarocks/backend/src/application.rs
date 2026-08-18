@@ -1255,4 +1255,4 @@ mod tests {
         );
     }
 }
-use novarocks::query_lifecycle::QueryLifecycleError;
+use crate::query_lifecycle::QueryLifecycleError;

@@ -25,7 +25,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use arrow::datatypes::DataType;
-use novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime_filter::{
     ConsumerActivation, RuntimeFilterBindingId, RuntimeFilterChannelId,
@@ -44,6 +43,7 @@ use prost::Message;
 use sha2::Digest;
 
 use crate::native::type_decode::decode_type;
+use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use crate::runtime_filter::artifact::{
     ArtifactKind, ConsumerArtifactProfile, ConsumerProfileId, HashContractDigest,
 };

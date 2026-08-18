@@ -101,6 +101,16 @@ impl QueryTerminalSnapshot {
     pub fn digest(&self) -> [u8; 32] {
         digest_array(&self.raw.digest).expect("validated terminal snapshot digest")
     }
+
+    pub fn profile_contribution_telemetry(&self) -> QueryTerminalProfileContributionTelemetry {
+        QueryTerminalProfileContributionTelemetry::parse(
+            self.raw
+                .profile_contribution
+                .clone()
+                .expect("validated QueryTerminalSnapshot always has profile telemetry"),
+        )
+        .expect("validated QueryTerminalSnapshot always has valid profile telemetry")
+    }
 }
 
 /// A validated, independently deliverable P0 terminalization proof.
@@ -385,6 +395,58 @@ impl ParticipantTerminalOutcome {
     }
 }
 
+/// A validated generated terminal outcome carried by a P0 proof fragment.
+///
+/// There is no standalone outcome message in the IDL. The proof fragment is
+/// therefore the smallest generated carrier that owns its outcome, diagnostic,
+/// and fragment identity without reconstructing a parallel Rust enum.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FragmentTerminalOutcome {
+    raw: novarocks::TerminalizationProofFragment,
+}
+
+impl FragmentTerminalOutcome {
+    pub fn parse(raw: novarocks::TerminalizationProofFragment) -> Result<Self, ContractError> {
+        validate_proof_fragment(&raw)?;
+        Ok(Self { raw })
+    }
+
+    pub const fn as_proto(&self) -> &novarocks::TerminalizationProofFragment {
+        &self.raw
+    }
+
+    pub fn fragment_instance_id(&self) -> common::UniqueId {
+        self.raw
+            .fragment_instance_id
+            .expect("validated FragmentTerminalOutcome always has an instance id")
+    }
+
+    pub const fn backend_num(&self) -> i32 {
+        self.raw.backend_num
+    }
+
+    pub fn kind(&self) -> novarocks::QueryTerminalFragmentOutcome {
+        novarocks::QueryTerminalFragmentOutcome::try_from(self.raw.outcome)
+            .expect("validated FragmentTerminalOutcome always has a known outcome")
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.kind() == novarocks::QueryTerminalFragmentOutcome::Succeeded
+    }
+
+    pub fn error_code(&self) -> &str {
+        &self.raw.error_code
+    }
+
+    pub fn error_detail(&self) -> &str {
+        &self.raw.error_detail
+    }
+
+    pub const fn error_detail_truncated(&self) -> bool {
+        self.raw.error_detail_truncated
+    }
+}
+
 /// A validated P1 fragment snapshot, useful to Backend terminal encoders.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FragmentTerminalSnapshot {
@@ -422,6 +484,30 @@ impl FragmentTerminalSnapshot {
         novarocks::QueryTerminalFragmentOutcome::try_from(self.raw.outcome)
             .expect("validated FragmentTerminalSnapshot always has a known outcome")
     }
+
+    /// Returns the terminal-outcome semantic view without introducing a
+    /// second, non-generated value representation.
+    pub fn terminal_outcome(&self) -> FragmentTerminalOutcome {
+        FragmentTerminalOutcome::parse(novarocks::TerminalizationProofFragment {
+            fragment_instance_id: self.raw.fragment_instance_id,
+            backend_num: self.raw.backend_num,
+            outcome: self.raw.outcome,
+            error_code: self.raw.error_code.clone(),
+            error_detail: self.raw.error_detail.clone(),
+            error_detail_truncated: self.raw.error_detail_truncated,
+        })
+        .expect("validated FragmentTerminalSnapshot always has a valid terminal outcome")
+    }
+
+    pub fn profile_telemetry(&self) -> FragmentTerminalProfileTelemetry {
+        FragmentTerminalProfileTelemetry::parse(
+            self.raw
+                .profile
+                .clone()
+                .expect("validated FragmentTerminalSnapshot always has profile telemetry"),
+        )
+        .expect("validated FragmentTerminalSnapshot always has valid profile telemetry")
+    }
 }
 
 /// A validated P2 runtime-filter contribution. The generated message is the
@@ -452,6 +538,136 @@ impl QueryTerminalProfileContributionV1 {
 
     pub const fn as_proto(&self) -> &novarocks::QueryTerminalProfileContributionV1 {
         &self.raw
+    }
+
+    pub const fn version(&self) -> u32 {
+        self.raw.version
+    }
+
+    /// Wire leaves remain generated values because their role-local semantic
+    /// interpretation belongs to the Frontend fold and Backend capture paths.
+    pub fn channels(&self) -> &[novarocks::QueryTerminalRuntimeFilterChannelV1] {
+        &self.raw.channels
+    }
+
+    pub fn producer_streams(&self) -> &[novarocks::QueryTerminalRuntimeFilterProducerStreamV1] {
+        &self.raw.producer_streams
+    }
+
+    pub fn transport_routes(&self) -> &[novarocks::QueryTerminalRuntimeFilterTransportRouteV1] {
+        &self.raw.transport_routes
+    }
+
+    pub fn consumers(&self) -> &[novarocks::QueryTerminalRuntimeFilterConsumerV1] {
+        &self.raw.consumers
+    }
+}
+
+/// A validated generated reason for unavailable terminal telemetry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminalTelemetryUnavailable {
+    raw: novarocks::TerminalTelemetryUnavailable,
+}
+
+impl TerminalTelemetryUnavailable {
+    pub fn parse(raw: novarocks::TerminalTelemetryUnavailable) -> Result<Self, ContractError> {
+        validate_unavailable(&raw)?;
+        Ok(Self { raw })
+    }
+
+    pub const fn as_proto(&self) -> &novarocks::TerminalTelemetryUnavailable {
+        &self.raw
+    }
+
+    pub fn stage(&self) -> &str {
+        &self.raw.stage
+    }
+
+    pub fn code(&self) -> &str {
+        &self.raw.code
+    }
+}
+
+/// A validated generated fragment-profile telemetry oneof.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FragmentTerminalProfileTelemetry {
+    raw: novarocks::FragmentTerminalProfileTelemetry,
+}
+
+impl FragmentTerminalProfileTelemetry {
+    pub fn parse(raw: novarocks::FragmentTerminalProfileTelemetry) -> Result<Self, ContractError> {
+        validate_fragment_profile_telemetry(&raw)?;
+        Ok(Self { raw })
+    }
+
+    pub const fn as_proto(&self) -> &novarocks::FragmentTerminalProfileTelemetry {
+        &self.raw
+    }
+
+    pub fn available(&self) -> Option<&novarocks::RuntimeProfileTree> {
+        let novarocks::fragment_terminal_profile_telemetry::Telemetry::Available(profile) =
+            self.raw.telemetry.as_ref()?
+        else {
+            return None;
+        };
+        Some(profile)
+    }
+
+    pub fn unavailable(&self) -> Option<TerminalTelemetryUnavailable> {
+        let novarocks::fragment_terminal_profile_telemetry::Telemetry::Unavailable(reason) =
+            self.raw.telemetry.as_ref()?
+        else {
+            return None;
+        };
+        Some(
+            TerminalTelemetryUnavailable::parse(reason.clone())
+                .expect("validated fragment telemetry always has a valid reason"),
+        )
+    }
+}
+
+/// A validated generated profile-contribution telemetry oneof.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryTerminalProfileContributionTelemetry {
+    raw: novarocks::QueryTerminalProfileContributionTelemetry,
+}
+
+impl QueryTerminalProfileContributionTelemetry {
+    pub fn parse(
+        raw: novarocks::QueryTerminalProfileContributionTelemetry,
+    ) -> Result<Self, ContractError> {
+        validate_profile_contribution_telemetry(&raw)?;
+        Ok(Self { raw })
+    }
+
+    pub const fn as_proto(&self) -> &novarocks::QueryTerminalProfileContributionTelemetry {
+        &self.raw
+    }
+
+    pub fn available(&self) -> Option<QueryTerminalProfileContributionV1> {
+        let novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
+            contribution,
+        ) = self.raw.telemetry.as_ref()?
+        else {
+            return None;
+        };
+        Some(
+            QueryTerminalProfileContributionV1::parse(contribution.clone())
+                .expect("validated profile telemetry always has a valid contribution"),
+        )
+    }
+
+    pub fn unavailable(&self) -> Option<TerminalTelemetryUnavailable> {
+        let novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(
+            reason,
+        ) = self.raw.telemetry.as_ref()?
+        else {
+            return None;
+        };
+        Some(
+            TerminalTelemetryUnavailable::parse(reason.clone())
+                .expect("validated profile telemetry always has a valid reason"),
+        )
     }
 }
 

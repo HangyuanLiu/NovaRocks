@@ -30,6 +30,7 @@ use novarocks_spi::connector::ConnectorCancellation;
 use crate::runtime::query_context::{
     QueryContextManager, QueryExecutionKey, QueryId, query_context_manager,
 };
+use crate::runtime::sink_commit::BackendSinkCommitPort;
 use novarocks::common::types::UniqueId;
 use novarocks_execution::exec::node::scan::ConnectorRowPositionLookup;
 use novarocks_execution::exec::node::scan::ScanOp;
@@ -351,9 +352,7 @@ impl NativeFragmentAdmissionResources {
             event_sink,
         )
         .with_scan_registration_port(self.scan_registration)
-        .with_fragment_commit_port(Arc::new(
-            novarocks::runtime::sink_commit::CoreSinkCommitPort,
-        ))
+        .with_fragment_commit_port(Arc::new(BackendSinkCommitPort))
         .with_debug_exec_node_output(novarocks::common::config::debug_exec_node_output())
     }
 }

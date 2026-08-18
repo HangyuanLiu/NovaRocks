@@ -14,51 +14,53 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
+//! Backend-owned final sink-report aggregation for native fragments.
+
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::common::types::UniqueId;
 use novarocks_execution::runtime::fragment::io::{
     FragmentCommitLease, FragmentCommitPort, FragmentCommitReport, FragmentSinkLoadStats,
     TabletCommitInfo as ExecutionTabletCommitInfo, TabletFailInfo as ExecutionTabletFailInfo,
 };
 use novarocks_spi::connector::{WriteCommitEvidenceLedger, WriteCommitEvidenceLimits};
+use novarocks_types::UniqueId;
 
 const TABLET_TERMINAL_CANONICAL_BYTES: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct SinkLoadStats {
-    pub loaded_rows: i64,
-    pub loaded_bytes: i64,
-    pub filtered_rows: i64,
+pub(crate) struct SinkLoadStats {
+    pub(crate) loaded_rows: i64,
+    pub(crate) loaded_bytes: i64,
+    pub(crate) filtered_rows: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TabletCommitInfo {
-    pub tablet_id: i64,
-    pub backend_id: i64,
+pub(crate) struct TabletCommitInfo {
+    pub(crate) tablet_id: i64,
+    pub(crate) backend_id: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TabletFailInfo {
-    pub tablet_id: i64,
-    pub backend_id: i64,
+pub(crate) struct TabletFailInfo {
+    pub(crate) tablet_id: i64,
+    pub(crate) backend_id: i64,
 }
 
-/// Protocol-neutral final-report facts collected by fragment sinks.
-///
-/// The runtime owns this data; protocol adapters are responsible for encoding
-/// it into their respective report wire formats.
+/// Runtime facts collected by Backend fragment sinks before the registry
+/// projects them into the Protocol terminal snapshot.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct SinkCommitReportSnapshot {
-    pub connector_staged_report_frames: Vec<novarocks_spi::connector::ConnectorStagedReportFrame>,
-    pub tablet_commit_infos: Vec<TabletCommitInfo>,
-    pub tablet_fail_infos: Vec<TabletFailInfo>,
-    pub load_stats: SinkLoadStats,
+pub(crate) struct SinkCommitReportSnapshot {
+    pub(crate) connector_staged_report_frames:
+        Vec<novarocks_spi::connector::ConnectorStagedReportFrame>,
+    pub(crate) tablet_commit_infos: Vec<TabletCommitInfo>,
+    pub(crate) tablet_fail_infos: Vec<TabletFailInfo>,
+    pub(crate) load_stats: SinkLoadStats,
 }
 
 impl SinkCommitReportSnapshot {
-    pub fn with_connector_staged_report_frames(
+    pub(crate) fn with_connector_staged_report_frames(
         mut self,
         frames: Vec<novarocks_spi::connector::ConnectorStagedReportFrame>,
     ) -> Self {
@@ -67,46 +69,43 @@ impl SinkCommitReportSnapshot {
     }
 }
 
-/// Temporary Core host adapter for fragment admission.
-///
-/// Query lifecycle retains the legacy store until the Backend composition cut;
-/// execution reaches it exclusively through the neutral port.
 #[derive(Debug, Default)]
-pub struct CoreSinkCommitPort;
+pub(crate) struct BackendSinkCommitPort;
 
-impl FragmentCommitPort for CoreSinkCommitPort {
+impl FragmentCommitPort for BackendSinkCommitPort {
     fn acquire(
         &self,
         fragment_instance_id: UniqueId,
     ) -> Result<Box<dyn FragmentCommitLease>, String> {
-        acquire_core_sink_commit_lease(fragment_instance_id, WriteCommitEvidenceLimits::default())
+        acquire_backend_sink_commit_lease(
+            fragment_instance_id,
+            WriteCommitEvidenceLimits::default(),
+        )
     }
 }
 
-/// Configured adapter used by Backend composition. The unit adapter remains
-/// available for legacy in-process callers and tests with the documented
-/// defaults.
+/// Configured Backend adapter used by production fragment composition.
 #[derive(Debug)]
-pub struct ConfiguredCoreSinkCommitPort {
+pub(crate) struct ConfiguredBackendSinkCommitPort {
     evidence_limits: WriteCommitEvidenceLimits,
 }
 
-impl ConfiguredCoreSinkCommitPort {
-    pub fn new(evidence_limits: WriteCommitEvidenceLimits) -> Self {
+impl ConfiguredBackendSinkCommitPort {
+    pub(crate) fn new(evidence_limits: WriteCommitEvidenceLimits) -> Self {
         Self { evidence_limits }
     }
 }
 
-impl FragmentCommitPort for ConfiguredCoreSinkCommitPort {
+impl FragmentCommitPort for ConfiguredBackendSinkCommitPort {
     fn acquire(
         &self,
         fragment_instance_id: UniqueId,
     ) -> Result<Box<dyn FragmentCommitLease>, String> {
-        acquire_core_sink_commit_lease(fragment_instance_id, self.evidence_limits)
+        acquire_backend_sink_commit_lease(fragment_instance_id, self.evidence_limits)
     }
 }
 
-fn acquire_core_sink_commit_lease(
+fn acquire_backend_sink_commit_lease(
     fragment_instance_id: UniqueId,
     evidence_limits: WriteCommitEvidenceLimits,
 ) -> Result<Box<dyn FragmentCommitLease>, String> {
@@ -116,20 +115,20 @@ fn acquire_core_sink_commit_lease(
             "sink commit already registered for fragment instance {fragment_instance_id}"
         ));
     }
-    Ok(Box::new(CoreSinkCommitLease {
+    Ok(Box::new(BackendSinkCommitLease {
         fragment_instance_id,
         evidence_ledger,
         active: true,
     }))
 }
 
-struct CoreSinkCommitLease {
+struct BackendSinkCommitLease {
     fragment_instance_id: UniqueId,
     evidence_ledger: WriteCommitEvidenceLedger,
     active: bool,
 }
 
-impl CoreSinkCommitLease {
+impl BackendSinkCommitLease {
     fn snapshot(&self) -> FragmentCommitReport {
         let snapshot = report_snapshot(self.fragment_instance_id);
         FragmentCommitReport {
@@ -159,7 +158,7 @@ impl CoreSinkCommitLease {
     }
 }
 
-impl FragmentCommitLease for CoreSinkCommitLease {
+impl FragmentCommitLease for BackendSinkCommitLease {
     fn write_commit_evidence_ledger(&self) -> WriteCommitEvidenceLedger {
         self.evidence_ledger.clone()
     }
@@ -216,7 +215,7 @@ impl FragmentCommitLease for CoreSinkCommitLease {
     }
 }
 
-impl Drop for CoreSinkCommitLease {
+impl Drop for BackendSinkCommitLease {
     fn drop(&mut self) {
         if self.active {
             unregister(self.fragment_instance_id);
@@ -255,18 +254,6 @@ fn store() -> &'static SinkCommitStore {
     })
 }
 
-pub(crate) fn register(finst_id: UniqueId) {
-    let store = store();
-    let mut guard = store.mu.lock().expect("sink commit store lock");
-    guard
-        .entry(finst_id)
-        .or_insert_with(|| SinkCommitEntry::new(WriteCommitEvidenceLedger::default()));
-}
-
-pub(crate) fn try_register(finst_id: UniqueId) -> bool {
-    try_register_with_ledger(finst_id, WriteCommitEvidenceLedger::default())
-}
-
 fn try_register_with_ledger(
     finst_id: UniqueId,
     evidence_ledger: WriteCommitEvidenceLedger,
@@ -280,25 +267,10 @@ fn try_register_with_ledger(
     true
 }
 
-pub fn unregister(finst_id: UniqueId) {
+fn unregister(finst_id: UniqueId) {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
     guard.remove(&finst_id);
-}
-
-pub(crate) fn is_registered(finst_id: UniqueId) -> bool {
-    store()
-        .mu
-        .lock()
-        .expect("sink commit store lock")
-        .contains_key(&finst_id)
-}
-
-pub(crate) fn add_tablet_commit_info(
-    finst_id: UniqueId,
-    info: TabletCommitInfo,
-) -> Result<(), String> {
-    try_add_tablet_commit_info(finst_id, info)
 }
 
 fn try_add_tablet_commit_info(finst_id: UniqueId, info: TabletCommitInfo) -> Result<(), String> {
@@ -307,8 +279,7 @@ fn try_add_tablet_commit_info(finst_id: UniqueId, info: TabletCommitInfo) -> Res
     let entry = guard
         .entry(finst_id)
         .or_insert_with(|| SinkCommitEntry::new(WriteCommitEvidenceLedger::default()));
-    let already_exists = entry.tablet_commit_infos.contains(&info);
-    if !already_exists {
+    if !entry.tablet_commit_infos.contains(&info) {
         entry
             .evidence_ledger
             .reserve(TABLET_TERMINAL_CANONICAL_BYTES, 1)
@@ -318,27 +289,13 @@ fn try_add_tablet_commit_info(finst_id: UniqueId, info: TabletCommitInfo) -> Res
     Ok(())
 }
 
-pub(crate) fn list_tablet_commit_infos(finst_id: UniqueId) -> Vec<TabletCommitInfo> {
-    let store = store();
-    let guard = store.mu.lock().expect("sink commit store lock");
-    guard
-        .get(&finst_id)
-        .map(|entry| entry.tablet_commit_infos.clone())
-        .unwrap_or_default()
-}
-
-pub(crate) fn add_tablet_fail_info(finst_id: UniqueId, info: TabletFailInfo) -> Result<(), String> {
-    try_add_tablet_fail_info(finst_id, info)
-}
-
 fn try_add_tablet_fail_info(finst_id: UniqueId, info: TabletFailInfo) -> Result<(), String> {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
     let entry = guard
         .entry(finst_id)
         .or_insert_with(|| SinkCommitEntry::new(WriteCommitEvidenceLedger::default()));
-    let already_exists = entry.tablet_fail_infos.contains(&info);
-    if !already_exists {
+    if !entry.tablet_fail_infos.contains(&info) {
         entry
             .evidence_ledger
             .reserve(TABLET_TERMINAL_CANONICAL_BYTES, 1)
@@ -348,21 +305,7 @@ fn try_add_tablet_fail_info(finst_id: UniqueId, info: TabletFailInfo) -> Result<
     Ok(())
 }
 
-pub(crate) fn list_tablet_fail_infos(finst_id: UniqueId) -> Vec<TabletFailInfo> {
-    let store = store();
-    let guard = store.mu.lock().expect("sink commit store lock");
-    guard
-        .get(&finst_id)
-        .map(|entry| entry.tablet_fail_infos.clone())
-        .unwrap_or_default()
-}
-
-pub(crate) fn add_load_stats(
-    finst_id: UniqueId,
-    loaded_rows: i64,
-    loaded_bytes: i64,
-    filtered_rows: i64,
-) {
+fn add_load_stats(finst_id: UniqueId, loaded_rows: i64, loaded_bytes: i64, filtered_rows: i64) {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
     let entry = guard.entry(finst_id).or_default();
@@ -371,25 +314,7 @@ pub(crate) fn add_load_stats(
     entry.filtered_rows = entry.filtered_rows.saturating_add(filtered_rows.max(0));
 }
 
-pub(crate) fn get_load_counters(finst_id: UniqueId) -> (i64, i64) {
-    let stats = get_load_stats(finst_id);
-    (stats.loaded_rows, stats.loaded_bytes)
-}
-
-pub(crate) fn get_load_stats(finst_id: UniqueId) -> SinkLoadStats {
-    let store = store();
-    let guard = store.mu.lock().expect("sink commit store lock");
-    guard
-        .get(&finst_id)
-        .map(|entry| SinkLoadStats {
-            loaded_rows: entry.loaded_rows,
-            loaded_bytes: entry.loaded_bytes,
-            filtered_rows: entry.filtered_rows,
-        })
-        .unwrap_or_default()
-}
-
-pub fn report_snapshot(finst_id: UniqueId) -> SinkCommitReportSnapshot {
+pub(crate) fn report_snapshot(finst_id: UniqueId) -> SinkCommitReportSnapshot {
     let store = store();
     let guard = store.mu.lock().expect("sink commit store lock");
     let Some(entry) = guard.get(&finst_id) else {
@@ -410,10 +335,10 @@ pub fn report_snapshot(finst_id: UniqueId) -> SinkCommitReportSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        TabletCommitInfo, TabletFailInfo, add_tablet_commit_info, add_tablet_fail_info,
-        list_tablet_commit_infos, list_tablet_fail_infos, unregister,
+        TabletCommitInfo, TabletFailInfo, try_add_tablet_commit_info, try_add_tablet_fail_info,
+        unregister,
     };
-    use crate::common::types::UniqueId;
+    use novarocks_types::UniqueId;
 
     #[test]
     fn tablet_domain_records_deduplicate_by_tablet_and_backend() {
@@ -424,9 +349,9 @@ mod tests {
             tablet_id: 101,
             backend_id: 202,
         };
-        add_tablet_commit_info(finst_id, commit).expect("first commit fact");
-        add_tablet_commit_info(finst_id, commit).expect("duplicate commit fact");
-        add_tablet_commit_info(
+        try_add_tablet_commit_info(finst_id, commit).expect("first commit fact");
+        try_add_tablet_commit_info(finst_id, commit).expect("duplicate commit fact");
+        try_add_tablet_commit_info(
             finst_id,
             TabletCommitInfo {
                 tablet_id: 101,
@@ -439,11 +364,12 @@ mod tests {
             tablet_id: 404,
             backend_id: 505,
         };
-        add_tablet_fail_info(finst_id, fail).expect("first failure fact");
-        add_tablet_fail_info(finst_id, fail).expect("duplicate failure fact");
+        try_add_tablet_fail_info(finst_id, fail).expect("first failure fact");
+        try_add_tablet_fail_info(finst_id, fail).expect("duplicate failure fact");
 
+        let snapshot = super::report_snapshot(finst_id);
         assert_eq!(
-            list_tablet_commit_infos(finst_id),
+            snapshot.tablet_commit_infos,
             vec![
                 commit,
                 TabletCommitInfo {
@@ -452,7 +378,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(list_tablet_fail_infos(finst_id), vec![fail]);
+        assert_eq!(snapshot.tablet_fail_infos, vec![fail]);
 
         unregister(finst_id);
     }

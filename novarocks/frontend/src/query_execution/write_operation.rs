@@ -864,9 +864,9 @@ mod tests {
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::outcome::ConnectorWriteCompletion;
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
+    use crate::query_execution::terminal_codec::encode_connector_staged_report_frame;
     use crate::query_execution::write::{WriteCommitInput, WriterCommitInput, WriterKey};
     use ::novarocks::common::types::UniqueId;
-    use ::novarocks::query_lifecycle::terminal::encode_connector_staged_report_frame;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
 
