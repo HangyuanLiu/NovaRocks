@@ -623,6 +623,54 @@ pub async fn acquire_refresh_ownership(
 /// So a failed renewal deregisters the target. The registry is the repository's
 /// fence source and is fail-closed for unregistered targets, which turns a lost
 /// lease into refused writes rather than unfenced ones.
+/// How many definite renewal conflicts to absorb before giving up. Each one
+/// proves the renewal did not land, so the lease still holds its existing
+/// deadline and a fresh attempt is safe; the bound stops a lease that genuinely
+/// cannot settle from being renewed past its own expiry.
+const RENEW_CONFLICT_RETRIES: u8 = 3;
+
+/// One renewal of a held lease, resolving the two outcomes that do not prove
+/// the lease was lost.
+///
+/// Ownership here is sticky: the lease outlives the refresh that took it, so the
+/// renewal task runs for as long as this frontend owns the target and a single
+/// mishandled renewal forgets it. Whatever refresh is in flight at that moment
+/// then fails its next durable write with "this frontend does not hold the
+/// refresh lease", naming a lease that was never actually lost.
+///
+/// `CommitUncertain` is ambiguous and is recovered under the **same**
+/// operation ID, exactly as the DML, statistics and table-maintenance renewal
+/// loops already do -- a fresh ID would let one logical renewal appear twice.
+/// A definite conflict is the opposite: it proves nothing landed, so there is
+/// nothing to recover and a fresh ID may simply try again.
+async fn renew_once(
+    guard: &tokio::sync::Mutex<LeaseGuard>,
+) -> Result<novarocks_state_store::coordination::LeaseFence, CoordinationError> {
+    let mut remaining = RENEW_CONFLICT_RETRIES;
+    loop {
+        let operation_id = OperationId::new_v7();
+        // The lock is held across the renewal await, which is why it is an
+        // async mutex. Nothing else takes it except the release path.
+        let mut guard = guard.lock().await;
+        let result = match guard.renew(operation_id).await {
+            Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
+                guard.recover_renew(operation_id).await
+            }
+            result => result,
+        };
+        match result {
+            Ok(()) => return Ok(guard.fence()),
+            Err(error)
+                if error.kind() == CoordinationErrorKind::OperationNotCommitted
+                    && remaining > 0 =>
+            {
+                remaining -= 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn spawn_renewal(
     context: &MvRefreshOwnershipContext,
     mv_id: i64,
@@ -643,19 +691,12 @@ fn spawn_renewal(
             if registry.is_shutting_down() || !registry.holds(mv_id) {
                 return;
             }
-            let operation_id = OperationId::new_v7();
-            // The lock is held across the renewal await, which is why it is an
-            // async mutex. Nothing else takes it except the release path.
-            let renewed = {
-                let mut guard = guard.lock().await;
-                guard.renew(operation_id).await.map(|()| guard.fence())
-            };
             // Renewal advances the fence, so the registered one must advance with
             // it. Leaving it behind makes every durable transition validate
             // against a superseded fence and fail as a conflict -- this frontend
             // rejecting its own writes, moments after renewing the very lease that
             // authorises them.
-            let advanced = match renewed {
+            let advanced = match renew_once(&guard).await {
                 Ok(current) => fence.replace(current).is_ok(),
                 Err(_) => false,
             };
@@ -686,11 +727,13 @@ mod tests {
     struct ConflictingStore {
         inner: Arc<dyn StateStore>,
         armed: Arc<std::sync::atomic::AtomicUsize>,
+        armed_uncertain: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     struct ConflictingTransaction {
         inner: Option<Box<dyn novarocks_spi::state_store::WriteTransaction>>,
         armed: Arc<std::sync::atomic::AtomicUsize>,
+        armed_uncertain: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl ConflictingTransaction {
@@ -760,6 +803,34 @@ mod tests {
 
         async fn commit(mut self: Box<Self>) -> novarocks_spi::state_store::CommitOutcome {
             use std::sync::atomic::Ordering;
+            // An ambiguous commit: the write may or may not have landed, so it
+            // is applied and then reported as unknown.
+            if self
+                .armed_uncertain
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |armed| {
+                    armed.checked_sub(1)
+                })
+                .is_ok()
+            {
+                let outcome = self
+                    .inner
+                    .take()
+                    .expect("transaction is active")
+                    .commit()
+                    .await;
+                if !matches!(
+                    outcome,
+                    novarocks_spi::state_store::CommitOutcome::Committed(_)
+                ) {
+                    return outcome;
+                }
+                return novarocks_spi::state_store::CommitOutcome::CommitUnknown(
+                    novarocks_spi::state_store::StateStoreError::new(
+                        novarocks_spi::state_store::StateStoreErrorKind::Internal,
+                        "injected uncertain commit",
+                    ),
+                );
+            }
             if self
                 .armed
                 // `checked_sub` is the whole point: `then_some(armed - 1)`
@@ -814,6 +885,7 @@ mod tests {
             Ok(Box::new(ConflictingTransaction {
                 inner: Some(self.inner.begin_write(transaction_id, purpose).await?),
                 armed: Arc::clone(&self.armed),
+                armed_uncertain: Arc::clone(&self.armed_uncertain),
             }))
         }
 
@@ -850,6 +922,7 @@ mod tests {
     async fn conflicting_coordination(
         path: &std::path::Path,
         armed: &Arc<std::sync::atomic::AtomicUsize>,
+        uncertain: &Arc<std::sync::atomic::AtomicUsize>,
     ) -> MvRefreshCoordination {
         let registry = novarocks_state_store::builtin_state_store_provider_registry()
             .expect("built-in provider registry");
@@ -882,6 +955,7 @@ mod tests {
         let store = Arc::new(ConflictingStore {
             inner,
             armed: Arc::clone(armed),
+            armed_uncertain: Arc::clone(uncertain),
         }) as Arc<dyn StateStore>;
         // Arm only after open, so the bootstrap writes are not the refused ones.
         MvRefreshCoordination::open(store)
@@ -889,13 +963,60 @@ mod tests {
             .expect("open MV refresh coordination")
     }
 
+    /// Ownership is sticky, so the renewal task runs for as long as this
+    /// frontend owns the target. A renewal that does not prove the lease was
+    /// lost must not forget it: whatever refresh is in flight at that moment
+    /// would fail its next durable write with "this frontend does not hold the
+    /// refresh lease", naming a lease nobody took away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_renewal_that_did_not_lose_the_lease_keeps_ownership() {
+        use std::sync::atomic::Ordering;
+        let temp = tempfile::TempDir::new().expect("temporary directory");
+        let armed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let uncertain = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let coordination =
+            conflicting_coordination(&temp.path().join("state.sqlite"), &armed, &uncertain).await;
+        let AcquireOutcome::Acquired(guard) = coordination
+            .acquire(&resource(0xbeef))
+            .await
+            .expect("acquire")
+        else {
+            panic!("an uncontended target must be acquired");
+        };
+        let guard = tokio::sync::Mutex::new(guard);
+
+        // An ambiguous renewal is resolved rather than treated as a loss.
+        uncertain.store(1, Ordering::Release);
+        renew_once(&guard)
+            .await
+            .expect("an uncertain renewal is recovered, not counted as a lost lease");
+        assert_eq!(uncertain.load(Ordering::Acquire), 0);
+
+        // A definite conflict proves the renewal did not land, and the lease
+        // still holds its existing deadline, so a fresh attempt is correct.
+        armed.store(2, Ordering::Release);
+        renew_once(&guard)
+            .await
+            .expect("a definite renewal conflict is absorbed");
+        assert_eq!(armed.load(Ordering::Acquire), 0);
+
+        // A lease that genuinely cannot settle still gives up, so it cannot be
+        // renewed past its own expiry.
+        armed.store(64, Ordering::Release);
+        let error = renew_once(&guard)
+            .await
+            .expect_err("the retry bound has to hold");
+        assert_eq!(error.kind(), CoordinationErrorKind::OperationNotCommitted);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_definite_acquire_conflict_is_absorbed_rather_than_refusing_the_caller() {
         use std::sync::atomic::Ordering;
         let temp = tempfile::TempDir::new().expect("temporary directory");
         let armed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let uncertain = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let coordination =
-            conflicting_coordination(&temp.path().join("state.sqlite"), &armed).await;
+            conflicting_coordination(&temp.path().join("state.sqlite"), &armed, &uncertain).await;
         armed.store(2, Ordering::Release);
 
         let outcome = coordination
@@ -920,8 +1041,9 @@ mod tests {
         use std::sync::atomic::Ordering;
         let temp = tempfile::TempDir::new().expect("temporary directory");
         let armed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let uncertain = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let coordination =
-            conflicting_coordination(&temp.path().join("state.sqlite"), &armed).await;
+            conflicting_coordination(&temp.path().join("state.sqlite"), &armed, &uncertain).await;
         // A record that never settles must stop retrying rather than spin.
         armed.store(64, Ordering::Release);
 
