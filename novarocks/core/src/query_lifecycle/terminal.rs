@@ -847,24 +847,27 @@ impl QueryTerminalRuntimeFilterChannelV1 {
                 "terminal runtime-filter published count and latest version disagree",
             ));
         }
-        let terminal_count = checked_sum(
-            [
-                self.completed_count,
-                self.unavailable_count,
-                self.cancelled_count,
-            ],
-            "terminal runtime-filter channel counters overflow",
-        )?;
+        // Terminal state is the joined semantic outcome, while these counters
+        // retain every observed event. In particular, AnyOf completion joins
+        // with IncompleteCoverage as Completed without erasing either event.
         let valid_terminal = match self.terminal_state {
-            QueryTerminalRuntimeFilterChannelTerminalStateV1::Open => terminal_count == 0,
+            QueryTerminalRuntimeFilterChannelTerminalStateV1::Open => {
+                self.completed_count == 0
+                    && self.unavailable_count == 0
+                    && self.cancelled_count == 0
+            }
             QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed => {
-                terminal_count == 1 && self.completed_count == 1
+                self.completed_count != 0 && self.cancelled_count == 0
             }
             QueryTerminalRuntimeFilterChannelTerminalStateV1::Unavailable => {
-                terminal_count == 1 && self.unavailable_count == 1
+                self.completed_count == 0
+                    && self.unavailable_count != 0
+                    && self.cancelled_count == 0
             }
             QueryTerminalRuntimeFilterChannelTerminalStateV1::Cancelled => {
-                terminal_count == 1 && self.cancelled_count == 1
+                self.completed_count == 0
+                    && self.unavailable_count == 0
+                    && self.cancelled_count != 0
             }
         };
         if !valid_terminal {
@@ -2801,6 +2804,51 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 vec![invalid],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn terminal_profile_contribution_accepts_joined_terminal_event_counters() {
+        let channel = QueryTerminalRuntimeFilterChannelV1::new(
+            QueryTerminalRuntimeFilterChannelKeyV1::new(1, 1),
+            QueryTerminalRuntimeFilterChannelInstallStateV1::Installed,
+            QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed,
+            Some(1),
+            1,
+            2,
+            1,
+            0,
+        );
+
+        let contribution = QueryTerminalProfileContributionV1::try_new(
+            vec![channel],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("joined terminal state preserves every observed event counter");
+
+        assert_eq!(contribution.channels()[0].completed_count(), 2);
+        assert_eq!(contribution.channels()[0].unavailable_count(), 1);
+
+        let conflicting = QueryTerminalRuntimeFilterChannelV1::new(
+            QueryTerminalRuntimeFilterChannelKeyV1::new(1, 1),
+            QueryTerminalRuntimeFilterChannelInstallStateV1::Installed,
+            QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed,
+            Some(1),
+            1,
+            1,
+            0,
+            1,
+        );
+        assert!(
+            QueryTerminalProfileContributionV1::try_new(
+                vec![conflicting],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
             )
             .is_err()
         );

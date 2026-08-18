@@ -824,19 +824,26 @@ fn validate_channels(
                 "terminal runtime-filter published count and latest version disagree",
             ));
         }
-        let terminal_count = checked_sum(
-            [
-                value.completed_count,
-                value.unavailable_count,
-                value.cancelled_count,
-            ],
-            "terminal runtime-filter channel counters overflow",
-        )?;
+        // Terminal state is the joined semantic outcome, while these counters
+        // retain every observed event. In particular, AnyOf completion joins
+        // with IncompleteCoverage as Completed without erasing either event.
         let valid = match value.terminal_state {
-            1 => terminal_count == 0,
-            2 => terminal_count == 1 && value.completed_count == 1,
-            3 => terminal_count == 1 && value.unavailable_count == 1,
-            4 => terminal_count == 1 && value.cancelled_count == 1,
+            1 => {
+                value.completed_count == 0
+                    && value.unavailable_count == 0
+                    && value.cancelled_count == 0
+            }
+            2 => value.completed_count != 0 && value.cancelled_count == 0,
+            3 => {
+                value.completed_count == 0
+                    && value.unavailable_count != 0
+                    && value.cancelled_count == 0
+            }
+            4 => {
+                value.completed_count == 0
+                    && value.unavailable_count == 0
+                    && value.cancelled_count != 0
+            }
             _ => false,
         };
         if !valid {
@@ -1586,5 +1593,40 @@ mod tests {
             ..Default::default()
         };
         assert!(QueryTerminalProfileContributionV1::parse(invalid).is_err());
+    }
+
+    #[test]
+    fn profile_contribution_accepts_joined_terminal_with_truthful_event_counters() {
+        let contribution =
+            QueryTerminalProfileContributionV1::seal(
+                novarocks::QueryTerminalProfileContributionV1 {
+                    version: QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
+                    channels: vec![novarocks::QueryTerminalRuntimeFilterChannelV1 {
+                        channel_binding_id: 1,
+                        channel_id: 1,
+                        install_state:
+                            novarocks::QueryTerminalRuntimeFilterChannelInstallStateV1::Installed
+                                as i32,
+                        terminal_state:
+                            novarocks::QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed
+                                as i32,
+                        latest_published_logical_version: Some(1),
+                        published_count: 1,
+                        completed_count: 2,
+                        unavailable_count: 1,
+                        cancelled_count: 0,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .expect("joined terminal state preserves repeated and incomplete-coverage events");
+
+        let channel = &contribution.as_proto().channels[0];
+        assert_eq!(channel.completed_count, 2);
+        assert_eq!(channel.unavailable_count, 1);
+
+        let mut conflicting = contribution.as_proto().clone();
+        conflicting.channels[0].cancelled_count = 1;
+        assert!(QueryTerminalProfileContributionV1::parse(conflicting).is_err());
     }
 }
