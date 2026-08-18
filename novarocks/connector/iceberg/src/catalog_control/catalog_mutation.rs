@@ -1122,9 +1122,9 @@ fn alter_schema(
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(&path.segments[0]))
         {
-            return Err(invalid(
-                "Iceberg equality-delete columns cannot be dropped while delete files exist",
-            ));
+            return Err(invalid(equality_delete_drop_block_message(
+                &path.segments[0],
+            )));
         }
     }
     if let ConnectorSchemaChange::AddColumn { column, .. } = change
@@ -1414,6 +1414,12 @@ fn split_path(path: &ConnectorColumnPath) -> Result<(&[Arc<str>], &str), Connect
         .split_last()
         .ok_or_else(|| invalid("Iceberg column path is empty"))?;
     Ok((parent, name))
+}
+
+fn equality_delete_drop_block_message(field: &str) -> String {
+    format!(
+        "DROP COLUMN `{field}` is blocked because an Iceberg equality-delete file references `{field}`"
+    )
 }
 
 fn find_field_id(
@@ -3282,6 +3288,14 @@ mod tests {
 
         assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
         assert_eq!(error.message(), "Iceberg column `bogus` does not exist");
+    }
+
+    #[test]
+    fn equality_delete_drop_block_message_names_the_referenced_field() {
+        assert_eq!(
+            equality_delete_drop_block_message("id"),
+            "DROP COLUMN `id` is blocked because an Iceberg equality-delete file references `id`"
+        );
     }
 
     #[test]

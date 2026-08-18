@@ -38,7 +38,7 @@ ALTER TABLE ${case_db}.tab1 DROP COLUMN c1.element;
 
 -- query 3
 -- Negative: cannot DROP a non-existent element field.
--- @expect_error=not found
+-- @expect_error=Iceberg column `v3` does not exist
 ALTER TABLE ${case_db}.tab1 DROP COLUMN c1.element.v3;
 
 -- query 4

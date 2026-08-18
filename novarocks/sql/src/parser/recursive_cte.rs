@@ -360,10 +360,12 @@ fn try_unroll_cte(cte: &Cte, max_depth: usize) -> Result<Option<Vec<Cte>>, Strin
         .expect("extract_union_chain guarantees >= 2 operands");
 
     // Anchor must not self-reference — that is an explicit error case in
-    // SQL recursive CTEs ("recursive reference in anchor"). Leave the CTE
-    // unchanged so the analyzer reports "Unknown table".
+    // SQL recursive CTEs ("recursive reference in anchor"). This is owned
+    // by the recursive-CTE rewrite admission, rather than the analyzer: once
+    // the CTE falls through, ordinary catalog resolution would turn the name
+    // into a namespace-qualified external-table miss.
     if set_expr_references_table(anchor, &cte_name_lower) {
-        return Ok(None);
+        return Err(format!("unknown table: {cte_name}"));
     }
 
     // At least one recursive operand must contain a self-reference, else
@@ -1136,6 +1138,22 @@ mod tests {
         assert_eq!(
             parse_normalized_sql_raw(sql).expect_err("mixed recursive CTE must fail"),
             "unsupported recursive CTE shape: mixed UNION quantifiers"
+        );
+    }
+
+    #[test]
+    fn rejects_anchor_self_reference_before_rewrite_fallback() {
+        // The recursive name in the leftmost anchor is invalid even when the
+        // remaining UNION operand does not recurse. Parsing must fail here;
+        // leaving this shape untouched would defer it to catalog lookup and
+        // change the contract to a namespace-qualified external-table error.
+        let sql = "WITH RECURSIVE invalid_cte AS (\
+            SELECT 1 WHERE 1 IN (SELECT 1 FROM invalid_cte) \
+            UNION ALL SELECT 2) \
+            SELECT * FROM invalid_cte";
+        assert_eq!(
+            parse_normalized_sql_raw(sql).expect_err("anchor self-reference must not fall through"),
+            "unknown table: invalid_cte"
         );
     }
 

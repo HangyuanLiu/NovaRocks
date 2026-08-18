@@ -267,7 +267,7 @@ ORDER BY steps;
 
 -- query 14
 -- Error case: a recursive reference in the non-recursive anchor is rejected
--- by recursive-name resolution, before any metadata lookup.
+-- by parser/rewrite admission, before any metadata lookup.
 -- @expect_error=unknown table: invalid_cte
 WITH RECURSIVE invalid_cte AS (
     SELECT employee_id, name FROM ${case_db}.employees WHERE employee_id IN (SELECT employee_id FROM invalid_cte)
