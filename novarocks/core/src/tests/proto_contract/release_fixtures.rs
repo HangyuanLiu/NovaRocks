@@ -652,18 +652,6 @@ fn release_stage_fragments_request_fixture_decodes() {
         "StageFragmentsRequest fixture FileScanRange.file_pruning_min_max_values[1].max_int_value"
     );
 
-    let query_options = crate::protocol::decode_native_query_options(
-        params
-            .query_options
-            .as_ref()
-            .expect("StageFragmentsRequest fixture query_options"),
-    )
-    .expect("StageFragmentsRequest fixture query_options DTO");
-    assert_eq!(query_options.exec_mem_limit(), Some(512 << 20));
-    assert_eq!(query_options.pipeline_dop(), Some(8));
-    assert_eq!(query_options.runtime_filter_scan_wait_time_ms(), Some(1500));
-    assert_eq!(query_options.runtime_filter_wait_timeout_ms(), Some(3000));
-
     let destination = params
         .destinations
         .first()

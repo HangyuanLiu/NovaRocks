@@ -15,6 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod cls_r6_migration;
 mod proto_contract;
 pub(crate) mod testutil;

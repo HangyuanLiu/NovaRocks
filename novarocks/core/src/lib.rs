@@ -20,8 +20,6 @@ mod tests;
 pub mod common;
 pub mod connector;
 pub mod maintenance;
-pub mod protocol;
-pub mod query_lifecycle;
 pub mod runtime;
 pub mod service;
 pub use novarocks_version as version;
