@@ -283,7 +283,7 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
             .unwrap_or(1);
         Ok(tonic::Response::new(proto::HeartbeatResponse {
             start_epoch: crate::runtime::start_epoch::start_epoch(),
-            version: novarocks::version::short_version().to_string(),
+            version: novarocks_version::short_version().to_string(),
             num_cores,
             status_code: 0,
         }))

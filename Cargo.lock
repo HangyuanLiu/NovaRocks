@@ -3086,72 +3086,6 @@ dependencies = [
 [[package]]
 name = "novarocks"
 version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "arrow-buffer",
- "arrow-data",
- "as-any",
- "async-trait",
- "atty",
- "axum",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "chrono-tz",
- "crc32c",
- "crc32fast",
- "csv",
- "datasketches",
- "futures",
- "hashbrown 0.14.5",
- "hex",
- "libc",
- "libm",
- "md-5",
- "mysql",
- "novarocks-catalog",
- "novarocks-execution",
- "novarocks-fs",
- "novarocks-protocol",
- "novarocks-spi",
- "novarocks-sql",
- "novarocks-state-store",
- "novarocks-types",
- "novarocks-version",
- "num-traits",
- "num_cpus",
- "once_cell",
- "opensrv-mysql",
- "openssl",
- "orc-rust",
- "ordered-float 4.6.0",
- "parquet",
- "prometheus",
- "prost 0.13.5",
- "prost-reflect",
- "rand 0.8.5",
- "regex",
- "reqwest",
- "roaring 0.10.12",
- "ryu",
- "serde",
- "serde_json",
- "sha2",
- "sm3",
- "sqlparser",
- "tdigest",
- "tempfile",
- "threadpool",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "twox-hash 2.1.2",
- "typetag",
- "url",
- "uuid",
-]
 
 [[package]]
 name = "novarocks-backend"
@@ -3163,12 +3097,12 @@ dependencies = [
  "axum",
  "bytes",
  "hex",
- "novarocks",
  "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-protocol",
  "novarocks-spi",
  "novarocks-types",
+ "novarocks-version",
  "once_cell",
  "parquet",
  "prometheus",
@@ -3332,7 +3266,6 @@ dependencies = [
  "hex",
  "libc",
  "mysql_common 0.32.4",
- "novarocks",
  "novarocks-catalog",
  "novarocks-connector-starrocks",
  "novarocks-execution",
@@ -3343,6 +3276,7 @@ dependencies = [
  "novarocks-sql",
  "novarocks-state-store",
  "novarocks-types",
+ "novarocks-version",
  "once_cell",
  "opensrv-mysql",
  "parquet",
@@ -3405,7 +3339,6 @@ dependencies = [
  "chrono",
  "libc",
  "mysql",
- "novarocks",
  "novarocks-backend",
  "novarocks-connector-iceberg",
  "novarocks-connector-starrocks",
@@ -3779,7 +3712,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68f19d67e5a2795c94e73e0bb1cc1a7edeb2e28efd39e2e1c9b7a40c1108b11c"
 dependencies = [
  "num-traits",
- "serde",
 ]
 
 [[package]]
@@ -5456,16 +5388,6 @@ name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
-
-[[package]]
-name = "tdigest"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c45d225a08ebccf0e0c7d46db4066ea8ab05b29d3750ecc1a04f1675978bf3c8"
-dependencies = [
- "ordered-float 2.10.1",
- "serde",
-]
 
 [[package]]
 name = "tempfile"

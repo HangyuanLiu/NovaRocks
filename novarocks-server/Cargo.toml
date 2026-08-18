@@ -8,7 +8,6 @@ name = "novarocks"
 path = "src/main.rs"
 
 [dependencies]
-novarocks = { path = "../novarocks/core" }
 novarocks-backend = { path = "../novarocks/backend" }
 novarocks-connector-iceberg = { path = "../novarocks/connector/iceberg" }
 novarocks-connector-starrocks = { path = "../novarocks/connector/starrocks" }

@@ -40,7 +40,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-use novarocks::version;
+use novarocks_version as version;
 
 use self::encoding::write_query_result;
 use self::session::{

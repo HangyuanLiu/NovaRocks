@@ -14,4 +14,5 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub use novarocks_version as version;
+// Design: ADR-0088 (docs/adr/ADR-0088-neutral-tail-owner-cut.md)
+// Core is intentionally empty after the neutral owner cut; boundaries are enforced by the Cargo DAG.
