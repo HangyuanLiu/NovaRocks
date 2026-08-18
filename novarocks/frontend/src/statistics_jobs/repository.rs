@@ -31,10 +31,12 @@ use uuid::Uuid;
 use crate::durable::{DurableOpaqueBytes, DurableRecordError, DurableRecordStore};
 
 use super::model::{
-    MAX_DURABLE_STATISTICS_PUBLICATION_EVIDENCE_BYTES, MAX_STATISTICS_ERROR_MESSAGE_BYTES,
-    MAX_STATISTICS_METRIC_NAME_BYTES, MAX_STATISTICS_METRIC_NAMES,
+    MAX_DURABLE_STATISTICS_BASIS_DATA_VERSION_BYTES,
+    MAX_DURABLE_STATISTICS_PUBLICATION_EVIDENCE_BYTES,
+    MAX_DURABLE_STATISTICS_TABLE_OBJECT_ID_BYTES, MAX_STATISTICS_ERROR_MESSAGE_BYTES,
+    MAX_STATISTICS_EXPLICIT_COLUMN_BYTES, MAX_STATISTICS_EXPLICIT_COLUMNS,
     MAX_STATISTICS_TARGET_COMPONENT_BYTES, STATISTICS_JOB_SCHEMA_VERSION, StatisticsJob,
-    StatisticsJobCreate, StatisticsJobError, StatisticsJobState, StoredStatisticsJobV2,
+    StatisticsJobCreate, StatisticsJobError, StatisticsJobState, StoredStatisticsJobV3,
 };
 
 const JOB_PREFIX: &str = "novarocks/frontend/statistics/v2/jobs/";
@@ -58,6 +60,7 @@ pub enum StatisticsJobRepositoryErrorKind {
     NotFound,
     Conflict,
     InvalidTransition,
+    UnsupportedSchemaVersion,
     Corruption,
     CommitUnknown,
     BudgetExceeded,
@@ -98,6 +101,15 @@ impl StatisticsJobRepositoryError {
 
     fn corruption(message: impl Into<String>) -> Self {
         Self::new(StatisticsJobRepositoryErrorKind::Corruption, message)
+    }
+
+    fn unsupported_schema_version(schema_version: u8) -> Self {
+        Self::new(
+            StatisticsJobRepositoryErrorKind::UnsupportedSchemaVersion,
+            format!(
+                "statistics job record has unsupported schema version {schema_version}; expected {STATISTICS_JOB_SCHEMA_VERSION}"
+            ),
+        )
     }
 
     fn durable(error: DurableRecordError) -> Self {
@@ -174,7 +186,7 @@ impl StatisticsJobRepository {
         validate_create(&request)?;
         let job_id = Uuid::now_v7();
         let operation_id = Uuid::now_v7();
-        let stored = StoredStatisticsJobV2::try_new(job_id, operation_id, request)
+        let stored = StoredStatisticsJobV3::try_new(job_id, operation_id, request)
             .map_err(StatisticsJobRepositoryError::durable)?;
         for retry in 0..=CREATE_CONFLICT_RETRY_LIMIT {
             let mut transaction = self.begin_write("create frontend statistics job").await?;
@@ -241,7 +253,14 @@ impl StatisticsJobRepository {
         loop {
             let page = transaction.range(&request).await.map_err(store_error)?;
             for record in page.records {
-                let stored: StoredStatisticsJobV2 =
+                let header: StoredStatisticsJobHeader =
+                    decode_json(record.value.as_bytes(), "statistics job header")?;
+                if header.schema_version != STATISTICS_JOB_SCHEMA_VERSION {
+                    return Err(StatisticsJobRepositoryError::unsupported_schema_version(
+                        header.schema_version,
+                    ));
+                }
+                let stored: StoredStatisticsJobV3 =
                     decode_json(record.value.as_bytes(), "statistics job")?;
                 validate_stored(&stored)?;
                 jobs.push(StatisticsJob::from(&stored));
@@ -326,6 +345,7 @@ impl StatisticsJobRepository {
             true,
             None,
             None,
+            None,
         )
         .await
         .map(Some)
@@ -355,6 +375,7 @@ impl StatisticsJobRepository {
             false,
             None,
             None,
+            None,
         )
         .await
     }
@@ -368,9 +389,12 @@ impl StatisticsJobRepository {
         job_id: Uuid,
         now_ms: i64,
         publication_evidence: Bytes,
+        basis_data_version: Bytes,
         fence: &FenceValidator,
     ) -> RepositoryResult<StatisticsJob> {
         let publication_evidence = DurableOpaqueBytes::try_new(publication_evidence.to_vec())
+            .map_err(StatisticsJobRepositoryError::durable)?;
+        let basis_data_version = DurableOpaqueBytes::try_new(basis_data_version.to_vec())
             .map_err(StatisticsJobRepositoryError::durable)?;
         self.transition_with_fence(
             job_id,
@@ -382,6 +406,7 @@ impl StatisticsJobRepository {
             false,
             None,
             Some(publication_evidence),
+            Some(basis_data_version),
         )
         .await
     }
@@ -412,6 +437,7 @@ impl StatisticsJobRepository {
             None,
             Some(fence),
             false,
+            None,
             None,
             None,
         )
@@ -496,6 +522,7 @@ impl StatisticsJobRepository {
             false,
             None,
             None,
+            None,
         )
         .await
     }
@@ -525,6 +552,7 @@ impl StatisticsJobRepository {
             false,
             Some(retry_not_before_ms),
             None,
+            None,
         )
         .await
     }
@@ -541,6 +569,9 @@ impl StatisticsJobRepository {
         retry_not_before_ms: Option<i64>,
         publication_evidence: Option<
             DurableOpaqueBytes<MAX_DURABLE_STATISTICS_PUBLICATION_EVIDENCE_BYTES>,
+        >,
+        basis_data_version: Option<
+            DurableOpaqueBytes<MAX_DURABLE_STATISTICS_BASIS_DATA_VERSION_BYTES>,
         >,
     ) -> RepositoryResult<StatisticsJob> {
         if !expected.can_transition_to(next) {
@@ -586,6 +617,9 @@ impl StatisticsJobRepository {
         }
         if let Some(publication_evidence) = publication_evidence {
             stored.publication_evidence = Some(publication_evidence);
+        }
+        if let Some(basis_data_version) = basis_data_version {
+            stored.basis_data_version = Some(basis_data_version);
         }
         stored.cancel_requested = false;
         if increment_attempt {
@@ -637,7 +671,7 @@ impl StatisticsJobRepository {
         &self,
         transaction: Box<dyn WriteTransaction>,
         context: &str,
-        expected: &StoredStatisticsJobV2,
+        expected: &StoredStatisticsJobV3,
     ) -> RepositoryResult<StatisticsJob> {
         let transaction_id = *transaction.transaction_id();
         match transaction.commit().await {
@@ -660,7 +694,7 @@ impl StatisticsJobRepository {
         &self,
         transaction_id: TransactionId,
         context: &str,
-        expected: &StoredStatisticsJobV2,
+        expected: &StoredStatisticsJobV3,
         commit_error: StateStoreError,
     ) -> RepositoryResult<StatisticsJob> {
         let resolution = self
@@ -707,7 +741,7 @@ impl StatisticsJobRepository {
 }
 
 struct VersionedJob {
-    stored: StoredStatisticsJobV2,
+    stored: StoredStatisticsJobV3,
     version: VersionToken,
 }
 
@@ -722,7 +756,14 @@ async fn load_job(
     else {
         return Ok(None);
     };
-    let stored: StoredStatisticsJobV2 = decode_json(record.value.as_bytes(), "statistics job")?;
+    let header: StoredStatisticsJobHeader =
+        decode_json(record.value.as_bytes(), "statistics job header")?;
+    if header.schema_version != STATISTICS_JOB_SCHEMA_VERSION {
+        return Err(StatisticsJobRepositoryError::unsupported_schema_version(
+            header.schema_version,
+        ));
+    }
+    let stored: StoredStatisticsJobV3 = decode_json(record.value.as_bytes(), "statistics job")?;
     validate_stored(&stored)?;
     if stored.job_id != job_id {
         return Err(StatisticsJobRepositoryError::corruption(
@@ -759,24 +800,39 @@ fn validate_create(request: &StatisticsJobCreate) -> RepositoryResult<()> {
             ));
         }
     }
-    request.table_pin.validate().map_err(|error| {
-        StatisticsJobRepositoryError::corruption(format!(
-            "invalid statistics job table pin: {error}"
-        ))
-    })?;
-    if request.metric_names.is_empty() || request.metric_names.len() > MAX_STATISTICS_METRIC_NAMES {
-        return Err(StatisticsJobRepositoryError::corruption(
-            "statistics job metric names must be non-empty and bounded",
-        ));
-    }
-    if request
-        .metric_names
-        .iter()
-        .any(|metric| metric.is_empty() || metric.len() > MAX_STATISTICS_METRIC_NAME_BYTES)
+    novarocks_spi::connector::ConnectorInstanceId::parse(&request.connector_instance_id).map_err(
+        |error| {
+            StatisticsJobRepositoryError::corruption(format!(
+                "invalid statistics connector instance ID: {error}"
+            ))
+        },
+    )?;
+    if request.object_id.is_empty()
+        || request.object_id.len() > MAX_DURABLE_STATISTICS_TABLE_OBJECT_ID_BYTES
     {
         return Err(StatisticsJobRepositoryError::corruption(
-            "statistics job metric name is empty or exceeds the bound",
+            "statistics job object ID is empty or exceeds the durable bound",
         ));
+    }
+    if let super::application::StatisticsColumnIntent::Explicit(columns) = &request.columns {
+        if columns.is_empty() || columns.len() > MAX_STATISTICS_EXPLICIT_COLUMNS {
+            return Err(StatisticsJobRepositoryError::corruption(
+                "statistics explicit columns must be non-empty and bounded",
+            ));
+        }
+        if columns
+            .iter()
+            .any(|column| column.is_empty() || column.len() > MAX_STATISTICS_EXPLICIT_COLUMN_BYTES)
+            || columns.iter().enumerate().any(|(index, column)| {
+                columns[..index]
+                    .iter()
+                    .any(|seen| seen.eq_ignore_ascii_case(column))
+            })
+        {
+            return Err(StatisticsJobRepositoryError::corruption(
+                "statistics explicit columns are invalid or contain duplicates",
+            ));
+        }
     }
     Ok(())
 }
@@ -792,16 +848,17 @@ fn validate_error(error: Option<&StatisticsJobError>) -> RepositoryResult<()> {
     Ok(())
 }
 
-fn validate_stored(stored: &StoredStatisticsJobV2) -> RepositoryResult<()> {
+fn validate_stored(stored: &StoredStatisticsJobV3) -> RepositoryResult<()> {
     if stored.schema_version != STATISTICS_JOB_SCHEMA_VERSION {
-        return Err(StatisticsJobRepositoryError::corruption(
-            "statistics job record has an unsupported schema version",
+        return Err(StatisticsJobRepositoryError::unsupported_schema_version(
+            stored.schema_version,
         ));
     }
     validate_create(&StatisticsJobCreate {
         target: stored.target.clone(),
-        table_pin: (&stored.table_pin).into(),
-        metric_names: stored.metric_names.clone(),
+        connector_instance_id: stored.connector_instance_id.clone(),
+        object_id: stored.object_id.as_bytes().to_vec(),
+        columns: stored.columns.clone(),
         submitted_at_ms: stored.submitted_at_ms,
     })?;
     validate_error(stored.error.as_ref())?;
@@ -817,6 +874,15 @@ fn validate_stored(stored: &StoredStatisticsJobV2) -> RepositoryResult<()> {
     if stored.state == StatisticsJobState::Publishing && stored.publication_evidence.is_none() {
         return Err(StatisticsJobRepositoryError::corruption(
             "publishing statistics job is missing operation evidence",
+        ));
+    }
+    if matches!(
+        stored.state,
+        StatisticsJobState::Publishing | StatisticsJobState::Succeeded
+    ) && stored.basis_data_version.is_none()
+    {
+        return Err(StatisticsJobRepositoryError::corruption(
+            "published statistics job is missing its basis data version",
         ));
     }
     if let Some(wire) = &stored.publication_evidence {
@@ -856,6 +922,7 @@ fn state_prefix(state: StatisticsJobState) -> &'static str {
         StatisticsJobState::Publishing => "novarocks/frontend/statistics/v1/state/PUBLISHING/",
         StatisticsJobState::Succeeded => "novarocks/frontend/statistics/v1/state/SUCCEEDED/",
         StatisticsJobState::Failed => "novarocks/frontend/statistics/v1/state/FAILED/",
+        StatisticsJobState::Stale => "novarocks/frontend/statistics/v1/state/STALE/",
         StatisticsJobState::Cancelled => "novarocks/frontend/statistics/v1/state/CANCELLED/",
     }
 }
@@ -887,6 +954,11 @@ fn decode_json<T: DeserializeOwned>(bytes: &[u8], context: &str) -> RepositoryRe
     serde_json::from_slice(bytes).map_err(|error| {
         StatisticsJobRepositoryError::corruption(format!("decode {context} failed: {error}"))
     })
+}
+
+#[derive(serde::Deserialize)]
+struct StoredStatisticsJobHeader {
+    schema_version: u8,
 }
 
 fn not_found(job_id: Uuid) -> StatisticsJobRepositoryError {

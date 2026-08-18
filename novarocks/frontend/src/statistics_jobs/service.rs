@@ -24,13 +24,12 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
 use super::application;
-use super::model::{
-    StatisticsJob, StatisticsJobCreate, StatisticsJobTablePin, StatisticsJobTarget,
-};
+use super::model::{StatisticsJob, StatisticsJobCreate, StatisticsJobTarget};
 use super::repository::{StatisticsJobRepository, StatisticsJobRepositoryError};
 use super::worker::{
     StatisticsAnalyzeWorker, StatisticsAnalyzeWorkerCoordination, StatisticsAttemptError,
@@ -41,7 +40,7 @@ use crate::coordination::FrontendCoordinationRuntime;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnalyzeTableStatement {
     pub target: StatisticsJobTarget,
-    pub metric_names: Vec<String>,
+    pub columns: application::StatisticsColumnIntent,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +69,7 @@ pub enum StatisticsStatement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatisticsStatementResult {
     JobSubmitted(StatisticsJob),
+    JobCompleted(StatisticsJob),
     JobCancellationRequested(StatisticsJob),
     AnalyzeJobs(Vec<StatisticsJob>),
     TableStats(Vec<StatisticsTableStatRow>),
@@ -95,23 +95,22 @@ pub trait TableStatisticsReader: Send + Sync {
     ) -> Result<Vec<StatisticsTableStatRow>, String>;
 }
 
-/// Resolves an ANALYZE logical target exactly once, before its durable job is
-/// created. The returned pin is persisted with the job and never refreshed by
-/// the worker; this keeps collection and publication on one data version.
+/// Captures the physical identity of an ANALYZE target before durable job
+/// creation. The returned schema columns are admission-only and never stored.
 pub trait StatisticsJobTargetResolver: Send + Sync {
-    fn resolve_table_pin(
+    fn capture_table_object(
         &self,
         target: &StatisticsJobTarget,
-    ) -> Result<StatisticsJobTablePin, String>;
+    ) -> Result<application::StatisticsTargetCapture, String>;
 }
 
 struct UnavailableStatisticsJobTargetResolver;
 
 impl StatisticsJobTargetResolver for UnavailableStatisticsJobTargetResolver {
-    fn resolve_table_pin(
+    fn capture_table_object(
         &self,
         _target: &StatisticsJobTarget,
-    ) -> Result<StatisticsJobTablePin, String> {
+    ) -> Result<application::StatisticsTargetCapture, String> {
         Err("ANALYZE is unavailable until the frontend statistics target resolver is bound".into())
     }
 }
@@ -153,24 +152,17 @@ impl TableStatisticsReader for StatisticsTableReaderAdapter {
 }
 
 impl StatisticsJobTargetResolver for StatisticsTargetResolverAdapter {
-    fn resolve_table_pin(
+    fn capture_table_object(
         &self,
         target: &StatisticsJobTarget,
-    ) -> Result<StatisticsJobTablePin, String> {
-        let pin = self
-            .inner
-            .resolve_table_pin(&application::StatisticsTableTarget {
+    ) -> Result<application::StatisticsTargetCapture, String> {
+        self.inner
+            .capture_table_object(&application::StatisticsTableTarget {
                 catalog: target.catalog.clone(),
                 namespace: target.namespace.clone(),
                 table: target.table.clone(),
             })
-            .map_err(|error| error.to_string())?;
-        Ok(StatisticsJobTablePin {
-            connector_instance_id: pin.connector_instance_id,
-            table_handle: pin.table_handle,
-            data_version: pin.data_version,
-            columns: pin.columns,
-        })
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -279,22 +271,15 @@ impl StatisticsApplicationService {
                         )
                     })?
                     .clone();
-                let table_pin = resolver
-                    .resolve_table_pin(&statement.target)
+                let target_capture = resolver
+                    .capture_table_object(&statement.target)
                     .map_err(StatisticsApplicationError::target_resolution)?;
-                // An omitted column list means every column from this one-time
-                // resolution. Persist that concrete, bounded list so a later
-                // worker attempt never has to resolve latest metadata again.
-                let metric_names = if statement.metric_names.is_empty() {
-                    table_pin.columns.clone()
-                } else {
-                    statement.metric_names
-                };
                 let job = repository
                     .create(StatisticsJobCreate {
                         target: statement.target,
-                        table_pin,
-                        metric_names,
+                        connector_instance_id: target_capture.connector_instance_id,
+                        object_id: target_capture.object_id,
+                        columns: statement.columns,
                         submitted_at_ms,
                     })
                     .await
@@ -324,6 +309,46 @@ impl StatisticsApplicationService {
                 .show_table_stats(&statement.target)
                 .map(StatisticsStatementResult::TableStats)
                 .map_err(StatisticsApplicationError::table_statistics),
+        }
+    }
+
+    /// Wait only for a durable job observation. Statement cancellation or its
+    /// deadline ends this wait without writing cancellation intent; the worker
+    /// remains the only owner that can cancel its durable operation.
+    async fn wait_for_terminal(
+        &self,
+        job_id: Uuid,
+        execution: &crate::common::admitted_query_context::QueryExecutionContext,
+    ) -> Result<Option<StatisticsJob>, StatisticsApplicationError> {
+        let repository = self.repository()?;
+        loop {
+            let job = repository
+                .get(job_id)
+                .await
+                .map_err(StatisticsApplicationError::repository)?
+                .ok_or_else(|| StatisticsApplicationError {
+                    kind: StatisticsApplicationErrorKind::Repository,
+                    message: format!(
+                        "statistics job {job_id} disappeared while waiting for completion"
+                    ),
+                })?;
+            if job.state.is_terminal() {
+                return Ok(Some(job));
+            }
+            if execution.cancellation().is_cancelled() {
+                return Ok(None);
+            }
+            let sleep_for = match execution.deadline() {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(None);
+                    }
+                    remaining.min(Duration::from_millis(25))
+                }
+                None => Duration::from_millis(25),
+            };
+            tokio::time::sleep(sleep_for).await;
         }
     }
 
@@ -529,13 +554,14 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
     fn execute(
         &self,
         command: application::StatisticsApplicationCommand,
+        execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     ) -> Result<application::StatisticsApplicationResult, application::StatisticsApplicationError>
     {
         let statement = match command {
             application::StatisticsApplicationCommand::AnalyzeTable { target, columns } => {
                 StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
                     target: target.into(),
-                    metric_names: columns,
+                    columns,
                 })
             }
             application::StatisticsApplicationCommand::ShowAnalyzeJobs => {
@@ -578,13 +604,29 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
             )
         })
         .map_err(|error| application::StatisticsApplicationError::new(error.to_string()))?;
-        if matches!(result, StatisticsStatementResult::JobSubmitted(_)) {
-            if let Ok(worker) = self.worker.lock() {
-                if let Some(worker) = worker.as_ref() {
-                    worker.wakeup();
+        if matches!(result, StatisticsStatementResult::JobSubmitted(_))
+            && let Ok(worker) = self.worker.lock()
+            && let Some(worker) = worker.as_ref()
+        {
+            worker.wakeup();
+        }
+        let result = match (result, execution) {
+            (StatisticsStatementResult::JobSubmitted(job), Some(execution)) => {
+                match tokio::task::block_in_place(|| {
+                    self.runtime
+                        .block_on(self.service.wait_for_terminal(job.job_id, execution))
+                }) {
+                    Ok(Some(completed)) => StatisticsStatementResult::JobCompleted(completed),
+                    Ok(None) => StatisticsStatementResult::JobSubmitted(job),
+                    Err(error) => {
+                        return Err(application::StatisticsApplicationError::new(
+                            error.to_string(),
+                        ));
+                    }
                 }
             }
-        }
+            (other, _) => other,
+        };
         Ok(map_application_result(result))
     }
 }
@@ -626,6 +668,10 @@ impl StatisticsCollectedAttempt for StatisticsCollectedAttemptAdapter {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn basis_data_version(&self) -> &[u8] {
+        self.inner.basis_data_version().as_bytes().as_ref()
+    }
 }
 
 struct StatisticsAttemptAdapter {
@@ -636,19 +682,17 @@ impl StatisticsAttemptAdapter {
     fn request(job: &StatisticsJob) -> application::StatisticsAttemptRequest {
         application::StatisticsAttemptRequest {
             operation_id: job.operation_id,
-            table_pin: application::StatisticsTablePin {
-                connector_instance_id: job.table_pin.connector_instance_id.clone(),
-                table_handle: job.table_pin.table_handle.clone(),
-                data_version: job.table_pin.data_version.clone(),
-                columns: job.table_pin.columns.clone(),
-            },
-            metric_names: job.metric_names.clone(),
+            connector_instance_id: job.connector_instance_id.clone(),
+            namespace: job.target.namespace.clone(),
+            table: job.target.table.clone(),
+            object_id: job.object_id.clone(),
+            columns: job.columns.clone(),
         }
     }
 
-    fn collected<'a>(
-        collected: &'a dyn StatisticsCollectedAttempt,
-    ) -> Result<&'a dyn application::StatisticsCollectedAttempt, StatisticsAttemptError> {
+    fn collected(
+        collected: &dyn StatisticsCollectedAttempt,
+    ) -> Result<&dyn application::StatisticsCollectedAttempt, StatisticsAttemptError> {
         collected
             .as_any()
             .downcast_ref::<StatisticsCollectedAttemptAdapter>()
@@ -662,7 +706,17 @@ impl StatisticsAttemptAdapter {
     }
 
     fn map_error(error: application::StatisticsApplicationError) -> StatisticsAttemptError {
-        if error.requires_reconcile() {
+        if let Some(failure) = error.target_binding_failure() {
+            let kind = match failure {
+                novarocks_spi::connector::ConnectorTableObjectBindingFailure::Replaced => {
+                    super::model::StatisticsJobErrorKind::TargetReplaced
+                }
+                novarocks_spi::connector::ConnectorTableObjectBindingFailure::Missing => {
+                    super::model::StatisticsJobErrorKind::TargetMissing
+                }
+            };
+            StatisticsAttemptError::permanent(kind, error.to_string())
+        } else if error.requires_reconcile() {
             StatisticsAttemptError::reconcile(
                 super::model::StatisticsJobErrorKind::Publish,
                 error.to_string(),
@@ -754,6 +808,9 @@ fn map_application_result(
         StatisticsStatementResult::JobSubmitted(job) => {
             application::StatisticsApplicationResult::JobSubmitted(job_view(job))
         }
+        StatisticsStatementResult::JobCompleted(job) => {
+            application::StatisticsApplicationResult::JobSubmitted(job_view(job))
+        }
         StatisticsStatementResult::JobCancellationRequested(job) => {
             application::StatisticsApplicationResult::JobCancellationRequested(job_view(job))
         }
@@ -791,5 +848,19 @@ fn job_view(job: StatisticsJob) -> application::StatisticsJobView {
             namespace: job.target.namespace,
             table: job.target.table,
         },
+        error_kind: job.error.as_ref().map(|error| {
+            match error.kind {
+                super::model::StatisticsJobErrorKind::Configuration => "CONFIGURATION",
+                super::model::StatisticsJobErrorKind::Connector => "CONNECTOR",
+                super::model::StatisticsJobErrorKind::Collection => "COLLECTION",
+                super::model::StatisticsJobErrorKind::Publish => "PUBLISH",
+                super::model::StatisticsJobErrorKind::TargetReplaced => "TARGET_REPLACED",
+                super::model::StatisticsJobErrorKind::TargetMissing => "TARGET_MISSING",
+                super::model::StatisticsJobErrorKind::Cancelled => "CANCELLED",
+                super::model::StatisticsJobErrorKind::Internal => "INTERNAL",
+            }
+            .to_string()
+        }),
+        error_message: job.error.map(|error| error.message),
     }
 }

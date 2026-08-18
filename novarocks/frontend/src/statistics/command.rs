@@ -27,7 +27,7 @@ use crate::query_execution::StatementResult;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::statistics_jobs::application::{
     StatisticsApplicationCommand, StatisticsApplicationPort, StatisticsApplicationResult,
-    StatisticsTableTarget,
+    StatisticsColumnIntent, StatisticsTableTarget,
 };
 use novarocks_catalog::identifier::normalize_identifier;
 
@@ -75,6 +75,8 @@ fn statistics_application_result(
                 "catalog",
                 "namespace",
                 "table",
+                "error_kind",
+                "error_message",
             ],
             jobs.into_iter()
                 .map(|job| {
@@ -86,6 +88,8 @@ fn statistics_application_result(
                         Some(job.target.catalog),
                         Some(job.target.namespace),
                         Some(job.target.table),
+                        job.error_kind,
+                        job.error_message,
                     ]
                 })
                 .collect(),
@@ -166,6 +170,7 @@ impl StatisticsCommandExecutor {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
+        execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     ) -> Result<Option<StatementResult>, String> {
         let Some(statement) = novarocks_sql::planning::dml::parse_statistics_command(sql)? else {
             return Ok(None);
@@ -180,7 +185,11 @@ impl StatisticsCommandExecutor {
                     current_catalog,
                     current_database,
                 )?,
-                columns,
+                columns: if columns.is_empty() {
+                    StatisticsColumnIntent::AllColumns
+                } else {
+                    StatisticsColumnIntent::Explicit(columns)
+                },
             },
             novarocks_sql::planning::dml::StatisticsCommand::ShowAnalyzeJobs => {
                 StatisticsApplicationCommand::ShowAnalyzeJobs
@@ -202,7 +211,7 @@ impl StatisticsCommandExecutor {
             }
         };
         self.application
-            .execute(command)
+            .execute(command, execution)
             .map_err(|error| error.to_string())
             .and_then(statistics_application_result)
             .map(Some)
@@ -238,6 +247,7 @@ mod tests {
         fn execute(
             &self,
             command: StatisticsApplicationCommand,
+            _execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
         ) -> Result<StatisticsApplicationResult, StatisticsApplicationError> {
             self.commands
                 .lock()
@@ -251,6 +261,8 @@ mod tests {
                         state: "SUBMITTED".into(),
                         attempt: 0,
                         target,
+                        error_kind: None,
+                        error_message: None,
                     }),
                 ),
                 StatisticsApplicationCommand::ShowAnalyzeJobs
@@ -286,12 +298,18 @@ mod tests {
                     "ANALYZE TABLE ice.analytics.orders (order_id)",
                     None,
                     "default",
+                    None,
                 )
                 .expect("submit typed analyze")
                 .is_some()
         );
         let show_stats = executor
-            .try_execute("SHOW TABLE STATS ice.analytics.orders", None, "default")
+            .try_execute(
+                "SHOW TABLE STATS ice.analytics.orders",
+                None,
+                "default",
+                None,
+            )
             .expect("show typed table stats")
             .expect("statistics command result");
         let crate::runtime::statement_result::StatementResult::Query(show_stats) = show_stats
@@ -316,7 +334,9 @@ mod tests {
                         namespace: "analytics".into(),
                         table: "orders".into(),
                     },
-                    columns: vec!["order_id".into()],
+                    columns: crate::statistics_jobs::application::StatisticsColumnIntent::Explicit(
+                        vec!["order_id".into()],
+                    ),
                 },
                 StatisticsApplicationCommand::ShowTableStats {
                     target: StatisticsTableTarget {
