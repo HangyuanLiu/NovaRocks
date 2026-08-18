@@ -18,14 +18,11 @@ pub mod backend;
 pub mod cleanup_maintenance;
 pub mod data_mutation;
 pub mod distributed_rewrite_application;
-pub mod file_execution;
 pub mod metadata_maintenance;
 pub mod mutation;
 pub mod runtime;
 pub mod scan_admission;
 pub mod scan_model;
-pub mod schema;
-pub mod stats;
 pub mod unified_statistics;
 pub mod write_target;
 
@@ -261,17 +258,6 @@ pub fn metadata_namespace_exists(
             context,
         })
         .map_err(|error| error.to_string())
-}
-
-pub fn metadata_table_exists(
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    context: ConnectorRequestContext,
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-) -> Result<bool, String> {
-    let binding = metadata_binding(controls, catalog)?;
-    metadata_table_exists_with_planning_lease(binding, context, namespace, table)
 }
 
 /// Resolve table existence through an admission-frozen planning lease.  A
@@ -566,8 +552,6 @@ pub fn acquire_metadata_planning_lease(
 pub(crate) use novarocks_execution::exec::min_max_predicate::{
     MinMaxPredicate, MinMaxPredicateValue,
 };
-
-pub use crate::connector::file_execution::FileScanRange;
 
 #[cfg(test)]
 mod runtime_test;

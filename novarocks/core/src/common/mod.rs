@@ -26,7 +26,5 @@ pub mod network;
 pub mod query_cancellation;
 pub mod query_lifecycle_fault;
 pub mod result_batch;
-pub(crate) mod runtime_scan_predicate;
-pub mod scan_predicate;
 pub mod types;
 pub mod util;

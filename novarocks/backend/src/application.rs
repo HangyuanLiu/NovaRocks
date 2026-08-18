@@ -38,7 +38,6 @@ pub struct BackendServerConfig {
     pub grpc_port: u16,
     pub metrics_http_port: u16,
     pub advertise_endpoint: AdvertiseEndpoint,
-    pub store_settings: BackendStoreSettings,
     pub query_lifecycle_sweep_interval: Duration,
     pub query_lifecycle_config: QueryLifecycleRegistryConfig,
     /// Server-resolved per-fragment terminal write evidence budget.
@@ -49,36 +48,6 @@ pub struct BackendServerConfig {
     /// Backend only owns registration and lifecycle of these contributions; it
     /// never constructs a provider-specific installer or catalog binding.
     pub execution_installers: Vec<Arc<dyn ConnectorExecutionInstaller>>,
-}
-
-/// BE-local schema-store policies resolved by application composition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BackendStoreSettings {
-    enable_tablet_write_log: bool,
-    tablet_write_log_buffer_size: usize,
-    txn_info_history_size: usize,
-}
-
-impl BackendStoreSettings {
-    pub const fn new(
-        enable_tablet_write_log: bool,
-        tablet_write_log_buffer_size: usize,
-        txn_info_history_size: usize,
-    ) -> Self {
-        Self {
-            enable_tablet_write_log,
-            tablet_write_log_buffer_size,
-            txn_info_history_size,
-        }
-    }
-
-    fn install(self) {
-        novarocks::connector::schema::install_be_store_settings(
-            self.enable_tablet_write_log,
-            self.tablet_write_log_buffer_size,
-            self.txn_info_history_size,
-        );
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -397,14 +366,12 @@ impl BackendApplicationHost {
             grpc_port,
             metrics_http_port,
             advertise_endpoint,
-            store_settings,
             query_lifecycle_sweep_interval,
             query_lifecycle_config,
             write_commit_evidence_limits,
             execution_runtime_config,
             execution_installers,
         } = config;
-        store_settings.install();
         let readiness_addr =
             advertised_probe_addr(&advertise_endpoint.host, advertise_endpoint.port).map_err(
                 |error| {
@@ -743,7 +710,6 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: advertise_port,
             },
-            store_settings: super::BackendStoreSettings::new(false, 0, 0),
             query_lifecycle_sweep_interval: Duration::from_millis(1_000),
             query_lifecycle_config: query_lifecycle_registry_config(Duration::from_millis(5_000)),
             write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),

@@ -24,8 +24,7 @@ use anyhow::Context;
 use novarocks::common::backend_topology::BackendTopologyPort;
 use novarocks::common::network;
 use novarocks_backend::{
-    BackendApplicationHost, BackendDataRuntime, BackendServerConfig, BackendStoreSettings,
-    QueryLifecycleRegistryConfig,
+    BackendApplicationHost, BackendDataRuntime, BackendServerConfig, QueryLifecycleRegistryConfig,
 };
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::control_factory::IcebergControlFactory;
@@ -401,11 +400,6 @@ pub fn compose_backend_server_config(
         grpc_port: config.server.grpc_port,
         metrics_http_port: config.server.http_port,
         advertise_endpoint,
-        store_settings: BackendStoreSettings::new(
-            runtime_config.enable_tablet_write_log,
-            runtime_config.tablet_write_log_buffer_size,
-            runtime_config.be_txn_info_history_size,
-        ),
         query_lifecycle_sweep_interval: Duration::from_millis(
             runtime_config.query_control_heartbeat_interval_ms,
         ),

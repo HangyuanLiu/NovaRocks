@@ -4,8 +4,7 @@ use std::time::Duration;
 
 use novarocks::common::network::AdvertiseEndpoint;
 use novarocks_backend::{
-    BackendApplicationHost, BackendDataRuntime, BackendServerConfig, BackendStoreSettings,
-    QueryLifecycleRegistryConfig,
+    BackendApplicationHost, BackendDataRuntime, BackendServerConfig, QueryLifecycleRegistryConfig,
 };
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
@@ -30,7 +29,6 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
             host: "127.0.0.1".to_string(),
             port: advertise_port,
         },
-        store_settings: BackendStoreSettings::new(false, 0, 0),
         query_lifecycle_sweep_interval: Duration::from_millis(1_000),
         query_lifecycle_config: QueryLifecycleRegistryConfig::new(
             4_096,

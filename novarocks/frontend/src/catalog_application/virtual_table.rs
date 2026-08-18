@@ -46,7 +46,7 @@ pub(crate) const INFORMATION_SCHEMA_DB: &str = "information_schema";
 // AST rewriter: substitute virtual-table refs with a VALUES derived table.
 // ---------------------------------------------------------------------------
 //
-// StarRocks routes information_schema scans through a `SchemaScanNode` that
+// StarRocks routes information_schema scans through a dedicated scan node that
 // produces rows at the BE; NovaRocks standalone has no equivalent BE-side
 // generator, so we materialize rows here against the frontend-injected leaf
 // ports
