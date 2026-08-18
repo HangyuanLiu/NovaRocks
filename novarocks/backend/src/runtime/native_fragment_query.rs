@@ -98,15 +98,15 @@ impl NativeFragmentQueryRuntime {
 
     pub fn publish_resource_snapshot(&self) {
         let snapshot = self.manager.native_execution_resource_snapshot();
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "native_query_contexts_active",
             snapshot.active_contexts,
         );
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "native_query_contexts_second_chance",
             snapshot.second_chance_contexts,
         );
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "native_query_active_fragments",
             snapshot.active_fragments,
         );

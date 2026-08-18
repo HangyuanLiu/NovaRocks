@@ -28,6 +28,7 @@ use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
+use crate::metrics::handle_metrics;
 use crate::service::native_data_plane::NativeDataPlaneKernel;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
@@ -435,7 +436,7 @@ impl NativeGrpcServerHandle {
                         );
                         let app = Router::new()
                             .route_service(&grpc_path, AxumGrpcService::new(service))
-                            .route("/metrics", get(novarocks::service::handle_metrics))
+                            .route("/metrics", get(handle_metrics))
                             .fallback(grpc_unimplemented_fallback);
                         axum::serve(listener, app)
                             .with_graceful_shutdown(async move {

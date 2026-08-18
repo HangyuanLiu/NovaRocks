@@ -20,7 +20,6 @@ use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use novarocks::service::query_lifecycle_metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks_execution::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
@@ -48,6 +47,11 @@ use super::{
     QueryLifecycleIngress, QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
 };
 use crate::BackendDataRuntime;
+use crate::metrics::query_lifecycle::BackendQueryLifecycleMetricsSnapshot;
+use crate::metrics::{
+    publish_backend_query_execution_resource, publish_backend_query_lifecycle_metrics,
+    publish_backend_query_lifecycle_terminal_limits,
+};
 use crate::native::client::NativeGrpcClient;
 use crate::native::runtime_filter_adapter::{
     BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
@@ -641,7 +645,7 @@ impl QueryLifecycleMetricsSink for PrometheusQueryLifecycleMetricsSink {
         snapshot: BackendQueryLifecycleMetricsSnapshot,
         termination_reasons: [u64; 6],
     ) {
-        novarocks::service::publish_backend_query_lifecycle_metrics(snapshot, termination_reasons);
+        publish_backend_query_lifecycle_metrics(snapshot, termination_reasons);
     }
 }
 
@@ -732,18 +736,9 @@ struct StageResourceLedger {
 
 impl StageResourceLedger {
     fn publish_snapshot(active_builders: usize, encoded_bytes: usize, dormant_workers: usize) {
-        novarocks::service::publish_backend_query_execution_resource(
-            "stage_active_builders",
-            active_builders,
-        );
-        novarocks::service::publish_backend_query_execution_resource(
-            "stage_encoded_bytes",
-            encoded_bytes,
-        );
-        novarocks::service::publish_backend_query_execution_resource(
-            "stage_dormant_workers",
-            dormant_workers,
-        );
+        publish_backend_query_execution_resource("stage_active_builders", active_builders);
+        publish_backend_query_execution_resource("stage_encoded_bytes", encoded_bytes);
+        publish_backend_query_execution_resource("stage_dormant_workers", dormant_workers);
     }
 }
 
@@ -1255,7 +1250,7 @@ impl QueryLifecycleRegistry {
         assert!(!config.terminal_retention.is_zero());
         assert!(config.terminal_retained_capacity > 0);
         assert!(config.terminal_max_retained_bytes > 0);
-        novarocks::service::publish_backend_query_lifecycle_terminal_limits(
+        publish_backend_query_lifecycle_terminal_limits(
             config.terminal_retained_capacity,
             config.terminal_max_retained_bytes,
         );
@@ -4079,7 +4074,7 @@ impl QueryLifecycleRegistry {
             (snapshot, termination_reasons, runtime_filter_services)
         };
         self.metrics.publish(snapshot, termination_reasons);
-        novarocks::service::publish_backend_query_execution_resource(
+        publish_backend_query_execution_resource(
             "native_runtime_filter_services",
             runtime_filter_services,
         );

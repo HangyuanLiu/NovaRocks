@@ -18,7 +18,7 @@
 use std::sync::{Arc, Barrier, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
-use novarocks::service::query_lifecycle_metrics::BackendQueryLifecycleMetricsSnapshot;
+use crate::metrics::query_lifecycle::BackendQueryLifecycleMetricsSnapshot;
 use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };

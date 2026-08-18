@@ -37,7 +37,8 @@
 //! The helpers below exist only to serve these two smoke closures. They must not
 //! grow into a second cluster lifecycle owner.
 
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
@@ -123,7 +124,7 @@ fn connect_mysql(port: u16) -> MysqlConn {
     }
 }
 
-fn start_all_in_one_with_debug_env(debug_env: &[(&str, &str)]) -> (ManagedProcess, u16) {
+fn start_all_in_one_with_debug_env(debug_env: &[(&str, &str)]) -> (ManagedProcess, u16, u16) {
     let mysql = reserve_port();
     let http = reserve_port();
     let grpc = reserve_port();
@@ -151,7 +152,32 @@ role = "all-in-one"
     let _ = http.release();
     let _ = grpc.release();
     let process = spawn_novarocks(config.path(), "NOVAROCKS_READY mysql_port=", debug_env);
-    (process, mysql_port)
+    (process, mysql_port, http_port)
+}
+
+fn scrape_metrics(port: u16) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect metrics endpoint");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set metrics read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .expect("set metrics write timeout");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .expect("request metrics");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read metrics response");
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .expect("split metrics HTTP response");
+    assert!(
+        headers.starts_with("HTTP/1.1 200") || headers.starts_with("HTTP/1.0 200"),
+        "metrics endpoint returned {headers}"
+    );
+    body.to_string()
 }
 
 /// Smoke closure 1: the binary composes FE and BE into one process, publishes the
@@ -165,13 +191,36 @@ fn all_in_one_loopback_stage_start_select_succeeds() {
     }
     let _lock = lock_server_binary_smoke();
 
-    let (mut srv, mysql_port) =
+    let (mut srv, mysql_port, _) =
         start_all_in_one_with_debug_env(&[("NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER", "1")]);
     let mut conn = connect_mysql(mysql_port);
     let rows: Vec<i64> = conn.query("SELECT 1").expect("SELECT 1");
     assert_eq!(rows, vec![1]);
     srv.wait_for_log_contains("NOVAROCKS_GRPC_FETCH_TYPED status=", Duration::from_secs(3))
         .expect("wait for typed gRPC fetch marker");
+}
+
+/// All-in-one keeps the production FE/BE application boundary while exposing
+/// one process metrics endpoint, so both role-owned metric families must be
+/// visible through that endpoint.
+#[test]
+fn all_in_one_metrics_surface_contains_both_role_families() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _lock = lock_server_binary_smoke();
+
+    let (_srv, _, http_port) = start_all_in_one_with_debug_env(&[]);
+    let metrics = scrape_metrics(http_port);
+    assert!(
+        metrics.contains("novarocks_live_backends"),
+        "all-in-one metrics omitted frontend family: {metrics}"
+    );
+    assert!(
+        metrics.contains("novarocks_backend_query_lifecycle_entries"),
+        "all-in-one metrics omitted backend family: {metrics}"
+    );
 }
 
 /// Smoke closure 2: `role=be` reaches readiness, shuts down cleanly on SIGINT,

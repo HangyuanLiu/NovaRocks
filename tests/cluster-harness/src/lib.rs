@@ -582,33 +582,102 @@ fn scrape_prometheus_metrics(port: u16) -> Result<String> {
     let mut stream = TcpStream::connect_timeout(
         &address
             .parse()
-            .with_context(|| format!("parse BE metrics address {address}"))?,
+            .with_context(|| format!("parse metrics address {address}"))?,
         TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
     )
-    .with_context(|| format!("connect BE metrics endpoint {address}"))?;
+    .with_context(|| format!("connect metrics endpoint {address}"))?;
     stream
         .set_read_timeout(Some(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP))
-        .context("set BE metrics read timeout")?;
+        .context("set metrics read timeout")?;
     stream
         .set_write_timeout(Some(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP))
-        .context("set BE metrics write timeout")?;
+        .context("set metrics write timeout")?;
     stream
         .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .context("request BE /metrics")?;
+        .context("request /metrics")?;
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
-        .context("read BE /metrics response")?;
+        .context("read /metrics response")?;
     let (headers, body) = response
         .split_once("\r\n\r\n")
-        .context("malformed BE /metrics HTTP response")?;
+        .context("malformed /metrics HTTP response")?;
     if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
         bail!(
-            "BE /metrics returned non-success status: {}",
+            "/metrics returned non-success status: {}",
             headers.lines().next().unwrap_or("<missing status>")
         );
     }
     Ok(body.to_string())
+}
+
+const FRONTEND_METRIC_FAMILIES: [&str; 8] = [
+    "novarocks_fragment_scheduled_total",
+    "novarocks_heartbeat_rtt_seconds",
+    "novarocks_live_backends",
+    "novarocks_backends",
+    "novarocks_frontend_query_lifecycle_active_attempts",
+    "novarocks_frontend_query_lifecycle_init_total",
+    "novarocks_frontend_query_lifecycle_control_total",
+    "novarocks_frontend_query_lifecycle_latency_micros",
+];
+
+const BACKEND_METRIC_FAMILIES: [&str; 5] = [
+    "novarocks_backend_query_lifecycle_entries",
+    "novarocks_backend_query_lifecycle_rejections",
+    "novarocks_backend_query_lifecycle_terminations",
+    "novarocks_backend_query_lifecycle_terminal_total",
+    "novarocks_backend_query_execution_resources",
+];
+
+fn assert_contains_metric_families(body: &str, families: &[&str], endpoint: &str) -> Result<()> {
+    for family in families {
+        if !body.contains(family) {
+            bail!("{endpoint} is missing required metric family {family}");
+        }
+    }
+    Ok(())
+}
+
+fn assert_excludes_metric_families(body: &str, families: &[&str], endpoint: &str) -> Result<()> {
+    for family in families {
+        if body.contains(family) {
+            bail!("{endpoint} unexpectedly exposes foreign metric family {family}");
+        }
+    }
+    Ok(())
+}
+
+/// The harness owns the production-shaped role boundary: every 1FE+NBE start
+/// must prove the process metrics listener did not leak the other role's
+/// registered metric families before a query is admitted.
+fn assert_role_scoped_metrics(runtime: &CrossProcessRuntime) -> Result<()> {
+    let frontend = scrape_prometheus_metrics(runtime.fe_http_port)
+        .context("scrape cross-process FE /metrics")?;
+    assert_contains_metric_families(
+        &frontend,
+        &FRONTEND_METRIC_FAMILIES,
+        "cross-process FE /metrics",
+    )?;
+    assert_excludes_metric_families(
+        &frontend,
+        &BACKEND_METRIC_FAMILIES,
+        "cross-process FE /metrics",
+    )?;
+
+    for (index, be) in runtime.be.iter().enumerate() {
+        let backend = scrape_prometheus_metrics(be.http)
+            .with_context(|| format!("scrape cross-process BE[{index}] /metrics"))?;
+        let endpoint = format!("cross-process BE[{index}] /metrics");
+        assert_contains_metric_families(&backend, &BACKEND_METRIC_FAMILIES, &endpoint)?;
+        assert_excludes_metric_families(&backend, &FRONTEND_METRIC_FAMILIES, &endpoint)?;
+    }
+    println!(
+        "cross-process role-scoped metrics barrier PASS: FE={} BE={}",
+        runtime.fe_http_port,
+        runtime.be.len()
+    );
+    Ok(())
 }
 
 fn prometheus_labeled_gauge(
@@ -1608,6 +1677,8 @@ impl CrossProcessServerHandle {
             startup_timeout,
         )
         .context("cross-process backend topology barrier")?;
+        assert_role_scoped_metrics(&runtime)
+            .context("cross-process role-scoped metrics barrier")?;
 
         Ok(Self {
             target_host: "127.0.0.1".to_string(),
@@ -3837,6 +3908,31 @@ enable_path_style_access = true
                 "native_query_contexts_active"
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn role_scoped_metrics_reject_foreign_role_families() {
+        let frontend = FRONTEND_METRIC_FAMILIES.join("\n");
+        assert_contains_metric_families(&frontend, &FRONTEND_METRIC_FAMILIES, "FE")
+            .expect("frontend body includes every frontend family");
+        assert_excludes_metric_families(&frontend, &BACKEND_METRIC_FAMILIES, "FE")
+            .expect("frontend body excludes backend families");
+
+        let backend = BACKEND_METRIC_FAMILIES.join("\n");
+        assert_contains_metric_families(&backend, &BACKEND_METRIC_FAMILIES, "BE")
+            .expect("backend body includes every backend family");
+        assert_excludes_metric_families(&backend, &FRONTEND_METRIC_FAMILIES, "BE")
+            .expect("backend body excludes frontend families");
+        let error = assert_excludes_metric_families(
+            &format!("{backend}\n{}", FRONTEND_METRIC_FAMILIES[0]),
+            &FRONTEND_METRIC_FAMILIES,
+            "BE",
+        )
+        .expect_err("backend leak must fail the role boundary");
+        assert!(
+            error.to_string().contains(FRONTEND_METRIC_FAMILIES[0]),
+            "{error:#}"
         );
     }
 

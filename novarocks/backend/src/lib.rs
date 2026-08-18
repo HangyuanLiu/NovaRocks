@@ -3,6 +3,7 @@ mod config;
 pub mod connector;
 mod exchange_receiver;
 mod fragment;
+mod metrics;
 pub(crate) mod native;
 mod query_lifecycle;
 mod runtime;

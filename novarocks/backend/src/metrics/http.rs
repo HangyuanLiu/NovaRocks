@@ -174,7 +174,7 @@ fn parse_metrics_bind_addr(host: &str, port: u16) -> Result<SocketAddr, String> 
 }
 
 pub fn publish_backend_query_lifecycle_metrics(
-    snapshot: crate::service::query_lifecycle_metrics::BackendQueryLifecycleMetricsSnapshot,
+    snapshot: crate::metrics::query_lifecycle::BackendQueryLifecycleMetricsSnapshot,
     termination_reasons: [u64; 6],
 ) {
     for (state_name, count) in [

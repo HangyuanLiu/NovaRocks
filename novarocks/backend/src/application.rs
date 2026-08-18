@@ -4,7 +4,6 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use novarocks::service::MetricsHttpServer;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_protocol::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest, QueryStageAck,
@@ -21,6 +20,7 @@ use crate::fragment::{
     NativeFragmentService, grpc_exchange_transmitter, grpc_fragment_lookup_client,
     native_result_writer,
 };
+use crate::metrics::MetricsHttpServer;
 use crate::native::runtime_filter_adapter::BackendRuntimeFilterEnvelopeIngress;
 use crate::native::service::{NativeBackendGrpcService, NativeGrpcServerHandle};
 use crate::query_lifecycle::{
