@@ -329,6 +329,7 @@ fn unroll_with_clause(with: &mut With, max_depth: usize) -> Result<(), String> {
     Ok(())
 }
 
+// Design: ADR-0088 (docs/adr/ADR-0088-domain-owned-sql-error-contracts.md)
 fn try_unroll_cte(cte: &Cte, max_depth: usize) -> Result<Option<Vec<Cte>>, String> {
     // Bail on shapes we don't recognise (materialised hints, FROM aliases,
     // etc.) — the analyzer will surface the original error untouched.

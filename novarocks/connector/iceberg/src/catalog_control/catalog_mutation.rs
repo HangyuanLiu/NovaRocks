@@ -1081,6 +1081,7 @@ fn is_engine_namespace(key: &str) -> bool {
     key.starts_with("novarocks.")
 }
 
+// Design: ADR-0088 (docs/adr/ADR-0088-domain-owned-sql-error-contracts.md)
 fn alter_schema(
     runtime: &IcebergControlRuntime,
     table: &ConnectorTableIdentity,

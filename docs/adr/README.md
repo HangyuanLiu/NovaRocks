@@ -275,3 +275,11 @@ debug/test 开关归启动进程环境。跨域 wire section 不因名字相似�
 #### 历史
 
 - ADR-0059 — 配置为何由组合根注入，而不从进程全局读取（superseded → ADR-0072）
+
+### error-contracts
+
+领域哲学：用户可见 SQL error 必须由最早拥有完整语义的 domain 产生。Parser 不把已识别的语法能力边界伪装为 catalog
+NotFound；Connector 不让通用 field lookup 遮蔽 table-format invariant；Frontend router 不根据文本或错误字符串重猜 SQL
+statement family。边界层只能传递或编码 owner 的事实，测试只能验证既定契约，不能成为第二错误 authority。
+
+- ADR-0088 — SQL、Iceberg 与 MV 的错误为何必须在各自 owner 内、跨域 fallback 前收敛（active）

@@ -49,6 +49,7 @@ pub enum MvAdmittedStatement {
 /// `Ok(None)` is a route miss: the input is not one of the materialized-view
 /// statement forms. Once the parser recognizes one of those forms, parse
 /// rejection remains an error instead of being converted into a route miss.
+// Design: ADR-0088 (docs/adr/ADR-0088-domain-owned-sql-error-contracts.md)
 pub fn parse_optional_mv_admitted_statement(
     sql: &str,
 ) -> Result<Option<MvAdmittedStatement>, String> {

@@ -71,6 +71,7 @@ impl MvCommandExecutor {
     /// Execute exactly one MV statement through explicit ports. Refresh and
     /// repartition receive the request's already-admitted execution context;
     /// they never capture a second topology or cancellation scope.
+    // Design: ADR-0088 (docs/adr/ADR-0088-domain-owned-sql-error-contracts.md)
     pub fn try_execute(
         &self,
         sql: &str,
