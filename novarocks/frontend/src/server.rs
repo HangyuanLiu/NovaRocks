@@ -21,14 +21,16 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use crate::capabilities as core_capabilities;
-use novarocks::maintenance::BackgroundMaintenanceAttemptFactory;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
-use novarocks::query_execution::session::QuerySessionFactory;
 use novarocks::server::ResolvedMysqlListenerSettings;
+use novarocks::server::session::QuerySessionFactory;
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_state_store::StateStoreHostConfig;
 
 use crate::native::report_server::FrontendReportServerHandle;
+use crate::query_execution::maintenance::{
+    BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory,
+};
 use crate::{
     ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
     FrontendApplicationHost, FrontendExecutionConfig, FrontendQueryControlTimeouts,
@@ -39,13 +41,11 @@ type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Clone)]
 struct FrontendBackgroundMaintenanceAttemptFactory {
     role: novarocks_types::ClusterRole,
-    topology: novarocks::query_execution::backend::BackendTopologyService,
+    topology: crate::common::backend_topology::BackendTopologyService,
 }
 
 impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemptFactory {
-    fn begin_automatic_maintenance_attempt(
-        &self,
-    ) -> Result<novarocks::maintenance::BackgroundMaintenanceAttempt, String> {
+    fn begin_automatic_maintenance_attempt(&self) -> Result<BackgroundMaintenanceAttempt, String> {
         core_capabilities::background_maintenance_attempt(self.role, self.topology.clone())
     }
 }
@@ -103,8 +103,8 @@ pub fn build_frontend_query_session_factory(
     let role = host.execution_role();
     let mv_repository = host.mv_repository();
     let mv_application = host.mv_application_service();
+    let mv_service = host.mv_service();
     let view_service = host.view_service();
-    let statistics_service = host.statistics_service();
     let statistics_application = host.statistics_application_port();
     let maintenance_service = host.table_maintenance_service();
 
@@ -115,13 +115,6 @@ pub fn build_frontend_query_session_factory(
     )
     .map_err(FrontendApplicationError::server)?;
 
-    let iceberg_mv_ports = novarocks::mv::iceberg_refresh::IcebergMvCorePorts::new(
-        Arc::clone(&catalog_service),
-        Some(Arc::clone(&catalog_application)),
-        Arc::clone(&connector_control),
-        Arc::clone(&mv_repository),
-        Arc::clone(&mv_storage_observation),
-    );
     if let Some(sink) = host.mv_refresh_provider_activation_sink() {
         core_capabilities::bind_mv_refresh_provider_activation(
             sink.as_ref(),
@@ -147,9 +140,9 @@ pub fn build_frontend_query_session_factory(
         Arc::clone(&mv_storage_observation),
         Arc::clone(&mv_repository),
         {
-            let application = Arc::clone(&mv_application);
+            let service = Arc::clone(&mv_service);
             Box::new(move || {
-                application
+                service
                     .recover_startup_mv_refreshes()
                     .map_err(|error| format!("frontend MV startup recovery failed: {error}"))
             })
@@ -258,16 +251,8 @@ pub fn build_frontend_query_session_factory(
             Arc::clone(&mv_storage_observation),
             view_service,
         ));
-    let statistics_command_executor = core_capabilities::statistics_command_executor(
-        core_capabilities::StatisticsCommandPorts::new(
-            Arc::clone(&catalog_service),
-            Arc::clone(&connector_control),
-            Arc::clone(&unified_statistics),
-            statistics_service,
-            statistics_application,
-            query_execution.clone(),
-        ),
-    );
+    let statistics_command_executor =
+        core_capabilities::statistics_command_executor(statistics_application);
     let backend_command_executor = core_capabilities::backend_command_executor(
         core_capabilities::BackendCommandPorts::new(topology.clone()),
     );
@@ -289,9 +274,9 @@ pub fn build_frontend_query_session_factory(
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
-            Arc::clone(&unified_statistics),
             Arc::clone(&mv_repository),
             mv_application,
+            mv_service,
             Arc::clone(&mv_storage_observation),
             query_execution.clone(),
         ));
@@ -307,6 +292,8 @@ pub fn build_frontend_query_session_factory(
         mv_storage_observation,
         query_execution.clone(),
     ));
+    host.dml_service()
+        .install_local_catalog(Arc::clone(&catalog_service));
     host.ctas_recovery_binding()
         .install_ctas_engine(Arc::clone(&dml_engines.ctas))
         .map_err(|error| {
@@ -346,7 +333,7 @@ pub fn build_frontend_query_session_factory(
 pub fn run_frontend_server(config: FrontendServerConfig) -> Result<(), FrontendApplicationError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
+        .thread_stack_size(crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
         .build()
         .map_err(|error| {
             FrontendApplicationError::server(format!(
@@ -624,8 +611,8 @@ mod tests {
         FrontendApplicationHost, FrontendExecutionConfig,
     };
     use novarocks::{
-        catalog_application::CatalogAdmission, query_execution::session::QuerySessionOpenRequest,
-        server::ResolvedMysqlListenerSettings,
+        catalog_application::CatalogAdmission, server::ResolvedMysqlListenerSettings,
+        server::session::QuerySessionOpenRequest,
     };
     use novarocks_state_store::{
         FoundationDbClientConfig, StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig,
@@ -810,7 +797,7 @@ mod tests {
                 .await
                 .expect_err("a dropped catalog stops being admitted")
                 .kind(),
-            novarocks::query_execution::session::QueryServiceErrorKind::BadDatabase
+            novarocks::server::session::QueryServiceErrorKind::BadDatabase
         );
 
         // The ready session factory and this test's probe both hold StateStore references; the

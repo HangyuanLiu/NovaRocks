@@ -21,27 +21,12 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorTableResolution};
 
-/// Freeze the narrow base-table facts used by one MV refresh attempt.
+/// Freeze the narrow base-table facts used by one MV refresh attempt, from the
+/// exact control and observation ports selected for that attempt.
 ///
 /// Metadata and the observation are resolved through the same exact planning
 /// lease. Callers must retain the returned value instead of re-resolving the
 /// connector's latest generation within the same decision.
-/// Freeze a refresh-base observation through the explicit MV kernel.
-pub(crate) fn observe_current_refresh_base_with_kernel(
-    kernel: &crate::query_execution::kernels::MvExecutionKernel,
-    table_ref: &TableIdentity,
-    connector_context: &ConnectorRequestContext,
-) -> Result<crate::mv::storage_observation::MvRefreshBaseObservation, String> {
-    observe_current_refresh_base_with_ports(
-        kernel.connector_control().as_ref(),
-        kernel.storage_observation().as_ref(),
-        table_ref,
-        connector_context,
-    )
-}
-
-/// Freeze a refresh-base observation from the exact control and observation
-/// ports selected for this refresh attempt.
 ///
 /// This is the planner-facing entry point.  Callers that already own their
 /// admitted connector-control generation must pass those ports directly;
@@ -105,24 +90,6 @@ pub(crate) fn acquire_mv_refresh_lock() -> Result<MutexGuard<'static, ()>, Strin
 fn lock_mv_refresh_mutex(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>, String> {
     lock.lock()
         .map_err(|_| "materialized view refresh lock poisoned".to_string())
-}
-
-pub(crate) fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<TableIdentity>, String> {
-    refs.iter()
-        .map(|fqn| {
-            let parts = fqn.split('.').collect::<Vec<_>>();
-            let [catalog, namespace, table] = parts.as_slice() else {
-                return Err(format!(
-                    "materialized view base table reference must be catalog.namespace.table, got `{fqn}`"
-                ));
-            };
-            Ok(TableIdentity {
-                catalog: novarocks_catalog::identifier::normalize_identifier(catalog)?,
-                namespace: novarocks_catalog::identifier::normalize_identifier(namespace)?,
-                table: novarocks_catalog::identifier::normalize_identifier(table)?,
-            })
-        })
-        .collect()
 }
 
 #[cfg(test)]

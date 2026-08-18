@@ -57,7 +57,7 @@ pub fn record_batch_to_chunk(batch: RecordBatch) -> Result<Chunk, String> {
     Chunk::try_new_with_chunk_schema(batch, chunk_schema)
 }
 
-pub(crate) fn build_string_query_result(
+pub fn build_string_query_result(
     column_name: &str,
     rows: Vec<String>,
 ) -> Result<QueryResult, String> {
@@ -96,7 +96,7 @@ impl QueryResult {
 
     /// Empty schema, empty chunks. Used as the no-op output when an
     /// IVM branch (insert or delete) has zero input files / rows.
-    pub(crate) fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             columns: Vec::new(),
             chunks: Vec::new(),

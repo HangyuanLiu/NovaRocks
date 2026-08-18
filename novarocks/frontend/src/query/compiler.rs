@@ -19,30 +19,29 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use crate::common::admitted_query_context::{QueryExecutionContext, RequestContext};
 use crate::native::fragment_encoder::encode_native_fragment_bundle;
+use crate::query_execution::PreparedQueryOperation;
+use crate::query_execution::compiler::{
+    TableLookupMode, freeze_query_mv_rewrite_definition_index, query_catalog_service_snapshot,
+    query_statistics_snapshot,
+};
+use crate::query_execution::kernels::{
+    QueryPreparationKernel, SystemTableQueryKernel, ViewExecutionKernel,
+};
+use crate::query_execution::planning::sql_cancellation_observation;
+use crate::query_execution::planning::time_travel::{
+    has_time_travel_refs, rewrite_time_travel_refs,
+};
+use crate::query_execution::post_compile::{PostCompileIntent, prepare_compiled_distributed_query};
+use crate::view::ViewRequestContext;
 use novarocks::catalog_application::information_schema;
+use novarocks::catalog_application::query_materializer::build_catalog_service_provider;
 use novarocks::catalog_application::virtual_table;
 use novarocks::connector::connector_request_context_for_query;
 use novarocks::mv::repository::MvRepository;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
-use novarocks::query_execution::PreparedQueryOperation;
-use novarocks::query_execution::compiler::{
-    TableLookupMode, build_query_catalog_materializer, freeze_query_mv_rewrite_definition_index,
-    query_catalog_service_snapshot, query_statistics_snapshot,
-};
-use novarocks::query_execution::kernels::{
-    QueryPreparationKernel, SystemTableQueryKernel, ViewExecutionKernel,
-};
-use novarocks::query_execution::planning::sql_cancellation_observation;
-use novarocks::query_execution::planning::time_travel::{
-    has_time_travel_refs, rewrite_time_travel_refs,
-};
-use novarocks::query_execution::post_compile::{
-    PostCompileIntent, prepare_compiled_distributed_query,
-};
-use novarocks::query_execution::request_context::{QueryExecutionContext, RequestContext};
-use novarocks::view::ViewRequestContext;
-use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_sql::compiler::{
     ExplainLevel, SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent, SqlCompiler,
     SqlOptimizeRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
@@ -127,12 +126,13 @@ impl FrontendQueryCompiler {
                     ExplainLevel::Normal
                 });
                 let catalog_service = query_catalog_service_snapshot(&self.query);
-                let materializer = build_query_catalog_materializer(
-                    &self.query,
+                let materializer = build_catalog_service_provider(
                     current_catalog,
                     &catalog_service,
+                    self.query.connector_control().as_ref(),
                     connector_context.clone(),
                     TableLookupMode::ExplainStats,
+                    self.query.catalog_application().map(Arc::as_ref),
                 );
                 let mv_definitions = if force_logical_explain {
                     None
@@ -195,9 +195,10 @@ impl FrontendQueryCompiler {
                 )
             }
             sqlparser::ast::Statement::Query(ref query) => {
-                if let Some(result) =
-                    information_schema::try_query_materialized_views(&self.system_tables, query)?
-                {
+                if let Some(result) = information_schema::try_query_materialized_views(
+                    self.system_tables.mv_repository().as_ref(),
+                    query,
+                )? {
                     return Ok(PreparedQueryOperation::immediate(result));
                 }
                 let query = self.prepare_query(
@@ -236,12 +237,13 @@ impl FrontendQueryCompiler {
         completion_intent: PostCompileIntent,
     ) -> Result<PreparedQueryOperation, String> {
         let catalog_service = query_catalog_service_snapshot(&self.query);
-        let materializer = build_query_catalog_materializer(
-            &self.query,
+        let materializer = build_catalog_service_provider(
             current_catalog,
             &catalog_service,
+            self.query.connector_control().as_ref(),
             connector_context.clone(),
             TableLookupMode::SchemaOnly,
+            self.query.catalog_application().map(Arc::as_ref),
         );
         let mv_definitions =
             if allow_mv_rewrite_candidates && self.mv_repository.availability().is_available() {
@@ -331,7 +333,12 @@ impl FrontendQueryCompiler {
             current_database,
             connector_context,
         )?;
-        virtual_table::rewrite_query(&self.system_tables, &mut prepared)?;
+        virtual_table::rewrite_query(
+            self.system_tables.catalog_service(),
+            self.system_tables.connector_control().as_ref(),
+            self.system_tables.system_catalog().as_ref(),
+            &mut prepared,
+        )?;
         Ok(prepared)
     }
 
@@ -401,9 +408,12 @@ impl FrontendQueryCompiler {
 }
 
 fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> QueryOptions {
-    let mut query_options = query_options.unwrap_or_default();
-    query_options.enable_profile = true;
-    query_options
+    let mut raw = query_options
+        .as_ref()
+        .map(|options| options.as_proto().clone())
+        .unwrap_or_default();
+    raw.enable_profile = true;
+    QueryOptions::parse(raw).expect("enabling query profiling does not invalidate query options")
 }
 
 fn is_query_sql(sql: &str) -> bool {

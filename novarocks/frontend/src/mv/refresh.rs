@@ -21,14 +21,23 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use crate::native::fragment_encoder::encode_native_fragment_bundle;
+use crate::query_execution::ConnectorWriteCompletion;
+use crate::query_execution::contract::ConnectorWriteExecutionRegistration;
+use crate::query_execution::mv_assembly::refresh_artifact::{
+    MvRefreshCommittedFacts, MvRefreshPublishedFacts,
+};
+use crate::query_execution::mv_assembly::refresh_handoff::{
+    MvRefreshAttemptIdentity, PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
+};
+use crate::query_execution::mv_native_write::{
+    MvRefreshProviderActivation, MvRefreshProviderActivationSink, PreparedMvNativeWriteAssembly,
+};
+use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
+use crate::query_execution::service::QueryExecutionService;
 use novarocks::connector::mutation::{
     CompletedCatalogMutation, ResolvedCatalogMutation, resolve_catalog_mutation_with_lease,
 };
-use novarocks::mv::application::{
-    MvApplicationError, MvApplicationErrorKind, MvRefreshCommittedFacts,
-    MvRefreshProviderActivation, MvRefreshProviderActivationSink, MvRefreshPublishedFacts,
-    MvStatementResult, PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
-};
+use novarocks::mv::application::{MvApplicationError, MvApplicationErrorKind, MvStatementResult};
 use novarocks::mv::persistence::refresh::{
     FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
     FrontendMvRefreshCommittedVersion, FrontendMvRefreshEvidence, FrontendMvRefreshLedger,
@@ -37,10 +46,6 @@ use novarocks::mv::persistence::refresh::{
 use novarocks::mv::repository::{
     BeginFrontendMvRefreshIntentRequest, MvRepository, MvRepositoryError,
 };
-use novarocks::query_execution::ConnectorWriteCompletion;
-use novarocks::query_execution::contract::ConnectorWriteExecutionRegistration;
-use novarocks::query_execution::prepared_write::PreparedDistributedWriteRequest;
-use novarocks::query_execution::service::QueryExecutionService;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt, ConnectorControlRegistry,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorMutationOperationId,
@@ -96,8 +101,8 @@ impl FrontendMvRefreshProviderActivationPort {
         prepared: PreparedMvRefreshWrite,
         planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
         lease: &novarocks_spi::connector::ConnectorWriteLease,
-        execution: &novarocks::query_execution::request_context::QueryExecutionContext,
-    ) -> Result<novarocks::mv::application::PreparedMvNativeWriteAssembly, MvApplicationError> {
+        execution: &crate::common::admitted_query_context::QueryExecutionContext,
+    ) -> Result<PreparedMvNativeWriteAssembly, MvApplicationError> {
         let activation = self
             .activation
             .read()
@@ -111,7 +116,7 @@ impl FrontendMvRefreshProviderActivationPort {
 
     fn interpret_write_commit(
         &self,
-        intent: novarocks::mv::application::MvRefreshPublicationIntent,
+        intent: crate::query_execution::mv_assembly::refresh_artifact::MvRefreshPublicationIntent,
         receipt: &ConnectorWriteReceipt,
     ) -> Result<MvRefreshCommittedFacts, MvApplicationError> {
         let activation = self
@@ -165,7 +170,7 @@ pub(super) fn execute(
     dependencies: &FrontendMvRefreshDependencies,
     refresh: PreparedMvRefresh,
     connector_context: ConnectorRequestContext,
-    execution: &novarocks::query_execution::request_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<MvStatementResult, MvApplicationError> {
     // A no-snapshot first observation is deliberately not a durable refresh.
     // It has no external action and no base watermark that can be finalized;
@@ -306,12 +311,12 @@ fn execute_data_refresh(
     repository: &dyn MvRepository,
     dependencies: &FrontendMvRefreshDependencies,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    attempt: novarocks::mv::application::MvRefreshAttemptIdentity,
+    attempt: MvRefreshAttemptIdentity,
     finalize: MvRefreshFinalizeFacts,
     prepared: PreparedMvRefreshWrite,
     base_snapshots: BTreeMap<String, i64>,
     connector_context: ConnectorRequestContext,
-    execution: &novarocks::query_execution::request_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<MvStatementResult, MvApplicationError> {
     let atomic_repartition = prepared
         .publication_intent()
@@ -1020,7 +1025,7 @@ fn sha256(payload: &[u8]) -> [u8; 32] {
 fn recovery_phase_barrier(phase: &str) -> Result<(), MvApplicationError> {
     use std::time::{Duration, Instant};
 
-    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
+    let Some(root) = crate::common::query_lifecycle_fault::configured_root() else {
         return Ok(());
     };
     let path = root.join(format!("mv-refresh-at-{phase}.trigger"));
@@ -1098,16 +1103,18 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use novarocks::mv::application::PreparedMvNativeWriteAssembly;
-    use novarocks::mv::application::{
-        MvRefreshCommittedFacts, MvRefreshProviderActivation, MvRefreshProviderActivationSink,
-        MvRefreshPublicationIntent, PreparedMvRefreshWrite,
+    use crate::common::admitted_query_context::QueryExecutionContext;
+    use crate::query_execution::mv_assembly::refresh_artifact::{
+        MvRefreshCommittedFacts, MvRefreshPublicationIntent,
+    };
+    use crate::query_execution::mv_assembly::refresh_handoff::PreparedMvRefreshWrite;
+    use crate::query_execution::mv_native_write::{
+        MvRefreshProviderActivation, MvRefreshProviderActivationSink, PreparedMvNativeWriteAssembly,
     };
     use novarocks::mv::persistence::refresh::{
         FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
         FrontendMvRefreshCommittedVersion,
     };
-    use novarocks::query_execution::request_context::QueryExecutionContext;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,
         ConnectorControlPlanningLease, ConnectorManagedPartitionTransform, ConnectorRequestContext,

@@ -272,15 +272,24 @@ fn parse_metrics_bind_addr(host: &str, port: u16) -> Result<SocketAddr, String> 
         .map_err(|error| format!("parse metrics bind addr '{formatted}' failed: {error}"))
 }
 
+/// Publishes already-counted backend registry states as neutral scalars.
+///
+/// Backend membership authority is owned outside this module (`ADR-0013`), so
+/// the metrics surface deliberately names no membership type: it accepts the
+/// counts and owns only the `novarocks_backends` label set they map onto. That
+/// keeps the membership owner and this listener independently relocatable.
 pub(crate) fn publish_backend_topology_metrics(
-    snapshot: crate::query_execution::backend::BackendTopologyMetricsSnapshot,
+    registering: usize,
+    live: usize,
+    lost: usize,
+    decommissioning: usize,
 ) {
-    Lazy::force(&LIVE_BACKENDS).set(snapshot.live as i64);
+    Lazy::force(&LIVE_BACKENDS).set(live as i64);
     for (state_name, count) in [
-        ("registering", snapshot.registering),
-        ("live", snapshot.live),
-        ("lost", snapshot.lost),
-        ("decommissioning", snapshot.decommissioning),
+        ("registering", registering),
+        ("live", live),
+        ("lost", lost),
+        ("decommissioning", decommissioning),
     ] {
         BACKENDS_BY_STATE
             .with_label_values(&[state_name])
@@ -289,7 +298,7 @@ pub(crate) fn publish_backend_topology_metrics(
 }
 
 pub fn publish_backend_query_lifecycle_metrics(
-    snapshot: crate::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot,
+    snapshot: crate::service::query_lifecycle_metrics::BackendQueryLifecycleMetricsSnapshot,
     termination_reasons: [u64; 6],
 ) {
     for (state_name, count) in [
@@ -371,7 +380,7 @@ pub fn publish_backend_query_lifecycle_terminal_limits(capacity: usize, max_byte
 }
 
 pub fn publish_frontend_query_lifecycle_metrics(
-    snapshot: crate::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot,
+    snapshot: crate::service::query_lifecycle_metrics::FrontendQueryLifecycleMetricsSnapshot,
 ) {
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_ATTEMPTS).set(snapshot.active_attempts as i64);
     for (outcome, count) in [
@@ -600,14 +609,7 @@ mod tests {
 
     #[test]
     fn backend_topology_gauges_preserve_the_last_nonzero_frontend_snapshot() {
-        publish_backend_topology_metrics(
-            crate::query_execution::backend::BackendTopologyMetricsSnapshot {
-                registering: 1,
-                live: 2,
-                lost: 3,
-                decommissioning: 4,
-            },
-        );
+        publish_backend_topology_metrics(1, 2, 3, 4);
 
         let first = render_metrics().expect("render first metrics snapshot");
         let second = render_metrics().expect("render second metrics snapshot");
@@ -650,7 +652,7 @@ mod tests {
     #[test]
     fn frontend_query_lifecycle_metrics_publish_structured_snapshot() {
         publish_frontend_query_lifecycle_metrics(
-            crate::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot {
+            crate::service::query_lifecycle_metrics::FrontendQueryLifecycleMetricsSnapshot {
                 active_attempts: 2,
                 init_applied: 3,
                 init_idempotent: 4,

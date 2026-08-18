@@ -1100,22 +1100,28 @@ mod tests {
         failure: Option<&'static str>,
     }
 
-    impl novarocks::mv::application::MvRefreshProviderActivation for TestDescriptorProjection {
+    impl crate::query_execution::mv_native_write::MvRefreshProviderActivation
+        for TestDescriptorProjection
+    {
         fn activate_write(
             &self,
-            _prepared: novarocks::mv::application::PreparedMvRefreshWrite,
+            _prepared: crate::query_execution::mv_assembly::refresh_handoff::PreparedMvRefreshWrite,
             _planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
             _exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
-            _execution: &novarocks::query_execution::request_context::QueryExecutionContext,
-        ) -> Result<novarocks::mv::application::PreparedMvNativeWriteAssembly, String> {
+            _execution: &crate::common::admitted_query_context::QueryExecutionContext,
+        ) -> Result<crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly, String>
+        {
             unreachable!("recovery never activates a writer")
         }
 
         fn interpret_write_commit(
             &self,
-            _intent: novarocks::mv::application::MvRefreshPublicationIntent,
+            _intent: crate::query_execution::mv_assembly::refresh_artifact::MvRefreshPublicationIntent,
             _receipt: &novarocks_spi::connector::ConnectorWriteReceipt,
-        ) -> Result<novarocks::mv::application::MvRefreshCommittedFacts, String> {
+        ) -> Result<
+            crate::query_execution::mv_assembly::refresh_artifact::MvRefreshCommittedFacts,
+            String,
+        > {
             unreachable!("recovery never interprets a live write receipt")
         }
 
@@ -1263,7 +1269,7 @@ mod tests {
         host.register(binding).expect("register control binding");
         let provider_activation =
             Arc::new(super::super::refresh::FrontendMvRefreshProviderActivationPort::new());
-        novarocks::mv::application::MvRefreshProviderActivationSink::bind_mv_refresh_provider_activation(
+        crate::query_execution::mv_native_write::MvRefreshProviderActivationSink::bind_mv_refresh_provider_activation(
             provider_activation.as_ref(),
             projection,
         )

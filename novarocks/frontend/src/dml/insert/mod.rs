@@ -21,19 +21,19 @@ mod command;
 mod iceberg;
 mod shaping;
 
-use novarocks::query_execution::dml::insert::{
+use crate::common::admitted_query_context::RequestContext;
+use crate::query_execution::dml::insert::{
     IcebergInsertSource, InsertEngine, InsertOverwriteMode, InsertTargetName, InsertValue,
     PrepareIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
 };
-use novarocks::query_execution::request_context::RequestContext;
-use novarocks::statistics::{
-    StatisticsInsertObservation, StatisticsInsertSource, StatisticsLiteral, StatisticsOverwriteMode,
-};
-use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::lifecycle::QueryOptions;
 
 use crate::dml::error::DmlError;
 use crate::dml::runner::{ActiveWriteTransactionRunner, preparing_request};
 use crate::dml::service::DmlService;
+use crate::statistics::{
+    StatisticsInsertObservation, StatisticsInsertSource, StatisticsLiteral, StatisticsOverwriteMode,
+};
 
 pub use command::{InsertCommand, InsertCommandSource, convert_insert_command};
 pub use shaping::reorder_insert_rows;
@@ -59,7 +59,7 @@ impl DmlService {
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
     ) -> Result<Option<()>, DmlError> {
-        let Some(statement) = novarocks::query_execution::dml::insert::parse_insert_statement(sql)
+        let Some(statement) = crate::query_execution::dml::insert::parse_insert_statement(sql)
             .map_err(DmlError::executor)?
         else {
             return Ok(None);
@@ -98,7 +98,6 @@ impl DmlService {
         };
         self.statistics()
             .observe_insert(
-                engine,
                 StatisticsInsertObservation {
                     database: &resolved.namespace,
                     table: &resolved.table,
@@ -106,6 +105,7 @@ impl DmlService {
                     source: &statistics_source,
                     overwrite_mode: statistics_overwrite_mode,
                 },
+                self.local_statistics_columns(&resolved.namespace, &resolved.table)?,
             )
             .map_err(DmlError::executor)?;
         Ok(Some(()))

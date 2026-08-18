@@ -19,14 +19,17 @@
 
 use std::sync::Arc;
 
+use crate::connector::MvBackend;
+use crate::mv::application::MvApplicationService;
+use crate::mv::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest};
 use crate::mv::model::{MvStorageEngine, MvTarget};
 use crate::mv::persistence::definition::{
     StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
+use crate::mv::refresh::target::{IcebergMvTarget, resolve_refresh_target};
 use crate::mv::repository::MvRepository;
-use crate::query_execution::StatementResult;
-use crate::query_execution::kernels::MvExecutionKernel;
+use crate::runtime::statement_result::StatementResult;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_sql::syntax::three_part_table_ref_occurrences;
 use novarocks_sql::syntax::{
@@ -329,7 +332,7 @@ fn storage_engine_for_create(stmt: &CreateMaterializedViewStmt) -> Result<MvStor
 
 fn existing_mv_storage_engine_by_target(
     repository: &dyn MvRepository,
-    target: &crate::mv::iceberg_refresh::IcebergMvTarget,
+    target: &IcebergMvTarget,
 ) -> Result<Option<MvStorageEngine>, String> {
     let Some(definition) = repository
         .find_by_target(&MvTarget {
@@ -410,7 +413,7 @@ fn load_definition_for_alter(
     db: &str,
     name: &novarocks_sql::syntax::ObjectName,
 ) -> Result<StoredMvDefinition, String> {
-    let target = crate::mv::iceberg_refresh::resolve_refresh_target(current_catalog, db, name)?;
+    let target = resolve_refresh_target(current_catalog, db, name)?;
     let Some(definition) = repository
         .find_by_target(&MvTarget {
             catalog: Some(target.catalog.clone()),
@@ -433,12 +436,14 @@ fn load_definition_for_alter(
     Ok(definition)
 }
 
-/// Create an MV through its explicit frontend-composed execution kernel.
+/// Create an MV from the explicit MV ports composed by the frontend.
 ///
 /// The SQL surface admits only Iceberg-backed MVs, so this uses the single
 /// injected backend rather than a string-keyed connector registry lookup.
-pub(crate) fn create_mv_with_kernel(
-    kernel: &MvExecutionKernel,
+pub fn create_mv_with_ports(
+    ports: &IcebergMvCorePorts,
+    application: &dyn MvApplicationService,
+    mv_backend: &dyn MvBackend,
     current_catalog: Option<&str>,
     db: &str,
     stmt: &CreateMaterializedViewStmt,
@@ -448,21 +453,14 @@ pub(crate) fn create_mv_with_kernel(
     if storage_engine_for_create(stmt)? != MvStorageEngine::Iceberg {
         return Err("materialized view backend must be Iceberg".to_string());
     }
-    let ports = crate::mv::iceberg_refresh::IcebergMvCorePorts::new(
-        Arc::clone(kernel.catalog_service()),
-        kernel.catalog_application().cloned(),
-        Arc::clone(kernel.connector_control()),
-        Arc::clone(kernel.repository()),
-        Arc::clone(kernel.storage_observation()),
-    );
     let engine = crate::mv::iceberg_refresh::StandaloneMvEngine::new_with_ports(
-        ports,
+        ports.clone(),
         connector_context.clone(),
     );
     let application_statement = crate::mv::application::MvApplicationStatement::Create(
         crate::mv::application::MvCreateStatement::from(stmt),
     );
-    match kernel.application().try_handle_statement(
+    match application.try_handle_statement(
         &engine,
         &application_statement,
         crate::mv::application::MvRequestContext {
@@ -477,7 +475,7 @@ pub(crate) fn create_mv_with_kernel(
         Ok(None) => {}
         Err(error) => return Err(error.to_string()),
     }
-    kernel.mv_backend().create_mv(CreateMvRequest {
+    mv_backend.create_mv(CreateMvRequest {
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
         current_database: db.to_string(),
@@ -486,19 +484,18 @@ pub(crate) fn create_mv_with_kernel(
     Ok(StatementResult::Ok)
 }
 
-/// Drop an MV through its explicit frontend-composed execution kernel.
-pub(crate) fn drop_mv_with_kernel(
-    kernel: &MvExecutionKernel,
+/// Drop an MV from the durable MV repository and the injected MV backend.
+pub fn drop_mv_with_ports(
+    repository: &dyn MvRepository,
+    mv_backend: &dyn MvBackend,
     current_catalog: Option<&str>,
     db: &str,
     stmt: &DropMaterializedViewStmt,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
-    let target =
-        crate::mv::iceberg_refresh::resolve_refresh_target(current_catalog, db, &stmt.name)?;
-    if let Some(engine) =
-        existing_mv_storage_engine_by_target(kernel.repository().as_ref(), &target)?
+    let target = resolve_refresh_target(current_catalog, db, &stmt.name)?;
+    if let Some(engine) = existing_mv_storage_engine_by_target(repository, &target)?
         && engine != MvStorageEngine::Iceberg
     {
         return Err(
@@ -506,7 +503,7 @@ pub(crate) fn drop_mv_with_kernel(
                 .to_string(),
         );
     }
-    kernel.mv_backend().drop_mv(DropMvRequest {
+    mv_backend.drop_mv(DropMvRequest {
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
         current_database: db.to_string(),
@@ -515,12 +512,12 @@ pub(crate) fn drop_mv_with_kernel(
     Ok(StatementResult::Ok)
 }
 
-/// Alter Iceberg MV metadata through the explicit frontend-composed kernel.
+/// Alter Iceberg MV metadata through the explicit frontend-composed MV ports.
 /// Repartition remains a request-frozen frontend refresh operation and is
 /// deliberately rejected here so its lifecycle cannot fall back to a generic
 /// command route.
-pub(crate) fn alter_mv_with_kernel(
-    kernel: &MvExecutionKernel,
+pub fn alter_mv_with_ports(
+    ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     db: &str,
     stmt: &AlterMaterializedViewStmt,
@@ -537,18 +534,14 @@ pub(crate) fn alter_mv_with_kernel(
         let current_catalog = current_catalog.ok_or_else(|| {
             "ALTER MATERIALIZED VIEW requires current Iceberg catalog".to_string()
         })?;
-        let target = crate::mv::iceberg_refresh::resolve_refresh_target(
-            Some(current_catalog),
-            db,
-            &stmt.name,
-        )?;
-        let engine = existing_mv_storage_engine_by_target(kernel.repository().as_ref(), &target)?
+        let target = resolve_refresh_target(Some(current_catalog), db, &stmt.name)?;
+        let engine = existing_mv_storage_engine_by_target(ports.repository().as_ref(), &target)?
             .ok_or_else(|| {
-            format!(
-                "materialized view {}.{}.{} not found",
-                target.catalog, target.namespace, target.table
-            )
-        })?;
+                format!(
+                    "materialized view {}.{}.{} not found",
+                    target.catalog, target.namespace, target.table
+                )
+            })?;
         if engine != MvStorageEngine::Iceberg {
             return Err(
                 "ALTER MATERIALIZED VIEW is only supported for Iceberg-backed materialized views"
@@ -561,7 +554,7 @@ pub(crate) fn alter_mv_with_kernel(
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| error.to_string())?;
         crate::connector::mutation::execute_catalog_mutation(
-            kernel.connector_control().as_ref(),
+            ports.connector_control(),
             &instance_id,
             novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
                 table: novarocks_spi::connector::ConnectorTableIdentity {
@@ -585,12 +578,8 @@ pub(crate) fn alter_mv_with_kernel(
         )?;
         return Ok(StatementResult::Ok);
     }
-    let definition = load_definition_for_alter(
-        kernel.repository().as_ref(),
-        current_catalog,
-        db,
-        &stmt.name,
-    )?;
+    let definition =
+        load_definition_for_alter(ports.repository().as_ref(), current_catalog, db, &stmt.name)?;
     let req = match &stmt.action {
         AlterMaterializedViewAction::SetRefresh(policy) => {
             refresh_metadata_request_for_policy(&definition, policy, definition.refresh_paused)
@@ -622,19 +611,12 @@ pub(crate) fn alter_mv_with_kernel(
     // lifecycle transition, so they go through the definition-DDL write. Using
     // the lifecycle write would put them inside the refresh fence domain and
     // fail closed whenever another frontend happened to own the active refresh.
-    kernel
+    ports
         .repository()
         .update_definition_refresh_metadata(req.clone())
         .map_err(|e| format!("update MV refresh metadata failed: {e}"))?;
-    let ports = crate::mv::iceberg_refresh::IcebergMvCorePorts::new(
-        Arc::clone(kernel.catalog_service()),
-        kernel.catalog_application().cloned(),
-        Arc::clone(kernel.connector_control()),
-        Arc::clone(kernel.repository()),
-        Arc::clone(kernel.storage_observation()),
-    );
     crate::mv::iceberg_refresh::sync_iceberg_mv_descriptor_with_ports(
-        &ports,
+        ports,
         &definition,
         &req.refresh_policy,
         req.refresh_paused,
@@ -648,8 +630,8 @@ pub(crate) fn alter_mv_with_kernel(
 
 /// List MVs through the injected backend, with no registry lookup. Sorting is
 /// retained here because it is part of the SQL presentation contract.
-pub(crate) fn list_mvs_with_kernel(
-    kernel: &MvExecutionKernel,
+pub fn list_mvs_with_backend(
+    mv_backend: &dyn MvBackend,
     current_catalog: Option<&str>,
     stmt: &ShowMaterializedViewsStmt,
 ) -> Result<StatementResult, String> {
@@ -657,7 +639,7 @@ pub(crate) fn list_mvs_with_kernel(
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
     };
-    let mut rows = kernel.mv_backend().list_mvs(req)?;
+    let mut rows = mv_backend.list_mvs(req)?;
     rows.sort_by(|left, right| {
         left.database
             .cmp(&right.database)
@@ -829,20 +811,6 @@ mod tests {
             .expect_err("extra 3-part ref must fail");
 
         assert!(err.contains("exactly one 3-part Iceberg table, got 2"));
-    }
-
-    #[test]
-    fn delete_temp_delta_file_omits_row_lineage_metadata() {
-        let file =
-            crate::query_execution::planning::time_travel::delete_temp_iceberg_file_for_query(
-                "file:///tmp/delete.parquet".to_string(),
-                128,
-                Some(1),
-                None,
-            );
-
-        assert_eq!(file.first_row_id, None);
-        assert_eq!(file.data_sequence_number, None);
     }
 
     #[test]

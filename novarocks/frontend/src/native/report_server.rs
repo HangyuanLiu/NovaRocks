@@ -7,14 +7,12 @@ use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
+use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress};
 use axum::Json;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use novarocks::query_execution::lifecycle::{
-    QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress,
-};
 use novarocks_protocol::lifecycle::{
     ContractError, ContractErrorCode, ParticipantTerminalOutcome, QueryTerminalReportOutcome,
 };
@@ -149,7 +147,7 @@ fn lifecycle_convergence_debug_snapshot(
 }
 
 fn lifecycle_metric_map(
-    metrics: novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot,
+    metrics: novarocks::service::query_lifecycle_metrics::FrontendQueryLifecycleMetricsSnapshot,
 ) -> BTreeMap<String, i64> {
     [
         ("active_attempts", metrics.active_attempts as i64),
@@ -421,7 +419,7 @@ impl FrontendReportServerHandle {
                         .enable_all()
                         .worker_threads(8)
                         .thread_stack_size(
-                            novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES,
+                            crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES,
                         )
                         .build()
                         .map_err(|error| {

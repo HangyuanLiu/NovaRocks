@@ -24,19 +24,33 @@
 use std::sync::Arc;
 
 use crate::catalog_application::CatalogApplicationPort;
-use crate::query_execution::kernels::{
-    CatalogCommandKernel, DmlExecutionKernel, MaintenanceExecutionKernel, MvExecutionKernel,
-    QueryPreparationKernel, ViewExecutionKernel,
-};
 use novarocks_catalog::identifier::{resolve_catalog_namespace_name, resolve_catalog_table_name};
+use novarocks_spi::connector::{
+    ConnectorInstanceId, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution, ConnectorWriteLease,
+};
 use novarocks_sql::syntax::ObjectName;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TargetBackend {
-    pub(crate) backend_name: &'static str,
-    pub(crate) catalog: String,
-    pub(crate) namespace: String,
-    pub(crate) table: String,
+pub struct TargetBackend {
+    pub backend_name: &'static str,
+    pub catalog: String,
+    pub namespace: String,
+    pub table: String,
+}
+
+// Ownership: this drops the local catalog snapshot for an already-resolved
+// `TargetBackend`. Both the target type and `QueryCatalogService` are owned by
+// catalog_application, and the operation is pure catalog cache maintenance with
+// no plan, fragment, or write-transaction state, so it belongs beside the
+// resolution that produced the target rather than in a DML writer.
+pub fn invalidate_iceberg_caches(
+    state: &impl crate::catalog_application::query_catalog::CatalogServiceSource,
+    target: &TargetBackend,
+) -> Result<(), String> {
+    state
+        .catalog_service()
+        .invalidate_table(&target.catalog, &target.namespace, &target.table)
 }
 
 const DEFAULT_CATALOG_NAME: &str = "default_catalog";
@@ -70,28 +84,18 @@ fn reject_default_catalog_reference(
     Ok(())
 }
 
-pub(crate) trait CatalogAdmission {
+/// The single catalog fact target resolution needs: the optional catalog
+/// application that admits a catalog name.
+///
+/// Core owns this contract because target resolution is a Core operation, but
+/// it deliberately owns no implementation: every implementor is a
+/// composition-side capability value that holds the port, so each `impl` lives
+/// with its own owner instead of being gathered here.
+pub trait CatalogAdmission {
     fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort>;
 }
 
-macro_rules! impl_kernel_catalog_admission {
-    ($kernel:ty) => {
-        impl CatalogAdmission for $kernel {
-            fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
-                self.catalog_application().map(Arc::as_ref)
-            }
-        }
-    };
-}
-
-impl_kernel_catalog_admission!(QueryPreparationKernel);
-impl_kernel_catalog_admission!(CatalogCommandKernel);
-impl_kernel_catalog_admission!(DmlExecutionKernel);
-impl_kernel_catalog_admission!(MvExecutionKernel);
-impl_kernel_catalog_admission!(ViewExecutionKernel);
-impl_kernel_catalog_admission!(MaintenanceExecutionKernel);
-
-pub(crate) fn resolve_table_target(
+pub fn resolve_table_target(
     admission: &impl CatalogAdmission,
     name: &ObjectName,
     current_catalog: Option<&str>,
@@ -113,7 +117,7 @@ pub(crate) fn resolve_table_target(
     })
 }
 
-pub(crate) fn resolve_existing_table_target(
+pub fn resolve_existing_table_target(
     admission: &impl CatalogAdmission,
     name: &ObjectName,
     current_catalog: Option<&str>,
@@ -135,7 +139,7 @@ pub(crate) fn resolve_existing_table_target(
     })
 }
 
-pub(crate) fn resolve_namespace_target(
+pub fn resolve_namespace_target(
     admission: &impl CatalogAdmission,
     name: &ObjectName,
     current_catalog: Option<&str>,
@@ -171,8 +175,41 @@ fn require_catalog_admission(
         .map_err(|error| error.to_string())
 }
 
+/// Loads the Iceberg table handle for an already-resolved write target.
+///
+/// Like `invalidate_iceberg_caches`, this acts on the resolver's own
+/// `TargetBackend` and names no query-assembly type: it checks the lease
+/// against the resolved instance and reads the table through it.
+pub fn iceberg_connector_table_handle(
+    exact_lease: &ConnectorWriteLease,
+    target: &TargetBackend,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<ConnectorTableHandle, String> {
+    let instance_id = ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
+    if exact_lease.binding_key().instance_id != instance_id {
+        return Err("Iceberg write lease does not match the target connector instance".to_string());
+    }
+    let metadata = exact_lease
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context,
+        })
+        .map_err(|error| {
+            format!("load Iceberg write target through connector metadata: {error}")
+        })?;
+    Ok(metadata.table)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::catalog_application::{
         CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind,

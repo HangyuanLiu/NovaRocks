@@ -20,22 +20,26 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use novarocks::mv::application::{
-    MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine,
-    MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
-    MvRequestContext, MvStatementResult, PreparedMvRefresh, PreparedMvRefreshWork,
-};
-use novarocks::mv::background::{
-    MvBackgroundBindings, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
+use super::background::{
+    MvBackgroundBindings, MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
     MvBackgroundEngineSink,
 };
-use novarocks::mv::repository::MvRepository;
-use novarocks::query_execution::backend::BackendTopologyService;
-use novarocks::query_execution::cancellation::QueryCancellationSource;
-use novarocks::query_execution::request_context::{
+use crate::common::admitted_query_context::{
     RequestAdmission, RequestContext, SessionOptimizerSettings,
 };
-use novarocks::query_execution::service::QueryExecutionService;
+use crate::common::backend_topology::BackendTopologyService;
+use crate::common::query_cancellation::QueryCancellationSource;
+use crate::query_execution::maintenance::{TableMaintenanceEngine, TableMaintenanceService};
+use crate::query_execution::mv_assembly::refresh_handoff::{
+    MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
+    PreparedMvRefresh, PreparedMvRefreshWork,
+};
+use crate::query_execution::service::QueryExecutionService;
+use novarocks::mv::application::{
+    MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine, MvRequestContext,
+    MvStatementResult,
+};
+use novarocks::mv::repository::MvRepository;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 
 use super::{
@@ -66,7 +70,7 @@ pub struct FrontendMvService {
     background: Mutex<Option<FrontendMvBackgroundRuntime>>,
     scheduler_config: FrontendMvSchedulerConfig,
     maintenance_config: MaintenanceCoordinatorConfig,
-    table_maintenance_service: Option<Arc<dyn novarocks::maintenance::TableMaintenanceService>>,
+    table_maintenance_service: Option<Arc<dyn TableMaintenanceService>>,
     execution_role: novarocks_types::ClusterRole,
     topology: Option<BackendTopologyService>,
     /// Cost budget frozen from `[runtime]`; the MV worker has no session, so it
@@ -100,7 +104,7 @@ impl FrontendMvService {
         topology: BackendTopologyService,
         scheduler_config: FrontendMvSchedulerConfig,
         maintenance_config: MaintenanceCoordinatorConfig,
-        table_maintenance_service: Arc<dyn novarocks::maintenance::TableMaintenanceService>,
+        table_maintenance_service: Arc<dyn TableMaintenanceService>,
         optimizer_query_mem_limit_bytes: u64,
         ownership: Option<super::coordination::MvRefreshOwnershipContext>,
     ) -> Self {
@@ -243,23 +247,17 @@ impl MvApplicationService for FrontendMvService {
                 create::handle_create(self.repository.as_ref(), engine, statement, context)
                     .map(Some)
             }
-            // REFRESH needs the immutable admitted execution context, which
-            // only the typed refresh entrypoint accepts.  Returning `None`
-            // here would let a caller silently fall through to the retired
-            // core lifecycle.
-            MvApplicationStatement::Refresh(_) => Err(MvApplicationError::new(
-                novarocks::mv::application::MvApplicationErrorKind::InvalidRequest,
-                "REFRESH MATERIALIZED VIEW requires the frontend refresh entrypoint",
-            )),
             MvApplicationStatement::Unhandled => Ok(None),
         }
     }
+}
 
-    fn execute_prepared_refresh(
+impl FrontendMvService {
+    pub fn execute_prepared_refresh(
         &self,
         refresh_plan: PreparedMvRefresh,
         connector_context: ConnectorRequestContext,
-        execution: &novarocks::query_execution::request_context::QueryExecutionContext,
+        execution: &crate::common::admitted_query_context::QueryExecutionContext,
     ) -> Result<MvStatementResult, MvApplicationError> {
         let dependencies = self.refresh.as_ref().ok_or_else(|| {
             MvApplicationError::new(
@@ -276,20 +274,14 @@ impl MvApplicationService for FrontendMvService {
         )
     }
 
-    fn prepare_and_execute_refresh(
+    pub fn prepare_and_execute_refresh(
         &self,
         preparation: &dyn MvRefreshPreparationService,
-        statement: MvApplicationStatement,
+        statement: novarocks_sql::planning::mv::MvRefreshStatement,
         target: novarocks::mv::repository::MvTarget,
         connector_context: ConnectorRequestContext,
-        execution: &novarocks::query_execution::request_context::QueryExecutionContext,
+        execution: &crate::common::admitted_query_context::QueryExecutionContext,
     ) -> Result<MvStatementResult, MvApplicationError> {
-        let MvApplicationStatement::Refresh(statement) = statement else {
-            return Err(MvApplicationError::new(
-                novarocks::mv::application::MvApplicationErrorKind::InvalidRequest,
-                "frontend refresh entrypoint requires REFRESH MATERIALIZED VIEW",
-            ));
-        };
         let mut gate_ticket = self
             .activity_gate
             .request(
@@ -342,7 +334,7 @@ impl MvApplicationService for FrontendMvService {
         self.execute_prepared_refresh(prepared, connector_context, execution)
     }
 
-    fn recover_startup_mv_refreshes(&self) -> Result<(), MvApplicationError> {
+    pub fn recover_startup_mv_refreshes(&self) -> Result<(), MvApplicationError> {
         let summary = self.recover_frontend_mv_refreshes();
         tracing::info!(
             candidates = summary.candidates,
@@ -353,12 +345,7 @@ impl MvApplicationService for FrontendMvService {
         );
         Ok(())
     }
-}
-
-impl FrontendMvService {
-    fn reserve_refresh_attempt(
-        &self,
-    ) -> Result<novarocks::mv::application::MvRefreshAttemptIdentity, MvApplicationError> {
+    fn reserve_refresh_attempt(&self) -> Result<MvRefreshAttemptIdentity, MvApplicationError> {
         let refresh_id = self
             .repository
             .reserve_frontend_refresh_id()
@@ -369,7 +356,7 @@ impl FrontendMvService {
                 )
             })?;
         let request_id = *uuid::Uuid::now_v7().as_bytes();
-        Ok(novarocks::mv::application::MvRefreshAttemptIdentity {
+        Ok(MvRefreshAttemptIdentity {
             refresh_id,
             request_id,
             staging_branch: format!("__novarocks_mv_refresh_{refresh_id}"),
@@ -401,13 +388,13 @@ impl MvBackgroundEngineSink for FrontendMvBackgroundEngineSink {
 struct RefreshWorkerDependencies {
     repository: Arc<dyn MvRepository>,
     refresh: refresh::FrontendMvRefreshDependencies,
-    background_engine: Arc<dyn novarocks::mv::background::MvBackgroundEngine>,
+    background_engine: Arc<dyn MvBackgroundEngine>,
     topology: BackendTopologyService,
     role: novarocks_types::ClusterRole,
     scheduler_config: FrontendMvSchedulerConfig,
     maintenance_config: MaintenanceCoordinatorConfig,
-    table_maintenance_engine: Arc<dyn novarocks::maintenance::TableMaintenanceEngine>,
-    table_maintenance_service: Arc<dyn novarocks::maintenance::TableMaintenanceService>,
+    table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
+    table_maintenance_service: Arc<dyn TableMaintenanceService>,
     activity_gate: MvActivityGate,
     maintenance_wakeup_tx: Option<mpsc::SyncSender<()>>,
     optimizer_query_mem_limit_bytes: u64,
@@ -605,7 +592,7 @@ fn run_scheduled_refreshes(
 fn execute_scheduled_refresh(
     dependencies: &RefreshWorkerDependencies,
     request: &ScheduledRefreshRequest,
-    cancellation: Option<novarocks::query_execution::cancellation::QueryCancellationView>,
+    cancellation: Option<crate::common::query_cancellation::QueryCancellationView>,
 ) -> ScheduledRefreshDisposition {
     let cancellation = cancellation.unwrap_or_else(|| QueryCancellationSource::new().view());
     if scheduled_refresh_test_barrier(&request.target, &cancellation) {
@@ -690,7 +677,7 @@ fn execute_scheduled_refresh(
 #[cfg(debug_assertions)]
 fn scheduled_refresh_test_barrier(
     target: &novarocks::mv::repository::MvTarget,
-    cancellation: &novarocks::query_execution::cancellation::QueryCancellationView,
+    cancellation: &crate::common::query_cancellation::QueryCancellationView,
 ) -> bool {
     let Some(directory) = std::env::var_os("NOVAROCKS_MVX4_SCHEDULER_TEST_DIR") else {
         return false;
@@ -711,7 +698,7 @@ fn scheduled_refresh_test_barrier(
 #[cfg(not(debug_assertions))]
 fn scheduled_refresh_test_barrier(
     _target: &novarocks::mv::repository::MvTarget,
-    _cancellation: &novarocks::query_execution::cancellation::QueryCancellationView,
+    _cancellation: &crate::common::query_cancellation::QueryCancellationView,
 ) -> bool {
     false
 }

@@ -29,18 +29,8 @@ use novarocks_sql::compiler::{
     MvRewriteDefinitionIndex, SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts,
 };
 
-/// Freeze rewrite candidates through the explicit MV kernel.  The frozen
-/// index remains request-local; the kernel only supplies its leaf ports.
-pub(crate) fn freeze_mv_rewrite_definition_index_with_kernel(
-    kernel: &crate::query_execution::kernels::MvExecutionKernel,
-) -> Result<MvRewriteDefinitionIndex, String> {
-    freeze_mv_rewrite_definition_index_with_ports(
-        kernel.repository().as_ref(),
-        kernel.connector_control().as_ref(),
-        kernel.storage_observation().as_ref(),
-    )
-}
-
+/// Freeze rewrite candidates from the caller's leaf ports.  The frozen index
+/// remains request-local.
 pub fn freeze_mv_rewrite_definition_index_with_ports(
     repository: &dyn MvRepository,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
@@ -93,7 +83,7 @@ fn freeze_base_table_state(
     storage_observation: &dyn MvStorageObservationPort,
     fqn: &str,
 ) -> Result<SqlMvRewriteBaseTableFacts, String> {
-    let table_ref = crate::mv::refresh_io::parse_iceberg_table_refs(&[fqn.to_string()])?
+    let table_ref = crate::mv::refresh::definition::parse_iceberg_table_refs(&[fqn.to_string()])?
         .into_iter()
         .next()
         .expect("one table reference produces one parsed identity");

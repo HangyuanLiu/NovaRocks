@@ -21,49 +21,51 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::common::admitted_query_context::{
+    RequestAdmission, RequestContext, SessionOptimizerSettings,
+};
+use crate::common::backend_topology::BackendTopologyService;
+use crate::common::engine_error::{EngineError, EngineErrorCode};
+use crate::common::query_cancellation::QueryCancellationReason;
+use crate::mv::command::MvCommandExecutor;
+use crate::query_execution::backend_command::BackendCommandExecutor;
+use crate::query_execution::control::{
+    QueryCancelOutcome, QueryControlService, QuerySessionLease, SessionIdentity, SessionToken,
+    StatementFinishOutcome,
+};
+use crate::query_execution::dml::add_files::AddFilesEngine;
+use crate::query_execution::dml::ctas::CtasEngine;
+use crate::query_execution::dml::delete::DeleteEngine;
+use crate::query_execution::dml::insert::InsertEngine;
+use crate::query_execution::dml::mutation::MutationEngine;
+use crate::query_execution::dml::truncate::TruncateEngine;
+use crate::query_execution::kernels::SessionCatalogResolver;
+use crate::query_execution::maintenance::command::{
+    MaintenanceCommandExecutor, MaintenanceReadCommandExecutor,
+};
+use crate::query_execution::service::QueryExecutionService;
+use crate::query_execution::{PreparedQueryOperation, StatementResult};
+use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use novarocks::catalog_application::command::CatalogCommandExecutor;
 use novarocks::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
-use novarocks::common::engine_error::{EngineError, EngineErrorCode};
-use novarocks::maintenance::command::{MaintenanceCommandExecutor, MaintenanceReadCommandExecutor};
-use novarocks::mv::command::MvCommandExecutor;
-use novarocks::query_execution::backend::BackendTopologyService;
-use novarocks::query_execution::backend_command::BackendCommandExecutor;
-use novarocks::query_execution::cancellation::QueryCancellationReason;
-use novarocks::query_execution::control::{
-    QueryCancelOutcome, QueryControlService, QuerySessionLease, SessionIdentity, SessionToken,
-    StatementFinishOutcome,
-};
-use novarocks::query_execution::dml::add_files::AddFilesEngine;
-use novarocks::query_execution::dml::ctas::CtasEngine;
-use novarocks::query_execution::dml::delete::DeleteEngine;
-use novarocks::query_execution::dml::insert::InsertEngine;
-use novarocks::query_execution::dml::mutation::MutationEngine;
-use novarocks::query_execution::dml::truncate::TruncateEngine;
-use novarocks::query_execution::kernels::SessionCatalogResolver;
-use novarocks::query_execution::request_context::{
-    RequestAdmission, RequestContext, SessionOptimizerSettings,
-};
-use novarocks::query_execution::service::QueryExecutionService;
-use novarocks::query_execution::session::{
+use novarocks::server::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
     QuerySessionOpenRequest, SessionExecutionSettings,
 };
-use novarocks::query_execution::{PreparedQueryOperation, StatementResult};
-use novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
-use novarocks::statistics::command::StatisticsCommandExecutor;
-use novarocks::view::view_command::ViewCommandExecutor;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
-use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_types::ClusterRole;
 use tokio::task;
 
 use crate::dml::DmlService;
 use crate::query::compiler::FrontendQueryCompiler;
+use crate::statistics::command::StatisticsCommandExecutor;
+use crate::view::command::ViewCommandExecutor;
 
 pub(crate) mod compiler;
 
@@ -511,7 +513,7 @@ impl FrontendQuerySession {
             let value = if let Some(inner_query) = parenthesized_query(raw_value) {
                 match self.execute_admitted(inner_query.to_string()).await? {
                     StatementResult::Query(result) => {
-                        novarocks::runtime::user_variable::query_result_to_user_variable_literal(
+                        crate::runtime::user_variable::query_result_to_user_variable_literal(
                             &result,
                         )
                         .map_err(|message| {
@@ -700,8 +702,8 @@ impl FrontendQuerySession {
         let add_files_engine = Arc::clone(&self.service.add_files_engine);
         let ctas_engine = Arc::clone(&self.service.ctas_engine);
         let truncate_engine = Arc::clone(&self.service.truncate_engine);
-        let mut query_options = state.execution_settings.query_options();
-        query_options.set_allow_throw_exception(
+        let query_options = with_allow_throw_exception(
+            state.execution_settings.query_options(),
             novarocks_sql::syntax::extract_allow_throw_exception_hint(&sql),
         );
         let is_query = is_query_statement(&sql);
@@ -782,6 +784,12 @@ impl FrontendQuerySession {
             }
         }
     }
+}
+
+fn with_allow_throw_exception(query_options: QueryOptions, enabled: bool) -> QueryOptions {
+    let mut raw = query_options.as_proto().clone();
+    raw.allow_throw_exception = enabled;
+    QueryOptions::parse(raw).expect("allow_throw_exception does not invalidate query options")
 }
 
 fn parenthesized_query(value: &str) -> Option<&str> {
@@ -1370,26 +1378,27 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use novarocks::query_execution::backend::BackendTopologySnapshot;
-    use novarocks::query_execution::cancellation::QueryCancellationSource;
-    use novarocks::query_execution::dml::delete::{
+    use crate::common::admitted_query_context::QueryExecutionContext;
+    use crate::common::backend_topology::BackendTopologySnapshot;
+    use crate::common::query_cancellation::QueryCancellationSource;
+    use crate::query_execution::dml::delete::{
         DeleteCommit, DeleteEngine, DeleteOperation, DeletePrepared, DeleteWriteReport,
         PrepareDeleteRequest, PreparedDelete,
     };
-    use novarocks::query_execution::dml::insert::{
+    use crate::query_execution::dml::insert::{
         IcebergInsertCommit, IcebergPreparedInsert, IcebergWriteReport, PrepareIcebergInsert,
         PreparedIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
     };
-    use novarocks::query_execution::dml::mutation::{
+    use crate::query_execution::dml::mutation::{
         MutationAbort, MutationCommit, MutationEngine, MutationPrepared, MutationStageOutcome,
         PrepareMutationRequest, PreparedMutation,
     };
-    use novarocks::query_execution::request_context::QueryExecutionContext;
-    use novarocks::statistics::{
-        CollectedColumnStatistics, EmptyStatisticsService, StatisticsColumn, StatisticsEngine,
-        StatisticsTableTarget,
-    };
     use novarocks_catalog::schema::ColumnDef;
+
+    fn default_query_options() -> QueryOptions {
+        QueryOptions::parse(novarocks_protocol::novarocks::QueryOptions::default())
+            .expect("default wire query options are valid")
+    }
 
     #[derive(Default)]
     struct RecordingCoreCommand {
@@ -1482,31 +1491,6 @@ mod tests {
     #[derive(Default)]
     struct RecordingInsertEngine {
         resolve_contexts: Mutex<Vec<QueryExecutionContext>>,
-    }
-
-    impl StatisticsEngine for RecordingInsertEngine {
-        fn resolve_table_columns(
-            &self,
-            _target: &StatisticsTableTarget,
-        ) -> Result<Vec<StatisticsColumn>, String> {
-            Ok(Vec::new())
-        }
-
-        fn resolve_local_table_columns(
-            &self,
-            _database: &str,
-            _table: &str,
-        ) -> Result<Option<Vec<StatisticsColumn>>, String> {
-            Ok(None)
-        }
-
-        fn collect_table_statistics(
-            &self,
-            _target: &StatisticsTableTarget,
-            _columns: &[String],
-        ) -> Result<Vec<CollectedColumnStatistics>, String> {
-            Ok(Vec::new())
-        }
     }
 
     impl InsertEngine for RecordingInsertEngine {
@@ -1605,7 +1589,10 @@ mod tests {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let dml = DmlService::compose(
+            None,
+            Arc::new(crate::statistics::FrontendStatisticsService::new()),
+        );
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(41, Instant::now() + Duration::from_secs(30), &cancellation);
@@ -1621,7 +1608,7 @@ mod tests {
             &command,
             "INSERT INTO t VALUES (1)",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .expect_err("Iceberg INSERT without StateStore must fail in DML");
 
@@ -1635,7 +1622,10 @@ mod tests {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let dml = DmlService::compose(
+            None,
+            Arc::new(crate::statistics::FrontendStatisticsService::new()),
+        );
         let cancellation = QueryCancellationSource::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         let context = router_test_context(73, deadline, &cancellation);
@@ -1651,7 +1641,7 @@ mod tests {
             &command,
             "INSERT INTO t VALUES (1)",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .expect_err("Iceberg INSERT without StateStore must fail in DML");
         assert!(error.to_string().contains("state store is required"));
@@ -1688,7 +1678,7 @@ mod tests {
             &command,
             "DELETE FROM t WHERE a = 1",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         // The statement is routed to the frontend DELETE owner and never falls
         // through to the core command. It then fails closed inside the DML
@@ -1709,7 +1699,10 @@ mod tests {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let dml = DmlService::compose(
+            None,
+            Arc::new(crate::statistics::FrontendStatisticsService::new()),
+        );
         let cancellation = QueryCancellationSource::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         let context = router_test_context(91, deadline, &cancellation);
@@ -1725,7 +1718,7 @@ mod tests {
             &command,
             "CREATE DATABASE db2",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .expect("core command route");
 
@@ -1741,7 +1734,10 @@ mod tests {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let dml = DmlService::compose(
+            None,
+            Arc::new(crate::statistics::FrontendStatisticsService::new()),
+        );
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(92, Instant::now() + Duration::from_secs(30), &cancellation);
@@ -1765,7 +1761,7 @@ mod tests {
             &command,
             "CREATE TABLE ice.db.dst AS SELECT 1",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .expect("frontend CTAS route");
 
@@ -1779,7 +1775,10 @@ mod tests {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let dml = DmlService::compose(
+            None,
+            Arc::new(crate::statistics::FrontendStatisticsService::new()),
+        );
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(93, Instant::now() + Duration::from_secs(30), &cancellation);
@@ -1794,7 +1793,7 @@ mod tests {
             &command,
             "CREATE TABLE ice.db.dst AS SELECT 1",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .unwrap_err();
 
@@ -1812,7 +1811,7 @@ mod tests {
             &command,
             "TRUNCATE TABLE ice.db.dst",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .unwrap_err();
         assert!(error.contains("TRUNCATE failed"));
@@ -1824,7 +1823,10 @@ mod tests {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let dml = DmlService::compose(
+            None,
+            Arc::new(crate::statistics::FrontendStatisticsService::new()),
+        );
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(94, Instant::now() + Duration::from_secs(30), &cancellation);
@@ -1840,7 +1842,7 @@ mod tests {
             &command,
             "ALTER TABLE ice.db.dst ADD FILES FROM 's3://warehouse/staged'",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .expect("ADD FILES frontend route");
         assert!(matches!(result, StatementResult::Query(_)));
@@ -1857,7 +1859,7 @@ mod tests {
             &command,
             "ALTER TABLE ice.db.dst ADD FILES FROM 's3://warehouse/staged'",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .unwrap_err();
         assert!(error.contains("ADD FILES failed"));
@@ -1893,7 +1895,7 @@ mod tests {
                 &command,
                 sql,
                 &context,
-                QueryOptions::default(),
+                default_query_options(),
             )
             .expect_err("recognized mutation must terminate frontend route");
             assert!(
@@ -1909,7 +1911,10 @@ mod tests {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let dml = DmlService::compose(
+            None,
+            Arc::new(crate::statistics::FrontendStatisticsService::new()),
+        );
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(94, Instant::now() + Duration::from_secs(30), &cancellation);
@@ -1933,7 +1938,7 @@ mod tests {
             &command,
             "TRUNCATE TABLE ice.db.dst",
             &context,
-            QueryOptions::default(),
+            default_query_options(),
         )
         .expect("frontend TRUNCATE route");
 

@@ -23,8 +23,8 @@
 
 use std::sync::Arc;
 
-use crate::query_execution::StatementResult;
-use crate::query_execution::kernels::CatalogCommandKernel;
+use crate::catalog_application::query_catalog::drop_local_table_registration_if_exists;
+use crate::runtime::statement_result::StatementResult;
 use bytes::Bytes;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::identifier::resolve_local_table_name;
@@ -32,10 +32,11 @@ use novarocks_catalog::schema::SqlType;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorColumnAggregation, ConnectorColumnDefinition,
-    ConnectorDataType, ConnectorDefaultValue, ConnectorDropTableDataDisposition,
-    ConnectorErrorKind, ConnectorInstanceId, ConnectorNamespaceIdentity,
-    ConnectorPartitionTransform, ConnectorTableIdentity, ConnectorTableKey, ConnectorTableKeyKind,
-    ConnectorViewIdentity, ConnectorViewRequest, CreatePolicy, DropPolicy,
+    ConnectorColumnPath, ConnectorColumnPosition, ConnectorDataType, ConnectorDefaultValue,
+    ConnectorDropTableDataDisposition, ConnectorErrorKind, ConnectorInstanceId,
+    ConnectorNamespaceIdentity, ConnectorPartitionTransform, ConnectorTableIdentity,
+    ConnectorTableKey, ConnectorTableKeyKind, ConnectorViewIdentity, ConnectorViewRequest,
+    CreatePolicy, DropPolicy,
 };
 use novarocks_sql::syntax::StarRocksDialect;
 use novarocks_sql::syntax::{CreateTableKind, DefaultLiteral, Literal, ObjectName};
@@ -50,39 +51,15 @@ use novarocks_sql::syntax::sqlparser_expr_to_literal;
 /// This deliberately does not expose the standalone application aggregate:
 /// catalog DDL needs only catalog admission, exact-generation connector
 /// control, local catalog invalidation, MV guards, and view metadata lookup.
-pub(crate) trait CatalogDropContext:
+pub trait CatalogDropContext:
     crate::catalog_application::resolver::CatalogAdmission
+    + crate::catalog_application::query_catalog::CatalogServiceSource
 {
-    fn catalog_service(
-        &self,
-    ) -> &Arc<crate::catalog_application::query_catalog::QueryCatalogService>;
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
     fn mv_repository(&self) -> &dyn crate::mv::repository::MvRepository;
     fn mv_storage_observation(
         &self,
     ) -> &dyn crate::mv::storage_observation::MvStorageObservationPort;
-}
-
-impl CatalogDropContext for CatalogCommandKernel {
-    fn catalog_service(
-        &self,
-    ) -> &Arc<crate::catalog_application::query_catalog::QueryCatalogService> {
-        self.catalog_service()
-    }
-
-    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
-        self.connector_control().as_ref()
-    }
-
-    fn mv_repository(&self) -> &dyn crate::mv::repository::MvRepository {
-        self.mv_repository().as_ref()
-    }
-
-    fn mv_storage_observation(
-        &self,
-    ) -> &dyn crate::mv::storage_observation::MvStorageObservationPort {
-        self.mv_storage_observation().as_ref()
-    }
 }
 
 /// Convert a sqlparser DELETE AST to our custom DeleteStmt.
@@ -92,7 +69,7 @@ impl CatalogDropContext for CatalogCommandKernel {
 /// - `WHERE` is mandatory. `DELETE FROM t` (no filter) is rejected — the
 ///   spec recommends `INSERT OVERWRITE t SELECT * FROM t WHERE FALSE` instead.
 /// - `LIMIT` and `ORDER BY` are rejected.
-pub(crate) fn convert_sqlparser_delete_to_custom(
+pub fn convert_sqlparser_delete_to_custom(
     delete: &sqlparser::ast::Delete,
 ) -> Result<novarocks_sql::syntax::DeleteStmt, String> {
     use sqlparser::ast as sqlast;
@@ -140,7 +117,7 @@ pub(crate) fn convert_sqlparser_delete_to_custom(
     })
 }
 
-pub(crate) fn convert_sqlparser_update_to_custom(
+pub fn convert_sqlparser_update_to_custom(
     statement: &sqlparser::ast::Statement,
 ) -> Result<novarocks_sql::syntax::UpdateStmt, String> {
     use novarocks_sql::syntax::{UpdateAssignment, UpdateStmt};
@@ -245,7 +222,7 @@ pub(crate) fn convert_sqlparser_update_to_custom(
     })
 }
 
-pub(crate) fn convert_sqlparser_merge_to_custom(
+pub fn convert_sqlparser_merge_to_custom(
     statement: &sqlparser::ast::Statement,
 ) -> Result<novarocks_sql::syntax::MergeStmt, String> {
     use novarocks_sql::syntax::{
@@ -672,16 +649,8 @@ fn update_alias_name(
 /// explicit catalog command kernel.  Keep statement helpers on this port so
 /// command routing cannot recover an application facade just to resolve a
 /// catalog target or issue a provider-owned mutation.
-pub(crate) trait CatalogMutationContext:
-    crate::catalog_application::resolver::CatalogAdmission
-{
+pub trait CatalogMutationContext: crate::catalog_application::resolver::CatalogAdmission {
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
-}
-
-impl CatalogMutationContext for CatalogCommandKernel {
-    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
-        self.connector_control().as_ref()
-    }
 }
 
 pub(crate) fn execute_create_database_statement(
@@ -837,7 +806,7 @@ fn mutation_instance_id(catalog: &str) -> Result<ConnectorInstanceId, String> {
     ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())
 }
 
-pub(crate) fn connector_column(
+pub fn connector_column(
     column: &novarocks_sql::syntax::TableColumnDef,
 ) -> Result<ConnectorColumnDefinition, String> {
     Ok(ConnectorColumnDefinition {
@@ -949,7 +918,7 @@ pub(crate) fn connector_table_key(key: &novarocks_sql::syntax::TableKeyDesc) -> 
     }
 }
 
-pub(crate) fn connector_partition_transform(
+pub fn connector_partition_transform(
     field: &novarocks_sql::syntax::IcebergPartitionFieldExpr,
 ) -> ConnectorPartitionTransform {
     use novarocks_sql::syntax::IcebergPartitionFieldExpr;
@@ -984,6 +953,34 @@ pub(crate) fn connector_partition_transform(
         }
         IcebergPartitionFieldExpr::Void { column } => ConnectorPartitionTransform::Void {
             column: Arc::from(column.as_str()),
+        },
+    }
+}
+
+// Ownership: `ColumnPath` and `AddPosition` are this module's own parsed
+// schema-change AST types, so lowering them onto the connector SPI is catalog
+// statement work, not query assembly. These two join the sibling converters
+// above (`connector_partition_transform`, `connector_table_key`,
+// `connector_column_aggregation`) that already own that lowering.
+pub(crate) fn connector_schema_path(path: ColumnPath) -> ConnectorColumnPath {
+    ConnectorColumnPath {
+        segments: path
+            .segments()
+            .iter()
+            .map(|segment| Arc::from(segment.as_str()))
+            .collect(),
+    }
+}
+
+pub(crate) fn connector_schema_position(position: AddPosition) -> ConnectorColumnPosition {
+    match position {
+        AddPosition::Default => ConnectorColumnPosition::Default,
+        AddPosition::First => ConnectorColumnPosition::First,
+        AddPosition::After(column) => ConnectorColumnPosition::After {
+            column: Arc::from(column),
+        },
+        AddPosition::Before(column) => ConnectorColumnPosition::Before {
+            column: Arc::from(column),
         },
     }
 }
@@ -1302,23 +1299,6 @@ fn drop_local_catalog_table(
     }
 }
 
-fn drop_local_table_registration_if_exists(
-    context: &impl CatalogDropContext,
-    namespace: &str,
-    table: &str,
-) -> Result<(), String> {
-    let mut guard = context
-        .catalog_service()
-        .local()
-        .write()
-        .map_err(|error| format!("standalone catalog write lock: {error}"))?;
-    match guard.drop_table(namespace, table) {
-        Ok(()) => Ok(()),
-        Err(error) if error.contains("unknown") => Ok(()),
-        Err(error) => Err(format!("drop local table metadata: {error}")),
-    }
-}
-
 fn ensure_no_iceberg_mv_targets_in_scope(
     context: &impl CatalogDropContext,
     scope_catalog: &str,
@@ -1425,10 +1405,10 @@ fn external_view_exists(
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct AddEqualityDeleteStmt {
-    pub(crate) table: ObjectName,
-    pub(crate) columns: Vec<String>,
-    pub(crate) rows: Vec<Vec<Literal>>,
+pub struct AddEqualityDeleteStmt {
+    pub table: ObjectName,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Literal>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1593,7 +1573,7 @@ pub(crate) fn parse_show_create_table(
     novarocks_sql::syntax::convert_object_name(obj)
 }
 
-pub(crate) fn looks_like_show_alter_table_optimize(sql: &str) -> bool {
+pub fn looks_like_show_alter_table_optimize(sql: &str) -> bool {
     let Ok(normalized) = novarocks_sql::syntax::normalize_for_raw_parse(sql) else {
         return false;
     };
@@ -2139,13 +2119,13 @@ fn expect_parser_eof(parser: &Parser<'_>) -> Result<(), String> {
 }
 
 /// Check if SQL looks like ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES ...
-pub(crate) fn looks_like_add_equality_delete(sql: &str) -> bool {
+pub fn looks_like_add_equality_delete(sql: &str) -> bool {
     let upper = sql.trim().to_ascii_uppercase();
     upper.starts_with("ALTER TABLE") && upper.contains("ADD EQUALITY DELETE")
 }
 
 /// Parse: ALTER TABLE [catalog.db.]table ADD EQUALITY DELETE (k1, k2) VALUES (...)
-pub(crate) fn parse_add_equality_delete_sql(sql: &str) -> Result<AddEqualityDeleteStmt, String> {
+pub fn parse_add_equality_delete_sql(sql: &str) -> Result<AddEqualityDeleteStmt, String> {
     const ALTER_TABLE: &str = "ALTER TABLE";
     const ADD_EQ_DELETE: &str = "ADD EQUALITY DELETE";
     const VALUES: &str = "VALUES";

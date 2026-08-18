@@ -26,27 +26,34 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::ConnectorControlRegistry;
 
+use crate::common::backend_topology::BackendTopologyService;
+use crate::query_execution::backend_command;
+use crate::query_execution::dml::{add_files, ctas, delete, insert, mutation, truncate};
+use crate::query_execution::kernels as domain;
+use crate::query_execution::maintenance::command as maintenance_command;
+use crate::query_execution::maintenance::{
+    BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory, BackgroundMaintenanceEngine,
+    TableMaintenanceEngine, TableMaintenanceService,
+};
+use crate::query_execution::service::QueryExecutionService;
+use crate::view::ViewService;
 use novarocks::catalog_application::CatalogApplicationPort;
 use novarocks::catalog_application::query_catalog::QueryCatalogService;
 use novarocks::catalog_application::system_catalog::SystemCatalog;
 use novarocks::catalog_application::{command as catalog_command, iceberg_ref_command};
 use novarocks::connector::UnifiedStatisticsResolver;
-use novarocks::maintenance::TableMaintenanceService;
-use novarocks::maintenance::command as maintenance_command;
 use novarocks::mv::application::MvApplicationService;
-use novarocks::mv::command as mv_command;
 use novarocks::mv::repository::MvRepository;
 use novarocks::mv::storage_observation::MvStorageObservationPort;
-use novarocks::query_execution::backend::BackendTopologyService;
-use novarocks::query_execution::backend_command;
-use novarocks::query_execution::dml::{add_files, ctas, delete, insert, mutation, truncate};
-use novarocks::query_execution::kernels as domain;
-use novarocks::query_execution::service::QueryExecutionService;
-use novarocks::statistics::StatisticsService;
-use novarocks::statistics::application::StatisticsApplicationPort;
-use novarocks::statistics::command as statistics_command;
-use novarocks::view::ViewService;
-use novarocks::view::view_command;
+
+use crate::mv::{FrontendMvService, command as mv_command};
+use crate::statistics::command::StatisticsCommandExecutor;
+use crate::statistics_jobs::application::{
+    ConnectorStatisticsTableReader, ConnectorStatisticsTargetResolver, StatisticsApplicationPort,
+    StatisticsAttemptExecutor, StatisticsAttemptExecutorSink, StatisticsTableReaderSink,
+    StatisticsTargetResolverSink,
+};
+use crate::view::command::ViewCommandExecutor;
 
 use crate::query::compiler::FrontendQueryCompiler;
 
@@ -236,59 +243,22 @@ impl CatalogCommandPorts {
 pub fn catalog_command_executor(
     ports: CatalogCommandPorts,
 ) -> catalog_command::CatalogCommandExecutor {
-    catalog_command::CatalogCommandExecutor::new(domain::CatalogCommandKernel::new(
+    catalog_command::CatalogCommandExecutor::new(
         ports.catalog_service,
         ports.catalog_application,
         ports.connector_control,
         ports.mv_repository,
         ports.mv_storage_observation,
-        ports.view_service,
-    ))
+    )
 }
 
-/// Leaf ports for durable statistics command submission and observation.
-#[derive(Clone)]
-pub struct StatisticsCommandPorts {
-    catalog_service: Arc<QueryCatalogService>,
-    connector_control: Arc<dyn ConnectorControlRegistry>,
-    unified_statistics: Arc<UnifiedStatisticsResolver>,
-    statistics_service: Arc<dyn StatisticsService>,
-    statistics_application: Arc<dyn StatisticsApplicationPort>,
-    query_execution: QueryExecutionService,
-}
-
-impl StatisticsCommandPorts {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        catalog_service: Arc<QueryCatalogService>,
-        connector_control: Arc<dyn ConnectorControlRegistry>,
-        unified_statistics: Arc<UnifiedStatisticsResolver>,
-        statistics_service: Arc<dyn StatisticsService>,
-        statistics_application: Arc<dyn StatisticsApplicationPort>,
-        query_execution: QueryExecutionService,
-    ) -> Self {
-        Self {
-            catalog_service,
-            connector_control,
-            unified_statistics,
-            statistics_service,
-            statistics_application,
-            query_execution,
-        }
-    }
-}
-
-pub fn statistics_command_executor(
-    ports: StatisticsCommandPorts,
-) -> statistics_command::StatisticsCommandExecutor {
-    statistics_command::StatisticsCommandExecutor::new(domain::StatisticsExecutionKernel::new(
-        ports.catalog_service,
-        ports.connector_control,
-        ports.unified_statistics,
-        ports.statistics_service,
-        ports.statistics_application,
-        ports.query_execution,
-    ))
+/// Statistics SQL commands terminate at the frontend durable application
+/// owner. They do not receive a query-execution kernel or Core composition
+/// bundle.
+pub(crate) fn statistics_command_executor(
+    application: Arc<dyn StatisticsApplicationPort>,
+) -> StatisticsCommandExecutor {
+    StatisticsCommandExecutor::new(application)
 }
 
 /// Leaf port for FE-owned backend membership commands.
@@ -409,9 +379,9 @@ pub struct MvCommandPorts {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    unified_statistics: Arc<UnifiedStatisticsResolver>,
     repository: Arc<dyn MvRepository>,
-    application: Arc<dyn MvApplicationService>,
+    create_application: Arc<dyn MvApplicationService>,
+    refresh_service: Arc<FrontendMvService>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
 }
@@ -422,9 +392,9 @@ impl MvCommandPorts {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        unified_statistics: Arc<UnifiedStatisticsResolver>,
         repository: Arc<dyn MvRepository>,
-        application: Arc<dyn MvApplicationService>,
+        create_application: Arc<dyn MvApplicationService>,
+        refresh_service: Arc<FrontendMvService>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
     ) -> Self {
@@ -432,9 +402,9 @@ impl MvCommandPorts {
             catalog_service,
             catalog_application,
             connector_control,
-            unified_statistics,
             repository,
-            application,
+            create_application,
+            refresh_service,
             storage_observation,
             query_execution,
         }
@@ -449,19 +419,17 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
         Arc::clone(&ports.repository),
         Arc::clone(&ports.storage_observation),
     );
-    let backend =
-        Arc::new(novarocks::mv::iceberg_backend::IcebergMvBackend::new_with_ports(iceberg_ports));
-    mv_command::MvCommandExecutor::new(domain::MvExecutionKernel::new(
-        ports.catalog_service,
-        ports.catalog_application,
-        ports.connector_control,
-        ports.unified_statistics,
+    let backend = Arc::new(
+        novarocks::mv::iceberg_backend::IcebergMvBackend::new_with_ports(iceberg_ports.clone()),
+    );
+    mv_command::MvCommandExecutor::new(
+        iceberg_ports,
+        ports.create_application,
+        ports.refresh_service,
+        Arc::clone(&ports.repository),
+        Arc::clone(&ports.storage_observation),
         backend,
-        ports.repository,
-        ports.application,
-        ports.storage_observation,
-        ports.query_execution,
-    ))
+    )
 }
 
 /// Leaf ports for external-view commands.
@@ -489,8 +457,8 @@ impl ViewCommandPorts {
     }
 }
 
-pub fn view_command_executor(ports: ViewCommandPorts) -> view_command::ViewCommandExecutor {
-    view_command::ViewCommandExecutor::new(domain::ViewExecutionKernel::new(
+pub(crate) fn view_command_executor(ports: ViewCommandPorts) -> ViewCommandExecutor {
+    ViewCommandExecutor::new(domain::ViewExecutionKernel::new(
         ports.catalog_service,
         ports.catalog_application,
         ports.connector_control,
@@ -522,8 +490,8 @@ impl SessionCatalogPorts {
 
 pub fn session_catalog_resolver(
     ports: SessionCatalogPorts,
-) -> novarocks::query_execution::kernels::SessionCatalogResolver {
-    novarocks::query_execution::kernels::SessionCatalogResolver::new(
+) -> crate::query_execution::kernels::SessionCatalogResolver {
+    crate::query_execution::kernels::SessionCatalogResolver::new(
         ports.catalog_service,
         ports.catalog_application,
         ports.connector_control,
@@ -597,7 +565,7 @@ impl MvRefreshProviderActivationPorts {
 /// and retains the admitted query execution service for native writes.
 pub fn mv_refresh_provider_activation(
     ports: MvRefreshProviderActivationPorts,
-) -> Arc<dyn novarocks::mv::application::MvRefreshProviderActivation> {
+) -> Arc<dyn crate::query_execution::mv_native_write::MvRefreshProviderActivation> {
     let query_kernel = domain::QueryPreparationKernel::new(
         Arc::clone(&ports.catalog_service),
         ports.catalog_application.clone(),
@@ -615,7 +583,7 @@ pub fn mv_refresh_provider_activation(
         ports.mv_storage_observation,
     );
     Arc::new(
-        novarocks::mv::iceberg_activation::IcebergMvRefreshProviderActivation::new(
+        crate::query_execution::mv_assembly::iceberg_activation::IcebergMvRefreshProviderActivation::new(
             query_kernel,
             mv_ports,
         ),
@@ -624,7 +592,7 @@ pub fn mv_refresh_provider_activation(
 
 /// Bind MV refresh activation before the Frontend performs startup restore.
 pub fn bind_mv_refresh_provider_activation(
-    sink: &dyn novarocks::mv::application::MvRefreshProviderActivationSink,
+    sink: &dyn crate::query_execution::mv_native_write::MvRefreshProviderActivationSink,
     ports: MvRefreshProviderActivationPorts,
 ) -> Result<(), String> {
     sink.bind_mv_refresh_provider_activation(mv_refresh_provider_activation(ports))
@@ -632,24 +600,22 @@ pub fn bind_mv_refresh_provider_activation(
 
 /// Bind the short-lived, generation-fenced statistics target resolver.
 pub fn bind_statistics_target_resolver(
-    sink: &dyn novarocks::statistics::application::StatisticsTargetResolverSink,
+    sink: &dyn StatisticsTargetResolverSink,
     connector_control: Arc<dyn ConnectorControlRegistry>,
 ) -> Result<(), String> {
-    sink.bind_statistics_target_resolver(Arc::new(
-        novarocks::statistics::application::ConnectorStatisticsTargetResolver::new(
-            connector_control,
-        ),
-    ))
+    sink.bind_statistics_target_resolver(Arc::new(ConnectorStatisticsTargetResolver::new(
+        connector_control,
+    )))
 }
 
 /// Bind the short-lived, generation-fenced statistics reader.
 pub fn bind_statistics_table_reader(
-    sink: &dyn novarocks::statistics::application::StatisticsTableReaderSink,
+    sink: &dyn StatisticsTableReaderSink,
     connector_control: Arc<dyn ConnectorControlRegistry>,
 ) -> Result<(), String> {
-    sink.bind_statistics_table_reader(Arc::new(
-        novarocks::statistics::application::ConnectorStatisticsTableReader::new(connector_control),
-    ))
+    sink.bind_statistics_table_reader(Arc::new(ConnectorStatisticsTableReader::new(
+        connector_control,
+    )))
 }
 
 /// Exact leaves retained by the Frontend-owned durable ANALYZE worker.
@@ -684,7 +650,7 @@ impl StatisticsAttemptExecutorPorts {
 /// Build the native statistics attempt executor from Frontend-owned leaves.
 pub fn statistics_attempt_executor(
     ports: StatisticsAttemptExecutorPorts,
-) -> Arc<dyn novarocks::statistics::application::StatisticsAttemptExecutor> {
+) -> Arc<dyn StatisticsAttemptExecutor> {
     Arc::new(
         crate::statistics_jobs::attempt_executor::FrontendStatisticsAttemptExecutor::new(
             crate::statistics_jobs::attempt_executor::StatisticsAttemptExecutionPorts::new(
@@ -701,7 +667,7 @@ pub fn statistics_attempt_executor(
 /// coordinator leaves are ready.  A missing sink remains a Frontend decision;
 /// this helper never supplies an in-memory job fallback.
 pub fn bind_statistics_attempt_executor(
-    sink: &dyn novarocks::statistics::application::StatisticsAttemptExecutorSink,
+    sink: &dyn StatisticsAttemptExecutorSink,
     ports: StatisticsAttemptExecutorPorts,
 ) -> Result<(), String> {
     sink.bind_statistics_attempt_executor(statistics_attempt_executor(ports))
@@ -712,9 +678,9 @@ pub fn bind_statistics_attempt_executor(
 /// obtains a fresh topology and cancellation scope through that factory.
 pub fn background_maintenance_engine(
     ports: MaintenanceCommandPorts,
-    attempt_factory: Arc<dyn novarocks::maintenance::BackgroundMaintenanceAttemptFactory>,
-) -> Arc<dyn novarocks::maintenance::TableMaintenanceEngine> {
-    Arc::new(novarocks::maintenance::BackgroundMaintenanceEngine::new(
+    attempt_factory: Arc<dyn BackgroundMaintenanceAttemptFactory>,
+) -> Arc<dyn TableMaintenanceEngine> {
+    Arc::new(BackgroundMaintenanceEngine::new(
         ports.kernel(),
         attempt_factory,
     ))
@@ -726,19 +692,19 @@ pub fn background_maintenance_engine(
 pub fn background_maintenance_attempt(
     role: novarocks_types::ClusterRole,
     topology: BackendTopologyService,
-) -> Result<novarocks::maintenance::BackgroundMaintenanceAttempt, String> {
+) -> Result<BackgroundMaintenanceAttempt, String> {
     let topology = topology.snapshot().map_err(|error| error.to_string())?;
-    let cancellation = novarocks::query_execution::cancellation::QueryCancellationSource::new();
-    let execution = novarocks::query_execution::request_context::QueryExecutionContext::new(
+    let cancellation = crate::common::query_cancellation::QueryCancellationSource::new();
+    let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
         role,
         topology,
         None,
         cancellation.view(),
-        novarocks::query_execution::request_context::SessionOptimizerSettings::default(),
+        crate::common::admitted_query_context::SessionOptimizerSettings::default(),
     );
     let connector_context =
         novarocks::connector::connector_request_context_for_execution(None, &execution)?;
-    Ok(novarocks::maintenance::BackgroundMaintenanceAttempt::new(
+    Ok(BackgroundMaintenanceAttempt::new(
         execution,
         connector_context,
     ))
@@ -746,7 +712,7 @@ pub fn background_maintenance_attempt(
 
 /// Leaf ports for the Frontend-owned MV background worker.
 #[derive(Clone)]
-pub struct MvBackgroundPorts {
+pub(crate) struct MvBackgroundPorts {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -755,7 +721,7 @@ pub struct MvBackgroundPorts {
 }
 
 impl MvBackgroundPorts {
-    pub fn new(
+    pub(crate) fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -774,10 +740,10 @@ impl MvBackgroundPorts {
 
 /// Build the two capabilities the Frontend binds into its MV background
 /// runtime after restore and maintenance recovery have completed.
-pub fn mv_background_bindings(
+pub(crate) fn mv_background_bindings(
     ports: MvBackgroundPorts,
-    table_maintenance_engine: Arc<dyn novarocks::maintenance::TableMaintenanceEngine>,
-) -> novarocks::mv::background::MvBackgroundBindings {
+    table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
+) -> crate::mv::background::MvBackgroundBindings {
     let iceberg_ports = novarocks::mv::iceberg_refresh::IcebergMvCorePorts::new(
         ports.catalog_service,
         ports.catalog_application,
@@ -785,9 +751,9 @@ pub fn mv_background_bindings(
         Arc::clone(&ports.repository),
         Arc::clone(&ports.storage_observation),
     );
-    novarocks::mv::background::MvBackgroundBindings {
+    crate::mv::background::MvBackgroundBindings {
         engine: Arc::new(
-            novarocks::mv::background_engine::StandaloneMvBackgroundEngine::new_with_ports(
+            crate::mv::background_engine::StandaloneMvBackgroundEngine::new_with_ports(
                 iceberg_ports,
                 ports.connector_control,
                 ports.repository,
@@ -800,10 +766,10 @@ pub fn mv_background_bindings(
 
 /// Bind the MV background capability only after the Frontend has completed
 /// its ordered restore and recovery sequence.
-pub fn bind_mv_background_engine(
-    sink: &dyn novarocks::mv::background::MvBackgroundEngineSink,
+pub(crate) fn bind_mv_background_engine(
+    sink: &dyn crate::mv::background::MvBackgroundEngineSink,
     ports: MvBackgroundPorts,
-    table_maintenance_engine: Arc<dyn novarocks::maintenance::TableMaintenanceEngine>,
-) -> Result<(), novarocks::mv::background::MvBackgroundEngineError> {
+    table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
+) -> Result<(), crate::mv::background::MvBackgroundEngineError> {
     sink.bind_mv_background_engine(mv_background_bindings(ports, table_maintenance_engine))
 }
