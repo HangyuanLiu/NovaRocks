@@ -1096,12 +1096,15 @@ fn alter_schema(
         .load_table(&table.namespace, &table.table)
         .map_err(unavailable)?;
     let metadata = loaded.table.metadata();
+    // Reserved lineage columns are an engine contract rather than observed
+    // schema fields, so reject them before any lookup can report them absent.
+    reject_reserved_schema_change(change)?;
     if let ConnectorSchemaChange::DropColumn { path } = change {
-        let dropped = find_field(metadata.current_schema().as_struct().fields(), path)?;
+        let dropped_id = find_field_id(metadata.current_schema().as_struct().fields(), path)?;
         if metadata
             .current_schema()
             .identifier_field_ids()
-            .any(|id| id == dropped.id)
+            .any(|id| id == dropped_id)
         {
             return Err(invalid("Iceberg identifier columns cannot be dropped"));
         }
@@ -1132,7 +1135,6 @@ fn alter_schema(
     {
         return Err(invalid("Iceberg column defaults require format-version 3"));
     }
-    reject_reserved_schema_change(change)?;
     let mut next_id = metadata
         .last_column_id()
         .checked_add(1)
@@ -1414,26 +1416,23 @@ fn split_path(path: &ConnectorColumnPath) -> Result<(&[Arc<str>], &str), Connect
     Ok((parent, name))
 }
 
-fn find_field<'a>(
-    fields: &'a [Arc<NestedField>],
+fn find_field_id(
+    fields: &[Arc<NestedField>],
     path: &ConnectorColumnPath,
-) -> Result<&'a NestedField, ConnectorError> {
-    let mut fields = fields;
-    let mut found = None;
+) -> Result<i32, ConnectorError> {
+    let mut fields = fields.to_vec();
+    let mut found_id = None;
     for (index, segment) in path.segments.iter().enumerate() {
         let field = fields
             .iter()
             .find(|field| field.name.eq_ignore_ascii_case(segment))
             .ok_or_else(|| not_found(format!("Iceberg column `{segment}` does not exist")))?;
-        found = Some(field.as_ref());
+        found_id = Some(field.id);
         if index + 1 < path.segments.len() {
-            let Type::Struct(struct_type) = field.field_type.as_ref() else {
-                return Err(invalid("Iceberg column path traverses a non-struct field"));
-            };
-            fields = struct_type.fields();
+            fields = composite_children(field.field_type.as_ref())?;
         }
     }
-    found.ok_or_else(|| invalid("Iceberg column path is empty"))
+    found_id.ok_or_else(|| invalid("Iceberg column path is empty"))
 }
 
 fn field_index(fields: &[Arc<NestedField>], name: &str) -> Result<usize, ConnectorError> {
@@ -3215,6 +3214,74 @@ mod tests {
             vec!["id", "name", "ts"]
         );
         assert_eq!(fields[1].id, 3);
+    }
+
+    #[test]
+    fn reserved_schema_drop_is_rejected_before_field_lookup() {
+        let (_executor, _warehouse, provider) = provider();
+        let table = guarded_table(&provider);
+        let change = ConnectorSchemaChange::DropColumn {
+            path: ConnectorColumnPath {
+                segments: vec![crate::row_lineage_synth::ICEBERG_ROW_ID_COL.into()],
+            },
+        };
+
+        let error = alter_schema(provider.runtime(), &table, &[change])
+            .expect_err("reserved field must not be resolved from table metadata");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(
+            error.message(),
+            "Iceberg schema evolution cannot modify reserved column `_row_id`"
+        );
+    }
+
+    #[test]
+    fn dropping_list_element_reaches_composite_rebuild_rejection() {
+        let fields = vec![Arc::new(NestedField::optional(
+            1,
+            "c1",
+            Type::List(crate::iceberg::spec::ListType::new(Arc::new(
+                NestedField::list_element(2, Type::Primitive(PrimitiveType::Long), false),
+            ))),
+        ))];
+        let path = ConnectorColumnPath {
+            segments: vec!["c1".into(), "element".into()],
+        };
+
+        assert_eq!(
+            find_field_id(&fields, &path).expect("resolve list element"),
+            2
+        );
+        let error =
+            apply_schema_change(&fields, &ConnectorSchemaChange::DropColumn { path }, &mut 3)
+                .expect_err("dropping a list element must preserve the composite shape");
+
+        assert_eq!(
+            error.message(),
+            "Iceberg LIST element cannot be added or dropped"
+        );
+    }
+
+    #[test]
+    fn missing_nested_leaf_keeps_canonical_leaf_error() {
+        let fields = vec![Arc::new(NestedField::optional(
+            1,
+            "address",
+            Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+                2,
+                "city",
+                Type::Primitive(PrimitiveType::String),
+            ))])),
+        ))];
+        let path = ConnectorColumnPath {
+            segments: vec!["address".into(), "bogus".into()],
+        };
+
+        let error = find_field_id(&fields, &path).expect_err("missing leaf must fail");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+        assert_eq!(error.message(), "Iceberg column `bogus` does not exist");
     }
 
     #[test]

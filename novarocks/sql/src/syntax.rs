@@ -44,14 +44,47 @@ pub enum MvAdmittedStatement {
     Show(ShowMaterializedViewsStmt),
 }
 
+/// Parse an MV command when the parser recognizes an MV statement form.
+///
+/// `Ok(None)` is a route miss: the input is not one of the materialized-view
+/// statement forms. Once the parser recognizes one of those forms, parse
+/// rejection remains an error instead of being converted into a route miss.
+pub fn parse_optional_mv_admitted_statement(
+    sql: &str,
+) -> Result<Option<MvAdmittedStatement>, String> {
+    let normalized = crate::parser::dialect::normalize_for_raw_parse(sql)?;
+    let dialect = crate::parser::dialect::StarRocksDialect;
+    let parser = Parser::new(&dialect)
+        .try_with_sql(&normalized)
+        .map_err(|error| error.to_string())?;
+    let recognized =
+        crate::parser::dialect::materialized_view::looks_like_create_materialized_view(&parser)
+            || crate::parser::dialect::materialized_view::looks_like_drop_materialized_view(
+                &parser,
+            )
+            || crate::parser::dialect::materialized_view::looks_like_refresh_materialized_view(
+                &parser,
+            )
+            || crate::parser::dialect::materialized_view::looks_like_show_materialized_views(
+                &parser,
+            )
+            || crate::parser::dialect::materialized_view::looks_like_alter_materialized_view(
+                &parser,
+            );
+    if !recognized {
+        return Ok(None);
+    }
+
+    parse_recognized_mv_admitted_statement(sql).map(Some)
+}
+
 pub fn parse_mv_admitted_statement(sql: &str) -> Result<MvAdmittedStatement, String> {
-    let mut statements = match crate::parser::parse_sql(sql) {
-        Ok(statements) => statements,
-        Err(error) if error == "parse_sql: only materialized-view DDL is recognized in Phase 1" => {
-            return Err("statement is not a materialized-view command".to_string());
-        }
-        Err(error) => return Err(error),
-    };
+    parse_optional_mv_admitted_statement(sql)?
+        .ok_or_else(|| "statement is not a materialized-view command".to_string())
+}
+
+fn parse_recognized_mv_admitted_statement(sql: &str) -> Result<MvAdmittedStatement, String> {
+    let mut statements = crate::parser::parse_sql(sql)?;
     if statements.len() != 1 {
         return Err("materialized-view command accepts exactly one statement".to_string());
     }
@@ -338,7 +371,8 @@ pub fn parse_alter_iceberg_ref(sql: &str) -> Result<Option<AlterIcebergRefStmt>,
 mod tests {
     use super::{
         BackendManagementCommand, MvAdmittedStatement, arrow_type_equals_ignoring_metadata,
-        parse_backend_management_command, parse_mv_admitted_statement, sql_type_to_arrow_type,
+        parse_backend_management_command, parse_mv_admitted_statement,
+        parse_optional_mv_admitted_statement, sql_type_to_arrow_type,
     };
 
     #[test]
@@ -376,6 +410,29 @@ mod tests {
         let error = parse_mv_admitted_statement("SELECT 1")
             .expect_err("non-MV syntax must not be admitted through the MV contract");
         assert_eq!(error, "statement is not a materialized-view command");
+    }
+
+    #[test]
+    fn optional_mv_admission_distinguishes_route_misses_from_mv_parse_errors() {
+        assert_eq!(
+            parse_optional_mv_admitted_statement("SELECT 1").expect("non-MV probe"),
+            None
+        );
+
+        let statement =
+            parse_optional_mv_admitted_statement("REFRESH MATERIALIZED VIEW analytics.mv")
+                .expect("valid MV command")
+                .expect("MV command should be recognized");
+        assert!(matches!(statement, MvAdmittedStatement::Refresh(_)));
+
+        let error = parse_optional_mv_admitted_statement(
+            "CREATE MATERIALIZED VIEW mv \
+             DISTRIBUTED BY HASH(k1) BUCKETS 1 \
+             PRIMARY KEY () \
+             AS SELECT k1 FROM source_table",
+        )
+        .expect_err("recognized MV syntax must preserve its parser error");
+        assert_eq!(error, "PRIMARY KEY clause requires at least one column");
     }
 
     #[test]

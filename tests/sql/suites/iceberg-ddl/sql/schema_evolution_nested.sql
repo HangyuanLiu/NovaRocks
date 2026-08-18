@@ -51,7 +51,7 @@ ALTER TABLE people DROP COLUMN address.city;
 ALTER TABLE people DROP COLUMN address.city;
 
 -- query 7
--- @expect_error=column path 'address.bogus' not found
+-- @expect_error=Iceberg column `bogus` does not exist
 ALTER TABLE people DROP COLUMN address.bogus;
 
 -- query 8

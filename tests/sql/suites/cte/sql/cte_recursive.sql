@@ -192,9 +192,9 @@ FROM parent_cte
 ORDER BY employee_id;
 
 -- query 9
--- Recursive CTE with mixed UNION ALL + UNION is rejected when the recursive
--- reference is resolved; it must not reach a metadata lookup.
--- @expect_error=unknown table: numbers
+-- Recursive CTE with mixed UNION ALL + UNION is rejected by the parser; it
+-- must not reach catalog lookup.
+-- @expect_error=unsupported recursive CTE shape: mixed UNION quantifiers
 WITH RECURSIVE numbers AS (
     SELECT cast(1 as bigint) AS n, cast(1 as bigint) AS category
     UNION ALL
