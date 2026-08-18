@@ -47,7 +47,8 @@ use crate::mv::domain::storage_observation::{
 pub(crate) struct RebuiltMvDefinition {
     pub create_request: CreateMvDefinitionRequest,
     pub last_refresh_snapshots: BTreeMap<String, i64>,
-    pub last_refresh_table_uuids: BTreeMap<String, String>,
+    pub last_refresh_table_object_ids:
+        BTreeMap<String, novarocks_spi::connector::ConnectorTableObjectId>,
 }
 
 /// Reconstruct an MV's repository definition-create inputs purely from its lake
@@ -84,15 +85,15 @@ pub(crate) fn rebuild_mv_definition_from_lake(
         created_at_ms: descriptor.created_at_ms,
     };
 
-    let (last_refresh_snapshots, last_refresh_table_uuids) = match &package.publication {
+    let (last_refresh_snapshots, last_refresh_table_object_ids) = match &package.publication {
         MvLakePublication::Published(facts) => {
             let mut snapshots = BTreeMap::new();
-            let mut table_uuids = BTreeMap::new();
+            let mut table_object_ids = BTreeMap::new();
             for base in &facts.bases {
                 snapshots.insert(base.table_fqn.clone(), base.to_snapshot);
-                table_uuids.insert(base.table_fqn.clone(), base.table_uuid.clone());
+                table_object_ids.insert(base.table_fqn.clone(), base.object_id.clone());
             }
-            (snapshots, table_uuids)
+            (snapshots, table_object_ids)
         }
         MvLakePublication::NeverPublished => (BTreeMap::new(), BTreeMap::new()),
     };
@@ -100,7 +101,7 @@ pub(crate) fn rebuild_mv_definition_from_lake(
     Ok(RebuiltMvDefinition {
         create_request,
         last_refresh_snapshots,
-        last_refresh_table_uuids,
+        last_refresh_table_object_ids,
     })
 }
 
@@ -269,7 +270,7 @@ pub(crate) fn rebuild_one_lake_package_if_missing_with_repository(
         .initialize_rebuilt_refresh_watermark(
             definition.mv_id,
             rebuilt.last_refresh_snapshots,
-            rebuilt.last_refresh_table_uuids,
+            rebuilt.last_refresh_table_object_ids,
         )
         .map_err(|e| format!("stamp rebuilt iceberg MV refresh watermark failed: {e}"))?;
     Ok(())
@@ -334,16 +335,23 @@ mod tests {
         MvLakePackageObservation, MvLakePublication, MvPublishedBaseFact, MvPublishedLakeFacts,
         MvPublishedRefreshTechnique,
     };
-    use novarocks_spi::connector::{ConnectorInstanceId, ConnectorTableIdentity};
+    use novarocks_spi::connector::{
+        ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableObjectId,
+    };
     use novarocks_sql::planning::mv::ApplyKeySource;
     use std::sync::Arc;
+
+    fn object_id(value: &'static [u8]) -> ConnectorTableObjectId {
+        ConnectorTableObjectId::try_new(bytes::Bytes::from_static(value))
+            .expect("test object ID is bounded")
+    }
 
     fn sample_contract() -> MvSchemaContract {
         MvSchemaContract {
             contract_version: 1,
             base: BaseContract {
                 table_fqn: "ice.sales.orders".to_string(),
-                table_uuid: "uuid-orders".to_string(),
+                table_object_id: object_id(b"orders-object-id"),
                 alias_at_create: None,
                 schema_id_at_create: 1,
                 schema_at_create: BaseSchemaSnapshot {
@@ -442,7 +450,7 @@ mod tests {
                 MvPublishedRefreshTechnique::Incremental,
                 vec![MvPublishedBaseFact {
                     table_fqn: "ice.sales.orders".to_string(),
-                    table_uuid: "uuid-orders".to_string(),
+                    object_id: object_id(b"orders-object-id"),
                     from_snapshot: Some(100),
                     to_snapshot: 200,
                 }],
@@ -493,8 +501,10 @@ mod tests {
             Some(&200)
         );
         assert_eq!(
-            rebuilt.last_refresh_table_uuids.get("ice.sales.orders"),
-            Some(&"uuid-orders".to_string())
+            rebuilt
+                .last_refresh_table_object_ids
+                .get("ice.sales.orders"),
+            Some(&object_id(b"orders-object-id"))
         );
     }
 
@@ -505,7 +515,7 @@ mod tests {
         let rebuilt = rebuild_mv_definition_from_lake(&package).expect("rebuild succeeds");
 
         assert!(rebuilt.last_refresh_snapshots.is_empty());
-        assert!(rebuilt.last_refresh_table_uuids.is_empty());
+        assert!(rebuilt.last_refresh_table_object_ids.is_empty());
         // The create request is still fully valid even with no refresh history.
         assert_eq!(
             rebuilt.create_request.select_sql,

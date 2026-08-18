@@ -79,16 +79,22 @@ mod tests {
         HiddenApplyKeyContract, OutputColumnLineage, OutputContract, TargetContract,
         TargetVisibleColumn,
     };
+    use bytes::Bytes;
     use novarocks_sql::planning::mv::{
         MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME, SqlMvApplyKeySourceFacts,
     };
+
+    fn object_id(bytes: &[u8]) -> novarocks_spi::connector::ConnectorTableObjectId {
+        novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes))
+            .expect("valid opaque table object ID")
+    }
 
     fn minimal_base_row_id_contract() -> MvSchemaContract {
         MvSchemaContract {
             contract_version: 1,
             base: BaseContract {
                 table_fqn: "ice.db.orders".to_string(),
-                table_uuid: "base-uuid".to_string(),
+                table_object_id: object_id(&[0, 0xff, b'b', b'a', b's', b'e']),
                 alias_at_create: None,
                 schema_id_at_create: 1,
                 schema_at_create: BaseSchemaSnapshot {
@@ -162,7 +168,7 @@ mod tests {
     fn provenance_base(table_fqn: &str, to_snapshot: i64) -> MvPublishedBaseFact {
         MvPublishedBaseFact {
             table_fqn: table_fqn.to_string(),
-            table_uuid: format!("uuid-{table_fqn}"),
+            object_id: object_id(format!("opaque:{table_fqn}").as_bytes()),
             from_snapshot: None,
             to_snapshot,
         }

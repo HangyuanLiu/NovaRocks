@@ -20,6 +20,7 @@ use std::io::Cursor;
 
 use apache_avro::{from_avro_datum, from_value, to_avro_datum, to_value};
 use bytes::Bytes;
+use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_spi::state_store::{Key, Value};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -119,7 +120,7 @@ struct StoredMvDefinitionAvro {
     last_refresh_ms: Option<i64>,
     last_refresh_rows: Option<i64>,
     last_refresh_snapshots: BTreeMap<String, i64>,
-    last_refresh_table_uuids: BTreeMap<String, String>,
+    last_refresh_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     last_refreshed_iceberg_snapshot_id: Option<i64>,
     refresh_in_progress: bool,
     active_refresh_id: Option<i64>,
@@ -162,7 +163,7 @@ impl TryFrom<&StoredMvDefinition> for StoredMvDefinitionAvro {
             last_refresh_ms: value.last_refresh_ms,
             last_refresh_rows: value.last_refresh_rows,
             last_refresh_snapshots: value.last_refresh_snapshots.clone(),
-            last_refresh_table_uuids: value.last_refresh_table_uuids.clone(),
+            last_refresh_table_object_ids: value.last_refresh_table_object_ids.clone(),
             last_refreshed_iceberg_snapshot_id: value.last_refreshed_iceberg_snapshot_id,
             refresh_in_progress: value.refresh_in_progress,
             active_refresh_id: value.active_refresh_id,
@@ -207,7 +208,7 @@ impl TryFrom<StoredMvDefinitionAvro> for StoredMvDefinition {
             last_refresh_ms: value.last_refresh_ms,
             last_refresh_rows: value.last_refresh_rows,
             last_refresh_snapshots: value.last_refresh_snapshots,
-            last_refresh_table_uuids: value.last_refresh_table_uuids,
+            last_refresh_table_object_ids: value.last_refresh_table_object_ids,
             last_refreshed_iceberg_snapshot_id: value.last_refreshed_iceberg_snapshot_id,
             refresh_in_progress: value.refresh_in_progress,
             active_refresh_id: value.active_refresh_id,

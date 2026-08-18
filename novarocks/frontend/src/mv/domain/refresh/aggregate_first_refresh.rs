@@ -833,8 +833,8 @@ mod tests {
 
     fn branch_pin() -> RefreshSnapshotPin {
         RefreshSnapshotPin::from_entries_for_tests(&[
-            ("ice.sales.fact_a", 41, "a-uuid"),
-            ("ice.sales.fact_b", 42, "b-uuid"),
+            ("ice.sales.fact_a", 41, b"a-object"),
+            ("ice.sales.fact_b", 42, b"b-object"),
         ])
     }
 
@@ -843,7 +843,7 @@ mod tests {
         let select_sql = "select region, count(*) as c from ice.sales.fact group by region";
         let calls = parse_calls(select_sql);
         let pin =
-            RefreshSnapshotPin::from_entries_for_tests(&[("ice.sales.fact", 42, "fact-uuid")]);
+            RefreshSnapshotPin::from_entries_for_tests(&[("ice.sales.fact", 42, b"fact-object")]);
         let mut reads = 0;
         let mut read =
             |visible_sql: &str, actual_calls: &AggregateSqlCalls, query: sqlparser::ast::Query| {
@@ -884,7 +884,7 @@ mod tests {
         let select_sql = "select f.region, count(*) as c from ice.sales.fact f group by f.region";
         let calls = parse_calls(select_sql);
         let pin =
-            RefreshSnapshotPin::from_entries_for_tests(&[("ice.sales.fact", 42, "fact-uuid")]);
+            RefreshSnapshotPin::from_entries_for_tests(&[("ice.sales.fact", 42, b"fact-object")]);
 
         let chunks = prepare_aggregate_first_refresh_chunks(
             select_sql,
@@ -912,7 +912,7 @@ mod tests {
         let select_sql = "select region, count(*) as c from ice.sales.fact group by region";
         let calls = parse_calls(select_sql);
         let pin =
-            RefreshSnapshotPin::from_entries_for_tests(&[("ice.sales.fact", 42, "fact-uuid")]);
+            RefreshSnapshotPin::from_entries_for_tests(&[("ice.sales.fact", 42, b"fact-object")]);
         let mut result = Some(result);
         prepare_aggregate_first_refresh_chunks(
             select_sql,
@@ -986,7 +986,7 @@ mod tests {
         let select_sql = "select region, count(*) as c from ice.sales.fact group by region";
         let calls = parse_calls(select_sql);
         let pin =
-            RefreshSnapshotPin::from_entries_for_tests(&[("ice.sales.fact", 42, "fact-uuid")]);
+            RefreshSnapshotPin::from_entries_for_tests(&[("ice.sales.fact", 42, b"fact-object")]);
 
         let error = prepare_aggregate_first_refresh_chunks(
             select_sql,

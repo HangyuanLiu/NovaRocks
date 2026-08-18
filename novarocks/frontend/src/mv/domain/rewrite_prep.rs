@@ -73,7 +73,7 @@ fn freeze_mv_rewrite_definition(
         definition.target_namespace,
         definition.target_table,
         definition.last_refresh_snapshots,
-        definition.last_refresh_table_uuids,
+        definition.last_refresh_table_object_ids,
         base_table_states,
     )
 }
@@ -103,13 +103,31 @@ fn freeze_base_table_state(
         &table_ref.table,
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
     )?;
-    let schema_observation = crate::mv::domain::storage_observation::observe_schema_validation(
+    let _schema_observation = crate::mv::domain::storage_observation::observe_schema_validation(
         storage_observation,
         &exact_lease,
         &metadata,
         connector_context.clone(),
     )
     .map_err(|error| format!("observe MV rewrite storage facts for {fqn}: {error}"))?;
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&table_ref.catalog)
+        .map_err(|error| format!("parse rewrite base connector instance for {fqn}: {error}"))?;
+    let captured = exact_lease
+        .binding()
+        .metadata()
+        .capture_table_object_binding(
+            novarocks_spi::connector::ConnectorTableObjectCaptureRequest {
+                table: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id,
+                    namespace: Arc::from(table_ref.namespace.as_str()),
+                    table: Arc::from(table_ref.table.as_str()),
+                },
+                resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                selector: novarocks_spi::connector::ConnectorTableObjectSelector::Current,
+                context: connector_context.clone(),
+            },
+        )
+        .map_err(|error| format!("capture MV rewrite object ID for {fqn}: {error}"))?;
     let reference_facts = novarocks::connector::metadata_read_reference_facts_with_planning_lease(
         exact_lease,
         connector_context,
@@ -118,6 +136,6 @@ fn freeze_base_table_state(
     )?;
     Ok(SqlMvRewriteBaseTableFacts::resolved(
         reference_facts.current_snapshot_id(),
-        Some(schema_observation.table_uuid().to_string()),
+        Some(captured.object_id),
     ))
 }

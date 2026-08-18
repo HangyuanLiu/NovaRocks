@@ -249,14 +249,14 @@ mod tests {
     use super::*;
 
     fn pin() -> RefreshSnapshotPin {
-        RefreshSnapshotPin::from_entries_for_tests(&[("ice.db.fact", 42, "fact-uuid")])
+        RefreshSnapshotPin::from_entries_for_tests(&[("ice.db.fact", 42, b"fact-object")])
     }
 
     fn union_pin() -> RefreshSnapshotPin {
         RefreshSnapshotPin::from_entries_for_tests(&[
-            ("ice.db.a", 11, "a-uuid"),
-            ("ice.db.b", 22, "b-uuid"),
-            ("ice.db.c", 33, "c-uuid"),
+            ("ice.db.a", 11, b"a-object"),
+            ("ice.db.b", 22, b"b-object"),
+            ("ice.db.c", 33, b"c-object"),
         ])
     }
 

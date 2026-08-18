@@ -36,13 +36,14 @@ use crate::planner::payload::PlanScanNode;
 use crate::planner::table::{
     ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
 };
+use novarocks_spi::connector::ConnectorTableObjectId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImvSnapshotWindow {
     pub(crate) base_fqn: String,
     pub(crate) from_snapshot_id: i64,
     pub(crate) to_snapshot_id: i64,
-    pub(crate) table_uuid: String,
+    pub(crate) table_object_id: ConnectorTableObjectId,
 }
 
 pub(crate) struct BindIcebergScanRule;
@@ -207,12 +208,12 @@ fn resolve_snapshot_window(
             )
         })?;
     let to_snapshot_id = base.snapshot_id;
-    let pin_uuid = &base.table_uuid;
+    let pin_object_id = &base.table_object_id;
     Ok(ImvSnapshotWindow {
         base_fqn,
         from_snapshot_id,
         to_snapshot_id,
-        table_uuid: pin_uuid.clone(),
+        table_object_id: pin_object_id.clone(),
     })
 }
 
@@ -320,7 +321,7 @@ mod tests {
         assert_eq!(window.base_fqn, "ice.db.b");
         assert_eq!(window.from_snapshot_id, 11);
         assert_eq!(window.to_snapshot_id, 22);
-        assert_eq!(window.table_uuid, "uuid-b");
+        assert_eq!(window.table_object_id.as_bytes().as_ref(), b"object-b");
     }
 
     #[test]

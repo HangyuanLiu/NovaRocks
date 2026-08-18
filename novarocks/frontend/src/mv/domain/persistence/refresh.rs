@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 
+use novarocks_spi::connector::ConnectorTableObjectId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -62,7 +63,7 @@ pub struct StoredMvRefresh {
     #[serde(default)]
     pub target_snapshots: BTreeMap<String, i64>,
     #[serde(default)]
-    pub base_table_uuids: BTreeMap<String, String>,
+    pub base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     #[serde(default)]
     pub rows: Option<i64>,
     #[serde(default)]
@@ -201,7 +202,7 @@ pub enum FrontendMvRefreshRecoveryDisposition {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrontendMvRefreshRecoveryBaseFact {
     pub table: String,
-    pub uuid: String,
+    pub object_id: ConnectorTableObjectId,
     #[serde(default)]
     pub from_snapshot: Option<i64>,
     pub to_snapshot: i64,
@@ -489,7 +490,7 @@ pub struct RecordStagingCommitRequest {
     pub refresh_id: i64,
     pub staging_snapshot_id: i64,
     pub rows: i64,
-    pub base_table_uuids: BTreeMap<String, String>,
+    pub base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -503,7 +504,7 @@ pub struct MvRefreshFinalizeRequest {
     pub refresh_id: i64,
     pub rows: i64,
     pub base_snapshots: BTreeMap<String, i64>,
-    pub base_table_uuids: BTreeMap<String, String>,
+    pub base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     pub target_snapshot_id: Option<i64>,
     /// Exact provider-committed partition contract for an atomic repartition
     /// write. Ordinary refreshes leave this absent.
@@ -516,7 +517,7 @@ pub struct UpdateStarRocksMvRefreshSummaryRequest {
     pub last_refresh_ms: i64,
     pub last_refresh_rows: i64,
     pub base_snapshots: BTreeMap<String, i64>,
-    pub base_table_uuids: BTreeMap<String, String>,
+    pub base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
 }
 
 #[cfg(test)]

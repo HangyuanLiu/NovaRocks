@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableObjectId,
 };
 
 pub const MAX_MV_OBSERVATION_FIELDS: usize = 4_096;
@@ -345,7 +345,7 @@ pub struct MvPublishedRefreshObservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvPublishedBaseObservation {
     pub table_fqn: String,
-    pub table_uuid: String,
+    pub object_id: ConnectorTableObjectId,
     pub from_snapshot: Option<i64>,
     pub to_snapshot: i64,
 }
@@ -387,23 +387,23 @@ impl MvPublishedRefreshObservation {
             return exhausted("published MV lake facts exceed the base bound");
         }
         let mut names = HashSet::with_capacity(bases.len());
-        let mut uuids = HashSet::with_capacity(bases.len());
+        let mut object_ids = HashSet::with_capacity(bases.len());
         let mut used = token.len()
             + definition_fingerprint.len()
             + provenance_hash.len()
             + waterline_hash.len();
         for base in &bases {
             require_non_empty(&base.table_fqn, "published MV base table FQN")?;
-            require_non_empty(&base.table_uuid, "published MV base table UUID")?;
             if base.to_snapshot < 0 || base.from_snapshot.is_some_and(|id| id < 0) {
                 return corrupt("published MV lake facts have a negative base watermark");
             }
-            if !names.insert(base.table_fqn.as_str()) || !uuids.insert(base.table_uuid.as_str()) {
+            if !names.insert(base.table_fqn.as_str()) || !object_ids.insert(base.object_id.clone())
+            {
                 return corrupt("published MV lake facts have duplicate base identity");
             }
             reserve(
                 &mut used,
-                base.table_fqn.len() + base.table_uuid.len(),
+                base.table_fqn.len() + base.object_id.as_bytes().len(),
                 context,
                 "published MV lake facts",
             )?;
@@ -459,38 +459,38 @@ impl MvLakePackageObservation {
     }
 }
 
-/// UUID and current snapshot projected from one exact base metadata value.
+/// Opaque physical identity and current snapshot projected from one exact base
+/// metadata value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvRefreshBaseObservation {
     table: ConnectorTableIdentity,
-    table_uuid: String,
+    object_id: ConnectorTableObjectId,
     current_snapshot_id: Option<i64>,
 }
 
 impl MvRefreshBaseObservation {
     pub fn try_new(
         table: ConnectorTableIdentity,
-        table_uuid: String,
+        object_id: ConnectorTableObjectId,
         current_snapshot_id: Option<i64>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         validate_context(context)?;
         validate_table(&table, "MV refresh base")?;
-        require_non_empty(&table_uuid, "MV refresh base table UUID")?;
         if current_snapshot_id.is_some_and(|id| id < 0) {
             return corrupt("MV refresh base observation has a negative current snapshot ID");
         }
         Ok(Self {
             table,
-            table_uuid,
+            object_id,
             current_snapshot_id,
         })
     }
     pub const fn table(&self) -> &ConnectorTableIdentity {
         &self.table
     }
-    pub fn table_uuid(&self) -> &str {
-        &self.table_uuid
+    pub const fn object_id(&self) -> &ConnectorTableObjectId {
+        &self.object_id
     }
     pub const fn current_snapshot_id(&self) -> Option<i64> {
         self.current_snapshot_id

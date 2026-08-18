@@ -66,6 +66,7 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
 };
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorTableIdentity,
+    ConnectorTableObjectId,
 };
 use novarocks_sql::planning::mv::MvRefreshFinalizeFacts;
 use novarocks_sql::planning::mv::{SqlMvAggregateLayoutScope, extract_aggregate_sql_calls};
@@ -206,7 +207,7 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                 .observe_current_binding(&instance_id)
                 .map_err(|error| error.to_string())?,
         };
-        let base_table_uuids = plan
+        let base_table_object_ids = plan
             .contract
             .base_refs
             .iter()
@@ -217,7 +218,18 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                     base,
                     self.connector_context,
                 )
-                .map(|observed| (base.fqn(), observed.table_uuid().to_string()))
+                .and_then(|observed| {
+                    observed
+                        .table_object_id()
+                        .cloned()
+                        .map(|object_id| (base.fqn(), object_id))
+                        .ok_or_else(|| {
+                            format!(
+                                "MV refresh base observation has no captured table object ID for {}",
+                                base.fqn()
+                            )
+                        })
+                })
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let expected_target_snapshot_id = match &plan.contract.state_baseline {
@@ -236,7 +248,7 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                     self.current_database,
                     &plan.contract,
                     &request.attempt,
-                    &base_table_uuids,
+                    &base_table_object_ids,
                     observed_binding.clone(),
                     partition_spec_replacement.clone(),
                     retained_repartition_target.as_ref(),
@@ -275,7 +287,7 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                 })?,
                 target: plan.contract.target,
                 base_snapshots: plan.contract.snapshot_pins,
-                base_table_uuids,
+                base_table_object_ids,
                 expected_target_snapshot_id,
             },
             work,
@@ -542,7 +554,7 @@ fn prepare_frontend_first_refresh_write(
     current_database: &str,
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
-    base_table_uuids: &BTreeMap<String, String>,
+    base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
     observed_binding: ConnectorExecutionBindingKey,
     partition_spec_replacement: Option<
         novarocks_spi::connector::ConnectorManagedPartitionSpecReplacement,
@@ -590,7 +602,7 @@ fn prepare_frontend_first_refresh_write(
         attempt,
         definition.mv_id,
         &definition.select_sql,
-        base_table_uuids,
+        base_table_object_ids,
     )?;
     if let Some(replacement) = partition_spec_replacement.clone() {
         publication_intent = publication_intent.with_partition_spec_replacement(replacement);
@@ -659,17 +671,18 @@ fn prepare_frontend_first_refresh_write(
                     base,
                     &connector_context,
                 )?;
-                let uuid = observed.table_uuid().to_string();
-                let expected_uuid = base_table_uuids.get(&base.fqn()).ok_or_else(|| {
-                    format!("MV first-refresh has no UUID fact for {}", base.fqn())
-                })?;
-                if &uuid != expected_uuid {
+                let object_id = observed.object_id().clone();
+                let expected_object_id =
+                    base_table_object_ids.get(&base.fqn()).ok_or_else(|| {
+                        format!("MV first-refresh has no object-ID fact for {}", base.fqn())
+                    })?;
+                if &object_id != expected_object_id {
                     return Err(format!(
                         "MV first-refresh base table identity changed after planning for {}",
                         base.fqn()
                     ));
                 }
-                Ok::<_, String>((base.clone(), snapshot_id, uuid))
+                Ok::<_, String>((base.clone(), snapshot_id, object_id))
             })
             .collect::<Result<Vec<_>, _>>()?,
     );
@@ -687,7 +700,7 @@ fn prepare_frontend_first_refresh_write(
     if schema_contract.join.is_some() && !capabilities.has_agg_state {
         let RefreshStateBaseline::SnapshotBacked {
             previous_snapshot_ids,
-            previous_table_uuids,
+            previous_table_object_ids,
             target_table_uuid,
             ..
         } = &contract.state_baseline
@@ -706,7 +719,7 @@ fn prepare_frontend_first_refresh_write(
             Arc::from(contract.base_refs.clone()),
             Arc::new(pin.clone()),
             previous_snapshot_ids.clone(),
-            previous_table_uuids.clone(),
+            previous_table_object_ids.clone(),
             expected_target_snapshot_id,
             target_table_uuid.clone(),
             retained_repartition_target.map(|retained| &retained.binding),
@@ -755,7 +768,7 @@ fn prepare_frontend_first_refresh_write(
     }
     let sql_pin = novarocks_sql::planning::mv::first_refresh::SqlMvSnapshotPin::try_from_maps(
         pin.to_snapshot_map(),
-        pin.to_table_uuid_map(),
+        pin.to_table_object_id_map(),
     )?;
     let shape = if capabilities.has_agg_state {
         // A branch UNION ALL has no top-level GROUP BY. Its aggregate-state
@@ -883,7 +896,7 @@ fn frontend_refresh_publication_intent(
     attempt: &MvRefreshAttemptIdentity,
     mv_id: i64,
     select_sql: &str,
-    base_table_uuids: &BTreeMap<String, String>,
+    base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
 ) -> Result<MvRefreshPublicationIntent, String> {
     let snapshots = contract
         .snapshot_pins
@@ -907,7 +920,7 @@ fn frontend_refresh_publication_intent(
         attempt.marker_token.clone(),
         MvRefreshPublicationTechnique::Full,
         &snapshots,
-        base_table_uuids,
+        base_table_object_ids,
         &previous_snapshots,
         mv_definition_fingerprint(select_sql),
         contract
@@ -928,7 +941,7 @@ fn mv_refresh_publication_intent(
     marker_token: String,
     technique: MvRefreshPublicationTechnique,
     snapshots: &BTreeMap<String, i64>,
-    base_table_uuids: &BTreeMap<String, String>,
+    base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
     previous_snapshots: &BTreeMap<String, i64>,
     definition_fingerprint: String,
     target_catalog: String,
@@ -941,9 +954,12 @@ fn mv_refresh_publication_intent(
         .map(|(table_fqn, to_snapshot)| {
             MvRefreshPublicationBase::try_new(
                 table_fqn.clone(),
-                base_table_uuids.get(table_fqn).cloned().ok_or_else(|| {
-                    format!("MV refresh publication has no UUID fact for {table_fqn}")
-                })?,
+                base_table_object_ids
+                    .get(table_fqn)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("MV refresh publication has no object-ID fact for {table_fqn}")
+                    })?,
                 previous_snapshots.get(table_fqn).copied(),
                 *to_snapshot,
             )
@@ -1007,7 +1023,7 @@ fn prepare_frontend_incremental_write(
     };
     let RefreshStateBaseline::SnapshotBacked {
         previous_snapshot_ids,
-        previous_table_uuids,
+        previous_table_object_ids,
         target_snapshot_id,
         target_table_uuid,
         definition_fingerprint,
@@ -1038,7 +1054,13 @@ fn prepare_frontend_incremental_write(
                     base,
                     &connector_context,
                 )?;
-                Ok::<_, String>((base.clone(), snapshot_id, observed.table_uuid().to_string()))
+                let object_id = observed.table_object_id().cloned().ok_or_else(|| {
+                    format!(
+                        "MV incremental refresh observation has no captured table object ID for {}",
+                        base.fqn()
+                    )
+                })?;
+                Ok::<_, String>((base.clone(), snapshot_id, object_id))
             })
             .collect::<Result<Vec<_>, _>>()?,
     );
@@ -1068,7 +1090,7 @@ fn prepare_frontend_incremental_write(
         Arc::from(contract.base_refs.clone()),
         Arc::new(pin),
         previous_snapshot_ids.clone(),
-        previous_table_uuids.clone(),
+        previous_table_object_ids.clone(),
         *target_snapshot_id,
         target_table_uuid.clone(),
         None,
@@ -1145,7 +1167,7 @@ fn prepare_frontend_incremental_write(
                 current_database,
                 contract,
                 attempt,
-                &rewrite.pin.to_table_uuid_map(),
+                &rewrite.pin.to_table_object_id_map(),
                 observed_binding,
                 None,
                 None,
@@ -1195,7 +1217,7 @@ fn prepare_frontend_incremental_write(
             attempt.marker_token.clone(),
             MvRefreshPublicationTechnique::Incremental,
             &rewrite.pin.to_snapshot_map(),
-            &rewrite.pin.to_table_uuid_map(),
+            &rewrite.pin.to_table_object_id_map(),
             &rewrite.previous_snapshot_ids,
             definition_fingerprint.clone(),
             target.catalog.clone(),
@@ -1265,9 +1287,9 @@ fn prepare_frontend_incremental_write(
                     base.fqn()
                 )
             })?;
-            let current_table_uuid = rewrite.pin.uuid(base).ok_or_else(|| {
+            let current_table_object_id = rewrite.pin.object_id(base).ok_or_else(|| {
                 format!(
-                    "MV incremental refresh is missing pinned UUID for {}",
+                    "MV incremental refresh is missing pinned object ID for {}",
                     base.fqn()
                 )
             })?;
@@ -1277,7 +1299,7 @@ fn prepare_frontend_incremental_write(
                 base,
                 &connector_context,
             )?;
-            if observed.table_uuid() != current_table_uuid {
+            if observed.table_object_id() != Some(current_table_object_id) {
                 return Err(format!(
                     "MV incremental refresh base table identity changed after planning for {}",
                     base.fqn()
@@ -1295,7 +1317,7 @@ fn prepare_frontend_incremental_write(
                 base,
                 previous_snapshot_id,
                 current_snapshot_id,
-                current_table_uuid.to_string(),
+                current_table_object_id.clone(),
                 admission,
             ))
         })
@@ -1307,14 +1329,14 @@ fn prepare_frontend_incremental_write(
                 base_ref,
                 previous_snapshot_id,
                 current_snapshot_id,
-                current_table_uuid,
+                current_table_object_id,
                 admission,
             )| {
                 NonJoinBaseChange {
                     base_ref,
                     previous_snapshot_id: *previous_snapshot_id,
                     current_snapshot_id: *current_snapshot_id,
-                    current_table_uuid,
+                    current_table_object_id,
                     admission: admission.clone(),
                 }
             },
@@ -1335,7 +1357,7 @@ fn prepare_frontend_incremental_write(
                 current_database,
                 contract,
                 attempt,
-                &rewrite.pin.to_table_uuid_map(),
+                &rewrite.pin.to_table_object_id_map(),
                 observed_binding,
                 None,
                 None,
@@ -1377,7 +1399,7 @@ fn prepare_frontend_incremental_write(
         attempt.marker_token.clone(),
         MvRefreshPublicationTechnique::Incremental,
         &rewrite.pin.to_snapshot_map(),
-        &rewrite.pin.to_table_uuid_map(),
+        &rewrite.pin.to_table_object_id_map(),
         &rewrite.previous_snapshot_ids,
         definition_fingerprint.clone(),
         target.catalog.clone(),

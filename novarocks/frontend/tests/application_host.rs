@@ -20,7 +20,7 @@ use novarocks::maintenance::MaintenanceTarget;
 use novarocks_frontend::dml::{DmlErrorKind, DmlOperationId};
 use novarocks_frontend::query_execution::maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
-    TableMaintenanceEngine,
+    MaintenanceTargetRebind, TableMaintenanceEngine,
 };
 use novarocks_frontend::view::repository::database_key;
 use novarocks_frontend::view::{
@@ -87,6 +87,21 @@ impl TableMaintenanceEngine for SessionMaintenanceEngine {
         _context: MaintenanceRequestContext<'_>,
     ) -> Result<MaintenanceTarget, String> {
         unreachable!("ordinary SQL must not resolve a maintenance target")
+    }
+
+    fn capture_target_object_id(
+        &self,
+        _target: &MaintenanceTarget,
+    ) -> Result<novarocks_spi::connector::ConnectorTableObjectId, String> {
+        unreachable!("ordinary SQL must not capture a maintenance target")
+    }
+
+    fn rebind_target_object(
+        &self,
+        _target: &MaintenanceTarget,
+        _expected_object_id: &novarocks_spi::connector::ConnectorTableObjectId,
+    ) -> Result<MaintenanceTargetRebind, String> {
+        unreachable!("ordinary SQL must not rebind a maintenance target")
     }
 
     fn reject_user_action_on_mv(&self, _target: &MaintenanceTarget) -> Result<(), String> {

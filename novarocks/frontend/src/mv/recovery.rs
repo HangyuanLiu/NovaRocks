@@ -424,7 +424,7 @@ fn finalize_legacy_published(
         refresh_id: refresh.refresh_id,
         rows,
         base_snapshots: refresh.target_snapshots.clone(),
-        base_table_uuids: refresh.base_table_uuids.clone(),
+        base_table_object_ids: refresh.base_table_object_ids.clone(),
         target_snapshot_id: Some(snapshot),
         partition_spec: None,
     };
@@ -599,7 +599,7 @@ fn finalize_published(
                 refresh_id: refresh.refresh_id,
                 rows,
                 base_snapshots: refresh.target_snapshots.clone(),
-                base_table_uuids: refresh.base_table_uuids.clone(),
+                base_table_object_ids: refresh.base_table_object_ids.clone(),
                 target_snapshot_id: Some(committed_snapshot_id),
                 partition_spec,
             },
@@ -744,15 +744,14 @@ fn descriptor_from_refresh(
         .target_snapshots
         .iter()
         .filter_map(|(table, to_version)| {
-            refresh
-                .base_table_uuids
-                .get(table)
-                .map(|uuid| ConnectorStagedPublicationBaseFact {
+            refresh.base_table_object_ids.get(table).map(|object_id| {
+                ConnectorStagedPublicationBaseFact {
                     table: Arc::from(table.as_str()),
-                    uuid: Arc::from(uuid.as_str()),
+                    object_id: object_id.clone(),
                     from_version: None,
                     to_version: *to_version,
-                })
+                }
+            })
         })
         .collect();
     ConnectorStagedPublicationDescriptor::try_new(
@@ -823,15 +822,14 @@ fn legacy_descriptor(
         .target_snapshots
         .iter()
         .filter_map(|(table, to_version)| {
-            refresh
-                .base_table_uuids
-                .get(table)
-                .map(|uuid| ConnectorStagedPublicationBaseFact {
+            refresh.base_table_object_ids.get(table).map(|object_id| {
+                ConnectorStagedPublicationBaseFact {
                     table: Arc::from(table.as_str()),
-                    uuid: Arc::from(uuid.as_str()),
+                    object_id: object_id.clone(),
                     from_version: None,
                     to_version: *to_version,
-                })
+                }
+            })
         })
         .collect();
     ConnectorStagedPublicationDescriptor::try_new(
@@ -911,7 +909,7 @@ fn frontend_observation(
             .iter()
             .map(|base| FrontendMvRefreshRecoveryBaseFact {
                 table: base.table.to_string(),
-                uuid: base.uuid.to_string(),
+                object_id: base.object_id.clone(),
                 from_snapshot: base.from_version,
                 to_snapshot: base.to_version,
             })
@@ -984,7 +982,7 @@ mod tests {
         ConnectorManagedPartitionTransform, ConnectorMutationFailure, ConnectorMutationFailureKind,
         ConnectorProviderId, ConnectorStagedPublicationCleanupReceipt,
         ConnectorStagedPublicationProof, ConnectorStagedPublicationRecovery,
-        ExternalMutationEffect, ExternalMutationEvidence,
+        ConnectorTableObjectId, ExternalMutationEffect, ExternalMutationEvidence,
     };
     use novarocks_spi::state_store::FeDeploymentView;
     use novarocks_sql::planning::mv::ApplyKeySource;
@@ -1068,9 +1066,10 @@ mod tests {
                     staging_branch: format!("__nova_mv_{table}"),
                     expected_main_snapshot_id: Some(7),
                     base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
-                    base_table_uuids: BTreeMap::from([(
+                    base_table_object_ids: BTreeMap::from([(
                         "ice.sales.orders".to_string(),
-                        "orders-uuid".to_string(),
+                        ConnectorTableObjectId::try_new(Bytes::from_static(b"orders-object"))
+                            .expect("bounded object ID"),
                     )]),
                     marker_token: format!("marker-{table}"),
                     prepare_external_actions: true,
@@ -1367,7 +1366,10 @@ mod tests {
             contract_version: 1,
             base: BaseContract {
                 table_fqn: "ice.sales.orders".to_string(),
-                table_uuid: "11111111-1111-1111-1111-111111111111".to_string(),
+                table_object_id: ConnectorTableObjectId::try_new(Bytes::from_static(
+                    b"orders-object-1",
+                ))
+                .expect("valid test object ID"),
                 alias_at_create: Some("orders".to_string()),
                 schema_id_at_create: 7,
                 schema_at_create: BaseSchemaSnapshot {
@@ -1458,7 +1460,8 @@ mod tests {
             published.then_some(2),
             vec![ConnectorStagedPublicationBaseFact {
                 table: "ice.sales.orders".into(),
-                uuid: "orders-uuid".into(),
+                object_id: ConnectorTableObjectId::try_new(Bytes::from_static(b"orders-object"))
+                    .expect("bounded object ID"),
                 from_version: Some(9),
                 to_version: 9,
             }],
@@ -1482,7 +1485,8 @@ mod tests {
             Some(2),
             vec![ConnectorStagedPublicationBaseFact {
                 table: "ice.sales.orders".into(),
-                uuid: "orders-uuid".into(),
+                object_id: ConnectorTableObjectId::try_new(Bytes::from_static(b"orders-object"))
+                    .expect("bounded object ID"),
                 from_version: Some(9),
                 to_version: 9,
             }],

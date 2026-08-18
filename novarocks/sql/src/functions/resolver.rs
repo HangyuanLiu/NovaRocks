@@ -415,7 +415,21 @@ mod tests {
     }
 
     #[test]
-    fn resolve_join_row_key_returns_utf8() {
+    fn resolve_join_row_key_accepts_binary_object_ids_and_returns_utf8() {
+        let r = resolve_scalar_function(
+            "join_row_key",
+            &[
+                DataType::Binary,
+                DataType::Int64,
+                DataType::LargeBinary,
+                DataType::Int64,
+            ],
+        );
+        assert_eq!(r, Ok(DataType::Utf8));
+    }
+
+    #[test]
+    fn resolve_join_row_key_rejects_utf8_object_id_salts() {
         let r = resolve_scalar_function(
             "join_row_key",
             &[
@@ -425,7 +439,7 @@ mod tests {
                 DataType::Int64,
             ],
         );
-        assert_eq!(r, Ok(DataType::Utf8));
+        assert!(r.is_err());
     }
 
     #[test]

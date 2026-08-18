@@ -30,7 +30,9 @@ use novarocks_frontend::mv::repository::{
     BeginFrontendMvRefreshIntentRequest, FenceValidator, MvRefreshFenceSource,
     StateStoreMvRepository,
 };
-use novarocks_spi::connector::{ConnectorMvRefreshResourceIdentity, ConnectorProviderId};
+use novarocks_spi::connector::{
+    ConnectorMvRefreshResourceIdentity, ConnectorProviderId, ConnectorTableObjectId,
+};
 use novarocks_spi::state_store::FeDeploymentView;
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
@@ -40,6 +42,10 @@ use sha2::{Digest, Sha256};
 
 #[path = "mv_repository_definition.rs"]
 mod definition_support;
+
+fn object_id(bytes: &[u8]) -> ConnectorTableObjectId {
+    ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes)).expect("bounded object ID")
+}
 
 fn repository() -> (
     tempfile::TempDir,
@@ -198,9 +204,9 @@ fn frontend_recovery_upgrades_v3_and_finalizes_published_truth_atomically() {
             staging_branch: "__nova_mv_recovery".to_string(),
             expected_main_snapshot_id: Some(7),
             base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
-            base_table_uuids: BTreeMap::from([(
+            base_table_object_ids: BTreeMap::from([(
                 "ice.sales.orders".to_string(),
-                "orders-uuid".to_string(),
+                object_id(b"orders-object"),
             )]),
             marker_token: "marker".to_string(),
             prepare_external_actions: true,
@@ -208,8 +214,8 @@ fn frontend_recovery_upgrades_v3_and_finalizes_published_truth_atomically() {
         })
         .expect("persist frontend v3 intent");
     assert_eq!(
-        refresh.base_table_uuids,
-        BTreeMap::from([("ice.sales.orders".to_string(), "orders-uuid".to_string(),)]),
+        refresh.base_table_object_ids,
+        BTreeMap::from([("ice.sales.orders".to_string(), object_id(b"orders-object"),)]),
         "frontend refresh intent must durably retain the exact base table identity",
     );
     let cleanup_operation_id = refresh
@@ -240,7 +246,7 @@ fn frontend_recovery_upgrades_v3_and_finalizes_published_truth_atomically() {
         resulting_row_count: Some(2),
         bases: vec![FrontendMvRefreshRecoveryBaseFact {
             table: "ice.sales.orders".to_string(),
-            uuid: "orders-uuid".to_string(),
+            object_id: object_id(b"orders-object"),
             from_snapshot: Some(9),
             to_snapshot: 9,
         }],
@@ -293,9 +299,9 @@ fn frontend_recovery_upgrades_v3_and_finalizes_published_truth_atomically() {
                 refresh_id: refresh.refresh_id,
                 rows: 2,
                 base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
-                base_table_uuids: BTreeMap::from([(
+                base_table_object_ids: BTreeMap::from([(
                     "ice.sales.orders".to_string(),
-                    "orders-uuid".to_string(),
+                    object_id(b"orders-object"),
                 )]),
                 target_snapshot_id: Some(42),
                 partition_spec: None,
@@ -319,8 +325,8 @@ fn frontend_recovery_upgrades_v3_and_finalizes_published_truth_atomically() {
     assert_eq!(definition.active_refresh_id, None);
     assert_eq!(definition.last_refresh_rows, Some(2));
     assert_eq!(
-        definition.last_refresh_table_uuids,
-        BTreeMap::from([("ice.sales.orders".to_string(), "orders-uuid".to_string(),)]),
+        definition.last_refresh_table_object_ids,
+        BTreeMap::from([("ice.sales.orders".to_string(), object_id(b"orders-object"),)]),
         "recovery finalize must preserve the identity frozen by the refresh intent",
     );
     assert_eq!(definition.last_refreshed_iceberg_snapshot_id, Some(42));
@@ -375,9 +381,9 @@ fn frontend_refresh_v3_is_single_journal_and_isolated_from_legacy_recovery() {
             staging_branch: "__nova_mv_1".to_string(),
             expected_main_snapshot_id: Some(7),
             base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
-            base_table_uuids: BTreeMap::from([(
+            base_table_object_ids: BTreeMap::from([(
                 "ice.sales.orders".to_string(),
-                "orders-uuid".to_string(),
+                object_id(b"orders-object"),
             )]),
             marker_token: "marker".to_string(),
             prepare_external_actions: true,
@@ -525,9 +531,9 @@ fn frontend_refresh_rejects_mismatched_base_snapshot_and_uuid_keys() {
             staging_branch: "__nova_mv_3".to_string(),
             expected_main_snapshot_id: Some(7),
             base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
-            base_table_uuids: BTreeMap::from([(
+            base_table_object_ids: BTreeMap::from([(
                 "ice.sales.customers".to_string(),
-                "customers-uuid".to_string(),
+                object_id(b"customers-object"),
             )]),
             marker_token: "marker".to_string(),
             prepare_external_actions: true,
@@ -556,9 +562,9 @@ fn frontend_noop_refresh_persists_no_synthetic_external_actions() {
             staging_branch: "__nova_mv_2".to_string(),
             expected_main_snapshot_id: Some(7),
             base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
-            base_table_uuids: BTreeMap::from([(
+            base_table_object_ids: BTreeMap::from([(
                 "ice.sales.orders".to_string(),
-                "orders-uuid".to_string(),
+                object_id(b"orders-object"),
             )]),
             marker_token: "marker".to_string(),
             prepare_external_actions: false,
@@ -579,9 +585,9 @@ fn frontend_noop_refresh_persists_no_synthetic_external_actions() {
             refresh_id: refresh.refresh_id,
             rows: 0,
             base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
-            base_table_uuids: BTreeMap::from([(
+            base_table_object_ids: BTreeMap::from([(
                 "ice.sales.orders".to_string(),
-                "uuid".to_string(),
+                object_id(b"object"),
             )]),
             target_snapshot_id: Some(7),
             partition_spec: None,
@@ -621,9 +627,9 @@ fn refresh_lifecycle_persists_transitions_and_finalizes_definition() {
             refresh_id: refresh.refresh_id,
             staging_snapshot_id: 43,
             rows: 7,
-            base_table_uuids: BTreeMap::from([(
+            base_table_object_ids: BTreeMap::from([(
                 "ice.sales.orders".to_string(),
-                "uuid-1".to_string(),
+                object_id(b"object-1"),
             )]),
         })
         .expect("record staging commit");
@@ -638,9 +644,9 @@ fn refresh_lifecycle_persists_transitions_and_finalizes_definition() {
             refresh_id: refresh.refresh_id,
             rows: 7,
             base_snapshots: base_snapshots.clone(),
-            base_table_uuids: BTreeMap::from([(
+            base_table_object_ids: BTreeMap::from([(
                 "ice.sales.orders".to_string(),
-                "uuid-1".to_string(),
+                object_id(b"object-1"),
             )]),
             target_snapshot_id: Some(44),
             partition_spec: None,
@@ -716,7 +722,7 @@ fn list_refreshes_pages_and_includes_finalized_and_aborted_records() {
             refresh_id: finalized.refresh_id,
             staging_snapshot_id: 1,
             rows: 1,
-            base_table_uuids: BTreeMap::new(),
+            base_table_object_ids: BTreeMap::new(),
         })
         .expect("stage refresh");
     repository
@@ -730,7 +736,7 @@ fn list_refreshes_pages_and_includes_finalized_and_aborted_records() {
             refresh_id: finalized.refresh_id,
             rows: 1,
             base_snapshots: BTreeMap::new(),
-            base_table_uuids: BTreeMap::new(),
+            base_table_object_ids: BTreeMap::new(),
             target_snapshot_id: Some(1),
             partition_spec: None,
         })
@@ -780,7 +786,7 @@ fn refresh_commands_return_not_found_for_missing_definition_and_refresh() {
                 refresh_id: 99,
                 staging_snapshot_id: 1,
                 rows: 1,
-                base_table_uuids: BTreeMap::new(),
+                base_table_object_ids: BTreeMap::new(),
             })
             .expect_err("missing refresh")
             .kind(),
@@ -805,7 +811,7 @@ fn dropping_a_finalized_mv_removes_refresh_and_partition_records_before_reopen()
             refresh_id: refresh.refresh_id,
             staging_snapshot_id: 1,
             rows: 1,
-            base_table_uuids: BTreeMap::new(),
+            base_table_object_ids: BTreeMap::new(),
         })
         .expect("stage refresh");
     repository
@@ -819,7 +825,7 @@ fn dropping_a_finalized_mv_removes_refresh_and_partition_records_before_reopen()
             refresh_id: refresh.refresh_id,
             rows: 1,
             base_snapshots: BTreeMap::new(),
-            base_table_uuids: BTreeMap::new(),
+            base_table_object_ids: BTreeMap::new(),
             target_snapshot_id: Some(2),
             partition_spec: None,
         })
@@ -894,7 +900,7 @@ fn dropping_paged_mv_records_removes_all_dependencies_and_refresh_history() {
                 refresh_id: refresh.refresh_id,
                 staging_snapshot_id: snapshot_id,
                 rows: snapshot_id,
-                base_table_uuids: BTreeMap::new(),
+                base_table_object_ids: BTreeMap::new(),
             })
             .expect("stage refresh");
         repository
@@ -908,7 +914,7 @@ fn dropping_paged_mv_records_removes_all_dependencies_and_refresh_history() {
                 refresh_id: refresh.refresh_id,
                 rows: snapshot_id,
                 base_snapshots: BTreeMap::new(),
-                base_table_uuids: BTreeMap::new(),
+                base_table_object_ids: BTreeMap::new(),
                 target_snapshot_id: Some(snapshot_id),
                 partition_spec: None,
             })
@@ -991,7 +997,7 @@ fn finalize_with_partitions_returns_not_found_for_missing_partition_mv() {
                 refresh_id: refresh.refresh_id,
                 rows: 1,
                 base_snapshots: BTreeMap::new(),
-                base_table_uuids: BTreeMap::new(),
+                base_table_object_ids: BTreeMap::new(),
                 target_snapshot_id: Some(1),
                 partition_spec: None,
             },
@@ -1094,9 +1100,9 @@ fn fence_intent_request(mv_id: i64) -> BeginFrontendMvRefreshIntentRequest {
         staging_branch: "__nova_mv_fenced".to_string(),
         expected_main_snapshot_id: Some(7),
         base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
-        base_table_uuids: BTreeMap::from([(
+        base_table_object_ids: BTreeMap::from([(
             "ice.sales.orders".to_string(),
-            "orders-uuid".to_string(),
+            object_id(b"orders-object"),
         )]),
         marker_token: "marker".to_string(),
         prepare_external_actions: true,

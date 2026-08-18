@@ -374,11 +374,16 @@ mod tests {
             HiddenApplyKeyContract, MvSchemaContract, OutputColumnLineage, OutputContract,
             TargetContract, TargetVisibleColumn,
         };
+        use bytes::Bytes;
+        use novarocks_spi::connector::ConnectorTableObjectId;
         let contract = MvSchemaContract {
             contract_version: 1,
             base: BaseContract {
                 table_fqn: "ice.ns.orders".to_string(),
-                table_uuid: "u".to_string(),
+                table_object_id: ConnectorTableObjectId::try_new(Bytes::from_static(&[
+                    0, 0xff, b'u',
+                ]))
+                .expect("valid opaque table object ID"),
                 alias_at_create: None,
                 schema_id_at_create: 0,
                 schema_at_create: BaseSchemaSnapshot {

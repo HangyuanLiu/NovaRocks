@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::{
     ConnectorCommittedPartitioning, ConnectorCommittedVersion, ConnectorExecutionBindingKey,
-    ConnectorManagedPartitionSpecReplacement, ConnectorTableHandle, ConnectorWriteCohortId,
-    ConnectorWriteOperationId, ConnectorWriteReceipt,
+    ConnectorManagedPartitionSpecReplacement, ConnectorTableHandle, ConnectorTableObjectId,
+    ConnectorWriteCohortId, ConnectorWriteOperationId, ConnectorWriteReceipt,
 };
 
 use novarocks_sql::planning::mv::MV_JOIN_APPLY_KEY_COLUMN_NAME;
@@ -46,7 +46,7 @@ pub enum MvRefreshPublicationTechnique {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvRefreshPublicationBase {
     table_fqn: String,
-    table_uuid: String,
+    table_object_id: ConnectorTableObjectId,
     from_snapshot: Option<i64>,
     to_snapshot: i64,
 }
@@ -54,12 +54,11 @@ pub struct MvRefreshPublicationBase {
 impl MvRefreshPublicationBase {
     pub(crate) fn try_new(
         table_fqn: String,
-        table_uuid: String,
+        table_object_id: ConnectorTableObjectId,
         from_snapshot: Option<i64>,
         to_snapshot: i64,
     ) -> Result<Self, String> {
         if table_fqn.is_empty()
-            || table_uuid.is_empty()
             || from_snapshot.is_some_and(|snapshot| snapshot < 0)
             || to_snapshot < 0
         {
@@ -67,7 +66,7 @@ impl MvRefreshPublicationBase {
         }
         Ok(Self {
             table_fqn,
-            table_uuid,
+            table_object_id,
             from_snapshot,
             to_snapshot,
         })
@@ -77,8 +76,8 @@ impl MvRefreshPublicationBase {
         &self.table_fqn
     }
 
-    pub(crate) fn table_uuid(&self) -> &str {
-        &self.table_uuid
+    pub(crate) fn table_object_id(&self) -> &ConnectorTableObjectId {
+        &self.table_object_id
     }
 
     pub(crate) const fn from_snapshot(&self) -> Option<i64> {
@@ -135,10 +134,10 @@ impl MvRefreshPublicationIntent {
             return Err("invalid MV refresh publication intent".to_string());
         }
         let mut table_fqns = std::collections::BTreeSet::new();
-        let mut table_uuids = std::collections::BTreeSet::new();
+        let mut table_object_ids = std::collections::HashSet::new();
         if bases.iter().any(|base| {
             !table_fqns.insert(base.table_fqn.as_str())
-                || !table_uuids.insert(base.table_uuid.as_str())
+                || !table_object_ids.insert(base.table_object_id.clone())
         }) {
             return Err("MV refresh publication intent has duplicate base identity".to_string());
         }
@@ -290,7 +289,7 @@ pub(crate) struct MvFirstRefreshLogicalContext {
     pub(crate) base_refs: Vec<novarocks_catalog::identifier::TableIdentity>,
     pub(crate) pin: SqlMvSnapshotPin,
     pub(crate) previous_snapshot_ids: BTreeMap<String, i64>,
-    pub(crate) previous_table_uuids: BTreeMap<String, String>,
+    pub(crate) previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     pub(crate) target_table_uuid: String,
     pub(crate) affected_partitions: crate::mv::domain::model::AffectedTargetPartitions,
     /// Base-table materializations admitted while the first-refresh artifact
@@ -670,7 +669,8 @@ mod incremental_tests {
     fn publication_intent_rejects_duplicate_base_identity() {
         let base = MvRefreshPublicationBase::try_new(
             "ice.db.base".to_string(),
-            "uuid-1".to_string(),
+            ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"base-object-1"))
+                .expect("valid test object ID"),
             None,
             7,
         )

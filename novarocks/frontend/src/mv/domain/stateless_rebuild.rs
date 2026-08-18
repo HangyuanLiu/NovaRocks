@@ -420,7 +420,13 @@ mod tests {
     use crate::mv::domain::storage_observation::{
         MvLakePublication, MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
     };
+    use bytes::Bytes;
     use novarocks_sql::syntax::parse_call_procedure_sql;
+
+    fn object_id(bytes: &[u8]) -> novarocks_spi::connector::ConnectorTableObjectId {
+        novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes))
+            .expect("valid opaque table object ID")
+    }
 
     #[test]
     fn guard_rejects_when_flag_absent() {
@@ -445,7 +451,7 @@ mod tests {
                 MvPublishedRefreshTechnique::Full,
                 vec![MvPublishedBaseFact {
                     table_fqn: "ice.sales.orders".to_string(),
-                    table_uuid: "uuid-orders".to_string(),
+                    object_id: object_id(&[0, 0xff, b'o', b'r', b'd', b'e', b'r', b's']),
                     from_snapshot: None,
                     to_snapshot: 200,
                 }],

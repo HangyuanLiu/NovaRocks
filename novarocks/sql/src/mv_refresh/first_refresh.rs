@@ -1305,8 +1305,8 @@ fn build_join_first_refresh_append_logical_plan(
         crate::planner::imv_rewrite::join_refresh_builder::build_join_apply_key_append_project(
             input,
             &descriptor,
-            &left.table_uuid,
-            &right.table_uuid,
+            &left.table_object_id,
+            &right.table_object_id,
             join_apply_key_id.0,
         )
         .map_err(|error| format!("build join first-refresh append projection: {error}"))?;

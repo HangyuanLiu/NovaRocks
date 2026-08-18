@@ -31,6 +31,7 @@ use crate::mv::domain::persistence::schema as mv_schema;
 use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
 use mv_schema::MvSchemaContract;
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::compiler::{
     SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
@@ -72,7 +73,7 @@ pub struct IcebergMvRewriteContext {
     pub base_refs: Arc<[TableIdentity]>,
     pub pin: Arc<RefreshSnapshotPin>,
     pub previous_snapshot_ids: BTreeMap<String, i64>,
-    pub previous_table_uuids: BTreeMap<String, String>,
+    pub previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
 
     // ---- Target table inputs (extracted from target_table.metadata()) ----
     pub target_snapshot_id: Option<i64>,
@@ -130,7 +131,7 @@ impl IcebergMvRewriteContext {
         base_refs: Arc<[TableIdentity]>,
         pin: Arc<RefreshSnapshotPin>,
         previous_snapshot_ids: BTreeMap<String, i64>,
-        previous_table_uuids: BTreeMap<String, String>,
+        previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
         target_snapshot_id: Option<i64>,
         target_table_uuid: String,
         target_arrow_schema: SchemaRef,
@@ -158,9 +159,9 @@ impl IcebergMvRewriteContext {
         }
 
         for base_ref in base_refs.iter() {
-            if pin.uuid(base_ref).is_none() {
+            if pin.object_id(base_ref).is_none() {
                 return Err(err(format!(
-                    "refresh pin missing uuid for base {}",
+                    "refresh pin missing object ID for base {}",
                     base_ref.fqn()
                 )));
             }
@@ -168,12 +169,11 @@ impl IcebergMvRewriteContext {
 
         for base_ref in base_refs.iter() {
             let fqn = base_ref.fqn();
-            if let Some(previous_uuid) = previous_table_uuids.get(&fqn) {
-                let current_uuid = pin
-                    .uuid(base_ref)
-                    .expect("uuid presence verified above")
-                    .to_string();
-                if previous_uuid != &current_uuid {
+            if let Some(previous_object_id) = previous_table_object_ids.get(&fqn) {
+                let current_object_id = pin
+                    .object_id(base_ref)
+                    .expect("object ID presence verified above");
+                if previous_object_id != current_object_id {
                     return Err(err(format!(
                         "base table identity changed for {fqn}; incremental refresh unsafe, rebuild the MV"
                     )));
@@ -233,7 +233,7 @@ impl IcebergMvRewriteContext {
             base_refs,
             pin,
             previous_snapshot_ids,
-            previous_table_uuids,
+            previous_table_object_ids,
             target_snapshot_id,
             target_table_uuid,
             target_arrow_schema,
@@ -262,7 +262,7 @@ impl IcebergMvRewriteContext {
         schema_contract: Option<Arc<MvSchemaContract>>,
     ) -> Result<Self, String> {
         let previous_snapshot_ids = mv_definition.last_refresh_snapshots.clone();
-        let previous_table_uuids = mv_definition.last_refresh_table_uuids.clone();
+        let previous_table_object_ids = mv_definition.last_refresh_table_object_ids.clone();
         Self::from_parts(
             target,
             mv_id,
@@ -273,7 +273,7 @@ impl IcebergMvRewriteContext {
             base_refs,
             pin,
             previous_snapshot_ids,
-            previous_table_uuids,
+            previous_table_object_ids,
             target_snapshot_id,
             target_table_uuid,
             target_arrow_schema,
@@ -393,16 +393,16 @@ impl IcebergMvRewriteContext {
                     table.fqn()
                 )
             })?;
-            let table_uuid = self.pin.uuid(table).ok_or_else(|| {
+            let table_object_id = self.pin.object_id(table).ok_or_else(|| {
                 format!(
-                    "IMV rewrite snapshot missing pinned table UUID for base {}",
+                    "IMV rewrite snapshot missing pinned table object ID for base {}",
                     table.fqn()
                 )
             })?;
             builder.add_base_snapshot(SqlImvBaseSnapshotFacts::try_new(
                 table.clone(),
                 snapshot_id,
-                table_uuid.to_string(),
+                table_object_id.clone(),
             )?)?;
         }
         builder.set_target_columns(SqlImvTargetColumnsFacts::try_new(sql_target_columns(
@@ -410,7 +410,7 @@ impl IcebergMvRewriteContext {
         ))?)?;
         builder.set_refresh_history(SqlImvRefreshHistoryFacts::try_new(
             self.previous_snapshot_ids.clone(),
-            self.previous_table_uuids.clone(),
+            self.previous_table_object_ids.clone(),
             self.target_snapshot_id,
             self.target_table_uuid.clone(),
         )?)?;
@@ -961,7 +961,28 @@ pub(crate) mod tests_support {
     }
 
     pub(crate) fn make_pin(entries: &[(&str, i64, &str)]) -> RefreshSnapshotPin {
-        RefreshSnapshotPin::from_entries_for_tests(entries)
+        let entries = entries
+            .iter()
+            .map(|(fqn, snapshot_id, object_id)| {
+                let object_id = object_id.strip_prefix("uuid-").map_or_else(
+                    || (*object_id).to_string(),
+                    |suffix| format!("object-{suffix}"),
+                );
+                (*fqn, *snapshot_id, object_id.into_bytes())
+            })
+            .collect::<Vec<_>>();
+        let entries = entries
+            .iter()
+            .map(|(fqn, snapshot_id, object_id)| (*fqn, *snapshot_id, object_id.as_slice()))
+            .collect::<Vec<_>>();
+        RefreshSnapshotPin::from_entries_for_tests(&entries)
+    }
+
+    pub(crate) fn object_id(value: &str) -> novarocks_spi::connector::ConnectorTableObjectId {
+        novarocks_spi::connector::ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(
+            value.as_bytes(),
+        ))
+        .expect("test object ID")
     }
 
     /// Neutral target-schema fixture: the Arrow types plus the positionally
@@ -981,7 +1002,7 @@ pub(crate) mod tests_support {
             contract_version: 3,
             base: BaseContract {
                 table_fqn: "ice.db.b".to_string(),
-                table_uuid: "uuid-b".to_string(),
+                table_object_id: object_id("object-b"),
                 alias_at_create: None,
                 schema_id_at_create: 0,
                 schema_at_create: BaseSchemaSnapshot {
@@ -1068,7 +1089,7 @@ pub(crate) mod tests_support {
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots: [("ice.db.b".to_string(), 11i64)].into_iter().collect(),
-            last_refresh_table_uuids: [("ice.db.b".to_string(), "uuid-b".to_string())]
+            last_refresh_table_object_ids: [("ice.db.b".to_string(), object_id("object-b"))]
                 .into_iter()
                 .collect(),
             last_refreshed_iceberg_snapshot_id: Some(99),
@@ -1142,9 +1163,9 @@ pub(crate) mod tests_support {
         ]
         .into_iter()
         .collect();
-        mv_def.last_refresh_table_uuids = [
-            ("ice.db.l".to_string(), "uuid-l".to_string()),
-            ("ice.db.r".to_string(), "uuid-r".to_string()),
+        mv_def.last_refresh_table_object_ids = [
+            ("ice.db.l".to_string(), object_id("object-l")),
+            ("ice.db.r".to_string(), object_id("object-r")),
         ]
         .into_iter()
         .collect();
@@ -1210,10 +1231,10 @@ pub(crate) mod tests_support {
         )
     }
 
-    fn join_base_contract(table_fqn: &str, table_uuid: &str, alias: &str) -> BaseContract {
+    fn join_base_contract(table_fqn: &str, object_id_value: &str, alias: &str) -> BaseContract {
         BaseContract {
             table_fqn: table_fqn.to_string(),
-            table_uuid: table_uuid.to_string(),
+            table_object_id: object_id(object_id_value),
             alias_at_create: Some(alias.to_string()),
             schema_id_at_create: 7,
             schema_at_create: BaseSchemaSnapshot {
@@ -1304,8 +1325,10 @@ mod tests {
         assert!(Arc::ptr_eq(&ctx.pin, &pin));
         assert_eq!(ctx.previous_snapshot_ids.get("ice.db.b"), Some(&11));
         assert_eq!(
-            ctx.previous_table_uuids.get("ice.db.b").map(String::as_str),
-            Some("uuid-b")
+            ctx.previous_table_object_ids
+                .get("ice.db.b")
+                .map(|id| id.as_bytes().as_ref()),
+            Some(b"object-b".as_ref())
         );
         assert_eq!(ctx.target_snapshot_id, Some(99));
         assert_eq!(ctx.target_table_uuid, "uuid-tgt");
@@ -1475,9 +1498,9 @@ mod tests {
             Arc::clone(&field_ids),
             Some(contract),
         )
-        .expect_err("missing pin uuid must fail");
+        .expect_err("missing pin object ID must fail");
         assert!(
-            err.contains("refresh pin missing uuid for base"),
+            err.contains("refresh pin missing object ID for base"),
             "got: {err}"
         );
     }
@@ -1486,8 +1509,8 @@ mod tests {
     fn from_parts_rejects_base_identity_drift() {
         let target = make_target();
         let mut def = make_mv_definition();
-        def.last_refresh_table_uuids
-            .insert("ice.db.b".to_string(), "uuid-OLD".to_string());
+        def.last_refresh_table_object_ids
+            .insert("ice.db.b".to_string(), object_id("object-old"));
         let mv_def = Arc::new(def);
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
         let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
@@ -1519,7 +1542,7 @@ mod tests {
         let target = make_target();
         let mut def = make_mv_definition();
         def.last_refresh_snapshots.clear();
-        def.last_refresh_table_uuids.clear();
+        def.last_refresh_table_object_ids.clear();
         let mv_def = Arc::new(def);
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
         let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
@@ -1544,7 +1567,7 @@ mod tests {
         )
         .expect("first refresh must succeed");
         assert!(ctx.previous_snapshot_ids.is_empty());
-        assert!(ctx.previous_table_uuids.is_empty());
+        assert!(ctx.previous_table_object_ids.is_empty());
     }
 
     #[test]
@@ -1638,16 +1661,16 @@ mod tests {
         def_for_three_bases
             .last_refresh_snapshots
             .insert("ice.db.b".to_string(), 11);
-        def_for_three_bases.last_refresh_table_uuids.clear();
+        def_for_three_bases.last_refresh_table_object_ids.clear();
         def_for_three_bases
-            .last_refresh_table_uuids
-            .insert("ice.db.b".to_string(), "uuid-b".to_string());
+            .last_refresh_table_object_ids
+            .insert("ice.db.b".to_string(), object_id("object-b"));
         def_for_three_bases
-            .last_refresh_table_uuids
-            .insert("ice.db.a".to_string(), "uuid-a".to_string());
+            .last_refresh_table_object_ids
+            .insert("ice.db.a".to_string(), object_id("object-a"));
         def_for_three_bases
-            .last_refresh_table_uuids
-            .insert("ice.db.c".to_string(), "uuid-c".to_string());
+            .last_refresh_table_object_ids
+            .insert("ice.db.c".to_string(), object_id("object-c"));
         let mv_def = Arc::new(def_for_three_bases);
         let contract = Arc::new(make_schema_contract());
 

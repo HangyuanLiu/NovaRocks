@@ -25,8 +25,8 @@ use bytes::Bytes;
 use novarocks::maintenance::MaintenanceTarget;
 use novarocks_frontend::query_execution::maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
-    MaintenanceStatementResult, OptimizeSubmission, TableMaintenanceEngine,
-    TableMaintenanceService,
+    MaintenanceStatementResult, MaintenanceTargetRebind, OptimizeSubmission,
+    TableMaintenanceEngine, TableMaintenanceService,
 };
 use novarocks_frontend::table_maintenance::FrontendTableMaintenanceService;
 use novarocks_frontend::table_maintenance::coordination::{
@@ -46,7 +46,7 @@ use novarocks_spi::connector::{
     ConnectorInstanceIncarnation, ConnectorMetadataMaintenanceOperation,
     ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanSummary,
     ConnectorMetadataMaintenancePlanningRequest, ConnectorMutationOperationId,
-    ConnectorRequestContext, ConnectorTableHandle,
+    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableObjectId,
 };
 use novarocks_spi::state_store::{FeDeploymentView, StateStore};
 use novarocks_state_store::OperationId;
@@ -65,6 +65,16 @@ struct FakeMaintenanceEngine {
     guarded_targets: Mutex<Vec<MaintenanceTarget>>,
     requests: Mutex<Vec<MaintenanceActionRequest>>,
     recovered_plans: Mutex<Vec<ConnectorMetadataMaintenancePlan>>,
+    target_rebind: Mutex<FakeTargetRebind>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum FakeTargetRebind {
+    #[default]
+    Bound,
+    Replaced,
+    Missing,
+    Unsupported,
 }
 
 struct NotCancelled;
@@ -91,6 +101,10 @@ impl FakeMaintenanceEngine {
     fn recovered_plans(&self) -> Vec<ConnectorMetadataMaintenancePlan> {
         self.recovered_plans.lock().unwrap().clone()
     }
+
+    fn set_target_rebind(&self, rebind: FakeTargetRebind) {
+        *self.target_rebind.lock().unwrap() = rebind;
+    }
 }
 
 impl TableMaintenanceEngine for FakeMaintenanceEngine {
@@ -112,6 +126,29 @@ impl TableMaintenanceEngine for FakeMaintenanceEngine {
                 "unsupported table name with {} parts",
                 name_parts.len()
             )),
+        }
+    }
+
+    fn capture_target_object_id(
+        &self,
+        _target: &MaintenanceTarget,
+    ) -> Result<ConnectorTableObjectId, String> {
+        ConnectorTableObjectId::try_new(Bytes::from_static(b"fake-maintenance-target"))
+            .map_err(|error| error.to_string())
+    }
+
+    fn rebind_target_object(
+        &self,
+        _target: &MaintenanceTarget,
+        _expected_object_id: &ConnectorTableObjectId,
+    ) -> Result<MaintenanceTargetRebind, String> {
+        match *self.target_rebind.lock().unwrap() {
+            FakeTargetRebind::Bound => Ok(MaintenanceTargetRebind::Bound),
+            FakeTargetRebind::Replaced => Ok(MaintenanceTargetRebind::Replaced),
+            FakeTargetRebind::Missing => Ok(MaintenanceTargetRebind::Missing),
+            FakeTargetRebind::Unsupported => {
+                Err("fake provider does not support target rebinding".to_string())
+            }
         }
     }
 
@@ -565,6 +602,10 @@ async fn startup_reconciles_only_the_persisted_exact_generation() {
         .create(MetadataMaintenanceOperationCreate {
             operation_id: durable_id,
             target: target("ice", "db", "orders"),
+            object_id: ConnectorTableObjectId::try_new(Bytes::from_static(
+                b"fake-maintenance-target",
+            ))
+            .unwrap(),
             owner: MetadataMaintenanceExactOwner {
                 instance_id: owner.instance_id.as_str().to_string(),
                 incarnation_id: uuid::Uuid::from_bytes(owner.incarnation.to_bytes()),
@@ -779,6 +820,30 @@ async fn automatic_calls_reject_actions_without_a_durable_route_and_deduplicate_
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn optimize_submission_captures_the_opaque_target_object_id_before_durable_create() {
+    let (_temp, _host, store, service) = durable_service().await;
+    let repository = OptimizeJobRepository::open(Arc::clone(&store))
+        .await
+        .expect("open optimize repository");
+    let engine = FakeMaintenanceEngine::default();
+
+    assert_eq!(
+        service
+            .submit_automatic_optimize(&engine, target("ice", "db", "orders"))
+            .expect("submit optimize"),
+        OptimizeSubmission::Submitted { job_id: 1 }
+    );
+
+    let job = repository
+        .list()
+        .await
+        .expect("list durable optimize jobs")
+        .pop()
+        .expect("one durable optimize job");
+    assert_eq!(job.object_id, b"fake-maintenance-target");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sqlx2_automatic_mv_expire_requires_the_durable_metadata_owner_without_user_mv_guard() {
     let service = FrontendTableMaintenanceService::open(None, tokio::runtime::Handle::current())
         .await
@@ -877,4 +942,39 @@ async fn user_duplicate_optimize_remains_a_compatible_string_error() {
     assert!(error.starts_with("ALTER TABLE OPTIMIZE: create iceberg optimize job failed:"));
     assert!(error.contains("ice.db.orders"));
     assert!(error.contains("active job"));
+}
+
+#[test]
+fn fake_engine_exposes_configurable_target_rebind_outcomes() {
+    let engine = FakeMaintenanceEngine::default();
+    let target = target("ice", "db", "orders");
+    let object_id = engine
+        .capture_target_object_id(&target)
+        .expect("capture test object id");
+
+    assert_eq!(
+        engine
+            .rebind_target_object(&target, &object_id)
+            .expect("bound result"),
+        MaintenanceTargetRebind::Bound
+    );
+
+    engine.set_target_rebind(FakeTargetRebind::Replaced);
+    assert_eq!(
+        engine
+            .rebind_target_object(&target, &object_id)
+            .expect("replacement result"),
+        MaintenanceTargetRebind::Replaced
+    );
+
+    engine.set_target_rebind(FakeTargetRebind::Missing);
+    assert_eq!(
+        engine
+            .rebind_target_object(&target, &object_id)
+            .expect("missing result"),
+        MaintenanceTargetRebind::Missing
+    );
+
+    engine.set_target_rebind(FakeTargetRebind::Unsupported);
+    assert!(engine.rebind_target_object(&target, &object_id).is_err());
 }

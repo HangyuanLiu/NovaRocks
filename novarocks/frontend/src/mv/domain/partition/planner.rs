@@ -98,18 +98,24 @@ mod tests {
         MvObservedTargetField, MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
         MvSchemaValidationPartitionField, MvSchemaValidationPartitionTransform,
     };
+    use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorChangePartition, ConnectorChangePartitionField, ConnectorChangePartitionTransform,
         ConnectorChangePartitionValue, ConnectorChangeWindowPartitionImpact,
     };
     use novarocks_sql::planning::mv::ApplyKeySource;
 
+    fn object_id(bytes: &[u8]) -> novarocks_spi::connector::ConnectorTableObjectId {
+        novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes))
+            .expect("valid opaque table object ID")
+    }
+
     fn contract_with_identity_partition() -> MvSchemaContract {
         MvSchemaContract {
             contract_version: 1,
             base: BaseContract {
                 table_fqn: "ice.sales.orders".to_string(),
-                table_uuid: "base-uuid".to_string(),
+                table_object_id: object_id(&[0, 0xff, b'b', b'a', b's', b'e']),
                 alias_at_create: None,
                 schema_id_at_create: 0,
                 schema_at_create: BaseSchemaSnapshot {
@@ -188,6 +194,7 @@ mod tests {
             ),
         )
         .expect("schema observation")
+        .with_table_object_id(object_id(&[0, 0xff, b'b', b'a', b's', b'e']))
     }
 
     fn partition(value: &str) -> ConnectorChangePartition {

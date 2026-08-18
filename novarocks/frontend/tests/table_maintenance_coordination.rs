@@ -38,6 +38,7 @@ use novarocks_frontend::table_maintenance::model::{CleanupOperationCreate, Optim
 use novarocks_frontend::table_maintenance::repository::{
     CleanupOperationRepository, OptimizeJobRepository, RepositoryErrorKind, cleanup_payload_digest,
 };
+use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_spi::state_store::{FeDeploymentView, StateStore};
 use novarocks_state_store::coordination::{
     ClockHealth, CoordinationError, IncarnationGate, LeaseClock, LeaseManager, LeaseSettings,
@@ -180,6 +181,10 @@ fn target(table: &str) -> MaintenanceTarget {
     }
 }
 
+fn object_id() -> ConnectorTableObjectId {
+    ConnectorTableObjectId::try_new(Bytes::from_static(b"test-object-id")).unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_one_frontend_holds_dispatch_authority_for_a_table() {
     let temp = TempDir::new().expect("temporary directory");
@@ -237,6 +242,7 @@ async fn a_taken_over_attempt_cannot_write_back_optimize_state() {
         .create_admitted(
             OptimizeJobCreate {
                 target: orders.clone(),
+                object_id: object_id(),
                 base_snapshot_id: 10,
                 created_at_ms: 100,
             },
@@ -359,6 +365,7 @@ async fn a_lost_lease_cannot_prepare_another_destructive_cleanup_batch() {
             CleanupOperationCreate {
                 operation_id,
                 target: orphans.clone(),
+                object_id: object_id(),
                 owner:
                     novarocks_frontend::table_maintenance::model::MetadataMaintenanceExactOwner {
                         instance_id: "ice".to_string(),

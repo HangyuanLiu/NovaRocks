@@ -2059,7 +2059,7 @@ fn build_non_branch_contract_core(
                     observed_base(base_field_observations, base_ref)?,
                     None,
                     base_fields,
-                )],
+                )?],
                 output,
                 join: None,
                 aggregate: None,
@@ -2310,7 +2310,7 @@ fn build_aggregate_contract_core(
         let bases = base_refs
             .iter()
             .map(|base_ref| {
-                Ok(base_contract(
+                base_contract(
                     base_ref,
                     observed_base(base_field_observations, base_ref)?,
                     None,
@@ -2318,7 +2318,7 @@ fn build_aggregate_contract_core(
                         base_field_observations,
                         base_ref,
                     )?),
-                ))
+                )
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(NonBranchContractCore {
@@ -2349,7 +2349,7 @@ fn build_aggregate_contract_core(
         let bases = base_refs
             .iter()
             .map(|base_ref| {
-                Ok(base_contract(
+                base_contract(
                     base_ref,
                     observed_base(base_field_observations, base_ref)?,
                     None,
@@ -2357,7 +2357,7 @@ fn build_aggregate_contract_core(
                         base_field_observations,
                         base_ref,
                     )?),
-                ))
+                )
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(NonBranchContractCore {
@@ -2391,7 +2391,7 @@ fn build_aggregate_contract_core(
                 observed_base(base_field_observations, base_ref)?,
                 None,
                 base_fields,
-            )],
+            )?],
             output,
             join: None,
             aggregate: Some(aggregate_contract(&layout, target_observation)?),
@@ -2447,13 +2447,13 @@ fn build_join_base_contracts_and_lineage(
         observed_base(base_field_observations, left_ref)?,
         Some(join_aliases.left_alias.clone()),
         persist_sql_mv_base_fields(join_lineage.left_base_fields()),
-    );
+    )?;
     let right_contract = base_contract(
         right_ref,
         observed_base(base_field_observations, right_ref)?,
         Some(join_aliases.right_alias.clone()),
         persist_sql_mv_base_fields(join_lineage.right_base_fields()),
-    );
+    )?;
     let output = persist_sql_mv_output_contract(join_lineage.output());
     let join = persist_sql_mv_join_contract(&join_lineage);
     Ok((left_contract, right_contract, output, join))
@@ -2486,7 +2486,7 @@ fn build_branch_union_schema_contract(
     let all_bases = base_refs
         .iter()
         .map(|base_ref| {
-            Ok(base_contract(
+            base_contract(
                 base_ref,
                 observed_base(base_field_observations, base_ref)?,
                 None,
@@ -2494,7 +2494,7 @@ fn build_branch_union_schema_contract(
                     base_field_observations,
                     base_ref,
                 )?),
-            ))
+            )
         })
         .collect::<Result<Vec<_>, String>>()?;
     if all_bases.is_empty() {
@@ -2754,14 +2754,20 @@ fn base_contract(
     observation: &crate::mv::domain::storage_observation::MvSchemaValidationObservation,
     alias_at_create: Option<String>,
     fields: Vec<mv_schema::BaseFieldRecord>,
-) -> mv_schema::BaseContract {
-    mv_schema::BaseContract {
+) -> Result<mv_schema::BaseContract, String> {
+    let table_object_id = observation.table_object_id().cloned().ok_or_else(|| {
+        format!(
+            "MV schema observation for {} is missing its captured table object ID",
+            base_ref.fqn()
+        )
+    })?;
+    Ok(mv_schema::BaseContract {
         table_fqn: base_ref.fqn(),
-        table_uuid: observation.table_uuid().to_string(),
+        table_object_id,
         alias_at_create,
         schema_id_at_create: observation.schema_id(),
         schema_at_create: mv_schema::BaseSchemaSnapshot { fields },
-    }
+    })
 }
 
 fn base_fields_from_observation(
@@ -3213,7 +3219,10 @@ mod tests {
     fn test_base_contract(table_fqn: &str) -> mv_schema::BaseContract {
         mv_schema::BaseContract {
             table_fqn: table_fqn.to_string(),
-            table_uuid: format!("{table_fqn}-uuid"),
+            table_object_id: novarocks_spi::connector::ConnectorTableObjectId::try_new(
+                bytes::Bytes::copy_from_slice(table_fqn.as_bytes()),
+            )
+            .expect("test object ID is bounded"),
             alias_at_create: None,
             schema_id_at_create: 1,
             schema_at_create: mv_schema::BaseSchemaSnapshot { fields: Vec::new() },
@@ -3820,7 +3829,7 @@ fn build_refresh_state_baseline(
 ) -> Result<RefreshStateBaseline, String> {
     Ok(RefreshStateBaseline::SnapshotBacked {
         previous_snapshot_ids: mv_definition.last_refresh_snapshots.clone(),
-        previous_table_uuids: mv_definition.last_refresh_table_uuids.clone(),
+        previous_table_object_ids: mv_definition.last_refresh_table_object_ids.clone(),
         target_snapshot_id: target.current_snapshot_id(),
         target_table_uuid: target.table_uuid().to_string(),
         definition_fingerprint: refresh_execution_definition_fingerprint(
@@ -4300,6 +4309,7 @@ fn plan_iceberg_union_projection_mv_refresh(
     .map_err(RefreshError::user)?;
 
     let mut current_snapshots = BTreeMap::new();
+    let mut current_table_object_ids = BTreeMap::new();
     let mut snapshot_pins = BTreeMap::new();
     for base_ref in base_refs {
         let refresh = observe_current_refresh_base(
@@ -4329,25 +4339,26 @@ fn plan_iceberg_union_projection_mv_refresh(
         let fqn = base_ref.fqn();
         snapshot_pins.insert(fqn.clone(), current);
         current_snapshots.insert(fqn.clone(), current);
+        current_table_object_ids.insert(fqn, refresh.object_id().clone());
     }
 
     let previous_snapshots = &mv_definition.last_refresh_snapshots;
-    let previous_table_uuids = &mv_definition.last_refresh_table_uuids;
+    let previous_table_object_ids = &mv_definition.last_refresh_table_object_ids;
     let has_previous_snapshots = base_refs
         .iter()
         .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
-    let has_previous_table_uuids = base_refs
+    let has_previous_table_object_ids = base_refs
         .iter()
-        .any(|base_ref| previous_table_uuids.contains_key(&base_ref.fqn()));
-    let has_previous = has_previous_snapshots || has_previous_table_uuids;
+        .any(|base_ref| previous_table_object_ids.contains_key(&base_ref.fqn()));
+    let has_previous = has_previous_snapshots || has_previous_table_object_ids;
     let all_previous_snapshots = base_refs
         .iter()
         .all(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
-    let all_previous_table_uuids = base_refs
+    let all_previous_table_object_ids = base_refs
         .iter()
-        .all(|base_ref| previous_table_uuids.contains_key(&base_ref.fqn()));
+        .all(|base_ref| previous_table_object_ids.contains_key(&base_ref.fqn()));
 
-    if has_previous && (!all_previous_snapshots || !all_previous_table_uuids) {
+    if has_previous && (!all_previous_snapshots || !all_previous_table_object_ids) {
         return Err(RefreshError::user(format!(
             "iceberg UNION ALL projection/filter MV {}.{}.{} has partial previous refresh metadata; recreate the MV",
             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
@@ -4369,17 +4380,13 @@ fn plan_iceberg_union_projection_mv_refresh(
     if has_previous {
         for base_ref in base_refs {
             let fqn = base_ref.fqn();
-            if let Some(previous_uuid) = previous_table_uuids.get(&fqn) {
-                let current_uuid = observe_schema_validation_for_table(
-                    source.connector_control(),
-                    source.storage_observation(),
-                    base_ref,
-                    connector_context,
-                )
-                .map_err(RefreshError::user)?
-                .table_uuid()
-                .to_string();
-                if previous_uuid != &current_uuid {
+            if let Some(previous_object_id) = previous_table_object_ids.get(&fqn) {
+                let current_object_id = current_table_object_ids.get(&fqn).ok_or_else(|| {
+                    RefreshError::user(format!(
+                        "refresh observation missing object ID for base {fqn} (this should not happen)"
+                    ))
+                })?;
+                if previous_object_id != current_object_id {
                     return Err(RefreshError::user(format!(
                         "iceberg MV base table identity changed for {fqn}; incremental refresh is unsafe, rebuild or recreate the MV"
                     )));
@@ -5106,13 +5113,13 @@ fn optional_snapshot_map(pin: &RefreshSnapshotPin) -> BTreeMap<String, Option<i6
         .collect()
 }
 
-fn validate_refresh_pin_table_uuids_against_baseline(
+fn validate_refresh_pin_table_object_ids_against_baseline(
     baseline: &RefreshStateBaseline,
     pin: &RefreshSnapshotPin,
     base_refs: &[TableIdentity],
 ) -> Result<(), String> {
     let RefreshStateBaseline::SnapshotBacked {
-        previous_table_uuids,
+        previous_table_object_ids,
         ..
     } = baseline
     else {
@@ -5121,16 +5128,16 @@ fn validate_refresh_pin_table_uuids_against_baseline(
         );
     };
     for base_ref in base_refs {
-        let Some(previous_uuid) = previous_table_uuids.get(&base_ref.fqn()) else {
+        let Some(previous_object_id) = previous_table_object_ids.get(&base_ref.fqn()) else {
             continue;
         };
-        let current_uuid = pin.uuid(base_ref).ok_or_else(|| {
+        let current_object_id = pin.object_id(base_ref).ok_or_else(|| {
             format!(
-                "refresh pin missing uuid for base {} (this should not happen)",
+                "refresh pin missing object ID for base {} (this should not happen)",
                 base_ref.fqn()
             )
         })?;
-        if previous_uuid != current_uuid {
+        if previous_object_id != current_object_id {
             return Err(format!(
                 "iceberg MV base table identity changed for {}; incremental refresh is unsafe, rebuild or recreate the MV",
                 base_ref.fqn(),
@@ -5369,7 +5376,10 @@ mod partition_planning_tests {
             contract_version: 1,
             base: BaseContract {
                 table_fqn: "ice.db.left".to_string(),
-                table_uuid: "base-uuid".to_string(),
+                table_object_id: novarocks_spi::connector::ConnectorTableObjectId::try_new(
+                    bytes::Bytes::from_static(b"base-object-id"),
+                )
+                .expect("test object ID is bounded"),
                 alias_at_create: None,
                 schema_id_at_create: 0,
                 schema_at_create: BaseSchemaSnapshot {

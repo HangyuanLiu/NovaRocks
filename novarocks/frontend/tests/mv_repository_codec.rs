@@ -20,6 +20,7 @@ use novarocks_frontend::mv::repository::key::{
     MvKeyKind, decode_key, definition_by_id_key, dependency_by_downstream_key,
     dependency_by_upstream_key, partition_by_mv_key, sequence_key, target_lookup_key,
 };
+use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_spi::state_store::{Key, Value};
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -28,6 +29,10 @@ fn sha256_bytes(payload: &[u8]) -> Vec<u8> {
     use sha2::{Digest, Sha256};
 
     Sha256::digest(payload).to_vec()
+}
+
+fn object_id(bytes: &[u8]) -> ConnectorTableObjectId {
+    ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes)).expect("bounded object ID")
 }
 
 fn upstream() -> MvDependencyObjectRef {
@@ -212,31 +217,33 @@ fn envelope_rejects_version_kind_fingerprint_and_payload_length_corruption() {
 }
 
 #[test]
-fn mv_catalog_validates_all_historical_schemas_transitively() {
+fn mv_catalog_exposes_only_the_current_incompatible_base_identity_schemas() {
     let catalog = schema_catalog().expect("MV-only schema catalog");
     catalog.validate_unique_entries().expect("unique entries");
     catalog
         .validate_full_transitive()
-        .expect("full transitive compatibility");
+        .expect("current catalog is internally compatible");
     assert_eq!(
         catalog
             .latest("mv.definition")
             .expect("definition schema")
             .id(),
-        2
+        3
     );
     assert_eq!(
         catalog.latest("mv.refresh").expect("refresh schema").id(),
-        4
+        5
     );
     assert_eq!(
         catalog.latest("mv.sequence").expect("sequence schema").id(),
         2
     );
+    assert!(catalog.entry("mv.definition", 2).is_err());
+    assert!(catalog.entry("mv.refresh", 4).is_err());
 }
 
 #[test]
-fn refresh_v4_round_trips_frontend_owned_opaque_ledger_and_recovery() {
+fn refresh_v5_round_trips_frontend_owned_opaque_ledger_recovery_and_binary_base_identity() {
     let request_id = Uuid::now_v7().into_bytes().to_vec();
     let staging_create_operation_id = Uuid::now_v7().into_bytes().to_vec();
     let write_operation_id = Uuid::now_v7().into_bytes().to_vec();
@@ -257,7 +264,10 @@ fn refresh_v4_round_trips_frontend_owned_opaque_ledger_and_recovery() {
         staging_snapshot_id: None,
         published_snapshot_id: None,
         target_snapshots: BTreeMap::new(),
-        base_table_uuids: BTreeMap::new(),
+        base_table_object_ids: BTreeMap::from([(
+            "ice.sales.orders".to_string(),
+            object_id(b"\x00orders\xff"),
+        )]),
         rows: None,
         marker: None,
         external_outcome: None,
@@ -335,9 +345,9 @@ fn refresh_v4_round_trips_frontend_owned_opaque_ledger_and_recovery() {
     ))
     .expect("refresh key");
     let encoded =
-        encode_record(MvRecordKind::Refresh, Uuid::now_v7(), &refresh).expect("encode v3 refresh");
+        encode_record(MvRecordKind::Refresh, Uuid::now_v7(), &refresh).expect("encode v5 refresh");
     let decoded: DecodedMvRecord<StoredMvRefresh> =
-        decode_record(&key, &encoded).expect("decode v3 refresh");
+        decode_record(&key, &encoded).expect("decode v5 refresh");
     assert_eq!(decoded.value, refresh);
 }
 
@@ -358,7 +368,10 @@ fn definition_uses_frontend_private_avro_projection() {
         last_refresh_ms: None,
         last_refresh_rows: None,
         last_refresh_snapshots: BTreeMap::new(),
-        last_refresh_table_uuids: BTreeMap::new(),
+        last_refresh_table_object_ids: BTreeMap::from([(
+            "ice.sales.orders".to_string(),
+            object_id(b"\x00orders\xff"),
+        )]),
         last_refreshed_iceberg_snapshot_id: None,
         refresh_in_progress: false,
         active_refresh_id: None,
@@ -377,4 +390,9 @@ fn definition_uses_frontend_private_avro_projection() {
     let decoded = decode_definition(&key, &encoded).expect("decode definition");
     assert_eq!(decoded.operation_id, operation_id);
     assert_eq!(decoded.value, definition);
+
+    let mut legacy_schema = encoded.as_bytes().to_vec();
+    legacy_schema[6..10].copy_from_slice(&2_i32.to_be_bytes());
+    let legacy_schema = Value::try_from(Bytes::from(legacy_schema)).expect("bounded value");
+    assert!(decode_definition(&key, &legacy_schema).is_err());
 }

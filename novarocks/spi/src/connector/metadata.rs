@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, SchemaRef};
 use bytes::Bytes;
+use serde::de::{SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -94,6 +96,7 @@ pub const MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES: usize = 256;
 /// catalog lookup, this value answers whether a lookup still denotes the same
 /// physical object across versions. Core and frontend may compare and persist
 /// it, but must not parse or rewrite its bytes.
+// Design: ADR-0085 (docs/adr/ADR-0085-durable-base-object-identities-remain-opaque.md)
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct ConnectorTableObjectId(Bytes);
 
@@ -127,6 +130,60 @@ impl fmt::Debug for ConnectorTableObjectId {
             .field("len", &self.0.len())
             .field("digest", &digest)
             .finish()
+    }
+}
+
+impl Serialize for ConnectorTableObjectId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(self.as_bytes())
+    }
+}
+
+impl<'de> Deserialize<'de> for ConnectorTableObjectId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ObjectIdVisitor;
+
+        impl<'de> Visitor<'de> for ObjectIdVisitor {
+            type Value = ConnectorTableObjectId;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bounded connector table object ID byte sequence")
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                ConnectorTableObjectId::try_new(Bytes::copy_from_slice(value)).map_err(E::custom)
+            }
+
+            fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                ConnectorTableObjectId::try_new(Bytes::from(value)).map_err(E::custom)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut value = Vec::new();
+                while let Some(byte) = sequence.next_element()? {
+                    value.push(byte);
+                }
+                ConnectorTableObjectId::try_new(Bytes::from(value))
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_bytes(ObjectIdVisitor)
     }
 }
 
@@ -1491,6 +1548,28 @@ mod tests {
         assert_eq!(
             oversized.kind(),
             super::super::ConnectorErrorKind::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn stat2b_table_object_id_serde_preserves_raw_bytes_and_rejects_invalid_values() {
+        let object_id = ConnectorTableObjectId::try_new(Bytes::from_static(&[0, 0xff, b'a']))
+            .expect("bounded object ID");
+        let encoded = serde_json::to_string(&object_id).expect("serialize object ID");
+        let decoded: ConnectorTableObjectId =
+            serde_json::from_str(&encoded).expect("deserialize object ID");
+        assert_eq!(decoded, object_id);
+        assert_eq!(decoded.as_bytes().as_ref(), &[0, 0xff, b'a']);
+
+        let empty = serde_json::from_str::<ConnectorTableObjectId>("[]")
+            .expect_err("empty object ID must fail closed");
+        assert!(empty.to_string().contains("must not be empty"));
+
+        let oversized = serde_json::to_string(&vec![7_u8; MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES + 1])
+            .expect("serialize oversized bytes");
+        assert!(
+            serde_json::from_str::<ConnectorTableObjectId>(&oversized).is_err(),
+            "oversized object ID must fail closed"
         );
     }
 

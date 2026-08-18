@@ -46,11 +46,7 @@ pub fn capture_refresh_snapshot_pin_with_ports(
                 base_ref.fqn()
             )
         })?;
-        entries.push((
-            base_ref.clone(),
-            snapshot_id,
-            observed.table_uuid().to_string(),
-        ));
+        entries.push((base_ref.clone(), snapshot_id, observed.object_id().clone()));
     }
     Ok(RefreshSnapshotPin::from_captured_entries(entries))
 }

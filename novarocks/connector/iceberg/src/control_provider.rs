@@ -1064,13 +1064,18 @@ impl ConnectorStagedPublicationRecovery for IcebergControlProvider {
             let bases = provenance
                 .bases
                 .into_iter()
-                .map(|base| ConnectorStagedPublicationBaseFact {
-                    table: Arc::from(base.table_fqn),
-                    uuid: Arc::from(base.uuid),
-                    from_version: base.from_snapshot,
-                    to_version: base.to_snapshot,
+                .map(|base| {
+                    // Iceberg keeps its UUID in provider-private lake
+                    // provenance. Convert it to the neutral opaque carrier
+                    // only at this provider boundary.
+                    Ok(ConnectorStagedPublicationBaseFact {
+                        table: Arc::from(base.table_fqn),
+                        object_id: iceberg_object_id_from_uuid(base.uuid)?,
+                        from_version: base.from_snapshot,
+                        to_version: base.to_snapshot,
+                    })
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, ConnectorError>>()?;
             let version = ConnectorCommittedVersion::try_new(
                 Bytes::from(format!("iceberg/recovery/v1/{snapshot_id}")),
                 Some(snapshot_id),
@@ -2573,6 +2578,17 @@ fn corrupt(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::CorruptData, message.into())
 }
 
+fn iceberg_object_id_from_uuid(uuid: String) -> Result<ConnectorTableObjectId, ConnectorError> {
+    let parsed = uuid::Uuid::parse_str(&uuid)
+        .map_err(|error| corrupt(format!("Iceberg provenance base UUID is invalid: {error}")))?;
+    if parsed.to_string() != uuid {
+        return Err(corrupt(
+            "Iceberg provenance base UUID is not canonically formatted",
+        ));
+    }
+    ConnectorTableObjectId::try_new(Bytes::from(uuid))
+}
+
 fn unavailable(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unavailable, message.into())
         .with_retryable_before_progress()
@@ -2948,7 +2964,12 @@ mod staged_publication_recovery_tests {
             mv_id: 7,
             token: "refresh-41".to_string(),
             technique: crate::commit::RefreshTechnique::Full,
-            bases: Vec::new(),
+            bases: vec![crate::commit::ProvenanceBase {
+                table_fqn: "ice.db.base".to_string(),
+                uuid: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
+                from_snapshot: None,
+                to_snapshot: 37,
+            }],
             definition_fingerprint: "definition-fingerprint".to_string(),
             rows: 3,
         }
@@ -3045,6 +3066,11 @@ mod staged_publication_recovery_tests {
             Some(published_snapshot_id)
         );
         assert_eq!(observation.committed_partitioning, Some(committed));
+        assert_eq!(observation.bases.len(), 1);
+        assert_eq!(
+            observation.bases[0].object_id.as_bytes().as_ref(),
+            b"00112233-4455-6677-8899-aabbccddeeff"
+        );
 
         provider
             .runtime

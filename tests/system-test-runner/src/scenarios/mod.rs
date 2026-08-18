@@ -4,6 +4,7 @@ mod catalog_state;
 mod connector;
 mod mv_recovery;
 mod query_lifecycle;
+mod table_maintenance;
 
 pub fn all() -> Vec<Box<dyn Scenario>> {
     let mut scenarios = Vec::new();
@@ -11,5 +12,6 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(connector::scenarios());
     scenarios.extend(catalog_state::scenarios());
     scenarios.extend(mv_recovery::scenarios());
+    scenarios.extend(table_maintenance::scenarios());
     scenarios
 }

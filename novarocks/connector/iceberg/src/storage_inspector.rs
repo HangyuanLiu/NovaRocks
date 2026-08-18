@@ -24,11 +24,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
+use bytes::Bytes;
 use serde::Deserialize;
 
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorTableMetadata,
+    ConnectorTableMetadata, ConnectorTableObjectId,
 };
 
 use crate::commit::mv_refresh_ref::{MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP};
@@ -115,7 +116,7 @@ pub enum IcebergStoragePartitionTransform {
 /// Narrow base-table facts projected from one frozen metadata document.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergStorageRefreshBaseObservation {
-    pub table_uuid: String,
+    pub object_id: ConnectorTableObjectId,
     pub current_snapshot_id: Option<i64>,
 }
 
@@ -184,7 +185,7 @@ pub struct IcebergStoragePublishedFacts {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergStoragePublishedBaseFact {
     pub table_fqn: String,
-    pub table_uuid: String,
+    pub object_id: ConnectorTableObjectId,
     pub from_snapshot: Option<i64>,
     pub to_snapshot: i64,
 }
@@ -309,12 +310,12 @@ fn refresh_base_observation(
     table: &TableMetadata,
     context: &ConnectorRequestContext,
 ) -> Result<IcebergStorageRefreshBaseObservation, ConnectorError> {
-    let table_uuid = table.uuid().to_string();
+    let object_id = iceberg_object_id_from_uuid(table.uuid().to_string())?;
     let mut budget = 0_usize;
-    reserve(context, &mut budget, &table_uuid)?;
+    reserve_bytes(context, &mut budget, object_id.as_bytes().len())?;
     validate_context(context)?;
     Ok(IcebergStorageRefreshBaseObservation {
-        table_uuid,
+        object_id,
         current_snapshot_id: table.current_snapshot_id(),
     })
 }
@@ -732,7 +733,7 @@ fn published_facts(
             reserve(context, budget, &base.uuid)?;
             Ok(IcebergStoragePublishedBaseFact {
                 table_fqn: base.table_fqn.clone(),
-                table_uuid: base.uuid.clone(),
+                object_id: iceberg_object_id_from_uuid(base.uuid.clone())?,
                 from_snapshot: base.from_snapshot,
                 to_snapshot: base.to_snapshot,
             })
@@ -816,6 +817,15 @@ fn reserve_bytes(
         ));
     }
     Ok(())
+}
+
+fn iceberg_object_id_from_uuid(uuid: String) -> Result<ConnectorTableObjectId, ConnectorError> {
+    ConnectorTableObjectId::try_new(Bytes::from(uuid)).map_err(|error| {
+        ConnectorError::new(
+            error.kind(),
+            format!("Iceberg table UUID cannot form an object ID: {error}"),
+        )
+    })
 }
 
 fn invalid(message: impl Into<String>) -> ConnectorError {
@@ -972,14 +982,17 @@ mod tests {
     }
 
     #[test]
-    fn refresh_base_projection_keeps_uuid_and_snapshot_from_one_metadata_value() {
+    fn refresh_base_projection_keeps_object_id_and_snapshot_from_one_metadata_value() {
         let table = maintenance_metadata(
             vec![SnapshotFixture::new(11, 1_700_000_001_000).on_main()],
             HashMap::new(),
         );
         let observed =
             refresh_base_observation(&table, &context(4096)).expect("refresh base observation");
-        assert_eq!(observed.table_uuid, table.uuid().to_string());
+        assert_eq!(
+            observed.object_id.as_bytes().as_ref(),
+            table.uuid().to_string().as_bytes()
+        );
         assert_eq!(observed.current_snapshot_id, Some(11));
     }
 

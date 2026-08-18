@@ -93,7 +93,7 @@ pub(crate) fn validate_join_schema_contract(
             .ok_or_else(|| JoinSchemaValidationError::MissingBaseContract {
                 base_fqn: (*base_fqn).to_string(),
             })?;
-        if base_contract.table_uuid != current_base.table_uuid() {
+        if current_base.table_object_id() != Some(&base_contract.table_object_id) {
             return Err(JoinSchemaValidationError::BaseIdentityChanged {
                 base_fqn: (*base_fqn).to_string(),
             });
@@ -238,11 +238,8 @@ fn validate_identity_guards(
     base: &MvSchemaValidationObservation,
     target: &MvSchemaValidationObservation,
 ) -> Option<SchemaEvolutionError> {
-    if base.table_uuid() != contract.base.table_uuid {
-        return Some(SchemaEvolutionError::BaseTableIdentityChanged {
-            expected: contract.base.table_uuid.clone(),
-            actual: base.table_uuid().to_string(),
-        });
+    if base.table_object_id() != Some(&contract.base.table_object_id) {
+        return Some(SchemaEvolutionError::BaseTableIdentityChanged);
     }
     if !base.is_format_v3() {
         return Some(SchemaEvolutionError::BaseRowLineageContractBroken {
@@ -624,6 +621,8 @@ mod tests {
         TargetContract, TargetVisibleColumn,
     };
     use crate::mv::domain::storage_observation::MvSchemaValidationPartitionField;
+    use bytes::Bytes;
+    use novarocks_spi::connector::ConnectorTableObjectId;
     use novarocks_sql::planning::mv::{
         MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
         MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
@@ -670,6 +669,7 @@ mod tests {
     #[derive(Clone)]
     struct TestCurrentTarget {
         table_uuid: String,
+        table_object_id: ConnectorTableObjectId,
         format_v3: bool,
         row_lineage_enabled: bool,
         schema: TestSchema,
@@ -685,6 +685,7 @@ mod tests {
                 &self.schema,
                 &self.partition,
             )
+            .with_table_object_id(self.table_object_id.clone())
         }
     }
 
@@ -704,6 +705,17 @@ mod tests {
             partition.clone(),
         )
         .expect("test schema observation")
+    }
+
+    fn object_id(bytes: &[u8]) -> ConnectorTableObjectId {
+        ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes))
+            .expect("valid opaque table object ID")
+    }
+
+    fn labeled_object_id(label: &str) -> ConnectorTableObjectId {
+        let mut bytes = vec![0, 0xff];
+        bytes.extend_from_slice(label.as_bytes());
+        object_id(&bytes)
     }
 
     fn validate_schema_contract_after_identity(
@@ -779,6 +791,7 @@ mod tests {
     ) -> TestCurrentTarget {
         TestCurrentTarget {
             table_uuid: table_uuid.to_string(),
+            table_object_id: labeled_object_id(table_uuid),
             format_v3,
             row_lineage_enabled,
             schema: test_schema(
@@ -794,7 +807,7 @@ mod tests {
 
     fn identity_contract(base: &TestCurrentTarget, target: &TestCurrentTarget) -> MvSchemaContract {
         let mut contract = minimal_base_row_id_contract();
-        contract.base.table_uuid = base.table_uuid.clone();
+        contract.base.table_object_id = base.table_object_id.clone();
         contract.target.table_uuid = target.table_uuid.clone();
         contract
     }
@@ -815,11 +828,8 @@ mod tests {
     fn schema_evolution_error_messages_are_exact() {
         let cases = vec![
             (
-                SchemaEvolutionError::BaseTableIdentityChanged {
-                    expected: "base-a".to_string(),
-                    actual: "base-b".to_string(),
-                },
-                "iceberg MV refresh blocked: base table identity changed (uuid expected=base-a, actual=base-b); run REFRESH FULL or recreate the MV",
+                SchemaEvolutionError::BaseTableIdentityChanged,
+                "iceberg MV refresh blocked: base table physical identity changed; run REFRESH FULL or recreate the MV",
             ),
             (
                 SchemaEvolutionError::BaseRowLineageContractBroken {
@@ -967,19 +977,17 @@ mod tests {
 
         let mut base = good_base.clone();
         let mut target = good_target.clone();
-        base.table_uuid = "BASE-UUID".to_string();
+        base.table_object_id =
+            object_id(&[0, 0xff, b'r', b'e', b'p', b'l', b'a', b'c', b'e', b'd']);
         base.format_v3 = false;
         base.row_lineage_enabled = false;
         target.table_uuid = "other-target".to_string();
         assert_eq!(
             validate_schema_contract(&contract, &base.view(), &target.view()),
-            ContractDecision::Incompatible(SchemaEvolutionError::BaseTableIdentityChanged {
-                expected: "base-uuid".to_string(),
-                actual: "BASE-UUID".to_string(),
-            })
+            ContractDecision::Incompatible(SchemaEvolutionError::BaseTableIdentityChanged)
         );
 
-        base.table_uuid = contract.base.table_uuid.clone();
+        base.table_object_id = contract.base.table_object_id.clone();
         assert_eq!(
             validate_schema_contract(&contract, &base.view(), &target.view()),
             ContractDecision::Incompatible(SchemaEvolutionError::BaseRowLineageContractBroken {
@@ -1324,7 +1332,7 @@ mod tests {
             contract_version: 1,
             base: BaseContract {
                 table_fqn: "ice.db.orders".to_string(),
-                table_uuid: "base-uuid".to_string(),
+                table_object_id: object_id(&[0, 0xff, b'b', b'a', b's', b'e']),
                 alias_at_create: None,
                 schema_id_at_create: 1,
                 schema_at_create: BaseSchemaSnapshot {
@@ -1620,7 +1628,7 @@ mod tests {
             contract_version: 1,
             base: BaseContract {
                 table_fqn: "ice.db.orders".to_string(),
-                table_uuid: "base-uuid".to_string(),
+                table_object_id: object_id(&[0, 0xff, b'b', b'a', b's', b'e']),
                 alias_at_create: None,
                 schema_id_at_create: 1,
                 schema_at_create: BaseSchemaSnapshot {
@@ -1670,7 +1678,7 @@ mod tests {
         let int_type = "int";
         let left = BaseContract {
             table_fqn: "ice.db.left".to_string(),
-            table_uuid: "left-uuid".to_string(),
+            table_object_id: labeled_object_id("left-uuid"),
             alias_at_create: Some("l".to_string()),
             schema_id_at_create: 1,
             schema_at_create: BaseSchemaSnapshot {
@@ -1684,7 +1692,7 @@ mod tests {
         };
         let right = BaseContract {
             table_fqn: "ice.db.right".to_string(),
-            table_uuid: "right-uuid".to_string(),
+            table_object_id: labeled_object_id("right-uuid"),
             alias_at_create: Some("r".to_string()),
             schema_id_at_create: 1,
             schema_at_create: BaseSchemaSnapshot {
@@ -1765,6 +1773,7 @@ mod tests {
         };
         TestCurrentTarget {
             table_uuid: table_uuid.to_string(),
+            table_object_id: labeled_object_id(table_uuid),
             format_v3: true,
             row_lineage_enabled: true,
             schema: test_schema(2, vec![field]),
@@ -1775,6 +1784,7 @@ mod tests {
     fn join_target_table() -> TestCurrentTarget {
         TestCurrentTarget {
             table_uuid: "target-uuid".to_string(),
+            table_object_id: labeled_object_id("target-uuid"),
             format_v3: true,
             row_lineage_enabled: true,
             schema: test_schema(
@@ -1933,8 +1943,8 @@ mod tests {
             "Iceberg join MV schema contract missing base ice.db.missing"
         );
 
-        left.table_uuid = "wrong-left".to_string();
-        right.table_uuid = "wrong-right".to_string();
+        left.table_object_id = labeled_object_id("wrong-left");
+        right.table_object_id = labeled_object_id("wrong-right");
         let error = validate_test_join(
             &contract,
             "ice.db.left",
@@ -1949,8 +1959,8 @@ mod tests {
             "iceberg join MV refresh blocked: base table identity changed for ice.db.left; recreate the MV"
         );
 
-        left.table_uuid = "left-uuid".to_string();
-        right.table_uuid = "right-uuid".to_string();
+        left.table_object_id = labeled_object_id("left-uuid");
+        right.table_object_id = labeled_object_id("right-uuid");
         left.schema = test_schema(2, Vec::new());
         let error = validate_test_join(
             &contract,
@@ -2106,7 +2116,7 @@ mod tests {
             contract_version: 2,
             base: BaseContract {
                 table_fqn: "ice.db.left".to_string(),
-                table_uuid: "left-uuid".to_string(),
+                table_object_id: labeled_object_id("left-uuid"),
                 alias_at_create: None,
                 schema_id_at_create: 0,
                 schema_at_create: BaseSchemaSnapshot { fields: vec![] },
@@ -2114,7 +2124,7 @@ mod tests {
             bases: vec![
                 BaseContract {
                     table_fqn: "ice.db.left".to_string(),
-                    table_uuid: "left-uuid".to_string(),
+                    table_object_id: labeled_object_id("left-uuid"),
                     alias_at_create: Some("l".to_string()),
                     schema_id_at_create: 0,
                     schema_at_create: BaseSchemaSnapshot {
@@ -2128,7 +2138,7 @@ mod tests {
                 },
                 BaseContract {
                     table_fqn: "ice.db.right".to_string(),
-                    table_uuid: "right-uuid".to_string(),
+                    table_object_id: labeled_object_id("right-uuid"),
                     alias_at_create: Some("r".to_string()),
                     schema_id_at_create: 0,
                     schema_at_create: BaseSchemaSnapshot {
@@ -2391,7 +2401,7 @@ mod tests {
             contract_version: 3,
             base: BaseContract {
                 table_fqn: "ice.db.orders".to_string(),
-                table_uuid: "base-uuid".to_string(),
+                table_object_id: object_id(&[0, 0xff, b'b', b'a', b's', b'e']),
                 alias_at_create: None,
                 schema_id_at_create: 0,
                 schema_at_create: BaseSchemaSnapshot { fields: vec![] },

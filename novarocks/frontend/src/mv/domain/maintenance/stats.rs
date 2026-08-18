@@ -215,7 +215,7 @@ mod tests {
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots,
-            last_refresh_table_uuids: BTreeMap::new(),
+            last_refresh_table_object_ids: BTreeMap::new(),
             last_refreshed_iceberg_snapshot_id: None,
             refresh_in_progress: false,
             active_refresh_id: None,

@@ -36,20 +36,21 @@ use crate::planner::table::{
     sql_mv_target_locator_scan,
 };
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_spi::connector::ConnectorTableObjectId;
 
 pub(crate) fn build_join_apply_key_project(
     input: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
-    left_uuid: &str,
-    right_uuid: &str,
+    left_object_id: &ConnectorTableObjectId,
+    right_object_id: &ConnectorTableObjectId,
     apply_key_column_id: u32,
     action_column_id: u32,
 ) -> Result<LogicalPlanNode, String> {
     build_join_apply_key_project_with_action(
         input,
         desc,
-        left_uuid,
-        right_uuid,
+        left_object_id,
+        right_object_id,
         apply_key_column_id,
         action_column_id,
         JoinApplyActionProjection::InputColumn,
@@ -59,16 +60,16 @@ pub(crate) fn build_join_apply_key_project(
 pub(crate) fn build_join_apply_key_project_with_constant_insert_action(
     input: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
-    left_uuid: &str,
-    right_uuid: &str,
+    left_object_id: &ConnectorTableObjectId,
+    right_object_id: &ConnectorTableObjectId,
     apply_key_column_id: u32,
     action_column_id: u32,
 ) -> Result<LogicalPlanNode, String> {
     build_join_apply_key_project_with_action(
         input,
         desc,
-        left_uuid,
-        right_uuid,
+        left_object_id,
+        right_object_id,
         apply_key_column_id,
         action_column_id,
         JoinApplyActionProjection::ConstantInsert,
@@ -84,8 +85,8 @@ pub(crate) fn build_join_apply_key_project_with_constant_insert_action(
 pub(crate) fn build_join_apply_key_append_project(
     input: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
-    left_uuid: &str,
-    right_uuid: &str,
+    left_object_id: &ConnectorTableObjectId,
+    right_object_id: &ConnectorTableObjectId,
     apply_key_column_id: u32,
 ) -> Result<LogicalPlanNode, String> {
     desc.validate()?;
@@ -108,8 +109,8 @@ pub(crate) fn build_join_apply_key_append_project(
                 mapping,
                 desc,
                 &input_columns,
-                left_uuid,
-                right_uuid,
+                left_object_id,
+                right_object_id,
                 JoinApplyActionProjection::InputColumn,
             )
         })
@@ -133,8 +134,8 @@ pub(crate) fn build_join_apply_key_append_project(
 fn build_join_apply_key_project_with_action(
     input: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
-    left_uuid: &str,
-    right_uuid: &str,
+    left_object_id: &ConnectorTableObjectId,
+    right_object_id: &ConnectorTableObjectId,
     apply_key_column_id: u32,
     action_column_id: u32,
     action_projection: JoinApplyActionProjection,
@@ -153,8 +154,8 @@ fn build_join_apply_key_project_with_action(
                 mapping,
                 desc,
                 &input_columns,
-                left_uuid,
-                right_uuid,
+                left_object_id,
+                right_object_id,
                 action_projection,
             )
         })
@@ -1064,8 +1065,8 @@ fn project_item_for_mapping(
     mapping: &JoinRefreshOutputMapping,
     desc: &JoinRefreshDescriptor,
     input_columns: &[OutputColumn],
-    left_uuid: &str,
-    right_uuid: &str,
+    left_object_id: &ConnectorTableObjectId,
+    right_object_id: &ConnectorTableObjectId,
     action_projection: JoinApplyActionProjection,
 ) -> Result<ProjectItem, String> {
     let expr = match mapping.source {
@@ -1119,7 +1120,7 @@ fn project_item_for_mapping(
             }
             validate_input_column(input_columns, &desc.left_row_id_column)?;
             validate_input_column(input_columns, &desc.right_row_id_column)?;
-            join_row_key_expr(desc, left_uuid, right_uuid)
+            join_row_key_expr(desc, left_object_id, right_object_id)
         }
     };
 
@@ -1182,15 +1183,19 @@ fn is_internal_output_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case(crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME)
 }
 
-fn join_row_key_expr(desc: &JoinRefreshDescriptor, left_uuid: &str, right_uuid: &str) -> TypedExpr {
+fn join_row_key_expr(
+    desc: &JoinRefreshDescriptor,
+    left_object_id: &ConnectorTableObjectId,
+    right_object_id: &ConnectorTableObjectId,
+) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
             name: "join_row_key".to_string(),
             args: vec![
-                string_literal(left_uuid),
+                object_id_binary_literal(left_object_id),
                 column_ref(&desc.left_row_id_column),
-                string_literal(right_uuid),
+                object_id_binary_literal(right_object_id),
                 column_ref(&desc.right_row_id_column),
             ],
             distinct: false,
@@ -1209,6 +1214,14 @@ fn column_ref(column: &OutputColumn) -> TypedExpr {
         },
         data_type: column.data_type.clone(),
         nullable: column.nullable,
+    }
+}
+
+fn object_id_binary_literal(value: &ConnectorTableObjectId) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::Binary(value.as_bytes().to_vec())),
+        data_type: DataType::Binary,
+        nullable: false,
     }
 }
 
@@ -1271,9 +1284,17 @@ mod tests {
         ]);
         let desc = test_descriptor(JoinRefreshMode::AppendOnly);
 
-        let plan =
-            super::build_join_apply_key_project(input, &desc, "left-uuid", "right-uuid", 90, 91)
-                .expect("apply-key project");
+        let left_object_id = test_object_id(b"left\x00object");
+        let right_object_id = test_object_id(b"right\xffobject");
+        let plan = super::build_join_apply_key_project(
+            input,
+            &desc,
+            &left_object_id,
+            &right_object_id,
+            90,
+            91,
+        )
+        .expect("apply-key project");
 
         let LogicalPlanKind::Project(project) = &plan.kind else {
             panic!("expected Project");
@@ -1305,9 +1326,17 @@ mod tests {
         ]);
         let desc = test_descriptor(JoinRefreshMode::AppendOnly);
 
-        let err =
-            super::build_join_apply_key_project(input, &desc, "left-uuid", "right-uuid", 90, 91)
-                .expect_err("missing right row-id should fail closed");
+        let left_object_id = test_object_id(b"left\x00object");
+        let right_object_id = test_object_id(b"right\xffobject");
+        let err = super::build_join_apply_key_project(
+            input,
+            &desc,
+            &left_object_id,
+            &right_object_id,
+            90,
+            91,
+        )
+        .expect_err("missing right row-id should fail closed");
 
         assert!(err.contains("missing input column c3"), "err={err}");
     }
@@ -1317,9 +1346,17 @@ mod tests {
         let input = test_values_plan(test_input_columns());
         let desc = test_descriptor(JoinRefreshMode::AppendOnly);
 
-        let err =
-            super::build_join_apply_key_project(input, &desc, "left-uuid", "right-uuid", 900, 91)
-                .expect_err("apply-key id mismatch should fail closed");
+        let left_object_id = test_object_id(b"left\x00object");
+        let right_object_id = test_object_id(b"right\xffobject");
+        let err = super::build_join_apply_key_project(
+            input,
+            &desc,
+            &left_object_id,
+            &right_object_id,
+            900,
+            91,
+        )
+        .expect_err("apply-key id mismatch should fail closed");
 
         assert!(err.contains("apply-key output id mismatch"), "err={err}");
     }
@@ -1345,11 +1382,13 @@ mod tests {
         ]);
         let desc = test_descriptor(JoinRefreshMode::Full);
 
+        let left_object_id = test_object_id(b"left\x00object");
+        let right_object_id = test_object_id(b"right\xffobject");
         let plan = super::build_join_apply_key_project_with_constant_insert_action(
             input,
             &desc,
-            "left-uuid",
-            "right-uuid",
+            &left_object_id,
+            &right_object_id,
             90,
             91,
         )
@@ -2097,13 +2136,13 @@ mod tests {
         };
         assert_eq!(name, "join_row_key");
         assert_eq!(args.len(), 4);
-        assert_string_literal(&args[0].kind, "left-uuid");
+        assert_binary_literal(&args[0].kind, b"left\x00object");
         assert_column_ref(
             &args[1].kind,
             ColumnId(2),
             crate::common::ICEBERG_ROW_ID_COL,
         );
-        assert_string_literal(&args[2].kind, "right-uuid");
+        assert_binary_literal(&args[2].kind, b"right\xffobject");
         assert_column_ref(
             &args[3].kind,
             ColumnId(3),
@@ -2143,11 +2182,18 @@ mod tests {
         assert_eq!(*value, i64::from(crate::common::CHANGE_OP_INSERT));
     }
 
-    fn assert_string_literal(kind: &ExprKind, expected: &str) {
-        let ExprKind::Literal(LiteralValue::String(actual)) = kind else {
-            panic!("expected string literal");
+    fn assert_binary_literal(kind: &ExprKind, expected: &[u8]) {
+        let ExprKind::Literal(LiteralValue::Binary(actual)) = kind else {
+            panic!("expected binary literal");
         };
         assert_eq!(actual, expected);
+    }
+
+    fn test_object_id(bytes: &[u8]) -> novarocks_spi::connector::ConnectorTableObjectId {
+        novarocks_spi::connector::ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(
+            bytes,
+        ))
+        .expect("test object id")
     }
 
     fn assert_column_ref(kind: &ExprKind, expected_id: ColumnId, expected_name: &str) {

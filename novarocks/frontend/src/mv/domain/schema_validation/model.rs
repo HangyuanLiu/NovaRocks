@@ -32,10 +32,7 @@ pub(crate) enum JoinContractDecision {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SchemaEvolutionError {
-    BaseTableIdentityChanged {
-        expected: String,
-        actual: String,
-    },
+    BaseTableIdentityChanged,
     BaseRowLineageContractBroken {
         reason: String,
     },
@@ -90,9 +87,9 @@ pub(crate) enum SchemaEvolutionError {
 impl std::fmt::Display for SchemaEvolutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BaseTableIdentityChanged { expected, actual } => write!(
+            Self::BaseTableIdentityChanged => write!(
                 f,
-                "iceberg MV refresh blocked: base table identity changed (uuid expected={expected}, actual={actual}); run REFRESH FULL or recreate the MV"
+                "iceberg MV refresh blocked: base table physical identity changed; run REFRESH FULL or recreate the MV"
             ),
             Self::BaseRowLineageContractBroken { reason } => write!(
                 f,

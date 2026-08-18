@@ -19,7 +19,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use crate::query_execution::maintenance::{MaintenanceActionOutcome, TableMaintenanceEngine};
+use bytes::Bytes;
+use novarocks_spi::connector::ConnectorTableObjectId;
+
+use crate::query_execution::maintenance::{
+    MaintenanceActionOutcome, MaintenanceTargetRebind, TableMaintenanceEngine,
+};
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -35,6 +40,22 @@ use super::now_unix_millis;
 use super::repository::{DistributedRewriteOperationRepository, OptimizeJobRepository};
 
 const OPTIMIZE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Runner-owned test root for the STAT-2F cross-process maintenance race.
+///
+/// When set in a debug build, a claimed optimize job writes three files below
+/// this existing directory:
+/// - `stat2f-maintenance-optimize-<job-id>.before-rebind.ready`
+/// - `stat2f-maintenance-optimize-<job-id>.before-rebind.resume`
+/// - `stat2f-maintenance-optimize-<job-id>.dispatch-count`
+///
+/// The worker writes `0` to the counter and the ready marker after durable
+/// claim/authority, then waits for the runner to create the resume trigger.
+/// It increments the counter immediately before entering the executor. The
+/// hook is intentionally unavailable in release builds and a missing variable
+/// is a no-op, so it cannot alter normal maintenance behavior.
+const STAT2F_TEST_ROOT_ENV: &str = "NOVAROCKS_STAT2F_MAINTENANCE_TEST_DIR";
+const STAT2F_TEST_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct OptimizeWorker {
     stop: Arc<AtomicBool>,
@@ -360,6 +381,56 @@ async fn execute_claimed_job(
     validator: MaintenanceFenceValidator,
 ) -> Result<(), String> {
     let job_id = job.job_id;
+    stat2f_before_rebind_barrier(job_id)?;
+    let expected_object_id = ConnectorTableObjectId::try_new(Bytes::from(job.object_id.clone()))
+        .map_err(|error| {
+            format!("restore optimize job {job_id} durable target object ID failed: {error}")
+        })?;
+    match engine.rebind_target_object(&job.target, &expected_object_id) {
+        Ok(MaintenanceTargetRebind::Bound) => {}
+        Ok(MaintenanceTargetRebind::Replaced) => {
+            repository
+                .mark_target_replaced_fenced(job_id, now_unix_millis(), authority, validator)
+                .await
+                .map_err(|error| {
+                    format!("mark optimize job {job_id} target replaced failed: {error}")
+                })?;
+            return Ok(());
+        }
+        Ok(MaintenanceTargetRebind::Missing) => {
+            repository
+                .fail_fenced(
+                    job_id,
+                    now_unix_millis(),
+                    "optimize target is missing before provider dispatch".to_string(),
+                    authority,
+                    validator,
+                )
+                .await
+                .map_err(|error| {
+                    format!("fail missing optimize target {job_id} before dispatch failed: {error}")
+                })?;
+            return Ok(());
+        }
+        Err(error) => {
+            repository
+                .fail_fenced(
+                    job_id,
+                    now_unix_millis(),
+                    format!("optimize target rebind failed before provider dispatch: {error}"),
+                    authority,
+                    validator,
+                )
+                .await
+                .map_err(|store| {
+                    format!(
+                        "persist optimize pre-dispatch rebind failure for {job_id} failed: {store}"
+                    )
+                })?;
+            return Ok(());
+        }
+    }
+    stat2f_record_provider_dispatch(job_id)?;
     let runtime = runtime.clone();
     let job_attempt = attempt.clone();
     let execution = tokio::task::spawn_blocking(move || {
@@ -394,6 +465,189 @@ async fn execute_claimed_job(
         .finish_fenced(job_id, now_unix_millis(), authority, validator)
         .await
         .map_err(|error| format!("finish optimize job {job_id} failed: {error}"))
+}
+
+#[cfg(debug_assertions)]
+fn stat2f_before_rebind_barrier(job_id: i64) -> Result<(), String> {
+    use std::time::Instant;
+
+    let Some(root) = std::env::var_os(STAT2F_TEST_ROOT_ENV) else {
+        return Ok(());
+    };
+    let root = std::path::PathBuf::from(root);
+    let paths = stat2f_test_paths(&root, job_id);
+    if paths.resume.exists() {
+        return Err(format!(
+            "STAT-2F maintenance test resume trigger already exists: {}",
+            paths.resume.display()
+        ));
+    }
+    std::fs::write(&paths.dispatch_count, "0\n").map_err(|error| {
+        format!(
+            "write STAT-2F maintenance dispatch counter {}: {error}",
+            paths.dispatch_count.display()
+        )
+    })?;
+    std::fs::write(
+        &paths.ready,
+        format!("job_id={job_id}\nphase=after-claim-before-rebind\n"),
+    )
+    .map_err(|error| {
+        format!(
+            "write STAT-2F maintenance ready marker {}: {error}",
+            paths.ready.display()
+        )
+    })?;
+
+    let deadline = Instant::now() + STAT2F_TEST_BARRIER_TIMEOUT;
+    while !paths.resume.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if paths.resume.exists() {
+        Ok(())
+    } else {
+        Err(format!(
+            "timed out waiting for STAT-2F maintenance resume trigger {}",
+            paths.resume.display()
+        ))
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn stat2f_before_rebind_barrier(_job_id: i64) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn stat2f_record_provider_dispatch(job_id: i64) -> Result<(), String> {
+    let Some(root) = std::env::var_os(STAT2F_TEST_ROOT_ENV) else {
+        return Ok(());
+    };
+    let paths = stat2f_test_paths(&std::path::PathBuf::from(root), job_id);
+    let previous = std::fs::read_to_string(&paths.dispatch_count).map_err(|error| {
+        format!(
+            "read STAT-2F maintenance dispatch counter {}: {error}",
+            paths.dispatch_count.display()
+        )
+    })?;
+    let previous = previous.trim().parse::<u64>().map_err(|error| {
+        format!(
+            "parse STAT-2F maintenance dispatch counter {}: {error}",
+            paths.dispatch_count.display()
+        )
+    })?;
+    let next = previous.checked_add(1).ok_or_else(|| {
+        format!(
+            "STAT-2F maintenance dispatch counter overflow: {}",
+            paths.dispatch_count.display()
+        )
+    })?;
+    std::fs::write(&paths.dispatch_count, format!("{next}\n")).map_err(|error| {
+        format!(
+            "write STAT-2F maintenance dispatch counter {}: {error}",
+            paths.dispatch_count.display()
+        )
+    })
+}
+
+#[cfg(not(debug_assertions))]
+fn stat2f_record_provider_dispatch(_job_id: i64) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+struct Stat2fTestPaths {
+    ready: std::path::PathBuf,
+    resume: std::path::PathBuf,
+    dispatch_count: std::path::PathBuf,
+}
+
+#[cfg(debug_assertions)]
+fn stat2f_test_paths(root: &std::path::Path, job_id: i64) -> Stat2fTestPaths {
+    let stem = format!("stat2f-maintenance-optimize-{job_id}");
+    Stat2fTestPaths {
+        ready: root.join(format!("{stem}.before-rebind.ready")),
+        resume: root.join(format!("{stem}.before-rebind.resume")),
+        dispatch_count: root.join(format!("{stem}.dispatch-count")),
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod stat2f_test_hook_tests {
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use tempfile::TempDir;
+
+    use super::{
+        STAT2F_TEST_ROOT_ENV, stat2f_before_rebind_barrier, stat2f_record_provider_dispatch,
+        stat2f_test_paths,
+    };
+
+    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct ScopedTestEnv {
+        prior: Option<OsString>,
+    }
+
+    impl ScopedTestEnv {
+        fn set(root: &std::path::Path) -> Self {
+            let prior = std::env::var_os(STAT2F_TEST_ROOT_ENV);
+            // The process-global environment is serialized by TEST_ENV_LOCK.
+            unsafe { std::env::set_var(STAT2F_TEST_ROOT_ENV, root) };
+            Self { prior }
+        }
+    }
+
+    impl Drop for ScopedTestEnv {
+        fn drop(&mut self) {
+            // The process-global environment is serialized by TEST_ENV_LOCK.
+            unsafe {
+                if let Some(prior) = self.prior.take() {
+                    std::env::set_var(STAT2F_TEST_ROOT_ENV, prior);
+                } else {
+                    std::env::remove_var(STAT2F_TEST_ROOT_ENV);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn barrier_reports_zero_then_one_dispatch_and_resumes_only_on_trigger() {
+        let _environment = TEST_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock STAT-2F test environment");
+        let temporary = TempDir::new().expect("create test root");
+        let root = temporary.path().join("stat2f-hook");
+        std::fs::create_dir(&root).expect("create hook directory");
+        let _hook_environment = ScopedTestEnv::set(&root);
+        let job_id = 42;
+        let paths = stat2f_test_paths(&root, job_id);
+
+        let barrier = std::thread::spawn(move || stat2f_before_rebind_barrier(job_id));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !paths.ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(paths.ready.exists(), "barrier never reported readiness");
+        assert_eq!(
+            std::fs::read_to_string(&paths.dispatch_count).expect("read zero counter"),
+            "0\n"
+        );
+
+        std::fs::write(&paths.resume, "resume\n").expect("create resume trigger");
+        barrier
+            .join()
+            .expect("join barrier thread")
+            .expect("resume barrier");
+        stat2f_record_provider_dispatch(job_id).expect("record provider dispatch");
+        assert_eq!(
+            std::fs::read_to_string(&paths.dispatch_count).expect("read dispatch counter"),
+            "1\n"
+        );
+    }
 }
 
 pub(crate) fn optimize_outcome(

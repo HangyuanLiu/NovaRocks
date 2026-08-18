@@ -90,7 +90,7 @@ pub struct RefreshOutcome {
     pub target: MvTarget,
     pub rows: Option<i64>,
     pub base_snapshots: BTreeMap<String, i64>,
-    pub base_table_uuids: BTreeMap<String, String>,
+    pub base_table_object_ids: BTreeMap<String, novarocks_spi::connector::ConnectorTableObjectId>,
     pub target_snapshot_id: Option<i64>,
     pub backend_outcome: BackendRefreshOutcome,
 }

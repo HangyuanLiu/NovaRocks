@@ -274,15 +274,16 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int64], TypeSpec::Utf8),
     );
 
-    // Stable relational identity for IMV join coalesce rows.
+    // Stable relational identity for IMV join coalesce rows. Object-ID salts
+    // are opaque connector bytes, not UTF-8 UUIDs.
     add(
         m,
         "join_row_key",
         Signature::new(
             vec![
-                TypeSpec::Utf8,
+                TypeSpec::Binary,
                 TypeSpec::Int64,
-                TypeSpec::Utf8,
+                TypeSpec::Binary,
                 TypeSpec::Int64,
             ],
             TypeSpec::Utf8,

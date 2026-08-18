@@ -198,6 +198,12 @@ mod tests {
     use crate::mv::domain::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
     use crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision;
     use novarocks_catalog::identifier::TableIdentity;
+    use novarocks_spi::connector::ConnectorTableObjectId;
+
+    fn object_id(value: &str) -> ConnectorTableObjectId {
+        ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(value.as_bytes()))
+            .expect("test object ID")
+    }
 
     fn table(name: &str) -> TableIdentity {
         TableIdentity::new("ice", "db", name)
@@ -217,9 +223,9 @@ mod tests {
                 ("ice.db.left".to_string(), 1),
                 ("ice.db.right".to_string(), 2),
             ]),
-            previous_table_uuids: BTreeMap::from([
-                ("ice.db.left".to_string(), "left-v1".to_string()),
-                ("ice.db.right".to_string(), "right-v1".to_string()),
+            previous_table_object_ids: BTreeMap::from([
+                ("ice.db.left".to_string(), object_id("left-v1")),
+                ("ice.db.right".to_string(), object_id("right-v1")),
             ]),
             target_snapshot_id: Some(10),
             target_table_uuid: "target-v1".to_string(),
@@ -505,7 +511,7 @@ mod tests {
         let contract = contract();
         let RefreshStateBaseline::SnapshotBacked {
             previous_snapshot_ids,
-            previous_table_uuids,
+            previous_table_object_ids,
             target_snapshot_id,
             target_table_uuid,
             definition_fingerprint,
@@ -516,40 +522,40 @@ mod tests {
 
         let mut changed_previous_snapshots = previous_snapshot_ids.clone();
         changed_previous_snapshots.insert("ice.db.left".to_string(), 99);
-        let mut changed_previous_uuids = previous_table_uuids.clone();
-        changed_previous_uuids.insert("ice.db.left".to_string(), "left-v2".to_string());
+        let mut changed_previous_object_ids = previous_table_object_ids.clone();
+        changed_previous_object_ids.insert("ice.db.left".to_string(), object_id("left-v2"));
         let drifts = [
             RefreshStateBaseline::SnapshotBacked {
                 previous_snapshot_ids: changed_previous_snapshots,
-                previous_table_uuids: previous_table_uuids.clone(),
+                previous_table_object_ids: previous_table_object_ids.clone(),
                 target_snapshot_id,
                 target_table_uuid: target_table_uuid.clone(),
                 definition_fingerprint: definition_fingerprint.clone(),
             },
             RefreshStateBaseline::SnapshotBacked {
                 previous_snapshot_ids: previous_snapshot_ids.clone(),
-                previous_table_uuids: changed_previous_uuids,
+                previous_table_object_ids: changed_previous_object_ids,
                 target_snapshot_id,
                 target_table_uuid: target_table_uuid.clone(),
                 definition_fingerprint: definition_fingerprint.clone(),
             },
             RefreshStateBaseline::SnapshotBacked {
                 previous_snapshot_ids: previous_snapshot_ids.clone(),
-                previous_table_uuids: previous_table_uuids.clone(),
+                previous_table_object_ids: previous_table_object_ids.clone(),
                 target_snapshot_id: Some(11),
                 target_table_uuid: target_table_uuid.clone(),
                 definition_fingerprint: definition_fingerprint.clone(),
             },
             RefreshStateBaseline::SnapshotBacked {
                 previous_snapshot_ids: previous_snapshot_ids.clone(),
-                previous_table_uuids: previous_table_uuids.clone(),
+                previous_table_object_ids: previous_table_object_ids.clone(),
                 target_snapshot_id,
                 target_table_uuid: "target-v2".to_string(),
                 definition_fingerprint: definition_fingerprint.clone(),
             },
             RefreshStateBaseline::SnapshotBacked {
                 previous_snapshot_ids,
-                previous_table_uuids,
+                previous_table_object_ids,
                 target_snapshot_id,
                 target_table_uuid,
                 definition_fingerprint: "definition-v2".to_string(),

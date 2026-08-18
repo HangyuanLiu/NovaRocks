@@ -33,11 +33,10 @@ pub(crate) fn map_connector_partition_to_mv_key(
     };
     let base_contract = std::iter::once(&contract.base)
         .chain(contract.bases.iter())
-        .find(|base| base.table_uuid == observation.table_uuid())
+        .find(|base| observation.table_object_id() == Some(&base.table_object_id))
         .ok_or_else(|| {
             format!(
-                "MV partition mapping has no stable base contract for observed table UUID {}",
-                observation.table_uuid()
+                "MV partition mapping has no stable base contract for the observed table object ID"
             )
         })?;
 
@@ -160,6 +159,12 @@ mod tests {
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
         TargetContract, TargetVisibleColumn,
     };
+    use bytes::Bytes;
+
+    fn object_id(bytes: &[u8]) -> novarocks_spi::connector::ConnectorTableObjectId {
+        novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes))
+            .expect("valid opaque table object ID")
+    }
 
     fn contract_with_partition(transform: MvPartitionTransformContract) -> MvSchemaContract {
         let mut contract = contract_with_identity_partition();
@@ -173,7 +178,7 @@ mod tests {
     }
 
     /// Neutral observation fixture: the mapper matches the contract's base by
-    /// observed table UUID, and reads the source column names from its fields.
+    /// opaque physical object ID and reads source column names from its fields.
     fn observation() -> crate::mv::domain::storage_observation::MvSchemaValidationObservation {
         crate::mv::domain::storage_observation::MvSchemaValidationObservation::try_new_with_maximum_payload(
             "base-uuid".to_string(),
@@ -189,6 +194,7 @@ mod tests {
             crate::mv::domain::storage_observation::MvSchemaValidationPartitionContract::new(7, Vec::new()),
         )
         .expect("observation fixture")
+        .with_table_object_id(object_id(&[0, 0xff, b'b', b'a', b's', b'e']))
     }
 
     fn connector_partition(
@@ -216,7 +222,7 @@ mod tests {
             contract_version: 1,
             base: BaseContract {
                 table_fqn: "ice.sales.orders".to_string(),
-                table_uuid: "base-uuid".to_string(),
+                table_object_id: object_id(&[0, 0xff, b'b', b'a', b's', b'e']),
                 alias_at_create: None,
                 schema_id_at_create: 0,
                 schema_at_create: BaseSchemaSnapshot {
