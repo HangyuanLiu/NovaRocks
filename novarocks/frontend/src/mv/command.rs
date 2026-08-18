@@ -27,6 +27,7 @@ use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::syntax::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, MvAdmittedStatement, ObjectName,
     RefreshMaterializedViewStmt, parse_call_procedure_sql, parse_mv_admitted_statement,
+    parse_optional_mv_admitted_statement,
 };
 
 use super::FrontendMvService;
@@ -70,6 +71,7 @@ impl MvCommandExecutor {
     /// Execute exactly one MV statement through explicit ports. Refresh and
     /// repartition receive the request's already-admitted execution context;
     /// they never capture a second topology or cancellation scope.
+    // Design: ADR-0088 (docs/adr/ADR-0088-domain-owned-sql-error-contracts.md)
     pub fn try_execute(
         &self,
         sql: &str,
@@ -112,9 +114,9 @@ impl MvCommandExecutor {
                 .map(Some);
             }
         }
-        let statement = match parse_mv_admitted_statement(&normalized) {
-            Ok(statement) => statement,
-            Err(_) => return Ok(None),
+        let statement = match parse_mv_statement_for_execution(&normalized)? {
+            Some(statement) => statement,
+            None => return Ok(None),
         };
         match statement {
             MvAdmittedStatement::Create(statement) => create_mv_with_ports(
@@ -288,6 +290,10 @@ fn statement_result(result: MvStatementResult) -> StatementResult {
     }
 }
 
+fn parse_mv_statement_for_execution(sql: &str) -> Result<Option<MvAdmittedStatement>, String> {
+    parse_optional_mv_admitted_statement(sql)
+}
+
 fn parse_explain_refresh_materialized_view(
     sql: &str,
 ) -> Option<
@@ -347,7 +353,7 @@ fn parse_explain_refresh_materialized_view(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_explain_refresh_materialized_view;
+    use super::{parse_explain_refresh_materialized_view, parse_mv_statement_for_execution};
 
     #[test]
     fn explain_refresh_parser_keeps_level_and_analyze_contract() {
@@ -366,5 +372,22 @@ mod tests {
                 .expect("parsed");
         assert_eq!(analyze.1, novarocks_sql::compiler::ExplainLevel::Analyze);
         assert!(analyze.2);
+    }
+
+    #[test]
+    fn mv_route_miss_defers_but_recognized_mv_parse_errors_propagate() {
+        assert_eq!(
+            parse_mv_statement_for_execution("SELECT 1").expect("non-MV route miss"),
+            None
+        );
+
+        let error = parse_mv_statement_for_execution(
+            "CREATE MATERIALIZED VIEW mv \
+             DISTRIBUTED BY HASH(k1) BUCKETS 1 \
+             PRIMARY KEY () \
+             AS SELECT k1 FROM source_table",
+        )
+        .expect_err("recognized MV parse error must propagate");
+        assert_eq!(error, "PRIMARY KEY clause requires at least one column");
     }
 }

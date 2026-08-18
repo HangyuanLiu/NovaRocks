@@ -47,11 +47,10 @@
 //! optimizer hint `SET_VAR(recursive_cte_max_depth=N)`; that hint is parsed
 //! out of the raw SQL text by [`extract_recursive_cte_max_depth`].
 //!
-//! Bodies that are not a recognised `UNION` chain (e.g. a single `SELECT`,
-//! or a mixed `UNION ALL` + `UNION` chain) are left untouched. The
-//! self-reference then falls through to the catalog and the analyzer reports
-//! an "Unknown table" error — matching the StarRocks behaviour exercised by
-//! the regression suite's negative cases.
+//! Bodies that are not a recognised `UNION` chain (for example, a single
+//! `SELECT`) are left untouched. A recursive self-reference in a mixed
+//! `UNION ALL` + `UNION` chain is rejected explicitly because NovaRocks cannot
+//! unroll that shape without changing its set semantics.
 
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
@@ -330,6 +329,7 @@ fn unroll_with_clause(with: &mut With, max_depth: usize) -> Result<(), String> {
     Ok(())
 }
 
+// Design: ADR-0088 (docs/adr/ADR-0088-domain-owned-sql-error-contracts.md)
 fn try_unroll_cte(cte: &Cte, max_depth: usize) -> Result<Option<Vec<Cte>>, String> {
     // Bail on shapes we don't recognise (materialised hints, FROM aliases,
     // etc.) — the analyzer will surface the original error untouched.
@@ -337,26 +337,36 @@ fn try_unroll_cte(cte: &Cte, max_depth: usize) -> Result<Option<Vec<Cte>>, Strin
         return Ok(None);
     }
 
+    let cte_name = cte.alias.name.value.clone();
+    let cte_name_lower = cte_name.to_ascii_lowercase();
+
     // The body must be a chain of consistent `UNION` operators
     // (`UNION ALL` or `UNION` — possibly more than two operands), with
     // the leftmost operand acting as the anchor and the rest as recursive
-    // bodies. Mixed quantifiers (e.g. `UNION ALL` + `UNION DISTINCT`) are
-    // not a recognised recursive-CTE shape; leave them alone.
-    let Some((chain_quantifier, operands)) = extract_union_chain(cte.query.body.as_ref()) else {
-        return Ok(None);
+    // bodies. Mixed quantifiers (e.g. `UNION ALL` + `UNION DISTINCT`) cannot
+    // be unrolled while preserving set semantics. Reject them only when the
+    // CTE body actually self-references: a non-recursive mixed set operation
+    // still follows the ordinary CTE path.
+    let (chain_quantifier, operands) = match extract_union_chain(cte.query.body.as_ref()) {
+        Some(UnionChain::Consistent(quantifier, operands)) => (quantifier, operands),
+        Some(UnionChain::Mixed)
+            if set_expr_references_table(cte.query.body.as_ref(), &cte_name_lower) =>
+        {
+            return Err("unsupported recursive CTE shape: mixed UNION quantifiers".to_string());
+        }
+        Some(UnionChain::Mixed) | None => return Ok(None),
     };
     let (anchor, recursive_parts) = operands
         .split_first()
         .expect("extract_union_chain guarantees >= 2 operands");
 
-    let cte_name = cte.alias.name.value.clone();
-    let cte_name_lower = cte_name.to_ascii_lowercase();
-
     // Anchor must not self-reference — that is an explicit error case in
-    // SQL recursive CTEs ("recursive reference in anchor"). Leave the CTE
-    // unchanged so the analyzer reports "Unknown table".
+    // SQL recursive CTEs ("recursive reference in anchor"). This is owned
+    // by the recursive-CTE rewrite admission, rather than the analyzer: once
+    // the CTE falls through, ordinary catalog resolution would turn the name
+    // into a namespace-qualified external-table miss.
     if set_expr_references_table(anchor, &cte_name_lower) {
-        return Ok(None);
+        return Err(format!("unknown table: {cte_name}"));
     }
 
     // At least one recursive operand must contain a self-reference, else
@@ -525,16 +535,24 @@ fn wrap_query_as_select_star(
     SetExpr::Select(Box::new(select))
 }
 
-/// Walk the left spine of `expr` collecting operands of a consistent
-/// `UNION` chain. Returns `None` if the chain length is less than two, if
-/// any non-`UNION` set operator is involved, or if the `UNION` operators
-/// disagree on their quantifier.
-fn extract_union_chain(expr: &SetExpr) -> Option<(SetQuantifier, Vec<&SetExpr>)> {
+/// Classification of a top-level `UNION` chain.
+enum UnionChain<'a> {
+    Consistent(SetQuantifier, Vec<&'a SetExpr>),
+    Mixed,
+}
+
+/// Walk the left spine of `expr` collecting operands of a `UNION` chain.
+/// Returns `None` if the chain length is less than two or a non-`UNION` set
+/// operator is involved. A complete chain with differing quantifiers is
+/// returned as [`UnionChain::Mixed`] so callers can distinguish it from a
+/// non-candidate shape.
+fn extract_union_chain(expr: &SetExpr) -> Option<UnionChain<'_>> {
     fn walk<'a>(
         expr: &'a SetExpr,
         operands: &mut Vec<&'a SetExpr>,
         quantifier: &mut Option<SetQuantifier>,
-    ) -> bool {
+        mixed_quantifiers: &mut bool,
+    ) {
         if let SetExpr::SetOperation {
             op: SetOperator::Union,
             set_quantifier,
@@ -545,23 +563,29 @@ fn extract_union_chain(expr: &SetExpr) -> Option<(SetQuantifier, Vec<&SetExpr>)>
             match quantifier {
                 None => *quantifier = Some(*set_quantifier),
                 Some(existing) if existing == set_quantifier => {}
-                Some(_) => return false,
+                Some(_) => *mixed_quantifiers = true,
             }
-            if !walk(left, operands, quantifier) {
-                return false;
-            }
+            walk(left, operands, quantifier, mixed_quantifiers);
             operands.push(right);
-            return true;
+            return;
         }
         operands.push(expr);
-        true
     }
 
     let mut operands: Vec<&SetExpr> = Vec::new();
     let mut quantifier: Option<SetQuantifier> = None;
-    if walk(expr, &mut operands, &mut quantifier) && operands.len() >= 2 {
+    let mut mixed_quantifiers = false;
+    walk(expr, &mut operands, &mut quantifier, &mut mixed_quantifiers);
+    if operands.len() >= 2 {
         // `quantifier` is Some because we observed at least one UNION node.
-        Some((quantifier.expect("union chain quantifier"), operands))
+        if mixed_quantifiers {
+            Some(UnionChain::Mixed)
+        } else {
+            Some(UnionChain::Consistent(
+                quantifier.expect("union chain quantifier"),
+                operands,
+            ))
+        }
     } else {
         None
     }
@@ -1103,17 +1127,49 @@ mod tests {
     }
 
     #[test]
-    fn leaves_mixed_union_quantifier_cte_alone() {
-        // `(A UNION ALL B) UNION C` mixes `UNION ALL` and `UNION` — not a
-        // recognised recursive shape, so the self-reference stays
-        // unresolved and the analyzer can report the original error.
+    fn rejects_recursive_cte_with_mixed_union_quantifiers() {
+        // `(A UNION ALL B) UNION C` mixes `UNION ALL` and `UNION`; a
+        // self-reference makes this a recursive CTE shape that cannot be
+        // unrolled without changing set semantics.
         let sql = "WITH RECURSIVE n AS (\
             SELECT 1 AS v \
             UNION ALL SELECT v + 1 FROM n WHERE v < 5 \
             UNION SELECT v FROM n) \
             SELECT * FROM n";
+        assert_eq!(
+            parse_normalized_sql_raw(sql).expect_err("mixed recursive CTE must fail"),
+            "unsupported recursive CTE shape: mixed UNION quantifiers"
+        );
+    }
+
+    #[test]
+    fn rejects_anchor_self_reference_before_rewrite_fallback() {
+        // The recursive name in the leftmost anchor is invalid even when the
+        // remaining UNION operand does not recurse. Parsing must fail here;
+        // leaving this shape untouched would defer it to catalog lookup and
+        // change the contract to a namespace-qualified external-table error.
+        let sql = "WITH RECURSIVE invalid_cte AS (\
+            SELECT 1 WHERE 1 IN (SELECT 1 FROM invalid_cte) \
+            UNION ALL SELECT 2) \
+            SELECT * FROM invalid_cte";
+        assert_eq!(
+            parse_normalized_sql_raw(sql).expect_err("anchor self-reference must not fall through"),
+            "unknown table: invalid_cte"
+        );
+    }
+
+    #[test]
+    fn leaves_non_recursive_mixed_union_quantifier_cte_alone() {
+        // A mixed set operation without a self-reference is not recursive,
+        // even though it appears under WITH RECURSIVE.
+        let sql = "WITH RECURSIVE n AS (\
+            SELECT 1 AS v \
+            UNION ALL SELECT 2 \
+            UNION SELECT 3) \
+            SELECT * FROM n";
         let out = rewrite(sql, 5);
         assert!(!out.contains("__nr_rec_"), "out: {out}");
+        assert!(out.contains("n AS"), "out: {out}");
     }
 
     #[test]
