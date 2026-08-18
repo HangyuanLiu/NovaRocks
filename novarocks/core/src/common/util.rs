@@ -92,7 +92,7 @@ fn map_entry_fields(entries: &Field) -> Result<(&Field, &Field), String> {
     Ok((fields[0].as_ref(), fields[1].as_ref()))
 }
 
-pub(crate) fn mysql_text_row_from_arrays_with_primitives(
+pub fn mysql_text_row_from_arrays_with_primitives(
     columns: &[ArrayRef],
     row: usize,
     primitive_types: Option<&[PrimitiveType]>,
@@ -311,7 +311,7 @@ pub(crate) fn mysql_text_row_from_arrays_with_primitives(
     Ok(out)
 }
 
-pub(crate) fn http_json_row_from_arrays_with_primitives(
+pub fn http_json_row_from_arrays_with_primitives(
     columns: &[ArrayRef],
     row: usize,
     primitive_types: Option<&[PrimitiveType]>,
@@ -856,7 +856,7 @@ pub(crate) fn format_mysql_container_value(col: &ArrayRef, row: usize) -> Result
     format_mysql_container_value_with_schema(col, row, None)
 }
 
-pub(crate) fn format_mysql_container_value_with_schema(
+pub fn format_mysql_container_value_with_schema(
     col: &ArrayRef,
     row: usize,
     field_schema: Option<&FieldRenderSchema>,

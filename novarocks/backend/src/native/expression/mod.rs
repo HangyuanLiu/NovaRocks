@@ -21,9 +21,9 @@ use arrow::datatypes::DataType;
 
 use self::error::NativeExpressionDecodeError;
 use super::type_decode::{decode_field_type, decode_type};
-use novarocks::protocol::FieldPath;
 use novarocks_execution::exec::chunk::ChunkFieldSchema;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
+use novarocks_protocol::FieldPath;
 use novarocks_protocol::expr;
 use novarocks_types::SlotId;
 
@@ -62,15 +62,14 @@ impl NativeExpressionInputLayout {
         &self,
         column_id: u32,
         path: FieldPath,
-    ) -> Result<SlotId, novarocks::protocol::ProtocolError> {
+    ) -> Result<SlotId, novarocks_protocol::ProtocolError> {
         let slot = SlotId::new(column_id);
         if self.slots.contains(&slot) {
             Ok(slot)
         } else {
-            Err(novarocks::protocol::ProtocolError::new(
-                novarocks::protocol::ProtocolFamily::Native,
+            Err(novarocks_protocol::ProtocolError::new(
                 path.field("column_id"),
-                novarocks::protocol::ProtocolErrorKind::InvalidValue,
+                novarocks_protocol::ProtocolErrorKind::InvalidValue,
                 format!("ColumnRef column_id={column_id} not found in input layout"),
             ))
         }

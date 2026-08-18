@@ -17,7 +17,6 @@
 
 use std::collections::BTreeMap;
 
-use novarocks::protocol::FieldPath;
 use novarocks::runtime::scan_range::{
     DatacacheOptions, DeletionVectorDescriptor, FileFormat, FilePruningMinMaxValue,
     FilePruningValueKind, FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat,
@@ -25,6 +24,7 @@ use novarocks::runtime::scan_range::{
 };
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::FieldPath;
 use novarocks_types::UniqueId;
 
 use novarocks_protocol::novarocks as native_proto;
@@ -285,7 +285,7 @@ fn unique_id(src: &novarocks_protocol::common::UniqueId) -> UniqueId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks::protocol::common::error::{ProtocolErrorKind, ProtocolFamily};
+    use novarocks_protocol::ProtocolErrorKind;
     use novarocks_protocol::novarocks as native_proto;
 
     #[test]
@@ -308,7 +308,6 @@ mod tests {
         }])
         .expect_err("missing finst id");
         let protocol = error.protocol().expect("protocol error");
-        assert_eq!(protocol.family(), ProtocolFamily::Native);
         assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
         assert_eq!(
             protocol.path().to_string(),

@@ -38,7 +38,7 @@ pub mod mv_native_write;
 pub mod native_fragment;
 pub(crate) mod outcome;
 pub mod planning;
-pub use crate::runtime::statement_result::StatementResult;
+pub use ::novarocks::runtime::statement_result::StatementResult;
 pub use completion::{
     PreparedDistributedQuery as PreparedQueryDistributedOperation, PreparedImmediateQuery,
     PreparedQueryCompletion, PreparedQueryOperation,

@@ -15,11 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::common::admitted_query_context::QueryExecutionContext;
-use crate::common::backend_topology::BackendTopologySnapshot;
-use crate::common::query_cancellation::{
-    QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
-};
 use crate::query_execution::artifact::{
     BackendPlacement, ConnectorBindingInstallBarrier, ConnectorBindingInstallLease,
     FragmentScheduleDraft, ValidatedFragmentSchedule, ValidatedNativeSubmission,
@@ -42,9 +37,14 @@ use crate::query_execution::statistics::{
 };
 use crate::query_execution::terminal_set::QueryTerminalSet;
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
-use crate::query_lifecycle::{AttemptId, QueryExecutionId};
+use ::novarocks::common::admitted_query_context::QueryExecutionContext;
+use ::novarocks::common::backend_topology::BackendTopologySnapshot;
+use ::novarocks::common::query_cancellation::{
+    QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
+};
 use bytes::Bytes;
 use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
 use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -87,7 +87,7 @@ struct NoopConnectorBindingBarrier;
 impl ConnectorBindingInstallBarrier for NoopConnectorBindingBarrier {
     fn install_all(
         &self,
-        _execution_id: crate::query_lifecycle::QueryExecutionId,
+        _execution_id: novarocks_protocol::lifecycle::QueryExecutionId,
         _plan: crate::query_execution::artifact::ConnectorBindingInstallPlan,
     ) -> Result<ConnectorBindingInstallLease, DistributedQueryError> {
         Ok(ConnectorBindingInstallLease)
@@ -270,7 +270,7 @@ fn query_control_typestate_initializes_before_native_assembly() {
     let mut draft = FragmentScheduleDraft::new();
     draft
         .freeze_live_backends(vec![
-            crate::common::backend_topology::LiveBackendTarget::new(3, endpoint, 11),
+            ::novarocks::common::backend_topology::LiveBackendTarget::new(3, endpoint, 11),
         ])
         .expect("freeze live topology");
     draft
@@ -281,14 +281,12 @@ fn query_control_typestate_initializes_before_native_assembly() {
             .expect("validate schedule");
     let options = QueryInitOptions::new(
         protocol_execution_id,
-        vec![crate::common::backend_topology::LiveBackendTarget::new(
-            3, endpoint, 11,
-        )],
+        vec![::novarocks::common::backend_topology::LiveBackendTarget::new(3, endpoint, 11)],
         &parts.options,
         wire_query_options,
         1_000,
         std::time::Duration::from_secs(30),
-        crate::common::backend_topology::CoordinatorReportEndpoint::from_socket_addr(
+        ::novarocks::common::backend_topology::CoordinatorReportEndpoint::from_socket_addr(
             "127.0.0.1:19030".parse().expect("valid report endpoint"),
         ),
     )
@@ -378,7 +376,7 @@ fn cancellation_view_observes_injected_flag() {
 #[test]
 fn outcome_factory_rejects_intent_mismatch() {
     let result = QueryOutcomeFactory::new(DistributedQueryIntent::Result).write(
-        crate::runtime::query_result::QueryResult::empty(),
+        ::novarocks::runtime::query_result::QueryResult::empty(),
         None,
         None,
     );
@@ -617,7 +615,7 @@ fn write_outcome_preserves_commit_or_abort() {
     };
     let commit_outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Write)
         .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: crate::runtime::query_result::build_string_query_result(
+            query_result: ::novarocks::runtime::query_result::build_string_query_result(
                 "status",
                 vec!["committed".to_string()],
             )
@@ -644,7 +642,7 @@ fn write_outcome_preserves_commit_or_abort() {
     };
     let abort_outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Write)
         .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: crate::runtime::query_result::QueryResult::empty(),
+            query_result: ::novarocks::runtime::query_result::QueryResult::empty(),
             write_commit: None,
             write_abort: Some(abort.clone()),
             connector_completion: None,
@@ -663,7 +661,7 @@ fn write_outcome_preserves_commit_or_abort() {
 fn connector_staging_rejects_a_legacy_direct_commit_payload() {
     let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Write)
         .write(
-            crate::runtime::query_result::QueryResult::empty(),
+            ::novarocks::runtime::query_result::QueryResult::empty(),
             Some(WriteCommitInput {
                 write_id: novarocks_types::UniqueId::new(43, 79),
                 writers: Vec::new(),
@@ -692,7 +690,7 @@ fn profile_outcome_preserves_fragment_profiles() {
         novarocks_execution::runtime::profile::Profiler::new("fragment-7").to_native_tree();
     let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Profile)
         .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: crate::runtime::query_result::build_string_query_result(
+            query_result: ::novarocks::runtime::query_result::build_string_query_result(
                 "status",
                 vec!["profiled".to_string()],
             )
@@ -716,7 +714,7 @@ fn profile_outcome_preserves_fragment_profiles() {
 fn result_outcome_preserves_query_result() {
     let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Result)
         .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: crate::runtime::query_result::build_string_query_result(
+            query_result: ::novarocks::runtime::query_result::build_string_query_result(
                 "value",
                 vec!["kept".to_string()],
             )
@@ -742,7 +740,7 @@ fn result_outcome_preserves_query_result() {
 fn write_outcome_rejects_commit_and_abort_together() {
     let write_id = novarocks_types::UniqueId::new(8, 13);
     let result = QueryOutcomeFactory::new(DistributedQueryIntent::Write).write(
-        crate::runtime::query_result::QueryResult::empty(),
+        ::novarocks::runtime::query_result::QueryResult::empty(),
         Some(WriteCommitInput {
             write_id,
             writers: Vec::new(),
@@ -778,7 +776,7 @@ impl DistributedQueryCoordinator for RecordingCoordinator {
         request
             .into_parts()
             .completion
-            .result(crate::runtime::query_result::QueryResult::empty())
+            .result(::novarocks::runtime::query_result::QueryResult::empty())
     }
 }
 

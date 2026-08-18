@@ -32,7 +32,7 @@ use novarocks_spi::connector::{
     ConnectorRowMutationEffect, ConnectorRowMutationIntent, ConnectorRowMutationSelection,
 };
 
-use crate::protocol::native::fragment_transport::FetchedQueryBatch;
+use crate::native::fragment_transport::FetchedQueryBatch;
 use novarocks_execution::runtime::query_options::QueryOptions;
 
 const DELETE_EFFECT_TAG: i8 = 1;

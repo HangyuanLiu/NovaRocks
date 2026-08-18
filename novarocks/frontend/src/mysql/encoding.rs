@@ -33,8 +33,8 @@ use mysql_common::value::Value as MySqlValue;
 use opensrv_mysql::{Column, ColumnFlags, ColumnType, QueryResultWriter, ToMysqlValue};
 use tokio::io::AsyncWrite;
 
-use crate::common::util::{FieldRenderSchema, format_mysql_container_value_with_schema};
-use crate::runtime::query_result::{QueryResult, QueryResultColumn};
+use ::novarocks::common::util::{FieldRenderSchema, format_mysql_container_value_with_schema};
+use ::novarocks::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_execution::exec::chunk::Chunk;
 
 #[derive(Clone, Debug, PartialEq)]

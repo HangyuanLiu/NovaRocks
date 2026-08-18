@@ -1,20 +1,23 @@
 //! Frontend-owned report-only native endpoint.
 
 use std::collections::BTreeMap;
+use std::future::IntoFuture;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
-use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress};
+use crate::coordinator::QueryTerminalIngress;
+use ::novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use axum::Json;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use novarocks_protocol::lifecycle::{
-    ContractError, ContractErrorCode, ParticipantTerminalOutcome, QueryTerminalReportOutcome,
+    ContractError, ContractErrorCode, ParticipantTerminalOutcome, QueryTerminalReportAck,
+    QueryTerminalReportOutcome,
 };
 use novarocks_protocol::{filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -329,27 +332,170 @@ impl NovaRocksGrpc for FrontendReportService {
                 tonic::Status::internal(format!("query terminal ingress panicked: {error}"))
             })?
             .map_err(status_from_lifecycle_error)?;
-        let outcome = match ack.outcome().map_err(status_from_contract_error)? {
-            QueryTerminalReportOutcome::Accepted => proto::ReportQueryTerminalOutcome::Accepted,
-            QueryTerminalReportOutcome::AlreadyAccepted => {
-                proto::ReportQueryTerminalOutcome::AlreadyAccepted
-            }
-            QueryTerminalReportOutcome::RejectedConflict => {
-                proto::ReportQueryTerminalOutcome::RejectedConflict
-            }
-            QueryTerminalReportOutcome::RejectedGone => {
-                proto::ReportQueryTerminalOutcome::RejectedGone
-            }
-            QueryTerminalReportOutcome::Unspecified => {
-                return Err(tonic::Status::internal(
-                    "validated query terminal report acknowledgement has an unspecified outcome",
-                ));
-            }
-        };
-        Ok(tonic::Response::new(proto::ReportQueryTerminalResponse {
-            outcome: outcome as i32,
-            detail: ack.detail().to_string(),
-        }))
+        let response = report_response_from_ack(ack)?;
+        Ok(tonic::Response::new(response))
+    }
+}
+
+fn report_response_from_ack(
+    ack: QueryTerminalReportAck,
+) -> Result<proto::ReportQueryTerminalResponse, tonic::Status> {
+    let outcome = match ack.outcome().map_err(status_from_contract_error)? {
+        QueryTerminalReportOutcome::Accepted => proto::ReportQueryTerminalOutcome::Accepted,
+        QueryTerminalReportOutcome::AlreadyAccepted => {
+            proto::ReportQueryTerminalOutcome::AlreadyAccepted
+        }
+        QueryTerminalReportOutcome::RejectedConflict => {
+            proto::ReportQueryTerminalOutcome::RejectedConflict
+        }
+        QueryTerminalReportOutcome::RejectedGone => proto::ReportQueryTerminalOutcome::RejectedGone,
+        QueryTerminalReportOutcome::Unspecified => {
+            return Err(tonic::Status::internal(
+                "validated query terminal report acknowledgement has an unspecified outcome",
+            ));
+        }
+    };
+    Ok(proto::ReportQueryTerminalResponse {
+        outcome: outcome as i32,
+        detail: ack.detail().to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::super::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
+    use super::{FrontendReportServerHandle, report_response_from_ack};
+    use crate::coordinator::{QueryLifecycleConvergenceReader, QueryTerminalIngress};
+    use novarocks_protocol::lifecycle::{
+        AttemptId, NegativeAttestation, ParticipantBackendIdentity, ParticipantTerminalOutcome,
+        QueryExecutionId, QueryTerminalReportAck, QueryTerminalReportOutcome,
+    };
+    use novarocks_protocol::novarocks as proto;
+    use novarocks_types::QueryId;
+
+    struct FixedIngress {
+        ack: QueryTerminalReportAck,
+    }
+
+    struct EmptyConvergenceReader;
+
+    impl QueryLifecycleConvergenceReader for EmptyConvergenceReader {
+        fn latest_convergence_snapshot(
+            &self,
+        ) -> Option<crate::coordinator::QueryLifecycleConvergenceSnapshot> {
+            None
+        }
+    }
+
+    impl QueryTerminalIngress for FixedIngress {
+        fn report_query_terminal(
+            &self,
+            _outcome: ParticipantTerminalOutcome,
+        ) -> Result<QueryTerminalReportAck, ::novarocks::query_lifecycle::QueryLifecycleError>
+        {
+            Ok(self.ack.clone())
+        }
+    }
+
+    fn terminal_outcome() -> ParticipantTerminalOutcome {
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(41, 42),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("execution id");
+        let backend = ParticipantBackendIdentity::parse(proto::ParticipantBackendIdentity {
+            backend_id: 7,
+            endpoint: Some(proto::QueryControlEndpoint {
+                host: "127.0.0.1".into(),
+                port: 9030,
+            }),
+            start_epoch: 11,
+        })
+        .expect("backend identity");
+        let attestation = NegativeAttestation::seal(proto::NegativeAttestation {
+            execution_id: Some(execution_id.into()),
+            backend: Some(backend.as_proto().clone()),
+            init_digest: vec![3; 32],
+            reason: proto::NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted as i32,
+            detail: "test terminal report".to_string(),
+            detail_truncated: false,
+            digest: Vec::new(),
+        })
+        .expect("negative attestation");
+        ParticipantTerminalOutcome::parse(proto::ParticipantTerminalOutcome {
+            snapshot: None,
+            outcome: Some(
+                proto::participant_terminal_outcome::Outcome::NegativeAttestation(
+                    attestation.as_proto().clone(),
+                ),
+            ),
+        })
+        .expect("participant terminal outcome")
+    }
+
+    #[test]
+    fn terminal_report_ack_preserves_every_typed_wire_outcome() {
+        for outcome in [
+            QueryTerminalReportOutcome::Accepted,
+            QueryTerminalReportOutcome::AlreadyAccepted,
+            QueryTerminalReportOutcome::RejectedConflict,
+            QueryTerminalReportOutcome::RejectedGone,
+        ] {
+            let response = report_response_from_ack(
+                QueryTerminalReportAck::new(outcome, "test").expect("valid report ack"),
+            )
+            .expect("encode report response");
+            assert_eq!(response.outcome, outcome as i32);
+            assert_eq!(response.detail, "test");
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_report_grpc_round_trip_preserves_every_typed_wire_outcome() {
+        for outcome in [
+            QueryTerminalReportOutcome::Accepted,
+            QueryTerminalReportOutcome::AlreadyAccepted,
+            QueryTerminalReportOutcome::RejectedConflict,
+            QueryTerminalReportOutcome::RejectedGone,
+        ] {
+            let ingress = Arc::new(FixedIngress {
+                ack: QueryTerminalReportAck::new(outcome, "wire outcome")
+                    .expect("valid report acknowledgement"),
+            });
+            let convergence_reader: Arc<dyn QueryLifecycleConvergenceReader> =
+                Arc::new(EmptyConvergenceReader);
+            let mut server = FrontendReportServerHandle::start(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                ingress,
+                convergence_reader,
+            )
+            .expect("start frontend report server");
+            let mut client = tokio::time::timeout(
+                Duration::from_secs(3),
+                NovaRocksGrpcClient::connect(format!("http://{}", server.bound_addr())),
+            )
+            .await
+            .expect("report client connect timeout")
+            .expect("connect report client");
+            let response = tokio::time::timeout(
+                Duration::from_secs(3),
+                client.report_query_terminal(proto::ReportQueryTerminalRequest {
+                    outcome: Some(terminal_outcome().as_proto().clone()),
+                }),
+            )
+            .await
+            .expect("terminal report RPC timeout")
+            .expect("report terminal outcome")
+            .into_inner();
+            assert_eq!(response.outcome, outcome as i32);
+            assert_eq!(response.detail, "wire outcome");
+            drop(client);
+            server.stop().expect("stop frontend report server");
+        }
     }
 }
 
@@ -382,7 +528,7 @@ fn status_from_contract_error(error: ContractError) -> tonic::Status {
 
 /// Instance-owned report listener. The host exposes only lifecycle methods,
 /// never a Tonic service or a Core listener handle.
-pub(crate) struct FrontendReportServerHandle {
+pub struct FrontendReportServerHandle {
     bound_addr: SocketAddr,
     shutdown_tx: Option<watch::Sender<bool>>,
     failure_rx: mpsc::Receiver<String>,
@@ -392,12 +538,10 @@ pub(crate) struct FrontendReportServerHandle {
 
 impl FrontendReportServerHandle {
     pub(crate) fn start(
-        host: &str,
-        port: u16,
+        address: SocketAddr,
         ingress: Arc<dyn QueryTerminalIngress>,
         convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
     ) -> Result<Self, String> {
-        let address = parse_bind_addr(host, port)?;
         let listener = TcpListener::bind(address).map_err(|error| {
             format!("bind frontend report endpoint on {address} failed: {error}")
         })?;
@@ -419,7 +563,7 @@ impl FrontendReportServerHandle {
                         .enable_all()
                         .worker_threads(8)
                         .thread_stack_size(
-                            crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES,
+                            ::novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES,
                         )
                         .build()
                         .map_err(|error| {
@@ -452,18 +596,20 @@ impl FrontendReportServerHandle {
                             app
                         };
                         let mut shutdown_rx = shutdown_rx;
-                        axum::serve(listener, app)
-                            .with_graceful_shutdown(async move {
+                        let serve = axum::serve(listener, app).into_future();
+                        tokio::pin!(serve);
+                        tokio::select! {
+                            result = &mut serve => result.map_err(|error| {
+                                format!("frontend report endpoint serve future failed: {error}")
+                            }),
+                            _ = async move {
                                 while !*shutdown_rx.borrow() {
                                     if shutdown_rx.changed().await.is_err() {
                                         break;
                                     }
                                 }
-                            })
-                            .await
-                            .map_err(|error| {
-                                format!("frontend report endpoint serve future failed: {error}")
-                            })
+                            } => Ok(()),
+                        }
                     })
                 }));
                 if thread_stop_requested.load(Ordering::Acquire) {
@@ -494,18 +640,27 @@ impl FrontendReportServerHandle {
         })
     }
 
-    pub(crate) const fn bound_addr(&self) -> SocketAddr {
+    pub(crate) fn start_from_host(
+        host: &str,
+        port: u16,
+        ingress: Arc<dyn QueryTerminalIngress>,
+        convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
+    ) -> Result<Self, String> {
+        Self::start(parse_bind_addr(host, port)?, ingress, convergence_reader)
+    }
+
+    pub const fn bound_addr(&self) -> SocketAddr {
         self.bound_addr
     }
 
-    pub(crate) fn poll_failure(&mut self) -> Result<Option<String>, String> {
+    pub fn poll_failure(&mut self) -> Result<Option<String>, String> {
         match self.failure_rx.try_recv() {
             Ok(error) => Ok(Some(error)),
             Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => Ok(None),
         }
     }
 
-    pub(crate) fn stop(&mut self) -> Result<(), String> {
+    pub fn stop(&mut self) -> Result<(), String> {
         self.stop_requested.store(true, Ordering::Release);
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(true);

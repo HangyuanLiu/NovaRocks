@@ -21,7 +21,6 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
-use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks::runtime::scan_range::{
     DatacacheOptions, DeletionVectorDescriptor, FileFormat, FilePruningMinMaxValue,
     FilePruningValueKind, FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat,
@@ -32,6 +31,7 @@ use novarocks_execution::runtime::fragment::{
     BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_protocol::{common, novarocks as proto};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
@@ -356,9 +356,7 @@ fn protocol_error(
     kind: ProtocolErrorKind,
     detail: impl Into<String>,
 ) -> NativeFragmentIngressError {
-    NativeFragmentIngressError::new(
-        ProtocolError::new(ProtocolFamily::Native, path, kind, detail.into()).to_string(),
-    )
+    NativeFragmentIngressError::new(ProtocolError::new(path, kind, detail.into()).to_string())
 }
 
 fn missing(path: FieldPath, detail: impl Into<String>) -> NativeFragmentIngressError {

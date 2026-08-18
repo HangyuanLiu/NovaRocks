@@ -26,7 +26,6 @@ use novarocks_spi::connector::{
 };
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::common::backend_topology::BackendTopologySnapshot;
 use crate::query_execution::contract::{
     ConnectorWriteExecutionRegistration, ConnectorWriteOperationRegistration,
     ConnectorWritePlanningTemplate,
@@ -35,6 +34,7 @@ use crate::query_execution::outcome::ConnectorWriteCompletion;
 use crate::query_execution::preparation::scan::PlannedConnectorRead;
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
+use ::novarocks::common::backend_topology::BackendTopologySnapshot;
 use novarocks::connector::distributed_rewrite_application::{
     DistributedRewriteApplicationSession, DistributedRewriteSealing, SealedDistributedRewrite,
 };

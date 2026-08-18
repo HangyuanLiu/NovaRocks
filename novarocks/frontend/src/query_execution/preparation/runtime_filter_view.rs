@@ -666,7 +666,7 @@ pub enum RuntimeFilterDeploymentBindingRoleFacts {
 pub struct RuntimeFilterValidatedPlacementFacts {
     fragment_id: u32,
     instance_index: usize,
-    fragment_instance_id: crate::common::types::UniqueId,
+    fragment_instance_id: ::novarocks::common::types::UniqueId,
     backend_idx: usize,
 }
 
@@ -679,7 +679,7 @@ impl RuntimeFilterValidatedPlacementFacts {
         self.instance_index
     }
 
-    pub const fn fragment_instance_id(self) -> crate::common::types::UniqueId {
+    pub const fn fragment_instance_id(self) -> ::novarocks::common::types::UniqueId {
         self.fragment_instance_id
     }
 

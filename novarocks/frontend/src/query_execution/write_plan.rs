@@ -32,9 +32,9 @@ use novarocks_spi::connector::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::common::types::UniqueId;
 use crate::query_execution::schedule::SchedulingPlan;
-use crate::query_lifecycle::QueryExecutionId;
+use ::novarocks::common::types::UniqueId;
+use novarocks_protocol::lifecycle::QueryExecutionId;
 use novarocks_sql::plan_read::FragmentId;
 
 /// One exact, placement-frozen writer manifest.  C1 gives each terminal sink
@@ -376,7 +376,7 @@ mod tests {
     fn execution() -> QueryExecutionId {
         QueryExecutionId::new(
             crate::query_execution::contract::QueryId::new(13, 17),
-            crate::query_lifecycle::AttemptId::new(5).expect("valid attempt"),
+            novarocks_protocol::lifecycle::AttemptId::new(5).expect("valid attempt"),
         )
         .expect("valid execution")
     }

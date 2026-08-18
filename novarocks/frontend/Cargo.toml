@@ -21,6 +21,7 @@ chrono = "0.4"
 datasketches = "0.2.0"
 futures = "0.3"
 hex = "0.4"
+libc = "0.2"
 novarocks = { path = "../core" }
 novarocks-fs = { path = "../fs" }
 novarocks-catalog = { path = "../catalog" }
@@ -30,6 +31,8 @@ novarocks-spi = { path = "../spi" }
 novarocks-sql = { path = "../sql" }
 novarocks-state-store = { path = "../state-store" }
 novarocks-types = { path = "../types" }
+mysql_common = "0.32"
+opensrv-mysql = { version = "0.7", default-features = false }
 prost = "0.13"
 regex = "1.10"
 serde = { version = "1", features = ["derive"] }

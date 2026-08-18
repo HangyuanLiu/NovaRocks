@@ -21,12 +21,12 @@
 //! ownership.  The opaque core handle owns exactly one admitted connector
 //! session; it is never recreated after a durable plan or evidence barrier.
 
-use crate::common::admitted_query_context::RequestContext;
 use crate::query_execution::dml::add_files::{
     AddFilesCommand, AddFilesDispatchState, AddFilesEffect, AddFilesEngine, AddFilesEvidence,
     AddFilesFailure, AddFilesFailureKind, AddFilesFinalization, AddFilesOutcome, AddFilesPlanError,
     AddFilesPlanFacts, AddFilesReceipt, PlanAddFilesRequest, PreparedAddFiles,
 };
+use ::novarocks::common::admitted_query_context::RequestContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorDataMutationSourceScopeKind, ExternalMutationEvidence, REGISTER_EXISTING_FILES_KIND,
@@ -1027,10 +1027,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
-    use crate::common::backend_topology::BackendTopologySnapshot;
-    use crate::common::query_cancellation::QueryCancellationSource;
     use crate::query_execution::dml::add_files::{AddFilesCommand, AddFilesPrepared};
+    use ::novarocks::common::admitted_query_context::{RequestAdmission, RequestContext};
+    use ::novarocks::common::backend_topology::BackendTopologySnapshot;
+    use ::novarocks::common::query_cancellation::QueryCancellationSource;
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorDataMutationPlanSummary, ConnectorDataMutationReceipt,

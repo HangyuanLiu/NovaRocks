@@ -19,11 +19,11 @@
 
 use std::collections::BTreeMap;
 
-use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks_execution::exec::fragment::program::{
     FragmentNodeId, ScanAssignmentKind, ScanSourceContract,
 };
 use novarocks_protocol::plan;
+use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
 
 pub(crate) fn decode_scan_source_contracts(
     root: &plan::DistributedNode,
@@ -102,14 +102,14 @@ fn visit(
 }
 
 fn error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) -> ProtocolError {
-    ProtocolError::new(ProtocolFamily::Native, path, kind, detail)
+    ProtocolError::new(path, kind, detail)
 }
 
 #[cfg(test)]
 mod tests {
     use super::decode_scan_source_contracts;
-    use novarocks::protocol::FieldPath;
     use novarocks_execution::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
+    use novarocks_protocol::FieldPath;
     use novarocks_protocol::plan;
 
     #[test]

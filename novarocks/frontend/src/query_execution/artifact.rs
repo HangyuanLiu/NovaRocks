@@ -33,9 +33,7 @@ use arrow::datatypes::Field;
 use novarocks_spi::connector::ConnectorWriteCohortId;
 use sha2::{Digest, Sha256};
 
-use crate::common::backend_topology::LiveBackendTarget;
-use crate::common::types::UniqueId;
-use crate::protocol::native::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBatch};
+use crate::native::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBatch};
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind, QueryId};
 use crate::query_execution::launch::{QueryLaunchBarrier, StageBatch, StageParticipantBinding};
 use crate::query_execution::lifecycle_plan::{
@@ -51,14 +49,16 @@ use crate::query_execution::schedule::{
 };
 use crate::query_execution::write_plan::{ConnectorWriteManifest, ConnectorWritePlanAttachment};
 use crate::query_execution::{RuntimeFilterBindingFactsView, RuntimeFilterDeploymentFactsView};
-use crate::query_lifecycle::{
-    ExchangeRouteManifest, QueryExecutionId, RuntimeFilterContribution, StageFragment,
-};
-use crate::runtime::query_result::{QueryResult, QueryResultColumn};
+use ::novarocks::common::backend_topology::LiveBackendTarget;
+use ::novarocks::common::types::UniqueId;
+use ::novarocks::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_protocol::lifecycle::{
     AttemptId as ProtocolAttemptId, QueryExecutionId as ProtocolQueryExecutionId,
+};
+use novarocks_protocol::lifecycle::{
+    ExchangeRouteManifest, QueryExecutionId, RuntimeFilterContribution, StageFragment,
 };
 use novarocks_protocol::plan::RuntimeFilterBindingTable;
 use novarocks_protocol::{common, novarocks};
@@ -1308,7 +1308,7 @@ pub fn fragment_instance_id_for_contract_test(
 ) -> UniqueId {
     let execution_id = QueryExecutionId::new(
         query_id,
-        crate::query_lifecycle::AttemptId::new(1)
+        novarocks_protocol::lifecycle::AttemptId::new(1)
             .expect("contract fixtures use a nonzero initial attempt"),
     )
     .expect("contract fixtures use a nonzero query id");
@@ -2005,12 +2005,12 @@ mod tests {
         attach_connector_write_plans, build_fragment_lifecycle_projection,
         derive_fragment_instance_id, place_connector_splits_by_cost,
     };
-    use crate::common::backend_topology::LiveBackendTarget;
-    use crate::common::types::UniqueId;
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
-    use crate::query_lifecycle::{AttemptId, ExchangeRouteManifest, QueryExecutionId};
+    use ::novarocks::common::backend_topology::LiveBackendTarget;
+    use ::novarocks::common::types::UniqueId;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+    use novarocks_protocol::lifecycle::{AttemptId, ExchangeRouteManifest, QueryExecutionId};
     use novarocks_protocol::{common, novarocks};
     use novarocks_sql::plan_read::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,

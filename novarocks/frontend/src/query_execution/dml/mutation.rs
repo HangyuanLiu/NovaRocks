@@ -25,7 +25,7 @@ use std::any::Any;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::common::admitted_query_context::QueryExecutionContext;
+use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 
 const PREPARED: u8 = 0;

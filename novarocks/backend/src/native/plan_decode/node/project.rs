@@ -21,13 +21,13 @@ use std::sync::Arc;
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::native::plan_decode::error::NativeFragmentLeafDecodeError;
 use crate::native::plan_decode::layout::Layout;
-use novarocks::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use novarocks_execution::exec::chunk::{
     ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema,
 };
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::project::ProjectNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_protocol::{FieldPath, ProtocolErrorKind};
 use novarocks_protocol::{expr, plan};
 use novarocks_types::SlotId;
 
@@ -314,8 +314,8 @@ mod tests {
     use super::super::{NativePlanDecodeContext, decode_node};
     use super::*;
     use crate::native::type_decode::encode_type;
-    use novarocks::protocol::common::error::ProtocolErrorKind;
     use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_protocol::ProtocolErrorKind;
     use novarocks_protocol::{common, expr, plan};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {

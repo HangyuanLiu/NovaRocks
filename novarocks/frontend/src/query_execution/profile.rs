@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::outcome::FragmentProfileSet;
-use crate::query_lifecycle::{
+use ::novarocks::query_lifecycle::{
     FragmentTerminalOutcome, FragmentTerminalSnapshot, QueryTerminalSnapshot,
 };
 
@@ -141,7 +141,7 @@ struct RuntimeFilterProfileTotals {
 
 impl RuntimeFilterProfileTotals {
     fn from_contribution(
-        contribution: &crate::query_lifecycle::QueryTerminalProfileContributionV1,
+        contribution: &::novarocks::query_lifecycle::QueryTerminalProfileContributionV1,
     ) -> Result<Self, DistributedQueryError> {
         let mut totals = Self::default();
         for consumer in contribution.consumers() {
@@ -342,7 +342,7 @@ impl RuntimeFilterProfileTotals {
 
 fn runtime_filter_profile_tree(
     snapshot: &QueryTerminalSnapshot,
-    contribution: &crate::query_lifecycle::QueryTerminalProfileContributionV1,
+    contribution: &::novarocks::query_lifecycle::QueryTerminalProfileContributionV1,
     totals: RuntimeFilterProfileTotals,
 ) -> Result<RuntimeProfileTree, DistributedQueryError> {
     let execution_id = snapshot.execution_id();
@@ -1073,18 +1073,20 @@ mod tests {
         collect_distributed_profile_summary_from_profile_trees,
         collect_per_fragment_profile_summaries, merge_actual_metrics,
     };
-    use crate::common::types::UniqueId;
     use crate::query_execution::contract::QueryId;
-    use crate::query_lifecycle::{
-        AttemptId, ParticipantBackendIdentity, ParticipantManifestDigest, QueryControlEndpoint,
-        QueryExecutionId, QueryTerminalProfileContributionV1,
-        QueryTerminalRuntimeFilterChannelInstallStateV1, QueryTerminalRuntimeFilterChannelKeyV1,
-        QueryTerminalRuntimeFilterChannelTerminalStateV1, QueryTerminalRuntimeFilterChannelV1,
-        QueryTerminalRuntimeFilterConsumerKeyV1, QueryTerminalRuntimeFilterConsumerV1,
-        QueryTerminalRuntimeFilterScanNotEvaluatedV1,
+    use ::novarocks::common::types::UniqueId;
+    use ::novarocks::query_lifecycle::{
+        QueryTerminalProfileContributionV1, QueryTerminalRuntimeFilterChannelInstallStateV1,
+        QueryTerminalRuntimeFilterChannelKeyV1, QueryTerminalRuntimeFilterChannelTerminalStateV1,
+        QueryTerminalRuntimeFilterChannelV1, QueryTerminalRuntimeFilterConsumerKeyV1,
+        QueryTerminalRuntimeFilterConsumerV1, QueryTerminalRuntimeFilterScanNotEvaluatedV1,
         QueryTerminalRuntimeFilterSubscriptionTerminalV1, QueryTerminalSnapshot,
     };
     use novarocks_execution::runtime::profile::{ProfileUnit, Profiler, RuntimeProfileTree};
+    use novarocks_protocol::lifecycle::{
+        AttemptId, ParticipantBackendIdentity, ParticipantManifestDigest, QueryControlEndpoint,
+        QueryExecutionId,
+    };
 
     fn runtime_filter_snapshot(
         backend_id: u64,

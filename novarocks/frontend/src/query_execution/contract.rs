@@ -22,8 +22,6 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::common::admitted_query_context::QueryExecutionContext;
-use crate::common::query_cancellation::QueryCancellationView;
 use crate::query_execution::artifact::PreparedDistributedQuery;
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 pub use crate::query_execution::outcome::DistributedQueryOutcome;
@@ -34,6 +32,8 @@ pub use crate::query_execution::profile::ProfileTerminalBuilder;
 pub use crate::query_execution::statistics::StatisticsCollectionProgram;
 pub use crate::query_execution::statistics::StatisticsExecutionMode;
 pub use crate::query_execution::statistics::StatisticsExecutionPolicy;
+use ::novarocks::common::admitted_query_context::QueryExecutionContext;
+use ::novarocks::common::query_cancellation::QueryCancellationView;
 use novarocks_execution::runtime::query_options::QueryOptions as RuntimeQueryOptions;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
@@ -59,7 +59,7 @@ pub struct ResolvedQueryOptions {
 impl ResolvedQueryOptions {
     pub(crate) fn from_upstream(options: Option<QueryOptions>) -> Self {
         let mut runtime = options
-            .map(|options| crate::protocol::decode_native_query_options(options.as_proto()))
+            .map(|options| ::novarocks::protocol::decode_native_query_options(options.as_proto()))
             .transpose()
             .expect("validated Protocol query options must decode for execution")
             .unwrap_or_default();
@@ -582,7 +582,7 @@ impl ConnectorWriteExecutionRegistration {
 pub struct DistributedQueryRequest {
     artifacts: PreparedDistributedQuery,
     options: ResolvedQueryOptions,
-    topology: crate::common::backend_topology::BackendTopologySnapshot,
+    topology: ::novarocks::common::backend_topology::BackendTopologySnapshot,
     deadline: Option<Instant>,
     cancellation: QueryCancellationView,
     completion: QueryOutcomeFactory,
@@ -607,7 +607,7 @@ impl DistributedQueryRequest {
         &self.cancellation
     }
 
-    pub fn topology(&self) -> &crate::common::backend_topology::BackendTopologySnapshot {
+    pub fn topology(&self) -> &::novarocks::common::backend_topology::BackendTopologySnapshot {
         &self.topology
     }
 
@@ -642,7 +642,7 @@ impl DistributedQueryRequest {
 pub struct DistributedQueryRequestParts {
     pub artifacts: PreparedDistributedQuery,
     pub options: ResolvedQueryOptions,
-    pub topology: crate::common::backend_topology::BackendTopologySnapshot,
+    pub topology: ::novarocks::common::backend_topology::BackendTopologySnapshot,
     pub deadline: Option<Instant>,
     pub cancellation: QueryCancellationView,
     pub completion: QueryOutcomeFactory,

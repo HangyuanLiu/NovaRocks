@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use crate::query_execution::contract::DistributedQueryErrorKind;
-use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress};
+use ::novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_protocol::lifecycle::{
     ParticipantTerminalOutcome, QueryTerminalReportAck, QueryTerminalReportOutcome,
 };
@@ -31,6 +31,15 @@ use super::query_registry::FrontendQueryRegistry;
 #[derive(Clone)]
 pub struct FrontendCoordinatorTerminalIngress {
     registry: Arc<FrontendQueryRegistry>,
+}
+
+/// Frontend-owned ingress for immutable participant terminal outcomes.
+/// It is intentionally distinct from FE-to-BE lifecycle RPCs.
+pub trait QueryTerminalIngress: Send + Sync + 'static {
+    fn report_query_terminal(
+        &self,
+        outcome: ParticipantTerminalOutcome,
+    ) -> Result<QueryTerminalReportAck, QueryLifecycleError>;
 }
 
 impl FrontendCoordinatorTerminalIngress {

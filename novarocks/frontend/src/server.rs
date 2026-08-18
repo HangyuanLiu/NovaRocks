@@ -21,13 +21,11 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use crate::capabilities as core_capabilities;
-use novarocks::server::ResolvedMysqlListenerSettings;
-use novarocks::server::session::QuerySessionFactory;
+use crate::{QuerySessionFactory, ResolvedMysqlListenerSettings};
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_state_store::StateStoreHostConfig;
 
-use crate::native::report_server::FrontendReportServerHandle;
 use crate::query_execution::maintenance::{
     BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory,
 };
@@ -41,7 +39,7 @@ type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Clone)]
 struct FrontendBackgroundMaintenanceAttemptFactory {
     role: novarocks_types::ClusterRole,
-    topology: crate::common::backend_topology::BackendTopologyService,
+    topology: ::novarocks::common::backend_topology::BackendTopologyService,
 }
 
 impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemptFactory {
@@ -333,7 +331,7 @@ pub fn build_frontend_query_session_factory(
 pub fn run_frontend_server(config: FrontendServerConfig) -> Result<(), FrontendApplicationError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
+        .thread_stack_size(::novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
         .build()
         .map_err(|error| {
             FrontendApplicationError::server(format!(
@@ -389,13 +387,8 @@ async fn serve_ready_frontend_session_factory<F>(
 where
     F: Future<Output = ()> + Send,
 {
-    let mut report_server = FrontendReportServerHandle::start(
-        &config.report_bind_host,
-        config.report_grpc_port,
-        host.terminal_ingress(),
-        host.lifecycle_convergence_reader(),
-    )
-    .map_err(FrontendApplicationError::server)?;
+    let mut report_server =
+        host.start_report_server_from_host(&config.report_bind_host, config.report_grpc_port)?;
     let exchange_port = report_server.bound_addr().port();
     host.coordinator_report_endpoint_sink()
         .set_bound_port(exchange_port);
@@ -415,13 +408,10 @@ where
             return combine_server_and_shutdown(Err(error), stop_result);
         }
     };
-    let server_result = novarocks::server::run_mysql_server_until_shutdown(
-        config.mysql_listener,
-        session_factory,
-        shutdown,
-    )
-    .await
-    .map_err(FrontendApplicationError::server);
+    let server_result =
+        crate::run_mysql_server_until_shutdown(config.mysql_listener, session_factory, shutdown)
+            .await
+            .map_err(FrontendApplicationError::server);
     let stop_result = report_server
         .stop()
         .map_err(FrontendApplicationError::server);
@@ -613,9 +603,7 @@ mod tests {
         ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
         FrontendApplicationHost, FrontendExecutionConfig,
     };
-    use novarocks::{
-        server::ResolvedMysqlListenerSettings, server::session::QuerySessionOpenRequest,
-    };
+    use crate::{QueryServiceErrorKind, QuerySessionOpenRequest, ResolvedMysqlListenerSettings};
     use novarocks_state_store::{
         FoundationDbClientConfig, StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig,
         StateStoreLimitOverrides, StateStoreProviderConfig,
@@ -797,7 +785,7 @@ mod tests {
                 .await
                 .expect_err("a dropped catalog stops being admitted")
                 .kind(),
-            novarocks::server::session::QueryServiceErrorKind::BadDatabase
+            QueryServiceErrorKind::BadDatabase
         );
 
         // The ready session factory and this test's probe both hold StateStore references; the
@@ -820,25 +808,25 @@ mod tests {
         .await
         .expect("open frontend application host");
         let report_endpoint = host.coordinator_report_endpoint_sink();
-        let mut report_server = crate::native::report_server::FrontendReportServerHandle::start(
-            "127.0.0.1",
-            0,
-            host.terminal_ingress(),
-            host.lifecycle_convergence_reader(),
-        )
-        .expect("start frontend-owned report endpoint");
-        let grpc_port = report_server.bound_addr().port();
-        report_endpoint.set_bound_port(grpc_port);
-        assert_ne!(
-            grpc_port, 0,
-            "ephemeral report listener selects a real port"
-        );
-        assert_eq!(
-            report_server.poll_failure().expect("poll report listener"),
-            None,
-            "report listener remains live after bind"
-        );
-        report_server.stop().expect("stop frontend report endpoint");
+        for bind_addr in ["127.0.0.1:0".parse().unwrap(), "[::1]:0".parse().unwrap()] {
+            let mut report_server = host
+                .start_report_server(bind_addr)
+                .expect("start frontend-owned report endpoint");
+            let bound_addr = report_server.bound_addr();
+            report_endpoint.set_bound_port(bound_addr.port());
+            assert_ne!(
+                bound_addr.port(),
+                0,
+                "ephemeral report listener selects a real port"
+            );
+            assert_eq!(bound_addr.is_ipv6(), bind_addr.is_ipv6());
+            assert_eq!(
+                report_server.poll_failure().expect("poll report listener"),
+                None,
+                "report listener remains live after bind"
+            );
+            report_server.stop().expect("stop frontend report endpoint");
+        }
         host.shutdown()
             .await
             .expect("shutdown frontend application host");

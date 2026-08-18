@@ -17,8 +17,8 @@
 
 //! Backend-owned native fragment envelope validation.
 
-use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks_protocol::plan;
+use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
 
 pub(crate) fn require_root(
     fragment: &plan::PlanFragment,
@@ -43,12 +43,7 @@ pub(crate) fn require_sink(
 }
 
 fn error(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
-    ProtocolError::new(
-        ProtocolFamily::Native,
-        path,
-        ProtocolErrorKind::MissingField,
-        detail,
-    )
+    ProtocolError::new(path, ProtocolErrorKind::MissingField, detail)
 }
 
 #[cfg(test)]

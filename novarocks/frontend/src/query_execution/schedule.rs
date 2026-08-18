@@ -23,13 +23,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
-use crate::common::backend_topology::LiveBackendTarget;
-use crate::common::types::UniqueId;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle_plan::QueryInitPlanHeader;
-use crate::query_lifecycle::ExchangeRouteManifest;
-use crate::runtime::scan_range::ScanRangeParams;
+use ::novarocks::common::backend_topology::LiveBackendTarget;
+use ::novarocks::common::types::UniqueId;
+use ::novarocks::runtime::scan_range::ScanRangeParams;
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use novarocks_protocol::lifecycle::ExchangeRouteManifest;
 use novarocks_spi::connector::ConnectorSplit;
 use novarocks_sql::plan_read::FragmentId;
 

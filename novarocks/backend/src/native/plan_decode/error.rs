@@ -18,8 +18,7 @@
 use std::error::Error;
 use std::fmt;
 
-use novarocks::protocol::common::error::FieldPathSegment;
-use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
+use novarocks_protocol::{FieldPath, FieldPathSegment, ProtocolError, ProtocolErrorKind};
 
 /// Typed error used by nested native-protobuf leaf decoders before the owning
 /// DTO boundary attaches its exact [`FieldPath`].
@@ -168,12 +167,7 @@ impl NativeFragmentDecodeError {
     }
 
     fn protocol_error(path: FieldPath, kind: ProtocolErrorKind, detail: impl fmt::Display) -> Self {
-        Self::Protocol(ProtocolError::new(
-            ProtocolFamily::Native,
-            path,
-            kind,
-            detail.to_string(),
-        ))
+        Self::Protocol(ProtocolError::new(path, kind, detail.to_string()))
     }
 }
 

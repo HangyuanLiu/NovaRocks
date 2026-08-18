@@ -17,12 +17,12 @@
 
 //! Closed typed executor for Iceberg MV statements.
 
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::mv::domain::application::{MvApplicationService, MvStatementResult};
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::repository::MvRepository;
-use crate::runtime::statement_result::StatementResult;
+use ::novarocks::common::admitted_query_context::QueryExecutionContext;
+use ::novarocks::runtime::statement_result::StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::syntax::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, MvAdmittedStatement, ObjectName,
@@ -35,7 +35,7 @@ use crate::mv::domain::{
     PROCEDURE_NAME, alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports,
     execute_novarocks_imv_stateless_rebuild, list_mvs_with_backend,
 };
-use crate::runtime::query_result::build_string_query_result;
+use ::novarocks::runtime::query_result::build_string_query_result;
 use std::sync::Arc;
 
 #[derive(Clone)]

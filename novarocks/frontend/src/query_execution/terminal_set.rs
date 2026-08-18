@@ -25,14 +25,14 @@ use std::collections::BTreeSet;
 
 use novarocks_protocol::lifecycle::QueryTerminalSnapshot as ProtocolQueryTerminalSnapshot;
 
-use crate::query_lifecycle::terminal::{
+use ::novarocks::query_lifecycle::terminal::{
     FragmentTerminalOutcome, FragmentTerminalSnapshot, QueryTerminalSnapshot,
     decode_fragment_terminal_profile_telemetry,
     decode_query_terminal_profile_contribution_telemetry,
 };
-use crate::query_lifecycle::{
-    ParticipantBackendIdentity, ParticipantManifestDigest, QueryExecutionId, QueryLifecycleError,
-    QueryLifecycleErrorCode,
+use ::novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
+use novarocks_protocol::lifecycle::{
+    ParticipantBackendIdentity, ParticipantManifestDigest, QueryExecutionId,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -85,7 +85,7 @@ impl QueryTerminalSet {
 
     pub fn fragments(
         &self,
-    ) -> impl Iterator<Item = &crate::query_lifecycle::FragmentTerminalSnapshot> {
+    ) -> impl Iterator<Item = &::novarocks::query_lifecycle::FragmentTerminalSnapshot> {
         self.snapshots
             .iter()
             .flat_map(QueryTerminalSnapshot::fragments)
@@ -101,7 +101,7 @@ impl QueryTerminalSet {
 fn decode_protocol_terminal_snapshot_projection(
     value: &novarocks_protocol::novarocks::QueryTerminalSnapshot,
 ) -> Result<QueryTerminalSnapshot, QueryLifecycleError> {
-    use crate::runtime::sink_commit::{
+    use ::novarocks::runtime::sink_commit::{
         SinkCommitReportSnapshot, SinkLoadStats, TabletCommitInfo, TabletFailInfo,
     };
 

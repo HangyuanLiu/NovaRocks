@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::runtime::query_result::{QueryResult, QueryResultColumn};
+use ::novarocks::runtime::query_result::{QueryResult, QueryResultColumn};
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;

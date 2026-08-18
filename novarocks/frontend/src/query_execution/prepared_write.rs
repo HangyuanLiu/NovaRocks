@@ -19,7 +19,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::contract::{
     ConnectorWriteExecutionRegistration, ConnectorWriteOperationRegistration,
     DistributedQueryError, DistributedQueryIntent, DistributedQueryRequest,
@@ -27,6 +26,7 @@ use crate::query_execution::contract::{
 };
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::PreparedFragmentSet;
+use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorWriteCohortId, ConnectorWriteLease, ConnectorWriteOperationId,

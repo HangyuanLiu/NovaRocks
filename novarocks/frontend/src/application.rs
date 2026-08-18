@@ -868,13 +868,41 @@ impl FrontendApplicationHost {
         self.query_control.clone()
     }
 
-    pub fn terminal_ingress(&self) -> Arc<dyn crate::query_lifecycle::QueryTerminalIngress> {
+    pub fn terminal_ingress(&self) -> Arc<dyn crate::coordinator::QueryTerminalIngress> {
         Arc::new(
             self.coordinator
                 .as_ref()
                 .expect("frontend coordinator is installed before host open returns")
                 .terminal_ingress(),
         )
+    }
+
+    pub fn start_report_server(
+        &self,
+        bind_addr: std::net::SocketAddr,
+    ) -> Result<crate::native::report_server::FrontendReportServerHandle, FrontendApplicationError>
+    {
+        crate::native::report_server::FrontendReportServerHandle::start(
+            bind_addr,
+            self.terminal_ingress(),
+            self.lifecycle_convergence_reader(),
+        )
+        .map_err(FrontendApplicationError::server)
+    }
+
+    pub(crate) fn start_report_server_from_host(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<crate::native::report_server::FrontendReportServerHandle, FrontendApplicationError>
+    {
+        crate::native::report_server::FrontendReportServerHandle::start_from_host(
+            host,
+            port,
+            self.terminal_ingress(),
+            self.lifecycle_convergence_reader(),
+        )
+        .map_err(FrontendApplicationError::server)
     }
 
     pub(crate) fn lifecycle_convergence_reader(&self) -> Arc<dyn QueryLifecycleConvergenceReader> {
@@ -910,13 +938,13 @@ impl FrontendApplicationHost {
 
     pub fn backend_query_event_sink(
         &self,
-    ) -> Arc<dyn crate::common::backend_topology::BackendQueryEventSink> {
+    ) -> Arc<dyn ::novarocks::common::backend_topology::BackendQueryEventSink> {
         Arc::new(self.backend_query_activity())
     }
 
     pub fn coordinator_report_endpoint_sink(
         &self,
-    ) -> Arc<dyn crate::common::backend_topology::CoordinatorReportEndpointSink> {
+    ) -> Arc<dyn ::novarocks::common::backend_topology::CoordinatorReportEndpointSink> {
         self.coordinator
             .as_ref()
             .expect("frontend coordinator is installed before host open returns")
@@ -926,8 +954,10 @@ impl FrontendApplicationHost {
     /// Frontend composition-time topology leaf.  The all-in-one server uses it
     /// only to register its separately owned backend endpoint before it builds
     /// the same ready SQL session factory as role=fe.
-    pub fn backend_topology_port(&self) -> crate::common::backend_topology::BackendTopologyService {
-        Arc::clone(self.topology()) as crate::common::backend_topology::BackendTopologyService
+    pub fn backend_topology_port(
+        &self,
+    ) -> ::novarocks::common::backend_topology::BackendTopologyService {
+        Arc::clone(self.topology()) as ::novarocks::common::backend_topology::BackendTopologyService
     }
 
     pub async fn shutdown(mut self) -> Result<(), FrontendApplicationError> {

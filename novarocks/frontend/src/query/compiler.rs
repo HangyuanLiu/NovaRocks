@@ -22,7 +22,6 @@ use std::sync::Arc;
 use crate::catalog_application::information_schema;
 use crate::catalog_application::query_materializer::build_catalog_service_provider;
 use crate::catalog_application::virtual_table;
-use crate::common::admitted_query_context::{QueryExecutionContext, RequestContext};
 use crate::mv::domain::repository::MvRepository;
 use crate::native::fragment_encoder::encode_native_fragment_bundle;
 use crate::query_execution::PreparedQueryOperation;
@@ -39,6 +38,7 @@ use crate::query_execution::planning::time_travel::{
 };
 use crate::query_execution::post_compile::{PostCompileIntent, prepare_compiled_distributed_query};
 use crate::view::ViewRequestContext;
+use ::novarocks::common::admitted_query_context::{QueryExecutionContext, RequestContext};
 use novarocks::connector::connector_request_context_for_query;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_spi::connector::MvStorageObservationPort;

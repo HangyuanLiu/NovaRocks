@@ -570,7 +570,7 @@ fn claim_backend_fault(
         execution_id,
         backend_index,
         backend_id,
-        novarocks::runtime::start_epoch::start_epoch(),
+        crate::runtime::start_epoch::start_epoch(),
     )
     .map_err(tonic::Status::failed_precondition)
 }
@@ -633,7 +633,7 @@ fn observe_backend_fault(
         execution_id,
         backend_index,
         backend_id,
-        novarocks::runtime::start_epoch::start_epoch(),
+        crate::runtime::start_epoch::start_epoch(),
     )
     .map_err(tonic::Status::failed_precondition)
 }

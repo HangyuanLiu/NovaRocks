@@ -527,7 +527,7 @@ pub fn compose_frontend_server_config(
         Duration::from_secs(config.cluster.decommission_timeout_secs),
     )
     .map_err(|error| anyhow::anyhow!("open frontend backend cluster configuration: {error}"))?;
-    let mysql_listener = novarocks::server::resolve_mysql_listener_settings(
+    let mysql_listener = novarocks_frontend::resolve_mysql_listener_settings(
         config
             .standalone_server
             .as_ref()
@@ -677,6 +677,13 @@ pub fn run_all_in_one(config: NovaRocksConfig, port_override: Option<u16>) -> an
     ))
 }
 
+fn all_in_one_report_bind_addr(backend_endpoint: std::net::SocketAddr) -> std::net::SocketAddr {
+    match backend_endpoint.ip() {
+        std::net::IpAddr::V4(_) => std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        std::net::IpAddr::V6(_) => std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+    }
+}
+
 async fn run_all_in_one_until<F>(
     config: NovaRocksConfig,
     port_override: Option<u16>,
@@ -691,10 +698,7 @@ where
         .await
         .map_err(|error| anyhow::anyhow!("open all-in-one frontend application failed: {error}"))?;
     let backend_config = compose_backend_server_config(&config, runtime)?;
-    let mut backend = match BackendApplicationHost::open_with_terminal_ingress(
-        backend_config,
-        Some(frontend.terminal_ingress()),
-    ) {
+    let mut backend = match BackendApplicationHost::open(backend_config) {
         Ok(backend) => backend,
         Err(error) => {
             let frontend_cleanup = frontend.shutdown().await;
@@ -705,26 +709,68 @@ where
         }
     };
     let endpoint = backend.connectable_native_endpoint();
-    let topology = frontend.backend_topology_port();
-    topology
-        .add_backend(endpoint)
-        .map_err(|error| anyhow::anyhow!("register all-in-one backend {endpoint}: {error}"))?;
-    wait_for_live_backend(topology.as_ref(), endpoint).await?;
+    let report_bind_addr = all_in_one_report_bind_addr(endpoint);
+    let mut report_server = match frontend.start_report_server(report_bind_addr) {
+        Ok(report_server) => report_server,
+        Err(error) => {
+            let backend_cleanup = backend.shutdown();
+            let frontend_cleanup = frontend.shutdown().await;
+            return Err(anyhow::anyhow!(
+                "open all-in-one frontend report endpoint failed: {error}; backend cleanup: {:?}; frontend cleanup: {:?}",
+                backend_cleanup.err(),
+                frontend_cleanup.err()
+            ));
+        }
+    };
+    let report_port = report_server.bound_addr().port();
     frontend
         .coordinator_report_endpoint_sink()
-        .set_bound_port(endpoint.port());
-    let session_factory = novarocks_frontend::build_frontend_query_session_factory(
+        .set_bound_port(report_port);
+    let topology = frontend.backend_topology_port();
+    if let Err(error) = topology.add_backend(endpoint) {
+        let report_cleanup = report_server.stop();
+        let backend_cleanup = backend.shutdown();
+        let frontend_cleanup = frontend.shutdown().await;
+        return Err(anyhow::anyhow!(
+            "register all-in-one backend {endpoint}: {error}; report cleanup: {:?}; backend cleanup: {:?}; frontend cleanup: {:?}",
+            report_cleanup.err(),
+            backend_cleanup.err(),
+            frontend_cleanup.err()
+        ));
+    }
+    if let Err(error) = wait_for_live_backend(topology.as_ref(), endpoint).await {
+        let report_cleanup = report_server.stop();
+        let backend_cleanup = backend.shutdown();
+        let frontend_cleanup = frontend.shutdown().await;
+        return Err(anyhow::anyhow!(
+            "wait for all-in-one backend {endpoint}: {error}; report cleanup: {:?}; backend cleanup: {:?}; frontend cleanup: {:?}",
+            report_cleanup.err(),
+            backend_cleanup.err(),
+            frontend_cleanup.err()
+        ));
+    }
+    let session_factory = match novarocks_frontend::build_frontend_query_session_factory(
         &frontend,
         std::sync::Arc::new(novarocks_frontend::SystemCatalogService::with_defaults()),
-        endpoint.port(),
+        report_port,
         std::sync::Arc::clone(&frontend_config.mv_storage_observation),
-    )
-    .map_err(|error| {
-        anyhow::anyhow!("build all-in-one frontend SQL capabilities failed: {error}")
-    })?;
+    ) {
+        Ok(session_factory) => session_factory,
+        Err(error) => {
+            let report_cleanup = report_server.stop();
+            let backend_cleanup = backend.shutdown();
+            let frontend_cleanup = frontend.shutdown().await;
+            return Err(anyhow::anyhow!(
+                "build all-in-one frontend SQL capabilities failed: {error}; report cleanup: {:?}; backend cleanup: {:?}; frontend cleanup: {:?}",
+                report_cleanup.err(),
+                backend_cleanup.err(),
+                frontend_cleanup.err()
+            ));
+        }
+    };
 
     let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
-    let listener = novarocks::server::resolve_mysql_listener_settings(
+    let listener = novarocks_frontend::resolve_mysql_listener_settings(
         config
             .standalone_server
             .as_ref()
@@ -736,10 +782,13 @@ where
         port_override,
     )
     .map_err(anyhow::Error::msg)?;
-    let server =
-        novarocks::server::run_mysql_server_until_shutdown(listener, session_factory, async move {
+    let server = novarocks_frontend::run_mysql_server_until_shutdown(
+        listener,
+        session_factory,
+        async move {
             let _ = server_shutdown_rx.await;
-        });
+        },
+    );
     tokio::pin!(server);
     tokio::pin!(shutdown);
 
@@ -767,8 +816,10 @@ where
         server.await
     };
     let backend_cleanup = backend.shutdown().map_err(|error| error.to_string());
+    let report_cleanup = report_server.stop().map_err(|error| error.to_string());
     let frontend_cleanup = frontend.shutdown().await.map_err(|error| error.to_string());
-    combine_primary_and_cleanup(primary, server_cleanup, backend_cleanup, frontend_cleanup)
+    combine_primary_and_cleanup(primary, server_cleanup, backend_cleanup, report_cleanup)
+        .and_then(|()| frontend_cleanup)
         .map_err(anyhow::Error::msg)
 }
 
@@ -826,9 +877,22 @@ fn combine_primary_and_cleanup(
 #[cfg(test)]
 mod tests {
     use super::{
-        combine_primary_and_cleanup, compose_backend_execution_installers,
-        compose_frontend_control_factories,
+        all_in_one_report_bind_addr, combine_primary_and_cleanup,
+        compose_backend_execution_installers, compose_frontend_control_factories,
     };
+
+    #[test]
+    fn all_in_one_report_listener_preserves_the_backend_address_family() {
+        for backend in [
+            std::net::SocketAddr::from(([127, 0, 0, 1], 19000)),
+            std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 19000)),
+        ] {
+            let report = all_in_one_report_bind_addr(backend);
+            assert_eq!(report.is_ipv4(), backend.is_ipv4());
+            assert!(report.ip().is_loopback());
+            assert_eq!(report.port(), 0);
+        }
+    }
 
     #[test]
     fn primary_failure_remains_primary_when_all_cleanup_steps_fail() {

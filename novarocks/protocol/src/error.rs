@@ -18,21 +18,6 @@
 use std::error::Error;
 use std::fmt;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProtocolFamily {
-    Native,
-    StarRocks,
-}
-
-impl fmt::Display for ProtocolFamily {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Native => f.write_str("native"),
-            Self::StarRocks => f.write_str("starrocks"),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FieldPath(Vec<FieldPathSegment>);
 
@@ -88,68 +73,6 @@ impl fmt::Display for FieldPath {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TransportDecodeErrorKind {
-    MalformedPayload,
-    TruncatedPayload,
-    UnsupportedEncoding,
-}
-
-impl fmt::Display for TransportDecodeErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MalformedPayload => f.write_str("malformed payload"),
-            Self::TruncatedPayload => f.write_str("truncated payload"),
-            Self::UnsupportedEncoding => f.write_str("unsupported encoding"),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TransportDecodeError {
-    family: ProtocolFamily,
-    kind: TransportDecodeErrorKind,
-    detail: String,
-}
-
-impl TransportDecodeError {
-    pub(crate) fn new(
-        family: ProtocolFamily,
-        kind: TransportDecodeErrorKind,
-        detail: impl Into<String>,
-    ) -> Self {
-        Self {
-            family,
-            kind,
-            detail: detail.into(),
-        }
-    }
-
-    pub(crate) fn family(&self) -> ProtocolFamily {
-        self.family
-    }
-
-    pub(crate) fn kind(&self) -> TransportDecodeErrorKind {
-        self.kind
-    }
-
-    pub(crate) fn detail(&self) -> &str {
-        &self.detail
-    }
-}
-
-impl fmt::Display for TransportDecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} transport decode error ({}): {}",
-            self.family, self.kind, self.detail
-        )
-    }
-}
-
-impl Error for TransportDecodeError {}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtocolErrorKind {
     MissingField,
     InvalidEnum,
@@ -176,29 +99,18 @@ impl fmt::Display for ProtocolErrorKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtocolError {
-    family: ProtocolFamily,
     path: FieldPath,
     kind: ProtocolErrorKind,
     detail: String,
 }
 
 impl ProtocolError {
-    pub fn new(
-        family: ProtocolFamily,
-        path: FieldPath,
-        kind: ProtocolErrorKind,
-        detail: impl Into<String>,
-    ) -> Self {
+    pub fn new(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) -> Self {
         Self {
-            family,
             path,
             kind,
             detail: detail.into(),
         }
-    }
-
-    pub fn family(&self) -> ProtocolFamily {
-        self.family
     }
 
     pub fn path(&self) -> &FieldPath {
@@ -218,8 +130,8 @@ impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} protocol error at {} ({}): {}",
-            self.family, self.path, self.kind, self.detail
+            "native protocol error at {} ({}): {}",
+            self.path, self.kind, self.detail
         )
     }
 }
@@ -253,80 +165,28 @@ mod tests {
                 FieldPathSegment::MapKey("scan\"owner".to_string()),
             ]
         );
-
-        let escaped = FieldPath::root("root").map_key("slash\\line\n\t\u{7}");
-        assert_eq!(escaped.to_string(), "root[\"slash\\\\line\\n\\t\\u{7}\"]");
-    }
-
-    #[test]
-    fn protocol_vocabulary_labels_are_stable() {
-        for (family, expected) in [
-            (ProtocolFamily::Native, "native"),
-            (ProtocolFamily::StarRocks, "starrocks"),
-        ] {
-            assert_eq!(family.to_string(), expected);
-        }
-        for (kind, expected) in [
-            (
-                TransportDecodeErrorKind::MalformedPayload,
-                "malformed payload",
-            ),
-            (
-                TransportDecodeErrorKind::TruncatedPayload,
-                "truncated payload",
-            ),
-            (
-                TransportDecodeErrorKind::UnsupportedEncoding,
-                "unsupported encoding",
-            ),
-        ] {
-            assert_eq!(kind.to_string(), expected);
-        }
-        for (kind, expected) in [
-            (ProtocolErrorKind::MissingField, "missing field"),
-            (ProtocolErrorKind::InvalidEnum, "invalid enum"),
-            (ProtocolErrorKind::InvalidValue, "invalid value"),
-            (ProtocolErrorKind::OutOfRange, "out of range"),
-            (ProtocolErrorKind::DuplicateField, "duplicate field"),
-            (ProtocolErrorKind::InconsistentFields, "inconsistent fields"),
-            (ProtocolErrorKind::Unsupported, "unsupported"),
-        ] {
-            assert_eq!(kind.to_string(), expected);
-        }
+        assert_eq!(
+            FieldPath::root("root")
+                .map_key("slash\\line\n\t\u{7}")
+                .to_string(),
+            "root[\"slash\\\\line\\n\\t\\u{7}\"]"
+        );
     }
 
     #[test]
     fn protocol_errors_expose_typed_state_and_stable_display() {
         let path = FieldPath::root("plan_fragment").field("root");
         let error = ProtocolError::new(
-            ProtocolFamily::Native,
             path.clone(),
             ProtocolErrorKind::MissingField,
             "root is required",
         );
-        assert_eq!(error.family(), ProtocolFamily::Native);
         assert_eq!(error.path(), &path);
         assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
         assert_eq!(error.detail(), "root is required");
         assert_eq!(
             error.to_string(),
             "native protocol error at plan_fragment.root (missing field): root is required"
-        );
-    }
-
-    #[test]
-    fn transport_decode_error_is_distinct_from_dto_validation() {
-        let error = TransportDecodeError::new(
-            ProtocolFamily::StarRocks,
-            TransportDecodeErrorKind::TruncatedPayload,
-            "compact payload ended early",
-        );
-        assert_eq!(error.family(), ProtocolFamily::StarRocks);
-        assert_eq!(error.kind(), TransportDecodeErrorKind::TruncatedPayload);
-        assert_eq!(error.detail(), "compact payload ended early");
-        assert_eq!(
-            error.to_string(),
-            "starrocks transport decode error (truncated payload): compact payload ended early"
         );
     }
 }

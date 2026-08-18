@@ -10,7 +10,6 @@ use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLeas
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::catalog_application::query_catalog::catalog_service_snapshot;
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::compiler::prepare_sealed_iceberg_write_native_assembly;
 use crate::query_execution::kernels::QueryPreparationKernel;
@@ -21,6 +20,7 @@ use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
 use crate::query_execution::planning::write_sink::{
     admit_prepared_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
+use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 use novarocks_sql::planning::mv::first_refresh::{
     SqlMvFirstRefreshAnalyzeContext, SqlMvJoinFirstRefreshAnalyzeContext,
     analyze_join_first_refresh_connector_write, analyze_mv_first_refresh_connector_write,

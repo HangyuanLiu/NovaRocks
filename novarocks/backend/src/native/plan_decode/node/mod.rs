@@ -48,7 +48,6 @@ use crate::native::plan_decode::runtime_filter_binding::{
     DecodedBindingRole, DecodedConsumerBindingTarget, DecodedRuntimeFilterBinding,
     NativeRuntimeFilterDecodeLedger, ProducerBindingTarget,
 };
-use novarocks::protocol::common::error::FieldPath;
 use novarocks_execution::exec::chunk::ChunkSchemaRef;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
@@ -63,6 +62,7 @@ use novarocks_execution::exec::node::runtime_filter::{
     RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode,
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_protocol::FieldPath;
 use novarocks_protocol::plan;
 
 #[derive(Clone, Debug)]
@@ -1888,7 +1888,7 @@ mod tests {
         assert_eq!(protocol.path().to_string(), "plan_fragment.root.children");
         assert_eq!(
             protocol.kind(),
-            novarocks::protocol::common::error::ProtocolErrorKind::InconsistentFields
+            novarocks_protocol::ProtocolErrorKind::InconsistentFields
         );
     }
 

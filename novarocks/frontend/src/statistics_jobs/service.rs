@@ -318,7 +318,7 @@ impl StatisticsApplicationService {
     async fn wait_for_terminal(
         &self,
         job_id: Uuid,
-        execution: &crate::common::admitted_query_context::QueryExecutionContext,
+        execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
     ) -> Result<Option<StatisticsJob>, StatisticsApplicationError> {
         let repository = self.repository()?;
         loop {
@@ -554,7 +554,7 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
     fn execute(
         &self,
         command: application::StatisticsApplicationCommand,
-        execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
+        execution: Option<&::novarocks::common::admitted_query_context::QueryExecutionContext>,
     ) -> Result<application::StatisticsApplicationResult, application::StatisticsApplicationError>
     {
         let statement = match command {

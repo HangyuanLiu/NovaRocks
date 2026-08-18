@@ -18,8 +18,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::common::result_batch::ResultBatch;
-use crate::common::types::{FetchResult, UniqueId};
+use novarocks::common::result_batch::ResultBatch;
+use novarocks::common::types::{FetchResult, UniqueId};
 use novarocks_execution::runtime::fragment::io::ResultAbort;
 use novarocks_execution::runtime::mem_tracker::{MemTracker, TrackedBytes};
 

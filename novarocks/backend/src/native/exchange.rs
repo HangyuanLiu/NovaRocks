@@ -19,9 +19,9 @@
 
 use std::collections::BTreeMap;
 
-use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks_execution::exec::fragment::program::{ExchangeInputContract, FragmentNodeId};
 use novarocks_protocol::plan;
+use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
 
 use super::layout::chunk_schema_from_output_columns;
 
@@ -50,7 +50,6 @@ pub(crate) fn decode_exchange_contracts(
                 .is_some()
             {
                 return Err(ProtocolError::new(
-                    ProtocolFamily::Native,
                     path.field("node_id"),
                     ProtocolErrorKind::InconsistentFields,
                     format!("duplicate exchange node_id={}", node.node_id),
@@ -75,7 +74,7 @@ pub(crate) fn decode_exchange_contracts(
 #[cfg(test)]
 mod tests {
     use super::decode_exchange_contracts;
-    use novarocks::protocol::FieldPath;
+    use novarocks_protocol::FieldPath;
     use novarocks_protocol::{common, plan};
 
     fn exchange_node(

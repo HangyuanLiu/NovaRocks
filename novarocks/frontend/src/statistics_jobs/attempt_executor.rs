@@ -26,12 +26,12 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::common::backend_topology::BackendTopologyService;
 use crate::query_execution::service::QueryExecutionService;
 use crate::statistics_jobs::application::{
     StatisticsApplicationError, StatisticsAttemptExecutor, StatisticsAttemptRequest,
     StatisticsCollectedAttempt, StatisticsColumnIntent, rebind_table_object,
 };
+use ::novarocks::common::backend_topology::BackendTopologyService;
 use novarocks_spi::connector::{
     ConnectorControlRegistry, ConnectorMutationOperationId, ConnectorRequestContext,
     ConnectorStatisticsLease, ConnectorTableHandle, ExternalMutationEvidence,
@@ -269,8 +269,8 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
             .backend_topology
             .snapshot()
             .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
-        let cancellation = crate::common::query_cancellation::QueryCancellationSource::new();
-        let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
+        let cancellation = ::novarocks::common::query_cancellation::QueryCancellationSource::new();
+        let execution = ::novarocks::common::admitted_query_context::QueryExecutionContext::new(
             self.ports.execution_role,
             topology,
             Some(Instant::now() + program.policy().attempt_timeout()),

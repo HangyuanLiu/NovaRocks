@@ -28,12 +28,12 @@ use std::sync::Arc;
 use novarocks_catalog::schema::ColumnDef;
 
 use crate::catalog_application::resolver::TargetBackend;
-use crate::common::admitted_query_context::{QueryExecutionContext, RequestContext};
 use crate::query_execution::dml::external_write_fence::{
     ExternalWriteFenceProposal, external_fence_authority_unavailable, invalid_fence_request,
 };
 use crate::query_execution::dml::iceberg_writer;
 use crate::query_execution::kernels::DmlExecutionKernel;
+use ::novarocks::common::admitted_query_context::{QueryExecutionContext, RequestContext};
 use novarocks::connector::backend::ResolvedTable;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_sql::planning::dml::parse_raw_statement;
@@ -578,15 +578,17 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
-    use crate::common::backend_topology::BackendTopologySnapshot;
-    use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
-    use crate::common::types::UniqueId;
     use crate::query_execution::outcome::QueryExecutionResult;
     use crate::query_execution::write::{
         WriteAbortInput, WriteCommitInput, WriterCommitInput, WriterKey,
     };
-    use crate::runtime::query_result::QueryResult;
+    use ::novarocks::common::admitted_query_context::{RequestAdmission, RequestContext};
+    use ::novarocks::common::backend_topology::BackendTopologySnapshot;
+    use ::novarocks::common::query_cancellation::{
+        QueryCancellationReason, QueryCancellationSource,
+    };
+    use ::novarocks::common::types::UniqueId;
+    use ::novarocks::runtime::query_result::QueryResult;
     use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::ClusterRole;
 

@@ -24,7 +24,6 @@ use std::time::Duration;
 
 use crate::native::expression::NativeExpressionInputLayout;
 use novarocks::connector::ConnectorRegistry;
-use novarocks::protocol::FieldPath;
 use novarocks::runtime::scan_range::ScanRangeParams;
 use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_execution::exec::fragment::program::FragmentNodeId;
@@ -34,6 +33,7 @@ use novarocks_execution::runtime::fragment::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_protocol::FieldPath;
 use novarocks_protocol::{common, expr};
 use novarocks_spi::connector::{ConnectorCancellation, ConnectorExecutionResolver};
 use novarocks_types::QueryId;
@@ -152,7 +152,7 @@ impl NativePlanDecodeContext {
             .map(Vec::as_slice)
             .ok_or_else(|| {
                 NativeFragmentLeafDecodeError::at_field(
-                    novarocks::protocol::ProtocolErrorKind::MissingField,
+                    novarocks_protocol::ProtocolErrorKind::MissingField,
                     "scan_ranges",
                     format!("native ScanNode node_id={node_id} missing scan ranges"),
                 )
@@ -177,7 +177,7 @@ impl NativePlanDecodeContext {
     pub(crate) fn connectors(&self) -> Result<&ConnectorRegistry, NativeFragmentLeafDecodeError> {
         self.connectors.as_deref().ok_or_else(|| {
             NativeFragmentLeafDecodeError::at_field(
-                novarocks::protocol::ProtocolErrorKind::MissingField,
+                novarocks_protocol::ProtocolErrorKind::MissingField,
                 "connector_registry",
                 "native ScanNode requires ConnectorRegistry in NativePlanDecodeContext",
             )
@@ -189,7 +189,7 @@ impl NativePlanDecodeContext {
     ) -> Result<&dyn ConnectorExecutionResolver, NativeFragmentLeafDecodeError> {
         self.execution_resolver.as_deref().ok_or_else(|| {
             NativeFragmentLeafDecodeError::at_field(
-                novarocks::protocol::ProtocolErrorKind::MissingField,
+                novarocks_protocol::ProtocolErrorKind::MissingField,
                 "connector_execution_resolver",
                 "native ConnectorReadSource requires a query-scoped execution resolver",
             )
@@ -201,7 +201,7 @@ impl NativePlanDecodeContext {
     ) -> Result<Arc<dyn ConnectorCancellation>, NativeFragmentLeafDecodeError> {
         self.connector_cancellation.clone().ok_or_else(|| {
             NativeFragmentLeafDecodeError::at_field(
-                novarocks::protocol::ProtocolErrorKind::MissingField,
+                novarocks_protocol::ProtocolErrorKind::MissingField,
                 "connector_cancellation",
                 "native ConnectorReadSource requires an execution cancellation capability",
             )
@@ -217,7 +217,7 @@ impl NativePlanDecodeContext {
             .get(&FragmentNodeId::new(node_id))
             .ok_or_else(|| {
                 NativeFragmentLeafDecodeError::at_field(
-                    novarocks::protocol::ProtocolErrorKind::MissingField,
+                    novarocks_protocol::ProtocolErrorKind::MissingField,
                     "exchange_inputs",
                     format!("ExchangeReceiver missing sender count for node_id {node_id}"),
                 )

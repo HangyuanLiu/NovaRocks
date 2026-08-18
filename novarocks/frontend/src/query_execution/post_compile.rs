@@ -25,9 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use novarocks_protocol::lifecycle::QueryOptions;
 
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::{PreparedQueryCompletion, PreparedQueryOperation};
+use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 use novarocks_sql::plan_read::DistributedPlan;
 
 /// Select the completion formatter paired with one post-compile assembly.

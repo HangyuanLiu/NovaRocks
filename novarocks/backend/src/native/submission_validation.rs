@@ -17,8 +17,8 @@
 
 //! Backend-owned structural validation for native fragment wire payloads.
 
-use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks_protocol::plan;
+use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
 
 use super::expression::validate_proto_expr_shape_at;
 
@@ -45,7 +45,6 @@ pub(crate) fn validate_fragment_expressions(
             .field("expression");
         let expression = binding.expression.as_ref().ok_or_else(|| {
             ProtocolError::new(
-                ProtocolFamily::Native,
                 path.clone(),
                 ProtocolErrorKind::MissingField,
                 "native runtime-filter binding requires expression",
@@ -62,7 +61,6 @@ pub(crate) fn validate_node_required_fields(
 ) -> Result<(), ProtocolError> {
     let payload = node.payload.as_ref().ok_or_else(|| {
         ProtocolError::new(
-            ProtocolFamily::Native,
             path.clone().field("payload"),
             ProtocolErrorKind::MissingField,
             format!("native DistributedNode {} requires payload", node.node_id),
@@ -71,7 +69,6 @@ pub(crate) fn validate_node_required_fields(
     if let plan::distributed_node::Payload::Physical(physical) = payload {
         let kind = physical.kind.as_ref().ok_or_else(|| {
             ProtocolError::new(
-                ProtocolFamily::Native,
                 path.clone()
                     .field("payload")
                     .field("physical")
@@ -108,7 +105,7 @@ pub(crate) fn validate_node_required_fields(
 #[cfg(test)]
 mod tests {
     use super::{validate_fragment_expressions, validate_node_required_fields};
-    use novarocks::protocol::FieldPath;
+    use novarocks_protocol::FieldPath;
     use novarocks_protocol::plan;
 
     #[test]

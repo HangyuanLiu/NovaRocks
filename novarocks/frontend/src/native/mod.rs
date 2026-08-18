@@ -5,6 +5,7 @@
 
 pub(crate) mod codec;
 pub(crate) mod fragment_encoder;
+pub(crate) mod fragment_transport;
 pub(crate) mod query_lifecycle;
 pub(crate) mod report_server;
 pub(crate) mod transport;

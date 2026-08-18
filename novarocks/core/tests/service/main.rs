@@ -17,7 +17,6 @@
 //! Integration tests for the service control surface.
 
 use crate::common::{test_query_id, unique_query_id};
-use novarocks::service::fragment_control::cancel_runtime_fragment;
 use novarocks_types::UniqueId;
 
 #[path = "../common/mod.rs"]
@@ -40,18 +39,6 @@ fn test_unique_id_creation() {
 
     assert_eq!(id1, id2);
     assert_ne!(id1, id3);
-}
-
-#[test]
-fn test_cancel_with_invalid_query_id() {
-    // Test cancel with a non-existent query ID
-    // This should not panic, even if the query doesn't exist
-    let query_id = test_query_id();
-    cancel_runtime_fragment(query_id);
-
-    // Cancel should not fail even if query doesn't exist
-    // The exact behavior depends on implementation
-    // For now, we just verify it doesn't panic
 }
 
 #[test]

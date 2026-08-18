@@ -25,7 +25,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use arrow::datatypes::DataType;
-use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime_filter::{
@@ -34,6 +33,7 @@ use novarocks_execution::runtime_filter::{
     RuntimeFilterLateApplyGranularity, RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics,
     RuntimeFilterProducerContract, RuntimeFilterProducerKind, RuntimeFilterReduction, contribution,
 };
+use novarocks_protocol::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_protocol::{
     common, filter,
     lifecycle::{QueryExecutionId, RuntimeFilterContribution},
@@ -142,7 +142,7 @@ pub(crate) fn decode_runtime_filter_contribution(
 }
 
 fn error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) -> ProtocolError {
-    ProtocolError::new(ProtocolFamily::Native, path, kind, detail)
+    ProtocolError::new(path, kind, detail)
 }
 
 fn contract_missing(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
@@ -544,7 +544,7 @@ fn codec_error(
     kind: ProtocolErrorKind,
     detail: impl Into<String>,
 ) -> ProtocolError {
-    ProtocolError::new(ProtocolFamily::Native, path, kind, detail)
+    ProtocolError::new(path, kind, detail)
 }
 
 fn invalid(path: FieldPath, detail: impl Into<String>) -> ProtocolError {

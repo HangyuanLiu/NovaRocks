@@ -34,7 +34,7 @@ use crate::query_execution::contract::{DistributedQueryError, DistributedQueryEr
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
-use crate::query_lifecycle::QueryExecutionId;
+use novarocks_protocol::lifecycle::QueryExecutionId;
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
@@ -277,7 +277,9 @@ pub(crate) fn compile_install_plan(
     })
 }
 
-fn connector_writer_fragment_instance_bytes(value: crate::common::types::UniqueId) -> [u8; 16] {
+fn connector_writer_fragment_instance_bytes(
+    value: ::novarocks::common::types::UniqueId,
+) -> [u8; 16] {
     let mut bytes = [0; 16];
     bytes[..8].copy_from_slice(&value.high().to_be_bytes());
     bytes[8..].copy_from_slice(&value.low().to_be_bytes());
@@ -374,8 +376,8 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::query_execution::contract::QueryId;
-    use crate::query_lifecycle::{AttemptId, QueryExecutionId};
     use bytes::Bytes;
+    use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_spi::connector::{
         ConnectorInstanceDescriptor, ConnectorInstanceIncarnation, ConnectorProviderId,
     };

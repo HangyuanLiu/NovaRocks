@@ -53,7 +53,6 @@ orc-rust = { version = "0.8.0", default-features = false }
 typetag = "0.2"
 futures = "0.3"
 mysql = "25"
-mysql_common = "0.32"
 url = "2"
 rand = "0.8"
 regex = "1.10"

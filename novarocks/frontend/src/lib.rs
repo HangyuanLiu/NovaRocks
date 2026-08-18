@@ -16,7 +16,6 @@
 // under the License.
 
 pub mod application;
-pub(crate) use novarocks::{common, protocol, query_lifecycle, runtime};
 pub mod capabilities;
 pub mod catalog_application;
 pub mod catalog_attachment;
@@ -30,6 +29,7 @@ pub mod deployment;
 pub mod dml;
 pub(crate) mod durable;
 pub mod mv;
+mod mysql;
 mod native;
 pub mod query;
 pub mod query_control;
@@ -41,6 +41,7 @@ pub mod statistics_jobs;
 pub mod system_catalog;
 pub mod table_maintenance;
 mod topology;
+mod user_variable;
 pub mod view;
 
 pub use application::{
@@ -50,6 +51,14 @@ pub use application::{
 pub use mv::FrontendMvService;
 pub use mv::maintenance::MaintenanceCoordinatorConfig;
 pub use mv::scheduler::FrontendMvSchedulerConfig;
+pub use mysql::session::{
+    QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
+    QuerySessionOpenRequest, SessionExecutionSettings,
+};
+pub use mysql::{
+    ResolvedMysqlListenerSettings, resolve_mysql_listener_settings, run_mysql_server_until_shutdown,
+};
+pub use native::report_server::FrontendReportServerHandle;
 pub use query::FrontendQueryService;
 pub use server::{
     FrontendServerConfig, build_frontend_query_session_factory,
