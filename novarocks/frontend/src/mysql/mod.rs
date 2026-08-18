@@ -40,15 +40,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-use crate::version;
+use novarocks::version;
 
 use self::encoding::write_query_result;
 use self::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
     QuerySessionOpenRequest,
 };
-use crate::common::query_cancellation::QueryCancellationReason;
-use crate::runtime::statement_result::StatementResult;
+use novarocks::common::query_cancellation::QueryCancellationReason;
+use novarocks::runtime::statement_result::StatementResult;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;
@@ -499,7 +499,7 @@ fn map_query_service_error(kind: QueryServiceErrorKind) -> ErrorKind {
 
 #[cfg(test)]
 #[test]
-fn query_service_error_mapping_keeps_wire_concerns_in_core() {
+fn query_service_error_mapping_keeps_wire_concerns_in_frontend() {
     assert_eq!(
         map_query_service_error(QueryServiceErrorKind::BadDatabase),
         ErrorKind::ER_BAD_DB_ERROR

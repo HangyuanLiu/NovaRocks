@@ -21,8 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use crate::capabilities as core_capabilities;
-use novarocks::server::ResolvedMysqlListenerSettings;
-use novarocks::server::session::QuerySessionFactory;
+use crate::{QuerySessionFactory, ResolvedMysqlListenerSettings};
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_state_store::StateStoreHostConfig;
@@ -415,13 +414,10 @@ where
             return combine_server_and_shutdown(Err(error), stop_result);
         }
     };
-    let server_result = novarocks::server::run_mysql_server_until_shutdown(
-        config.mysql_listener,
-        session_factory,
-        shutdown,
-    )
-    .await
-    .map_err(FrontendApplicationError::server);
+    let server_result =
+        crate::run_mysql_server_until_shutdown(config.mysql_listener, session_factory, shutdown)
+            .await
+            .map_err(FrontendApplicationError::server);
     let stop_result = report_server
         .stop()
         .map_err(FrontendApplicationError::server);
@@ -613,9 +609,7 @@ mod tests {
         ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
         FrontendApplicationHost, FrontendExecutionConfig,
     };
-    use novarocks::{
-        server::ResolvedMysqlListenerSettings, server::session::QuerySessionOpenRequest,
-    };
+    use crate::{QueryServiceErrorKind, QuerySessionOpenRequest, ResolvedMysqlListenerSettings};
     use novarocks_state_store::{
         FoundationDbClientConfig, StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig,
         StateStoreLimitOverrides, StateStoreProviderConfig,
@@ -797,7 +791,7 @@ mod tests {
                 .await
                 .expect_err("a dropped catalog stops being admitted")
                 .kind(),
-            novarocks::server::session::QueryServiceErrorKind::BadDatabase
+            QueryServiceErrorKind::BadDatabase
         );
 
         // The ready session factory and this test's probe both hold StateStore references; the

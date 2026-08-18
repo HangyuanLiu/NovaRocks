@@ -22,11 +22,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use novarocks::connector::ConnectorRegistry;
 use novarocks::novarocks_logging::error;
 #[cfg(test)]
 use novarocks::novarocks_logging::warn;
-use novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use novarocks::runtime::sink_commit::{ConfiguredCoreSinkCommitPort, CoreSinkCommitPort};
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_execution::runtime::fragment::io::{

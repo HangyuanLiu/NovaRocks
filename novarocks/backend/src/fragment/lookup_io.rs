@@ -59,7 +59,7 @@ impl FragmentLookupClient for GrpcFragmentLookupClient {
 
 fn local_lookup(request: LookupRequest) -> Result<LookupBatch, FragmentIoError> {
     let output = match request.kind() {
-        LookupKind::PrimaryKey => novarocks::runtime::lookup::execute_lookup_request(
+        LookupKind::PrimaryKey => crate::runtime::lookup::execute_lookup_request(
             request.query_id(),
             request.tuple_id(),
             request
@@ -97,7 +97,7 @@ fn remote_request(
         request_columns: Vec::with_capacity(request.columns().len()),
     };
     for column in request.columns() {
-        let data = novarocks::runtime::lookup::encode_column_ipc(column.values())
+        let data = crate::runtime::lookup::encode_column_ipc(column.values())
             .map_err(|error| lookup_error(FragmentIoErrorKind::Internal, error))?;
         output
             .request_columns
@@ -132,7 +132,7 @@ fn decode_response(
         let slot_id = novarocks_types::SlotId::try_from(column.slot_id).map_err(|error| {
             lookup_error(FragmentIoErrorKind::InvalidResponse, error.to_string())
         })?;
-        let values = novarocks::runtime::lookup::decode_column_ipc(&column.data)
+        let values = crate::runtime::lookup::decode_column_ipc(&column.data)
             .map_err(|error| lookup_error(FragmentIoErrorKind::InvalidResponse, error))?;
         columns.push(LookupColumn::new(slot_id, values));
     }

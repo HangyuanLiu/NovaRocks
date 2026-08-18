@@ -13,7 +13,7 @@ use tonic::transport::Channel;
 
 use crate::common::backend_topology::{BeId, HeartbeatOutcome, LiveBackendTarget};
 use crate::common::network::format_host_for_url;
-use crate::protocol::native::fragment_transport::{
+use crate::native::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, decode_fetched_query_batch,
 };
 use crate::query_execution::artifact::ConnectorBindingDispatcher;

@@ -48,14 +48,14 @@ use crate::query_execution::maintenance::command::{
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::{PreparedQueryOperation, StatementResult};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use crate::{
+    QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
+    QuerySessionOpenRequest, SessionExecutionSettings,
+};
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use novarocks::server::session::{
-    QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
-    QuerySessionOpenRequest, SessionExecutionSettings,
-};
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 use novarocks_protocol::lifecycle::QueryOptions;
@@ -514,12 +514,10 @@ impl FrontendQuerySession {
             let value = if let Some(inner_query) = parenthesized_query(raw_value) {
                 match self.execute_admitted(inner_query.to_string()).await? {
                     StatementResult::Query(result) => {
-                        crate::runtime::user_variable::query_result_to_user_variable_literal(
-                            &result,
-                        )
-                        .map_err(|message| {
-                            QueryServiceError::new(QueryServiceErrorKind::Internal, message)
-                        })?
+                        crate::user_variable::query_result_to_user_variable_literal(&result)
+                            .map_err(|message| {
+                                QueryServiceError::new(QueryServiceErrorKind::Internal, message)
+                            })?
                     }
                     StatementResult::Ok => {
                         return Err(QueryServiceError::new(

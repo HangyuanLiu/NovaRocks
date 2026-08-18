@@ -1518,7 +1518,7 @@ impl QueryContextManager {
 
 #[cfg(test)]
 mod fragment_cancellation_boundary_tests {
-    use crate::common::types::UniqueId;
+    use novarocks::common::types::UniqueId;
     use novarocks_execution::exec::pipeline::global_driver_executor::FragmentCompletion;
 
     use super::{QueryContextManager, QueryId};
@@ -1684,7 +1684,7 @@ mod sender_error_tests {
     use std::time::Duration;
 
     use super::{QueryContextManager, QueryContextManagerInner, QueryId};
-    use crate::common::types::UniqueId;
+    use novarocks::common::types::UniqueId;
 
     fn test_manager() -> QueryContextManager {
         QueryContextManager {
@@ -1730,7 +1730,7 @@ mod native_lifecycle_cleanup_tests {
     use std::time::{Duration, Instant};
 
     use super::{QueryContext, QueryContextManager, QueryContextManagerInner, QueryId};
-    use crate::common::types::UniqueId;
+    use novarocks::common::types::UniqueId;
 
     fn test_manager() -> QueryContextManager {
         QueryContextManager {
@@ -1790,7 +1790,7 @@ mod incremental_scan_domain_tests {
     use std::sync::atomic::AtomicBool;
 
     use super::{QueryContextManager, QueryContextManagerInner, QueryId};
-    use crate::common::types::UniqueId;
+    use novarocks::common::types::UniqueId;
     use novarocks_execution::exec::node::scan::IncrementalScanRange;
     use novarocks_types::SlotId;
 

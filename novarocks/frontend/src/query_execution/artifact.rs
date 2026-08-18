@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 
 use crate::common::backend_topology::LiveBackendTarget;
 use crate::common::types::UniqueId;
-use crate::protocol::native::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBatch};
+use crate::native::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBatch};
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind, QueryId};
 use crate::query_execution::launch::{QueryLaunchBarrier, StageBatch, StageParticipantBinding};
 use crate::query_execution::lifecycle_plan::{

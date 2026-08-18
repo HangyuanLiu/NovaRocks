@@ -35,11 +35,11 @@ fn debug_env_flag(_name: &str) -> bool {
     false
 }
 
-pub(crate) fn debug_exec_node_output() -> bool {
+pub fn debug_exec_node_output() -> bool {
     debug_env_flag("NOVAROCKS_DEBUG_EXEC_NODE_OUTPUT")
 }
 
-pub(crate) fn debug_fault_inject_fetch_not_ready_count() -> Option<usize> {
+pub fn debug_fault_inject_fetch_not_ready_count() -> Option<usize> {
     if !cfg!(debug_assertions) {
         return None;
     }
@@ -54,7 +54,7 @@ pub fn debug_emit_cancel_marker() -> bool {
         || sql_test_fragment_failure_harness_enabled()
 }
 
-pub(crate) fn debug_emit_grpc_fragment_marker() -> bool {
+pub fn debug_emit_grpc_fragment_marker() -> bool {
     debug_env_flag("NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER")
         || sql_test_fragment_failure_harness_enabled()
 }

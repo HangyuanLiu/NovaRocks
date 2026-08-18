@@ -14,10 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub mod fragment_control;
-pub mod internal_rpc;
 pub(crate) mod metrics_http;
-pub mod native_data_plane;
 pub mod query_lifecycle_metrics;
 pub use metrics_http::{
     MetricsHttpServer, handle_metrics, observe_backend_heartbeat_rtt,
@@ -25,4 +22,3 @@ pub use metrics_http::{
     publish_backend_query_lifecycle_terminal_limits, publish_frontend_query_lifecycle_metrics,
     render_metrics, render_metrics_json,
 };
-pub(crate) mod result_batch_wire;

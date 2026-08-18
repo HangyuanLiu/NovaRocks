@@ -527,7 +527,7 @@ pub fn compose_frontend_server_config(
         Duration::from_secs(config.cluster.decommission_timeout_secs),
     )
     .map_err(|error| anyhow::anyhow!("open frontend backend cluster configuration: {error}"))?;
-    let mysql_listener = novarocks::server::resolve_mysql_listener_settings(
+    let mysql_listener = novarocks_frontend::resolve_mysql_listener_settings(
         config
             .standalone_server
             .as_ref()
@@ -724,7 +724,7 @@ where
     })?;
 
     let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
-    let listener = novarocks::server::resolve_mysql_listener_settings(
+    let listener = novarocks_frontend::resolve_mysql_listener_settings(
         config
             .standalone_server
             .as_ref()
@@ -736,10 +736,13 @@ where
         port_override,
     )
     .map_err(anyhow::Error::msg)?;
-    let server =
-        novarocks::server::run_mysql_server_until_shutdown(listener, session_factory, async move {
+    let server = novarocks_frontend::run_mysql_server_until_shutdown(
+        listener,
+        session_factory,
+        async move {
             let _ = server_shutdown_rx.await;
-        });
+        },
+    );
     tokio::pin!(server);
     tokio::pin!(shutdown);
 

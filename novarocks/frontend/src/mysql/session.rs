@@ -18,7 +18,7 @@
 //! Frontend-owned SQL session boundary consumed by the MySQL wire adapter.
 //! Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
 //!
-//! The core server owns protocol framing only. Authentication success opens a
+//! The Frontend MySQL server owns protocol framing. Authentication success opens a
 //! frontend session through this port; all request admission, routing and
 //! cancellation identity remain with that session.
 
@@ -27,8 +27,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::common::query_cancellation::QueryCancellationReason;
-use crate::runtime::statement_result::StatementResult;
+use ::novarocks::common::query_cancellation::QueryCancellationReason;
+use ::novarocks::runtime::statement_result::StatementResult;
 use novarocks_protocol::{lifecycle::QueryOptions, novarocks};
 
 #[derive(Clone, Debug, Eq, PartialEq)]

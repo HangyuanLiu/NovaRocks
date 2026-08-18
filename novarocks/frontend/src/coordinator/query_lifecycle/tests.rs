@@ -22,10 +22,10 @@ use std::time::{Duration, Instant};
 
 use crate::common::backend_topology::LiveBackendTarget;
 use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
-use crate::native::transport::new_query_lifecycle_transport;
-use crate::protocol::native::fragment_transport::{
+use crate::native::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher,
 };
+use crate::native::transport::new_query_lifecycle_transport;
 use crate::query_execution::contract::DistributedQueryIntent;
 use crate::query_execution::lifecycle_plan::{QueryInitBarrier, QueryInitPlan};
 use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};

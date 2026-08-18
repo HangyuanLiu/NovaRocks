@@ -170,7 +170,7 @@ impl FrontendQueryRegistry {
         self: &Arc<Self>,
         query_id: QueryId,
         _intent: DistributedQueryIntent,
-        _dispatcher: Arc<dyn crate::protocol::native::fragment_transport::FragmentDispatcher>,
+        _dispatcher: Arc<dyn crate::native::fragment_transport::FragmentDispatcher>,
     ) -> Result<ActiveQueryGuard, DistributedQueryError> {
         let key = query_key(query_id);
         let mut active = self.active.lock().expect("frontend query registry lock");

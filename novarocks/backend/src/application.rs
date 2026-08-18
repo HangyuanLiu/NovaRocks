@@ -278,7 +278,7 @@ fn compose_backend_application_services(
         Arc::clone(&execution_host),
     ));
     let query_lifecycle_registry = QueryLifecycleRegistry::new_unbound(
-        novarocks::runtime::start_epoch::start_epoch(),
+        crate::runtime::start_epoch::start_epoch(),
         local_runtime,
         query_lifecycle_config,
     );
@@ -309,7 +309,7 @@ fn compose_backend_application_services(
     );
     controls.publish_resource_snapshot();
     execution_host.publish_resource_snapshot();
-    novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime::global()
+    crate::runtime::native_fragment_query::NativeFragmentQueryRuntime::global()
         .publish_resource_snapshot();
     let query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress> =
         Arc::new(BackendStageLifecycleIngress {

@@ -78,7 +78,7 @@ impl NativeDataPlaneKernel {
         };
         let finst_id = UniqueId::new(finst_id.hi, finst_id.lo);
         let call_index = FETCH_RESULT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
-        if crate::common::config::debug_fault_inject_fetch_not_ready_count()
+        if novarocks::common::config::debug_fault_inject_fetch_not_ready_count()
             .is_some_and(|limit| call_index <= limit)
         {
             return fetch_response(FetchStatus::NotReady, String::new(), 0, false, Vec::new());
@@ -124,7 +124,7 @@ fn fetch_response(
 }
 
 fn emit_typed_fetch_marker(status: i32) {
-    if crate::common::config::debug_emit_grpc_fragment_marker() {
+    if novarocks::common::config::debug_emit_grpc_fragment_marker() {
         println!("NOVAROCKS_GRPC_FETCH_TYPED status={status}");
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }

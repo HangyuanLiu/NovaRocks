@@ -28,12 +28,12 @@ use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
+use crate::service::native_data_plane::NativeDataPlaneKernel;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use novarocks::query_lifecycle::QueryTerminalIngress;
-use novarocks::service::native_data_plane::NativeDataPlaneKernel;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_protocol::{filter, lifecycle::ParticipantTerminalOutcome, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -285,7 +285,7 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
             .map(|count| count.get() as u32)
             .unwrap_or(1);
         Ok(tonic::Response::new(proto::HeartbeatResponse {
-            start_epoch: novarocks::runtime::start_epoch::start_epoch(),
+            start_epoch: crate::runtime::start_epoch::start_epoch(),
             version: novarocks::version::short_version().to_string(),
             num_cores,
             status_code: 0,

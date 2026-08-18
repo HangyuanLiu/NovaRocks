@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::common::types::UniqueId;
-use crate::novarocks_logging::info;
 use crate::runtime::query_context::{QueryContextManager, query_context_manager};
 use crate::runtime::result_buffer;
+use novarocks::common::types::UniqueId;
+use novarocks::novarocks_logging::info;
 
 pub fn cancel_runtime_fragment(finst_id: UniqueId) {
     cancel_with_manager(finst_id, query_context_manager());
@@ -49,8 +49,8 @@ pub(crate) fn cancel_with_manager(finst_id: UniqueId, mgr: std::sync::Arc<QueryC
 #[cfg(test)]
 mod tests {
     use super::cancel_runtime_fragment;
-    use crate::common::types::UniqueId;
     use crate::runtime::query_context::{QueryId, query_context_manager};
+    use novarocks::common::types::UniqueId;
 
     #[test]
     fn cancel_fans_out_to_query_fragment_peers() {
@@ -66,5 +66,10 @@ mod tests {
 
         mgr.unregister_finst(finst_a);
         mgr.unregister_finst(finst_b);
+    }
+
+    #[test]
+    fn cancel_unknown_fragment_does_not_panic() {
+        cancel_runtime_fragment(UniqueId::new(1, 2));
     }
 }

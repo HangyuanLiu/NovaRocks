@@ -2,8 +2,8 @@ use arrow::array::ArrayRef;
 use novarocks_types::PrimitiveType;
 use novarocks_types::arrow_primitive::arrow_field_to_primitive;
 
-use crate::common::result_batch::ResultBatch;
-use crate::common::util::{
+use novarocks::common::result_batch::ResultBatch;
+use novarocks::common::util::{
     FieldRenderSchema, http_json_row_from_arrays_with_primitives,
     mysql_text_row_from_arrays_with_primitives,
 };
@@ -232,7 +232,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
 
     use super::build_statistic_result_batch;
-    use crate::common::util::FieldRenderSchema;
+    use novarocks::common::util::FieldRenderSchema;
     use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use novarocks_execution::runtime::fragment::io::ResultProjection;
     use novarocks_types::PrimitiveType;

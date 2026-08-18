@@ -23,7 +23,6 @@ pub mod maintenance;
 pub mod protocol;
 pub mod query_lifecycle;
 pub mod runtime;
-pub mod server;
 pub mod service;
 pub use novarocks_version as version;
 // StarRocks-BE-like folder layout, with `novarocks_*` convenience aliases.

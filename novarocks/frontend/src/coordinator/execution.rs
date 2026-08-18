@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicI64, AtomicU16, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::common::backend_topology::LiveBackendTarget;
-use crate::protocol::native::fragment_transport::{FetchOutcome, FragmentDispatcher};
+use crate::native::fragment_transport::{FetchOutcome, FragmentDispatcher};
 use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::artifact::{
     ConnectorBindingDispatcher, ConnectorBindingInstallObserver,

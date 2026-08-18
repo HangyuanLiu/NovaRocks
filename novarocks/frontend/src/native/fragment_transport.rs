@@ -17,7 +17,7 @@
 
 //! Fragment dispatcher port and native submission DTO.
 
-use crate::common::types::UniqueId;
+use novarocks::common::types::UniqueId;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
 
 /// Opaque data-plane batch returned by a fragment dispatcher.
