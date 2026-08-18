@@ -296,6 +296,48 @@ fn refresh_frontend_gauges() {
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_INIT);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_CONTROL);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_LATENCY);
+    ensure_frontend_metric_label_families();
+}
+
+/// Make the documented FE metric families observable before their first event
+/// without resetting values already published by their application owner.
+fn ensure_frontend_metric_label_families() {
+    for state in ["registering", "live", "lost", "decommissioning"] {
+        let _ = BACKENDS_BY_STATE.get_metric_with_label_values(&[state]);
+    }
+    for outcome in [
+        "applied",
+        "already_applied",
+        "failed",
+        "uncertain_cleanup",
+        "manifest_conflict",
+    ] {
+        let _ = FRONTEND_QUERY_LIFECYCLE_INIT.get_metric_with_label_values(&[outcome]);
+    }
+    for outcome in [
+        "control_ready",
+        "attach_failed",
+        "heartbeat_timeout",
+        "coordinator_lost",
+        "local_failure",
+        "backend_epoch_mismatch",
+        "cleanup_failure",
+        "terminal_locally_drained",
+        "terminal_snapshot_accepted",
+        "terminal_snapshot_idempotent",
+        "terminal_snapshot_conflict",
+        "terminal_finalize_failure",
+    ] {
+        let _ = FRONTEND_QUERY_LIFECYCLE_CONTROL.get_metric_with_label_values(&[outcome]);
+    }
+    for (phase, measure) in [
+        ("init", "total"),
+        ("init", "samples"),
+        ("attach", "total"),
+        ("attach", "samples"),
+    ] {
+        let _ = FRONTEND_QUERY_LIFECYCLE_LATENCY.get_metric_with_label_values(&[phase, measure]);
+    }
 }
 #[cfg(test)]
 mod tests {

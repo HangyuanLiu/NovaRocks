@@ -350,6 +350,55 @@ fn refresh_backend_gauges() {
     Lazy::force(&BACKEND_QUERY_LIFECYCLE_REJECTIONS);
     Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINATIONS);
     Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINAL);
+    Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES);
+    ensure_backend_metric_label_families();
+}
+
+/// Make the documented BE metric families observable before their first event
+/// without resetting values already published by their application owner.
+fn ensure_backend_metric_label_families() {
+    for state in [
+        "initializing",
+        "initialized",
+        "control_attached",
+        "terminating",
+        "tombstone",
+    ] {
+        let _ = BACKEND_QUERY_LIFECYCLE_ENTRIES.get_metric_with_label_values(&[state]);
+    }
+    for reason in [
+        "admission",
+        "init_conflict",
+        "heartbeat_timeout",
+        "terminal_fallback_rejected",
+    ] {
+        let _ = BACKEND_QUERY_LIFECYCLE_REJECTIONS.get_metric_with_label_values(&[reason]);
+    }
+    for reason in [
+        "coordinator_abort",
+        "coordinator_finalize",
+        "coordinator_stream_lost",
+        "coordinator_heartbeat_timeout",
+        "local_failure",
+        "pre_start_timeout",
+    ] {
+        let _ = BACKEND_QUERY_LIFECYCLE_TERMINATIONS.get_metric_with_label_values(&[reason]);
+    }
+    for outcome in [
+        "terminal_fact",
+        "terminal_local_drained",
+        "terminal_record_frozen",
+        "terminal_acknowledged",
+        "terminal_retention_expired",
+        "terminal_fallback_accepted",
+        "terminal_retained",
+        "terminal_retained_bytes",
+        "terminal_retained_capacity",
+        "terminal_max_retained_bytes",
+    ] {
+        let _ = BACKEND_QUERY_LIFECYCLE_TERMINAL.get_metric_with_label_values(&[outcome]);
+    }
+    let _ = BACKEND_QUERY_EXECUTION_RESOURCES.get_metric_with_label_values(&["active"]);
 }
 #[cfg(test)]
 mod tests {
