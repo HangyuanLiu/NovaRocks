@@ -49,7 +49,6 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
-use super::fast_append::carry_forward_puffin_stats;
 use super::helpers::{
     FencedSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
     metadata_dir, now_ms, read_snapshot_manifest_list, required_target_ref_snapshot_id,
@@ -119,12 +118,6 @@ impl IcebergCommitAction for RowDeltaCommit {
                     ctx.target_ref,
                     "RowDelta",
                 )?;
-                // DELETE preserves NDV upper-bound semantics — carry forward the
-                // previous snapshot's Puffin entry to the new snapshot id.
-                if let Some(prev) = prev_snapshot_id {
-                    carry_forward_puffin_stats(&table_after, ctx.catalog, new_snapshot_id, prev)
-                        .await;
-                }
                 Ok(CommitOutcome {
                     new_snapshot_id,
                     written_manifest_paths: written_manifest_paths(),

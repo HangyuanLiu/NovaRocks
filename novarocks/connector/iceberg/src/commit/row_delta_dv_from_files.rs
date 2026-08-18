@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
-use super::fast_append::{carry_forward_puffin_stats, commit_empty_iceberg_mv_snapshot};
+use super::fast_append::commit_empty_iceberg_mv_snapshot;
 use super::helpers::{
     FencedSubmit, debug_assert_single_unmarked_row_bearing_data_manifest, effective_next_row_id,
     finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
@@ -146,10 +146,6 @@ impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
                     ctx.target_ref,
                     "RowDeltaDvFromFiles",
                 )?;
-                if let Some(prev) = prev_snapshot_id {
-                    carry_forward_puffin_stats(&table_after, ctx.catalog, new_snapshot_id, prev)
-                        .await;
-                }
                 Ok(CommitOutcome {
                     new_snapshot_id,
                     written_manifest_paths: written_manifest_paths(),

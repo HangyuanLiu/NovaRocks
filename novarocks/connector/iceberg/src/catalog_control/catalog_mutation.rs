@@ -40,6 +40,7 @@ use crate::reconcile_payload::{
     ICEBERG_MUTATION_EVIDENCE_VERSION, IcebergMutationEvidenceTarget, IcebergMutationEvidenceV1,
     decode_mutation_evidence, encode_mutation_evidence,
 };
+use crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY;
 
 const LOGICAL_TYPE_PROPERTY_PREFIX: &str = "novarocks.logical_type.";
 const TABLE_KEY_KIND_PROPERTY: &str = "novarocks.table.key_kind";
@@ -1062,7 +1063,10 @@ fn reserved_property(key: &str) -> Option<&'static str> {
     ) {
         return Some("Iceberg internal metadata key");
     }
-    if key == "novarocks.maintenance.enabled" {
+    if matches!(
+        key,
+        "novarocks.maintenance.enabled" | COLLECT_ON_WRITE_PROPERTY
+    ) {
         return None;
     }
     key.starts_with("novarocks.")
@@ -3214,10 +3218,12 @@ mod tests {
     }
 
     #[test]
-    fn property_guard_keeps_only_the_maintenance_escape_hatch() {
+    fn property_guard_keeps_only_the_explicit_user_property_escape_hatches() {
         assert!(reserved_property("format-version").is_some());
         assert!(reserved_property("novarocks.table.key_columns").is_some());
         assert_eq!(reserved_property("novarocks.maintenance.enabled"), None);
+        assert_eq!(reserved_property(COLLECT_ON_WRITE_PROPERTY), None);
+        assert!(reserved_property("novarocks.statistics.future").is_some());
         assert_eq!(reserved_property("write.parquet.compression-codec"), None);
     }
 

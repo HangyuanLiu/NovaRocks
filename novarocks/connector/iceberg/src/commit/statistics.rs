@@ -18,6 +18,8 @@
 //! Shared metadata-only commit for an iceberg Puffin StatisticsFile.
 //! Design: ADR-0082 (docs/adr/ADR-0082-same-snapshot-statistics-publication-arbitration.md)
 
+use std::fmt;
+
 use crate::iceberg::spec::StatisticsFile;
 use crate::iceberg::table::Table;
 use crate::iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -40,6 +42,21 @@ pub enum StatisticsCommitOutcome {
     YieldedToFullerCoverage,
 }
 
+/// Why a registration attempt did not produce authoritative proof.
+#[derive(Debug)]
+pub enum StatisticsRegistrationFailure {
+    Commit(String),
+    Unknown(String),
+}
+
+impl fmt::Display for StatisticsRegistrationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Commit(error) | Self::Unknown(error) => formatter.write_str(error),
+        }
+    }
+}
+
 /// Registers `stats_file`, deciding against whatever currently occupies its
 /// snapshot and re-deciding after every lost race.
 ///
@@ -57,7 +74,7 @@ pub async fn commit_statistics_file(
     catalog: &dyn crate::iceberg::Catalog,
     stats_file: StatisticsFile,
     coverage: StatisticsCoverageMark,
-) -> Result<StatisticsCommitOutcome, String> {
+) -> Result<StatisticsCommitOutcome, StatisticsRegistrationFailure> {
     let mut table = table.clone();
     for attempt in 0..MAX_STATISTICS_COMMIT_ATTEMPTS {
         if !supersedes_registered_entry(&table, &stats_file, coverage) {
@@ -65,32 +82,84 @@ pub async fn commit_statistics_file(
         }
         let tx = Transaction::new(&table);
         let action = tx.update_statistics().set_statistics(stats_file.clone());
-        let tx = action
-            .apply(tx)
-            .map_err(|e| format!("iceberg update_statistics apply failed: {e}"))?;
-        match tx.commit(catalog).await {
-            Ok(committed) => {
-                let _ = committed;
+        let tx = action.apply(tx).map_err(|e| {
+            StatisticsRegistrationFailure::Commit(format!(
+                "iceberg update_statistics apply failed: {e}"
+            ))
+        })?;
+        let commit_result = tx.commit(catalog).await;
+
+        // A commit response is not the publication receipt. Catalogs can lose
+        // the response after applying the update, and another writer can
+        // replace this snapshot's singleton statistics entry immediately after
+        // a successful response. Always reload the catalog's authoritative
+        // metadata and make the exact path the registration proof.
+        let reloaded = crate::iceberg::Catalog::load_table(catalog, table.identifier())
+            .await
+            .map_err(|reload| match &commit_result {
+                Ok(_) => StatisticsRegistrationFailure::Unknown(format!(
+                    "iceberg update_statistics commit succeeded, but reloading the table to \
+                     confirm statistics registration failed: {reload}"
+                )),
+                Err(error) => StatisticsRegistrationFailure::Unknown(format!(
+                    "iceberg update_statistics commit failed ({error}); reloading the table to \
+                     confirm statistics registration also failed: {reload}"
+                )),
+            })?;
+
+        match decide_registration_attempt(
+            commit_result.map(|_| ()),
+            is_exact_statistics_path_registered(&reloaded, &stats_file),
+            attempt + 1 == MAX_STATISTICS_COMMIT_ATTEMPTS,
+            &stats_file.statistics_path,
+        ) {
+            Ok(RegistrationAttemptDecision::Registered) => {
                 return Ok(StatisticsCommitOutcome::Registered);
             }
-            Err(error) if attempt + 1 < MAX_STATISTICS_COMMIT_ATTEMPTS => {
-                // Reload before deciding again: the winner of this race may
-                // have registered something this entry must not replace.
-                table = crate::iceberg::Catalog::load_table(catalog, table.identifier())
-                    .await
-                    .map_err(|reload| {
-                        format!(
-                            "iceberg update_statistics commit failed ({error}); \
-                             reloading the table to re-decide also failed: {reload}"
-                        )
-                    })?;
-            }
-            Err(error) => {
-                return Err(format!("iceberg update_statistics commit failed: {error}"));
-            }
+            Ok(RegistrationAttemptDecision::Retry) => {}
+            Err(error) => return Err(error),
         }
+
+        // Re-arbitrate against the authoritative winner before a retry. This
+        // may correctly yield to a fuller entry instead of blindly replacing
+        // it.
+        table = reloaded;
     }
-    Err("iceberg update_statistics exhausted its commit attempts".to_string())
+    Err(StatisticsRegistrationFailure::Unknown(
+        "iceberg update_statistics exhausted its commit attempts".to_string(),
+    ))
+}
+
+/// Decide a commit attempt only after authoritative metadata has been loaded.
+/// A failed response is still successful when that metadata names the exact
+/// candidate path, because the catalog may have persisted before losing its
+/// response.
+enum RegistrationAttemptDecision {
+    Registered,
+    Retry,
+}
+
+fn decide_registration_attempt(
+    commit_result: Result<(), crate::iceberg::Error>,
+    candidate_registered: bool,
+    final_attempt: bool,
+    candidate_path: &str,
+) -> Result<RegistrationAttemptDecision, StatisticsRegistrationFailure> {
+    if candidate_registered {
+        return Ok(RegistrationAttemptDecision::Registered);
+    }
+    if !final_attempt {
+        return Ok(RegistrationAttemptDecision::Retry);
+    }
+    match commit_result {
+        Err(error) => Err(StatisticsRegistrationFailure::Commit(format!(
+            "iceberg update_statistics commit failed: {error}"
+        ))),
+        Ok(()) => Err(StatisticsRegistrationFailure::Unknown(format!(
+            "iceberg update_statistics commit completed, but authoritative table metadata did not \
+             register statistics path {candidate_path}"
+        ))),
+    }
 }
 
 /// Whether `candidate` should replace whatever is registered for its snapshot.
@@ -116,6 +185,24 @@ fn supersedes_registered_entry(
         (StatisticsCoverageMark::AllVisibleRows, StatisticsCoverageMark::IncrementalUnion) => false,
         _ => true,
     }
+}
+
+/// Whether the catalog's currently loaded metadata contains this exact
+/// singleton statistics entry for the candidate snapshot.
+fn is_exact_statistics_path_registered(table: &Table, candidate: &StatisticsFile) -> bool {
+    statistics_path_matches(
+        table
+            .metadata()
+            .statistics_for_snapshot(candidate.snapshot_id),
+        candidate,
+    )
+}
+
+fn statistics_path_matches(
+    registered: Option<&StatisticsFile>,
+    candidate: &StatisticsFile,
+) -> bool {
+    registered.is_some_and(|registered| registered.statistics_path == candidate.statistics_path)
 }
 
 #[cfg(test)]
@@ -167,5 +254,28 @@ mod tests {
             )),
             StatisticsCoverageMark::AllVisibleRows
         );
+    }
+
+    #[test]
+    fn exact_registration_requires_the_candidate_path() {
+        let candidate = entry("candidate.puffin", None);
+        let other = entry("other.puffin", None);
+
+        assert!(statistics_path_matches(Some(&candidate), &candidate));
+        assert!(!statistics_path_matches(Some(&other), &candidate));
+        assert!(!statistics_path_matches(None, &candidate));
+    }
+
+    #[test]
+    fn response_loss_is_registered_when_reloaded_metadata_proves_the_path() {
+        let response_loss = crate::iceberg::Error::new(
+            crate::iceberg::ErrorKind::Unexpected,
+            "response lost after commit",
+        );
+
+        assert!(matches!(
+            decide_registration_attempt(Err(response_loss), true, false, "candidate.puffin"),
+            Ok(RegistrationAttemptDecision::Registered)
+        ));
     }
 }

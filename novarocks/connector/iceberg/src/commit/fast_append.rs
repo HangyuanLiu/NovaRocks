@@ -51,7 +51,81 @@ use super::helpers::{
 };
 use super::overwrite::write_added_data_manifest;
 use crate::commit::{CommitOutcome, IcebergWriteMode, WrittenFile};
-use crate::stats_assembler::{CommitType, FileSketchSet, StatsAssembler};
+use crate::stats_assembler::{
+    COLLECT_ON_WRITE_PROPERTY, CommitType, FileSketchSet, StatisticsAssemblyFailure, StatsAssembler,
+};
+
+/// Stable category emitted for best-effort collect-on-write maintenance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatisticsMaintenanceFailure {
+    SketchAssembly,
+    ParentStatisticsRead,
+    PuffinWrite,
+    RegistrationCommit,
+    RegistrationUnknown,
+}
+
+impl StatisticsMaintenanceFailure {
+    fn as_marker(self) -> &'static str {
+        match self {
+            Self::SketchAssembly => "SketchAssembly",
+            Self::ParentStatisticsRead => "ParentStatisticsRead",
+            Self::PuffinWrite => "PuffinWrite",
+            Self::RegistrationCommit => "RegistrationCommit",
+            Self::RegistrationUnknown => "RegistrationUnknown",
+        }
+    }
+
+    fn from_assembly_failure(error: &StatisticsAssemblyFailure) -> Self {
+        match error {
+            StatisticsAssemblyFailure::SketchAssembly(_) => Self::SketchAssembly,
+            StatisticsAssemblyFailure::ParentStatisticsRead(_) => Self::ParentStatisticsRead,
+            StatisticsAssemblyFailure::PuffinWrite(_) => Self::PuffinWrite,
+        }
+    }
+
+    fn from_registration_failure(
+        error: &crate::commit::statistics::StatisticsRegistrationFailure,
+    ) -> Self {
+        match error {
+            crate::commit::statistics::StatisticsRegistrationFailure::Commit(_) => {
+                Self::RegistrationCommit
+            }
+            crate::commit::statistics::StatisticsRegistrationFailure::Unknown(_) => {
+                Self::RegistrationUnknown
+            }
+        }
+    }
+}
+
+fn collect_on_write_enabled(table: &Table) -> bool {
+    collect_on_write_enabled_from_properties(table.metadata().properties())
+}
+
+fn collect_on_write_enabled_from_properties(
+    properties: &std::collections::HashMap<String, String>,
+) -> bool {
+    properties
+        .get(COLLECT_ON_WRITE_PROPERTY)
+        .is_none_or(|value| !value.eq_ignore_ascii_case("false"))
+}
+
+fn emit_statistics_maintenance_failure(
+    kind: StatisticsMaintenanceFailure,
+    snapshot_id: i64,
+    error: &impl std::fmt::Display,
+) {
+    eprintln!(
+        "NOVAROCKS_STATISTICS_MAINTENANCE_FAILED kind={} snapshot_id={snapshot_id}",
+        kind.as_marker(),
+    );
+    tracing::warn!(
+        snapshot_id,
+        kind = kind.as_marker(),
+        error = %error,
+        "iceberg collect-on-write statistics maintenance failed; snapshot committed without stats",
+    );
+}
 
 pub struct FastAppendCommit;
 
@@ -151,6 +225,14 @@ pub(crate) async fn register_puffin_stats(
     new_sequence_number: i64,
     prev_snapshot_id: Option<i64>,
 ) {
+    if !collect_on_write_enabled(table_after) {
+        tracing::debug!(
+            new_snapshot_id,
+            "iceberg collect-on-write statistics maintenance is disabled by table property",
+        );
+        return;
+    }
+
     match StatsAssembler::assemble(
         table_after,
         commit_type,
@@ -181,67 +263,20 @@ pub(crate) async fn register_puffin_stats(
                         "iceberg puffin stats yielded to an all-visible-rows entry",
                     );
                 }
-                Err(err) => {
-                    tracing::warn!(
-                        new_snapshot_id,
-                        error = %err,
-                        "iceberg puffin stats commit failed; snapshot committed without stats",
-                    );
-                }
+                Err(err) => emit_statistics_maintenance_failure(
+                    StatisticsMaintenanceFailure::from_registration_failure(&err),
+                    new_snapshot_id,
+                    &err,
+                ),
             }
         }
         Ok(None) => {
-            // Either no new sketches available (empty input) or the
-            // assembler chose to reuse the previous Puffin (DELETE /
-            // REWRITE). Carry-forward registration is handled by the
-            // delete / rewrite paths directly.
+            // No statistics file was assembled for this snapshot.
         }
         Err(err) => {
-            tracing::warn!(
-                new_snapshot_id,
-                error = %err,
-                "iceberg puffin stats assemble failed; snapshot committed without stats",
-            );
+            let kind = StatisticsMaintenanceFailure::from_assembly_failure(&err);
+            emit_statistics_maintenance_failure(kind, new_snapshot_id, &err);
         }
-    }
-}
-
-/// Carry forward the previous snapshot's Puffin statistics entry to
-/// `new_snapshot_id`. Used by DELETE / REWRITE commits where NDV remains
-/// a valid upper bound — the statistics file path is identical, only the
-/// snapshot_id key on the metadata entry changes.
-///
-/// Errors are logged and swallowed; missing previous stats is normal.
-pub(crate) async fn carry_forward_puffin_stats(
-    table_after: &Table,
-    catalog: &dyn crate::iceberg::Catalog,
-    new_snapshot_id: i64,
-    prev_snapshot_id: i64,
-) {
-    let Some(prev) = table_after
-        .metadata()
-        .statistics_for_snapshot(prev_snapshot_id)
-    else {
-        return;
-    };
-    let mut entry = prev.clone();
-    entry.snapshot_id = new_snapshot_id;
-    // Reseat each blob's snapshot_id so the metadata entry is self-consistent.
-    for blob in entry.blob_metadata.iter_mut() {
-        blob.snapshot_id = new_snapshot_id;
-    }
-    // Carrying an entry forward preserves whatever it already claimed; it is a
-    // re-registration of the same artifact, not a new measurement.
-    let coverage = crate::stats_assembler::StatisticsCoverageMark::of(&entry);
-    if let Err(err) =
-        crate::commit::statistics::commit_statistics_file(table_after, catalog, entry, coverage)
-            .await
-    {
-        tracing::warn!(
-            new_snapshot_id,
-            error = %err,
-            "iceberg puffin carry-forward stats commit failed",
-        );
     }
 }
 
@@ -682,4 +717,76 @@ fn append_summary(
 
 fn to_iceberg_unexpected(s: String) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, s)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn collect_on_write_defaults_to_enabled_and_only_false_disables_it() {
+        assert!(collect_on_write_enabled_from_properties(&HashMap::new()));
+        assert!(collect_on_write_enabled_from_properties(&HashMap::from([
+            (COLLECT_ON_WRITE_PROPERTY.to_string(), "true".to_string(),)
+        ])));
+        assert!(!collect_on_write_enabled_from_properties(&HashMap::from([
+            (COLLECT_ON_WRITE_PROPERTY.to_string(), "FALSE".to_string(),)
+        ])));
+    }
+
+    #[test]
+    fn maintenance_failure_markers_are_stable_and_distinct() {
+        let markers = [
+            StatisticsMaintenanceFailure::SketchAssembly.as_marker(),
+            StatisticsMaintenanceFailure::ParentStatisticsRead.as_marker(),
+            StatisticsMaintenanceFailure::PuffinWrite.as_marker(),
+            StatisticsMaintenanceFailure::RegistrationCommit.as_marker(),
+            StatisticsMaintenanceFailure::RegistrationUnknown.as_marker(),
+        ];
+        assert_eq!(
+            markers.len(),
+            markers
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        );
+    }
+
+    #[test]
+    fn maintenance_failure_mapping_preserves_all_five_failure_kinds() {
+        assert_eq!(
+            StatisticsMaintenanceFailure::from_assembly_failure(
+                &StatisticsAssemblyFailure::SketchAssembly("sketch".into())
+            ),
+            StatisticsMaintenanceFailure::SketchAssembly
+        );
+        assert_eq!(
+            StatisticsMaintenanceFailure::from_assembly_failure(
+                &StatisticsAssemblyFailure::ParentStatisticsRead("parent".into())
+            ),
+            StatisticsMaintenanceFailure::ParentStatisticsRead
+        );
+        assert_eq!(
+            StatisticsMaintenanceFailure::from_assembly_failure(
+                &StatisticsAssemblyFailure::PuffinWrite("puffin".into())
+            ),
+            StatisticsMaintenanceFailure::PuffinWrite
+        );
+        assert_eq!(
+            StatisticsMaintenanceFailure::from_registration_failure(
+                &crate::commit::statistics::StatisticsRegistrationFailure::Commit("commit".into())
+            ),
+            StatisticsMaintenanceFailure::RegistrationCommit
+        );
+        assert_eq!(
+            StatisticsMaintenanceFailure::from_registration_failure(
+                &crate::commit::statistics::StatisticsRegistrationFailure::Unknown(
+                    "unknown".into()
+                )
+            ),
+            StatisticsMaintenanceFailure::RegistrationUnknown
+        );
+    }
 }
