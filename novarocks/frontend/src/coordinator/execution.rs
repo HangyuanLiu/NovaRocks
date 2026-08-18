@@ -1059,7 +1059,25 @@ impl FrontendDistributedQueryCoordinator {
             ));
         }
 
-        let query_failure = self.registry.first_failure(query_id);
+        // A failure recorded after this point cannot invalidate the query. Every
+        // participant already converged on a Succeeded terminal, so the work
+        // finished and a write's staged reports are all in hand; the pre-finalize
+        // check above is what fails a query that actually failed. Heartbeat
+        // observations keep latching into active queries regardless -- a backend
+        // briefly marked unavailable under load latches into every query
+        // scheduled on it -- and consuming that here turned a completed
+        // statement into `connector write execution ended without a complete
+        // staged-report commit`, a message describing neither the latch nor its
+        // reason, because the latch made the builder emit an abort that this
+        // call site then discarded.
+        if let Some(message) = self.registry.first_failure(query_id) {
+            tracing::warn!(
+                query_id = ?query_id,
+                latched = %message,
+                "query failure recorded after a successful terminal set; the completed \
+                 query is not failed by it",
+            );
+        }
         let outcome = (|| match intent {
             DistributedQueryIntent::Result => parts
                 .completion
@@ -1067,9 +1085,6 @@ impl FrontendDistributedQueryCoordinator {
             DistributedQueryIntent::Write => {
                 let result = expected_output.into_query_result(batches)?;
                 let mut builder = WriteTerminalBuilder::new(writer_registrations)?;
-                if let Some(message) = query_failure {
-                    builder.latch_failure(message);
-                }
                 for fragment in terminal_set.fragments() {
                     builder.apply_terminal(fragment)?;
                 }
