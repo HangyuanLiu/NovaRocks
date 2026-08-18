@@ -981,6 +981,62 @@ mod tests {
             .collect()
     }
 
+    fn registrations() -> WriterRegistrationSet {
+        WriterRegistrationSet::new([crate::query_execution::artifact::WriterRegistration::new(
+            query_id(),
+            execution_id(),
+            1,
+            fragment_instance_id(),
+            0,
+            None,
+        )])
+    }
+
+    /// A latched failure produces an abort payload, never an error.
+    ///
+    /// The distinction is load bearing at the call site: an abort is something
+    /// it can carry through to the write completion, whereas treating "no
+    /// commit" as a contract violation reports neither the latch nor its
+    /// reason, and drops the abort on the floor with the staged files still in
+    /// object storage.
+    #[test]
+    fn a_latched_failure_yields_an_abort_rather_than_no_outcome_at_all() {
+        let mut builder = WriteTerminalBuilder::new(registrations()).expect("builder");
+        builder.latch_failure("backend 2 lost");
+
+        let outcome = builder.finish().expect("a latch is an abort, not an error");
+
+        assert!(
+            outcome.commit.is_none(),
+            "a latched failure must not also claim a commit"
+        );
+        let abort = outcome.abort.expect("a latched failure produces an abort");
+        assert_eq!(abort.reason, "backend 2 lost");
+        assert_eq!(
+            abort.incomplete_writers.len(),
+            1,
+            "the writer that never reported is named, so cleanup knows what to look for"
+        );
+    }
+
+    /// Without a latch, a writer set that never reported is a failure in its own
+    /// right, and it says so rather than silently producing no commit.
+    #[test]
+    fn missing_writer_reports_fail_by_name_without_a_latch() {
+        let Err(error) = WriteTerminalBuilder::new(registrations())
+            .expect("builder")
+            .finish()
+        else {
+            panic!("an unreported writer cannot be committed");
+        };
+        assert!(
+            error
+                .message()
+                .contains("before all writer reports arrived"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn p2_unavailable_preserves_staged_report_frame_bytes() {
         let available = terminal_snapshot_with_p2(TerminalTelemetry::Available(
