@@ -900,8 +900,10 @@ mod tests {
         }
 
         accepts_sync_runner(run_frontend_server);
+        let data_runtime = tokio::runtime::Runtime::new().expect("data runtime");
         accepts_async_runner(run_frontend_server_until_shutdown(
             frontend_config(),
+            data_runtime.handle().clone(),
             async {},
         ));
     }
