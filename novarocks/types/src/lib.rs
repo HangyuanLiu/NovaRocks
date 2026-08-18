@@ -42,3 +42,10 @@ pub use field_render_schema::FieldRenderSchema;
 pub use identity::{QueryId, UniqueId, format_uuid};
 pub use primitive::PrimitiveType;
 pub use slot_id::SlotId;
+
+/// Worker thread stack size for Tokio runtimes that execute NovaRocks workloads.
+///
+/// Deep SQL planner and fragment-builder walks require more than the platform
+/// default stack. All application and execution runtime builders use this
+/// shared process-independent sizing contract.
+pub const WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
