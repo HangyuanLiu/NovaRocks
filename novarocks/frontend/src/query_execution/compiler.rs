@@ -18,15 +18,12 @@
 
 use std::sync::Arc;
 
-use tokio::runtime::Handle;
-
 use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
 pub use crate::query_execution::post_compile::{
     NativeFragmentEncodingInput, PreparedDistributedQueryAssembly,
 };
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::{PreparedImmediateQuery, PreparedQueryCompletion, StatementResult};
-use ::novarocks::runtime::global_async_runtime::data_block_on;
 use ::novarocks::runtime::query_result::{QueryResult, build_string_query_result};
 use novarocks_protocol::lifecycle::QueryOptions;
 
@@ -1331,20 +1328,6 @@ fn require_backend_management_role(
 // ---------------------------------------------------------------------------
 // Local parquet table helpers
 // ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Utility functions
-// ---------------------------------------------------------------------------
-
-pub(crate) fn block_on_standalone_async<F>(future: F) -> Result<F::Output, String>
-where
-    F: std::future::Future,
-{
-    if let Ok(handle) = Handle::try_current() {
-        return Ok(handle.block_on(future));
-    }
-    data_block_on(future)
-}
 
 // ---------------------------------------------------------------------------
 // Query plan build + execute (delegates to novarocks_sql::*)
