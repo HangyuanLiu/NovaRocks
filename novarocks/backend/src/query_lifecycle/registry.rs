@@ -47,6 +47,7 @@ use super::{
     BackendQueryControl, QueryControlAttachment, QueryLifecycleError, QueryLifecycleErrorCode,
     QueryLifecycleIngress, QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
 };
+use crate::BackendDataRuntime;
 use crate::native::client::NativeGrpcClient;
 use crate::native::runtime_filter_adapter::{
     BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
@@ -861,7 +862,9 @@ pub(crate) struct QueryLifecycleRegistry {
     self_weak: Weak<QueryLifecycleRegistry>,
 }
 
-struct GrpcQueryTerminalFallbackTransport;
+struct GrpcQueryTerminalFallbackTransport {
+    runtime: BackendDataRuntime,
+}
 
 impl QueryTerminalFallbackTransport for GrpcQueryTerminalFallbackTransport {
     fn report_query_terminal(
@@ -870,8 +873,12 @@ impl QueryTerminalFallbackTransport for GrpcQueryTerminalFallbackTransport {
         outcome: ParticipantTerminalOutcome,
         timeout: Duration,
     ) -> Result<QueryTerminalReportAck, QueryTerminalFallbackTransportError> {
-        let client = NativeGrpcClient::new_host_port(endpoint.host().to_string(), endpoint.port())
-            .map_err(|error| QueryTerminalFallbackTransportError::unavailable(error))?;
+        let client = NativeGrpcClient::new_host_port(
+            self.runtime.clone(),
+            endpoint.host().to_string(),
+            endpoint.port(),
+        )
+        .map_err(|error| QueryTerminalFallbackTransportError::unavailable(error))?;
         let response = client
             .blocking_report_query_terminal_with_timeout(
                 novarocks_protocol::novarocks::ReportQueryTerminalRequest {
@@ -1066,6 +1073,7 @@ impl QueryLifecycleRegistry {
         release.wait();
     }
 
+    #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn new(
         local_backend_id: u64,
@@ -1082,6 +1090,7 @@ impl QueryLifecycleRegistry {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_clock(
         local_backend_id: u64,
         local_start_epoch: u64,
@@ -1099,6 +1108,7 @@ impl QueryLifecycleRegistry {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_clock_and_metrics(
         local_backend_id: u64,
         local_start_epoch: u64,
@@ -1114,10 +1124,13 @@ impl QueryLifecycleRegistry {
             config,
             clock,
             metrics,
-            Arc::new(GrpcQueryTerminalFallbackTransport),
+            Arc::new(GrpcQueryTerminalFallbackTransport {
+                runtime: crate::native::runtime::test_backend_data_runtime(),
+            }),
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_clock_metrics_and_terminal_fallback(
         local_backend_id: u64,
         local_start_epoch: u64,
@@ -1128,6 +1141,7 @@ impl QueryLifecycleRegistry {
         terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
     ) -> Arc<Self> {
         Self::new_with_backend_identity(
+            crate::native::runtime::test_backend_data_runtime(),
             Some(local_backend_id),
             local_start_epoch,
             local_runtime,
@@ -1161,23 +1175,40 @@ impl QueryLifecycleRegistry {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_unbound(
         local_start_epoch: u64,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
         config: QueryLifecycleRegistryConfig,
     ) -> Arc<Self> {
+        Self::new_unbound_with_runtime(
+            crate::native::runtime::test_backend_data_runtime(),
+            local_start_epoch,
+            local_runtime,
+            config,
+        )
+    }
+
+    pub(crate) fn new_unbound_with_runtime(
+        runtime: BackendDataRuntime,
+        local_start_epoch: u64,
+        local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
+        config: QueryLifecycleRegistryConfig,
+    ) -> Arc<Self> {
         Self::new_with_backend_identity(
+            runtime.clone(),
             None,
             local_start_epoch,
             local_runtime,
             config,
             Arc::new(SystemMonotonicClock),
             Arc::new(PrometheusQueryLifecycleMetricsSink),
-            Arc::new(GrpcQueryTerminalFallbackTransport),
+            Arc::new(GrpcQueryTerminalFallbackTransport { runtime }),
         )
     }
 
     fn new_with_backend_identity(
+        runtime: BackendDataRuntime,
         local_backend_id: Option<u64>,
         local_start_epoch: u64,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
@@ -1194,7 +1225,7 @@ impl QueryLifecycleRegistry {
             clock,
             metrics,
             terminal_fallback,
-            Arc::new(BackendRuntimeFilterParticipantFactory),
+            Arc::new(BackendRuntimeFilterParticipantFactory::new(runtime)),
         )
     }
 

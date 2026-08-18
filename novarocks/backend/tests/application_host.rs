@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use novarocks::common::network::AdvertiseEndpoint;
 use novarocks_backend::{
-    BackendApplicationHost, BackendServerConfig, BackendStoreSettings, QueryLifecycleRegistryConfig,
+    BackendApplicationHost, BackendDataRuntime, BackendServerConfig, BackendStoreSettings,
+    QueryLifecycleRegistryConfig,
 };
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
@@ -84,8 +85,16 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
 #[test]
 fn host_preserves_native_backend_ready_marker() {
     let grpc_port = unused_port();
-    let host = BackendApplicationHost::open(backend_config(grpc_port, grpc_port))
-        .expect("open native backend host");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(1)
+        .build()
+        .expect("build Backend application host runtime");
+    let host = BackendApplicationHost::open(
+        backend_config(grpc_port, grpc_port),
+        BackendDataRuntime::new(runtime.handle().clone()),
+    )
+    .expect("open native backend host");
 
     assert_eq!(
         host.ready_marker(),

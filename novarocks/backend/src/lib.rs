@@ -17,4 +17,5 @@ pub use connector::{
     ConnectorExecutionHost, ConnectorExecutionLease, ConnectorExecutionQueryResolver,
 };
 pub use fragment::NativeFragmentService;
+pub use native::runtime::BackendDataRuntime;
 pub use query_lifecycle::QueryLifecycleRegistryConfig;

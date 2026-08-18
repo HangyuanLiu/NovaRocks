@@ -55,7 +55,13 @@ fn execution_config() -> FrontendExecutionConfig {
 async fn open_host(
     config: Option<StateStoreHostConfig>,
 ) -> Result<FrontendApplicationHost, novarocks_frontend::FrontendApplicationError> {
-    FrontendApplicationHost::open(config, execution_config(), backend_config()).await
+    FrontendApplicationHost::open(
+        config,
+        execution_config(),
+        backend_config(),
+        tokio::runtime::Handle::current(),
+    )
+    .await
 }
 
 fn backend_config() -> ClusterBackendOpenConfig {

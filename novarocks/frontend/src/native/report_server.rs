@@ -561,9 +561,7 @@ impl FrontendReportServerHandle {
                     let runtime = tokio::runtime::Builder::new_multi_thread()
                         .enable_all()
                         .worker_threads(8)
-                        .thread_stack_size(
-                            ::novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES,
-                        )
+                        .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
                         .build()
                         .map_err(|error| {
                             format!("build frontend report endpoint runtime failed: {error}")

@@ -20,6 +20,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher,
 };
@@ -42,6 +43,10 @@ use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+
+fn frontend_data_runtime_for_test() -> FrontendDataRuntime {
+    FrontendDataRuntime::new(tokio::runtime::Handle::current())
+}
 
 use super::barrier::{
     FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig, PreReadyAttemptGuard,
@@ -2404,8 +2409,8 @@ async fn frontend_query_lifecycle_live_transport_crosses_generated_grpc_service(
     let plan = QueryInitPlan::from_manifests_for_contract_test(execution_id, [(7, live_manifest)])
         .expect("live plan");
     let (registry, _query) = registry_for(&plan);
-    let transport =
-        new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
+        .expect("production lifecycle transport");
     let live_config = FrontendQueryLifecycleConfig::new(
         Duration::from_millis(100),
         Duration::from_millis(300),
@@ -2465,8 +2470,8 @@ async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stre
         .execution_id()
         .expect("id");
     let digest = request.digest().expect("digest");
-    let transport =
-        new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
+        .expect("production lifecycle transport");
     transport
         .init_query(target, request, Duration::from_secs(2))
         .expect("InitQuery");
@@ -2520,8 +2525,8 @@ async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal
         .execution_id()
         .expect("id");
     let digest = request.digest().expect("digest");
-    let transport =
-        new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
+        .expect("production lifecycle transport");
     transport
         .init_query(target, request, Duration::from_secs(2))
         .expect("InitQuery");
@@ -2590,8 +2595,8 @@ async fn frontend_query_lifecycle_live_transport_ack_releases_only_its_pending_c
         .execution_id()
         .expect("id");
     let digest = request.digest().expect("digest");
-    let transport =
-        new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
+        .expect("production lifecycle transport");
     transport
         .init_query(target, request, Duration::from_secs(2))
         .expect("InitQuery");
@@ -2676,8 +2681,8 @@ async fn frontend_query_lifecycle_live_transport_rejects_mismatched_terminal_ack
         .execution_id()
         .expect("id");
     let digest = request.digest().expect("digest");
-    let transport =
-        new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
+        .expect("production lifecycle transport");
     transport
         .init_query(target, request, Duration::from_secs(2))
         .expect("InitQuery");
@@ -2727,8 +2732,8 @@ async fn frontend_query_lifecycle_live_transport_accepts_finalized_abort_replay_
         .execution_id()
         .expect("id");
     let digest = request.digest().expect("digest");
-    let transport =
-        new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
+        .expect("production lifecycle transport");
     transport
         .init_query(target, request, Duration::from_secs(2))
         .expect("InitQuery");
@@ -2786,8 +2791,8 @@ async fn frontend_query_lifecycle_live_transport_pre_submission_timeout_is_defin
     let backend = LiveBackendTarget::new(7, endpoint, 92);
     let target = QueryLifecycleTarget::new(7, endpoint, 92);
     let request = live_init_request(backend, 806);
-    let transport =
-        new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
+        .expect("production lifecycle transport");
 
     let error = transport
         .init_query(target, request, Duration::ZERO)
@@ -2805,8 +2810,8 @@ async fn frontend_query_lifecycle_live_transport_post_submission_timeout_is_unkn
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
     let backend = LiveBackendTarget::new(7, endpoint, 93);
     let target = QueryLifecycleTarget::new(7, endpoint, 93);
-    let transport =
-        new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
+        .expect("production lifecycle transport");
 
     transport
         .init_query(

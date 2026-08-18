@@ -19,6 +19,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::runtime::Handle;
 
 use crate::query_execution::dml::ctas::CtasEngine;
 use crate::query_execution::service::QueryExecutionService;
@@ -44,6 +45,7 @@ use crate::mv::scheduler::FrontendMvSchedulerConfig;
 use crate::mv::{
     FrontendMvRefreshProviderActivationPort, FrontendMvService, repository::StateStoreMvRepository,
 };
+use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_control::FrontendQueryControl;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::statistics::FrontendStatisticsService;
@@ -138,6 +140,7 @@ pub struct FrontendApplicationHost {
     query_control: crate::query_execution::control::QueryControlService,
     coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
     execution_role: novarocks_types::ClusterRole,
+    data_runtime: FrontendDataRuntime,
     topology: Option<Arc<ClusterBackendService>>,
     optimizer_query_mem_limit_bytes: u64,
 }
@@ -309,8 +312,9 @@ impl FrontendApplicationHost {
         config: Option<StateStoreHostConfig>,
         execution: FrontendExecutionConfig,
         backend: ClusterBackendOpenConfig,
+        data_runtime: Handle,
     ) -> Result<Self, FrontendApplicationError> {
-        Self::open_with_factories(config, execution, backend, Vec::new()).await
+        Self::open_with_factories(config, execution, backend, Vec::new(), data_runtime).await
     }
 
     pub async fn open_with_factories(
@@ -318,7 +322,9 @@ impl FrontendApplicationHost {
         execution: FrontendExecutionConfig,
         backend: ClusterBackendOpenConfig,
         connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
+        data_runtime: Handle,
     ) -> Result<Self, FrontendApplicationError> {
+        let data_runtime = FrontendDataRuntime::new(data_runtime);
         let catalog_runtime_projection =
             crate::catalog_application::CatalogRuntimeProjection::new();
         let mut host = Self {
@@ -351,6 +357,7 @@ impl FrontendApplicationHost {
             query_control: FrontendQueryControl::service(),
             coordinator: None,
             execution_role: backend.role(),
+            data_runtime: data_runtime.clone(),
             topology: None,
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
         };
@@ -438,6 +445,7 @@ impl FrontendApplicationHost {
             backend,
             host.state_store(),
             tokio::runtime::Handle::current(),
+            data_runtime,
         )
         .await
         {
@@ -1010,6 +1018,7 @@ impl FrontendApplicationHost {
                 execution.query_control_timeouts,
                 self.backend_topology_port(),
                 Arc::clone(&self.connector_control),
+                self.data_runtime.clone(),
             )
             .map_err(FrontendApplicationError::server)?,
         );
@@ -1305,6 +1314,7 @@ mod tests {
                 NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
             ),
             backend,
+            tokio::runtime::Handle::current(),
         )
         .await
         .expect("host opens with the catalog controller");
