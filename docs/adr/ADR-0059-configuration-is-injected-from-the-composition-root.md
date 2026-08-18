@@ -11,9 +11,7 @@ provenance:
   - "discussion: 2026-08-11 common/app_config.rs ownership, on whether to build novarocks-common"
   - "PR: pending — CLS-0 + CFG Phase 1 aggregate-core residue cut"
 code-anchors:
-  - "novarocks/core/src/common/app_config.rs (load_from_path, load_from_env_or_default)"
   - "novarocks-server/src/main.rs (run_standalone_server_cli)"
-  - "novarocks/core/src/runtime/global_async_runtime.rs (install_data_runtime_sizing)"
 ---
 
 ## 问题
