@@ -1135,7 +1135,7 @@ impl FrontendDistributedQueryCoordinator {
                 for snapshot in terminal_set.snapshots() {
                     builder.apply_profile_contribution(snapshot)?;
                     for fragment in snapshot.fragments() {
-                        builder.apply_terminal(fragment)?;
+                        builder.apply_terminal(fragment.as_proto())?;
                     }
                 }
                 parts.completion.profile(result, builder.finish())
@@ -1150,7 +1150,7 @@ impl FrontendDistributedQueryCoordinator {
                 let result = program.finish_fragment_payloads(
                     terminal_set
                         .fragments()
-                        .map(|fragment| fragment.statistics_payload()),
+                        .map(|fragment| fragment.statistics_payload.as_slice()),
                 )?;
                 parts.completion.statistics(program, result)
             }

@@ -22,7 +22,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks::connector::ConnectorRegistry;
-use novarocks::runtime::scan_range::ScanRangeParams;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::fragment::program::{
     FragmentContractVersion, FragmentProgram, FragmentProgramOptions, FragmentSinkSpec,
@@ -33,6 +32,7 @@ use novarocks_execution::runtime::fragment::{
     FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSubmission, ScanAssignments,
 };
 use novarocks_protocol::FieldPath;
+use novarocks_protocol::lifecycle::ScanRangeParams;
 use novarocks_protocol::{novarocks as proto, plan};
 use novarocks_spi::connector::{ConnectorCancellation, ConnectorExecutionResolver};
 

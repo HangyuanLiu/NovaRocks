@@ -19,45 +19,50 @@ use super::super::instance;
 
 #[test]
 fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
-    let mut scan_range = ::novarocks::runtime::scan_range::ScanRangeParams::file(
-        ::novarocks::runtime::scan_range::FileScanRange {
-            file_format: ::novarocks::runtime::scan_range::FileFormat::Parquet,
-            full_path: Some("s3://bucket/data.parquet".to_string()),
-            relative_path: Some("data.parquet".to_string()),
-            table_id: Some(99),
-            offset: 8,
-            length: 16,
-            file_length: 128,
-            delete_files: Vec::new(),
-            deletion_vector_descriptor: None,
-            first_row_id: Some(1_000),
-            data_sequence_number: Some(44),
-            modification_time: None,
-            datacache_options: None,
-            candidate_node: None,
-            included_positions: vec![3, 5, 8],
-            serialized_split: Some("{\"split\":1}".to_string()),
-            use_iceberg_jni_metadata_reader: true,
-            ivm_change_op: Some(novarocks_execution::exec::change_op::CHANGE_OP_DELETE),
-            file_pruning_min_max_values: Some(BTreeMap::from([(
-                0,
-                ::novarocks::runtime::scan_range::FilePruningMinMaxValue {
-                    value_kind: ::novarocks::runtime::scan_range::FilePruningValueKind::Int,
-                    has_null: false,
-                    all_null: false,
-                    min_int_value: Some(10),
-                    max_int_value: Some(20),
-                    min_float_value: None,
-                    max_float_value: None,
-                },
-            )])),
+    let scan_range = novarocks_protocol::lifecycle::ScanRangeParams::parse(
+        novarocks_protocol::novarocks::ScanRangeParams {
+            range: Some(novarocks_protocol::novarocks::ScanRange {
+                kind: Some(novarocks_protocol::novarocks::scan_range::Kind::File(
+                    novarocks_protocol::novarocks::FileScanRange {
+                        file_format: "PARQUET".to_string(),
+                        full_path: Some("s3://bucket/data.parquet".to_string()),
+                        relative_path: Some("data.parquet".to_string()),
+                        table_id: Some(99),
+                        offset: 8,
+                        length: 16,
+                        file_length: 128,
+                        first_row_id: Some(1_000),
+                        data_sequence_number: Some(44),
+                        included_positions: vec![3, 5, 8],
+                        serialized_split: Some("{\"split\":1}".to_string()),
+                        use_iceberg_jni_metadata_reader: true,
+                        change_op: Some(i32::from(
+                            novarocks_execution::exec::change_op::CHANGE_OP_DELETE,
+                        )),
+                        file_pruning_min_max_values: HashMap::from([(
+                            0,
+                            novarocks_protocol::novarocks::FilePruningMinMaxValue {
+                                value_kind: 2,
+                                has_null: false,
+                                all_null: false,
+                                min_int_value: Some(10),
+                                max_int_value: Some(20),
+                                min_float_value: None,
+                                max_float_value: None,
+                            },
+                        )]),
+                        ..Default::default()
+                    },
+                )),
+            }),
+            volume_id: Some(13),
+            empty: Some(true),
+            has_more: Some(false),
         },
-    );
-    scan_range.volume_id = Some(13);
-    scan_range.empty = Some(true);
-    scan_range.has_more = Some(false);
+    )
+    .expect("validated native file scan range");
     let mut scan_ranges = BTreeMap::new();
     scan_ranges.insert(11, vec![scan_range]);
     let destination = novarocks_execution::runtime::endpoint::FragmentDestination::new(

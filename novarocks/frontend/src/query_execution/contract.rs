@@ -34,7 +34,10 @@ pub use crate::query_execution::statistics::StatisticsExecutionMode;
 pub use crate::query_execution::statistics::StatisticsExecutionPolicy;
 use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 use ::novarocks::common::query_cancellation::QueryCancellationView;
-use novarocks_execution::runtime::query_options::QueryOptions as RuntimeQueryOptions;
+use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
+use novarocks_execution::runtime::query_options::{
+    QueryCacheOptions, QueryOptions as RuntimeQueryOptions,
+};
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorActivatedWriteCohort, ConnectorError, ConnectorExecutionBindingKey,
@@ -59,9 +62,8 @@ pub struct ResolvedQueryOptions {
 impl ResolvedQueryOptions {
     pub(crate) fn from_upstream(options: Option<QueryOptions>) -> Self {
         let mut runtime = options
-            .map(|options| ::novarocks::protocol::decode_native_query_options(options.as_proto()))
-            .transpose()
-            .expect("validated Protocol query options must decode for execution")
+            .as_ref()
+            .map(reconstruct_runtime_query_options)
             .unwrap_or_default();
         let pipeline_dop = novarocks_execution::runtime::exec_env::calc_pipeline_dop(
             runtime.pipeline_dop.unwrap_or_default(),
@@ -104,6 +106,83 @@ impl ResolvedQueryOptions {
     /// construction or a mutable execution handle.
     pub fn runtime_options(&self) -> &RuntimeQueryOptions {
         &self.runtime
+    }
+}
+
+/// Reconstructs the Frontend-local execution view from an already validated
+/// protocol value without creating a second wire representation or decoder.
+fn reconstruct_runtime_query_options(options: &QueryOptions) -> RuntimeQueryOptions {
+    let src = options.as_proto();
+    RuntimeQueryOptions {
+        batch_size: (src.batch_size > 0).then_some(src.batch_size),
+        query_timeout: (src.query_timeout > 0).then_some(src.query_timeout),
+        query_delivery_timeout: (src.query_delivery_timeout > 0)
+            .then_some(src.query_delivery_timeout),
+        enable_profile: src.enable_profile,
+        runtime_profile_report_interval: (src.runtime_profile_report_interval > 0)
+            .then_some(src.runtime_profile_report_interval),
+        pipeline_dop: (src.pipeline_dop > 0).then_some(src.pipeline_dop),
+        exec_mem_limit: (src.query_mem_limit > 0).then_some(src.query_mem_limit),
+        connector_io_tasks_per_scan_operator: (src.connector_io_tasks_per_scan_operator > 0)
+            .then_some(src.connector_io_tasks_per_scan_operator),
+        orc_use_column_names: src.orc_use_column_names,
+        enable_file_metacache: src.enable_file_metacache,
+        enable_file_pagecache: src.enable_file_pagecache,
+        enable_parquet_reader_page_index: src.enable_parquet_reader_page_index,
+        runtime_filter_scan_wait_time_ms: src.runtime_filter_scan_wait_time_ms,
+        runtime_filter_wait_timeout_ms: src.runtime_filter_wait_timeout_ms,
+        allow_throw_exception: src.allow_throw_exception,
+        group_concat_max_len: src.group_concat_max_len,
+        enable_join_runtime_bitset_filter: src.enable_join_runtime_bitset_filter,
+        global_runtime_filter_build_max_size: (src.global_runtime_filter_build_max_size > 0)
+            .then_some(src.global_runtime_filter_build_max_size),
+        cache: QueryCacheOptions {
+            enable_scan_datacache: src.enable_scan_datacache,
+            enable_populate_datacache: src.enable_populate_datacache,
+            enable_datacache_async_populate_mode: src.enable_datacache_async_populate_mode,
+            enable_datacache_io_adaptor: src.enable_datacache_io_adaptor,
+            enable_cache_select: src.enable_cache_select,
+            datacache_evict_probability: src.datacache_evict_probability,
+            datacache_priority: (src.datacache_priority != 0).then_some(src.datacache_priority),
+            datacache_ttl_seconds: (src.datacache_ttl_seconds > 0)
+                .then_some(src.datacache_ttl_seconds),
+            datacache_sharing_work_period: (src.datacache_sharing_work_period > 0)
+                .then_some(src.datacache_sharing_work_period),
+        },
+        spill: src.enable_spill.then(|| {
+            let spill = src
+                .spill_options
+                .as_ref()
+                .expect("validated enabled spilling has spill options");
+            SpillConfig {
+                enable_spill: src.enable_spill,
+                spill_mode: match spill.spill_mode {
+                    0 => SpillMode::Auto,
+                    1 => SpillMode::Force,
+                    2 => SpillMode::None,
+                    _ => {
+                        unreachable!("validated Protocol query options have a supported spill mode")
+                    }
+                },
+                spill_mem_limit_threshold: (spill.spill_mem_limit_threshold > 0.0)
+                    .then_some(spill.spill_mem_limit_threshold),
+                spill_operator_min_bytes: (spill.spill_operator_min_bytes > 0)
+                    .then_some(spill.spill_operator_min_bytes),
+                spill_operator_max_bytes: (spill.spill_operator_max_bytes > 0)
+                    .then_some(spill.spill_operator_max_bytes),
+                spill_encode_level: (spill.spill_encode_level > 0)
+                    .then_some(spill.spill_encode_level),
+                enable_spill_buffer_read: Some(spill.enable_spill_buffer_read),
+                max_spill_read_buffer_bytes_per_driver: (spill
+                    .max_spill_read_buffer_bytes_per_driver
+                    > 0)
+                .then_some(spill.max_spill_read_buffer_bytes_per_driver),
+                spill_mem_table_size: (spill.spill_mem_table_size > 0)
+                    .then_some(spill.spill_mem_table_size),
+                spill_mem_table_num: (spill.spill_mem_table_num > 0)
+                    .then_some(spill.spill_mem_table_num),
+            }
+        }),
     }
 }
 
@@ -764,6 +843,93 @@ impl fmt::Display for DistributedQueryError {
 }
 
 impl std::error::Error for DistributedQueryError {}
+
+#[cfg(test)]
+mod tests {
+    use super::reconstruct_runtime_query_options;
+    use novarocks_protocol::lifecycle::QueryOptions;
+    use novarocks_protocol::novarocks;
+
+    #[test]
+    fn reconstructed_runtime_options_preserve_protocol_scalars() {
+        let protocol = QueryOptions::parse(novarocks::QueryOptions {
+            batch_size: 4096,
+            query_timeout: 60,
+            query_delivery_timeout: 30,
+            enable_profile: true,
+            runtime_profile_report_interval: 7,
+            pipeline_dop: 8,
+            query_mem_limit: 1 << 20,
+            connector_io_tasks_per_scan_operator: 12,
+            runtime_filter_scan_wait_time_ms: Some(250),
+            runtime_filter_wait_timeout_ms: Some(5000),
+            allow_throw_exception: true,
+            group_concat_max_len: Some(65_535),
+            enable_join_runtime_bitset_filter: Some(false),
+            global_runtime_filter_build_max_size: 1 << 19,
+            orc_use_column_names: true,
+            enable_file_metacache: true,
+            enable_file_pagecache: true,
+            enable_parquet_reader_page_index: true,
+            enable_scan_datacache: true,
+            enable_populate_datacache: true,
+            enable_datacache_async_populate_mode: true,
+            enable_datacache_io_adaptor: true,
+            enable_cache_select: true,
+            datacache_evict_probability: Some(75),
+            datacache_priority: 2,
+            datacache_ttl_seconds: 3600,
+            datacache_sharing_work_period: 10,
+            enable_spill: true,
+            spill_options: Some(novarocks::SpillOptions {
+                spill_mode: 1,
+                spill_mem_limit_threshold: 0.75,
+                spill_operator_min_bytes: 64,
+                spill_operator_max_bytes: 128,
+                spill_encode_level: 3,
+                enable_spill_buffer_read: true,
+                max_spill_read_buffer_bytes_per_driver: 256,
+                spill_mem_table_size: 512,
+                spill_mem_table_num: 4,
+            }),
+        })
+        .expect("valid query options");
+
+        let runtime = reconstruct_runtime_query_options(&protocol);
+
+        assert_eq!(runtime.batch_size, Some(4096));
+        assert_eq!(runtime.query_timeout, Some(60));
+        assert_eq!(runtime.query_delivery_timeout, Some(30));
+        assert!(runtime.enable_profile);
+        assert_eq!(runtime.runtime_profile_report_interval, Some(7));
+        assert_eq!(runtime.pipeline_dop, Some(8));
+        assert_eq!(runtime.exec_mem_limit, Some(1 << 20));
+        assert_eq!(runtime.connector_io_tasks_per_scan_operator, Some(12));
+        assert_eq!(runtime.runtime_filter_scan_wait_time_ms, Some(250));
+        assert_eq!(runtime.runtime_filter_wait_timeout_ms, Some(5000));
+        assert!(runtime.allow_throw_exception);
+        assert_eq!(runtime.group_concat_max_len, Some(65_535));
+        assert_eq!(runtime.enable_join_runtime_bitset_filter, Some(false));
+        assert_eq!(runtime.global_runtime_filter_build_max_size, Some(1 << 19));
+        assert!(runtime.orc_use_column_names);
+        assert!(runtime.enable_file_metacache);
+        assert!(runtime.enable_file_pagecache);
+        assert!(runtime.enable_parquet_reader_page_index);
+        assert_eq!(runtime.cache.datacache_evict_probability, Some(75));
+        assert_eq!(runtime.cache.datacache_priority, Some(2));
+        assert_eq!(runtime.cache.datacache_ttl_seconds, Some(3600));
+        assert_eq!(runtime.cache.datacache_sharing_work_period, Some(10));
+        let spill = runtime.spill.expect("enabled spill is reconstructed");
+        assert!(spill.enable_spill);
+        assert_eq!(spill.spill_mem_limit_threshold, Some(0.75));
+        assert_eq!(spill.spill_operator_min_bytes, Some(64));
+        assert_eq!(spill.spill_operator_max_bytes, Some(128));
+        assert_eq!(spill.spill_encode_level, Some(3));
+        assert_eq!(spill.max_spill_read_buffer_bytes_per_driver, Some(256));
+        assert_eq!(spill.spill_mem_table_size, Some(512));
+        assert_eq!(spill.spill_mem_table_num, Some(4));
+    }
+}
 
 /// Frontend-owned distributed query execution port.
 pub trait DistributedQueryCoordinator: Send + Sync + 'static {

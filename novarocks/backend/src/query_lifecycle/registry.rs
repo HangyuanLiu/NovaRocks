@@ -24,7 +24,6 @@ use novarocks::common::query_lifecycle_fault::QueryLifecycleFaultKind;
 #[cfg(debug_assertions)]
 use novarocks::common::query_lifecycle_fault::{claim_matching_fault, configured_root};
 use novarocks::novarocks_logging::{info, warn};
-use novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
 use novarocks::service::query_lifecycle_metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks_execution::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
@@ -53,6 +52,8 @@ use crate::native::runtime_filter_adapter::{
     BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
 };
 use crate::native::runtime_filter_install::decode_runtime_filter_contribution;
+use crate::runtime::profile_codec::encode_runtime_profile_tree;
+use crate::runtime::sink_commit::SinkCommitReportSnapshot;
 use crate::runtime_filter::observation::{
     RuntimeFilterChannelTerminal, RuntimeFilterConsumerOutcome, RuntimeFilterObservationSnapshot,
 };
@@ -146,48 +147,6 @@ fn terminal_outcome_event(outcome: &ParticipantTerminalOutcome) -> QueryControlE
     ))
 }
 
-fn protocol_runtime_profile_tree(
-    tree: &RuntimeProfileTree,
-) -> novarocks_protocol::novarocks::RuntimeProfileTree {
-    novarocks_protocol::novarocks::RuntimeProfileTree {
-        root: Some(protocol_profile_node(&tree.root)),
-    }
-}
-
-fn protocol_profile_node(
-    node: &novarocks_execution::runtime::profile::ProfileNode,
-) -> novarocks_protocol::novarocks::ProfileNode {
-    use novarocks_execution::runtime::profile::ProfileUnit;
-    use novarocks_protocol::novarocks::{Counter, ProfileNode, ProfileUnit as WireUnit};
-
-    ProfileNode {
-        name: node.name.clone(),
-        node_id: node.node_id,
-        counters: node
-            .counters
-            .iter()
-            .map(|counter| Counter {
-                name: counter.name.clone(),
-                parent_name: counter.parent_name.clone(),
-                unit: match counter.unit {
-                    ProfileUnit::Unit => WireUnit::Unit as i32,
-                    ProfileUnit::CpuTicks => WireUnit::CpuTicks as i32,
-                    ProfileUnit::Bytes => WireUnit::Bytes as i32,
-                    ProfileUnit::TimeNs => WireUnit::TimeNs as i32,
-                    ProfileUnit::TimeMs => WireUnit::TimeMs as i32,
-                    ProfileUnit::TimeS => WireUnit::TimeS as i32,
-                    ProfileUnit::None => WireUnit::None as i32,
-                },
-                value: counter.value,
-                min_value: counter.min_value,
-                max_value: counter.max_value,
-            })
-            .collect(),
-        info_strings: node.info_strings.clone().into_iter().collect(),
-        children: node.children.iter().map(protocol_profile_node).collect(),
-    }
-}
-
 fn protocol_unique_id(value: UniqueId) -> novarocks_protocol::common::UniqueId {
     novarocks_protocol::common::UniqueId {
         hi: value.high(),
@@ -266,7 +225,7 @@ fn terminal_fragment_snapshot(
     use wire::fragment_terminal_profile_telemetry::Telemetry;
     let profile = wire::FragmentTerminalProfileTelemetry {
         telemetry: Some(match profile {
-            Some(value) => Telemetry::Available(protocol_runtime_profile_tree(&value)),
+            Some(value) => Telemetry::Available(encode_runtime_profile_tree(&value)),
             None => Telemetry::Unavailable(wire::TerminalTelemetryUnavailable {
                 stage: "fragment_profile".to_owned(),
                 code: "PROFILE_UNAVAILABLE".to_owned(),
@@ -1802,7 +1761,7 @@ impl QueryLifecycleRegistry {
                     input_rows,
                     output_rows,
                     elapsed_ms,
-                    profile: profile.as_ref().map(protocol_runtime_profile_tree),
+                    profile: profile.as_ref().map(encode_runtime_profile_tree),
                 },
             )
             .expect("registry-owned fragment observation satisfies the Protocol contract");

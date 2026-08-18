@@ -15,16 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
-
-use novarocks::runtime::scan_range::{
-    DatacacheOptions, DeletionVectorDescriptor, FileFormat, FilePruningMinMaxValue,
-    FilePruningValueKind, FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat,
-    ScanRange, ScanRangeParams,
-};
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::FieldPath;
+use novarocks_protocol::lifecycle::ScanRangeParams;
 use novarocks_types::UniqueId;
 
 use novarocks_protocol::novarocks as native_proto;
@@ -52,12 +45,6 @@ impl NativeSubmissionMetadata {
     pub(crate) fn typed_result_sink(&self) -> bool {
         self.typed_result_sink
     }
-}
-
-pub(crate) fn decode_query_options(
-    src: &native_proto::QueryOptions,
-) -> Result<QueryOptions, NativeFragmentDecodeError> {
-    novarocks::protocol::decode_native_query_options(src).map_err(Into::into)
 }
 
 pub(crate) fn decode_destinations(
@@ -110,172 +97,14 @@ pub(super) fn decode_scan_range_params_at(
             "native ScanRangeParams requires range",
         )
     })?;
-    let kind = range.kind.as_ref().ok_or_else(|| {
+    range.kind.as_ref().ok_or_else(|| {
         NativeFragmentDecodeError::missing(
             path.clone().field("range").field("kind"),
             "native ScanRange requires kind",
         )
     })?;
-    let range = match kind {
-        native_proto::scan_range::Kind::File(file) => ScanRange::File(decode_file_scan_range(
-            file,
-            path.clone().field("range").field("file"),
-        )?),
-    };
-    Ok(ScanRangeParams {
-        range,
-        volume_id: src.volume_id,
-        empty: src.empty,
-        has_more: src.has_more,
-    })
-}
-
-fn decode_file_scan_range(
-    src: &native_proto::FileScanRange,
-    path: FieldPath,
-) -> Result<FileScanRange, NativeFragmentDecodeError> {
-    let file_format = match src.file_format.to_ascii_uppercase().as_str() {
-        "PARQUET" => FileFormat::Parquet,
-        "ORC" => FileFormat::Orc,
-        value => {
-            return Err(NativeFragmentDecodeError::invalid_enum(
-                path.clone().field("file_format"),
-                format!("unsupported file_format {value}"),
-            ));
-        }
-    };
-    let delete_files = src
-        .delete_files
-        .iter()
-        .enumerate()
-        .map(|(index, delete_file)| {
-            decode_iceberg_delete_file(delete_file, path.clone().field("delete_files").index(index))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let file_pruning_min_max_values = if src.file_pruning_min_max_values.is_empty() {
-        None
-    } else {
-        let mut ordinals = src
-            .file_pruning_min_max_values
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        ordinals.sort_unstable();
-        let mut values = BTreeMap::new();
-        for ordinal in ordinals {
-            let value = decode_file_pruning_value(
-                &src.file_pruning_min_max_values[&ordinal],
-                path.clone()
-                    .field("file_pruning_min_max_values")
-                    .map_key(ordinal.to_string()),
-            )?;
-            values.insert(ordinal, value);
-        }
-        Some(values)
-    };
-    let ivm_change_op = src
-        .change_op
-        .map(|value| {
-            i8::try_from(value).map_err(|_| {
-                NativeFragmentDecodeError::out_of_range(
-                    path.clone().field("change_op"),
-                    format!("change_op {value} exceeds i8 range"),
-                )
-            })
-        })
-        .transpose()?;
-    Ok(FileScanRange {
-        file_format,
-        full_path: src.full_path.clone(),
-        relative_path: src.relative_path.clone(),
-        table_id: src.table_id,
-        offset: src.offset,
-        length: src.length,
-        file_length: src.file_length,
-        delete_files,
-        deletion_vector_descriptor: src.deletion_vector_descriptor.as_ref().map(|descriptor| {
-            DeletionVectorDescriptor {
-                storage_type: descriptor.storage_type.clone(),
-                path_or_inline_dv: descriptor.path_or_inline_dv.clone(),
-                offset: descriptor.offset,
-                size_in_bytes: descriptor.size_in_bytes,
-                cardinality: descriptor.cardinality,
-            }
-        }),
-        first_row_id: src.first_row_id,
-        data_sequence_number: src.data_sequence_number,
-        modification_time: src.modification_time,
-        datacache_options: src
-            .datacache_options
-            .as_ref()
-            .map(|options| DatacacheOptions {
-                enable_populate_datacache: options.enable_populate_datacache,
-                priority: options.priority,
-            }),
-        candidate_node: None,
-        included_positions: src.included_positions.clone(),
-        serialized_split: src.serialized_split.clone(),
-        use_iceberg_jni_metadata_reader: src.use_iceberg_jni_metadata_reader,
-        ivm_change_op,
-        file_pruning_min_max_values,
-    })
-}
-
-fn decode_iceberg_delete_file(
-    src: &native_proto::IcebergDeleteFile,
-    path: FieldPath,
-) -> Result<IcebergDeleteFile, NativeFragmentDecodeError> {
-    let file_format = match src.file_format.to_ascii_uppercase().as_str() {
-        "PARQUET" => IcebergFileFormat::Parquet,
-        value => {
-            return Err(NativeFragmentDecodeError::invalid_enum(
-                path.clone().field("file_format"),
-                format!("unsupported Iceberg file_format {value}"),
-            ));
-        }
-    };
-    let file_content = match src.file_content.to_ascii_uppercase().as_str() {
-        "POSITION_DELETES" => IcebergFileContent::PositionDeletes,
-        "EQUALITY_DELETES" => IcebergFileContent::EqualityDeletes,
-        value => {
-            return Err(NativeFragmentDecodeError::invalid_enum(
-                path.field("file_content"),
-                format!("unsupported Iceberg file_content {value}"),
-            ));
-        }
-    };
-    Ok(IcebergDeleteFile {
-        full_path: src.full_path.clone(),
-        file_format,
-        file_content,
-        length: src.length,
-    })
-}
-
-fn decode_file_pruning_value(
-    src: &native_proto::FilePruningMinMaxValue,
-    path: FieldPath,
-) -> Result<FilePruningMinMaxValue, NativeFragmentDecodeError> {
-    let value_kind = match src.value_kind {
-        1 => FilePruningValueKind::Bool,
-        2 => FilePruningValueKind::Int,
-        3 => FilePruningValueKind::Float,
-        value => {
-            return Err(NativeFragmentDecodeError::invalid_enum(
-                path.field("value_kind"),
-                format!("unsupported file pruning value_kind {value}"),
-            ));
-        }
-    };
-    Ok(FilePruningMinMaxValue {
-        value_kind,
-        has_null: src.has_null,
-        all_null: src.all_null,
-        min_int_value: src.min_int_value,
-        max_int_value: src.max_int_value,
-        min_float_value: src.min_float_value,
-        max_float_value: src.max_float_value,
-    })
+    ScanRangeParams::parse(src.clone())
+        .map_err(|error| NativeFragmentDecodeError::invalid_value(path, error.detail()))
 }
 
 fn unique_id(src: &novarocks_protocol::common::UniqueId) -> UniqueId {
@@ -284,7 +113,8 @@ fn unique_id(src: &novarocks_protocol::common::UniqueId) -> UniqueId {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::decode_destinations;
+    use crate::native::query_options::decode_query_options;
     use novarocks_protocol::ProtocolErrorKind;
     use novarocks_protocol::novarocks as native_proto;
 
@@ -360,10 +190,7 @@ mod tests {
         })
         .expect_err("spill options are required");
 
-        assert_eq!(
-            error.protocol().expect("protocol error").kind(),
-            ProtocolErrorKind::MissingField
-        );
+        assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
         assert!(error.to_string().contains("spill_options"), "{error}");
     }
 }

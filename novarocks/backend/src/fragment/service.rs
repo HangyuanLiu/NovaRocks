@@ -23,11 +23,11 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
+use crate::runtime::sink_commit::{BackendSinkCommitPort, ConfiguredBackendSinkCommitPort};
 use novarocks::connector::ConnectorRegistry;
 use novarocks::novarocks_logging::error;
 #[cfg(test)]
 use novarocks::novarocks_logging::warn;
-use novarocks::runtime::sink_commit::{ConfiguredCoreSinkCommitPort, CoreSinkCommitPort};
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_execution::runtime::fragment::io::{
     ExchangeFrameTransmitter, ExchangeReceiverPort, FragmentCommitPort, FragmentResultWriter,
@@ -194,7 +194,7 @@ impl NativeFragmentService {
             connector_registry,
             execution_host,
             execution_runtime,
-            commit_port: Arc::new(CoreSinkCommitPort),
+            commit_port: Arc::new(BackendSinkCommitPort),
             exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
             lifecycle_observer: None,
             #[cfg(test)]
@@ -218,7 +218,7 @@ impl NativeFragmentService {
         mut self,
         limits: WriteCommitEvidenceLimits,
     ) -> Self {
-        self.commit_port = Arc::new(ConfiguredCoreSinkCommitPort::new(limits));
+        self.commit_port = Arc::new(ConfiguredBackendSinkCommitPort::new(limits));
         self
     }
 
@@ -746,7 +746,7 @@ fn consume_terminal_fact(
     if let FragmentOutcome::Failed(execution_error) = fact.outcome() {
         error!(target: "novarocks_execution", finst_id = %fragment_instance_id, error = %execution_error, "native fragment execution failed");
     }
-    let sink = novarocks::runtime::sink_commit::report_snapshot(fragment_instance_id)
+    let sink = crate::runtime::sink_commit::report_snapshot(fragment_instance_id)
         .with_connector_staged_report_frames(running.take_connector_staged_report_frames());
     // QLC terminal facts are transferred before local runtime cleanup.
     lifecycle.record_fragment_terminal_fact(execution_id, fact, backend_num, sink);

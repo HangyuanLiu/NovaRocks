@@ -70,6 +70,7 @@ pub(crate) mod row_mutation;
 pub(crate) mod schedule;
 pub mod service;
 pub mod statistics;
+pub(crate) mod terminal_codec;
 pub mod terminal_set;
 pub mod write;
 pub mod write_operation;
