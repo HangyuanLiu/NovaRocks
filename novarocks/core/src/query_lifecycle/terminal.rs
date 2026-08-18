@@ -2435,10 +2435,10 @@ fn decode_query_terminal_profile_contribution(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_lifecycle::{AttemptId, ParticipantRole, QueryControlEndpoint};
     use novarocks_execution::runtime::profile::{
         CounterStrategy, ProfileCounter, ProfileNode, ProfileUnit, RuntimeProfileTree,
     };
+    use novarocks_protocol::lifecycle::{AttemptId, ParticipantRole, QueryControlEndpoint};
     use novarocks_protocol::{common, novarocks};
     use novarocks_types::QueryId;
 
