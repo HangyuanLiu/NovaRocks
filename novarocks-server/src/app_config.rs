@@ -26,7 +26,7 @@ use novarocks_state_store::config::{
 use novarocks_types::ClusterRole;
 use uuid::Uuid;
 
-pub use novarocks::common::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
+pub use crate::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
 
 fn default_log_level() -> String {
     "info".to_string()
@@ -1521,7 +1521,7 @@ impl RuntimeConfig {
             return Ok(self.be_mem_limit_bytes);
         }
 
-        novarocks::common::memory_limit::resolve_starrocks_process_mem_limit_bytes(&self.mem_limit)
+        crate::memory_limit::resolve_starrocks_process_mem_limit_bytes(&self.mem_limit)
             .with_context(|| format!("resolve runtime.mem_limit '{}'", self.mem_limit))
     }
 
@@ -1533,7 +1533,7 @@ impl RuntimeConfig {
             return Ok(self.be_mem_limit_bytes);
         }
 
-        novarocks::common::memory_limit::resolve_starrocks_process_mem_limit_bytes_for_visible_memory(
+        crate::memory_limit::resolve_starrocks_process_mem_limit_bytes_for_visible_memory(
             &self.mem_limit,
             visible_memory_bytes,
         )

@@ -18,8 +18,8 @@ use std::env;
 use std::path::PathBuf;
 use std::process;
 
-use novarocks::novarocks_logging;
 use novarocks_server::composition;
+use novarocks_server::logging;
 
 #[derive(Debug, PartialEq, Eq)]
 struct StandaloneServerCliArgs {
@@ -299,9 +299,9 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
     // Install the global config and initialize the tracing subscriber before
     // starting the server. Without this, standalone runs with no logging
     // path), so log_filter/log_level/sys_log_dir from the config are ignored.
-    novarocks_logging::init_with_level(
+    logging::init_with_level(
         &resolve_log_filter(&cfg),
-        &novarocks_logging::LogFileSettings {
+        &logging::LogFileSettings {
             dir: cfg.sys_log_dir.clone(),
             roll_mode: cfg.sys_log_roll_mode.clone(),
             roll_num: cfg.sys_log_roll_num,

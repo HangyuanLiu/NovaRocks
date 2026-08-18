@@ -20,10 +20,13 @@ novarocks-spi = { path = "../novarocks/spi" }
 novarocks-state-store = { path = "../novarocks/state-store" }
 novarocks-types = { path = "../novarocks/types" }
 anyhow = "1"
+atty = "0.2"
+chrono = "0.4"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "time"] }
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "sync", "time"] }
 uuid = "1"
 

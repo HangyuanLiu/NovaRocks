@@ -18,7 +18,7 @@
 use crate::runtime::query_context::{QueryContextManager, query_context_manager};
 use crate::runtime::result_buffer;
 use novarocks::common::types::UniqueId;
-use novarocks::novarocks_logging::info;
+use tracing::info;
 
 pub fn cancel_runtime_fragment(finst_id: UniqueId) {
     cancel_with_manager(finst_id, query_context_manager());

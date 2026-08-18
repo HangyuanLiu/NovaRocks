@@ -85,7 +85,7 @@ fn probe_parquet_bytes(path: &str, bytes: Bytes) -> Result<ParquetProbe> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    novarocks::novarocks_logging::init();
+    novarocks_server::logging::init();
     let mut args = std::env::args().skip(1);
     let mut config_path: Option<String> = None;
     let mut prefix: String = String::new();

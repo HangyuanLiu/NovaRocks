@@ -23,9 +23,9 @@
 
 use std::time::Duration;
 
-use novarocks::common::network::format_host_for_url;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_protocol::{filter, novarocks as proto};
+use novarocks_types::format_host_for_url;
 use novarocks_types::identity::UniqueId;
 use tonic::Request;
 use tonic::transport::Channel;

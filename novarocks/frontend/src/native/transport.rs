@@ -17,7 +17,6 @@ use crate::native::fragment_transport::{
 use crate::query_execution::artifact::ConnectorBindingDispatcher;
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 use ::novarocks::common::backend_topology::{BeId, HeartbeatOutcome, LiveBackendTarget};
-use ::novarocks::common::network::format_host_for_url;
 use novarocks::service::observe_backend_heartbeat_rtt;
 use novarocks_protocol::common::UniqueId as ProtoUniqueId;
 use novarocks_protocol::lifecycle::{
@@ -30,7 +29,7 @@ use novarocks_protocol::novarocks::{
     QueryExecutionId as ProtoQueryExecutionId, RetireConnectorExecutionBindingRequest,
     fetch_result_response::Status as FetchStatus,
 };
-use novarocks_types::UniqueId;
+use novarocks_types::{UniqueId, format_host_for_url};
 
 use super::data_runtime::FrontendDataRuntime;
 use super::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;

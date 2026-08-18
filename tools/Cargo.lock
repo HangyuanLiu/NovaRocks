@@ -2923,7 +2923,6 @@ dependencies = [
  "libm",
  "md-5",
  "mysql",
- "mysql_common",
  "novarocks-catalog",
  "novarocks-execution",
  "novarocks-fs",
@@ -2977,6 +2976,7 @@ dependencies = [
  "bytes",
  "novarocks",
  "novarocks-execution",
+ "novarocks-failpoint",
  "novarocks-protocol",
  "novarocks-spi",
  "novarocks-types",
@@ -2989,6 +2989,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-build",
+ "tracing",
 ]
 
 [[package]]
@@ -3100,6 +3101,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-failpoint"
+version = "0.1.0"
+dependencies = [
+ "novarocks-protocol",
+ "novarocks-types",
+]
+
+[[package]]
 name = "novarocks-frontend"
 version = "0.1.0"
 dependencies = [
@@ -3110,19 +3119,28 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
+ "datasketches",
  "futures",
  "hex",
+ "libc",
+ "mysql_common",
  "novarocks",
  "novarocks-catalog",
  "novarocks-execution",
+ "novarocks-failpoint",
  "novarocks-fs",
  "novarocks-protocol",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-state-store",
  "novarocks-types",
+ "once_cell",
+ "opensrv-mysql",
+ "parquet",
+ "prometheus",
  "prost 0.13.5",
  "protoc-bin-vendored",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
@@ -3170,12 +3188,15 @@ name = "novarocks-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atty",
+ "chrono",
  "libc",
  "novarocks",
  "novarocks-backend",
  "novarocks-connector-iceberg",
  "novarocks-connector-starrocks",
  "novarocks-execution",
+ "novarocks-failpoint",
  "novarocks-frontend",
  "novarocks-fs",
  "novarocks-spi",
@@ -3185,6 +3206,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -3195,6 +3217,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "serde",
  "sha2",
  "uuid",
 ]
@@ -3205,6 +3228,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "hex",
  "md-5",
@@ -3247,7 +3271,6 @@ dependencies = [
  "anyhow",
  "bytes",
  "futures",
- "novarocks",
  "novarocks-fs",
  "novarocks-server",
  "opendal",

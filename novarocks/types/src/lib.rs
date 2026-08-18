@@ -29,6 +29,7 @@ pub mod identity;
 pub mod largeint;
 pub mod logical;
 pub mod mv_aggregate_layout;
+pub mod network;
 mod predicate;
 pub mod primitive;
 pub mod slot_id;
@@ -47,6 +48,7 @@ pub use field_render::{
 };
 pub use field_render_schema::FieldRenderSchema;
 pub use identity::{QueryId, UniqueId, format_uuid};
+pub use network::{AdvertiseEndpoint, format_host_for_url};
 pub use primitive::PrimitiveType;
 pub use slot_id::SlotId;
 

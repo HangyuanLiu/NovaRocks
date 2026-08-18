@@ -4,7 +4,6 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use novarocks::common::network::AdvertiseEndpoint;
 use novarocks::connector::ConnectorRegistry;
 use novarocks::service::MetricsHttpServer;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
@@ -13,6 +12,7 @@ use novarocks_protocol::lifecycle::{
     QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminationAck,
 };
 use novarocks_spi::connector::ConnectorExecutionInstaller;
+use novarocks_types::AdvertiseEndpoint;
 
 use crate::BackendDataRuntime;
 use crate::exchange_receiver::BackendExchangeReceiverPort;
@@ -614,7 +614,6 @@ mod tests {
         compose_backend_application_services,
     };
     use crate::native::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
-    use novarocks::common::network::AdvertiseEndpoint;
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
@@ -630,6 +629,7 @@ mod tests {
     };
     use novarocks_protocol::{lifecycle as protocol_lifecycle, novarocks as protocol};
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
+    use novarocks_types::AdvertiseEndpoint;
     use novarocks_types::QueryId;
     use tokio_stream::wrappers::ReceiverStream;
 

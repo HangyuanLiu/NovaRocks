@@ -30,9 +30,9 @@ use crate::query_execution::preparation::{
     PreparedFragmentRole, PreparedFragmentSet, PreparedOutputColumn,
 };
 use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
-use novarocks::novarocks_logging::debug;
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdge, FragmentEdgeKind, FragmentId};
+use tracing::debug;
 
 pub(crate) fn align_fetch_chunks_to_output_columns(
     chunks: Vec<Chunk>,

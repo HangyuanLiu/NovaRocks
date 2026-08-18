@@ -19,6 +19,8 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ptr;
 
+use novarocks_types::AdvertiseEndpoint;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Cidr {
     network: IpAddr,
@@ -31,12 +33,6 @@ struct LocalAddress {
     is_loopback: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdvertiseEndpoint {
-    pub host: String,
-    pub port: u16,
-}
-
 pub fn standalone_advertise_endpoint(
     bind_host: &str,
     priority_networks: &str,
@@ -44,7 +40,8 @@ pub fn standalone_advertise_endpoint(
     grpc_port: u16,
 ) -> Result<AdvertiseEndpoint, String> {
     let host = if configured_advertise_host.trim().is_empty() {
-        advertise_host_for_server(bind_host, priority_networks)
+        let candidates = local_address_candidates()?;
+        choose_advertise_host(bind_host, priority_networks, &candidates)
     } else {
         Ok(configured_advertise_host.trim().to_string())
     }?;
@@ -52,22 +49,6 @@ pub fn standalone_advertise_endpoint(
         host,
         port: grpc_port,
     })
-}
-
-pub fn advertise_host_for_server(
-    bind_host: &str,
-    priority_networks: &str,
-) -> Result<String, String> {
-    let candidates = local_address_candidates()?;
-    choose_advertise_host(bind_host, priority_networks, &candidates)
-}
-
-pub fn format_host_for_url(host: &str) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    }
 }
 
 fn choose_advertise_host(
@@ -252,9 +233,7 @@ fn mask_v6(addr: Ipv6Addr, prefix_len: u8) -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        LocalAddress, choose_advertise_host, format_host_for_url, standalone_advertise_endpoint,
-    };
+    use super::{LocalAddress, choose_advertise_host, standalone_advertise_endpoint};
     use std::net::IpAddr;
 
     fn addr(ip: &str, is_loopback: bool) -> LocalAddress {
@@ -325,12 +304,6 @@ mod tests {
         )
         .expect("choose host");
         assert_eq!(host, "2001:db8::10");
-    }
-
-    #[test]
-    fn format_host_for_url_wraps_ipv6() {
-        assert_eq!(format_host_for_url("2001:db8::1"), "[2001:db8::1]");
-        assert_eq!(format_host_for_url("10.0.0.9"), "10.0.0.9");
     }
 
     #[test]

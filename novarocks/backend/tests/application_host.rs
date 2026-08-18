@@ -2,13 +2,13 @@ use std::net::TcpListener;
 
 use std::time::Duration;
 
-use novarocks::common::network::AdvertiseEndpoint;
 use novarocks_backend::{
     BackendApplicationHost, BackendDataRuntime, BackendServerConfig, QueryLifecycleRegistryConfig,
 };
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
+use novarocks_types::AdvertiseEndpoint;
 
 fn unused_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");

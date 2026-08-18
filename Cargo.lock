@@ -3177,6 +3177,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-build",
+ "tracing",
 ]
 
 [[package]]
@@ -3396,7 +3397,9 @@ name = "novarocks-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atty",
  "bytes",
+ "chrono",
  "libc",
  "mysql",
  "novarocks",
@@ -3416,6 +3419,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

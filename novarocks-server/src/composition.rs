@@ -20,9 +20,9 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::app_config::NovaRocksConfig;
+use crate::network;
 use anyhow::Context;
 use novarocks::common::backend_topology::BackendTopologyPort;
-use novarocks::common::network;
 use novarocks_backend::{
     BackendApplicationHost, BackendDataRuntime, BackendServerConfig, QueryLifecycleRegistryConfig,
 };

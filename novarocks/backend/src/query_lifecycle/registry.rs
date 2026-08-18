@@ -20,7 +20,6 @@ use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use novarocks::novarocks_logging::{info, warn};
 use novarocks::service::query_lifecycle_metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks_execution::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
@@ -41,6 +40,7 @@ use novarocks_protocol::lifecycle::{
 };
 use novarocks_types::UniqueId;
 use prost::Message;
+use tracing::{info, warn};
 
 use super::entry::{ImmutableQueryTerminalRecord, QueryLifecycleEntry, QueryLifecyclePhase};
 use super::{

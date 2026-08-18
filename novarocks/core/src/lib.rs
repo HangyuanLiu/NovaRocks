@@ -19,9 +19,7 @@ pub mod connector;
 pub mod maintenance;
 pub mod runtime;
 pub mod service;
-pub use novarocks_version as version;
-// StarRocks-BE-like folder layout, with `novarocks_*` convenience aliases.
-pub use common::logging as novarocks_logging;
 pub use connector as novarocks_connectors;
+pub use novarocks_version as version;
 
 pub use common::types::FetchResult;

@@ -552,17 +552,6 @@ pub fn init_with_level(level: &str, files: &LogFileSettings) {
     });
 }
 
-/// The directory and basename of the log files logging opened, for code that
-/// reads those files back. Falls back to the env-and-defaults resolution when
-/// logging was never initialized, which is the case in unit tests.
-pub fn active_log_location() -> (PathBuf, String) {
-    let settings = ACTIVE
-        .get()
-        .cloned()
-        .unwrap_or_else(|| LogSettings::from_files_and_env(&LogFileSettings::default()));
-    (settings.dir, settings.basename)
-}
-
 pub fn init() {
     init_with_level("info", &LogFileSettings::default());
 }

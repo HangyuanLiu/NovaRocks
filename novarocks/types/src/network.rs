@@ -14,10 +14,28 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub mod admitted_query_context;
-pub mod backend_topology;
-pub mod config;
-pub mod engine_error;
-pub mod query_cancellation;
-pub mod result_batch;
-pub mod types;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdvertiseEndpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+pub fn format_host_for_url(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_host_for_url;
+
+    #[test]
+    fn format_host_for_url_wraps_ipv6() {
+        assert_eq!(format_host_for_url("2001:db8::1"), "[2001:db8::1]");
+        assert_eq!(format_host_for_url("10.0.0.9"), "10.0.0.9");
+    }
+}
