@@ -14,32 +14,22 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Integration tests for supported connector infrastructure.
 
-use novarocks::connector;
+//! NIDL contract round-trip tests: hand-written internal <-> proto conversions
+//! + encode/decode/assert_eq, locking each wire contract. Permanent (unlike the
+//! NIDL-0 spike). One submodule per proto file; expr/plan added in later PRs.
 
-#[path = "../common/mod.rs"]
+#[path = "proto_contract/common.rs"]
 mod common;
-
-#[test]
-fn test_connector_registry_exists() {
-    // Test that connector registry module exists and can be accessed
-    // This is a basic smoke test to ensure the module is properly exported
-    let _registry = connector::ConnectorRegistry::default();
-}
-
-#[test]
-fn test_connector_registry_initialization() {
-    // Test connector registry initialization
-    let registry = connector::ConnectorRegistry::default();
-
-    // Registry construction must not install a synthetic transport connector.
-    let _ = registry;
-}
-
-#[test]
-fn test_connector_registry_new() {
-    // Test creating a new empty registry
-    let registry = connector::ConnectorRegistry::new();
-    let _ = registry;
-}
+#[path = "proto_contract/expr.rs"]
+mod expr;
+#[path = "proto_contract/filter.rs"]
+mod filter;
+#[path = "proto_contract/instance_params.rs"]
+mod instance_params;
+#[path = "proto_contract/plan.rs"]
+mod plan;
+#[path = "proto_contract/release_fixtures.rs"]
+mod release_fixtures;
+#[path = "proto_contract/service.rs"]
+mod service;

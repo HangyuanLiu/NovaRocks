@@ -468,15 +468,15 @@ impl NovaRocksConfig {
 /// Reject runner-owned fault-injection environment variables in release builds.
 ///
 /// The fault hooks themselves read these variables directly (see
-/// `common::query_lifecycle_fault` and `common::cleanup_fault`) and are compiled
+/// `novarocks-failpoint`) and are compiled
 /// out of release builds. Failing startup here keeps a release binary from
 /// silently ignoring an armed fault and letting a cross-process test pass
 /// vacuously.
 #[cfg(not(debug_assertions))]
 fn reject_fault_injection_environment() -> Result<()> {
     for name in [
-        "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR",
-        "NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR",
+        novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
+        novarocks_failpoint::CLEANUP_FAULT_DIR_ENV,
         "NOVAROCKS_SQL_TEST_FAULT_INJECT_FETCH_NOT_READY_COUNT",
         "NOVAROCKS_SQL_TEST_EMIT_CANCEL_MARKER",
         "NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER",

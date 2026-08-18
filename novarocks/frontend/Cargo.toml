@@ -26,6 +26,7 @@ novarocks = { path = "../core" }
 novarocks-fs = { path = "../fs" }
 novarocks-catalog = { path = "../catalog" }
 novarocks-execution = { path = "../execution" }
+novarocks-failpoint = { path = "../failpoint" }
 novarocks-protocol = { path = "../protocol" }
 novarocks-spi = { path = "../spi" }
 novarocks-sql = { path = "../sql" }

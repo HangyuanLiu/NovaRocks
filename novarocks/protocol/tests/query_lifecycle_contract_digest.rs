@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(feature = "query-execution-contract-test-support")]
-
 use std::time::Duration;
 
 use novarocks_protocol::{

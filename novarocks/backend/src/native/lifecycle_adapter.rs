@@ -506,10 +506,10 @@ async fn run_attached_control_stream(
 }
 
 #[cfg(debug_assertions)]
-use novarocks::common::query_lifecycle_fault::observe_matching_fault;
-use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, QueryLifecycleFaultScope};
+use novarocks_failpoint::observe_matching_fault;
+use novarocks_failpoint::{QueryLifecycleFaultKind, QueryLifecycleFaultScope};
 #[cfg(debug_assertions)]
-use novarocks::common::query_lifecycle_fault::{claim_matching_fault, trigger_path};
+use novarocks_failpoint::{claim_matching_fault, trigger_path};
 
 #[cfg(debug_assertions)]
 fn staged_heartbeat_stops() -> &'static Mutex<
@@ -551,7 +551,7 @@ fn claim_backend_fault(
     kind: QueryLifecycleFaultKind,
     execution_id: QueryExecutionId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
-    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
+    let Some(root) = novarocks_failpoint::configured_root() else {
         return Ok(None);
     };
     let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
@@ -582,7 +582,7 @@ fn claim_backend_fault(
 /// write and the parent's kill, which does not prove loss after admission.
 #[cfg(debug_assertions)]
 fn wait_for_runner_owned_restart(scope: &QueryLifecycleFaultScope) {
-    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
+    let Some(root) = novarocks_failpoint::configured_root() else {
         return;
     };
     let release = trigger_path(
@@ -614,7 +614,7 @@ fn observe_backend_fault(
     kind: QueryLifecycleFaultKind,
     execution_id: QueryExecutionId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
-    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
+    let Some(root) = novarocks_failpoint::configured_root() else {
         return Ok(None);
     };
     let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")

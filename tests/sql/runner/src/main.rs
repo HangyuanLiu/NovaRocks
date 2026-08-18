@@ -30,7 +30,7 @@ mod shell;
 mod suite_manifest;
 mod types;
 
-#[path = "../../../../novarocks/core/src/common/engine_error_codes.rs"]
+#[path = "../../../../novarocks/types/src/engine_error_codes.rs"]
 mod engine_error_codes;
 
 use crate::benchmark_bootstrap::{

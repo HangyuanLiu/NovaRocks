@@ -1,0 +1,13 @@
+[package]
+name = "novarocks-failpoint"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["typed"]
+typed = ["dep:novarocks-protocol", "dep:novarocks-types"]
+
+[dependencies]
+novarocks-protocol = { path = "../protocol", optional = true }
+novarocks-types = { path = "../types", optional = true }

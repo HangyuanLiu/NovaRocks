@@ -14,10 +14,30 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#[path = "../common/mod.rs"]
+#[path = "common/mod.rs"]
 mod common;
 
-mod avg_decimal;
-mod clone_expr;
-mod exec_test;
-mod statistic_agg;
+#[path = "function/array.rs"]
+mod array;
+#[path = "function/bit.rs"]
+mod bit;
+#[path = "function/conditional.rs"]
+mod conditional;
+#[path = "function/date.rs"]
+mod date;
+#[path = "function/encryption.rs"]
+mod encryption;
+#[path = "function/map.rs"]
+mod map;
+#[path = "function/matching.rs"]
+mod matching;
+#[path = "function/math.rs"]
+mod math;
+#[path = "function/object.rs"]
+mod object;
+#[path = "function/string.rs"]
+mod string;
+#[path = "function/struct_fn.rs"]
+mod struct_fn;
+#[path = "function/variant.rs"]
+mod variant;

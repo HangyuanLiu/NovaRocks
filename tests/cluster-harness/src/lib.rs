@@ -18,6 +18,10 @@
 use anyhow::{Context, Result, bail};
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
+use novarocks_failpoint::{
+    QueryLifecycleFaultKind, arm_path as lifecycle_arm_path, cleanup_trigger_path,
+    parse_cleanup_fault_directive, parse_runner_rfo_kind,
+};
 use novarocks_test_support::{ManagedProcess, ReadyMarker, ReservedTcpPort};
 use std::collections::BTreeMap;
 use std::fs;
@@ -1102,47 +1106,49 @@ impl QueryLifecycleFaultFiles {
     }
 
     fn init_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "init-ack-drop")
+        self.be_path(index, QueryLifecycleFaultKind::InitAckDrop)
     }
 
     fn heartbeat_stop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "heartbeat-stop")
+        self.be_path(index, QueryLifecycleFaultKind::HeartbeatStop)
     }
 
     fn restart_after_init_ack_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "restart-after-init-ack")
+        self.be_path(index, QueryLifecycleFaultKind::RestartAfterInitAck)
     }
 
     fn stage_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "stage-ack-drop")
+        self.be_path(index, QueryLifecycleFaultKind::StageAckDrop)
     }
 
     fn start_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "start-ack-drop")
+        self.be_path(index, QueryLifecycleFaultKind::StartAckDrop)
     }
 
     fn start_ack_suppress_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "start-ack-suppress")
+        self.be_path(index, QueryLifecycleFaultKind::StartAckSuppress)
     }
 
     fn terminal_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "terminal-ack-drop")
+        self.be_path(index, QueryLifecycleFaultKind::TerminalAckDrop)
     }
 
     fn terminal_snapshot_stream_drop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "terminal-snapshot-stream-drop")
+        self.be_path(index, QueryLifecycleFaultKind::TerminalSnapshotStreamDrop)
     }
 
     fn terminal_snapshot_conflict_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "terminal-snapshot-conflict")
+        self.be_path(index, QueryLifecycleFaultKind::TerminalSnapshotConflict)
     }
 
     fn heartbeat_stop_after_stage_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "heartbeat-stop-after-stage")
+        self.be_path(index, QueryLifecycleFaultKind::HeartbeatStopAfterStage)
     }
 
     fn rfo_8r2_fault_path(&self, index: usize, kind: &'static str) -> Result<PathBuf> {
-        validate_rfo_8r2_fault_kind(kind)?;
+        let kind = parse_runner_rfo_kind(kind).ok_or_else(|| {
+            anyhow::anyhow!("unsupported RFO-8R2 query lifecycle fault kind {kind}")
+        })?;
         self.be_path(index, kind)
     }
 
@@ -1301,40 +1307,20 @@ impl QueryLifecycleFaultFiles {
         Ok(())
     }
 
-    fn be_path(&self, index: usize, kind: &str) -> Result<PathBuf> {
+    fn be_path(&self, index: usize, kind: QueryLifecycleFaultKind) -> Result<PathBuf> {
         if index >= self.be_count {
             bail!(
                 "BE index {index} is out of bounds for query lifecycle fault scope with {} BE(s)",
                 self.be_count
             );
         }
-        Ok(self.root.join(format!("be-{index}.{kind}.arm")))
+        Ok(lifecycle_arm_path(&self.root, index, kind))
     }
 }
 
 impl Drop for QueryLifecycleFaultFiles {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
-fn validate_rfo_8r2_fault_kind(kind: &str) -> Result<()> {
-    const KINDS: &[&str] = &[
-        "observation-p2-assembly-failure",
-        "observation-p2-budget-pressure",
-        "terminal-p0-retained-slot-exhausted",
-        "terminal-p0-bytes-exhausted",
-        "terminal-p0-delivery-permit-exhausted",
-        "terminal-p1-encode-failure",
-        "terminal-p1-retention-exhausted",
-        "terminal-proof-stream-drop",
-        "terminal-attestation-stream-drop",
-        "terminal-outcome-suppress",
-    ];
-    if KINDS.contains(&kind) {
-        Ok(())
-    } else {
-        bail!("unsupported RFO-8R2 query lifecycle fault kind {kind}")
     }
 }
 
@@ -1356,21 +1342,12 @@ impl CleanupFaultFiles {
     }
 
     fn arm(&self, kind: &str) -> Result<()> {
-        const ALLOWED: &[&str] = &[
-            "delete_failed",
-            "drop_delete_response",
-            "receipt_write_failed",
-            "checkpoint_failed",
-            "kill_fe_after_delete",
-        ];
-        if !ALLOWED.contains(&kind) {
-            bail!("unsupported connector cleanup fault {kind}");
-        }
-        let stem = kind.replace('_', "-");
-        let path = self.root.join(format!("{stem}.trigger"));
+        let kind = parse_cleanup_fault_directive(kind)
+            .ok_or_else(|| anyhow::anyhow!("unsupported connector cleanup fault {kind}"))?;
+        let path = cleanup_trigger_path(&self.root, kind);
         let token = next_fragment_failure_token(0);
         publish_query_lifecycle_fault_token(&path, &token, token.as_bytes())
-            .with_context(|| format!("publish connector cleanup fault {kind}"))
+            .with_context(|| format!("publish connector cleanup fault {}", kind.directive_name()))
     }
 
     fn clear(&self) -> Result<()> {
@@ -2438,7 +2415,7 @@ impl ServerHandle for CrossProcessServerHandle {
         if self.query_lifecycle_faults_enabled {
             command
                 .env(
-                    "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR",
+                    novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
                     self.query_lifecycle_fault_files.root(),
                 )
                 .env(
@@ -2542,7 +2519,7 @@ impl ServerHandle for CrossProcessServerHandle {
         let mut command = build_novarocks_command(&self.novarocks_bin, "fe", &self.fe_config_path);
         if self.query_lifecycle_faults_enabled {
             command.env(
-                "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR",
+                novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
                 self.query_lifecycle_fault_files.root(),
             );
         }
@@ -2551,7 +2528,7 @@ impl ServerHandle for CrossProcessServerHandle {
                 .cleanup_fault_files
                 .as_ref()
                 .expect("cleanup fault scope enabled");
-            command.env("NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR", files.root());
+            command.env(novarocks_failpoint::CLEANUP_FAULT_DIR_ENV, files.root());
         }
         apply_child_environment(&mut command, &self.fe_environment);
         self.fe_process
@@ -2728,7 +2705,10 @@ fn spawn_novarocks_process(launch: ProcessLaunch<'_>) -> Result<ManagedProcess> 
         );
     }
     if let Some((fault_dir, backend_index)) = query_lifecycle_fault_scope {
-        command.env("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR", fault_dir);
+        command.env(
+            novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
+            fault_dir,
+        );
         if let Some(backend_index) = backend_index {
             command.env(
                 "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
@@ -2737,7 +2717,7 @@ fn spawn_novarocks_process(launch: ProcessLaunch<'_>) -> Result<ManagedProcess> 
         }
     }
     if let Some(fault_dir) = cleanup_fault_dir {
-        command.env("NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR", fault_dir);
+        command.env(novarocks_failpoint::CLEANUP_FAULT_DIR_ENV, fault_dir);
     }
     apply_child_environment(&mut command, child_environment);
     let result = ManagedProcess::spawn(

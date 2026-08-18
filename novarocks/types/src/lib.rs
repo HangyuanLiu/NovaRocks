@@ -22,6 +22,8 @@ pub mod arrow_primitive;
 pub mod cluster_role;
 pub mod coercion;
 pub mod decimal;
+pub mod engine_error_codes;
+mod field_render;
 pub mod field_render_schema;
 pub mod identity;
 pub mod largeint;
@@ -38,6 +40,11 @@ pub use arithmetic::{
 };
 pub use cluster_role::ClusterRole;
 pub use coercion::{comparison_common_type, wider_type};
+pub use engine_error_codes::EngineErrorCode;
+pub use field_render::{
+    format_mysql_container_value_with_schema, http_json_row_from_arrays_with_primitives,
+    mysql_text_row_from_arrays_with_primitives,
+};
 pub use field_render_schema::FieldRenderSchema;
 pub use identity::{QueryId, UniqueId, format_uuid};
 pub use primitive::PrimitiveType;

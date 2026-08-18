@@ -28,10 +28,9 @@ use chrono::{DateTime, Datelike, NaiveDate};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 
-pub use novarocks_types::FieldRenderSchema;
-use novarocks_types::PrimitiveType;
-use novarocks_types::largeint;
-use novarocks_types::value::variant::VariantValue;
+use crate::largeint;
+use crate::value::variant::VariantValue;
+use crate::{FieldRenderSchema, PrimitiveType};
 
 fn format_date32_for_mysql(days: i32) -> String {
     let Some(date) = NaiveDate::from_num_days_from_ce_opt(719163 + days) else {
@@ -1627,8 +1626,8 @@ mod tests {
     use arrow::array::{ArrayRef, Int32Array, StringArray, StructArray, Time64MicrosecondArray};
     use arrow::datatypes::{DataType, Field, TimeUnit};
 
-    use novarocks_types::PrimitiveType;
-    use novarocks_types::logical::{LogicalType, field_with_logical_type};
+    use crate::PrimitiveType;
+    use crate::logical::{LogicalType, field_with_logical_type};
 
     #[test]
     fn format_timestamp_microsecond_omits_zero_fraction() {

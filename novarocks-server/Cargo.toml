@@ -13,6 +13,7 @@ novarocks-backend = { path = "../novarocks/backend" }
 novarocks-connector-iceberg = { path = "../novarocks/connector/iceberg" }
 novarocks-connector-starrocks = { path = "../novarocks/connector/starrocks" }
 novarocks-execution = { path = "../novarocks/execution" }
+novarocks-failpoint = { path = "../novarocks/failpoint", default-features = false }
 novarocks-frontend = { path = "../novarocks/frontend" }
 novarocks-fs = { path = "../novarocks/fs" }
 novarocks-spi = { path = "../novarocks/spi" }

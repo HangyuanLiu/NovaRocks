@@ -26,13 +26,13 @@ use crate::query_execution::maintenance::{
     MaintenanceAttemptCancellationSource, MaintenanceRequestContext, MaintenanceStatementResult,
     MaintenanceTargetRebind, OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
 };
-use ::novarocks::common::cleanup_fault::{
-    CleanupFaultKind, claim_configured as claim_cleanup_fault,
-};
 use novarocks::connector::cleanup_maintenance::CleanupBatchExecution;
 use novarocks::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use novarocks::connector::metadata_maintenance::MetadataMaintenanceIntent;
 use novarocks::maintenance::MaintenanceTarget;
+use novarocks_failpoint::{
+    CleanupFaultKind, claim_configured_cleanup_fault as claim_cleanup_fault,
+};
 use novarocks_spi::connector::{
     BatchReceipt, ConnectorCleanupOperationId, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,

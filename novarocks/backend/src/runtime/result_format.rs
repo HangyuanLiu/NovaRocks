@@ -3,13 +3,12 @@ use novarocks_types::PrimitiveType;
 use novarocks_types::arrow_primitive::arrow_field_to_primitive;
 
 use novarocks::common::result_batch::ResultBatch;
-use novarocks::common::util::{
+use novarocks_execution::exec::chunk::Chunk;
+use novarocks_execution::runtime::fragment::io::{ResultPresentation, ResultProjection};
+use novarocks_types::{
     FieldRenderSchema, http_json_row_from_arrays_with_primitives,
     mysql_text_row_from_arrays_with_primitives,
 };
-use novarocks_execution::exec::chunk::Chunk;
-
-use novarocks_execution::runtime::fragment::io::{ResultPresentation, ResultProjection};
 
 fn columns_for_projections(
     chunk: &Chunk,
@@ -232,9 +231,9 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
 
     use super::build_statistic_result_batch;
-    use novarocks::common::util::FieldRenderSchema;
     use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use novarocks_execution::runtime::fragment::io::ResultProjection;
+    use novarocks_types::FieldRenderSchema;
     use novarocks_types::PrimitiveType;
     use novarocks_types::SlotId;
 

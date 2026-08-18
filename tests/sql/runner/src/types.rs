@@ -16,61 +16,10 @@
 // under the License.
 
 use crate::suite_manifest::SuiteManifest;
+pub use novarocks_failpoint::QueryLifecycleFaultKind;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
-
-/// Stable runner-facing names for the RFO-8R2 lifecycle fault arms. The
-/// server-side owners consume the matching core file stem; the runner never
-/// infers an owner from log text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueryLifecycleFaultKind {
-    ObservationP2AssemblyFailure,
-    ObservationP2BudgetPressure,
-    TerminalP0RetainedSlotExhausted,
-    TerminalP0BytesExhausted,
-    TerminalP0DeliveryPermitExhausted,
-    TerminalP1EncodeFailure,
-    TerminalP1RetentionExhausted,
-    TerminalProofStreamDrop,
-    TerminalAttestationStreamDrop,
-    TerminalOutcomeSuppress,
-}
-
-impl QueryLifecycleFaultKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ObservationP2AssemblyFailure => "observation-p2-assembly-failure",
-            Self::ObservationP2BudgetPressure => "observation-p2-budget-pressure",
-            Self::TerminalP0RetainedSlotExhausted => "terminal-p0-retained-slot-exhausted",
-            Self::TerminalP0BytesExhausted => "terminal-p0-bytes-exhausted",
-            Self::TerminalP0DeliveryPermitExhausted => "terminal-p0-delivery-permit-exhausted",
-            Self::TerminalP1EncodeFailure => "terminal-p1-encode-failure",
-            Self::TerminalP1RetentionExhausted => "terminal-p1-retention-exhausted",
-            Self::TerminalProofStreamDrop => "terminal-proof-stream-drop",
-            Self::TerminalAttestationStreamDrop => "terminal-attestation-stream-drop",
-            Self::TerminalOutcomeSuppress => "terminal-outcome-suppress",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "observation-p2-assembly-failure" => Some(Self::ObservationP2AssemblyFailure),
-            "observation-p2-budget-pressure" => Some(Self::ObservationP2BudgetPressure),
-            "terminal-p0-retained-slot-exhausted" => Some(Self::TerminalP0RetainedSlotExhausted),
-            "terminal-p0-bytes-exhausted" => Some(Self::TerminalP0BytesExhausted),
-            "terminal-p0-delivery-permit-exhausted" => {
-                Some(Self::TerminalP0DeliveryPermitExhausted)
-            }
-            "terminal-p1-encode-failure" => Some(Self::TerminalP1EncodeFailure),
-            "terminal-p1-retention-exhausted" => Some(Self::TerminalP1RetentionExhausted),
-            "terminal-proof-stream-drop" => Some(Self::TerminalProofStreamDrop),
-            "terminal-attestation-stream-drop" => Some(Self::TerminalAttestationStreamDrop),
-            "terminal-outcome-suppress" => Some(Self::TerminalOutcomeSuppress),
-            _ => None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryLifecycleFaultDirective {

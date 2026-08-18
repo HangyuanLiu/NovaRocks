@@ -20,14 +20,14 @@ use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use novarocks::common::query_lifecycle_fault::QueryLifecycleFaultKind;
-#[cfg(debug_assertions)]
-use novarocks::common::query_lifecycle_fault::{claim_matching_fault, configured_root};
 use novarocks::novarocks_logging::{info, warn};
 use novarocks::service::query_lifecycle_metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks_execution::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
+use novarocks_failpoint::QueryLifecycleFaultKind;
+#[cfg(debug_assertions)]
+use novarocks_failpoint::{claim_matching_fault, configured_root};
 use novarocks_protocol::lifecycle::terminal::p0_max_encoded_len;
 use novarocks_protocol::lifecycle::{
     FragmentLiveObservation, FragmentTerminalSnapshot, NegativeAttestation,
@@ -4479,7 +4479,7 @@ fn format_execution_id(execution_id: QueryExecutionId) -> String {
 
 #[cfg(debug_assertions)]
 pub(super) fn query_lifecycle_test_markers_enabled() -> bool {
-    novarocks::common::query_lifecycle_fault::configured_root().is_some()
+    novarocks_failpoint::configured_root().is_some()
 }
 
 #[cfg(not(debug_assertions))]

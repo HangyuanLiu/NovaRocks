@@ -10,6 +10,7 @@ doctest = false
 [dependencies]
 novarocks = { path = "../core" }
 novarocks-execution = { path = "../execution" }
+novarocks-failpoint = { path = "../failpoint" }
 novarocks-protocol = { path = "../protocol" }
 novarocks-spi = { path = "../spi" }
 bytes = "1"

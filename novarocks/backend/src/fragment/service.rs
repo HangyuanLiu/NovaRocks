@@ -100,27 +100,18 @@ fn test_execution_runtime() -> Arc<ExecutionRuntime> {
 #[cfg(debug_assertions)]
 fn runner_stage_prepare_failure(
     available_fragments: usize,
-) -> Result<
-    Option<novarocks::common::query_lifecycle_fault::StagePrepareFailure>,
-    NativeFragmentIngressError,
-> {
-    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
+) -> Result<Option<novarocks_failpoint::StagePrepareFailure>, NativeFragmentIngressError> {
+    let Some(root) = novarocks_failpoint::configured_root() else {
         return Ok(None);
     };
-    novarocks::common::query_lifecycle_fault::claim_stage_prepare_failure(
-        &root,
-        available_fragments,
-    )
-    .map_err(NativeFragmentIngressError::new)
+    novarocks_failpoint::claim_stage_prepare_failure(&root, available_fragments)
+        .map_err(NativeFragmentIngressError::new)
 }
 
 #[cfg(not(debug_assertions))]
 fn runner_stage_prepare_failure(
     _available_fragments: usize,
-) -> Result<
-    Option<novarocks::common::query_lifecycle_fault::StagePrepareFailure>,
-    NativeFragmentIngressError,
-> {
+) -> Result<Option<novarocks_failpoint::StagePrepareFailure>, NativeFragmentIngressError> {
     Ok(None)
 }
 

@@ -39,7 +39,7 @@ const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
 
 fn lifecycle_convergence_debug_enabled() -> bool {
     cfg!(debug_assertions)
-        && std::env::var_os("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR").is_some()
+        && std::env::var_os(novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV).is_some()
 }
 
 #[derive(serde::Serialize)]

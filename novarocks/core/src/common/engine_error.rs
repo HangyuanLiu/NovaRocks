@@ -23,7 +23,7 @@ pub const REPORT_EXEC_STATUS_OK: i32 = 0;
 pub const REPORT_EXEC_STATUS_ERROR: i32 = 1;
 pub const REPORT_EXEC_STATUS_QUERY_GONE: i32 = 2;
 
-pub use super::engine_error_codes::EngineErrorCode;
+pub use novarocks_types::EngineErrorCode;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum InternalInvariantCode {

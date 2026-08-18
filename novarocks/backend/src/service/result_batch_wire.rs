@@ -18,14 +18,13 @@
 use arrow::array::ArrayRef;
 
 use novarocks::common::result_batch::ResultBatch;
-use novarocks::common::util::{
-    FieldRenderSchema, http_json_row_from_arrays_with_primitives,
-    mysql_text_row_from_arrays_with_primitives,
-};
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_execution::runtime::fragment::io::ResultProjection;
-use novarocks_types::PrimitiveType;
 use novarocks_types::arrow_primitive::arrow_field_to_primitive;
+use novarocks_types::{
+    FieldRenderSchema, PrimitiveType, http_json_row_from_arrays_with_primitives,
+    mysql_text_row_from_arrays_with_primitives,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ResultSinkType {
@@ -200,8 +199,8 @@ mod tests {
 
     use super::build_fetch_result_batch_for_chunk;
     use super::{ResultProjection, ResultSinkConfig};
-    use novarocks::common::util::FieldRenderSchema;
     use novarocks_execution::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
+    use novarocks_types::FieldRenderSchema;
     use novarocks_types::PrimitiveType;
     use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};

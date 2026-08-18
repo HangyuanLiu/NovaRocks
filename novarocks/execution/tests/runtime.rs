@@ -21,7 +21,7 @@ use novarocks_execution::runtime::exchange::{ExchangeKey, ExecutionExchangeRegis
 use novarocks_execution::runtime::profile::Profiler;
 use novarocks_types::UniqueId;
 
-#[path = "../common/mod.rs"]
+#[path = "common/mod.rs"]
 mod common;
 
 fn sample_exchange_key(node_id: i32) -> ExchangeKey {

@@ -1622,11 +1622,9 @@ fn claim_terminal_ack_drop(
     session: &ActiveSession,
     outcome: &ParticipantTerminalOutcome,
 ) -> Result<bool, String> {
-    use ::novarocks::common::query_lifecycle_fault::{
-        QueryLifecycleFaultKind, claim_matching_fault,
-    };
+    use novarocks_failpoint::{QueryLifecycleFaultKind, claim_matching_fault};
 
-    let Some(root) = ::novarocks::common::query_lifecycle_fault::configured_root() else {
+    let Some(root) = novarocks_failpoint::configured_root() else {
         return Ok(false);
     };
     let backend_index = session.target.backend_idx();
@@ -1661,12 +1659,10 @@ fn claim_terminal_ack_drop(
 fn claim_terminal_snapshot_conflict(
     session: &ActiveSession,
     outcome: &ParticipantTerminalOutcome,
-) -> Result<Option<::novarocks::common::query_lifecycle_fault::QueryLifecycleFaultScope>, String> {
-    use ::novarocks::common::query_lifecycle_fault::{
-        QueryLifecycleFaultKind, claim_matching_fault,
-    };
+) -> Result<Option<novarocks_failpoint::QueryLifecycleFaultScope>, String> {
+    use novarocks_failpoint::{QueryLifecycleFaultKind, claim_matching_fault};
 
-    let Some(root) = ::novarocks::common::query_lifecycle_fault::configured_root() else {
+    let Some(root) = novarocks_failpoint::configured_root() else {
         return Ok(None);
     };
     let backend_index = session.target.backend_idx();
@@ -1692,7 +1688,7 @@ fn protocol_execution_id(execution_id: QueryExecutionId) -> Result<QueryExecutio
 fn claim_terminal_snapshot_conflict(
     _session: &ActiveSession,
     _outcome: &ParticipantTerminalOutcome,
-) -> Result<Option<::novarocks::common::query_lifecycle_fault::QueryLifecycleFaultScope>, String> {
+) -> Result<Option<novarocks_failpoint::QueryLifecycleFaultScope>, String> {
     Ok(None)
 }
 
