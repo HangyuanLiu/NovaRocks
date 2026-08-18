@@ -27,13 +27,13 @@ use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
+use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
     admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
-use ::novarocks::common::admitted_query_context::QueryExecutionContext;
-use ::novarocks::runtime::query_result::QueryResult;
+use crate::runtime::query_result::QueryResult;
 use novarocks_sql::planning::dml::{
     DmlChangeStreamCompileRequest, DmlChangeStreamKind, DmlChangeStreamRoute,
     DmlChangeStreamRouteField, DmlPreExpandKeyedAssert, DmlWriteSinkMode, IcebergRefSuffix,
@@ -1451,7 +1451,7 @@ fn build_update_mor_change_stream_write_plan(
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     target_ref: &str,
     new_sequence_number: i64,
-    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     preparations: &ActivatedDmlChangeStreamPreparations,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -3954,7 +3954,7 @@ fn build_merge_mor_change_stream_write_plan(
     insert_columns: Option<&[MergeInsertColumn]>,
     target_ref: &str,
     new_sequence_number: i64,
-    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     preparations: &ActivatedDmlChangeStreamPreparations,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,

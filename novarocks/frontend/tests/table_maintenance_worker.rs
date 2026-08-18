@@ -23,7 +23,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks::maintenance::MaintenanceTarget;
+use novarocks_frontend::maintenance::MaintenanceTarget;
 use novarocks_frontend::query_execution::maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
     MaintenanceTargetRebind, OptimizeJobState, TableMaintenanceEngine, TableMaintenanceService,

@@ -14,8 +14,5 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub mod common;
-pub mod maintenance;
-pub mod runtime;
 pub mod service;
 pub use novarocks_version as version;

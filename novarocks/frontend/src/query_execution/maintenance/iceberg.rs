@@ -24,7 +24,7 @@
 
 use super::{MaintenanceActionOutcome, MaintenanceActionRequest};
 use crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer;
-use novarocks::maintenance::MaintenanceTarget;
+use crate::maintenance::MaintenanceTarget;
 
 /// Execute a non-rewrite maintenance action through explicit frontend-owned
 /// connector and cache-finalization ports. The caller owns the request context;

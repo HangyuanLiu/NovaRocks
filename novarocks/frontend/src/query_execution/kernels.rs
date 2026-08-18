@@ -26,6 +26,7 @@ use std::sync::Arc;
 use crate::catalog_application::CatalogApplicationPort;
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::system_catalog::SystemCatalog;
+use crate::common::backend_topology::BackendTopologyService;
 use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::mv::domain::application::MvApplicationService;
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
@@ -33,7 +34,6 @@ use crate::mv::domain::repository::MvRepository;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::service::QueryExecutionService;
 use crate::view::ViewService;
-use ::novarocks::common::backend_topology::BackendTopologyService;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::MvStorageObservationPort;
 

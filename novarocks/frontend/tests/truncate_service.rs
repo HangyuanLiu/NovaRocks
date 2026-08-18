@@ -22,10 +22,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks::common::admitted_query_context::{RequestAdmission, RequestContext};
-use novarocks::common::backend_topology::BackendTopologySnapshot;
-use novarocks::common::query_cancellation::QueryCancellationSource;
 use novarocks_frontend::FrontendStatisticsService;
+use novarocks_frontend::common::admitted_query_context::{RequestAdmission, RequestContext};
+use novarocks_frontend::common::backend_topology::BackendTopologySnapshot;
+use novarocks_frontend::common::query_cancellation::QueryCancellationSource;
 use novarocks_frontend::dml::model::{
     DML_EXTERNAL_FACT_ENCODED_LIMIT, DML_OPERATION_SCHEMA_VERSION,
     DmlDirectMutationFenceMutationRequest, DmlDirectMutationFenceReceiptRecord,

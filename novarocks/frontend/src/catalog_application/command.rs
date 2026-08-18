@@ -37,8 +37,8 @@ use crate::catalog_application::statement::{
 };
 use crate::catalog_application::{CatalogApplicationPort, CatalogCreateCommand};
 use crate::mv::domain::repository::MvRepository;
-use novarocks::runtime::query_result::QueryResultColumn;
-use novarocks::runtime::statement_result::StatementResult;
+use crate::runtime::query_result::QueryResultColumn;
+use crate::runtime::statement_result::StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::syntax::{
     StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
@@ -652,7 +652,7 @@ fn execute_show_create_table(
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
         .map_err(|error| format!("build SHOW CREATE TABLE result failed: {error}"))?;
     Ok(StatementResult::Query(
-        novarocks::runtime::query_result::QueryResult {
+        crate::runtime::query_result::QueryResult {
             columns: vec![
                 QueryResultColumn {
                     name: "Table".to_string(),
@@ -667,9 +667,7 @@ fn execute_show_create_table(
                     logical_type: None,
                 },
             ],
-            chunks: vec![novarocks::runtime::query_result::record_batch_to_chunk(
-                batch,
-            )?],
+            chunks: vec![crate::runtime::query_result::record_batch_to_chunk(batch)?],
         },
     ))
 }

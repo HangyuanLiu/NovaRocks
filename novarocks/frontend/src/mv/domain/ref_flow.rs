@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use novarocks::runtime::statement_result::StatementResult;
+use crate::runtime::statement_result::StatementResult;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorInstanceId, ConnectorRefAction, ConnectorRefKind,
     ConnectorTableIdentity, ConnectorTableResolution, CreateOrReplacePolicy, DropPolicy,
@@ -106,7 +106,7 @@ pub(crate) fn execute_with_ports(
         crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
             if let ExternalMutationFinalization::Failed(failure) = completed.finalization {
                 return Err(
-                    novarocks::common::engine_error::EngineError::commit_known_committed_finalize_failed(
+                    crate::common::engine_error::EngineError::commit_known_committed_finalize_failed(
                         failure.to_string(),
                     )
                     .to_string(),
@@ -115,17 +115,17 @@ pub(crate) fn execute_with_ports(
         }
         crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
             return Err(
-                novarocks::common::engine_error::EngineError::commit_known_uncommitted(
+                crate::common::engine_error::EngineError::commit_known_uncommitted(
                     failure.to_string(),
                 )
                 .to_string(),
             );
         }
         crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
-            return Err(
-                novarocks::common::engine_error::EngineError::commit_unknown(failure.to_string())
-                    .to_string(),
-            );
+            return Err(crate::common::engine_error::EngineError::commit_unknown(
+                failure.to_string(),
+            )
+            .to_string());
         }
         crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { error, .. } => {
             return Err(error.to_string());

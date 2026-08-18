@@ -11,13 +11,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 use tonic::transport::Channel;
 
+use crate::common::backend_topology::{BeId, HeartbeatOutcome, LiveBackendTarget};
+use crate::metrics::observe_backend_heartbeat_rtt;
 use crate::native::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, decode_fetched_query_batch,
 };
 use crate::query_execution::artifact::ConnectorBindingDispatcher;
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
-use ::novarocks::common::backend_topology::{BeId, HeartbeatOutcome, LiveBackendTarget};
-use novarocks::service::observe_backend_heartbeat_rtt;
 use novarocks_protocol::common::UniqueId as ProtoUniqueId;
 use novarocks_protocol::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,

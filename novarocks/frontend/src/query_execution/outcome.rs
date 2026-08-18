@@ -26,7 +26,7 @@ use crate::query_execution::statistics::StatisticsCollectionProgram;
 use crate::query_execution::write::{ConnectorWriteCommitInput, WriteAbortInput, WriteCommitInput};
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
-use ::novarocks::runtime::query_result::QueryResult;
+use crate::runtime::query_result::QueryResult;
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorWriteCohortId};
 

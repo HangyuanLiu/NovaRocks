@@ -22,7 +22,6 @@ use std::time::Duration;
 use crate::app_config::NovaRocksConfig;
 use crate::network;
 use anyhow::Context;
-use novarocks::common::backend_topology::BackendTopologyPort;
 use novarocks_backend::{
     BackendApplicationHost, BackendDataRuntime, BackendServerConfig, QueryLifecycleRegistryConfig,
 };
@@ -40,7 +39,7 @@ use novarocks_execution::runtime::execution_runtime::{
 };
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendExecutionConfig, FrontendQueryControlTimeouts,
-    FrontendServerConfig,
+    FrontendServerConfig, common::backend_topology::BackendTopologyPort,
 };
 use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
 use novarocks_spi::connector::{

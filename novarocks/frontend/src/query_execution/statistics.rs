@@ -45,6 +45,7 @@ use novarocks_spi::connector::{
     StatisticsMissing, StatisticsMissingKind, StatisticsNumericNature, StatisticsRowCoverage,
 };
 
+use crate::common::backend_topology::BackendTopologySnapshot;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryRequest,
     build_statistics_query_request_with_execution,
@@ -52,7 +53,6 @@ use crate::query_execution::contract::{
 use crate::query_execution::preparation::scan::{
     PlannedConnectorRead, ResolvedScanExecution, ScanBindingResolver,
 };
-use ::novarocks::common::backend_topology::BackendTopologySnapshot;
 use sha2::{Digest, Sha256};
 
 /// The longest independently owned durable ANALYZE attempt. A client wait
@@ -327,7 +327,7 @@ fn statistics_target_parallelism(
 pub struct PreparedStatisticsCollectionRequest {
     encoding: crate::query_execution::post_compile::NativeFragmentEncodingInput,
     program: StatisticsCollectionProgram,
-    execution: ::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: crate::common::admitted_query_context::QueryExecutionContext,
 }
 
 impl PreparedStatisticsCollectionRequest {
@@ -370,7 +370,7 @@ impl PreparedStatisticsCollectionRequest {
 /// identity or reader path.
 pub fn prepare_statistics_collection_request(
     controls: &dyn ConnectorControlResolver,
-    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
     context: ConnectorRequestContext,
     program: StatisticsCollectionProgram,
     planning_lease: ConnectorControlPlanningLease,
@@ -1977,11 +1977,11 @@ mod tests {
                 &plan,
             )
             .expect("prepared native facts");
-        let execution = ::novarocks::common::admitted_query_context::QueryExecutionContext::new(
+        let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
             novarocks_types::ClusterRole::AllInOne,
             BackendTopologySnapshot::empty(17),
             Some(Instant::now() + Duration::from_secs(60)),
-            ::novarocks::common::query_cancellation::QueryCancellationSource::new().view(),
+            crate::common::query_cancellation::QueryCancellationSource::new().view(),
             novarocks_sql::compiler::SessionOptimizerSettings::default(),
         );
         PreparedStatisticsCollectionRequest {

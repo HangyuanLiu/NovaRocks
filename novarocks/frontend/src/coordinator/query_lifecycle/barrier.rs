@@ -19,12 +19,12 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::common::query_cancellation::QueryCancellationView;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::launch::{QueryLaunchBarrier, StageBatch};
 use crate::query_execution::lifecycle_plan::{
     QueryInitBarrier, QueryInitPlan, QueryLifecycleLease,
 };
-use ::novarocks::common::query_cancellation::QueryCancellationView;
 use novarocks_protocol::lifecycle::{
     AttemptId as CoreAttemptId, AttemptId as ProtocolAttemptId, QueryControlAttach,
     QueryExecutionId, QueryInitOutcome, QueryStageAck, QueryStageRequest, QueryStartAck,
@@ -256,9 +256,7 @@ impl FrontendQueryLifecycleBarrier {
     }
 
     #[cfg(test)]
-    pub(super) fn metrics_snapshot(
-        &self,
-    ) -> novarocks::service::query_lifecycle_metrics::FrontendQueryLifecycleMetricsSnapshot {
+    pub(super) fn metrics_snapshot(&self) -> crate::metrics::FrontendQueryLifecycleMetricsSnapshot {
         self.metrics.snapshot()
     }
 

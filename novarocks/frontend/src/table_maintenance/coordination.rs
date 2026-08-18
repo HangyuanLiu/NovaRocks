@@ -27,8 +27,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::maintenance::MaintenanceTarget;
 use bytes::{BufMut, Bytes, BytesMut};
-use novarocks::maintenance::MaintenanceTarget;
 use novarocks_spi::connector::ConnectorInstanceId;
 use novarocks_spi::state_store::WriteTransaction;
 use novarocks_state_store::OperationId;
@@ -532,8 +532,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
+    use crate::maintenance::MaintenanceTarget;
     use bytes::Bytes;
-    use novarocks::maintenance::MaintenanceTarget;
     use novarocks_spi::state_store::{FeDeploymentView, StateStore, TransactionId};
     use novarocks_state_store::coordination::{
         ClockHealth, CoordinationError, CoordinationErrorKind, IncarnationGate, LeaseClock,

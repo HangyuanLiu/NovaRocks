@@ -14,10 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub(crate) mod metrics_http;
-pub mod query_lifecycle_metrics;
-pub use metrics_http::{
-    MetricsHttpServer, handle_metrics, publish_backend_query_execution_resource,
-    publish_backend_query_lifecycle_metrics, publish_backend_query_lifecycle_terminal_limits,
-    render_metrics, render_metrics_json,
-};
+
+pub mod query_result;
+pub mod statement_result;

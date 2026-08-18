@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::maintenance::MaintenanceTarget;
 use crate::query_execution::maintenance::OptimizeJobState;
 use bytes::Bytes;
-use novarocks::maintenance::MaintenanceTarget;
 use novarocks_spi::connector::{
     ConnectorTableObjectId, ConnectorWriteExecutionId, MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES,
 };

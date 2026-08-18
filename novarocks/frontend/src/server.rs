@@ -40,7 +40,7 @@ type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Clone)]
 struct FrontendBackgroundMaintenanceAttemptFactory {
     role: novarocks_types::ClusterRole,
-    topology: ::novarocks::common::backend_topology::BackendTopologyService,
+    topology: crate::common::backend_topology::BackendTopologyService,
 }
 
 impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemptFactory {

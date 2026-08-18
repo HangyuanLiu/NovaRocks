@@ -26,7 +26,7 @@ use novarocks_spi::connector::{
     ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
-use novarocks::common::engine_error::EngineError;
+use crate::common::engine_error::EngineError;
 
 #[derive(Clone, Debug)]
 pub struct CompletedCatalogMutation {

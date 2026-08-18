@@ -23,9 +23,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
+use crate::common::backend_topology::LiveBackendTarget;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle_plan::QueryInitPlanHeader;
-use ::novarocks::common::backend_topology::LiveBackendTarget;
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_protocol::lifecycle::{ExchangeRouteManifest, ScanRangeParams};
 use novarocks_spi::connector::ConnectorSplit;

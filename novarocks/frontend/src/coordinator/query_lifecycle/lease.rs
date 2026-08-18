@@ -21,12 +21,12 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::metrics::FrontendQueryLifecycleMetricsSnapshot;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle_plan::{
     QueryLifecycleAbortOutcome, QueryLifecycleLease, QueryLifecycleLeaseGuard,
 };
 use crate::query_execution::terminal_set::QueryTerminalSet;
-use novarocks::service::query_lifecycle_metrics::FrontendQueryLifecycleMetricsSnapshot;
 use novarocks_protocol::lifecycle::{
     FragmentLiveObservation, ParticipantManifestDigest, ParticipantTerminalOutcome,
     QueryAbortRequest, QueryControlCommand, QueryControlEvent, QueryExecutionId, QueryTerminalAck,
@@ -280,7 +280,7 @@ impl FrontendLifecycleMetrics {
             update(&mut snapshot);
             *snapshot
         };
-        novarocks::service::publish_frontend_query_lifecycle_metrics(snapshot);
+        crate::metrics::publish_frontend_query_lifecycle_metrics(snapshot);
     }
 }
 

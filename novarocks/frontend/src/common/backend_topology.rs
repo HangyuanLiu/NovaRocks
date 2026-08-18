@@ -161,7 +161,7 @@ pub struct BackendTopologyMetricsSnapshot {
 /// surface is the only side that knows the gauge label set, so neither has to
 /// name a type belonging to the other.
 pub fn publish_backend_topology_metrics(snapshot: BackendTopologyMetricsSnapshot) {
-    crate::service::metrics_http::publish_backend_topology_metrics(
+    crate::metrics::publish_backend_topology_metrics(
         snapshot.registering,
         snapshot.live,
         snapshot.lost,
@@ -204,7 +204,7 @@ pub enum HeartbeatOutcome {
 /// Core-local scheduling metric. Topology accounting is performed by the
 /// frontend-owned port at the composition boundary.
 pub fn record_successful_stage(_backend_idx: usize, fragment_count: usize) {
-    crate::service::metrics_http::observe_fragments_scheduled(fragment_count);
+    crate::metrics::observe_fragments_scheduled(fragment_count);
 }
 
 /// Resolves the report endpoint after the coordinator gRPC listener has bound.

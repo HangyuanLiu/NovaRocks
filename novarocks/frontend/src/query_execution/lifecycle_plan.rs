@@ -19,11 +19,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use crate::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, ResolvedQueryOptions,
 };
 use crate::query_execution::schedule::FragmentLifecycleProjection;
-use ::novarocks::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::common;
@@ -618,9 +618,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{QueryInitOptions, compile_query_init_plan};
+    use crate::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
     use crate::query_execution::contract::{QueryId, ResolvedQueryOptions};
     use crate::query_execution::schedule::FragmentLifecycleProjection;
-    use ::novarocks::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
     use novarocks_protocol::lifecycle::{
         AttemptId, ParticipantRole, QueryExecutionId, QueryOptions, RuntimeFilterContribution,
     };

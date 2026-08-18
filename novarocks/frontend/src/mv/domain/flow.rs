@@ -29,7 +29,7 @@ use crate::mv::domain::persistence::definition::{
 };
 use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target};
 use crate::mv::domain::repository::MvRepository;
-use novarocks::runtime::statement_result::StatementResult;
+use crate::runtime::statement_result::StatementResult;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_sql::syntax::three_part_table_ref_occurrences;
 use novarocks_sql::syntax::{

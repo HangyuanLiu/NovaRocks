@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::Field;
 
 use crate::catalog_application::resolver::TargetBackend;
+use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::connector::backend::ResolvedTable;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
@@ -36,7 +37,6 @@ use crate::query_execution::write_transaction::{
     IcebergWriteCommitPolicy, IcebergWriteSource, IcebergWriteTransactionSpec,
     IcebergWriteValidationPolicy,
 };
-use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::ColumnDefault;
 use novarocks_catalog::schema::SqlType;

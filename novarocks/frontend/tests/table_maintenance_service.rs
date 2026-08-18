@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use arrow::array::StringArray;
 use bytes::Bytes;
-use novarocks::maintenance::MaintenanceTarget;
+use novarocks_frontend::maintenance::MaintenanceTarget;
 use novarocks_frontend::query_execution::maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
     MaintenanceStatementResult, MaintenanceTargetRebind, OptimizeSubmission,
@@ -369,14 +369,14 @@ fn expect_ok(result: Option<MaintenanceStatementResult>) {
 
 fn expect_query(
     result: Option<MaintenanceStatementResult>,
-) -> novarocks::runtime::query_result::QueryResult {
+) -> novarocks_frontend::runtime::query_result::QueryResult {
     let Some(MaintenanceStatementResult::Query(result)) = result else {
         panic!("expected query result");
     };
     result
 }
 
-fn column_names(result: &novarocks::runtime::query_result::QueryResult) -> Vec<&str> {
+fn column_names(result: &novarocks_frontend::runtime::query_result::QueryResult) -> Vec<&str> {
     result
         .columns
         .iter()

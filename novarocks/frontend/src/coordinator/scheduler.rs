@@ -18,12 +18,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
+use crate::common::backend_topology::LiveBackendTarget;
 use crate::query_execution::artifact::{
     BackendPlacement, FragmentId, FragmentScheduleDraft, FragmentSchedulingView,
     SchedulingStreamKind, ValidatedFragmentSchedule,
 };
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use ::novarocks::common::backend_topology::LiveBackendTarget;
 #[cfg(debug_assertions)]
 use novarocks_failpoint::{QueryLifecycleFaultKind, arm_path, configured_root};
 use novarocks_protocol::lifecycle::QueryExecutionId;

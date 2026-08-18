@@ -18,7 +18,7 @@
 //! Closed Frontend backend-membership command capability.
 
 use crate::query_execution::kernels::BackendManagementKernel;
-use ::novarocks::runtime::statement_result::StatementResult;
+use crate::runtime::statement_result::StatementResult;
 use novarocks_types::ClusterRole;
 
 #[derive(Clone)]

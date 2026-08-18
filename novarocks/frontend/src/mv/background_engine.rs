@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::maintenance::MaintenanceTarget;
 use crate::mv::domain::dependency::model::iceberg_mv_dependency_ref;
 use crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_repository;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
@@ -33,7 +34,6 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
     PreparedMvRefresh,
 };
-use novarocks::maintenance::MaintenanceTarget;
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,

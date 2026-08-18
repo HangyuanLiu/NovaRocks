@@ -32,16 +32,16 @@ use std::time::Instant;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 
+use crate::common::query_cancellation::QueryCancellationView;
 use crate::connector::cleanup_maintenance::{CleanupBatchExecution, CleanupMaintenanceSession};
 use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use crate::connector::metadata_maintenance::{
     CompletedMetadataMaintenance, MetadataMaintenanceIntent, MetadataMaintenanceSession,
 };
+use crate::maintenance::MaintenanceTarget;
 use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession;
-use ::novarocks::common::query_cancellation::QueryCancellationView;
-use ::novarocks::runtime::query_result::QueryResult;
-use novarocks::maintenance::MaintenanceTarget;
+use crate::runtime::query_result::QueryResult;
 use novarocks_spi::connector::{
     BatchReceipt, CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupPlan,
     ConnectorControlResolver, ConnectorDistributedRewriteAttemptCheckpoint,
@@ -63,7 +63,7 @@ pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance servi
 pub struct PreparedDistributedRewriteCohort {
     encoding: crate::query_execution::compiler::NativeFragmentEncodingInput,
     query_execution: crate::query_execution::service::QueryExecutionService,
-    execution: ::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: crate::common::admitted_query_context::QueryExecutionContext,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
 }
 
@@ -71,7 +71,7 @@ impl PreparedDistributedRewriteCohort {
     fn new(
         encoding: crate::query_execution::compiler::NativeFragmentEncodingInput,
         query_execution: crate::query_execution::service::QueryExecutionService,
-        execution: ::novarocks::common::admitted_query_context::QueryExecutionContext,
+        execution: crate::common::admitted_query_context::QueryExecutionContext,
         connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
     ) -> Self {
         Self {
@@ -716,14 +716,14 @@ pub trait TableMaintenanceService: Send + Sync {
 #[derive(Clone)]
 pub(crate) struct RequestScopedMaintenanceEngine {
     kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
-    execution: ::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: crate::common::admitted_query_context::QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 impl RequestScopedMaintenanceEngine {
     pub fn new(
         kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
-        execution: ::novarocks::common::admitted_query_context::QueryExecutionContext,
+        execution: crate::common::admitted_query_context::QueryExecutionContext,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Self {
         Self {
@@ -860,13 +860,13 @@ fn maintenance_target_rebind_from_connector_result(
 /// generation and execution identity for recovery.
 #[derive(Clone)]
 pub struct BackgroundMaintenanceAttempt {
-    execution: ::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: crate::common::admitted_query_context::QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 impl BackgroundMaintenanceAttempt {
     pub fn new(
-        execution: ::novarocks::common::admitted_query_context::QueryExecutionContext,
+        execution: crate::common::admitted_query_context::QueryExecutionContext,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Self {
         Self {
@@ -1647,7 +1647,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
     cohort_id: ConnectorWriteCohortId,
-    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedDistributedRewriteCohort, String> {
     let cohort = session

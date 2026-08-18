@@ -39,7 +39,7 @@ impl ConnectorCancellation for RequestConnectorCancellation {
 }
 
 struct QueryConnectorCancellation {
-    cancellation: novarocks::common::query_cancellation::QueryCancellationView,
+    cancellation: crate::common::query_cancellation::QueryCancellationView,
 }
 
 impl ConnectorCancellation for QueryConnectorCancellation {
@@ -80,7 +80,7 @@ pub fn connector_request_context(
 /// provider requests share the statement cancellation identity and options.
 pub fn connector_request_context_for_query(
     query_options: Option<&QueryOptions>,
-    cancellation: novarocks::common::query_cancellation::QueryCancellationView,
+    cancellation: crate::common::query_cancellation::QueryCancellationView,
 ) -> Result<ConnectorRequestContext, String> {
     build_connector_request_context(
         query_options,
@@ -93,7 +93,7 @@ pub fn connector_request_context_for_query(
 /// admission deadline use the bounded connector fallback.
 pub fn connector_request_context_for_execution(
     query_options: Option<&QueryOptions>,
-    execution: &novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<ConnectorRequestContext, String> {
     let cancellation: Arc<dyn ConnectorCancellation> = Arc::new(QueryConnectorCancellation {
         cancellation: execution.cancellation().clone(),
@@ -142,9 +142,9 @@ mod request_context_tests {
     use std::time::{Duration, Instant};
 
     use super::{connector_request_context_for_execution, query_expire_duration};
-    use novarocks::common::admitted_query_context::{RequestAdmission, RequestContext};
-    use novarocks::common::backend_topology::BackendTopologySnapshot;
-    use novarocks::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
+    use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
+    use crate::common::backend_topology::BackendTopologySnapshot;
+    use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
     use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::ClusterRole;
 

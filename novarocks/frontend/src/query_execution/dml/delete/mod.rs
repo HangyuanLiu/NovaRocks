@@ -23,8 +23,8 @@ pub(crate) mod standard;
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
-use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 
 /// DELETE statements recognized by the frontend command router.

@@ -32,12 +32,12 @@ use novarocks_spi::connector::{
     ExternalMutationEvidence, ExternalMutationFinalization,
 };
 
+use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::connector::data_mutation::{
     CompletedDataMutation, DataMutationDispatchState, DataMutationIntent, DataMutationSession,
     KnownUncommittedDataMutation, ResolvedDataMutation,
 };
 use crate::query_execution::kernels::DmlExecutionKernel;
-use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_sql::planning::dml::classify_add_files;
 use novarocks_sql::syntax::ObjectName;

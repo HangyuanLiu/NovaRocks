@@ -28,7 +28,7 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
 use crate::mv::domain::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_of};
-use novarocks::runtime::query_result::{QueryResult, record_batch_to_chunk};
+use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_execution::exec::mv::aggregate_state::materialize_aggregate_result_chunks;
 use novarocks_sql::planning::mv::VisibleAggregateOutput;
@@ -722,7 +722,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
-    use novarocks::runtime::query_result::{QueryResultColumn, record_batch_to_chunk};
+    use crate::runtime::query_result::{QueryResultColumn, record_batch_to_chunk};
     use novarocks_catalog::schema::SqlType;
     use novarocks_execution::exec::mv::state_codec::encode_count_state;
     use novarocks_sql::plan_read::{ColumnId, OutputColumn};

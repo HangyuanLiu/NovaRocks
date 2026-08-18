@@ -150,7 +150,7 @@ fn lifecycle_convergence_debug_snapshot(
 }
 
 fn lifecycle_metric_map(
-    metrics: novarocks::service::query_lifecycle_metrics::FrontendQueryLifecycleMetricsSnapshot,
+    metrics: crate::metrics::FrontendQueryLifecycleMetricsSnapshot,
 ) -> BTreeMap<String, i64> {
     [
         ("active_attempts", metrics.active_attempts as i64),
@@ -579,7 +579,7 @@ impl FrontendReportServerHandle {
                         );
                         let app = Router::new()
                             .route_service(&grpc_path, AxumGrpcService::new(service))
-                            .route("/metrics", get(novarocks::service::handle_metrics))
+                            .route("/metrics", get(crate::metrics::handle_metrics))
                             .fallback(grpc_unimplemented_fallback);
                         let app = if lifecycle_convergence_debug_enabled() {
                             let debug_reader = Arc::clone(&convergence_reader);

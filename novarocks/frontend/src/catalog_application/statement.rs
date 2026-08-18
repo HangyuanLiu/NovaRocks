@@ -24,8 +24,8 @@
 use std::sync::Arc;
 
 use crate::catalog_application::query_catalog::drop_local_table_registration_if_exists;
+use crate::runtime::statement_result::StatementResult;
 use bytes::Bytes;
-use novarocks::runtime::statement_result::StatementResult;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::identifier::resolve_local_table_name;
 use novarocks_catalog::schema::SqlType;

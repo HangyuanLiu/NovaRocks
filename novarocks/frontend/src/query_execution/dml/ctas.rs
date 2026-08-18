@@ -44,8 +44,8 @@ use novarocks_spi::connector::{
     CreatePolicy, ExternalMutationEvidence,
 };
 
+use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
-use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2172,9 +2172,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use ::novarocks::common::backend_topology::BackendTopologySnapshot;
-    use ::novarocks::common::backend_topology::LiveBackendTarget;
-    use ::novarocks::common::query_cancellation::QueryCancellationSource;
+    use crate::common::backend_topology::BackendTopologySnapshot;
+    use crate::common::backend_topology::LiveBackendTarget;
+    use crate::common::query_cancellation::QueryCancellationSource;
     use bytes::Bytes;
     use novarocks_spi::connector::*;
     use novarocks_sql::compiler::SessionOptimizerSettings;

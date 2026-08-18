@@ -32,6 +32,7 @@ use crate::catalog_application::query_bindings::{
     QueryTableBindingStore,
 };
 use crate::catalog_application::query_catalog::QueryCatalogService;
+use crate::common::engine_error::EngineError;
 use crate::mv::domain::analysis::rebind::rewrite_select_sql_for_rebind;
 use crate::mv::domain::analysis::refresh_property::{
     RefreshFragmentProperty, TargetIdentity, derive_fragment_property, derive_imv_refresh_contract,
@@ -129,9 +130,8 @@ use crate::mv::domain::schema_validation::{
 };
 use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
 use crate::mv::domain::storage_observation::MvTargetCreationObservation;
+use crate::runtime::statement_result::StatementResult;
 use mv_schema::MvPartitionContract;
-use novarocks::common::engine_error::EngineError;
-use novarocks::runtime::statement_result::StatementResult;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
 use novarocks_spi::connector::MvStorageObservationPort;
 #[cfg(test)]

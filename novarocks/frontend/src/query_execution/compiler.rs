@@ -24,7 +24,7 @@ pub use crate::query_execution::post_compile::{
 };
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::{PreparedImmediateQuery, PreparedQueryCompletion, StatementResult};
-use ::novarocks::runtime::query_result::{QueryResult, build_string_query_result};
+use crate::runtime::query_result::{QueryResult, build_string_query_result};
 use novarocks_protocol::lifecycle::QueryOptions;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
@@ -123,7 +123,7 @@ pub(crate) trait DmlQueryExecutionKernel:
     fn query_execution(&self) -> &crate::query_execution::service::QueryExecutionService;
     fn capture_dml_fallback_execution(
         &self,
-    ) -> Result<::novarocks::common::admitted_query_context::QueryExecutionContext, String>;
+    ) -> Result<crate::common::admitted_query_context::QueryExecutionContext, String>;
 }
 
 impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
@@ -143,7 +143,7 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
 
     fn capture_dml_fallback_execution(
         &self,
-    ) -> Result<::novarocks::common::admitted_query_context::QueryExecutionContext, String> {
+    ) -> Result<crate::common::admitted_query_context::QueryExecutionContext, String> {
         Err("foreground DML requires an admitted query execution context".to_string())
     }
 }
@@ -168,7 +168,7 @@ impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
 
     fn capture_dml_fallback_execution(
         &self,
-    ) -> Result<::novarocks::common::admitted_query_context::QueryExecutionContext, String> {
+    ) -> Result<crate::common::admitted_query_context::QueryExecutionContext, String> {
         Err("MV activation requires an admitted query execution context".to_string())
     }
 }
@@ -976,7 +976,7 @@ impl TestQueryCompiler {
     pub fn prepare(
         &self,
         sql: &str,
-        context: &::novarocks::common::admitted_query_context::RequestContext,
+        context: &crate::common::admitted_query_context::RequestContext,
         query_opts: Option<QueryOptions>,
     ) -> Result<TestPreparedQueryOperation, String> {
         let connector_context = crate::connector::connector_request_context_for_query(
@@ -989,7 +989,7 @@ impl TestQueryCompiler {
     fn prepare_with_connector_context(
         &self,
         sql: &str,
-        request_context: &::novarocks::common::admitted_query_context::RequestContext,
+        request_context: &crate::common::admitted_query_context::RequestContext,
         query_opts: Option<QueryOptions>,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<TestPreparedQueryOperation, String> {
@@ -1153,7 +1153,7 @@ impl TestQueryCompiler {
         current_database: &str,
         query_opts: Option<QueryOptions>,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-        execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+        execution: &crate::common::admitted_query_context::QueryExecutionContext,
     ) -> Result<TestPreparedQueryOperation, String> {
         let query = prepare_explain_query_with_ports(
             &self.query,
@@ -1226,7 +1226,7 @@ fn is_query_sql(sql: &str) -> bool {
 fn test_request_context(
     current_catalog: Option<&str>,
     current_database: &str,
-) -> ::novarocks::common::admitted_query_context::RequestContext {
+) -> crate::common::admitted_query_context::RequestContext {
     test_request_context_with_role(
         current_catalog,
         current_database,
@@ -1239,12 +1239,12 @@ fn test_request_context_with_role(
     current_catalog: Option<&str>,
     current_database: &str,
     role: novarocks_types::ClusterRole,
-) -> ::novarocks::common::admitted_query_context::RequestContext {
-    use ::novarocks::common::admitted_query_context::{
+) -> crate::common::admitted_query_context::RequestContext {
+    use crate::common::admitted_query_context::{
         QueryExecutionContext, RequestContext, RequestSessionContext,
     };
-    use ::novarocks::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
-    use ::novarocks::common::query_cancellation::QueryCancellationSource;
+    use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
+    use crate::common::query_cancellation::QueryCancellationSource;
 
     let cancellation = QueryCancellationSource::new();
     RequestContext::new(
@@ -1353,7 +1353,7 @@ pub(crate) fn ensure_mainline_distributed_execution(
 }
 
 fn optimizer_settings_for_execution(
-    execution: Option<&::novarocks::common::admitted_query_context::QueryExecutionContext>,
+    execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
 ) -> novarocks_sql::compiler::SessionOptimizerSettings {
     let mut settings = execution
         .map(|execution| execution.optimizer_settings().clone())
@@ -1368,7 +1368,7 @@ fn optimizer_settings_for_execution(
 
 pub(crate) fn scan_preparation_options(
     settings: &novarocks_sql::compiler::SessionOptimizerSettings,
-    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
     let target_parallelism = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .or_else(|| {
@@ -1472,7 +1472,7 @@ pub(crate) fn prepare_query_as_iceberg_write(
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
-    execution: Option<&::novarocks::common::admitted_query_context::QueryExecutionContext>,
+    execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
 ) -> Result<PreparedDmlWriteAssembly, String> {
     // This public write helper is also used by non-session transaction executors,
     // so it owns an operation-scoped context when no request signal is available.
@@ -1505,7 +1505,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_context(
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
-    execution: Option<&::novarocks::common::admitted_query_context::QueryExecutionContext>,
+    execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: Option<crate::query_execution::contract::ConnectorWritePlanningTemplate>,
 ) -> Result<PreparedDmlWriteAssembly, String> {
@@ -1536,7 +1536,7 @@ pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_connector_context
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
-    execution: Option<&::novarocks::common::admitted_query_context::QueryExecutionContext>,
+    execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
 ) -> Result<PreparedDmlWriteAssembly, String> {
@@ -1571,7 +1571,7 @@ pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_query_local_overl
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
-    execution: Option<&::novarocks::common::admitted_query_context::QueryExecutionContext>,
+    execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
     scan_resolver: &dyn crate::query_execution::preparation::scan::ScanBindingResolver,
@@ -1607,7 +1607,7 @@ pub(crate) enum DistributedConnectorWrite {
 pub(crate) struct PreparedDmlWriteAssembly {
     encoding: NativeFragmentEncodingInput,
     query_options: Option<QueryOptions>,
-    execution: ::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: crate::common::admitted_query_context::QueryExecutionContext,
     query_execution: crate::query_execution::service::QueryExecutionService,
     connector_write: Option<DistributedConnectorWrite>,
 }
@@ -1616,7 +1616,7 @@ impl PreparedDmlWriteAssembly {
     fn new(
         encoding: NativeFragmentEncodingInput,
         query_options: Option<QueryOptions>,
-        execution: ::novarocks::common::admitted_query_context::QueryExecutionContext,
+        execution: crate::common::admitted_query_context::QueryExecutionContext,
         query_execution: crate::query_execution::service::QueryExecutionService,
         connector_write: Option<DistributedConnectorWrite>,
     ) -> Self {
@@ -1664,7 +1664,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
-    execution: Option<&::novarocks::common::admitted_query_context::QueryExecutionContext>,
+    execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: Option<DistributedConnectorWrite>,
     scan_resolver: Option<&dyn crate::query_execution::preparation::scan::ScanBindingResolver>,
@@ -1868,7 +1868,7 @@ pub(crate) fn observe_change_stream_write_build_for_test(
         });
     if observer.short_circuit_after_build {
         Some(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: ::novarocks::runtime::query_result::QueryResult::empty(),
+            query_result: crate::runtime::query_result::QueryResult::empty(),
             write_commit: None,
             write_abort: None,
             connector_completion: None,
@@ -1893,7 +1893,7 @@ pub(crate) struct PlannedIcebergChangeStreamWrite {
 /// the resulting writer/cohort map for application-owned operation fencing.
 pub(crate) fn prepare_dml_change_stream_write_with_execution(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
     plan: novarocks_sql::planning::dml::DmlChangeStreamPlan,
     query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -1924,7 +1924,7 @@ pub(crate) fn prepare_dml_change_stream_write_with_execution(
 /// sealed plan with the exact admitted bindings and connector write template.
 pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
     distributed_plan: novarocks_sql::plan_read::DistributedPlan,
     query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -1983,7 +1983,7 @@ fn prepare_distributed_write_request_with_execution(
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     query_options: Option<QueryOptions>,
-    _execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+    _execution: &crate::common::admitted_query_context::QueryExecutionContext,
     connector_write: Option<DistributedConnectorWrite>,
 ) -> Result<PreparedDistributedWriteRequest, String> {
     let Some(DistributedConnectorWrite::Begin(template)) = connector_write else {
@@ -2024,7 +2024,7 @@ pub(crate) enum BoundDistributedWriteBinding {
 
 pub(crate) fn bind_prepared_distributed_write_request(
     query_execution: &crate::query_execution::service::QueryExecutionService,
-    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
     prepared: PreparedDistributedWriteRequest,
 ) -> Result<BoundDistributedWriteBinding, String> {
     let cohort_id = prepared.write_cohort_id();
@@ -2107,7 +2107,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     mv_storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     query_opts: Option<QueryOptions>,
-    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
     intent: novarocks_sql::compiler::SqlCompileIntent,
     allow_mv_rewrite_candidates: bool,
 ) -> Result<
@@ -2219,7 +2219,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
     mv_repository: &dyn crate::mv::domain::repository::MvRepository,
     mv_storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
     level: novarocks_sql::compiler::ExplainLevel,
     logical: bool,
 ) -> Result<QueryResult, String> {
@@ -2298,7 +2298,7 @@ fn execute_distributed_result_with_execution(
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     query_options: Option<QueryOptions>,
-    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<QueryResult, String> {
     let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,
@@ -2320,7 +2320,7 @@ fn execute_distributed_write_with_execution(
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     query_options: Option<QueryOptions>,
-    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
     connector_write: Option<DistributedConnectorWrite>,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
@@ -2376,7 +2376,7 @@ fn execute_distributed_profile_with_execution(
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     query_options: Option<QueryOptions>,
-    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,

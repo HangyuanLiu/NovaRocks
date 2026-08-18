@@ -24,12 +24,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::connector::cleanup_maintenance::CleanupBatchExecution;
 use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use crate::connector::metadata_maintenance::MetadataMaintenanceIntent;
+use crate::maintenance::MaintenanceTarget;
 use crate::query_execution::maintenance::{
     HistoricalMaintenanceInspection, MaintenanceActionOutcome, MaintenanceActionRequest,
     MaintenanceAttemptCancellationSource, MaintenanceRequestContext, MaintenanceStatementResult,
     MaintenanceTargetRebind, OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
 };
-use novarocks::maintenance::MaintenanceTarget;
 use novarocks_failpoint::{
     CleanupFaultKind, claim_configured_cleanup_fault as claim_cleanup_fault,
 };

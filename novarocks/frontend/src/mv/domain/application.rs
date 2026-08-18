@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::mv::domain::repository::{
     CreateMvRepositoryRequest, MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvTarget,
 };
-use novarocks::runtime::query_result::QueryResult;
+use crate::runtime::query_result::QueryResult;
 use novarocks_sql::syntax::{
     CreateMaterializedViewStmt, IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy,
 };

@@ -25,12 +25,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ::novarocks::common::backend_topology::{
+use crate::common::backend_topology::{
     BackendQueryEvent, BackendQueryEventSink, BackendTopologyError, BackendTopologyMetricsSnapshot,
     BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, HeartbeatOutcome,
     LiveBackendTarget, publish_backend_topology_metrics,
 };
-use ::novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -1552,7 +1552,7 @@ fn invalid_state_store_request(
 mod tests {
     use std::net::SocketAddr;
 
-    use ::novarocks::common::backend_topology::{BackendTopologyPort, LiveBackendTarget};
+    use crate::common::backend_topology::{BackendTopologyPort, LiveBackendTarget};
 
     use super::{
         ClusterBackendOpenConfig, ClusterBackendService, DesiredBackendState,
