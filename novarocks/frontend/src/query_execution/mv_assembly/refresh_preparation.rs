@@ -424,9 +424,15 @@ fn prepare_managed_repartition_transition(
         connector_context,
     )?;
     let query = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&definition.select_sql)?,
-        current_catalog,
-        current_database,
+        &parse_mv_select_query(&definition.query_definition.raw_query_source)?,
+        Some(
+            definition
+                .query_definition
+                .resolution
+                .default_catalog
+                .as_str(),
+        ),
+        &definition.query_definition.resolution.default_database,
     );
     let provider = crate::catalog_application::query_materializer::build_catalog_service_provider(
         current_catalog,
@@ -600,7 +606,7 @@ fn prepare_frontend_first_refresh_write(
         );
     }
     let definition = load_iceberg_mv_definition_by_target(source.repository().as_ref(), &target)?;
-    let definition = rebind_mv_definition_before_refresh_derivation(
+    let (definition, refresh_query_source) = rebind_mv_definition_before_refresh_derivation(
         source.connector_control(),
         source.storage_observation(),
         &definition,
@@ -613,7 +619,7 @@ fn prepare_frontend_first_refresh_write(
         contract,
         attempt,
         definition.mv_id,
-        &definition.select_sql,
+        &refresh_query_source,
         base_table_object_ids,
     )?;
     if let Some(replacement) = partition_spec_replacement.clone() {
@@ -699,9 +705,15 @@ fn prepare_frontend_first_refresh_write(
             .collect::<Result<Vec<_>, _>>()?,
     );
     let query = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&definition.select_sql)?,
-        current_catalog,
-        current_database,
+        &parse_mv_select_query(&refresh_query_source)?,
+        Some(
+            definition
+                .query_definition
+                .resolution
+                .default_catalog
+                .as_str(),
+        ),
+        &definition.query_definition.resolution.default_database,
     );
     let expected_target_snapshot_id = match &contract.state_baseline {
         RefreshStateBaseline::SnapshotBacked {
@@ -798,7 +810,7 @@ fn prepare_frontend_first_refresh_write(
         let aggregate_layout_sql = if schema_contract.branch.is_some() {
             aggregate_query.to_string()
         } else {
-            definition.select_sql.clone()
+            refresh_query_source.clone()
         };
         let aggregate_layout = build_aggregate_layout_for_refresh_select_sql(
             source,
@@ -838,7 +850,7 @@ fn prepare_frontend_first_refresh_write(
     };
     let physical_sql =
         novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifactBuilder::try_new(
-            definition.select_sql.clone(),
+            refresh_query_source.clone(),
             sql_pin,
             current_catalog.map(str::to_string),
             current_database.to_string(),
@@ -1076,7 +1088,7 @@ fn prepare_frontend_incremental_write(
             })
             .collect::<Result<Vec<_>, _>>()?,
     );
-    let definition = rebind_mv_definition_before_refresh_derivation(
+    let (definition, refresh_query_source) = rebind_mv_definition_before_refresh_derivation(
         source.connector_control(),
         source.storage_observation(),
         &definition,
@@ -1086,9 +1098,15 @@ fn prepare_frontend_incremental_write(
         &connector_context,
     )?;
     let canonical_query = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&definition.select_sql)?,
-        current_catalog,
-        current_database,
+        &parse_mv_select_query(&refresh_query_source)?,
+        Some(
+            definition
+                .query_definition
+                .resolution
+                .default_catalog
+                .as_str(),
+        ),
+        &definition.query_definition.resolution.default_database,
     );
     let rewrite = build_neutral_refresh_rewrite_context(
         source.connector_control(),

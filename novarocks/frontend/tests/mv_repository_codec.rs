@@ -1,4 +1,7 @@
 use bytes::Bytes;
+use novarocks_frontend::common::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
+};
 use novarocks_frontend::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
@@ -228,7 +231,7 @@ fn mv_catalog_exposes_only_the_current_incompatible_base_identity_schemas() {
             .latest("mv.definition")
             .expect("definition schema")
             .id(),
-        3
+        4
     );
     assert_eq!(
         catalog.latest("mv.refresh").expect("refresh schema").id(),
@@ -239,6 +242,7 @@ fn mv_catalog_exposes_only_the_current_incompatible_base_identity_schemas() {
         2
     );
     assert!(catalog.entry("mv.definition", 2).is_err());
+    assert!(catalog.entry("mv.definition", 3).is_err());
     assert!(catalog.entry("mv.refresh", 4).is_err());
 }
 
@@ -355,7 +359,13 @@ fn refresh_v5_round_trips_frontend_owned_opaque_ledger_recovery_and_binary_base_
 fn definition_uses_frontend_private_avro_projection() {
     let definition = StoredMvDefinition {
         mv_id: 9,
-        select_sql: "SELECT 1".to_string(),
+        query_definition: PersistedQueryDefinition::new(
+            "SELECT 1",
+            PersistedQueryDialect::StarRocks,
+            "ice",
+            "sales",
+        )
+        .unwrap(),
         base_table_refs: Vec::new(),
         primary_key_columns: Vec::new(),
         storage_engine: "iceberg".to_string(),

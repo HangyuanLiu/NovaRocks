@@ -524,11 +524,20 @@ fn backoff_ms(config: &FrontendMvSchedulerConfig, attempt: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::persisted_query_definition::{
+        PersistedQueryDefinition, PersistedQueryDialect,
+    };
 
     fn definition(policy: StoredMvRefreshPolicy) -> StoredMvDefinition {
         StoredMvDefinition {
             mv_id: 7,
-            select_sql: "SELECT 1".to_string(),
+            query_definition: PersistedQueryDefinition::new(
+                "SELECT 1",
+                PersistedQueryDialect::StarRocks,
+                "iceberg",
+                "db",
+            )
+            .unwrap(),
             base_table_refs: vec!["iceberg.db.base".to_string()],
             primary_key_columns: Vec::new(),
             storage_engine: "iceberg".to_string(),

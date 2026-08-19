@@ -71,7 +71,7 @@ pub(crate) fn rebuild_mv_definition_from_lake(
         .and_then(|contract| contract.target.partition.clone());
 
     let create_request = CreateMvDefinitionRequest {
-        select_sql: descriptor.logical_sql.clone(),
+        query_definition: descriptor.query_definition.clone(),
         base_table_refs,
         // W1 descriptors carry no primary-key metadata; a rebuilt definition
         // is indistinguishable from one created without `PRIMARY KEY (...)`.
@@ -238,8 +238,11 @@ pub(crate) fn rebuild_one_lake_package_if_missing_with_repository(
     repository: &dyn crate::mv::domain::repository::MvRepository,
     package: &MvLakePackageObservation,
 ) -> Result<(), String> {
-    // Repository-hit check: skip MVs already recorded. The rebuilt target
-    // maps to (discovered.catalog, discovered.namespace, discovered.table).
+    let rebuilt = rebuild_mv_definition_from_lake(package)?;
+    // Repository-hit check: a lake package and a durable record for the same
+    // target must describe exactly the same immutable definition. Silently
+    // accepting a mismatch would let a restart reinterpret user SQL under a
+    // different frozen context.
     let existing = repository
         .find_by_target(&crate::mv::domain::model::MvTarget {
             catalog: Some(package.table.instance_id.as_str().to_string()),
@@ -247,11 +250,18 @@ pub(crate) fn rebuild_one_lake_package_if_missing_with_repository(
             name: package.table.table.to_string(),
         })
         .map_err(|e| format!("look up MV definition during lake rebuild failed: {e}"))?;
-    if existing.is_some() {
+    if let Some(existing) = existing {
+        if !stored_definition_matches_rebuilt_request(&existing, &rebuilt.create_request) {
+            return Err(format!(
+                "lake MV package definition conflicts with the existing repository definition for target {}.{}.{}",
+                package.table.instance_id.as_str(),
+                package.table.namespace,
+                package.table.table,
+            ));
+        }
         return Ok(());
     }
 
-    let rebuilt = rebuild_mv_definition_from_lake(package)?;
     let created_at_ms = rebuilt.create_request.created_at_ms;
     let dependencies =
         dependency_requests_from_descriptor(&package.descriptor.base_dependencies, created_at_ms)?;
@@ -274,6 +284,22 @@ pub(crate) fn rebuild_one_lake_package_if_missing_with_repository(
         )
         .map_err(|e| format!("stamp rebuilt iceberg MV refresh watermark failed: {e}"))?;
     Ok(())
+}
+
+fn stored_definition_matches_rebuilt_request(
+    stored: &crate::mv::domain::persistence::definition::StoredMvDefinition,
+    rebuilt: &CreateMvDefinitionRequest,
+) -> bool {
+    stored.query_definition == rebuilt.query_definition
+        && stored.base_table_refs == rebuilt.base_table_refs
+        && stored.primary_key_columns == rebuilt.primary_key_columns
+        && stored.storage_engine == rebuilt.storage_engine
+        && stored.target_catalog == rebuilt.target_catalog
+        && stored.target_namespace == rebuilt.target_namespace
+        && stored.target_table == rebuilt.target_table
+        && stored.schema_contract == rebuilt.schema_contract
+        && stored.partition_spec == rebuilt.partition_spec
+        && stored.created_at_ms == rebuilt.created_at_ms
 }
 
 /// Map the descriptor's `base_dependencies` back into the repository
@@ -324,7 +350,7 @@ fn parse_dependency_storage_engine(value: &str) -> Result<MvDependencyStorageEng
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::persistence::descriptor::{DescriptorDependency, MvDescriptorV1};
+    use crate::mv::domain::persistence::descriptor::{DescriptorDependency, MvDescriptorV2};
     use crate::mv::domain::persistence::schema::{
         BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
         HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
@@ -407,11 +433,17 @@ mod tests {
     }
 
     fn sample_package(publication: MvLakePublication) -> MvLakePackageObservation {
-        let mut descriptor = MvDescriptorV1 {
-            descriptor_version: 1,
+        let mut descriptor = MvDescriptorV2 {
+            descriptor_version: 2,
             package_id: "analytics.mv_orders".to_string(),
-            logical_sql: "SELECT id FROM ice.sales.orders".to_string(),
-            dialect: "starrocks".to_string(),
+            query_definition:
+                crate::common::persisted_query_definition::PersistedQueryDefinition::new(
+                    "SELECT id FROM ice.sales.orders",
+                    crate::common::persisted_query_definition::PersistedQueryDialect::StarRocks,
+                    "ice",
+                    "sales",
+                )
+                .expect("query definition"),
             visible_columns: vec!["id".to_string()],
             hidden_columns: vec!["__nova_base_row_id".to_string()],
             base_dependencies: vec![DescriptorDependency {
@@ -470,7 +502,10 @@ mod tests {
         let rebuilt = rebuild_mv_definition_from_lake(&package).expect("rebuild succeeds");
 
         let request = &rebuilt.create_request;
-        assert_eq!(request.select_sql, "SELECT id FROM ice.sales.orders");
+        assert_eq!(
+            request.query_definition.raw_query_source,
+            "SELECT id FROM ice.sales.orders"
+        );
         assert_eq!(
             request.base_table_refs,
             vec!["ice.sales.orders".to_string()]
@@ -518,7 +553,7 @@ mod tests {
         assert!(rebuilt.last_refresh_table_object_ids.is_empty());
         // The create request is still fully valid even with no refresh history.
         assert_eq!(
-            rebuilt.create_request.select_sql,
+            rebuilt.create_request.query_definition.raw_query_source,
             "SELECT id FROM ice.sales.orders"
         );
         assert!(rebuilt.create_request.schema_contract.is_some());

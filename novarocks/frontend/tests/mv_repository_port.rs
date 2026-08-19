@@ -17,6 +17,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use novarocks_frontend::common::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
+};
 use novarocks_frontend::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
@@ -56,7 +59,13 @@ fn provider_neutral_repository_preserves_create_refresh_partition_and_dependency
             Uuid::now_v7(),
             CreateMvRepositoryRequest {
                 definition: CreateMvDefinitionRequest {
-                    select_sql: "SELECT id FROM ice.sales.orders".to_string(),
+                    query_definition: PersistedQueryDefinition::new(
+                        "SELECT id FROM ice.sales.orders",
+                        PersistedQueryDialect::StarRocks,
+                        "ice",
+                        "sales",
+                    )
+                    .unwrap(),
                     base_table_refs: vec!["ice.sales.orders".to_string()],
                     primary_key_columns: vec!["id".to_string()],
                     storage_engine: "iceberg".to_string(),

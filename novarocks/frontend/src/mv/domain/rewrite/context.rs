@@ -937,6 +937,9 @@ fn arrow_type_from_contract_signature(type_signature: &str) -> Result<DataType, 
 pub(crate) mod tests_support {
     use std::sync::Arc;
 
+    use crate::common::persisted_query_definition::{
+        PersistedQueryDefinition, PersistedQueryDialect,
+    };
     use crate::mv::domain::persistence::definition::StoredMvDefinition;
     use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
     use mv_schema::{
@@ -1076,7 +1079,13 @@ pub(crate) mod tests_support {
     pub(crate) fn make_mv_definition() -> StoredMvDefinition {
         StoredMvDefinition {
             mv_id: 42,
-            select_sql: "SELECT k, v FROM ice.db.b".to_string(),
+            query_definition: PersistedQueryDefinition::new(
+                "SELECT k, v FROM ice.db.b",
+                PersistedQueryDialect::StarRocks,
+                "ice",
+                "db",
+            )
+            .unwrap(),
             base_table_refs: vec!["ice.db.b".to_string()],
             primary_key_columns: vec!["k".to_string()],
             storage_engine: "iceberg".to_string(),

@@ -66,7 +66,7 @@ fn freeze_mv_rewrite_definition(
 
     SqlMvRewriteDefinitionFacts::try_new(
         definition.mv_id,
-        definition.select_sql,
+        definition.query_definition.raw_query_source,
         definition.base_table_refs,
         definition.storage_engine,
         definition.target_catalog,

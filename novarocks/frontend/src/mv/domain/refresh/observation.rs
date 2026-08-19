@@ -116,9 +116,12 @@ pub(crate) fn rebind_mv_definition_before_refresh_derivation(
     target: &IcebergMvTarget,
     retained_target_observation: Option<&MvSchemaValidationObservation>,
     connector_context: &ConnectorRequestContext,
-) -> Result<StoredMvDefinition, String> {
+) -> Result<(StoredMvDefinition, String), String> {
     let Some(contract) = mv_definition.schema_contract.as_ref() else {
-        return Ok(mv_definition.clone());
+        return Ok((
+            mv_definition.clone(),
+            mv_definition.query_definition.raw_query_source.clone(),
+        ));
     };
     let caps = RefreshCapabilities::from_schema_contract(contract)?;
     let target_ref = TableIdentity {
@@ -152,13 +155,17 @@ pub(crate) fn rebind_mv_definition_before_refresh_derivation(
             };
             match validate_schema_contract(contract, &base_observation, target_observation) {
                 ContractDecision::Incompatible(error) => Err(error.to_string()),
-                ContractDecision::CompatibleSafe => Ok(mv_definition.clone()),
-                ContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
-                    let mut definition = mv_definition.clone();
-                    definition.select_sql =
-                        rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
-                    Ok(definition)
-                }
+                ContractDecision::CompatibleSafe => Ok((
+                    mv_definition.clone(),
+                    mv_definition.query_definition.raw_query_source.clone(),
+                )),
+                ContractDecision::CompatibleSafeWithRebind { rebound_columns } => Ok((
+                    mv_definition.clone(),
+                    rewrite_select_sql_for_rebind(
+                        &mv_definition.query_definition.raw_query_source,
+                        &rebound_columns,
+                    )?,
+                )),
             }
         }
         BaseSnapshotPolicy::JoinPairPartialInitialSkip => {
@@ -202,15 +209,22 @@ pub(crate) fn rebind_mv_definition_before_refresh_derivation(
             )
             .map_err(|error| error.to_string())?
             {
-                JoinContractDecision::CompatibleSafe => Ok(mv_definition.clone()),
-                JoinContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
-                    let mut definition = mv_definition.clone();
-                    definition.select_sql =
-                        rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
-                    Ok(definition)
-                }
+                JoinContractDecision::CompatibleSafe => Ok((
+                    mv_definition.clone(),
+                    mv_definition.query_definition.raw_query_source.clone(),
+                )),
+                JoinContractDecision::CompatibleSafeWithRebind { rebound_columns } => Ok((
+                    mv_definition.clone(),
+                    rewrite_select_sql_for_rebind(
+                        &mv_definition.query_definition.raw_query_source,
+                        &rebound_columns,
+                    )?,
+                )),
             }
         }
-        BaseSnapshotPolicy::AllBasesRequired => Ok(mv_definition.clone()),
+        BaseSnapshotPolicy::AllBasesRequired => Ok((
+            mv_definition.clone(),
+            mv_definition.query_definition.raw_query_source.clone(),
+        )),
     }
 }

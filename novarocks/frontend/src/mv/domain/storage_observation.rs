@@ -42,7 +42,7 @@ use novarocks_spi::connector::{
     MvSchemaValidationObservation as SpiSchemaValidationObservation, MvStorageObservationPort,
 };
 
-use crate::mv::domain::persistence::{descriptor::MvDescriptorV1, schema::MvPartitionContract};
+use crate::mv::domain::persistence::{descriptor::MvDescriptorV2, schema::MvPartitionContract};
 
 const MAX_MV_SCHEMA_VALIDATION_FIELDS: usize = 4_096;
 const MAX_MV_SCHEMA_VALIDATION_PARTITION_FIELDS: usize = 4_096;
@@ -396,14 +396,14 @@ pub(crate) enum MvSchemaValidationPartitionTransform {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MvLakePackageObservation {
     pub table: ConnectorTableIdentity,
-    pub descriptor: MvDescriptorV1,
+    pub descriptor: MvDescriptorV2,
     pub publication: MvLakePublication,
 }
 
 impl MvLakePackageObservation {
     pub fn try_new(
         table: ConnectorTableIdentity,
-        descriptor: MvDescriptorV1,
+        descriptor: MvDescriptorV2,
         publication: MvLakePublication,
     ) -> Result<Self, ConnectorError> {
         validate_table_identity(&table, "MV lake package")?;
@@ -999,7 +999,7 @@ fn lake_package_from_spi(
             content_hash.to_string(),
         );
     }
-    let descriptor = MvDescriptorV1::from_storage_properties(&properties).map_err(|error| {
+    let descriptor = MvDescriptorV2::from_storage_properties(&properties).map_err(|error| {
         ConnectorError::new(
             ConnectorErrorKind::CorruptData,
             format!("decode MV storage descriptor: {error}"),
@@ -1390,10 +1390,14 @@ fn validate_table_identity(
     Ok(())
 }
 
-fn validate_descriptor(descriptor: &MvDescriptorV1) -> Result<(), ConnectorError> {
+fn validate_descriptor(descriptor: &MvDescriptorV2) -> Result<(), ConnectorError> {
     require_non_empty(&descriptor.package_id, "MV descriptor package ID")?;
-    require_non_empty(&descriptor.logical_sql, "MV descriptor logical SQL")?;
-    require_non_empty(&descriptor.dialect, "MV descriptor dialect")?;
+    descriptor.query_definition.validate().map_err(|error| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("invalid MV descriptor query definition: {error}"),
+        )
+    })?;
     descriptor
         .to_canonical_json()
         .map_err(|err| ConnectorError::new(ConnectorErrorKind::CorruptData, err))?;
@@ -1593,7 +1597,7 @@ mod tests {
         MvTargetCreationObservation,
     };
     use crate::mv::domain::persistence::{
-        descriptor::MvDescriptorV1,
+        descriptor::MvDescriptorV2,
         schema::{MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract},
     };
 
@@ -1609,12 +1613,18 @@ mod tests {
         ConnectorTableObjectId::try_new(Bytes::from_static(bytes)).expect("bounded object ID")
     }
 
-    fn descriptor() -> MvDescriptorV1 {
-        MvDescriptorV1 {
-            descriptor_version: 1,
+    fn descriptor() -> MvDescriptorV2 {
+        MvDescriptorV2 {
+            descriptor_version: 2,
             package_id: "package-1".to_string(),
-            logical_sql: "select 1".to_string(),
-            dialect: "novarocks".to_string(),
+            query_definition:
+                crate::common::persisted_query_definition::PersistedQueryDefinition::new(
+                    "select 1",
+                    crate::common::persisted_query_definition::PersistedQueryDialect::StarRocks,
+                    "iceberg.rest",
+                    "db",
+                )
+                .unwrap(),
             visible_columns: vec!["c1".to_string()],
             hidden_columns: vec![],
             base_dependencies: vec![],

@@ -181,7 +181,7 @@ pub(crate) fn list_mv_rows_with_ports(
             last_refresh_time: mv.last_refresh_ms.map(|value| value.to_string()),
             last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
             base_tables: mv.base_table_refs.join(", "),
-            select_text: mv.select_sql.clone(),
+            select_text: mv.query_definition.raw_query_source.clone(),
             dependencies: dependency_display_for_mv_with_repository(repository, mv.mv_id)?,
             refresh_paused: mv.refresh_paused.to_string(),
             next_refresh_time: mv.next_refresh_after_ms.map(|value| value.to_string()),

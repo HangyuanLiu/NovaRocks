@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use novarocks_frontend::common::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
+};
 use novarocks_frontend::mv::FrontendMvService;
 use novarocks_frontend::mv::domain::application::{
     CreatedMvTarget, MvApplicationErrorKind, MvApplicationService, MvApplicationStatement,
@@ -385,7 +388,13 @@ fn target() -> MvTarget {
 fn create_request() -> CreateMvRepositoryRequest {
     CreateMvRepositoryRequest {
         definition: CreateMvDefinitionRequest {
-            select_sql: "SELECT 1".to_string(),
+            query_definition: PersistedQueryDefinition::new(
+                "SELECT 1",
+                PersistedQueryDialect::StarRocks,
+                "ice",
+                "db",
+            )
+            .unwrap(),
             base_table_refs: vec![],
             primary_key_columns: vec![],
             storage_engine: "iceberg".to_string(),
@@ -404,7 +413,13 @@ fn create_request() -> CreateMvRepositoryRequest {
 fn stored_definition() -> StoredMvDefinition {
     StoredMvDefinition {
         mv_id: 1,
-        select_sql: "SELECT 1".to_string(),
+        query_definition: PersistedQueryDefinition::new(
+            "SELECT 1",
+            PersistedQueryDialect::StarRocks,
+            "ice",
+            "db",
+        )
+        .unwrap(),
         base_table_refs: vec![],
         primary_key_columns: vec![],
         storage_engine: "iceberg".to_string(),

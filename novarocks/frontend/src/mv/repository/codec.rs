@@ -26,6 +26,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
+use crate::common::persisted_query_definition::PersistedQueryDefinition;
 use crate::mv::domain::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::mv::domain::persistence::schema::{MvPartitionContract, MvSchemaContract};
 
@@ -106,7 +107,7 @@ pub struct MvSequence {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct StoredMvDefinitionAvro {
     mv_id: i64,
-    select_sql: String,
+    query_definition: PersistedQueryDefinition,
     base_table_refs: Vec<String>,
     primary_key_columns: Vec<String>,
     storage_engine: String,
@@ -140,7 +141,7 @@ impl TryFrom<&StoredMvDefinition> for StoredMvDefinitionAvro {
     fn try_from(value: &StoredMvDefinition) -> Result<Self, Self::Error> {
         Ok(Self {
             mv_id: value.mv_id,
-            select_sql: value.select_sql.clone(),
+            query_definition: value.query_definition.clone(),
             base_table_refs: value.base_table_refs.clone(),
             primary_key_columns: value.primary_key_columns.clone(),
             storage_engine: value.storage_engine.clone(),
@@ -185,7 +186,7 @@ impl TryFrom<StoredMvDefinitionAvro> for StoredMvDefinition {
     fn try_from(value: StoredMvDefinitionAvro) -> Result<Self, Self::Error> {
         Ok(Self {
             mv_id: value.mv_id,
-            select_sql: value.select_sql,
+            query_definition: value.query_definition,
             base_table_refs: value.base_table_refs,
             primary_key_columns: value.primary_key_columns,
             storage_engine: value.storage_engine,
@@ -228,6 +229,10 @@ pub fn encode_definition(
     operation_id: Uuid,
     definition: &StoredMvDefinition,
 ) -> Result<Value, String> {
+    definition
+        .query_definition
+        .validate()
+        .map_err(|error| format!("invalid persisted MV query definition: {error}"))?;
     encode_record(
         MvRecordKind::Definition,
         operation_id,
@@ -240,9 +245,14 @@ pub fn decode_definition(
     value: &Value,
 ) -> Result<DecodedMvRecord<StoredMvDefinition>, String> {
     let decoded: DecodedMvRecord<StoredMvDefinitionAvro> = decode_record(key, value)?;
+    let value: StoredMvDefinition = decoded.value.try_into()?;
+    value
+        .query_definition
+        .validate()
+        .map_err(|error| format!("invalid persisted MV query definition: {error}"))?;
     Ok(DecodedMvRecord {
         operation_id: decoded.operation_id,
-        value: decoded.value.try_into()?,
+        value,
     })
 }
 
