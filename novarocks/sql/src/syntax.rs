@@ -8,19 +8,14 @@
 pub use super::parser::{normalize_for_raw_parse, parse_normalized_sql_raw};
 pub use crate::parser::ast::{
     AlterIcebergPartitionSpecStmt, AlterMaterializedViewAction, AlterMaterializedViewStmt,
-    ColumnAggregation, CreateCatalogStmt, CreateMaterializedViewStmt, CreateTableKind,
-    CreateTableStmt, DefaultLiteral, DeleteStmt, DropCatalogStmt, DropDatabaseStmt,
-    DropMaterializedViewStmt, DropTableStmt, IcebergPartitionFieldExpr, Literal,
+    ColumnAggregation, CreateMaterializedViewStmt, CreateTableKind, CreateTableStmt,
+    DefaultLiteral, DeleteStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr, Literal,
     MaterializedViewDistribution, MaterializedViewRefreshPolicy, MergeMatchedAction,
     MergeNotMatchedAction, MergeStmt, MergeWhenClause, MutationSource, ObjectName,
     RefreshMaterializedViewStmt, ShowMaterializedViewsStmt, TableColumnDef, TableKeyDesc,
     TableKeyKind, UpdateAssignment, UpdateStmt,
 };
-pub use crate::parser::ast::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
 pub use crate::parser::dialect::StarRocksDialect;
-pub use crate::parser::procedure::{
-    CallProcedureStmt, ProcedureArg, ProcedureArgMode, ProcedureArgValue,
-};
 
 pub use crate::parser::dialect::substitute_user_variables;
 
@@ -28,126 +23,6 @@ use sqlparser::parser::Parser;
 
 pub fn parse_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
     crate::parser::parse_sql_raw(sql)
-}
-
-/// Typed, closed materialized-view command admission surface.
-///
-/// This intentionally does not expose the parser's generic statement enum:
-/// consumers can handle only the five MV command forms supported by this
-/// contract.
-#[derive(Clone, Debug, PartialEq)]
-pub enum MvAdmittedStatement {
-    Create(CreateMaterializedViewStmt),
-    Drop(DropMaterializedViewStmt),
-    Alter(AlterMaterializedViewStmt),
-    Refresh(RefreshMaterializedViewStmt),
-    Show(ShowMaterializedViewsStmt),
-}
-
-/// Parse an MV command when the parser recognizes an MV statement form.
-///
-/// `Ok(None)` is a route miss: the input is not one of the materialized-view
-/// statement forms. Once the parser recognizes one of those forms, parse
-/// rejection remains an error instead of being converted into a route miss.
-// Design: ADR-0088 (docs/adr/ADR-0088-domain-owned-sql-error-contracts.md)
-pub fn parse_optional_mv_admitted_statement(
-    sql: &str,
-) -> Result<Option<MvAdmittedStatement>, String> {
-    let normalized = crate::parser::dialect::normalize_for_raw_parse(sql)?;
-    let dialect = crate::parser::dialect::StarRocksDialect;
-    let parser = Parser::new(&dialect)
-        .try_with_sql(&normalized)
-        .map_err(|error| error.to_string())?;
-    let recognized =
-        crate::parser::dialect::materialized_view::looks_like_create_materialized_view(&parser)
-            || crate::parser::dialect::materialized_view::looks_like_drop_materialized_view(
-                &parser,
-            )
-            || crate::parser::dialect::materialized_view::looks_like_refresh_materialized_view(
-                &parser,
-            )
-            || crate::parser::dialect::materialized_view::looks_like_show_materialized_views(
-                &parser,
-            )
-            || crate::parser::dialect::materialized_view::looks_like_alter_materialized_view(
-                &parser,
-            );
-    if !recognized {
-        return Ok(None);
-    }
-
-    parse_recognized_mv_admitted_statement(sql).map(Some)
-}
-
-pub fn parse_mv_admitted_statement(sql: &str) -> Result<MvAdmittedStatement, String> {
-    parse_optional_mv_admitted_statement(sql)?
-        .ok_or_else(|| "statement is not a materialized-view command".to_string())
-}
-
-fn parse_recognized_mv_admitted_statement(sql: &str) -> Result<MvAdmittedStatement, String> {
-    let mut statements = crate::parser::parse_sql(sql)?;
-    if statements.len() != 1 {
-        return Err("materialized-view command accepts exactly one statement".to_string());
-    }
-    match statements.pop().expect("one checked statement") {
-        crate::parser::ast::Statement::CreateMaterializedView(statement) => {
-            Ok(MvAdmittedStatement::Create(statement))
-        }
-        crate::parser::ast::Statement::DropMaterializedView(statement) => {
-            Ok(MvAdmittedStatement::Drop(statement))
-        }
-        crate::parser::ast::Statement::AlterMaterializedView(statement) => {
-            Ok(MvAdmittedStatement::Alter(statement))
-        }
-        crate::parser::ast::Statement::RefreshMaterializedView(statement) => {
-            Ok(MvAdmittedStatement::Refresh(statement))
-        }
-        crate::parser::ast::Statement::ShowMaterializedViews(statement) => {
-            Ok(MvAdmittedStatement::Show(statement))
-        }
-        _ => Err("statement is not a materialized-view command".to_string()),
-    }
-}
-
-/// Closed syntax accepted by the Frontend backend-membership command owner.
-/// Parser AST variants remain inside SQL; consumers receive only the immutable
-/// address and force facts needed to invoke their topology capability.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum BackendManagementCommand {
-    Add { address: String },
-    Drop { address: String, force: bool },
-    Show,
-}
-
-/// Parse one backend-management command without exposing the generic parser
-/// statement enum. Non-backend SQL and parser rejection remain a probe miss,
-/// while the historical multi-statement error remains fail-closed.
-pub fn parse_backend_management_command(
-    sql: &str,
-) -> Result<Option<BackendManagementCommand>, String> {
-    let normalized = crate::parser::dialect::normalize_for_raw_parse(sql)?;
-    let mut statements = match crate::parser::parse_sql(&normalized) {
-        Ok(statements) => statements,
-        Err(_) => return Ok(None),
-    };
-    if statements.len() != 1 {
-        return Err("backend command accepts exactly one statement".to_string());
-    }
-    match statements.pop().expect("one checked statement") {
-        crate::parser::ast::Statement::AddBackend(statement) => {
-            Ok(Some(BackendManagementCommand::Add {
-                address: statement.addr,
-            }))
-        }
-        crate::parser::ast::Statement::DropBackend(statement) => {
-            Ok(Some(BackendManagementCommand::Drop {
-                address: statement.addr,
-                force: statement.force,
-            }))
-        }
-        crate::parser::ast::Statement::ShowBackends(_) => Ok(Some(BackendManagementCommand::Show)),
-        _ => Ok(None),
-    }
 }
 
 /// Return every three-part table reference in one admitted SELECT statement.
@@ -162,10 +37,6 @@ pub fn three_part_table_ref_occurrences(
         return Err("three-part table reference extraction requires a SELECT query".to_string());
     };
     Ok(crate::parser::query_refs::extract_three_part_table_ref_occurrences(&query))
-}
-
-pub fn parse_call_procedure_sql(sql: &str) -> Result<CallProcedureStmt, String> {
-    crate::parser::procedure::parse_call_procedure_sql(sql)
 }
 
 pub fn extract_allow_throw_exception_hint(sql: &str) -> bool {
@@ -283,34 +154,8 @@ pub fn peek_word_eq(parser: &Parser<'_>, offset: usize, word: &str) -> bool {
     crate::parser::dialect::peek_word_eq(parser, offset, word)
 }
 
-pub fn looks_like_create_catalog(parser: &Parser<'_>) -> bool {
-    crate::parser::dialect::looks_like_create_catalog(parser)
-}
-
 pub fn looks_like_create_table(parser: &Parser<'_>) -> bool {
     crate::parser::dialect::looks_like_create_table(parser)
-}
-
-pub fn looks_like_create_database(parser: &Parser<'_>) -> bool {
-    crate::parser::dialect::looks_like_create_database(parser)
-}
-
-pub fn looks_like_drop_statement(parser: &Parser<'_>) -> bool {
-    crate::parser::dialect::looks_like_drop_statement(parser)
-}
-
-pub fn looks_like_call_procedure(sql: &str) -> bool {
-    crate::parser::procedure::looks_like_call_procedure(sql)
-}
-
-pub fn parse_create_database_name(parser: &mut Parser<'_>) -> Result<(ObjectName, bool), String> {
-    crate::parser::dialect::parse_create_database_name(parser)
-}
-
-pub fn parse_create_catalog_statement(
-    parser: &mut Parser<'_>,
-) -> Result<CreateCatalogStmt, String> {
-    crate::parser::dialect::create_catalog::parse_create_catalog_statement(parser)
 }
 
 pub fn parse_create_table_statement(parser: &mut Parser<'_>) -> Result<CreateTableStmt, String> {
@@ -336,45 +181,9 @@ pub fn parse_partition_field_expr(
     crate::parser::dialect::create_table::parse_partition_field_expr(parser)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DropStatement {
-    Table(DropTableStmt),
-    Database(DropDatabaseStmt),
-    Catalog(DropCatalogStmt),
-}
-
-pub fn parse_drop_statement(parser: &mut Parser<'_>) -> Result<DropStatement, String> {
-    match crate::parser::dialect::drop::parse_drop_statement(parser)? {
-        crate::parser::dialect::drop::DropResult::Table(statement) => {
-            Ok(DropStatement::Table(statement))
-        }
-        crate::parser::dialect::drop::DropResult::Database(statement) => {
-            Ok(DropStatement::Database(statement))
-        }
-        crate::parser::dialect::drop::DropResult::Catalog(statement) => {
-            Ok(DropStatement::Catalog(statement))
-        }
-    }
-}
-
-pub fn parse_alter_iceberg_ref(sql: &str) -> Result<Option<AlterIcebergRefStmt>, String> {
-    let mut statements = crate::parser::parse_sql(sql)?;
-    if statements.len() != 1 {
-        return Err("Iceberg ref command accepts exactly one statement".to_string());
-    }
-    match statements.pop().expect("one checked statement") {
-        crate::parser::ast::Statement::AlterIcebergRef(statement) => Ok(Some(statement)),
-        _ => Ok(None),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        BackendManagementCommand, MvAdmittedStatement, arrow_type_equals_ignoring_metadata,
-        parse_backend_management_command, parse_mv_admitted_statement,
-        parse_optional_mv_admitted_statement, sql_type_to_arrow_type,
-    };
+    use super::{arrow_type_equals_ignoring_metadata, sql_type_to_arrow_type};
 
     #[test]
     fn syntax_value_helpers_keep_sql_type_conversion_and_metadata_tolerant_shape_equality() {
@@ -393,77 +202,5 @@ mod tests {
             &DataType::Utf8,
             &DataType::Int64
         ));
-    }
-
-    #[test]
-    fn mv_admission_exposes_only_typed_mv_syntax() {
-        let statement = parse_mv_admitted_statement("REFRESH MATERIALIZED VIEW analytics.mv")
-            .expect("MV refresh should be admitted");
-        let MvAdmittedStatement::Refresh(statement) = statement else {
-            panic!("expected typed REFRESH MATERIALIZED VIEW statement");
-        };
-        assert_eq!(statement.name.parts, ["analytics", "mv"]);
-        assert!(!statement.full);
-    }
-
-    #[test]
-    fn mv_admission_rejects_non_mv_statement_without_exposing_parser_enum() {
-        let error = parse_mv_admitted_statement("SELECT 1")
-            .expect_err("non-MV syntax must not be admitted through the MV contract");
-        assert_eq!(error, "statement is not a materialized-view command");
-    }
-
-    #[test]
-    fn optional_mv_admission_distinguishes_route_misses_from_mv_parse_errors() {
-        assert_eq!(
-            parse_optional_mv_admitted_statement("SELECT 1").expect("non-MV probe"),
-            None
-        );
-
-        let statement =
-            parse_optional_mv_admitted_statement("REFRESH MATERIALIZED VIEW analytics.mv")
-                .expect("valid MV command")
-                .expect("MV command should be recognized");
-        assert!(matches!(statement, MvAdmittedStatement::Refresh(_)));
-
-        let error = parse_optional_mv_admitted_statement(
-            "CREATE MATERIALIZED VIEW mv \
-             DISTRIBUTED BY HASH(k1) BUCKETS 1 \
-             PRIMARY KEY () \
-             AS SELECT k1 FROM source_table",
-        )
-        .expect_err("recognized MV syntax must preserve its parser error");
-        assert_eq!(error, "PRIMARY KEY clause requires at least one column");
-    }
-
-    #[test]
-    fn backend_management_admission_exposes_only_closed_command_facts() {
-        assert_eq!(
-            parse_backend_management_command("ADD BACKEND '127.0.0.1:19070'")
-                .expect("parse ADD BACKEND"),
-            Some(BackendManagementCommand::Add {
-                address: "127.0.0.1:19070".to_string(),
-            })
-        );
-        assert_eq!(
-            parse_backend_management_command("DROP BACKEND '127.0.0.1:19070' FORCE")
-                .expect("parse DROP BACKEND"),
-            Some(BackendManagementCommand::Drop {
-                address: "127.0.0.1:19070".to_string(),
-                force: true,
-            })
-        );
-        assert_eq!(
-            parse_backend_management_command("SHOW BACKENDS").expect("parse SHOW BACKENDS"),
-            Some(BackendManagementCommand::Show)
-        );
-    }
-
-    #[test]
-    fn backend_management_admission_treats_other_sql_as_a_probe_miss() {
-        assert_eq!(
-            parse_backend_management_command("SELECT 1").expect("non-backend probe"),
-            None
-        );
     }
 }

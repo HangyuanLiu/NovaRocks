@@ -17,11 +17,6 @@
 
 use bytes::Bytes;
 use novarocks_frontend::dml::{DmlErrorKind, DmlOperationId};
-use novarocks_frontend::maintenance::MaintenanceTarget;
-use novarocks_frontend::query_execution::maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
-    MaintenanceTargetRebind, TableMaintenanceEngine,
-};
 use novarocks_frontend::view::repository::database_key;
 use novarocks_frontend::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
@@ -31,6 +26,7 @@ use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
     FrontendApplicationHost, FrontendExecutionConfig,
 };
+use novarocks_parser::parse as parse_typed_statement;
 use novarocks_spi::state_store::{CommitOutcome, Key, Precondition, TransactionId, Value};
 use novarocks_state_store::{
     OperationId, SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig,
@@ -83,48 +79,6 @@ fn fe_backend_config() -> ClusterBackendOpenConfig {
 }
 
 struct SessionViewEngine;
-
-struct SessionMaintenanceEngine;
-
-impl TableMaintenanceEngine for SessionMaintenanceEngine {
-    fn resolve_target(
-        &self,
-        _name_parts: &[String],
-        _context: MaintenanceRequestContext<'_>,
-    ) -> Result<MaintenanceTarget, String> {
-        unreachable!("ordinary SQL must not resolve a maintenance target")
-    }
-
-    fn capture_target_object_id(
-        &self,
-        _target: &MaintenanceTarget,
-    ) -> Result<novarocks_spi::connector::ConnectorTableObjectId, String> {
-        unreachable!("ordinary SQL must not capture a maintenance target")
-    }
-
-    fn rebind_target_object(
-        &self,
-        _target: &MaintenanceTarget,
-        _expected_object_id: &novarocks_spi::connector::ConnectorTableObjectId,
-    ) -> Result<MaintenanceTargetRebind, String> {
-        unreachable!("ordinary SQL must not rebind a maintenance target")
-    }
-
-    fn reject_user_action_on_mv(&self, _target: &MaintenanceTarget) -> Result<(), String> {
-        unreachable!("ordinary SQL must not run a maintenance MV guard")
-    }
-
-    fn current_snapshot_id(&self, _target: &MaintenanceTarget) -> Result<i64, String> {
-        unreachable!("ordinary SQL must not read a maintenance snapshot")
-    }
-
-    fn execute_action(
-        &self,
-        _request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, String> {
-        unreachable!("ordinary SQL must not execute a maintenance action")
-    }
-}
 
 impl ViewEngine for SessionViewEngine {
     fn resolve_external_view(
@@ -316,17 +270,8 @@ async fn absent_config_opens_disabled_host() {
     assert!(host.state_store().is_none());
     assert_eq!(host.state_store_provider_id(), None);
     assert!(
-        host.table_maintenance_service()
-            .try_handle_statement(
-                &SessionMaintenanceEngine,
-                "SELECT 1",
-                MaintenanceRequestContext {
-                    current_catalog: None,
-                    current_database: "db",
-                },
-            )
-            .expect("ordinary SQL must pass through the maintenance service")
-            .is_none()
+        parse_typed_statement("SELECT 1").is_err(),
+        "ordinary SQL must not be admitted as a typed maintenance statement"
     );
     let _query_execution = host.query_execution_service();
     let _backend_activity = host.backend_query_activity();

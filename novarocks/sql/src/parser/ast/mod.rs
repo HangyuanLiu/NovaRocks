@@ -22,18 +22,6 @@ pub use iceberg_ref::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor
 use novarocks_catalog::partition::LegacyRangePartition;
 use novarocks_catalog::schema::SqlType;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateCatalogStmt {
-    pub name: String,
-    pub properties: Vec<(String, String)>,
-    pub if_not_exists: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CreateDatabaseStmt {
-    pub name: ObjectName,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateTableStmt {
     pub name: ObjectName,
@@ -47,19 +35,6 @@ pub struct CreateTableStmt {
     /// For CTAS, the engine skips table creation and data write when the
     /// target table already exists.
     pub if_not_exists: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DropCatalogStmt {
-    pub name: String,
-    pub if_exists: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DropDatabaseStmt {
-    pub name: ObjectName,
-    pub if_exists: bool,
-    pub force: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -100,13 +75,6 @@ pub enum AlterIcebergPartitionSpecStmt {
         table: ObjectName,
         field: IcebergPartitionFieldExpr,
     },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DropTableStmt {
-    pub name: ObjectName,
-    pub if_exists: bool,
-    pub force: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,69 +154,6 @@ pub struct RefreshMaterializedViewStmt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShowMaterializedViewsStmt {
     pub database: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AddBackendStmt {
-    pub addr: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DropBackendStmt {
-    pub addr: String,
-    pub force: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ShowBackendsStmt;
-
-/// `ANALYZE TABLE <name> [(column, ...)]`.
-///
-/// This is deliberately a typed command rather than a preserved SQL string:
-/// the frontend statistics application receives the resolved statement and
-/// never needs to inspect SQL text a second time.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AnalyzeTableStmt {
-    pub name: ObjectName,
-    pub columns: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ShowAnalyzeJobsStmt;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CancelAnalyzeStmt {
-    pub job_id: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ShowTableStatsStmt {
-    pub name: ObjectName,
-}
-
-/// Top-level statement variants produced by the custom dialect `parse_sql`
-/// entry point. Phase 1 only covers materialized-view DDL; other statements
-/// still flow through the legacy `parse_sql_raw` path.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Statement {
-    CreateMaterializedView(CreateMaterializedViewStmt),
-    DropMaterializedView(DropMaterializedViewStmt),
-    AlterMaterializedView(AlterMaterializedViewStmt),
-    RefreshMaterializedView(RefreshMaterializedViewStmt),
-    ShowMaterializedViews(ShowMaterializedViewsStmt),
-    AlterIcebergRef(AlterIcebergRefStmt),
-    Truncate {
-        name: ObjectName,
-        /// `"main"` by default; branch name when the SQL uses `t.branch_<name>`.
-        target_ref: String,
-    },
-    AddBackend(AddBackendStmt),
-    DropBackend(DropBackendStmt),
-    ShowBackends(ShowBackendsStmt),
-    AnalyzeTable(AnalyzeTableStmt),
-    ShowAnalyzeJobs(ShowAnalyzeJobsStmt),
-    CancelAnalyze(CancelAnalyzeStmt),
-    ShowTableStats(ShowTableStatsStmt),
 }
 
 /// `DELETE FROM <table> WHERE <predicate>`. Phase 1 only supports iceberg

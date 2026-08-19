@@ -955,6 +955,73 @@ pub fn connector_partition_transform(
     }
 }
 
+/// Typed-AST counterpart to [`connector_partition_transform`]. It keeps the
+/// legacy partition grammar's single-column and positive-u32 constraints at
+/// the semantic lowering boundary, without a source-text round trip.
+pub(crate) fn connector_typed_partition_transform(
+    field: &novarocks_parser::ast::IcebergPartitionField,
+) -> Result<ConnectorPartitionTransform, String> {
+    use novarocks_parser::ast::IcebergPartitionField;
+
+    match field {
+        IcebergPartitionField::Identity { column, .. } => {
+            Ok(ConnectorPartitionTransform::Identity {
+                column: typed_partition_column(column)?,
+            })
+        }
+        IcebergPartitionField::Year { column, .. } => Ok(ConnectorPartitionTransform::Year {
+            column: typed_partition_column(column)?,
+        }),
+        IcebergPartitionField::Month { column, .. } => Ok(ConnectorPartitionTransform::Month {
+            column: typed_partition_column(column)?,
+        }),
+        IcebergPartitionField::Day { column, .. } => Ok(ConnectorPartitionTransform::Day {
+            column: typed_partition_column(column)?,
+        }),
+        IcebergPartitionField::Hour { column, .. } => Ok(ConnectorPartitionTransform::Hour {
+            column: typed_partition_column(column)?,
+        }),
+        IcebergPartitionField::Void { column, .. } => Ok(ConnectorPartitionTransform::Void {
+            column: typed_partition_column(column)?,
+        }),
+        IcebergPartitionField::Bucket {
+            column, buckets, ..
+        } => Ok(ConnectorPartitionTransform::Bucket {
+            column: typed_partition_column(column)?,
+            num_buckets: typed_positive_u32(buckets, "bucket count")?,
+        }),
+        IcebergPartitionField::Truncate { column, width, .. } => {
+            Ok(ConnectorPartitionTransform::Truncate {
+                column: typed_partition_column(column)?,
+                width: typed_positive_u32(width, "truncate width")?,
+            })
+        }
+    }
+}
+
+fn typed_partition_column(path: &novarocks_parser::ast::ColumnPath) -> Result<Arc<str>, String> {
+    let [column] = path.parts.as_slice() else {
+        return Err("partition transform requires a single column identifier".to_string());
+    };
+    Ok(Arc::from(normalize_identifier(&column.value)?))
+}
+
+fn typed_positive_u32(
+    literal: &novarocks_parser::ast::Literal,
+    label: &str,
+) -> Result<u32, String> {
+    let novarocks_parser::ast::LiteralKind::Number(value) = &literal.kind else {
+        return Err(format!("expected numeric {label}"));
+    };
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|error| format!("invalid {label} `{value}`: {error}"))?;
+    if parsed == 0 {
+        return Err(format!("{label} must be positive"));
+    }
+    Ok(parsed)
+}
+
 // Ownership: `ColumnPath` and `AddPosition` are this module's own parsed
 // schema-change AST types, so lowering them onto the connector SPI is catalog
 // statement work, not query assembly. These two join the sibling converters
@@ -1427,6 +1494,84 @@ pub(crate) enum PropertiesOp {
     Unset { keys: Vec<String>, if_exists: bool },
 }
 
+/// One typed partition-spec mutation after syntax has been lowered to the
+/// connector-owned representation. Table resolution remains with command
+/// execution, which owns the target catalog and mutation admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IcebergPartitionSpecChange {
+    Add(ConnectorPartitionTransform),
+    Drop(ConnectorPartitionTransform),
+}
+
+/// Lower typed Iceberg table-property syntax without reparsing SQL text.
+/// The legacy path admits string-valued user properties only, so typed
+/// literals retain that same semantic boundary here.
+pub(crate) fn lower_typed_iceberg_properties_action(
+    action: &novarocks_parser::ast::IcebergPropertiesAction,
+) -> Result<PropertiesOp, String> {
+    use novarocks_parser::ast::IcebergPropertiesAction;
+
+    match action {
+        IcebergPropertiesAction::Set { entries } => {
+            if entries.is_empty() {
+                return Err("SET TBLPROPERTIES requires at least one key=value pair".to_string());
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut lowered = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let key = entry.key.value.clone();
+                if !seen.insert(key.clone()) {
+                    return Err(format!("duplicate key '{key}' in SET TBLPROPERTIES"));
+                }
+                lowered.push((key, lower_typed_property_string(&entry.value)?));
+            }
+            Ok(PropertiesOp::Set { entries: lowered })
+        }
+        IcebergPropertiesAction::Unset { keys, if_exists } => {
+            if keys.is_empty() {
+                return Err("UNSET TBLPROPERTIES requires at least one key".to_string());
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut lowered = Vec::with_capacity(keys.len());
+            for key in keys {
+                let key = key.key.value.clone();
+                if !seen.insert(key.clone()) {
+                    return Err(format!("duplicate key '{key}' in UNSET TBLPROPERTIES"));
+                }
+                lowered.push(key);
+            }
+            Ok(PropertiesOp::Unset {
+                keys: lowered,
+                if_exists: *if_exists,
+            })
+        }
+        IcebergPropertiesAction::Comment { value } => Ok(PropertiesOp::Set {
+            entries: vec![("comment".to_string(), lower_typed_property_string(value)?)],
+        }),
+    }
+}
+
+/// Lower a typed partition change directly to the connector representation.
+pub(crate) fn lower_typed_iceberg_partition_change(
+    change: &novarocks_parser::ast::IcebergPartitionChange,
+) -> Result<IcebergPartitionSpecChange, String> {
+    match change {
+        novarocks_parser::ast::IcebergPartitionChange::Add { field } => Ok(
+            IcebergPartitionSpecChange::Add(connector_typed_partition_transform(field)?),
+        ),
+        novarocks_parser::ast::IcebergPartitionChange::Drop { field } => Ok(
+            IcebergPartitionSpecChange::Drop(connector_typed_partition_transform(field)?),
+        ),
+    }
+}
+
+fn lower_typed_property_string(literal: &novarocks_parser::ast::Literal) -> Result<String, String> {
+    let novarocks_parser::ast::LiteralKind::String(value) = &literal.kind else {
+        return Err("TBLPROPERTIES key/value must be a string literal".to_string());
+    };
+    Ok(value.clone())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ColumnPath {
     segments: Vec<String>,
@@ -1530,6 +1675,518 @@ pub(crate) enum IcebergSchemaChange {
     },
 }
 
+/// Lower one parser-owned Iceberg schema change into the existing catalog
+/// application DTO without reparsing SQL text. Catalog and provider checks
+/// deliberately remain at the caller's admission boundary.
+pub(crate) fn lower_typed_iceberg_schema_change(
+    change: &novarocks_parser::ast::IcebergSchemaChange,
+) -> Result<IcebergSchemaChange, String> {
+    use novarocks_parser::ast::{IcebergColumnAction, IcebergSchemaChange as Typed};
+
+    match change {
+        Typed::AddColumn {
+            path,
+            data_type,
+            nullable,
+            default,
+            position,
+        } => {
+            if matches!(nullable, Some(false)) {
+                return Err(
+                    "ADD COLUMN NOT NULL is not supported for Iceberg schema evolution".to_string(),
+                );
+            }
+            let (parent, name) = lower_typed_add_column_path(path)?;
+            let data_type = lower_typed_sql_type(data_type)?;
+            Ok(IcebergSchemaChange::AddColumn {
+                parent,
+                name,
+                data_type: data_type.clone(),
+                default: default
+                    .as_ref()
+                    .map(|literal| lower_typed_default_literal(literal, &data_type))
+                    .transpose()?,
+                position: lower_typed_add_position(position, true)?,
+            })
+        }
+        Typed::DropColumn { path } => Ok(IcebergSchemaChange::DropColumn {
+            path: lower_typed_column_path(path)?,
+        }),
+        Typed::RenameColumn { from, to } => {
+            let path = lower_typed_column_path(from)?;
+            let target = lower_typed_column_path(to)?;
+            if target.is_empty() {
+                return Err("RENAME COLUMN target requires an identifier".to_string());
+            }
+            let source_parent = path.parent();
+            let target_parent = target.parent();
+            if !target_parent.is_empty() && target_parent != source_parent {
+                return Err(
+                    "RENAME COLUMN target must share the same parent path as the source"
+                        .to_string(),
+                );
+            }
+            Ok(IcebergSchemaChange::RenameColumn {
+                path,
+                new_name: target
+                    .last()
+                    .expect("non-empty typed rename target checked above")
+                    .to_owned(),
+            })
+        }
+        Typed::ModifyColumn { path, data_type } => Ok(IcebergSchemaChange::ModifyColumn {
+            path: lower_typed_column_path(path)?,
+            new_type: lower_typed_sql_type(data_type)?,
+        }),
+        Typed::AlterColumn { path, action } => {
+            let path = lower_typed_column_path(path)?;
+            match action {
+                IcebergColumnAction::Reorder(position) => Ok(IcebergSchemaChange::Reorder {
+                    path,
+                    position: lower_typed_add_position(position, false)?,
+                }),
+                IcebergColumnAction::SetNullable(nullable) => {
+                    Ok(IcebergSchemaChange::SetNullable {
+                        path,
+                        nullable: *nullable,
+                    })
+                }
+                IcebergColumnAction::Comment(comment) => {
+                    let novarocks_parser::ast::LiteralKind::String(comment) = &comment.kind else {
+                        return Err("ALTER COLUMN COMMENT requires a string literal".to_string());
+                    };
+                    Ok(IcebergSchemaChange::UpdateComment {
+                        path,
+                        comment: comment.clone(),
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Lower a parser-owned syntax type directly to the catalog's semantic type.
+/// This is intentionally recursive so ARRAY/MAP/STRUCT never fall back to a
+/// SQL text round-trip.
+pub(crate) fn lower_typed_sql_type(
+    type_name: &novarocks_parser::ast::TypeName,
+) -> Result<SqlType, String> {
+    use novarocks_parser::ast::TypeNameArgument;
+
+    let name = type_name
+        .name
+        .parts
+        .last()
+        .ok_or_else(|| "type name is empty".to_string())?
+        .value
+        .to_ascii_lowercase();
+    if type_name.name.parts.len() != 1 {
+        return Err(format!("qualified type name `{name}` is not supported"));
+    }
+
+    match name.as_str() {
+        "array" => Ok(SqlType::Array(Box::new(lower_array_element_type(
+            type_name,
+        )?))),
+        "map" => {
+            let (key, value) = lower_map_types(type_name)?;
+            Ok(SqlType::Map(Box::new(key), Box::new(value)))
+        }
+        "struct" => Ok(SqlType::Struct(
+            type_name
+                .arguments
+                .iter()
+                .map(|argument| match argument {
+                    TypeNameArgument::Field(field) => Ok((
+                        field.name.value.clone(),
+                        lower_typed_sql_type(&field.data_type)?,
+                    )),
+                    _ => Err("STRUCT type requires named fields".to_string()),
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        )),
+        "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
+            let (precision, scale) = lower_decimal_arguments(type_name)?;
+            Ok(SqlType::Decimal { precision, scale })
+        }
+        "tinyint" | "int8" => Ok(SqlType::TinyInt),
+        "smallint" | "int16" => Ok(SqlType::SmallInt),
+        "int" | "integer" | "int32" => Ok(SqlType::Int),
+        "bigint" | "int64" => Ok(SqlType::BigInt),
+        "largeint" | "int128" => Ok(SqlType::LargeInt),
+        "float" | "float32" => Ok(SqlType::Float),
+        "double" | "float64" | "double precision" => Ok(SqlType::Double),
+        "boolean" | "bool" => Ok(SqlType::Boolean),
+        "string" | "varchar" | "char" | "character" | "text" => Ok(SqlType::String),
+        "date" => Ok(SqlType::Date),
+        "datetime" | "timestamp" => Ok(SqlType::DateTime),
+        "timestamp_ns" | "timestamptz_ns" | "datetime_ns" => Ok(SqlType::DateTimeNs),
+        "time" => Ok(SqlType::Time),
+        "binary" | "varbinary" => Ok(SqlType::Binary),
+        "json" | "jsonb" => Ok(SqlType::Json),
+        "bitmap" => Ok(SqlType::Bitmap),
+        "hll" => Ok(SqlType::Hll),
+        "variant" => Ok(SqlType::Variant),
+        _ => Err(format!("unsupported Iceberg schema type `{name}`")),
+    }
+}
+
+fn lower_typed_add_column_path(
+    path: &novarocks_parser::ast::ColumnPath,
+) -> Result<(ColumnPath, String), String> {
+    let mut path = lower_typed_column_path(path)?;
+    let name = path
+        .segments
+        .pop()
+        .ok_or_else(|| "ADD COLUMN requires a column path".to_string())?;
+    Ok((path, name))
+}
+
+fn lower_typed_column_path(path: &novarocks_parser::ast::ColumnPath) -> Result<ColumnPath, String> {
+    if path.parts.is_empty() {
+        return Err("column path is empty".to_string());
+    }
+    Ok(ColumnPath::from_segments(
+        path.parts.iter().map(|part| part.value.clone()).collect(),
+    ))
+}
+
+fn lower_typed_add_position(
+    position: &novarocks_parser::ast::ColumnPosition,
+    add_column: bool,
+) -> Result<AddPosition, String> {
+    use novarocks_parser::ast::ColumnPosition;
+
+    match position {
+        ColumnPosition::Default => Ok(AddPosition::Default),
+        ColumnPosition::First => Ok(AddPosition::First),
+        ColumnPosition::After(path) => {
+            Ok(AddPosition::After(lower_position_target(path, add_column)?))
+        }
+        ColumnPosition::Before(path) => Ok(AddPosition::Before(lower_position_target(
+            path, add_column,
+        )?)),
+    }
+}
+
+fn lower_position_target(
+    path: &novarocks_parser::ast::ColumnPath,
+    add_column: bool,
+) -> Result<String, String> {
+    let lowered = lower_typed_column_path(path)?;
+    if add_column && lowered.segments.len() != 1 {
+        return Err("ADD COLUMN position target must be a single column identifier".to_string());
+    }
+    lowered
+        .last()
+        .map(str::to_owned)
+        .ok_or_else(|| "column position target is empty".to_string())
+}
+
+fn lower_array_element_type(
+    type_name: &novarocks_parser::ast::TypeName,
+) -> Result<SqlType, String> {
+    use novarocks_parser::ast::TypeNameArgument;
+
+    let [TypeNameArgument::Type(element)] = type_name.arguments.as_slice() else {
+        return Err("ARRAY type requires one element type".to_string());
+    };
+    lower_typed_sql_type(element)
+}
+
+fn lower_map_types(
+    type_name: &novarocks_parser::ast::TypeName,
+) -> Result<(SqlType, SqlType), String> {
+    use novarocks_parser::ast::TypeNameArgument;
+
+    let [TypeNameArgument::Type(key), TypeNameArgument::Type(value)] =
+        type_name.arguments.as_slice()
+    else {
+        return Err("MAP type requires key and value types".to_string());
+    };
+    Ok((lower_typed_sql_type(key)?, lower_typed_sql_type(value)?))
+}
+
+fn lower_decimal_arguments(
+    type_name: &novarocks_parser::ast::TypeName,
+) -> Result<(u8, i8), String> {
+    use novarocks_parser::ast::{LiteralKind, TypeNameArgument};
+
+    if type_name.arguments.len() > 2 {
+        return Err("DECIMAL type accepts at most precision and scale".to_string());
+    }
+    let mut values = type_name.arguments.iter().map(|argument| match argument {
+        TypeNameArgument::Literal(literal) => match &literal.kind {
+            LiteralKind::Number(value) => Ok(value.as_str()),
+            _ => Err("DECIMAL precision and scale must be numeric literals".to_string()),
+        },
+        _ => Err("DECIMAL precision and scale must be numeric literals".to_string()),
+    });
+    let precision = match values.next() {
+        Some(value) => value?
+            .parse::<u8>()
+            .map_err(|_| "DECIMAL precision must fit u8".to_string())?,
+        None => 38,
+    };
+    let scale = match values.next() {
+        Some(value) => value?
+            .parse::<i8>()
+            .map_err(|_| "DECIMAL scale must fit i8".to_string())?,
+        None => 0,
+    };
+    Ok((precision, scale))
+}
+
+fn lower_typed_default_literal(
+    literal: &novarocks_parser::ast::Literal,
+    data_type: &SqlType,
+) -> Result<DefaultLiteral, String> {
+    use novarocks_parser::ast::LiteralKind;
+
+    let lowered = match &literal.kind {
+        LiteralKind::Null => DefaultLiteral::Null,
+        LiteralKind::Boolean(value) => DefaultLiteral::Bool(*value),
+        LiteralKind::Number(value) => lower_typed_numeric_default(value, data_type)?,
+        LiteralKind::String(value) => lower_typed_string_default(value, data_type)?,
+        LiteralKind::HexString(value) => {
+            if !matches!(data_type, SqlType::Binary) {
+                return Err(format!(
+                    "hex DEFAULT not supported for column type {data_type:?}"
+                ));
+            }
+            let digits = value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+                .unwrap_or(value);
+            DefaultLiteral::Binary(
+                hex::decode(digits)
+                    .map_err(|error| format!("invalid hex DEFAULT literal `{value}`: {error}"))?,
+            )
+        }
+    };
+
+    validate_typed_default_literal(&lowered, data_type)?;
+    Ok(lowered)
+}
+
+fn lower_typed_numeric_default(text: &str, data_type: &SqlType) -> Result<DefaultLiteral, String> {
+    match data_type {
+        SqlType::TinyInt | SqlType::SmallInt | SqlType::Int | SqlType::BigInt => {
+            let value = text
+                .parse::<i64>()
+                .map_err(|error| format!("invalid integer DEFAULT `{text}`: {error}"))?;
+            Ok(DefaultLiteral::Int(value))
+        }
+        SqlType::Float | SqlType::Double => {
+            let value = text
+                .parse::<f64>()
+                .map_err(|error| format!("invalid float DEFAULT `{text}`: {error}"))?;
+            Ok(DefaultLiteral::Float(value))
+        }
+        SqlType::Decimal { scale, .. } => {
+            let (unscaled, literal_scale) = typed_decimal_from_str(text)?;
+            if literal_scale != *scale {
+                return Err(format!(
+                    "DEFAULT value scale {literal_scale} does not match column scale {scale}"
+                ));
+            }
+            Ok(DefaultLiteral::Decimal {
+                unscaled,
+                scale: *scale,
+            })
+        }
+        other => Err(format!(
+            "numeric DEFAULT not supported for column type {other:?}"
+        )),
+    }
+}
+
+fn lower_typed_string_default(value: &str, data_type: &SqlType) -> Result<DefaultLiteral, String> {
+    match data_type {
+        SqlType::String => Ok(DefaultLiteral::String(value.to_string())),
+        SqlType::TinyInt
+        | SqlType::SmallInt
+        | SqlType::Int
+        | SqlType::BigInt
+        | SqlType::Float
+        | SqlType::Double
+        | SqlType::Decimal { .. } => lower_typed_numeric_default(value.trim(), data_type),
+        SqlType::Boolean => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => Ok(DefaultLiteral::Bool(true)),
+            "false" | "0" => Ok(DefaultLiteral::Bool(false)),
+            other => Err(format!(
+                "invalid boolean DEFAULT `{other}` (expected true/false/0/1)"
+            )),
+        },
+        SqlType::Json => {
+            serde_json::from_str::<serde_json::Value>(value)
+                .map_err(|error| format!("invalid JSON DEFAULT literal: {error}"))?;
+            Ok(DefaultLiteral::String(value.to_string()))
+        }
+        SqlType::Date => Ok(DefaultLiteral::Date(
+            novarocks_sql::syntax::parse_date_string_to_days(value)?,
+        )),
+        SqlType::DateTime => Ok(DefaultLiteral::DateTime(
+            novarocks_sql::syntax::parse_datetime_string_to_micros(value)?,
+        )),
+        SqlType::DateTimeNs => Ok(DefaultLiteral::DateTime(typed_datetime_string_to_nanos(
+            value,
+        )?)),
+        SqlType::Binary | SqlType::Bitmap | SqlType::Hll => {
+            Ok(DefaultLiteral::Binary(value.as_bytes().to_vec()))
+        }
+        SqlType::Array(_) => {
+            let json: serde_json::Value = serde_json::from_str(value)
+                .map_err(|error| format!("invalid ARRAY DEFAULT literal: {error}"))?;
+            if !json.is_array() {
+                return Err(format!(
+                    "ARRAY DEFAULT must be a JSON array literal (e.g. '[]'), got: {value:?}"
+                ));
+            }
+            Ok(DefaultLiteral::String(value.to_string()))
+        }
+        SqlType::Map(_, _) => {
+            let json: serde_json::Value = serde_json::from_str(value)
+                .map_err(|error| format!("invalid MAP DEFAULT literal: {error}"))?;
+            if !json.is_object() {
+                return Err(format!(
+                    "MAP DEFAULT must be a JSON object literal (e.g. '{{}}'), got: {value:?}"
+                ));
+            }
+            Ok(DefaultLiteral::String(value.to_string()))
+        }
+        other => Err(format!(
+            "string DEFAULT not supported for column type {other:?}"
+        )),
+    }
+}
+
+fn validate_typed_default_literal(
+    literal: &DefaultLiteral,
+    data_type: &SqlType,
+) -> Result<(), String> {
+    if matches!(literal, DefaultLiteral::Null) {
+        return Ok(());
+    }
+    if let DefaultLiteral::Decimal { scale, .. } = literal
+        && *scale < 0
+    {
+        return Err(format!("negative DECIMAL scale {scale} is not supported"));
+    }
+    if let SqlType::Decimal { scale, .. } = data_type
+        && *scale < 0
+    {
+        return Err(format!("negative DECIMAL scale {scale} is not supported"));
+    }
+
+    match (literal, data_type) {
+        (DefaultLiteral::String(value), SqlType::Array(_)) => {
+            let elements = serde_json::from_str::<serde_json::Value>(value)
+                .map_err(|error| format!("invalid ARRAY DEFAULT JSON: {error}"))?
+                .as_array()
+                .ok_or_else(|| format!("ARRAY DEFAULT must be a JSON array, got: {value:?}"))?
+                .clone();
+            if !elements.is_empty() {
+                return Err(
+                    "non-empty ARRAY DEFAULT literals are not yet supported; use '[]'".to_string(),
+                );
+            }
+        }
+        (DefaultLiteral::String(value), SqlType::Map(_, _)) => {
+            let entries = serde_json::from_str::<serde_json::Value>(value)
+                .map_err(|error| format!("invalid MAP DEFAULT JSON: {error}"))?
+                .as_object()
+                .ok_or_else(|| format!("MAP DEFAULT must be a JSON object, got: {value:?}"))?
+                .clone();
+            if !entries.is_empty() {
+                return Err(
+                    "non-empty MAP DEFAULT literals are not yet supported; use '{}'".to_string(),
+                );
+            }
+        }
+        (DefaultLiteral::Bool(_), SqlType::Boolean)
+        | (DefaultLiteral::Int(_), SqlType::BigInt)
+        | (DefaultLiteral::Float(_), SqlType::Float | SqlType::Double)
+        | (DefaultLiteral::String(_), SqlType::String | SqlType::Json)
+        | (DefaultLiteral::Binary(_), SqlType::Binary | SqlType::Bitmap | SqlType::Hll)
+        | (DefaultLiteral::Date(_), SqlType::Date)
+        | (DefaultLiteral::DateTime(_), SqlType::DateTime | SqlType::DateTimeNs) => {}
+        (DefaultLiteral::Int(value), SqlType::TinyInt) => {
+            i8::try_from(*value).map_err(|_| default_out_of_range("TINYINT", *value))?;
+        }
+        (DefaultLiteral::Int(value), SqlType::SmallInt) => {
+            i16::try_from(*value).map_err(|_| default_out_of_range("SMALLINT", *value))?;
+        }
+        (DefaultLiteral::Int(value), SqlType::Int) => {
+            i32::try_from(*value).map_err(|_| default_out_of_range("INT", *value))?;
+        }
+        (
+            DefaultLiteral::Decimal { scale, .. },
+            SqlType::Decimal {
+                scale: column_scale,
+                ..
+            },
+        ) if scale == column_scale => {}
+        (
+            DefaultLiteral::Decimal { scale, .. },
+            SqlType::Decimal {
+                scale: column_scale,
+                ..
+            },
+        ) => {
+            return Err(format!(
+                "DEFAULT value scale {scale} does not match column scale {column_scale}"
+            ));
+        }
+        (literal, column_type) => {
+            return Err(format!(
+                "DEFAULT value type does not match column type: literal={literal:?} column={column_type:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn typed_decimal_from_str(text: &str) -> Result<(i128, i8), String> {
+    let trimmed = text.trim();
+    let (sign, body) = if let Some(rest) = trimmed.strip_prefix('-') {
+        (-1_i128, rest)
+    } else {
+        (1_i128, trimmed)
+    };
+    let (whole, fraction) = match body.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (body, ""),
+    };
+    let combined: String = whole.chars().chain(fraction.chars()).collect();
+    let unscaled = combined
+        .parse::<i128>()
+        .map_err(|error| format!("invalid decimal DEFAULT `{text}`: {error}"))?;
+    let scale = i8::try_from(fraction.len()).map_err(|_| "decimal scale too large".to_string())?;
+    Ok((sign * unscaled, scale))
+}
+
+fn typed_datetime_string_to_nanos(value: &str) -> Result<i64, String> {
+    use chrono::{NaiveDate, NaiveDateTime};
+
+    let value = value.trim();
+    let date_time = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f"))
+        .or_else(|_| {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .map(|date| date.and_hms_opt(0, 0, 0).expect("midnight"))
+        })
+        .map_err(|_| format!("invalid datetime literal `{value}`"))?;
+    date_time
+        .and_utc()
+        .timestamp_nanos_opt()
+        .ok_or_else(|| format!("DATETIME literal '{value}' out of nanosecond representable range"))
+}
+
+fn default_out_of_range(type_name: &str, value: i64) -> String {
+    format!("DEFAULT value {value} out of range for {type_name}")
+}
+
 /// Detect `SHOW CREATE TABLE <name>` statements so the server layer can
 /// route them to the engine instead of treating them as session noops.
 pub(crate) fn looks_like_show_create_table(sql: &str) -> bool {
@@ -1582,508 +2239,6 @@ pub fn looks_like_show_alter_table_optimize(sql: &str) -> bool {
         && parser.parse_keyword(Keyword::ALTER)
         && parser.parse_keyword(Keyword::TABLE)
         && peek_token_word_eq(&parser, "OPTIMIZE")
-}
-
-pub(crate) fn looks_like_alter_iceberg_schema(sql: &str) -> bool {
-    let Ok(normalized) = novarocks_sql::syntax::normalize_for_raw_parse(sql) else {
-        return false;
-    };
-    let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
-        return false;
-    };
-
-    if !parser.parse_keyword(Keyword::ALTER) || !parser.parse_keyword(Keyword::TABLE) {
-        return false;
-    }
-    if parser.parse_object_name(false).is_err() {
-        return false;
-    }
-
-    if parser.parse_keyword(Keyword::ADD) {
-        return parser.parse_keyword(Keyword::COLUMN);
-    }
-    if parser.parse_keyword(Keyword::DROP) {
-        return parser.parse_keyword(Keyword::COLUMN);
-    }
-    if parser.parse_keyword(Keyword::RENAME) {
-        return parser.parse_keyword(Keyword::COLUMN);
-    }
-    if novarocks_sql::syntax::peek_word_eq(&parser, 0, "MODIFY") {
-        parser.next_token();
-        return parser.parse_keyword(Keyword::COLUMN);
-    }
-    if parser.parse_keyword(Keyword::ALTER) {
-        return parser.parse_keyword(Keyword::COLUMN);
-    }
-    false
-}
-
-pub(crate) fn looks_like_alter_iceberg_properties(sql: &str) -> bool {
-    let Ok(normalized) = novarocks_sql::syntax::normalize_for_raw_parse(sql) else {
-        return false;
-    };
-    let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
-        return false;
-    };
-    if !parser.parse_keyword(Keyword::ALTER) || !parser.parse_keyword(Keyword::TABLE) {
-        return false;
-    }
-    if parser.parse_object_name(false).is_err() {
-        return false;
-    }
-    // Use peek_word_eq for both SET and UNSET so no tokens are consumed before the check.
-    if novarocks_sql::syntax::peek_word_eq(&parser, 0, "SET") {
-        if novarocks_sql::syntax::peek_word_eq(&parser, 1, "TBLPROPERTIES") {
-            return true;
-        }
-        parser.next_token();
-        if parser.peek_token_ref().token == Token::LParen {
-            return true;
-        }
-    }
-    if novarocks_sql::syntax::peek_word_eq(&parser, 0, "UNSET")
-        && novarocks_sql::syntax::peek_word_eq(&parser, 1, "TBLPROPERTIES")
-    {
-        return true;
-    }
-    // ALTER TABLE t COMMENT 'x'  — set the table-level comment property.
-    if parser.parse_keyword(Keyword::COMMENT) {
-        return true;
-    }
-    false
-}
-
-pub(crate) fn parse_alter_iceberg_properties_sql(
-    sql: &str,
-) -> Result<AlterIcebergPropertiesStmt, String> {
-    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
-    let mut parser = Parser::new(&StarRocksDialect)
-        .try_with_sql(&normalized)
-        .map_err(|e| format!("parse ALTER TABLE TBLPROPERTIES DDL: {e}"))?;
-
-    parser
-        .expect_keyword(Keyword::ALTER)
-        .map_err(|e| e.to_string())?;
-    parser
-        .expect_keyword(Keyword::TABLE)
-        .map_err(|e| e.to_string())?;
-    let table = novarocks_sql::syntax::convert_object_name(
-        parser.parse_object_name(false).map_err(|e| e.to_string())?,
-    )?;
-
-    let op = if parser.parse_keyword(Keyword::SET) {
-        if novarocks_sql::syntax::peek_word_eq(&parser, 0, "TBLPROPERTIES") {
-            parser.next_token(); // consume TBLPROPERTIES
-        } else if parser.peek_token_ref().token != Token::LParen {
-            return Err("expected TBLPROPERTIES or property list after SET".to_string());
-        }
-        let entries = parse_property_entries(&mut parser)?;
-        PropertiesOp::Set { entries }
-    } else if parser.parse_keyword(Keyword::UNSET) {
-        if !novarocks_sql::syntax::peek_word_eq(&parser, 0, "TBLPROPERTIES") {
-            return Err("expected TBLPROPERTIES after UNSET".to_string());
-        }
-        parser.next_token(); // consume TBLPROPERTIES
-        let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
-        let keys = parse_property_keys(&mut parser)?;
-        PropertiesOp::Unset { keys, if_exists }
-    } else if parser.parse_keyword(Keyword::COMMENT) {
-        // ALTER TABLE t COMMENT 'x' — shorthand for setting the "comment" property.
-        let comment = parser
-            .parse_literal_string()
-            .map_err(|e| format!("COMMENT expects a string literal: {e}"))?;
-        PropertiesOp::Set {
-            entries: vec![("comment".to_string(), comment)],
-        }
-    } else {
-        return Err("expected SET or UNSET TBLPROPERTIES".to_string());
-    };
-
-    if parser.peek_token_ref().token == Token::SemiColon {
-        parser.next_token();
-    }
-    if parser.peek_token_ref().token != Token::EOF {
-        return Err(format!(
-            "unsupported trailing tokens at {}",
-            parser.peek_token_ref().token
-        ));
-    }
-    Ok(AlterIcebergPropertiesStmt { table, op })
-}
-
-fn parse_property_entries(parser: &mut Parser<'_>) -> Result<Vec<(String, String)>, String> {
-    parser
-        .expect_token(&Token::LParen)
-        .map_err(|e| e.to_string())?;
-    if parser.peek_token_ref().token == Token::RParen {
-        parser.next_token();
-        return Err("SET TBLPROPERTIES requires at least one key=value pair".to_string());
-    }
-    let mut entries = Vec::new();
-    let mut seen = std::collections::HashSet::<String>::new();
-    loop {
-        let key = parse_string_literal(parser)?;
-        parser.expect_token(&Token::Eq).map_err(|e| e.to_string())?;
-        let value = parse_string_literal(parser)?;
-        if !seen.insert(key.clone()) {
-            return Err(format!("duplicate key '{key}' in SET TBLPROPERTIES"));
-        }
-        entries.push((key, value));
-        if parser.consume_token(&Token::Comma) {
-            continue;
-        }
-        break;
-    }
-    parser
-        .expect_token(&Token::RParen)
-        .map_err(|e| e.to_string())?;
-    Ok(entries)
-}
-
-fn parse_property_keys(parser: &mut Parser<'_>) -> Result<Vec<String>, String> {
-    parser
-        .expect_token(&Token::LParen)
-        .map_err(|e| e.to_string())?;
-    if parser.peek_token_ref().token == Token::RParen {
-        parser.next_token();
-        return Err("UNSET TBLPROPERTIES requires at least one key".to_string());
-    }
-    let mut keys = Vec::new();
-    let mut seen = std::collections::HashSet::<String>::new();
-    loop {
-        let key = parse_string_literal(parser)?;
-        if !seen.insert(key.clone()) {
-            return Err(format!("duplicate key '{key}' in UNSET TBLPROPERTIES"));
-        }
-        keys.push(key);
-        if parser.consume_token(&Token::Comma) {
-            continue;
-        }
-        break;
-    }
-    parser
-        .expect_token(&Token::RParen)
-        .map_err(|e| e.to_string())?;
-    Ok(keys)
-}
-
-fn parse_string_literal(parser: &mut Parser<'_>) -> Result<String, String> {
-    let tok = parser.next_token();
-    match tok.token {
-        Token::SingleQuotedString(s) => Ok(s),
-        Token::DoubleQuotedString(s) => Ok(s),
-        other => Err(format!(
-            "TBLPROPERTIES key/value must be a string literal, got `{other}`"
-        )),
-    }
-}
-
-fn parse_column_path(parser: &mut Parser<'_>) -> Result<ColumnPath, String> {
-    let mut segments = Vec::new();
-    loop {
-        let id = parser.parse_identifier().map_err(|e| e.to_string())?.value;
-        segments.push(id);
-        if parser.consume_token(&Token::Period) {
-            continue;
-        }
-        break;
-    }
-    Ok(ColumnPath::from_segments(segments))
-}
-
-pub(crate) fn parse_alter_iceberg_schema_sql(sql: &str) -> Result<AlterIcebergSchemaStmt, String> {
-    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
-    let mut parser = Parser::new(&StarRocksDialect)
-        .try_with_sql(&normalized)
-        .map_err(|e| format!("parse ALTER TABLE schema DDL: {e}"))?;
-
-    parser
-        .expect_keyword(Keyword::ALTER)
-        .map_err(|e| e.to_string())?;
-    parser
-        .expect_keyword(Keyword::TABLE)
-        .map_err(|e| e.to_string())?;
-    let table = novarocks_sql::syntax::convert_object_name(
-        parser.parse_object_name(false).map_err(|e| e.to_string())?,
-    )?;
-
-    let change = if parser.parse_keywords(&[Keyword::ADD, Keyword::COLUMN]) {
-        parse_add_column_change(&mut parser)?
-    } else if parser.parse_keywords(&[Keyword::DROP, Keyword::COLUMN]) {
-        let path = parse_column_path(&mut parser)?;
-        if path.is_empty() {
-            return Err("DROP COLUMN requires a column path".to_string());
-        }
-        IcebergSchemaChange::DropColumn { path }
-    } else if parser.parse_keywords(&[Keyword::RENAME, Keyword::COLUMN]) {
-        let path = parse_column_path(&mut parser)?;
-        if path.is_empty() {
-            return Err("RENAME COLUMN requires a column path".to_string());
-        }
-        parser
-            .expect_keyword(Keyword::TO)
-            .map_err(|e| e.to_string())?;
-        let new_path = parse_column_path(&mut parser)?;
-        if new_path.is_empty() {
-            return Err("RENAME COLUMN target requires an identifier".to_string());
-        }
-        // The target may be a single identifier OR a dotted path whose parent
-        // matches the source's parent (i.e. the rename does not move the column).
-        let new_segments = new_path.segments();
-        let src_parent = &path.segments()[..path.segments().len() - 1];
-        let new_parent = &new_segments[..new_segments.len() - 1];
-        if !new_parent.is_empty() && new_parent != src_parent {
-            return Err(
-                "RENAME COLUMN target must share the same parent path as the source".to_string(),
-            );
-        }
-        IcebergSchemaChange::RenameColumn {
-            path,
-            new_name: new_segments.last().unwrap().clone(),
-        }
-    } else if novarocks_sql::syntax::peek_word_eq(&parser, 0, "MODIFY") {
-        parser.next_token();
-        parser
-            .expect_keyword(Keyword::COLUMN)
-            .map_err(|e| e.to_string())?;
-        let path = parse_column_path(&mut parser)?;
-        // Use parse_sql_type_definition so that MAP<K,V>/ARRAY<T> work without normalize.
-        let new_type = novarocks_sql::syntax::parse_sql_type_definition(&mut parser)?;
-        if parser.parse_keyword(Keyword::FIRST)
-            || parser.parse_keyword(Keyword::AFTER)
-            || novarocks_sql::syntax::peek_word_eq(&parser, 0, "BEFORE")
-        {
-            return Err(
-                "MODIFY COLUMN cannot combine type change with FIRST/AFTER/BEFORE; use a separate ALTER COLUMN statement".to_string(),
-            );
-        }
-        IcebergSchemaChange::ModifyColumn { path, new_type }
-    } else if parser.parse_keywords(&[Keyword::ALTER, Keyword::COLUMN]) {
-        let path = parse_column_path(&mut parser)?;
-        if path.is_empty() {
-            return Err("ALTER COLUMN requires a column path".to_string());
-        }
-        if parser.parse_keyword(Keyword::FIRST) {
-            IcebergSchemaChange::Reorder {
-                path,
-                position: AddPosition::First,
-            }
-        } else if parser.parse_keyword(Keyword::AFTER) {
-            let target_path = parse_column_path(&mut parser)?;
-            let last = target_path
-                .segments()
-                .last()
-                .ok_or_else(|| "AFTER target empty".to_string())?
-                .clone();
-            IcebergSchemaChange::Reorder {
-                path,
-                position: AddPosition::After(last),
-            }
-        } else if novarocks_sql::syntax::peek_word_eq(&parser, 0, "BEFORE") {
-            parser.next_token();
-            let target_path = parse_column_path(&mut parser)?;
-            let last = target_path
-                .segments()
-                .last()
-                .ok_or_else(|| "BEFORE target empty".to_string())?
-                .clone();
-            IcebergSchemaChange::Reorder {
-                path,
-                position: AddPosition::Before(last),
-            }
-        } else if parser.parse_keywords(&[Keyword::SET, Keyword::NOT, Keyword::NULL]) {
-            IcebergSchemaChange::SetNullable {
-                path,
-                nullable: false,
-            }
-        } else if parser.parse_keywords(&[Keyword::DROP, Keyword::NOT, Keyword::NULL]) {
-            IcebergSchemaChange::SetNullable {
-                path,
-                nullable: true,
-            }
-        } else if parser.parse_keyword(Keyword::COMMENT) {
-            let comment = parser
-                .parse_literal_string()
-                .map_err(|e| format!("COMMENT expects a string literal: {e}"))?;
-            IcebergSchemaChange::UpdateComment { path, comment }
-        } else {
-            return Err(
-                "ALTER COLUMN must be followed by FIRST / AFTER / BEFORE / SET NOT NULL / DROP NOT NULL / COMMENT".to_string(),
-            );
-        }
-    } else {
-        return Err("unsupported ALTER TABLE schema evolution clause".to_string());
-    };
-
-    if parser.peek_token_ref().token == Token::SemiColon {
-        parser.next_token();
-    }
-    if parser.peek_token_ref().token != Token::EOF {
-        return Err(format!(
-            "unsupported trailing ALTER TABLE schema tokens starting at {}",
-            parser.peek_token_ref().token
-        ));
-    }
-
-    Ok(AlterIcebergSchemaStmt { table, change })
-}
-
-fn parse_add_column_change(parser: &mut Parser<'_>) -> Result<IcebergSchemaChange, String> {
-    let path = parse_column_path(parser)?;
-    if path.is_empty() {
-        return Err("ADD COLUMN requires a column path".to_string());
-    }
-    let last = path.segments().last().unwrap().clone();
-    let parent_segments = path.segments()[..path.segments().len() - 1].to_vec();
-    let parent = ColumnPath::from_segments(parent_segments);
-
-    // Use parse_sql_type_definition (not parser.parse_data_type + convert_sql_type) so that
-    // collection types like MAP<K,V> and ARRAY<T> are parsed via native angle-bracket syntax
-    // rather than going through normalize_for_raw_parse which only rewrites MAP<> inside CAST.
-    let data_type = novarocks_sql::syntax::parse_sql_type_definition(parser)?;
-    let mut default: Option<DefaultLiteral> = None;
-    let mut seen_null = false;
-    let mut seen_default = false;
-    let mut position = AddPosition::Default;
-    let mut seen_position = false;
-    loop {
-        if parser.parse_keywords(&[Keyword::NOT, Keyword::NULL]) {
-            return Err(
-                "ADD COLUMN NOT NULL is not supported for Iceberg schema evolution".to_string(),
-            );
-        }
-        if parser.parse_keyword(Keyword::NULL) {
-            if seen_null {
-                return Err("duplicate NULL clause in ADD COLUMN".to_string());
-            }
-            seen_null = true;
-            continue;
-        }
-        if parser.parse_keyword(Keyword::DEFAULT) {
-            if seen_default {
-                return Err("duplicate DEFAULT clause in ADD COLUMN".to_string());
-            }
-            seen_default = true;
-            // DEFAULT NULL keeps existing v2 behavior (does not persist).
-            if parser.parse_keyword(Keyword::NULL) {
-                default = Some(DefaultLiteral::Null);
-                continue;
-            }
-            default = Some(novarocks_sql::syntax::parse_default_literal(
-                parser, &data_type,
-            )?);
-            continue;
-        }
-        if parser.parse_keyword(Keyword::FIRST) {
-            if seen_position {
-                return Err("duplicate column position clause in ADD COLUMN".to_string());
-            }
-            seen_position = true;
-            position = AddPosition::First;
-            continue;
-        }
-        if parser.parse_keyword(Keyword::AFTER) {
-            if seen_position {
-                return Err("duplicate column position clause in ADD COLUMN".to_string());
-            }
-            seen_position = true;
-            let target = parser.parse_identifier().map_err(|e| e.to_string())?.value;
-            position = AddPosition::After(target);
-            continue;
-        }
-        if novarocks_sql::syntax::peek_word_eq(parser, 0, "BEFORE") {
-            if seen_position {
-                return Err("duplicate column position clause in ADD COLUMN".to_string());
-            }
-            seen_position = true;
-            parser.next_token();
-            let target = parser.parse_identifier().map_err(|e| e.to_string())?.value;
-            position = AddPosition::Before(target);
-            continue;
-        }
-        break;
-    }
-    Ok(IcebergSchemaChange::AddColumn {
-        parent,
-        name: last,
-        data_type,
-        default,
-        position,
-    })
-}
-
-pub(crate) fn looks_like_alter_partition_column(sql: &str) -> bool {
-    let mut parser = match Parser::new(&StarRocksDialect).try_with_sql(sql) {
-        Ok(parser) => parser,
-        Err(_) => return false,
-    };
-    if !parser.parse_keyword(Keyword::ALTER) || !parser.parse_keyword(Keyword::TABLE) {
-        return false;
-    }
-    if parser.parse_object_name(false).is_err() {
-        return false;
-    }
-
-    (parser.parse_keyword(Keyword::ADD) || parser.parse_keyword(Keyword::DROP))
-        && parser.parse_keyword(Keyword::PARTITION)
-        && peek_token_word_eq(&parser, "COLUMN")
-}
-
-pub(crate) fn parse_alter_partition_column_sql(
-    sql: &str,
-) -> Result<novarocks_sql::syntax::AlterIcebergPartitionSpecStmt, String> {
-    let mut parser = Parser::new(&StarRocksDialect)
-        .try_with_sql(sql)
-        .map_err(|e| format!("parse ALTER TABLE partition column: {e}"))?;
-    parser
-        .expect_keyword(Keyword::ALTER)
-        .map_err(|e| format!("expected ALTER: {e}"))?;
-    parser
-        .expect_keyword(Keyword::TABLE)
-        .map_err(|e| format!("expected TABLE after ALTER: {e}"))?;
-
-    let mut table = novarocks_sql::syntax::convert_object_name(
-        parser
-            .parse_object_name(false)
-            .map_err(|e| format!("parse ALTER TABLE name: {e}"))?,
-    )?;
-    table.parts = table
-        .parts
-        .into_iter()
-        .map(|part| normalize_identifier(&part))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let is_add = if parser.parse_keyword(Keyword::ADD) {
-        true
-    } else if parser.parse_keyword(Keyword::DROP) {
-        false
-    } else {
-        return Err("expected ADD or DROP before PARTITION COLUMN".to_string());
-    };
-    parser
-        .expect_keyword(Keyword::PARTITION)
-        .map_err(|e| format!("expected PARTITION after ADD/DROP: {e}"))?;
-    expect_word(&mut parser, "COLUMN")?;
-
-    let field = novarocks_sql::syntax::parse_partition_field_expr(&mut parser)?;
-    consume_optional_final_semicolon(&mut parser)?;
-    expect_parser_eof(&parser)?;
-
-    if is_add {
-        Ok(
-            novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
-                table,
-                field,
-            },
-        )
-    } else {
-        Ok(
-            novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
-                table,
-                field,
-            },
-        )
-    }
 }
 
 fn peek_token_word_eq(parser: &Parser<'_>, word: &str) -> bool {
@@ -2348,822 +2503,225 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_alter_iceberg_schema_add_column_default_null() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.db.orders ADD COLUMN discount INT DEFAULT NULL",
-        )
-        .expect("parse");
+    fn typed_iceberg_action(sql: &str) -> novarocks_parser::ast::IcebergTableAction {
+        let mut statements = novarocks_parser::parse(sql).expect("parse typed Iceberg command");
+        let novarocks_parser::ast::Statement::Iceberg(
+            novarocks_parser::ast::IcebergStatement::AlterTable(statement),
+        ) = statements.remove(0)
+        else {
+            panic!("expected typed Iceberg ALTER TABLE statement");
+        };
+        statement.action
+    }
 
-        assert_eq!(stmt.table.parts, vec!["ice", "db", "orders"]);
+    fn typed_schema_change(sql: &str) -> novarocks_parser::ast::IcebergSchemaChange {
+        match typed_iceberg_action(sql) {
+            novarocks_parser::ast::IcebergTableAction::Schema(change) => change,
+            action => panic!("expected typed Iceberg schema action: {action:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_typed_schema_add_column_preserves_nested_parameterized_type() {
+        let change = typed_schema_change(
+            "ALTER TABLE ice.db.orders ADD COLUMN profile STRUCT<name STRING, attributes MAP<STRING, ARRAY<DECIMAL(10, 2)>>> FIRST",
+        );
+        let lowered = super::lower_typed_iceberg_schema_change(&change).expect("lower typed add");
+
         assert_eq!(
-            stmt.change,
+            lowered,
             super::IcebergSchemaChange::AddColumn {
                 parent: super::ColumnPath::root(),
-                name: "discount".to_string(),
-                data_type: novarocks_catalog::schema::SqlType::Int,
-                default: Some(super::DefaultLiteral::Null),
-                position: super::AddPosition::Default,
+                name: "profile".to_string(),
+                data_type: super::SqlType::Struct(vec![
+                    ("name".to_string(), super::SqlType::String),
+                    (
+                        "attributes".to_string(),
+                        super::SqlType::Map(
+                            Box::new(super::SqlType::String),
+                            Box::new(super::SqlType::Array(Box::new(super::SqlType::Decimal {
+                                precision: 10,
+                                scale: 2,
+                            }))),
+                        ),
+                    ),
+                ]),
+                default: None,
+                position: super::AddPosition::First,
             }
         );
     }
 
     #[test]
-    fn parse_alter_iceberg_schema_drop_rename_modify() {
-        let drop_stmt =
-            super::parse_alter_iceberg_schema_sql("ALTER TABLE ice.db.orders DROP COLUMN old_col")
-                .expect("drop");
-        let super::IcebergSchemaChange::DropColumn { path } = drop_stmt.change else {
-            panic!("expected DropColumn");
-        };
-        assert_eq!(path.dotted(), "old_col");
+    fn lower_typed_schema_defaults_without_sql_reparse() {
+        let change = typed_schema_change("ALTER TABLE ice.db.orders ADD COLUMN d INT DEFAULT NULL");
+        let lowered =
+            super::lower_typed_iceberg_schema_change(&change).expect("lower null default");
 
-        let rename_stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.db.orders RENAME COLUMN old_col TO new_col",
-        )
-        .expect("rename");
-        let super::IcebergSchemaChange::RenameColumn { path, new_name } = rename_stmt.change else {
-            panic!("expected RenameColumn");
+        let super::IcebergSchemaChange::AddColumn { default, .. } = lowered else {
+            panic!("expected AddColumn");
         };
-        assert_eq!(path.dotted(), "old_col");
-        assert_eq!(new_name, "new_col");
+        assert_eq!(default, Some(super::DefaultLiteral::Null));
 
-        let modify_stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.db.orders MODIFY COLUMN id BIGINT",
-        )
-        .expect("modify");
-        let super::IcebergSchemaChange::ModifyColumn { path, new_type } = modify_stmt.change else {
-            panic!("expected ModifyColumn");
+        let integer = typed_schema_change("ALTER TABLE ice.db.orders ADD COLUMN d INT DEFAULT 7");
+        let super::IcebergSchemaChange::AddColumn { default, .. } =
+            super::lower_typed_iceberg_schema_change(&integer).expect("lower integer default")
+        else {
+            panic!("expected AddColumn");
         };
-        assert_eq!(path.dotted(), "id");
-        assert_eq!(new_type, novarocks_catalog::schema::SqlType::BigInt);
+        assert_eq!(default, Some(super::DefaultLiteral::Int(7)));
+
+        let decimal = typed_schema_change(
+            "ALTER TABLE ice.db.orders ADD COLUMN d DECIMAL(8, 2) DEFAULT '12.34'",
+        );
+        let super::IcebergSchemaChange::AddColumn { default, .. } =
+            super::lower_typed_iceberg_schema_change(&decimal).expect("lower decimal default")
+        else {
+            panic!("expected AddColumn");
+        };
+        assert_eq!(
+            default,
+            Some(super::DefaultLiteral::Decimal {
+                unscaled: 1234,
+                scale: 2,
+            })
+        );
+
+        let boolean = typed_schema_change(
+            "ALTER TABLE ice.db.orders ADD COLUMN enabled BOOLEAN DEFAULT TRUE",
+        );
+        let super::IcebergSchemaChange::AddColumn { default, .. } =
+            super::lower_typed_iceberg_schema_change(&boolean).expect("lower boolean default")
+        else {
+            panic!("expected AddColumn");
+        };
+        assert_eq!(default, Some(super::DefaultLiteral::Bool(true)));
     }
 
     #[test]
-    fn parse_alter_iceberg_schema_rejects_unsupported_add_forms() {
-        let not_null = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.db.orders ADD COLUMN discount INT NOT NULL",
-        )
-        .expect_err("not null should fail");
-        assert!(not_null.contains("ADD COLUMN NOT NULL is not supported"));
-
-        // Quoted DEFAULT values are accepted for numeric columns iff the
-        // string parses as the column's numeric type (StarRocks compat:
-        // `DEFAULT "0"` for INT works). A genuinely non-numeric string —
-        // here `'abc'` — must still be rejected.
-        let type_mismatch = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.db.orders ADD COLUMN discount INT DEFAULT 'abc'",
-        )
-        .expect_err("non-numeric string default for INT should fail");
+    fn lower_typed_schema_defaults_reject_legacy_overflow_and_type_mismatch() {
+        let overflow =
+            typed_schema_change("ALTER TABLE ice.db.orders ADD COLUMN d TINYINT DEFAULT 200");
         assert!(
-            type_mismatch.contains("invalid integer DEFAULT"),
-            "expected 'invalid integer DEFAULT' but got: {type_mismatch}"
-        );
-    }
-
-    #[test]
-    fn parse_alter_iceberg_schema_probe_matches_only_schema_clauses() {
-        for sql in [
-            "ALTER TABLE ice.db.orders ADD COLUMN discount INT",
-            "ALTER TABLE ice.db.orders DROP COLUMN old_col",
-            "ALTER TABLE ice.db.orders RENAME COLUMN old_col TO new_col",
-            "ALTER TABLE ice.db.orders MODIFY COLUMN id BIGINT",
-        ] {
-            assert!(
-                super::looks_like_alter_iceberg_schema(sql),
-                "expected schema DDL probe to match {sql}"
-            );
-        }
-
-        for sql in [
-            "ALTER TABLE ice.db.orders ADD FILES FROM 's3://bucket/path'",
-            "ALTER TABLE ice.db.orders ADD EQUALITY DELETE (id) VALUES (1)",
-            "ALTER TABLE ice.db.orders SET COMMENT = 'ADD COLUMN c INT'",
-            "ALTER TABLE ice.db.orders /* ADD COLUMN c INT */ ADD FILES FROM 's3://bucket/path'",
-            "ALTER TABLE ice.db.orders ADD PARTITION p1 VALUES LESS THAN (10)",
-            "ALTER TABLE ice.db.orders ADD PARTITION COLUMN city",
-        ] {
-            assert!(
-                !super::looks_like_alter_iceberg_schema(sql),
-                "expected schema DDL probe not to match {sql}"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_alter_iceberg_schema_rejects_trailing_unsupported_syntax() {
-        let err = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.db.orders ADD COLUMN c INT COMMENT 'x'",
-        )
-        .expect_err("comment should fail");
-        assert!(err.contains("unsupported trailing ALTER TABLE schema tokens"));
-    }
-
-    #[test]
-    fn parse_alter_iceberg_schema_rejects_duplicate_add_column_attributes() {
-        let duplicate_null = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.db.orders ADD COLUMN c INT NULL NULL",
-        )
-        .expect_err("duplicate null should fail");
-        assert!(duplicate_null.contains("duplicate NULL"));
-
-        let duplicate_default = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.db.orders ADD COLUMN c INT DEFAULT NULL DEFAULT NULL",
-        )
-        .expect_err("duplicate default should fail");
-        assert!(duplicate_default.contains("duplicate DEFAULT clause"));
-    }
-
-    #[test]
-    fn parse_alter_iceberg_schema_add_column_date_default() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.ns.orders ADD COLUMN c DATE DEFAULT '1970-01-02'",
-        )
-        .expect("date default");
-        match stmt.change {
-            super::IcebergSchemaChange::AddColumn { default, .. } => {
-                assert_eq!(default, Some(super::DefaultLiteral::Date(1)));
-            }
-            _ => panic!("expected AddColumn"),
-        }
-    }
-
-    #[test]
-    fn parse_alter_iceberg_schema_add_column_datetime_default() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.ns.orders ADD COLUMN c DATETIME DEFAULT '1970-01-01 00:00:01'",
-        )
-        .expect("datetime default");
-        match stmt.change {
-            super::IcebergSchemaChange::AddColumn { default, .. } => {
-                assert_eq!(default, Some(super::DefaultLiteral::DateTime(1_000_000)),);
-            }
-            _ => panic!("expected AddColumn"),
-        }
-    }
-
-    #[test]
-    fn parse_alter_partition_column_statement() {
-        use novarocks_sql::syntax::{
-            AlterIcebergPartitionSpecStmt, IcebergPartitionFieldExpr, ObjectName,
-        };
-
-        assert!(super::looks_like_alter_partition_column(
-            "alter table ice.db.orders add partition column city"
-        ));
-        assert_eq!(
-            super::parse_alter_partition_column_sql(
-                "ALTER TABLE ice.db.orders ADD PARTITION COLUMN city;"
-            )
-            .expect("parse add with final semicolon"),
-            AlterIcebergPartitionSpecStmt::AddPartitionColumn {
-                table: ObjectName {
-                    parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()]
-                },
-                field: IcebergPartitionFieldExpr::Identity {
-                    column: "city".to_string()
-                }
-            }
+            super::lower_typed_iceberg_schema_change(&overflow)
+                .expect_err("tinyint overflow")
+                .contains("out of range for TINYINT")
         );
 
-        let add = super::parse_alter_partition_column_sql(
-            "ALTER TABLE ice.db.orders ADD PARTITION COLUMN bucket(user_id, 32)",
-        )
-        .expect("parse add");
-        assert_eq!(
-            add,
-            AlterIcebergPartitionSpecStmt::AddPartitionColumn {
-                table: ObjectName {
-                    parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()]
-                },
-                field: IcebergPartitionFieldExpr::Bucket {
-                    column: "user_id".to_string(),
-                    num_buckets: 32
-                }
-            }
-        );
-
-        let drop = super::parse_alter_partition_column_sql(
-            "ALTER TABLE ice.db.orders DROP PARTITION COLUMN month(ts)",
-        )
-        .expect("parse drop");
-        assert_eq!(
-            drop,
-            AlterIcebergPartitionSpecStmt::DropPartitionColumn {
-                table: ObjectName {
-                    parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()]
-                },
-                field: IcebergPartitionFieldExpr::Month {
-                    column: "ts".to_string()
-                }
-            }
-        );
-    }
-
-    #[test]
-    fn parse_alter_partition_column_accepts_flexible_whitespace() {
-        use novarocks_sql::syntax::{AlterIcebergPartitionSpecStmt, IcebergPartitionFieldExpr};
-
-        assert!(super::looks_like_alter_partition_column(
-            "ALTER TABLE ice.db.orders\nADD   PARTITION\tCOLUMN bucket(user_id, 32)"
-        ));
-
-        let add = super::parse_alter_partition_column_sql(
-            "ALTER TABLE ice.db.orders\nADD   PARTITION\tCOLUMN bucket(user_id, 32)",
-        )
-        .expect("parse add");
-        assert_eq!(
-            add,
-            AlterIcebergPartitionSpecStmt::AddPartitionColumn {
-                table: novarocks_sql::syntax::ObjectName {
-                    parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()]
-                },
-                field: IcebergPartitionFieldExpr::Bucket {
-                    column: "user_id".to_string(),
-                    num_buckets: 32
-                }
-            }
-        );
-
-        let drop = super::parse_alter_partition_column_sql(
-            "ALTER TABLE ice.db.orders\tDROP\nPARTITION   COLUMN month(ts)",
-        )
-        .expect("parse drop");
-        assert_eq!(
-            drop,
-            AlterIcebergPartitionSpecStmt::DropPartitionColumn {
-                table: novarocks_sql::syntax::ObjectName {
-                    parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()]
-                },
-                field: IcebergPartitionFieldExpr::Month {
-                    column: "ts".to_string()
-                }
-            }
-        );
-    }
-
-    #[test]
-    fn parse_alter_partition_column_rejects_multi_statement_tails() {
-        for sql in [
-            "ALTER TABLE ice.db.orders; ADD PARTITION COLUMN bucket(user_id, 32)",
-            "ALTER TABLE ice.db.orders ADD PARTITION COLUMN bucket(user_id, 32); SELECT 1",
-            "ALTER TABLE ice.db.orders ADD PARTITION COLUMN bucket(user_id, 32);;",
-        ] {
-            assert!(
-                super::parse_alter_partition_column_sql(sql).is_err(),
-                "expected ALTER partition parse failure for {sql}"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_alter_iceberg_schema_add_column_int_default() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.ns.orders ADD COLUMN c INT DEFAULT 5",
-        )
-        .expect("parsed");
-        match stmt.change {
-            super::IcebergSchemaChange::AddColumn { default, .. } => {
-                assert_eq!(default, Some(super::DefaultLiteral::Int(5)));
-            }
-            _ => panic!("expected AddColumn"),
-        }
-    }
-
-    #[test]
-    fn parse_alter_iceberg_schema_add_column_string_default() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.ns.orders ADD COLUMN c STRING DEFAULT 'hi'",
-        )
-        .expect("parsed");
-        match stmt.change {
-            super::IcebergSchemaChange::AddColumn { default, .. } => {
-                assert_eq!(default, Some(super::DefaultLiteral::String("hi".into())));
-            }
-            _ => panic!("expected AddColumn"),
-        }
-    }
-
-    #[test]
-    fn parse_alter_iceberg_schema_add_column_default_overflow_rejected() {
-        let err = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.ns.orders ADD COLUMN c TINYINT DEFAULT 200",
-        )
-        .expect_err("overflow");
-        assert!(err.contains("TINYINT"));
-    }
-
-    #[test]
-    fn parse_alter_iceberg_schema_add_column_null_then_default_null() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.ns.orders ADD COLUMN c INT NULL DEFAULT NULL",
-        )
-        .expect("null before default null");
-        match stmt.change {
-            super::IcebergSchemaChange::AddColumn { default, .. } => {
-                assert_eq!(default, Some(super::DefaultLiteral::Null));
-            }
-            _ => panic!("expected AddColumn"),
-        }
-    }
-
-    #[test]
-    fn parse_alter_iceberg_schema_add_column_default_null_then_null() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE ice.ns.orders ADD COLUMN c INT DEFAULT NULL NULL",
-        )
-        .expect("default null before null");
-        match stmt.change {
-            super::IcebergSchemaChange::AddColumn { default, .. } => {
-                assert_eq!(default, Some(super::DefaultLiteral::Null));
-            }
-            _ => panic!("expected AddColumn"),
-        }
-    }
-
-    #[test]
-    fn parse_drop_nested_column() {
-        let stmt =
-            super::parse_alter_iceberg_schema_sql("ALTER TABLE t DROP COLUMN address.street")
-                .unwrap();
-        let super::IcebergSchemaChange::DropColumn { path } = stmt.change else {
-            panic!();
-        };
-        assert_eq!(path.dotted(), "address.street");
-    }
-
-    #[test]
-    fn parse_rename_nested_column() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t RENAME COLUMN address.zip TO address.postal_code",
-        )
-        .unwrap();
-        let super::IcebergSchemaChange::RenameColumn { path, new_name } = stmt.change else {
-            panic!();
-        };
-        assert_eq!(path.dotted(), "address.zip");
-        assert_eq!(new_name, "postal_code");
-    }
-
-    #[test]
-    fn parse_modify_nested_column() {
-        let stmt =
-            super::parse_alter_iceberg_schema_sql("ALTER TABLE t MODIFY COLUMN address.zip BIGINT")
-                .unwrap();
-        let super::IcebergSchemaChange::ModifyColumn { path, new_type } = stmt.change else {
-            panic!();
-        };
-        assert_eq!(path.dotted(), "address.zip");
-        assert!(matches!(
-            new_type,
-            novarocks_catalog::schema::SqlType::BigInt
-        ));
-    }
-
-    #[test]
-    fn parse_modify_array_element() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t MODIFY COLUMN tags.element VARCHAR",
-        )
-        .unwrap();
-        let super::IcebergSchemaChange::ModifyColumn { path, .. } = stmt.change else {
-            panic!();
-        };
-        assert_eq!(path.dotted(), "tags.element");
-    }
-
-    #[test]
-    fn parse_rename_extracts_only_last_segment_in_new_name() {
+        let wrong_type =
+            typed_schema_change("ALTER TABLE ice.db.orders ADD COLUMN d BOOLEAN DEFAULT 'maybe'");
         assert!(
-            super::parse_alter_iceberg_schema_sql(
-                "ALTER TABLE t RENAME COLUMN address.zip TO foo.bar"
-            )
-            .is_err()
+            super::lower_typed_iceberg_schema_change(&wrong_type)
+                .expect_err("boolean coercion must validate")
+                .contains("invalid boolean DEFAULT")
+        );
+
+        let hex =
+            typed_schema_change("ALTER TABLE ice.db.orders ADD COLUMN d BINARY DEFAULT 0xCAFE");
+        let super::IcebergSchemaChange::AddColumn { default, .. } =
+            super::lower_typed_iceberg_schema_change(&hex).expect("binary hex default")
+        else {
+            panic!("expected AddColumn");
+        };
+        assert_eq!(
+            default,
+            Some(super::DefaultLiteral::Binary(vec![0xCA, 0xFE]))
         );
     }
 
     #[test]
-    fn parse_add_column_first() {
-        let stmt =
-            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ADD COLUMN c INT FIRST").unwrap();
-        let super::IcebergSchemaChange::AddColumn { position, .. } = stmt.change else {
-            panic!();
-        };
-        assert!(matches!(position, super::AddPosition::First));
-    }
-
-    #[test]
-    fn parse_add_column_after_target() {
-        let stmt =
-            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ADD COLUMN c INT AFTER existing")
-                .unwrap();
-        let super::IcebergSchemaChange::AddColumn { position, .. } = stmt.change else {
-            panic!();
-        };
-        assert!(matches!(position, super::AddPosition::After(ref s) if s == "existing"));
-    }
-
-    #[test]
-    fn parse_add_column_before_target() {
-        let stmt =
-            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ADD COLUMN c INT BEFORE existing")
-                .unwrap();
-        let super::IcebergSchemaChange::AddColumn { position, .. } = stmt.change else {
-            panic!();
-        };
-        assert!(matches!(position, super::AddPosition::Before(ref s) if s == "existing"));
-    }
-
-    #[test]
-    fn parse_add_column_map_default_empty() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t ADD COLUMN counts MAP<STRING, INT> DEFAULT '{}'",
-        )
-        .expect("parse MAP column with default");
-        match stmt.change {
-            super::IcebergSchemaChange::AddColumn {
-                name, data_type, ..
-            } => {
-                assert_eq!(name, "counts");
-                assert!(
-                    matches!(data_type, novarocks_catalog::schema::SqlType::Map(_, _)),
-                    "expected Map type, got {:?}",
-                    data_type
-                );
+    fn lower_typed_schema_rename_and_comment_preserve_existing_dto_shape() {
+        let rename = typed_schema_change(
+            "ALTER TABLE ice.db.orders RENAME COLUMN Address.Zip TO Address.Postal_Code",
+        );
+        assert_eq!(
+            super::lower_typed_iceberg_schema_change(&rename).expect("lower rename"),
+            super::IcebergSchemaChange::RenameColumn {
+                path: super::ColumnPath::from_segments(vec!["Address".into(), "Zip".into()]),
+                new_name: "postal_code".to_string(),
             }
-            _ => panic!("expected AddColumn"),
-        }
-    }
+        );
 
-    #[test]
-    fn parse_add_column_array_default_empty() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t ADD COLUMN tags ARRAY<INT> DEFAULT '[]'",
-        )
-        .expect("parse ARRAY column with default");
-        match stmt.change {
-            super::IcebergSchemaChange::AddColumn {
-                name, data_type, ..
-            } => {
-                assert_eq!(name, "tags");
-                assert!(
-                    matches!(data_type, novarocks_catalog::schema::SqlType::Array(_)),
-                    "expected Array type, got {:?}",
-                    data_type
-                );
+        let comment = typed_schema_change(
+            "ALTER TABLE ice.db.orders ALTER COLUMN address.zip COMMENT 'postal code'",
+        );
+        assert_eq!(
+            super::lower_typed_iceberg_schema_change(&comment).expect("lower comment"),
+            super::IcebergSchemaChange::UpdateComment {
+                path: super::ColumnPath::from_segments(vec!["address".into(), "zip".into()]),
+                comment: "postal code".to_string(),
             }
-            _ => panic!("expected AddColumn"),
-        }
-    }
-
-    #[test]
-    fn parse_add_column_into_nested_struct() {
-        let stmt =
-            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ADD COLUMN address.zip INT")
-                .unwrap();
-        let super::IcebergSchemaChange::AddColumn { parent, name, .. } = stmt.change else {
-            panic!();
-        };
-        assert_eq!(parent.dotted(), "address");
-        assert_eq!(name, "zip");
-    }
-
-    #[test]
-    fn parse_alter_column_first() {
-        let stmt =
-            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ALTER COLUMN c FIRST").unwrap();
-        let super::IcebergSchemaChange::Reorder { path, position } = stmt.change else {
-            panic!();
-        };
-        assert_eq!(path.dotted(), "c");
-        assert!(matches!(position, super::AddPosition::First));
-    }
-
-    #[test]
-    fn parse_alter_column_after_target() {
-        let stmt =
-            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ALTER COLUMN c AFTER d").unwrap();
-        let super::IcebergSchemaChange::Reorder { path, position } = stmt.change else {
-            panic!();
-        };
-        assert_eq!(path.dotted(), "c");
-        assert!(matches!(position, super::AddPosition::After(ref s) if s == "d"));
-    }
-
-    #[test]
-    fn parse_alter_column_nested_before() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t ALTER COLUMN address.street BEFORE address.city",
-        )
-        .unwrap();
-        let super::IcebergSchemaChange::Reorder { path, position } = stmt.change else {
-            panic!();
-        };
-        assert_eq!(path.dotted(), "address.street");
-        let super::AddPosition::Before(ref s) = position else {
-            panic!();
-        };
-        assert_eq!(s, "city");
-    }
-
-    #[test]
-    fn parse_alter_column_set_not_null() {
-        let stmt =
-            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ALTER COLUMN c SET NOT NULL")
-                .unwrap();
-        let super::IcebergSchemaChange::SetNullable { path, nullable } = stmt.change else {
-            panic!();
-        };
-        assert_eq!(path.dotted(), "c");
-        assert!(!nullable);
-    }
-
-    #[test]
-    fn parse_alter_column_drop_not_null() {
-        let stmt =
-            super::parse_alter_iceberg_schema_sql("ALTER TABLE t ALTER COLUMN c DROP NOT NULL")
-                .unwrap();
-        let super::IcebergSchemaChange::SetNullable { path, nullable } = stmt.change else {
-            panic!();
-        };
-        assert_eq!(path.dotted(), "c");
-        assert!(nullable);
-    }
-
-    #[test]
-    fn parse_alter_column_set_not_null_nested() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t ALTER COLUMN address.street SET NOT NULL",
-        )
-        .unwrap();
-        let super::IcebergSchemaChange::SetNullable { path, .. } = stmt.change else {
-            panic!();
-        };
-        assert_eq!(path.dotted(), "address.street");
-    }
-
-    #[test]
-    fn parse_alter_column_comment() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t ALTER COLUMN v COMMENT 'value column'",
-        )
-        .unwrap();
-        let super::IcebergSchemaChange::UpdateComment { path, comment } = stmt.change else {
-            panic!("expected UpdateComment");
-        };
-        assert_eq!(path.dotted(), "v");
-        assert_eq!(comment, "value column");
-    }
-
-    #[test]
-    fn parse_alter_column_comment_nested() {
-        let stmt = super::parse_alter_iceberg_schema_sql(
-            "ALTER TABLE t ALTER COLUMN address.street COMMENT 'street name'",
-        )
-        .unwrap();
-        let super::IcebergSchemaChange::UpdateComment { path, comment } = stmt.change else {
-            panic!("expected UpdateComment");
-        };
-        assert_eq!(path.dotted(), "address.street");
-        assert_eq!(comment, "street name");
-    }
-
-    #[test]
-    fn parse_alter_column_comment_empty_string() {
-        let stmt = super::parse_alter_iceberg_schema_sql("ALTER TABLE t ALTER COLUMN c COMMENT ''")
-            .unwrap();
-        let super::IcebergSchemaChange::UpdateComment { path, comment } = stmt.change else {
-            panic!("expected UpdateComment");
-        };
-        assert_eq!(path.dotted(), "c");
-        assert_eq!(comment, "");
-    }
-
-    #[test]
-    fn parse_modify_column_with_position_rejected() {
-        assert!(
-            super::parse_alter_iceberg_schema_sql("ALTER TABLE t MODIFY COLUMN c BIGINT FIRST")
-                .is_err()
-        );
-        assert!(
-            super::parse_alter_iceberg_schema_sql("ALTER TABLE t MODIFY COLUMN c BIGINT AFTER d")
-                .is_err()
-        );
-        assert!(
-            super::parse_alter_iceberg_schema_sql("ALTER TABLE t MODIFY COLUMN c BIGINT BEFORE d")
-                .is_err()
         );
     }
-}
-
-#[cfg(test)]
-mod parse_alter_iceberg_properties_tests {
-    use super::{
-        AlterIcebergPropertiesStmt, PropertiesOp, looks_like_alter_iceberg_properties,
-        parse_alter_iceberg_properties_sql,
-    };
 
     #[test]
-    fn looks_like_set_tblproperties() {
-        assert!(looks_like_alter_iceberg_properties(
-            "ALTER TABLE ice.db.t SET TBLPROPERTIES ('k' = 'v')"
-        ));
-    }
-
-    #[test]
-    fn looks_like_set_property_list() {
-        assert!(looks_like_alter_iceberg_properties(
-            "ALTER TABLE ice.db.t SET ('unique_constraints' = 'id')"
-        ));
-    }
-
-    #[test]
-    fn looks_like_unset_tblproperties() {
-        assert!(looks_like_alter_iceberg_properties(
-            "ALTER TABLE ice.db.t UNSET TBLPROPERTIES ('k')"
-        ));
-    }
-
-    #[test]
-    fn looks_like_unset_tblproperties_if_exists() {
-        assert!(looks_like_alter_iceberg_properties(
-            "ALTER TABLE ice.db.t UNSET TBLPROPERTIES IF EXISTS ('k')"
-        ));
-    }
-
-    #[test]
-    fn looks_like_does_not_match_alter_column() {
-        assert!(!looks_like_alter_iceberg_properties(
-            "ALTER TABLE ice.db.t ADD COLUMN c INT"
-        ));
-        assert!(!looks_like_alter_iceberg_properties(
-            "ALTER TABLE ice.db.t ALTER COLUMN c FIRST"
-        ));
-    }
-
-    #[test]
-    fn parse_set_one_pair() {
-        let stmt = parse_alter_iceberg_properties_sql(
-            "ALTER TABLE ice.db.t SET TBLPROPERTIES ('write.parquet.compression-codec' = 'zstd')",
-        )
-        .expect("parse");
-        assert_eq!(stmt.table.parts, vec!["ice", "db", "t"]);
-        let PropertiesOp::Set { entries } = stmt.op else {
-            panic!()
+    fn lower_typed_properties_preserves_existing_property_dto_rules() {
+        let action = typed_iceberg_action(
+            "ALTER TABLE ice.db.orders SET TBLPROPERTIES ('format' = 'parquet', 'owner' = 'ops')",
+        );
+        let novarocks_parser::ast::IcebergTableAction::Properties(action) = action else {
+            panic!("expected typed properties action");
         };
         assert_eq!(
-            entries,
-            vec![(
-                "write.parquet.compression-codec".to_string(),
-                "zstd".to_string()
-            )]
+            super::lower_typed_iceberg_properties_action(&action).expect("lower properties"),
+            super::PropertiesOp::Set {
+                entries: vec![
+                    ("format".to_string(), "parquet".to_string()),
+                    ("owner".to_string(), "ops".to_string()),
+                ],
+            }
         );
-    }
 
-    #[test]
-    fn parse_set_property_list_one_pair() {
-        let stmt = parse_alter_iceberg_properties_sql(
-            "ALTER TABLE ice.db.t SET ('unique_constraints' = 'id')",
-        )
-        .expect("parse");
-        assert_eq!(stmt.table.parts, vec!["ice", "db", "t"]);
-        let PropertiesOp::Set { entries } = stmt.op else {
-            panic!()
+        let comment = typed_iceberg_action("ALTER TABLE ice.db.orders COMMENT 'order table'");
+        let novarocks_parser::ast::IcebergTableAction::Properties(comment) = comment else {
+            panic!("expected typed comment action");
         };
         assert_eq!(
-            entries,
-            vec![("unique_constraints".to_string(), "id".to_string())]
+            super::lower_typed_iceberg_properties_action(&comment).expect("lower comment"),
+            super::PropertiesOp::Set {
+                entries: vec![("comment".to_string(), "order table".to_string())],
+            }
         );
-    }
 
-    #[test]
-    fn parse_set_multiple_pairs() {
-        let stmt = parse_alter_iceberg_properties_sql(
-            "ALTER TABLE t SET TBLPROPERTIES ('a' = 'x', 'b' = 'y', 'c' = 'z')",
-        )
-        .expect("parse");
-        let PropertiesOp::Set { entries } = stmt.op else {
-            panic!()
+        let non_string =
+            typed_iceberg_action("ALTER TABLE ice.db.orders SET TBLPROPERTIES ('retention' = 7)");
+        let novarocks_parser::ast::IcebergTableAction::Properties(non_string) = non_string else {
+            panic!("expected typed properties action");
         };
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0], ("a".to_string(), "x".to_string()));
-        assert_eq!(entries[2], ("c".to_string(), "z".to_string()));
-    }
-
-    #[test]
-    fn parse_unset_strict() {
-        let stmt =
-            parse_alter_iceberg_properties_sql("ALTER TABLE t UNSET TBLPROPERTIES ('a', 'b')")
-                .expect("parse");
-        let PropertiesOp::Unset { keys, if_exists } = stmt.op else {
-            panic!()
-        };
-        assert_eq!(keys, vec!["a".to_string(), "b".to_string()]);
-        assert!(!if_exists);
-    }
-
-    #[test]
-    fn parse_unset_if_exists() {
-        let stmt =
-            parse_alter_iceberg_properties_sql("ALTER TABLE t UNSET TBLPROPERTIES IF EXISTS ('a')")
-                .expect("parse");
-        let PropertiesOp::Unset { keys, if_exists } = stmt.op else {
-            panic!()
-        };
-        assert_eq!(keys, vec!["a".to_string()]);
-        assert!(if_exists);
-    }
-
-    #[test]
-    fn parse_set_empty_parens_rejected() {
-        assert!(parse_alter_iceberg_properties_sql("ALTER TABLE t SET TBLPROPERTIES ()").is_err());
-    }
-
-    #[test]
-    fn parse_unset_empty_parens_rejected() {
         assert!(
-            parse_alter_iceberg_properties_sql("ALTER TABLE t UNSET TBLPROPERTIES ()").is_err()
+            super::lower_typed_iceberg_properties_action(&non_string)
+                .expect_err("legacy properties require string values")
+                .contains("string literal")
         );
     }
 
     #[test]
-    fn parse_set_duplicate_key_rejected() {
-        let res = parse_alter_iceberg_properties_sql(
-            "ALTER TABLE t SET TBLPROPERTIES ('a' = 'x', 'a' = 'y')",
+    fn lower_typed_partition_change_preserves_transform_validation() {
+        let action = typed_iceberg_action(
+            "ALTER TABLE ice.db.orders ADD PARTITION COLUMN bucket(User_Id, 32)",
         );
-        assert!(res.is_err());
-        assert!(res.unwrap_err().to_lowercase().contains("duplicate"));
-    }
-
-    #[test]
-    fn parse_unset_duplicate_key_rejected() {
-        let res =
-            parse_alter_iceberg_properties_sql("ALTER TABLE t UNSET TBLPROPERTIES ('a', 'a')");
-        assert!(res.is_err());
-        assert!(res.unwrap_err().to_lowercase().contains("duplicate"));
-    }
-
-    #[test]
-    fn parse_unquoted_key_rejected() {
-        // Keys must be string literals, not identifiers.
-        assert!(
-            parse_alter_iceberg_properties_sql("ALTER TABLE t SET TBLPROPERTIES (foo = 'bar')")
-                .is_err()
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // Table-level COMMENT tests
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn looks_like_table_comment() {
-        assert!(looks_like_alter_iceberg_properties(
-            "ALTER TABLE ice.db.t COMMENT 'my table'"
-        ));
-    }
-
-    #[test]
-    fn parse_table_comment() {
-        let stmt =
-            parse_alter_iceberg_properties_sql("ALTER TABLE ice.db.t COMMENT 'my table comment'")
-                .expect("parse");
-        assert_eq!(stmt.table.parts, vec!["ice", "db", "t"]);
-        let PropertiesOp::Set { entries } = stmt.op else {
-            panic!("expected Set op")
+        let novarocks_parser::ast::IcebergTableAction::Partition(change) = action else {
+            panic!("expected typed partition action");
         };
         assert_eq!(
-            entries,
-            vec![("comment".to_string(), "my table comment".to_string())]
+            super::lower_typed_iceberg_partition_change(&change).expect("lower partition"),
+            super::IcebergPartitionSpecChange::Add(super::ConnectorPartitionTransform::Bucket {
+                column: std::sync::Arc::from("user_id"),
+                num_buckets: 32,
+            },)
         );
-    }
 
-    #[test]
-    fn parse_table_comment_three_part_name() {
-        let stmt =
-            parse_alter_iceberg_properties_sql("ALTER TABLE cat.ns.tbl COMMENT 'hello world'")
-                .expect("parse");
-        assert_eq!(stmt.table.parts, vec!["cat", "ns", "tbl"]);
-        let PropertiesOp::Set { entries } = stmt.op else {
-            panic!("expected Set op")
+        let zero = typed_iceberg_action(
+            "ALTER TABLE ice.db.orders ADD PARTITION COLUMN bucket(user_id, 0)",
+        );
+        let novarocks_parser::ast::IcebergTableAction::Partition(zero) = zero else {
+            panic!("expected typed partition action");
         };
-        assert_eq!(entries[0].0, "comment");
-        assert_eq!(entries[0].1, "hello world");
-    }
-
-    #[test]
-    fn parse_table_comment_empty_string() {
-        let stmt = parse_alter_iceberg_properties_sql("ALTER TABLE t COMMENT ''").expect("parse");
-        let PropertiesOp::Set { entries } = stmt.op else {
-            panic!("expected Set op")
-        };
-        assert_eq!(entries, vec![("comment".to_string(), String::new())]);
-    }
-
-    #[test]
-    fn parse_table_comment_missing_literal_rejected() {
-        // COMMENT without a string literal must error.
-        assert!(parse_alter_iceberg_properties_sql("ALTER TABLE t COMMENT").is_err());
+        assert!(
+            super::lower_typed_iceberg_partition_change(&zero)
+                .expect_err("zero bucket count must fail")
+                .contains("must be positive")
+        );
     }
 }
 

@@ -50,6 +50,10 @@ use novarocks_spi::state_store::StateStore;
 use novarocks_state_store::coordination::WriteAdmission;
 use tokio::runtime::Handle;
 
+pub(crate) use self::admission::{
+    ParsedMaintenanceAction, ParsedMaintenanceStatement, ParsedShowOptimize,
+    is_typed_spark_maintenance_call, lower_typed_maintenance_statement, lower_typed_show_optimize,
+};
 use self::coordination::{
     MaintenanceAcquireOutcome, MaintenanceCoordination, MaintenanceFenceValidator,
     MaintenanceLeaseAttempt,
@@ -63,10 +67,6 @@ use self::model::{
     MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationKind,
     MetadataMaintenancePlanPayload, OptimizeJobCreate,
 };
-use self::parser::{
-    ParsedMaintenanceAction, ParsedMaintenanceStatement, is_spark_maintenance_call,
-    parse_maintenance_statement, parse_show_optimize,
-};
 use self::repository::{
     CleanupOperationRepository, DistributedRewriteOperationRepository,
     MetadataMaintenanceOperationRepository, OptimizeJobRepository, RepositoryErrorKind,
@@ -76,9 +76,9 @@ use self::repository::{
 use self::result::{action_result, optimize_jobs_result};
 use self::worker::OptimizeWorker;
 
+pub mod admission;
 pub mod coordination;
 pub mod model;
-pub mod parser;
 pub mod repository;
 pub mod result;
 pub mod worker;
@@ -200,6 +200,28 @@ impl FrontendTableMaintenanceService {
             worker: Mutex::new(WorkerLifecycle::NotStarted),
             runtime,
         })
+    }
+
+    /// Executes one parser-owned maintenance statement without accepting raw
+    /// command text. This test-facing composition helper keeps integration
+    /// coverage on the same typed lowering path as query admission.
+    pub fn execute_typed_statement(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+        statement: &novarocks_parser::ast::MaintenanceStatement,
+        context: MaintenanceRequestContext<'_>,
+    ) -> Result<MaintenanceStatementResult, String> {
+        match statement {
+            novarocks_parser::ast::MaintenanceStatement::ShowOptimize(statement) => {
+                self.handle_typed_show_optimize(lower_typed_show_optimize(statement)?, context)
+            }
+            _ => self.handle_typed_statement(
+                engine,
+                lower_typed_maintenance_statement(statement, context)?,
+                is_typed_spark_maintenance_call(statement),
+                context,
+            ),
+        }
     }
 
     /// Fail closed when a durable maintenance path runs without installed
@@ -1369,14 +1391,13 @@ impl FrontendTableMaintenanceService {
 
     fn show_optimize(
         &self,
-        sql: &str,
+        statement: ParsedShowOptimize,
         context: MaintenanceRequestContext<'_>,
     ) -> Result<MaintenanceStatementResult, String> {
         let repository = self
             .repository
             .as_ref()
             .ok_or_else(|| SHOW_STATE_STORE_REQUIRED.to_string())?;
-        let statement = parse_show_optimize(sql)?;
         let mut jobs = self
             .block_on(repository.list())
             .map_err(|error| format!("show frontend optimize jobs failed: {error}"))?;
@@ -2092,45 +2113,37 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         }
     }
 
-    fn try_handle_statement(
+    fn handle_typed_statement(
         &self,
         engine: &dyn TableMaintenanceEngine,
-        sql: &str,
+        statement: ParsedMaintenanceStatement,
+        spark_procedure: bool,
         context: MaintenanceRequestContext<'_>,
-    ) -> Result<Option<MaintenanceStatementResult>, String> {
-        let Some(statement) = parse_maintenance_statement(sql, context)? else {
-            return Ok(None);
-        };
-        let result = match statement {
+    ) -> Result<MaintenanceStatementResult, String> {
+        match statement {
             ParsedMaintenanceStatement::Execute { name_parts, action } => {
                 let target = engine.resolve_target(&name_parts, context)?;
-                self.execute_user_action(engine, target, action, is_spark_maintenance_call(sql))?
+                self.execute_user_action(engine, target, action, spark_procedure)
             }
             ParsedMaintenanceStatement::SubmitOptimize { name_parts } => {
                 if self.repository.is_none() {
                     return Err(OPTIMIZE_STATE_STORE_REQUIRED.to_string());
                 }
                 let target = engine.resolve_target(&name_parts, context)?;
-                self.submit_user_optimize(engine, target)?
+                self.submit_user_optimize(engine, target)
             }
-            ParsedMaintenanceStatement::ShowOptimize => self.show_optimize(sql, context)?,
-        };
-        Ok(Some(result))
+            ParsedMaintenanceStatement::ShowOptimize => Err(
+                "SHOW ALTER TABLE OPTIMIZE belongs to the read-only maintenance owner".to_string(),
+            ),
+        }
     }
 
-    fn try_handle_readonly_statement(
+    fn handle_typed_show_optimize(
         &self,
-        sql: &str,
+        statement: ParsedShowOptimize,
         context: MaintenanceRequestContext<'_>,
-    ) -> Result<Option<MaintenanceStatementResult>, String> {
-        let Some(statement) = parse_maintenance_statement(sql, context)? else {
-            return Ok(None);
-        };
-        match statement {
-            ParsedMaintenanceStatement::ShowOptimize => self.show_optimize(sql, context).map(Some),
-            ParsedMaintenanceStatement::Execute { .. }
-            | ParsedMaintenanceStatement::SubmitOptimize { .. } => Ok(None),
-        }
+    ) -> Result<MaintenanceStatementResult, String> {
+        self.show_optimize(statement, context)
     }
 
     fn execute_automatic_action(

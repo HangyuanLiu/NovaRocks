@@ -5,11 +5,49 @@
 
 //! Syntax-only SQL abstract syntax tree nodes.
 
+pub(crate) mod backend;
+pub(crate) mod catalog;
+pub(crate) mod command;
 mod expr;
+pub(crate) mod iceberg;
+pub(crate) mod maintenance;
+pub(crate) mod materialized_view;
+pub(crate) mod statistics;
 mod visit;
 
+pub use backend::{AddBackend, BackendStatement, DropBackend, ShowBackends};
+pub use catalog::{
+    CatalogProperty, CatalogStatement, CreateCatalog, CreateDatabase, DropCatalog, DropDatabase,
+    DropTable, ShowCreateTable, TruncateTable,
+};
+pub use command::{Property, PropertyKeyValue};
 pub use expr::{
     BinaryExpr, BinaryOperator, Expr, FunctionCall, NestedExpr, UnaryExpr, UnaryOperator,
+};
+pub use iceberg::{
+    AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
+    IcebergPartitionChange, IcebergPartitionField, IcebergPropertiesAction, IcebergReferenceAction,
+    IcebergReferenceKind, IcebergSchemaChange, IcebergStatement, IcebergTableAction,
+    RawReferenceOptions, ReferenceAnchor,
+};
+pub use maintenance::{
+    CallStatement, ExpireSnapshots, ExpireSnapshotsOption, MaintenanceStatement, MaintenanceValue,
+    OptimizeTable, ProcedureArgument, ProcedureArgumentMode, ProcedureMap, ProcedureMapEntry,
+    RemoveOrphanFiles, RewriteManifests, ShowAlterTableOptimize, ShowOptimizeFilter,
+    ShowOptimizeOrder, SortDirection,
+};
+pub use materialized_view::{
+    AlterMaterializedView, CreateMaterializedView, DropMaterializedView,
+    ExplainRefreshMaterializedView, MaterializedViewAlterAction, MaterializedViewDistribution,
+    MaterializedViewExplainLevel, MaterializedViewPartitionArgument,
+    MaterializedViewPartitionField, MaterializedViewProperty, MaterializedViewRefreshMode,
+    MaterializedViewRefreshPolicy, MaterializedViewStatement, RefreshMaterializedView,
+    ShowMaterializedViews,
+};
+pub use statistics::{
+    AnalyzeMode, AnalyzeTable, CancelAnalyze, DropHistogram, DropMultipleColumnsStats, DropStats,
+    ShowAnalyzeJobs, ShowBasicStatsMeta, ShowHistogramStatsMeta, ShowTableStats,
+    StatisticsStatement,
 };
 pub use visit::{
     Fold, Visit, fold_binary_expr, fold_expr, fold_function_call, fold_ident, fold_literal,
@@ -24,23 +62,27 @@ use crate::Span;
 /// A top-level SQL statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
-    ShowBackends(ShowBackends),
+    Backend(BackendStatement),
+    Statistics(StatisticsStatement),
+    Catalog(CatalogStatement),
+    Iceberg(IcebergStatement),
+    Maintenance(MaintenanceStatement),
+    MaterializedView(MaterializedViewStatement),
     RawQuery(RawQuerySlice),
 }
 
 impl Statement {
     pub const fn span(&self) -> Span {
         match self {
-            Self::ShowBackends(statement) => statement.span,
+            Self::Backend(statement) => statement.span(),
+            Self::Statistics(statement) => statement.span(),
+            Self::Catalog(statement) => statement.span(),
+            Self::Iceberg(statement) => statement.span(),
+            Self::Maintenance(statement) => statement.span(),
+            Self::MaterializedView(statement) => statement.span(),
             Self::RawQuery(query) => query.span,
         }
     }
-}
-
-/// The initial vertical-slice statement family: `SHOW BACKENDS`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ShowBackends {
-    pub span: Span,
 }
 
 /// An SQL identifier preserving its source spelling.
@@ -62,6 +104,23 @@ pub struct ObjectName {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypeName {
     pub name: ObjectName,
+    pub arguments: Vec<TypeNameArgument>,
+    pub span: Span,
+}
+
+/// A type parameter retained without lowering it into an execution type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypeNameArgument {
+    Type(TypeName),
+    Literal(Literal),
+    Field(StructField),
+}
+
+/// One named field in a `STRUCT<...>` type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StructField {
+    pub name: Ident,
+    pub data_type: TypeName,
     pub span: Span,
 }
 
@@ -114,6 +173,7 @@ mod tests {
         };
         let type_name = TypeName {
             name: name.clone(),
+            arguments: Vec::new(),
             span: span(0, 7),
         };
         let literal = Literal {
@@ -121,7 +181,9 @@ mod tests {
             span: span(8, 10),
         };
         let expression = Expr::Literal(literal.clone());
-        let statement = Statement::ShowBackends(ShowBackends { span: span(11, 24) });
+        let statement = Statement::Backend(BackendStatement::ShowBackends(ShowBackends {
+            span: span(11, 24),
+        }));
         let raw_query = RawQuerySlice {
             text: "SELECT 42".to_owned(),
             span: span(25, 34),

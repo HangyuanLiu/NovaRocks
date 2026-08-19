@@ -45,15 +45,19 @@ pub struct TruncateCommand {
     pub target_ref: String,
 }
 
-/// Recognize and validate the syntax of one `TRUNCATE TABLE` command without
-/// resolving its catalog or performing any connector operation.
-pub fn parse_truncate_command(sql: &str) -> Result<Option<TruncateCommand>, String> {
-    novarocks_sql::planning::dml::parse_truncate_command(sql).map(|command| {
-        command.map(|command| TruncateCommand {
-            target_parts: command.target_parts,
-            target_ref: command.target_ref,
-        })
-    })
+/// Lowers the parser-owned TRUNCATE syntax into the mutation lifecycle input.
+pub fn command_from_typed_statement(
+    statement: &novarocks_parser::ast::TruncateTable,
+) -> TruncateCommand {
+    TruncateCommand {
+        target_parts: statement
+            .name
+            .parts
+            .iter()
+            .map(|part| part.value.clone())
+            .collect(),
+        target_ref: statement.target_ref.clone(),
+    }
 }
 
 pub struct PlanTruncateRequest {
@@ -194,8 +198,6 @@ pub enum TruncateOutcome {
 
 /// One-to-one core capability used only by the frontend TRUNCATE owner.
 pub trait TruncateEngine: Send + Sync {
-    fn classify_truncate(&self, sql: &str) -> Result<Option<TruncateCommand>, String>;
-
     fn plan_truncate(
         &self,
         request: PlanTruncateRequest,
@@ -263,10 +265,6 @@ impl TruncateEngine for DmlExecutionKernel {
             ))
         })?;
         session.establish_external_fence(fence)
-    }
-
-    fn classify_truncate(&self, sql: &str) -> Result<Option<TruncateCommand>, String> {
-        parse_truncate_command(sql)
     }
 
     fn plan_truncate(
@@ -609,24 +607,6 @@ fn contract_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn classifier_is_side_effect_free_and_preserves_branch() {
-        assert_eq!(parse_truncate_command("SELECT 1").unwrap(), None);
-        assert_eq!(
-            parse_truncate_command("TRUNCATE TABLE ice.db.orders.branch_dev").unwrap(),
-            Some(TruncateCommand {
-                target_parts: vec!["ice".into(), "db".into(), "orders".into()],
-                target_ref: "dev".into(),
-            })
-        );
-    }
-
-    #[test]
-    fn classifier_rejects_read_only_and_partial_forms() {
-        assert!(parse_truncate_command("TRUNCATE TABLE ice.db.orders.tag_v1").is_err());
-        assert!(parse_truncate_command("TRUNCATE TABLE ice.db.orders PARTITION (p1)").is_err());
-    }
 
     #[test]
     fn reverse_port_is_object_safe() {

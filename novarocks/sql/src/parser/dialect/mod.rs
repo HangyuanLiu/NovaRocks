@@ -15,15 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod add_files;
-pub(crate) mod alter_iceberg_ref;
-pub(crate) mod backend;
-pub(crate) mod create_catalog;
 pub(crate) mod create_table;
-pub(crate) mod drop;
-pub(crate) mod materialized_view;
-pub(crate) mod statistics;
-pub(crate) mod truncate;
 
 use sqlparser::ast as sqlast;
 use sqlparser::keywords::Keyword;
@@ -278,43 +270,11 @@ fn parse_custom_decimal_modifiers(modifiers: &[String]) -> (u8, i8) {
 // Token-level lookahead helpers (moved from sqlparser_backend)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn looks_like_create_catalog(parser: &Parser<'_>) -> bool {
-    parser.peek_keyword(Keyword::CREATE)
-        && ((peek_word_eq(parser, 1, "EXTERNAL") && peek_word_eq(parser, 2, "CATALOG"))
-            || peek_word_eq(parser, 1, "CATALOG"))
-}
-
 pub(crate) fn looks_like_create_table(parser: &Parser<'_>) -> bool {
     parser.peek_keyword(Keyword::CREATE)
         && (peek_word_eq(parser, 1, "TABLE")
             || (peek_word_eq(parser, 1, "TEMPORARY") && peek_word_eq(parser, 2, "TABLE"))
             || (peek_word_eq(parser, 1, "EXTERNAL") && peek_word_eq(parser, 2, "TABLE")))
-}
-
-pub(crate) fn looks_like_create_database(parser: &Parser<'_>) -> bool {
-    parser.peek_keyword(Keyword::CREATE) && peek_word_eq(parser, 1, "DATABASE")
-}
-
-pub(crate) fn looks_like_drop_statement(parser: &Parser<'_>) -> bool {
-    parser.peek_keyword(Keyword::DROP)
-        && (peek_word_eq(parser, 1, "TABLE")
-            || peek_word_eq(parser, 1, "DATABASE")
-            || peek_word_eq(parser, 1, "CATALOG"))
-}
-
-/// Parse a CREATE DATABASE statement and return just the database name.
-pub(crate) fn parse_create_database_name(
-    parser: &mut Parser<'_>,
-) -> Result<(ObjectName, bool), String> {
-    parser
-        .expect_keyword(Keyword::CREATE)
-        .map_err(|e| e.to_string())?;
-    parser
-        .expect_keyword(Keyword::DATABASE)
-        .map_err(|e| e.to_string())?;
-    let if_not_exists = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
-    let name = convert_object_name(parser.parse_object_name(false).map_err(|e| e.to_string())?)?;
-    Ok((name, if_not_exists))
 }
 
 // ---------------------------------------------------------------------------

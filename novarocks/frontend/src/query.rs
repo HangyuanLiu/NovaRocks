@@ -58,6 +58,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
+use novarocks_parser::ast::Statement as ParsedStatement;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_types::{ClusterRole, EngineErrorCode};
 use tokio::task;
@@ -72,12 +73,21 @@ pub(crate) mod compiler;
 const DEFAULT_CATALOG: &str = "default_catalog";
 
 pub trait CoreCommandRoute: Send + Sync {
-    fn execute(
+    fn execute_legacy(
         &self,
         sql: &str,
         context: &RequestContext,
         query_options: QueryOptions,
     ) -> Result<StatementResult, String>;
+
+    fn execute_typed(
+        &self,
+        _statement: &ParsedStatement,
+        _context: &RequestContext,
+        _query_options: QueryOptions,
+    ) -> Result<StatementResult, String> {
+        Err("typed command route is unavailable".to_string())
+    }
 }
 
 #[derive(Clone)]
@@ -117,7 +127,7 @@ impl TypedCommandRoute {
 }
 
 impl CoreCommandRoute for TypedCommandRoute {
-    fn execute(
+    fn execute_legacy(
         &self,
         sql: &str,
         context: &RequestContext,
@@ -127,77 +137,161 @@ impl CoreCommandRoute for TypedCommandRoute {
             Some(&query_options),
             context.execution().cancellation().clone(),
         )?;
-        match self.catalog.try_execute(
+        if let Some(result) = self.catalog.try_execute(
             sql,
             context.session().current_catalog(),
             context.session().current_database(),
             &connector_context,
         )? {
-            Some(result) => Ok(result),
-            None => match self.statistics.try_execute(
-                sql,
+            return Ok(result);
+        }
+        if let Some(result) = self.view.try_execute(
+            sql,
+            context.session().current_catalog(),
+            context.session().current_database(),
+            &connector_context,
+        )? {
+            return Ok(result);
+        }
+        Err("unsupported SQL command for the frontend capability router".to_string())
+    }
+
+    fn execute_typed(
+        &self,
+        statement: &ParsedStatement,
+        context: &RequestContext,
+        query_options: QueryOptions,
+    ) -> Result<StatementResult, String> {
+        match statement {
+            ParsedStatement::Backend(statement) => {
+                self.backend.execute(statement, context.execution().role())
+            }
+            ParsedStatement::Statistics(statement) => self.statistics.execute(
+                statement,
                 context.session().current_catalog(),
                 context.session().current_database(),
                 Some(context.execution()),
-            )? {
-                Some(result) => Ok(result),
-                None => match self.backend.try_execute(sql, context.execution().role())? {
-                    Some(result) => Ok(result),
-                    None => match self.view.try_execute(
-                        sql,
-                        context.session().current_catalog(),
-                        context.session().current_database(),
-                        &connector_context,
-                    )? {
-                        Some(result) => Ok(result),
-                        None => match self.iceberg_ref.try_execute(
-                            sql,
-                            context.session().current_database(),
-                            &connector_context,
-                        )? {
-                            Some(result) => Ok(result),
-                            None => match self.mv.try_execute(
-                                sql,
-                                context.session().current_catalog(),
-                                context.session().current_database(),
-                                &connector_context,
-                                context.execution(),
-                            )? {
-                                Some(result) => Ok(result),
-                                None => match self.maintenance.try_execute(
-                                    sql,
-                                    context.session().current_catalog(),
-                                    context.session().current_database(),
-                                    context.execution(),
-                                    &connector_context,
-                                )? {
-                                    Some(result) => Ok(result),
-                                    None => match self.maintenance_read.try_execute(
-                                        sql,
-                                        context.session().current_catalog(),
-                                        context.session().current_database(),
-                                    )? {
-                                        Some(result) => Ok(result),
-                                        None => Err("unsupported SQL command for the frontend capability router".to_string()),
-                                    },
-                                },
-                            },
-                        },
-                    },
-                },
-            },
+            ),
+            ParsedStatement::Catalog(novarocks_parser::ast::CatalogStatement::DropDatabase(
+                statement,
+            )) if context.session().current_catalog().is_none()
+                && statement.name.parts.len() == 1 =>
+            {
+                self.view
+                    .drop_database(DEFAULT_CATALOG, &statement.name.parts[0].value)?;
+                Ok(StatementResult::Ok)
+            }
+            ParsedStatement::Catalog(statement) => {
+                let connector_context = crate::connector::connector_request_context_for_query(
+                    Some(&query_options),
+                    context.execution().cancellation().clone(),
+                )?;
+                self.catalog.execute_typed(
+                    statement,
+                    context.session().current_catalog(),
+                    context.session().current_database(),
+                    &connector_context,
+                )
+            }
+            ParsedStatement::Iceberg(novarocks_parser::ast::IcebergStatement::AlterTable(
+                statement,
+            )) if matches!(
+                &statement.action,
+                novarocks_parser::ast::IcebergTableAction::Reference(_)
+            ) =>
+            {
+                let connector_context = crate::connector::connector_request_context_for_query(
+                    Some(&query_options),
+                    context.execution().cancellation().clone(),
+                )?;
+                self.iceberg_ref.execute(
+                    statement,
+                    context.session().current_database(),
+                    &connector_context,
+                )
+            }
+            ParsedStatement::Iceberg(novarocks_parser::ast::IcebergStatement::AlterTable(
+                statement,
+            )) => {
+                let connector_context = crate::connector::connector_request_context_for_query(
+                    Some(&query_options),
+                    context.execution().cancellation().clone(),
+                )?;
+                self.catalog.execute_iceberg_typed(
+                    statement,
+                    context.session().current_catalog(),
+                    context.session().current_database(),
+                    &connector_context,
+                )
+            }
+            ParsedStatement::Maintenance(
+                novarocks_parser::ast::MaintenanceStatement::ShowOptimize(statement),
+            ) => self.maintenance_read.execute(
+                statement,
+                context.session().current_catalog(),
+                context.session().current_database(),
+            ),
+            ParsedStatement::Maintenance(novarocks_parser::ast::MaintenanceStatement::Call(
+                statement,
+            )) => {
+                let connector_context = crate::connector::connector_request_context_for_query(
+                    Some(&query_options),
+                    context.execution().cancellation().clone(),
+                )?;
+                if let Some(result) = self.mv.try_execute_typed_call(
+                    statement,
+                    context.session().current_database(),
+                    &connector_context,
+                )? {
+                    return Ok(result);
+                }
+                self.maintenance.execute(
+                    &novarocks_parser::ast::MaintenanceStatement::Call(statement.clone()),
+                    context.session().current_catalog(),
+                    context.session().current_database(),
+                    context.execution(),
+                    &connector_context,
+                )
+            }
+            ParsedStatement::Maintenance(statement) => {
+                let connector_context = crate::connector::connector_request_context_for_query(
+                    Some(&query_options),
+                    context.execution().cancellation().clone(),
+                )?;
+                self.maintenance.execute(
+                    statement,
+                    context.session().current_catalog(),
+                    context.session().current_database(),
+                    context.execution(),
+                    &connector_context,
+                )
+            }
+            ParsedStatement::MaterializedView(statement) => {
+                let connector_context = crate::connector::connector_request_context_for_query(
+                    Some(&query_options),
+                    context.execution().cancellation().clone(),
+                )?;
+                self.mv.execute(
+                    statement,
+                    context.session().current_catalog(),
+                    context.session().current_database(),
+                    &connector_context,
+                    context.execution(),
+                )
+            }
+            ParsedStatement::RawQuery(_) => {
+                Err("statement was admitted before its command-family owner cut".to_string())
+            }
         }
     }
 }
 
-fn execute_frontend_command<C, T, A>(
+fn execute_frontend_command<C>(
     dml: &DmlService,
     insert_engine: &dyn InsertEngine,
     delete_engine: &dyn DeleteEngine,
     mutation_engine: Option<&dyn MutationEngine>,
     ctas_route: C,
-    truncate_route: T,
-    add_files_route: A,
     command: &dyn CoreCommandRoute,
     sql: &str,
     context: &RequestContext,
@@ -205,8 +299,6 @@ fn execute_frontend_command<C, T, A>(
 ) -> Result<StatementResult, String>
 where
     C: FnOnce(&str, &RequestContext, &QueryOptions) -> Result<Option<()>, crate::dml::DmlError>,
-    T: FnOnce(&str, &RequestContext, &QueryOptions) -> Result<Option<()>, crate::dml::DmlError>,
-    A: FnOnce(&str, &RequestContext, &QueryOptions) -> Result<Option<u32>, crate::dml::DmlError>,
 {
     match dml.try_execute_insert(insert_engine, sql, context, Some(&query_options)) {
         Ok(Some(())) => Ok(StatementResult::Ok),
@@ -230,17 +322,7 @@ where
                         Ok(Some(())) => Ok(StatementResult::Ok),
                         Ok(None) => match ctas_route(sql, context, &query_options) {
                             Ok(Some(())) => Ok(StatementResult::Ok),
-                            Ok(None) => match truncate_route(sql, context, &query_options) {
-                                Ok(Some(())) => Ok(StatementResult::Ok),
-                                Ok(None) => match add_files_route(sql, context, &query_options) {
-                                    Ok(Some(file_count)) => {
-                                        add_files_status(file_count).map(StatementResult::Query)
-                                    }
-                                    Ok(None) => command.execute(sql, context, query_options),
-                                    Err(error) => Err(error.to_string()),
-                                },
-                                Err(error) => Err(error.to_string()),
-                            },
+                            Ok(None) => command.execute_legacy(sql, context, query_options),
                             Err(error) => Err(error.to_string()),
                         },
                         Err(error) => Err(error.to_string()),
@@ -249,17 +331,7 @@ where
                 },
                 None => match ctas_route(sql, context, &query_options) {
                     Ok(Some(())) => Ok(StatementResult::Ok),
-                    Ok(None) => match truncate_route(sql, context, &query_options) {
-                        Ok(Some(())) => Ok(StatementResult::Ok),
-                        Ok(None) => match add_files_route(sql, context, &query_options) {
-                            Ok(Some(file_count)) => {
-                                add_files_status(file_count).map(StatementResult::Query)
-                            }
-                            Ok(None) => command.execute(sql, context, query_options),
-                            Err(error) => Err(error.to_string()),
-                        },
-                        Err(error) => Err(error.to_string()),
-                    },
+                    Ok(None) => command.execute_legacy(sql, context, query_options),
                     Err(error) => Err(error.to_string()),
                 },
             },
@@ -645,6 +717,24 @@ impl FrontendQuerySession {
             .collect::<Vec<_>>();
         let sql = novarocks_sql::syntax::substitute_user_variables(&sql, &assignments)
             .map_err(classify_engine_error)?;
+        let (admission, parsed_statements) =
+            crate::query_execution::statement_admission::admit_statement(&sql)
+                .map_err(QueryServiceError::from_user_error)?;
+        let parsed_statement = match admission {
+            crate::query_execution::statement_admission::StatementAdmission::Parsed => {
+                let [statement] = parsed_statements.as_slice() else {
+                    return Err(QueryServiceError::new(
+                        QueryServiceErrorKind::Parse,
+                        "command admission requires exactly one statement",
+                    ));
+                };
+                Some(statement.clone())
+            }
+            crate::query_execution::statement_admission::StatementAdmission::LegacyFrontier
+            | crate::query_execution::statement_admission::StatementAdmission::DeferredFamily => {
+                None
+            }
+        };
         let token = self.token()?;
         let mut active = self
             .service
@@ -710,9 +800,47 @@ impl FrontendQuerySession {
             state.execution_settings.query_options(),
             novarocks_sql::syntax::extract_allow_throw_exception_hint(&sql),
         );
-        let is_query = is_query_statement(&sql);
+        let is_query = parsed_statement.is_none() && is_query_statement(&sql);
         let mut worker = task::spawn_blocking(move || {
-            let result = if is_query {
+            let result = if let Some(statement) = parsed_statement {
+                if let ParsedStatement::Catalog(
+                    novarocks_parser::ast::CatalogStatement::TruncateTable(statement),
+                ) = &statement
+                {
+                    dml.execute_truncate(
+                        truncate_engine.as_ref(),
+                        crate::query_execution::dml::truncate::command_from_typed_statement(
+                            statement,
+                        ),
+                        &context,
+                        Some(&query_options),
+                    )
+                    .map(|()| StatementResult::Ok)
+                    .map_err(|error| error.to_string())
+                } else if let ParsedStatement::Iceberg(
+                    novarocks_parser::ast::IcebergStatement::AlterTable(iceberg_statement),
+                ) = &statement
+                {
+                    match crate::query_execution::dml::add_files::command_from_typed_statement(
+                        iceberg_statement,
+                    ) {
+                        Ok(command) => dml
+                            .execute_add_files(
+                                add_files_engine.as_ref(),
+                                command,
+                                &context,
+                                Some(&query_options),
+                            )
+                            .map_err(|error| error.to_string())
+                            .and_then(|count| add_files_status(count).map(StatementResult::Query)),
+                        Err(_) => {
+                            command_executor.execute_typed(&statement, &context, query_options)
+                        }
+                    }
+                } else {
+                    command_executor.execute_typed(&statement, &context, query_options)
+                }
+            } else if is_query {
                 compiler
                     .prepare(&sql, &context, Some(query_options))
                     .and_then(|operation| execute_prepared_query(operation, &query_execution))
@@ -725,22 +853,6 @@ impl FrontendQuerySession {
                     |sql, context, query_options| {
                         dml.try_execute_ctas(
                             ctas_engine.as_ref(),
-                            sql,
-                            context,
-                            Some(query_options),
-                        )
-                    },
-                    |sql, context, query_options| {
-                        dml.try_execute_truncate(
-                            truncate_engine.as_ref(),
-                            sql,
-                            context,
-                            Some(query_options),
-                        )
-                    },
-                    |sql, context, query_options| {
-                        dml.try_execute_add_files(
-                            add_files_engine.as_ref(),
                             sql,
                             context,
                             Some(query_options),
@@ -1106,6 +1218,9 @@ fn parse_kill_query(sql: &str) -> Result<Option<u32>, QueryServiceError> {
         return Ok(None);
     }
     let second = words.next();
+    if second.is_some_and(|word| word.eq_ignore_ascii_case("analyze")) {
+        return Ok(None);
+    }
     let target = match second {
         Some(word) if word.eq_ignore_ascii_case("query") => words.next(),
         Some(word) => Some(word),
@@ -1477,7 +1592,7 @@ mod tests {
     }
 
     impl CoreCommandRoute for RecordingCoreCommand {
-        fn execute(
+        fn execute_legacy(
             &self,
             _sql: &str,
             context: &RequestContext,
@@ -1572,22 +1687,6 @@ mod tests {
         Ok(None)
     }
 
-    fn not_truncate(
-        _sql: &str,
-        _context: &RequestContext,
-        _query_options: &QueryOptions,
-    ) -> Result<Option<()>, crate::dml::DmlError> {
-        Ok(None)
-    }
-
-    fn not_add_files(
-        _sql: &str,
-        _context: &RequestContext,
-        _query_options: &QueryOptions,
-    ) -> Result<Option<u32>, crate::dml::DmlError> {
-        Ok(None)
-    }
-
     #[test]
     fn sqlx2_application_frontend_router_handles_insert_before_core_command() {
         let engine = RecordingInsertEngine::default();
@@ -1607,8 +1706,6 @@ mod tests {
             &delete_engine,
             None,
             not_ctas,
-            not_truncate,
-            not_add_files,
             &command,
             "INSERT INTO t VALUES (1)",
             &context,
@@ -1640,8 +1737,6 @@ mod tests {
             &delete_engine,
             None,
             not_ctas,
-            not_truncate,
-            not_add_files,
             &command,
             "INSERT INTO t VALUES (1)",
             &context,
@@ -1677,8 +1772,6 @@ mod tests {
             &delete_engine,
             None,
             not_ctas,
-            not_truncate,
-            not_add_files,
             &command,
             "DELETE FROM t WHERE a = 1",
             &context,
@@ -1717,8 +1810,6 @@ mod tests {
             &delete_engine,
             None,
             not_ctas,
-            not_truncate,
-            not_add_files,
             &command,
             "CREATE DATABASE db2",
             &context,
@@ -1746,7 +1837,6 @@ mod tests {
         let context =
             router_test_context(92, Instant::now() + Duration::from_secs(30), &cancellation);
         let ctas_calls = AtomicUsize::new(0);
-        let truncate_calls = AtomicUsize::new(0);
 
         execute_frontend_command(
             &dml,
@@ -1757,11 +1847,6 @@ mod tests {
                 ctas_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Some(()))
             },
-            |_, _, _| {
-                truncate_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(None)
-            },
-            not_add_files,
             &command,
             "CREATE TABLE ice.db.dst AS SELECT 1",
             &context,
@@ -1770,7 +1855,6 @@ mod tests {
         .expect("frontend CTAS route");
 
         assert_eq!(ctas_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(truncate_calls.load(Ordering::SeqCst), 0);
         assert_eq!(command.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1792,8 +1876,6 @@ mod tests {
             &delete,
             None,
             |_, _, _| Err(crate::dml::DmlError::executor("CTAS failed")),
-            |_, _, _| panic!("TRUNCATE route must not follow a CTAS error"),
-            not_add_files,
             &command,
             "CREATE TABLE ice.db.dst AS SELECT 1",
             &context,
@@ -1803,27 +1885,10 @@ mod tests {
 
         assert!(error.contains("CTAS failed"));
         assert_eq!(command.calls.load(Ordering::SeqCst), 0);
-
-        let error = execute_frontend_command(
-            &dml,
-            &insert,
-            &delete,
-            None,
-            |_, _, _| Ok(None),
-            |_, _, _| Err(crate::dml::DmlError::executor("TRUNCATE failed")),
-            not_add_files,
-            &command,
-            "TRUNCATE TABLE ice.db.dst",
-            &context,
-            default_query_options(),
-        )
-        .unwrap_err();
-        assert!(error.contains("TRUNCATE failed"));
-        assert_eq!(command.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn frontend_router_add_files_returns_status_and_never_falls_back() {
+    fn legacy_frontend_router_does_not_claim_add_files() {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
@@ -1841,33 +1906,14 @@ mod tests {
             &delete,
             None,
             not_ctas,
-            not_truncate,
-            |_, _, _| Ok(Some(7)),
             &command,
             "ALTER TABLE ice.db.dst ADD FILES FROM 's3://warehouse/staged'",
             &context,
             default_query_options(),
         )
-        .expect("ADD FILES frontend route");
-        assert!(matches!(result, StatementResult::Query(_)));
-        assert_eq!(command.calls.load(Ordering::SeqCst), 0);
-
-        let error = execute_frontend_command(
-            &dml,
-            &insert,
-            &delete,
-            None,
-            not_ctas,
-            not_truncate,
-            |_, _, _| Err(crate::dml::DmlError::executor("ADD FILES failed")),
-            &command,
-            "ALTER TABLE ice.db.dst ADD FILES FROM 's3://warehouse/staged'",
-            &context,
-            default_query_options(),
-        )
-        .unwrap_err();
-        assert!(error.contains("ADD FILES failed"));
-        assert_eq!(command.calls.load(Ordering::SeqCst), 0);
+        .expect("legacy router delegates unadmitted ADD FILES");
+        assert!(matches!(result, StatementResult::Ok));
+        assert_eq!(command.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1894,8 +1940,6 @@ mod tests {
                 &delete,
                 Some(&mutation),
                 not_ctas,
-                not_truncate,
-                not_add_files,
                 &command,
                 sql,
                 &context,
@@ -1911,7 +1955,7 @@ mod tests {
     }
 
     #[test]
-    fn frontend_router_runs_truncate_before_fallback() {
+    fn frontend_router_never_probes_raw_truncate_after_typed_admission() {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
@@ -1923,7 +1967,6 @@ mod tests {
         let context =
             router_test_context(94, Instant::now() + Duration::from_secs(30), &cancellation);
         let ctas_calls = AtomicUsize::new(0);
-        let truncate_calls = AtomicUsize::new(0);
 
         execute_frontend_command(
             &dml,
@@ -1934,21 +1977,15 @@ mod tests {
                 ctas_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(None)
             },
-            |_, _, _| {
-                truncate_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(Some(()))
-            },
-            not_add_files,
             &command,
             "TRUNCATE TABLE ice.db.dst",
             &context,
             default_query_options(),
         )
-        .expect("frontend TRUNCATE route");
+        .expect("legacy helper must not own TRUNCATE");
 
         assert_eq!(ctas_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(truncate_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(command.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(command.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

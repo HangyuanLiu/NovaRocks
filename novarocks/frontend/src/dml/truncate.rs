@@ -80,23 +80,15 @@ struct DurableTruncateFailureV1<'a> {
 }
 
 impl DmlService {
-    /// Recognize and execute one `TRUNCATE TABLE` through the frontend durable
-    /// direct-mutation owner.
-    ///
-    /// `Ok(None)` is reserved for non-TRUNCATE SQL. Once classified, every
-    /// failure is terminal for routing and carries the durable operation ID and
-    /// a typed recovery action.
-    pub fn try_execute_truncate(
+    /// Executes one already-admitted typed TRUNCATE command through the
+    /// durable direct-mutation lifecycle.
+    pub fn execute_truncate(
         &self,
         engine: &dyn TruncateEngine,
-        sql: &str,
+        command: TruncateCommand,
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
-    ) -> Result<Option<()>, DmlError> {
-        let Some(command) = engine.classify_truncate(sql).map_err(DmlError::executor)? else {
-            return Ok(None);
-        };
-
+    ) -> Result<(), DmlError> {
         let operation_id = DmlOperationId::new_v7();
         let connector_operation_id = Uuid::now_v7();
         let session = context.session();
@@ -141,8 +133,7 @@ impl DmlService {
             &mut active,
         );
         let _ = active.release();
-        result?;
-        Ok(Some(()))
+        result
     }
 }
 

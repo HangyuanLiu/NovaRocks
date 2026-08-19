@@ -69,6 +69,7 @@ pub mod read_session;
 pub(crate) mod row_mutation;
 pub(crate) mod schedule;
 pub mod service;
+pub(crate) mod statement_admission;
 pub mod statistics;
 pub(crate) mod terminal_codec;
 pub mod terminal_set;

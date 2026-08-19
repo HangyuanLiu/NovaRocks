@@ -29,9 +29,6 @@ pub(crate) mod iceberg;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use sqlparser::keywords::Keyword;
-use sqlparser::parser::Parser;
-
 use crate::common::query_cancellation::QueryCancellationView;
 use crate::connector::cleanup_maintenance::{CleanupBatchExecution, CleanupMaintenanceSession};
 use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
@@ -52,7 +49,6 @@ use novarocks_spi::connector::{
     ConnectorWriteCohortId, ConnectorWriteInputShape, ConnectorWriteReceipt,
     ExternalMutationEvidence, ExternalMutationOutcome, PreparedBatch,
 };
-use novarocks_sql::syntax::StarRocksDialect;
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";
 
@@ -645,22 +641,27 @@ pub trait TableMaintenanceEngine: Send + Sync {
 pub trait TableMaintenanceService: Send + Sync {
     fn start(&self, engine: Arc<dyn TableMaintenanceEngine>) -> Result<(), String>;
 
-    fn try_handle_statement(
+    /// Executes one already-lowered maintenance write statement. The parser
+    /// owner has consumed SQL syntax before this boundary, so implementations
+    /// must not reparse or probe raw source text.
+    fn handle_typed_statement(
         &self,
-        engine: &dyn TableMaintenanceEngine,
-        sql: &str,
-        context: MaintenanceRequestContext<'_>,
-    ) -> Result<Option<MaintenanceStatementResult>, String>;
-
-    /// Execute the read-only maintenance subset without manufacturing a
-    /// `TableMaintenanceEngine`.  Durable command writes keep their explicit
-    /// engine and request execution context.
-    fn try_handle_readonly_statement(
-        &self,
-        _sql: &str,
+        _engine: &dyn TableMaintenanceEngine,
+        _statement: crate::table_maintenance::ParsedMaintenanceStatement,
+        _spark_procedure: bool,
         _context: MaintenanceRequestContext<'_>,
-    ) -> Result<Option<MaintenanceStatementResult>, String> {
-        Ok(None)
+    ) -> Result<MaintenanceStatementResult, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    /// Executes the read-only typed `SHOW ALTER TABLE OPTIMIZE` presentation
+    /// without creating a maintenance engine or re-entering a raw parser.
+    fn handle_typed_show_optimize(
+        &self,
+        _statement: crate::table_maintenance::ParsedShowOptimize,
+        _context: MaintenanceRequestContext<'_>,
+    ) -> Result<MaintenanceStatementResult, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 
     fn execute_automatic_action(
@@ -1767,49 +1768,6 @@ fn rewrite_sink_mode(
         ConnectorWriteInputShape::EqualityDelete { .. } => {
             Ok(novarocks_sql::planning::dml::DmlWriteSinkMode::EqualityDeletes)
         }
-    }
-}
-
-pub(crate) fn looks_like_maintenance_statement(sql: &str) -> bool {
-    if novarocks_sql::syntax::looks_like_call_procedure(sql) {
-        return true;
-    }
-    let Ok(normalized) = novarocks_sql::syntax::normalize_for_raw_parse(sql) else {
-        return false;
-    };
-    let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
-        return false;
-    };
-    if parser.parse_keyword(Keyword::SHOW) {
-        return parser.parse_keyword(Keyword::ALTER)
-            && parser.parse_keyword(Keyword::TABLE)
-            && consume_word(&mut parser, "OPTIMIZE");
-    }
-    if !parser.parse_keyword(Keyword::ALTER) || !parser.parse_keyword(Keyword::TABLE) {
-        return false;
-    }
-    if parser.parse_object_name(false).is_err() {
-        return false;
-    }
-    consume_word(&mut parser, "OPTIMIZE")
-        || (consume_word(&mut parser, "REWRITE") && consume_word(&mut parser, "MANIFESTS"))
-        || (consume_word(&mut parser, "EXPIRE") && consume_word(&mut parser, "SNAPSHOTS"))
-        || (consume_word(&mut parser, "REMOVE")
-            && consume_word(&mut parser, "ORPHAN")
-            && consume_word(&mut parser, "FILES"))
-}
-
-fn consume_word(parser: &mut Parser<'_>, expected: &str) -> bool {
-    if parser
-        .peek_token()
-        .token
-        .to_string()
-        .eq_ignore_ascii_case(expected)
-    {
-        parser.next_token();
-        true
-    } else {
-        false
     }
 }
 

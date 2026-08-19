@@ -19,6 +19,7 @@
 
 use crate::query_execution::kernels::BackendManagementKernel;
 use crate::runtime::statement_result::StatementResult;
+use novarocks_parser::ast::{BackendStatement, LiteralKind};
 use novarocks_types::ClusterRole;
 
 #[derive(Clone)]
@@ -41,29 +42,33 @@ impl BackendCommandExecutor {
         Self { kernel }
     }
 
-    pub fn try_execute(
+    pub fn execute(
         &self,
-        sql: &str,
+        statement: &BackendStatement,
         role: ClusterRole,
-    ) -> Result<Option<StatementResult>, String> {
-        match novarocks_sql::syntax::parse_backend_management_command(sql)? {
-            Some(novarocks_sql::syntax::BackendManagementCommand::Add { address }) => {
+    ) -> Result<StatementResult, String> {
+        match statement {
+            BackendStatement::AddBackend(statement) => {
                 require_backend_management_role("ADD BACKEND", role)?;
+                let address = string_literal(&statement.address)?;
                 let endpoint = address
                     .parse()
                     .map_err(|error| format!("invalid backend address '{address}': {error}"))?;
                 self.kernel.topology().add_backend(endpoint)?;
-                Ok(Some(StatementResult::Ok))
+                Ok(StatementResult::Ok)
             }
-            Some(novarocks_sql::syntax::BackendManagementCommand::Drop { address, force }) => {
+            BackendStatement::DropBackend(statement) => {
                 require_backend_management_role("DROP BACKEND", role)?;
+                let address = string_literal(&statement.address)?;
                 let endpoint = address
                     .parse()
                     .map_err(|error| format!("invalid backend address '{address}': {error}"))?;
-                self.kernel.topology().drop_backend(endpoint, force)?;
-                Ok(Some(StatementResult::Ok))
+                self.kernel
+                    .topology()
+                    .drop_backend(endpoint, statement.force)?;
+                Ok(StatementResult::Ok)
             }
-            Some(novarocks_sql::syntax::BackendManagementCommand::Show) => {
+            BackendStatement::ShowBackends(_) => {
                 if role == ClusterRole::Be {
                     return Err("SHOW BACKENDS is not available in role=be".to_string());
                 }
@@ -71,9 +76,57 @@ impl BackendCommandExecutor {
                     .topology()
                     .show_backends()
                     .map(StatementResult::Query)
-                    .map(Some)
             }
-            None => Ok(None),
         }
+    }
+}
+
+fn string_literal(literal: &novarocks_parser::ast::Literal) -> Result<&str, String> {
+    match &literal.kind {
+        LiteralKind::String(value) => Ok(value),
+        _ => Err("backend address must be a string literal".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use novarocks_parser::ast::Statement;
+
+    use super::*;
+
+    fn backend_statement(sql: &str) -> BackendStatement {
+        let statements = novarocks_parser::parse(sql).expect("parse backend command");
+        assert_eq!(statements.len(), 1);
+        match statements.into_iter().next().expect("one statement") {
+            Statement::Backend(statement) => statement,
+            other => panic!("expected backend statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_backend_statement_reaches_the_topology_owner() {
+        let topology: crate::common::backend_topology::BackendTopologyService =
+            Arc::new(crate::topology::ClusterBackendService::new_transient_for_test(1));
+        let executor =
+            BackendCommandExecutor::new(BackendManagementKernel::new(Arc::clone(&topology)));
+
+        assert!(matches!(
+            executor.execute(
+                &backend_statement("ADD BACKEND '127.0.0.1:19070'"),
+                ClusterRole::Fe,
+            ),
+            Ok(StatementResult::Ok)
+        ));
+        topology
+            .show_backends()
+            .expect("typed ADD must update the topology owner");
+        assert!(
+            executor
+                .execute(&backend_statement("SHOW BACKENDS"), ClusterRole::Be,)
+                .expect_err("backend role must be rejected")
+                .contains("role=be")
+        );
     }
 }

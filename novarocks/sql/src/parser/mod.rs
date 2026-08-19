@@ -18,16 +18,10 @@
 
 pub(crate) mod ast;
 pub(crate) mod dialect;
-pub(crate) mod procedure;
 pub(crate) mod query_refs;
 pub(crate) mod raw;
 pub(crate) mod recursive_cte;
 pub(crate) mod set_var_hint;
-
-use sqlparser::parser::Parser;
-
-use crate::parser::ast::Statement;
-use crate::parser::dialect::StarRocksDialect;
 
 pub use dialect::normalize_for_raw_parse;
 
@@ -39,87 +33,6 @@ pub(crate) fn parse_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, Stri
 
 pub fn parse_normalized_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
     raw::parse_normalized_sql_raw(sql)
-}
-
-/// Parse SQL through the custom StarRocks dialect into a `Vec<Statement>`.
-///
-/// Phase 1 only recognizes materialized-view DDL (CREATE/DROP/REFRESH/SHOW
-/// MATERIALIZED VIEW[S]). All other statements return an explicit error so
-/// callers know to fall back to `parse_sql_raw` for the legacy path.
-pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>, String> {
-    let normalized = dialect::normalize_for_raw_parse(sql)?;
-    let sr_dialect = StarRocksDialect;
-    let mut parser = Parser::new(&sr_dialect)
-        .try_with_sql(&normalized)
-        .map_err(|e| e.to_string())?;
-
-    // MV probes MUST come BEFORE any generic CREATE TABLE / DROP TABLE /
-    // SHOW TABLES / REFRESH dispatch we may add later: the `MATERIALIZED`
-    // token is what distinguishes these from their plain-table counterparts,
-    // and the generic paths would happily swallow `CREATE MATERIALIZED VIEW`
-    // as a failed `CREATE TABLE`. Keep these four probes first.
-    if dialect::materialized_view::looks_like_create_materialized_view(&parser) {
-        let stmt = dialect::materialized_view::parse_create_materialized_view(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-    if dialect::materialized_view::looks_like_drop_materialized_view(&parser) {
-        let stmt = dialect::materialized_view::parse_drop_materialized_view(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-    if dialect::materialized_view::looks_like_refresh_materialized_view(&parser) {
-        let stmt = dialect::materialized_view::parse_refresh_materialized_view(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-    if dialect::materialized_view::looks_like_show_materialized_views(&parser) {
-        let stmt = dialect::materialized_view::parse_show_materialized_views(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-    if dialect::materialized_view::looks_like_alter_materialized_view(&parser) {
-        let stmt = dialect::materialized_view::parse_alter_materialized_view(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-
-    if dialect::alter_iceberg_ref::looks_like_alter_iceberg_ref(&parser) {
-        let stmt = dialect::alter_iceberg_ref::parse_alter_iceberg_ref(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-
-    if dialect::truncate::looks_like_truncate_table(&parser) {
-        let stmt = dialect::truncate::parse_truncate_table(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-
-    if dialect::backend::looks_like_add_backend(&parser) {
-        let stmt = dialect::backend::parse_add_backend(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-    if dialect::backend::looks_like_drop_backend(&parser) {
-        let stmt = dialect::backend::parse_drop_backend(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-    if dialect::backend::looks_like_show_backends(&parser) {
-        let stmt = dialect::backend::parse_show_backends(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-
-    if dialect::statistics::looks_like_analyze_table(&parser) {
-        let stmt = dialect::statistics::parse_analyze_table(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-    if dialect::statistics::looks_like_show_analyze_jobs(&parser) {
-        let stmt = dialect::statistics::parse_show_analyze_jobs(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-    if dialect::statistics::looks_like_cancel_analyze(&parser) {
-        let stmt = dialect::statistics::parse_cancel_analyze(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-    if dialect::statistics::looks_like_show_table_stats(&parser) {
-        let stmt = dialect::statistics::parse_show_table_stats(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-
-    Err("parse_sql: only materialized-view DDL is recognized in Phase 1".to_string())
 }
 
 #[cfg(test)]
@@ -511,28 +424,6 @@ mod tests {
             func.null_treatment,
         );
         assert!(func.over.is_some(), "OVER clause must still be parsed");
-    }
-
-    #[test]
-    fn parse_sql_recognizes_backend_management_statements() {
-        let add = parse_sql("ADD BACKEND '127.0.0.1:19070'").expect("parse ADD BACKEND");
-        match &add[0] {
-            Statement::AddBackend(stmt) => assert_eq!(stmt.addr, "127.0.0.1:19070"),
-            other => panic!("expected AddBackend, got {other:?}"),
-        }
-
-        let drop =
-            parse_sql("DROP BACKEND '127.0.0.1:19070' FORCE").expect("parse DROP BACKEND FORCE");
-        match &drop[0] {
-            Statement::DropBackend(stmt) => {
-                assert_eq!(stmt.addr, "127.0.0.1:19070");
-                assert!(stmt.force);
-            }
-            other => panic!("expected DropBackend, got {other:?}"),
-        }
-
-        let show = parse_sql("SHOW BACKENDS").expect("parse SHOW BACKENDS");
-        assert!(matches!(show[0], Statement::ShowBackends(_)));
     }
 
     #[test]

@@ -30,6 +30,7 @@ use crate::statistics_jobs::application::{
     StatisticsColumnIntent, StatisticsTableTarget,
 };
 use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_parser::ast::{AnalyzeMode, StatisticsStatement};
 
 #[derive(Clone)]
 pub struct StatisticsCommandExecutor {
@@ -165,56 +166,83 @@ impl StatisticsCommandExecutor {
         Self { application }
     }
 
-    pub fn try_execute(
+    pub fn execute(
         &self,
-        sql: &str,
+        statement: &StatisticsStatement,
         current_catalog: Option<&str>,
         current_database: &str,
         execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
-    ) -> Result<Option<StatementResult>, String> {
-        let Some(statement) = novarocks_sql::planning::dml::parse_statistics_command(sql)? else {
-            return Ok(None);
-        };
+    ) -> Result<StatementResult, String> {
         let command = match statement {
-            novarocks_sql::planning::dml::StatisticsCommand::AnalyzeTable {
-                target_parts,
-                columns,
-            } => StatisticsApplicationCommand::AnalyzeTable {
-                target: statistics_application_target(
-                    &target_parts,
-                    current_catalog,
-                    current_database,
-                )?,
-                columns: if columns.is_empty() {
-                    StatisticsColumnIntent::AllColumns
-                } else {
-                    StatisticsColumnIntent::Explicit(columns)
-                },
-            },
-            novarocks_sql::planning::dml::StatisticsCommand::ShowAnalyzeJobs => {
-                StatisticsApplicationCommand::ShowAnalyzeJobs
-            }
-            novarocks_sql::planning::dml::StatisticsCommand::CancelAnalyze { job_id } => {
-                StatisticsApplicationCommand::CancelAnalyze {
-                    job_id: uuid::Uuid::parse_str(&job_id)
-                        .map_err(|error| format!("invalid ANALYZE job ID '{job_id}': {error}"))?,
+            StatisticsStatement::AnalyzeTable(statement) => {
+                if statement.mode != AnalyzeMode::Default || statement.with_sync_mode {
+                    return Err(
+                        "ANALYZE mode and sync options are not supported by the statistics application"
+                            .to_string(),
+                    );
+                }
+                StatisticsApplicationCommand::AnalyzeTable {
+                    target: statistics_application_target(
+                        &statement
+                            .name
+                            .parts
+                            .iter()
+                            .map(|part| part.value.clone())
+                            .collect::<Vec<_>>(),
+                        current_catalog,
+                        current_database,
+                    )?,
+                    columns: if statement.columns.is_empty() {
+                        StatisticsColumnIntent::AllColumns
+                    } else {
+                        StatisticsColumnIntent::Explicit(
+                            statement
+                                .columns
+                                .iter()
+                                .map(|column| column.value.clone())
+                                .collect(),
+                        )
+                    },
                 }
             }
-            novarocks_sql::planning::dml::StatisticsCommand::ShowTableStats { target_parts } => {
+            StatisticsStatement::ShowAnalyzeJobs(_) => {
+                StatisticsApplicationCommand::ShowAnalyzeJobs
+            }
+            StatisticsStatement::CancelAnalyze(statement) => {
+                StatisticsApplicationCommand::CancelAnalyze {
+                    job_id: uuid::Uuid::parse_str(&statement.job_id).map_err(|error| {
+                        format!("invalid ANALYZE job ID '{}': {error}", statement.job_id)
+                    })?,
+                }
+            }
+            StatisticsStatement::ShowTableStats(statement) => {
                 StatisticsApplicationCommand::ShowTableStats {
                     target: statistics_application_target(
-                        &target_parts,
+                        &statement
+                            .name
+                            .parts
+                            .iter()
+                            .map(|part| part.value.clone())
+                            .collect::<Vec<_>>(),
                         current_catalog,
                         current_database,
                     )?,
                 }
+            }
+            StatisticsStatement::ShowBasicStatsMeta(_)
+            | StatisticsStatement::ShowHistogramStatsMeta(_)
+            | StatisticsStatement::DropStats(_)
+            | StatisticsStatement::DropHistogram(_)
+            | StatisticsStatement::DropMultipleColumnsStats(_) => {
+                return Err(
+                    "statistics command is not supported by the statistics application".to_string(),
+                );
             }
         };
         self.application
             .execute(command, execution)
             .map_err(|error| error.to_string())
             .and_then(statistics_application_result)
-            .map(Some)
     }
 }
 
@@ -292,26 +320,22 @@ mod tests {
         let executor =
             StatisticsCommandExecutor::new(Arc::clone(&port) as Arc<dyn StatisticsApplicationPort>);
 
-        assert!(
-            executor
-                .try_execute(
-                    "ANALYZE TABLE ice.analytics.orders (order_id)",
-                    None,
-                    "default",
-                    None,
-                )
-                .expect("submit typed analyze")
-                .is_some()
-        );
+        let statements = novarocks_parser::parse("ANALYZE TABLE ice.analytics.orders (order_id)")
+            .expect("parse typed analyze");
+        let [novarocks_parser::ast::Statement::Statistics(statement)] = statements.as_slice()
+        else {
+            panic!("expected statistics statement");
+        };
+        assert!(executor.execute(statement, None, "default", None).is_ok());
+        let statements = novarocks_parser::parse("SHOW TABLE STATS ice.analytics.orders")
+            .expect("parse typed table stats");
+        let [novarocks_parser::ast::Statement::Statistics(statement)] = statements.as_slice()
+        else {
+            panic!("expected statistics statement");
+        };
         let show_stats = executor
-            .try_execute(
-                "SHOW TABLE STATS ice.analytics.orders",
-                None,
-                "default",
-                None,
-            )
-            .expect("show typed table stats")
-            .expect("statistics command result");
+            .execute(statement, None, "default", None)
+            .expect("show typed table stats");
         let crate::runtime::statement_result::StatementResult::Query(show_stats) = show_stats
         else {
             panic!("SHOW TABLE STATS must return a query result");

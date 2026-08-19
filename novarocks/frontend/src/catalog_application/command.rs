@@ -39,11 +39,9 @@ use crate::catalog_application::{CatalogApplicationPort, CatalogCreateCommand};
 use crate::mv::domain::repository::MvRepository;
 use crate::runtime::query_result::QueryResultColumn;
 use crate::runtime::statement_result::StatementResult;
+use novarocks_parser::ast::{CatalogStatement, LiteralKind};
 use novarocks_spi::connector::MvStorageObservationPort;
-use novarocks_sql::syntax::{
-    StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
-    looks_like_create_table, looks_like_drop_statement,
-};
+use novarocks_sql::syntax::{StarRocksDialect, looks_like_create_table};
 
 /// Catalog DDL capability built from catalog-only leaf ports.
 ///
@@ -110,6 +108,107 @@ impl CatalogCommandExecutor {
         }
     }
 
+    /// Executes the SQLP-3 basic catalog family without reparsing source SQL.
+    pub fn execute_typed(
+        &self,
+        statement: &CatalogStatement,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<StatementResult, String> {
+        match statement {
+            CatalogStatement::CreateCatalog(statement) => {
+                self.execute_create_catalog(lower_create_catalog(statement)?)
+            }
+            CatalogStatement::DropCatalog(statement) => {
+                execute_drop_catalog_statement(self, &statement.name.value, statement.if_exists)
+            }
+            CatalogStatement::CreateDatabase(statement) => execute_create_database_statement(
+                self,
+                &typed_object_name(&statement.name),
+                statement.if_not_exists,
+                current_catalog,
+                connector_context,
+            ),
+            CatalogStatement::DropDatabase(statement) => execute_drop_database_statement(
+                self,
+                &typed_object_name(&statement.name),
+                current_catalog,
+                statement.if_exists,
+                statement.force,
+                connector_context,
+            ),
+            CatalogStatement::DropTable(statement) => execute_drop_table_statement(
+                self,
+                &typed_object_name(&statement.name),
+                current_catalog,
+                current_database,
+                statement.if_exists,
+                statement.force,
+                connector_context,
+            ),
+            CatalogStatement::TruncateTable(_) | CatalogStatement::ShowCreateTable(_) => {
+                Err("catalog statement belongs to a later typed command owner".to_string())
+            }
+        }
+    }
+
+    /// Executes an admitted Iceberg `ALTER TABLE` syntax node without a SQL
+    /// text round-trip. Reference mutations belong to their dedicated owner;
+    /// ADD FILES belongs to the DML lifecycle owner.
+    pub fn execute_iceberg_typed(
+        &self,
+        statement: &novarocks_parser::ast::AlterIcebergTable,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<StatementResult, String> {
+        use novarocks_parser::ast::IcebergTableAction;
+
+        match &statement.action {
+            IcebergTableAction::Schema(change) => execute_alter_iceberg_schema(
+                self,
+                crate::catalog_application::statement::AlterIcebergSchemaStmt {
+                    table: typed_object_name(&statement.table),
+                    change: crate::catalog_application::statement::lower_typed_iceberg_schema_change(
+                        change,
+                    )?,
+                },
+                current_catalog,
+                current_database,
+                connector_context,
+            ),
+            IcebergTableAction::Properties(action) => execute_alter_iceberg_properties(
+                self,
+                crate::catalog_application::statement::AlterIcebergPropertiesStmt {
+                    table: typed_object_name(&statement.table),
+                    op: crate::catalog_application::statement::lower_typed_iceberg_properties_action(
+                        action,
+                    )?,
+                },
+                current_catalog,
+                current_database,
+                connector_context,
+            ),
+            IcebergTableAction::Partition(change) => execute_alter_partition_spec(
+                self,
+                typed_object_name(&statement.table),
+                crate::catalog_application::statement::lower_typed_iceberg_partition_change(
+                    change,
+                )?,
+                current_catalog,
+                current_database,
+                connector_context,
+            ),
+            IcebergTableAction::Reference(_) => Err(
+                "Iceberg reference command belongs to the ref command executor".to_string(),
+            ),
+            IcebergTableAction::AddFiles(_) => {
+                Err("ADD FILES belongs to the DML lifecycle executor".to_string())
+            }
+        }
+    }
+
     /// Execute exactly one catalog-DDL statement.
     ///
     /// CTAS belongs to the frontend DML service and is rejected here.  A
@@ -147,38 +246,6 @@ impl CatalogCommandExecutor {
             )
             .map(Some);
         }
-        if crate::catalog_application::statement::looks_like_alter_iceberg_properties(&normalized) {
-            return execute_alter_iceberg_properties(
-                self,
-                &normalized,
-                current_catalog,
-                current_database,
-                connector_context,
-            )
-            .map(Some);
-        }
-        if crate::catalog_application::statement::looks_like_alter_iceberg_schema(&normalized) {
-            return execute_alter_iceberg_schema(
-                self,
-                &normalized,
-                current_catalog,
-                current_database,
-                connector_context,
-            )
-            .map(Some);
-        }
-        if crate::catalog_application::statement::looks_like_alter_partition_column(&normalized) {
-            return execute_alter_partition_spec(
-                self,
-                crate::catalog_application::statement::parse_alter_partition_column_sql(
-                    &normalized,
-                )?,
-                current_catalog,
-                current_database,
-                connector_context,
-            )
-            .map(Some);
-        }
         let dialect = StarRocksDialect;
         let mut parser = Parser::new(&dialect)
             .try_with_sql(&normalized)
@@ -196,93 +263,68 @@ impl CatalogCommandExecutor {
             )
             .map(Some);
         }
-        if looks_like_create_catalog(&parser) {
-            let statement = novarocks_sql::syntax::parse_create_catalog_statement(&mut parser)?;
-            require_statement_end(&mut parser)?;
-            return self.execute_create_catalog(statement).map(Some);
-        }
-        if looks_like_create_database(&parser) {
-            let (name, if_not_exists) =
-                novarocks_sql::syntax::parse_create_database_name(&mut parser)?;
-            require_statement_end(&mut parser)?;
-            return execute_create_database_statement(
-                self,
-                &name,
-                if_not_exists,
-                current_catalog,
-                connector_context,
-            )
-            .map(Some);
-        }
-        if looks_like_drop_statement(&parser) {
-            let statement = novarocks_sql::syntax::parse_drop_statement(&mut parser)?;
-            require_statement_end(&mut parser)?;
-            use novarocks_sql::syntax::DropStatement;
-            return match statement {
-                DropStatement::Catalog(statement) => {
-                    execute_drop_catalog_statement(self, &statement.name, statement.if_exists)
-                        .map(Some)
-                }
-                DropStatement::Database(statement) => {
-                    if current_catalog.is_none() && statement.name.parts.len() == 1 {
-                        Err("DROP DATABASE in default_catalog must be routed through the view command capability".to_string())
-                    } else {
-                        execute_drop_database_statement(
-                            self,
-                            &statement.name,
-                            current_catalog,
-                            statement.if_exists,
-                            statement.force,
-                            connector_context,
-                        )
-                        .map(Some)
-                    }
-                }
-                DropStatement::Table(statement) => execute_drop_table_statement(
-                    self,
-                    &statement.name,
-                    current_catalog,
-                    current_database,
-                    statement.if_exists,
-                    statement.force,
-                    connector_context,
-                )
-                .map(Some),
-            };
-        }
         Ok(None)
     }
 
     fn execute_create_catalog(
         &self,
-        statement: novarocks_sql::syntax::CreateCatalogStmt,
+        command: CatalogCreateCommand,
     ) -> Result<StatementResult, String> {
-        let normalized_catalog = normalize_identifier(&statement.name)?;
         let application = self.catalog_application.as_ref().ok_or_else(|| {
             "catalog statements require a configured frontend catalog application".to_string()
         })?;
-        let instance_id = ConnectorInstanceId::parse(&normalized_catalog)
-            .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
         application
-            .create_catalog(CatalogCreateCommand {
-                instance_id,
-                display_name: statement.name,
-                properties: statement.properties,
-                if_not_exists: statement.if_not_exists,
-            })
+            .create_catalog(command)
             .map_err(|error| error.to_string())?;
         Ok(StatementResult::Ok)
     }
 }
 
+fn typed_object_name(
+    name: &novarocks_parser::ast::ObjectName,
+) -> novarocks_sql::syntax::ObjectName {
+    novarocks_sql::syntax::ObjectName {
+        parts: name.parts.iter().map(|part| part.value.clone()).collect(),
+    }
+}
+
+fn catalog_property_text(literal: &novarocks_parser::ast::Literal) -> Result<String, String> {
+    match &literal.kind {
+        LiteralKind::String(value) => Ok(value.clone()),
+        _ => Err("catalog properties require identifier or string values".to_string()),
+    }
+}
+
+fn lower_create_catalog(
+    statement: &novarocks_parser::ast::CreateCatalog,
+) -> Result<CatalogCreateCommand, String> {
+    let properties = statement
+        .properties
+        .iter()
+        .map(|property| {
+            Ok((
+                catalog_property_text(&property.key)?,
+                catalog_property_text(&property.value)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let instance_id = ConnectorInstanceId::parse(&normalize_identifier(&statement.name.value)?)
+        .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
+    Ok(CatalogCreateCommand {
+        instance_id,
+        display_name: statement.name.value.clone(),
+        properties,
+        if_not_exists: statement.if_not_exists,
+    })
+}
+
 fn execute_alter_iceberg_properties(
     executor: &CatalogCommandExecutor,
-    sql: &str,
+    statement: crate::catalog_application::statement::AlterIcebergPropertiesStmt,
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    let statement = crate::catalog_application::statement::parse_alter_iceberg_properties_sql(sql)?;
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
         executor,
         &statement.table,
@@ -343,12 +385,11 @@ fn execute_alter_iceberg_properties(
 
 fn execute_alter_iceberg_schema(
     executor: &CatalogCommandExecutor,
-    sql: &str,
+    statement: crate::catalog_application::statement::AlterIcebergSchemaStmt,
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    let statement = crate::catalog_application::statement::parse_alter_iceberg_schema_sql(sql)?;
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
         executor,
         &statement.table,
@@ -462,22 +503,15 @@ fn execute_alter_iceberg_schema(
 
 fn execute_alter_partition_spec(
     executor: &CatalogCommandExecutor,
-    statement: novarocks_sql::syntax::AlterIcebergPartitionSpecStmt,
+    table_name: novarocks_sql::syntax::ObjectName,
+    statement: crate::catalog_application::statement::IcebergPartitionSpecChange,
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    let table_name = match &statement {
-        novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
-            table, ..
-        }
-        | novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
-            table, ..
-        } => table,
-    };
     let target = crate::catalog_application::resolver::resolve_table_target(
         executor,
-        table_name,
+        &table_name,
         current_catalog,
         current_database,
     )?;
@@ -493,20 +527,14 @@ fn execute_alter_partition_spec(
         &target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::AlterTable,
     )?;
-    let adding = matches!(
-        &statement,
-        novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::AddPartitionColumn { .. }
-    );
-    let partition_field = match &statement {
-        novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
-            field, ..
+    let (adding, transform) = match statement {
+        crate::catalog_application::statement::IcebergPartitionSpecChange::Add(transform) => {
+            (true, transform)
         }
-        | novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
-            field, ..
-        } => field,
+        crate::catalog_application::statement::IcebergPartitionSpecChange::Drop(transform) => {
+            (false, transform)
+        }
     };
-    let transform =
-        crate::catalog_application::statement::connector_partition_transform(partition_field);
     let instance_id =
         ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
     crate::connector::mutation::execute_catalog_mutation(
@@ -682,7 +710,9 @@ fn require_statement_end(parser: &mut Parser<'_>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::CatalogCommandExecutor;
+    use novarocks_parser::ast::{CatalogStatement, Statement};
+
+    use super::{CatalogCommandExecutor, lower_create_catalog};
 
     #[test]
     fn non_catalog_statement_is_not_claimed() {
@@ -693,5 +723,27 @@ mod tests {
             novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize query");
         assert!(normalized.starts_with("SELECT"));
         let _ = std::any::type_name::<CatalogCommandExecutor>();
+    }
+
+    #[test]
+    fn typed_create_catalog_lowers_without_the_legacy_sql_facade() {
+        let statement = novarocks_parser::parse(
+            "CREATE EXTERNAL CATALOG IF NOT EXISTS Warehouse PROPERTIES ('type'='iceberg')",
+        )
+        .expect("parse catalog statement")
+        .pop()
+        .expect("one statement");
+        let Statement::Catalog(CatalogStatement::CreateCatalog(statement)) = statement else {
+            panic!("expected CREATE CATALOG");
+        };
+
+        let command = lower_create_catalog(&statement).expect("lower catalog command");
+        assert_eq!(command.instance_id.as_str(), "warehouse");
+        assert_eq!(command.display_name, "Warehouse");
+        assert_eq!(
+            command.properties,
+            [("type".to_string(), "iceberg".to_string())]
+        );
+        assert!(command.if_not_exists);
     }
 }

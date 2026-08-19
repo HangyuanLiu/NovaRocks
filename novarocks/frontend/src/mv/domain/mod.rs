@@ -48,6 +48,6 @@ pub use flow::{
     alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports, list_mvs_with_backend,
 };
 pub use iceberg_refresh::IcebergMvCorePorts;
-pub use stateless_rebuild::{PROCEDURE_NAME, execute_novarocks_imv_stateless_rebuild};
+pub use stateless_rebuild::{PROCEDURE_NAME, execute_typed_novarocks_imv_stateless_rebuild};
 #[doc(hidden)]
 pub mod test_repository;

@@ -25,11 +25,11 @@ DROP TABLE IF EXISTS p;
 CREATE TABLE p (id INT) TBLPROPERTIES ("format-version" = "2");
 
 -- query 2
--- @expect_error=at least one
+-- @expect_error=[sql.parse.unexpected_token] expected literal
 ALTER TABLE p SET TBLPROPERTIES ();
 
 -- query 3
--- @expect_error=at least one
+-- @expect_error=[sql.parse.unexpected_token] expected literal
 ALTER TABLE p UNSET TBLPROPERTIES ();
 
 -- query 4
