@@ -25,85 +25,6 @@ pub fn parse_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
     crate::parser::parse_sql_raw(sql)
 }
 
-/// Typed, closed materialized-view command admission surface.
-///
-/// This intentionally does not expose the parser's generic statement enum:
-/// consumers can handle only the five MV command forms supported by this
-/// contract.
-#[derive(Clone, Debug, PartialEq)]
-pub enum MvAdmittedStatement {
-    Create(CreateMaterializedViewStmt),
-    Drop(DropMaterializedViewStmt),
-    Alter(AlterMaterializedViewStmt),
-    Refresh(RefreshMaterializedViewStmt),
-    Show(ShowMaterializedViewsStmt),
-}
-
-/// Parse an MV command when the parser recognizes an MV statement form.
-///
-/// `Ok(None)` is a route miss: the input is not one of the materialized-view
-/// statement forms. Once the parser recognizes one of those forms, parse
-/// rejection remains an error instead of being converted into a route miss.
-// Design: ADR-0088 (docs/adr/ADR-0088-domain-owned-sql-error-contracts.md)
-pub fn parse_optional_mv_admitted_statement(
-    sql: &str,
-) -> Result<Option<MvAdmittedStatement>, String> {
-    let normalized = crate::parser::dialect::normalize_for_raw_parse(sql)?;
-    let dialect = crate::parser::dialect::StarRocksDialect;
-    let parser = Parser::new(&dialect)
-        .try_with_sql(&normalized)
-        .map_err(|error| error.to_string())?;
-    let recognized =
-        crate::parser::dialect::materialized_view::looks_like_create_materialized_view(&parser)
-            || crate::parser::dialect::materialized_view::looks_like_drop_materialized_view(
-                &parser,
-            )
-            || crate::parser::dialect::materialized_view::looks_like_refresh_materialized_view(
-                &parser,
-            )
-            || crate::parser::dialect::materialized_view::looks_like_show_materialized_views(
-                &parser,
-            )
-            || crate::parser::dialect::materialized_view::looks_like_alter_materialized_view(
-                &parser,
-            );
-    if !recognized {
-        return Ok(None);
-    }
-
-    parse_recognized_mv_admitted_statement(sql).map(Some)
-}
-
-pub fn parse_mv_admitted_statement(sql: &str) -> Result<MvAdmittedStatement, String> {
-    parse_optional_mv_admitted_statement(sql)?
-        .ok_or_else(|| "statement is not a materialized-view command".to_string())
-}
-
-fn parse_recognized_mv_admitted_statement(sql: &str) -> Result<MvAdmittedStatement, String> {
-    let mut statements = crate::parser::parse_sql(sql)?;
-    if statements.len() != 1 {
-        return Err("materialized-view command accepts exactly one statement".to_string());
-    }
-    match statements.pop().expect("one checked statement") {
-        crate::parser::ast::Statement::CreateMaterializedView(statement) => {
-            Ok(MvAdmittedStatement::Create(statement))
-        }
-        crate::parser::ast::Statement::DropMaterializedView(statement) => {
-            Ok(MvAdmittedStatement::Drop(statement))
-        }
-        crate::parser::ast::Statement::AlterMaterializedView(statement) => {
-            Ok(MvAdmittedStatement::Alter(statement))
-        }
-        crate::parser::ast::Statement::RefreshMaterializedView(statement) => {
-            Ok(MvAdmittedStatement::Refresh(statement))
-        }
-        crate::parser::ast::Statement::ShowMaterializedViews(statement) => {
-            Ok(MvAdmittedStatement::Show(statement))
-        }
-        _ => Err("statement is not a materialized-view command".to_string()),
-    }
-}
-
 /// Return every three-part table reference in one admitted SELECT statement.
 ///
 /// Raw sqlparser nodes remain inside the SQL crate; callers receive only the
@@ -262,10 +183,7 @@ pub fn parse_partition_field_expr(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MvAdmittedStatement, arrow_type_equals_ignoring_metadata, parse_mv_admitted_statement,
-        parse_optional_mv_admitted_statement, sql_type_to_arrow_type,
-    };
+    use super::{arrow_type_equals_ignoring_metadata, sql_type_to_arrow_type};
 
     #[test]
     fn syntax_value_helpers_keep_sql_type_conversion_and_metadata_tolerant_shape_equality() {
@@ -284,46 +202,5 @@ mod tests {
             &DataType::Utf8,
             &DataType::Int64
         ));
-    }
-
-    #[test]
-    fn mv_admission_exposes_only_typed_mv_syntax() {
-        let statement = parse_mv_admitted_statement("REFRESH MATERIALIZED VIEW analytics.mv")
-            .expect("MV refresh should be admitted");
-        let MvAdmittedStatement::Refresh(statement) = statement else {
-            panic!("expected typed REFRESH MATERIALIZED VIEW statement");
-        };
-        assert_eq!(statement.name.parts, ["analytics", "mv"]);
-        assert!(!statement.full);
-    }
-
-    #[test]
-    fn mv_admission_rejects_non_mv_statement_without_exposing_parser_enum() {
-        let error = parse_mv_admitted_statement("SELECT 1")
-            .expect_err("non-MV syntax must not be admitted through the MV contract");
-        assert_eq!(error, "statement is not a materialized-view command");
-    }
-
-    #[test]
-    fn optional_mv_admission_distinguishes_route_misses_from_mv_parse_errors() {
-        assert_eq!(
-            parse_optional_mv_admitted_statement("SELECT 1").expect("non-MV probe"),
-            None
-        );
-
-        let statement =
-            parse_optional_mv_admitted_statement("REFRESH MATERIALIZED VIEW analytics.mv")
-                .expect("valid MV command")
-                .expect("MV command should be recognized");
-        assert!(matches!(statement, MvAdmittedStatement::Refresh(_)));
-
-        let error = parse_optional_mv_admitted_statement(
-            "CREATE MATERIALIZED VIEW mv \
-             DISTRIBUTED BY HASH(k1) BUCKETS 1 \
-             PRIMARY KEY () \
-             AS SELECT k1 FROM source_table",
-        )
-        .expect_err("recognized MV syntax must preserve its parser error");
-        assert_eq!(error, "PRIMARY KEY clause requires at least one column");
     }
 }

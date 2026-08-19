@@ -39,9 +39,10 @@ pub use maintenance::{
 pub use materialized_view::{
     AlterMaterializedView, CreateMaterializedView, DropMaterializedView,
     ExplainRefreshMaterializedView, MaterializedViewAlterAction, MaterializedViewDistribution,
-    MaterializedViewPartitionArgument, MaterializedViewPartitionField, MaterializedViewProperty,
-    MaterializedViewRefreshMode, MaterializedViewRefreshPolicy, MaterializedViewStatement,
-    RefreshMaterializedView, ShowMaterializedViews,
+    MaterializedViewExplainLevel, MaterializedViewPartitionArgument,
+    MaterializedViewPartitionField, MaterializedViewProperty, MaterializedViewRefreshMode,
+    MaterializedViewRefreshPolicy, MaterializedViewStatement, RefreshMaterializedView,
+    ShowMaterializedViews,
 };
 pub use statistics::{
     AnalyzeMode, AnalyzeTable, CancelAnalyze, DropHistogram, DropMultipleColumnsStats, DropStats,

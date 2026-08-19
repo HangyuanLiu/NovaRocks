@@ -23,14 +23,24 @@ use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::repository::MvRepository;
 use crate::runtime::statement_result::StatementResult;
-use novarocks_parser::ast::CallStatement;
+use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_parser::ast::{
+    CallStatement, Literal, LiteralKind, MaterializedViewAlterAction as TypedAlterAction,
+    MaterializedViewExplainLevel, MaterializedViewPartitionArgument,
+    MaterializedViewPartitionField, MaterializedViewRefreshMode,
+    MaterializedViewRefreshPolicy as TypedRefreshPolicy, MaterializedViewStatement,
+};
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::syntax::{
-    AlterMaterializedViewAction, AlterMaterializedViewStmt, MvAdmittedStatement, ObjectName,
-    RefreshMaterializedViewStmt, parse_mv_admitted_statement, parse_optional_mv_admitted_statement,
+    AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
+    DropMaterializedViewStmt, IcebergPartitionFieldExpr,
+    MaterializedViewDistribution as SyntaxMaterializedViewDistribution,
+    MaterializedViewRefreshPolicy, ObjectName, RefreshMaterializedViewStmt,
+    ShowMaterializedViewsStmt,
 };
 
 use super::FrontendMvService;
+use crate::mv::domain::refresh::definition::parse_mv_select_query;
 use crate::mv::domain::refresh::resolve_refresh_mv_target;
 use crate::mv::domain::{
     alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports,
@@ -68,68 +78,43 @@ impl MvCommandExecutor {
         }
     }
 
-    /// Execute exactly one MV statement through explicit ports. Refresh and
-    /// repartition receive the request's already-admitted execution context;
-    /// they never capture a second topology or cancellation scope.
+    /// Executes one parser-admitted MV command through explicit ports. Refresh
+    /// and repartition receive the request's already-admitted execution
+    /// context; they never capture a second topology or cancellation scope.
     // Design: ADR-0088 (docs/adr/ADR-0088-domain-owned-sql-error-contracts.md)
-    pub fn try_execute(
+    pub fn execute(
         &self,
-        sql: &str,
+        statement: &MaterializedViewStatement,
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &QueryExecutionContext,
-    ) -> Result<Option<StatementResult>, String> {
-        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
-        if let Some(parsed) = parse_explain_refresh_materialized_view(&normalized) {
-            let (statement, level, analyze) = parsed?;
-            if analyze {
-                return Err(
-                    "EXPLAIN ANALYZE REFRESH MATERIALIZED VIEW is not supported".to_string()
-                );
-            }
-            let lines = crate::query_execution::mv_assembly::refresh_explain::explain_iceberg_mv_refresh_rewrite_plan_with_ports(
-                &self.ports,
-                current_catalog,
-                current_database,
-                &statement,
-                level,
-                connector_context,
-            )?;
-            return build_string_query_result("Explain String", lines)
-                .map(StatementResult::Query)
-                .map(Some);
-        }
-        let statement = match parse_mv_statement_for_execution(&normalized)? {
-            Some(statement) => statement,
-            None => return Ok(None),
-        };
+    ) -> Result<StatementResult, String> {
         match statement {
-            MvAdmittedStatement::Create(statement) => create_mv_with_ports(
+            MaterializedViewStatement::Create(statement) => create_mv_with_ports(
                 &self.ports,
                 self.create_application.as_ref(),
                 self.mv_backend.as_ref(),
                 current_catalog,
                 current_database,
-                &statement,
+                &lower_typed_create(statement)?,
                 connector_context,
-            )
-            .map(Some),
-            MvAdmittedStatement::Drop(statement) => drop_mv_with_ports(
+            ),
+            MaterializedViewStatement::Drop(statement) => drop_mv_with_ports(
                 self.repository.as_ref(),
                 self.mv_backend.as_ref(),
                 current_catalog,
                 current_database,
-                &statement,
+                &DropMaterializedViewStmt {
+                    name: lower_typed_object_name(&statement.name)?,
+                    if_exists: statement.if_exists,
+                },
                 connector_context,
-            )
-            .map(Some),
-            MvAdmittedStatement::Alter(statement)
-                if !matches!(
-                    &statement.action,
-                    AlterMaterializedViewAction::Repartition(_)
-                ) =>
+            ),
+            MaterializedViewStatement::Alter(statement)
+                if !matches!(&statement.action, TypedAlterAction::Repartition(_)) =>
             {
+                let statement = lower_typed_alter(statement)?;
                 alter_mv_with_ports(
                     &self.ports,
                     current_catalog,
@@ -137,30 +122,33 @@ impl MvCommandExecutor {
                     &statement,
                     connector_context,
                 )
-                .map(Some)
             }
-            MvAdmittedStatement::Alter(statement) => self
-                .execute_repartition(
-                    current_catalog,
-                    current_database,
-                    &statement,
-                    connector_context,
-                    execution,
-                )
-                .map(Some),
-            MvAdmittedStatement::Refresh(statement) => self
-                .execute_refresh(
-                    current_catalog,
-                    current_database,
-                    &statement,
-                    connector_context,
-                    execution,
-                )
-                .map(Some),
-            MvAdmittedStatement::Show(statement) => {
-                list_mvs_with_backend(self.mv_backend.as_ref(), current_catalog, &statement)
-                    .map(Some)
-            }
+            MaterializedViewStatement::Alter(statement) => self.execute_repartition(
+                current_catalog,
+                current_database,
+                &lower_typed_alter(statement)?,
+                connector_context,
+                execution,
+            ),
+            MaterializedViewStatement::Refresh(statement) => self.execute_refresh(
+                current_catalog,
+                current_database,
+                &lower_typed_refresh(statement)?,
+                connector_context,
+                execution,
+            ),
+            MaterializedViewStatement::Show(statement) => list_mvs_with_backend(
+                self.mv_backend.as_ref(),
+                current_catalog,
+                &lower_typed_show(statement)?,
+            ),
+            MaterializedViewStatement::ExplainRefresh(statement) => self.execute_explain_refresh(
+                current_catalog,
+                current_database,
+                &lower_typed_refresh(&statement.refresh)?,
+                lower_typed_explain_level(statement.level),
+                connector_context,
+            ),
         }
     }
 
@@ -180,6 +168,25 @@ impl MvCommandExecutor {
             current_database,
             connector_context.clone(),
         )
+    }
+
+    fn execute_explain_refresh(
+        &self,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        statement: &RefreshMaterializedViewStmt,
+        level: novarocks_sql::compiler::ExplainLevel,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<StatementResult, String> {
+        let lines = crate::query_execution::mv_assembly::refresh_explain::explain_iceberg_mv_refresh_rewrite_plan_with_ports(
+            &self.ports,
+            current_catalog,
+            current_database,
+            statement,
+            level,
+            connector_context,
+        )?;
+        build_string_query_result("Explain String", lines).map(StatementResult::Query)
     }
 
     fn execute_repartition(
@@ -287,6 +294,319 @@ impl MvCommandExecutor {
     }
 }
 
+fn lower_typed_create(
+    statement: &novarocks_parser::ast::CreateMaterializedView,
+) -> Result<CreateMaterializedViewStmt, String> {
+    let distribution = statement.distribution.as_ref().ok_or_else(|| {
+        "CREATE MATERIALIZED VIEW requires a DISTRIBUTED BY HASH(...) BUCKETS n clause".to_string()
+    })?;
+    let bucket_count = distribution
+        .buckets
+        .as_ref()
+        .ok_or_else(|| {
+            "CREATE MATERIALIZED VIEW requires a DISTRIBUTED BY HASH(...) BUCKETS n clause"
+                .to_string()
+        })
+        .and_then(|value| lower_typed_u32(value, "BUCKETS count"))?;
+    let primary_key = statement
+        .primary_key
+        .as_ref()
+        .map(|columns| {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut lowered = Vec::with_capacity(columns.len());
+            for column in columns {
+                if !seen.insert(column.value.to_ascii_lowercase()) {
+                    return Err(format!(
+                        "duplicate column `{}` in PRIMARY KEY clause",
+                        column.value
+                    ));
+                }
+                lowered.push(column.value.clone());
+            }
+            Ok(lowered)
+        })
+        .transpose()?;
+    let select_query = parse_mv_select_query(&statement.query.text)?;
+
+    Ok(CreateMaterializedViewStmt {
+        name: lower_typed_object_name(&statement.name)?,
+        if_not_exists: statement.if_not_exists,
+        partition_by: statement
+            .partition_by
+            .as_ref()
+            .map(|fields| lower_typed_partition_fields(fields))
+            .transpose()?,
+        distribution: Some(SyntaxMaterializedViewDistribution {
+            hash_columns: distribution
+                .hash_columns
+                .iter()
+                .map(|column| normalize_identifier(&column.value))
+                .collect::<Result<Vec<_>, _>>()?,
+            bucket_count: Some(bucket_count),
+        }),
+        refresh_policy: lower_typed_refresh_policy(
+            statement
+                .refresh
+                .as_ref()
+                .unwrap_or(&TypedRefreshPolicy::Manual { deferred: false }),
+        )?,
+        select_sql: select_query.to_string(),
+        select_query,
+        properties: lower_typed_properties(&statement.properties)?,
+        primary_key,
+    })
+}
+
+fn lower_typed_alter(
+    statement: &novarocks_parser::ast::AlterMaterializedView,
+) -> Result<AlterMaterializedViewStmt, String> {
+    let action = match &statement.action {
+        TypedAlterAction::SetRefresh(policy) => {
+            AlterMaterializedViewAction::SetRefresh(lower_typed_refresh_policy(policy)?)
+        }
+        TypedAlterAction::SetProperties(properties) => {
+            let properties = lower_typed_properties(properties)?;
+            if properties.is_empty() {
+                return Err(
+                    "ALTER MATERIALIZED VIEW SET TBLPROPERTIES requires at least one key=value pair"
+                        .to_string(),
+                );
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for (key, _) in &properties {
+                if !seen.insert(key.clone()) {
+                    return Err(format!(
+                        "duplicate key '{key}' in ALTER MATERIALIZED VIEW SET TBLPROPERTIES"
+                    ));
+                }
+            }
+            AlterMaterializedViewAction::SetProperties(properties)
+        }
+        TypedAlterAction::PauseRefresh => AlterMaterializedViewAction::PauseRefresh,
+        TypedAlterAction::ResumeRefresh => AlterMaterializedViewAction::ResumeRefresh,
+        TypedAlterAction::Repartition(fields) => {
+            AlterMaterializedViewAction::Repartition(lower_typed_partition_fields(fields)?)
+        }
+    };
+    Ok(AlterMaterializedViewStmt {
+        name: lower_typed_object_name(&statement.name)?,
+        action,
+    })
+}
+
+fn lower_typed_refresh(
+    statement: &novarocks_parser::ast::RefreshMaterializedView,
+) -> Result<RefreshMaterializedViewStmt, String> {
+    if matches!(statement.mode, Some(MaterializedViewRefreshMode::Async)) {
+        return Err(
+            "REFRESH MATERIALIZED VIEW ... WITH ASYNC MODE is not supported yet".to_string(),
+        );
+    }
+    Ok(RefreshMaterializedViewStmt {
+        name: lower_typed_object_name(&statement.name)?,
+        full: statement.full,
+    })
+}
+
+fn lower_typed_explain_level(
+    level: MaterializedViewExplainLevel,
+) -> novarocks_sql::compiler::ExplainLevel {
+    match level {
+        MaterializedViewExplainLevel::Default => novarocks_sql::compiler::ExplainLevel::Normal,
+        MaterializedViewExplainLevel::Verbose => novarocks_sql::compiler::ExplainLevel::Verbose,
+        MaterializedViewExplainLevel::Costs => novarocks_sql::compiler::ExplainLevel::Costs,
+    }
+}
+
+fn lower_typed_show(
+    statement: &novarocks_parser::ast::ShowMaterializedViews,
+) -> Result<ShowMaterializedViewsStmt, String> {
+    let database = statement
+        .database
+        .as_ref()
+        .map(|database| match database.parts.as_slice() {
+            [database] => Ok(database.value.clone()),
+            _ => Err("SHOW MATERIALIZED VIEWS FROM expects one database identifier".to_string()),
+        })
+        .transpose()?;
+    Ok(ShowMaterializedViewsStmt { database })
+}
+
+fn lower_typed_refresh_policy(
+    policy: &TypedRefreshPolicy,
+) -> Result<MaterializedViewRefreshPolicy, String> {
+    match policy {
+        TypedRefreshPolicy::Immediate => Err("REFRESH IMMEDIATE is not supported yet".to_string()),
+        TypedRefreshPolicy::Manual { .. } => Ok(MaterializedViewRefreshPolicy::Manual),
+        TypedRefreshPolicy::AsyncOnChange { .. } => {
+            Ok(MaterializedViewRefreshPolicy::AsyncOnChange)
+        }
+        TypedRefreshPolicy::AsyncEvery { interval, unit, .. } => {
+            let interval = lower_typed_u64(interval, "REFRESH ASYNC interval")?;
+            if interval == 0 {
+                return Err("REFRESH ASYNC interval must be positive".to_string());
+            }
+            let multiplier = match unit.value.to_ascii_uppercase().as_str() {
+                "SECOND" | "SECONDS" => 1_000_u64,
+                "MINUTE" | "MINUTES" => 60_000_u64,
+                "HOUR" | "HOURS" => 3_600_000_u64,
+                "DAY" | "DAYS" => 86_400_000_u64,
+                _ => {
+                    return Err(format!(
+                        "unsupported REFRESH ASYNC interval unit `{}`; expected SECOND, MINUTE, HOUR, or DAY",
+                        unit.value
+                    ));
+                }
+            };
+            let interval_ms = interval
+                .checked_mul(multiplier)
+                .ok_or_else(|| "REFRESH ASYNC interval is too large".to_string())?
+                .try_into()
+                .map_err(|_| "REFRESH ASYNC interval is too large".to_string())?;
+            Ok(MaterializedViewRefreshPolicy::AsyncInterval { interval_ms })
+        }
+    }
+}
+
+fn lower_typed_partition_fields(
+    fields: &[MaterializedViewPartitionField],
+) -> Result<Vec<IcebergPartitionFieldExpr>, String> {
+    fields.iter().map(lower_typed_partition_field).collect()
+}
+
+fn lower_typed_partition_field(
+    field: &MaterializedViewPartitionField,
+) -> Result<IcebergPartitionFieldExpr, String> {
+    match field {
+        MaterializedViewPartitionField::Identity(column) => {
+            Ok(IcebergPartitionFieldExpr::Identity {
+                column: normalize_identifier(&column.value)?,
+            })
+        }
+        MaterializedViewPartitionField::Transform {
+            name, arguments, ..
+        } => {
+            let transform = normalize_identifier(&name.value)?;
+            let column = typed_partition_column(arguments, &transform)?;
+            match transform.as_str() {
+                "identity" => require_partition_argument_count(arguments, 1, "identity")
+                    .map(|()| IcebergPartitionFieldExpr::Identity { column }),
+                "year" => require_partition_argument_count(arguments, 1, "year")
+                    .map(|()| IcebergPartitionFieldExpr::Year { column }),
+                "month" => require_partition_argument_count(arguments, 1, "month")
+                    .map(|()| IcebergPartitionFieldExpr::Month { column }),
+                "day" => require_partition_argument_count(arguments, 1, "day")
+                    .map(|()| IcebergPartitionFieldExpr::Day { column }),
+                "hour" => require_partition_argument_count(arguments, 1, "hour")
+                    .map(|()| IcebergPartitionFieldExpr::Hour { column }),
+                "void" => require_partition_argument_count(arguments, 1, "void")
+                    .map(|()| IcebergPartitionFieldExpr::Void { column }),
+                "bucket" => Ok(IcebergPartitionFieldExpr::Bucket {
+                    column,
+                    num_buckets: typed_partition_positive_u32(arguments, "bucket count")?,
+                }),
+                "truncate" => Ok(IcebergPartitionFieldExpr::Truncate {
+                    column,
+                    width: typed_partition_positive_u32(arguments, "truncate width")?,
+                }),
+                _ => Err(format!(
+                    "unsupported Iceberg partition transform `{}`",
+                    name.value
+                )),
+            }
+        }
+    }
+}
+
+fn typed_partition_column(
+    arguments: &[MaterializedViewPartitionArgument],
+    transform: &str,
+) -> Result<String, String> {
+    let Some(MaterializedViewPartitionArgument::Ident(column)) = arguments.first() else {
+        return Err(format!(
+            "expected column argument for partition transform `{transform}`"
+        ));
+    };
+    normalize_identifier(&column.value)
+}
+
+fn require_partition_argument_count(
+    arguments: &[MaterializedViewPartitionArgument],
+    expected: usize,
+    transform: &str,
+) -> Result<(), String> {
+    if arguments.len() == expected {
+        Ok(())
+    } else if transform == "identity" {
+        Err("identity() requires exactly one column argument: identity(column)".to_string())
+    } else {
+        Err(format!(
+            "expected {expected} argument(s) for partition transform `{transform}`"
+        ))
+    }
+}
+
+fn typed_partition_positive_u32(
+    arguments: &[MaterializedViewPartitionArgument],
+    label: &str,
+) -> Result<u32, String> {
+    require_partition_argument_count(arguments, 2, label)?;
+    let Some(MaterializedViewPartitionArgument::Literal(value)) = arguments.get(1) else {
+        return Err(format!("expected numeric {label}"));
+    };
+    let value = lower_typed_u32(value, label)?;
+    if value == 0 {
+        return Err(format!("{label} must be positive"));
+    }
+    Ok(value)
+}
+
+fn lower_typed_properties(
+    properties: &[novarocks_parser::ast::MaterializedViewProperty],
+) -> Result<Vec<(String, String)>, String> {
+    properties
+        .iter()
+        .map(|property| {
+            Ok((
+                lower_typed_string(&property.key, "MV property key")?,
+                lower_typed_string(&property.value, "MV property value")?,
+            ))
+        })
+        .collect()
+}
+
+fn lower_typed_object_name(name: &novarocks_parser::ast::ObjectName) -> Result<ObjectName, String> {
+    Ok(ObjectName {
+        parts: name
+            .parts
+            .iter()
+            .map(|part| normalize_identifier(&part.value))
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn lower_typed_u32(value: &Literal, context: &str) -> Result<u32, String> {
+    lower_typed_u64(value, context)?
+        .try_into()
+        .map_err(|_| format!("{context} is too large"))
+}
+
+fn lower_typed_u64(value: &Literal, context: &str) -> Result<u64, String> {
+    let LiteralKind::Number(value) = &value.kind else {
+        return Err(format!("{context} expects a number"));
+    };
+    value
+        .parse::<u64>()
+        .map_err(|error| format!("invalid {context} `{value}`: {error}"))
+}
+
+fn lower_typed_string(value: &Literal, context: &str) -> Result<String, String> {
+    let LiteralKind::String(value) = &value.kind else {
+        return Err(format!("{context} expects a string"));
+    };
+    Ok(value.clone())
+}
+
 fn statement_result(result: MvStatementResult) -> StatementResult {
     match result {
         MvStatementResult::Ok => StatementResult::Ok,
@@ -294,104 +614,131 @@ fn statement_result(result: MvStatementResult) -> StatementResult {
     }
 }
 
-fn parse_mv_statement_for_execution(sql: &str) -> Result<Option<MvAdmittedStatement>, String> {
-    parse_optional_mv_admitted_statement(sql)
-}
-
-fn parse_explain_refresh_materialized_view(
-    sql: &str,
-) -> Option<
-    Result<
-        (
-            RefreshMaterializedViewStmt,
-            novarocks_sql::compiler::ExplainLevel,
-            bool,
-        ),
-        String,
-    >,
-> {
-    let trimmed = sql.trim_start();
-    let prefixes = [
-        (
-            "EXPLAIN ANALYZE REFRESH ",
-            novarocks_sql::compiler::ExplainLevel::Analyze,
-            true,
-        ),
-        (
-            "EXPLAIN VERBOSE REFRESH ",
-            novarocks_sql::compiler::ExplainLevel::Verbose,
-            false,
-        ),
-        (
-            "EXPLAIN COSTS REFRESH ",
-            novarocks_sql::compiler::ExplainLevel::Costs,
-            false,
-        ),
-        (
-            "EXPLAIN REFRESH ",
-            novarocks_sql::compiler::ExplainLevel::Normal,
-            false,
-        ),
-    ];
-    for (prefix, level, analyze) in prefixes {
-        if trimmed
-            .as_bytes()
-            .get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
-        {
-            let body = format!("REFRESH {}", trimmed[prefix.len()..].trim_start());
-            let statement = match parse_mv_admitted_statement(&body) {
-                Ok(statement) => statement,
-                Err(error) => return Some(Err(error)),
-            };
-            let MvAdmittedStatement::Refresh(statement) = statement else {
-                return Some(Err(
-                    "EXPLAIN REFRESH only supports REFRESH MATERIALIZED VIEW".to_string(),
-                ));
-            };
-            return Some(Ok((statement, level, analyze)));
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{parse_explain_refresh_materialized_view, parse_mv_statement_for_execution};
+    use super::*;
+    use novarocks_parser::{
+        ast::{MaterializedViewStatement, Statement},
+        parse,
+    };
 
-    #[test]
-    fn explain_refresh_parser_keeps_level_and_analyze_contract() {
-        let verbose = parse_explain_refresh_materialized_view(
-            "EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW db.mv",
-        )
-        .expect("recognized")
-        .expect("parsed");
-        assert_eq!(verbose.0.name.parts, vec!["db", "mv"]);
-        assert_eq!(verbose.1, novarocks_sql::compiler::ExplainLevel::Verbose);
-        assert!(!verbose.2);
-
-        let analyze =
-            parse_explain_refresh_materialized_view("EXPLAIN ANALYZE REFRESH MATERIALIZED VIEW mv")
-                .expect("recognized")
-                .expect("parsed");
-        assert_eq!(analyze.1, novarocks_sql::compiler::ExplainLevel::Analyze);
-        assert!(analyze.2);
+    fn typed_mv(source: &str) -> MaterializedViewStatement {
+        let statements = parse(source).expect("typed MV statement should parse");
+        let [Statement::MaterializedView(statement)] = statements.as_slice() else {
+            panic!("expected one typed MV statement for {source}");
+        };
+        statement.clone()
     }
 
     #[test]
-    fn mv_route_miss_defers_but_recognized_mv_parse_errors_propagate() {
+    fn lowers_create_header_and_parses_only_embedded_query_slice() {
+        let statement = typed_mv(
+            "CREATE MATERIALIZED VIEW `analytics`.`orders_mv` \
+             PARTITION BY (month(order_date)) \
+             DISTRIBUTED BY HASH(order_id) BUCKETS 4 \
+             REFRESH ASYNC EVERY INTERVAL 2 HOUR \
+             PROPERTIES ('storage_engine' = 'iceberg') \
+             AS SELECT order_id, order_date FROM ice.analytics.orders",
+        );
+        let MaterializedViewStatement::Create(create) = statement else {
+            panic!("expected typed CREATE MATERIALIZED VIEW");
+        };
+
+        let lowered = lower_typed_create(&create).expect("typed create should lower");
+        assert_eq!(lowered.name.parts, vec!["analytics", "orders_mv"]);
         assert_eq!(
-            parse_mv_statement_for_execution("SELECT 1").expect("non-MV route miss"),
-            None
+            lowered.refresh_policy,
+            MaterializedViewRefreshPolicy::AsyncInterval {
+                interval_ms: 7_200_000
+            }
+        );
+        assert_eq!(
+            lowered.partition_by,
+            Some(vec![IcebergPartitionFieldExpr::Month {
+                column: "order_date".to_string()
+            }])
+        );
+        assert_eq!(lowered.select_query.to_string(), lowered.select_sql);
+    }
+
+    #[test]
+    fn lowers_typed_alter_and_show_without_raw_command_parse() {
+        let alter = typed_mv(
+            "ALTER MATERIALIZED VIEW `analytics`.`orders_mv` \
+             SET TBLPROPERTIES ('refresh_priority' = 'high')",
+        );
+        let MaterializedViewStatement::Alter(alter) = alter else {
+            panic!("expected typed ALTER MATERIALIZED VIEW");
+        };
+        assert_eq!(
+            lower_typed_alter(&alter)
+                .expect("typed alter should lower")
+                .action,
+            AlterMaterializedViewAction::SetProperties(vec![(
+                "refresh_priority".to_string(),
+                "high".to_string(),
+            )])
         );
 
-        let error = parse_mv_statement_for_execution(
-            "CREATE MATERIALIZED VIEW mv \
-             DISTRIBUTED BY HASH(k1) BUCKETS 1 \
-             PRIMARY KEY () \
-             AS SELECT k1 FROM source_table",
-        )
-        .expect_err("recognized MV parse error must propagate");
-        assert_eq!(error, "PRIMARY KEY clause requires at least one column");
+        let show = typed_mv("SHOW MATERIALIZED VIEWS FROM analytics");
+        let MaterializedViewStatement::Show(show) = show else {
+            panic!("expected typed SHOW MATERIALIZED VIEWS");
+        };
+        assert_eq!(
+            lower_typed_show(&show).expect("typed show should lower"),
+            ShowMaterializedViewsStmt {
+                database: Some("analytics".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn typed_lowering_reapplies_legacy_mv_semantic_limits() {
+        let immediate = typed_mv(
+            "CREATE MATERIALIZED VIEW mv DISTRIBUTED BY HASH(k1) BUCKETS 1 \
+             REFRESH IMMEDIATE AS SELECT k1 FROM ice.db.source",
+        );
+        let MaterializedViewStatement::Create(immediate) = immediate else {
+            panic!("expected typed CREATE MATERIALIZED VIEW");
+        };
+        assert!(
+            lower_typed_create(&immediate)
+                .expect_err("legacy MV create rejects immediate refresh")
+                .contains("IMMEDIATE")
+        );
+
+        let refresh = typed_mv("REFRESH MATERIALIZED VIEW db.mv WITH ASYNC MODE");
+        let MaterializedViewStatement::Refresh(refresh) = refresh else {
+            panic!("expected typed REFRESH MATERIALIZED VIEW");
+        };
+        assert!(
+            lower_typed_refresh(&refresh)
+                .expect_err("legacy refresh rejects async mode")
+                .contains("ASYNC")
+        );
+    }
+
+    #[test]
+    fn typed_explain_refresh_preserves_requested_presentation_level() {
+        for (sql, expected) in [
+            (
+                "EXPLAIN REFRESH MATERIALIZED VIEW db.mv",
+                novarocks_sql::compiler::ExplainLevel::Normal,
+            ),
+            (
+                "EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW db.mv",
+                novarocks_sql::compiler::ExplainLevel::Verbose,
+            ),
+            (
+                "EXPLAIN COSTS REFRESH MATERIALIZED VIEW db.mv",
+                novarocks_sql::compiler::ExplainLevel::Costs,
+            ),
+        ] {
+            let statement = typed_mv(sql);
+            let MaterializedViewStatement::ExplainRefresh(explain) = statement else {
+                panic!("expected typed EXPLAIN REFRESH MATERIALIZED VIEW");
+            };
+            assert_eq!(lower_typed_explain_level(explain.level), expected);
+        }
     }
 }

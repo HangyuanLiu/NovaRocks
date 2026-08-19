@@ -97,11 +97,23 @@ pub struct ShowMaterializedViews {
     pub span: Span,
 }
 
-/// The syntax-level `EXPLAIN REFRESH MATERIALIZED VIEW` wrapper.
+/// The syntax-level `EXPLAIN [VERBOSE|COSTS] REFRESH MATERIALIZED VIEW` wrapper.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExplainRefreshMaterializedView {
+    pub level: MaterializedViewExplainLevel,
     pub refresh: RefreshMaterializedView,
     pub span: Span,
+}
+
+/// The explain presentation level accepted for materialized-view refreshes.
+///
+/// `ANALYZE` deliberately has no variant: `EXPLAIN ANALYZE REFRESH` is not a
+/// supported SQLP-3 command shape and must be rejected by the parser.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaterializedViewExplainLevel {
+    Default,
+    Verbose,
+    Costs,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,7 +170,13 @@ pub(crate) fn write_sql(statement: &MaterializedViewStatement, output: &mut Stri
         MaterializedViewStatement::Refresh(value) => write_refresh(value, output),
         MaterializedViewStatement::Show(value) => write_show(value, output),
         MaterializedViewStatement::ExplainRefresh(value) => {
-            output.push_str("EXPLAIN ");
+            output.push_str("EXPLAIN");
+            match value.level {
+                MaterializedViewExplainLevel::Default => {}
+                MaterializedViewExplainLevel::Verbose => output.push_str(" VERBOSE"),
+                MaterializedViewExplainLevel::Costs => output.push_str(" COSTS"),
+            }
+            output.push(' ');
             write_refresh(&value.refresh, output);
         }
     }

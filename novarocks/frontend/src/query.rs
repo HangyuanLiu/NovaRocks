@@ -153,15 +153,6 @@ impl CoreCommandRoute for TypedCommandRoute {
         )? {
             return Ok(result);
         }
-        if let Some(result) = self.mv.try_execute(
-            sql,
-            context.session().current_catalog(),
-            context.session().current_database(),
-            &connector_context,
-            context.execution(),
-        )? {
-            return Ok(result);
-        }
         Err("unsupported SQL command for the frontend capability router".to_string())
     }
 
@@ -275,7 +266,20 @@ impl CoreCommandRoute for TypedCommandRoute {
                     &connector_context,
                 )
             }
-            ParsedStatement::MaterializedView(_) | ParsedStatement::RawQuery(_) => {
+            ParsedStatement::MaterializedView(statement) => {
+                let connector_context = crate::connector::connector_request_context_for_query(
+                    Some(&query_options),
+                    context.execution().cancellation().clone(),
+                )?;
+                self.mv.execute(
+                    statement,
+                    context.session().current_catalog(),
+                    context.session().current_database(),
+                    &connector_context,
+                    context.execution(),
+                )
+            }
+            ParsedStatement::RawQuery(_) => {
                 Err("statement was admitted before its command-family owner cut".to_string())
             }
         }

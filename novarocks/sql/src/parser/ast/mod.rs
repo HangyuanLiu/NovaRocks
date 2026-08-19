@@ -156,19 +156,6 @@ pub struct ShowMaterializedViewsStmt {
     pub database: Option<String>,
 }
 
-/// Top-level statement variants produced by the custom dialect `parse_sql`
-/// entry point. Phase 1 only covers materialized-view DDL; other statements
-/// still flow through the legacy `parse_sql_raw` path.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Statement {
-    CreateMaterializedView(CreateMaterializedViewStmt),
-    DropMaterializedView(DropMaterializedViewStmt),
-    AlterMaterializedView(AlterMaterializedViewStmt),
-    RefreshMaterializedView(RefreshMaterializedViewStmt),
-    ShowMaterializedViews(ShowMaterializedViewsStmt),
-    AlterIcebergRef(AlterIcebergRefStmt),
-}
-
 /// `DELETE FROM <table> WHERE <predicate>`. Phase 1 only supports iceberg
 /// backends; the engine layer rejects other backends. WHERE is required;
 /// `DELETE FROM <table>` (no filter) is rejected — the spec recommends

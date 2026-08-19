@@ -4,7 +4,7 @@
 // The ASF licenses this file to you under the Apache License, Version 2.0.
 
 use novarocks_parser::{
-    ast::{Fold, MaterializedViewStatement, Statement, Visit},
+    ast::{Fold, MaterializedViewExplainLevel, MaterializedViewStatement, Statement, Visit},
     parse,
     printer::print_statements,
 };
@@ -41,9 +41,29 @@ fn mv_command_family_round_trips_through_the_typed_ast() {
         ALTER MATERIALIZED VIEW analytics.mv REPARTITION BY (truncate(name, 4)); \
         REFRESH MATERIALIZED VIEW analytics.mv FULL WITH SYNC MODE; \
         SHOW MATERIALIZED VIEWS FROM analytics; \
-        EXPLAIN REFRESH MATERIALIZED VIEW analytics.mv";
+        EXPLAIN REFRESH MATERIALIZED VIEW analytics.mv; \
+        EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW analytics.mv; \
+        EXPLAIN COSTS REFRESH MATERIALIZED VIEW analytics.mv";
     let statements = parse(source).expect("MV command family should parse");
-    assert_eq!(statements.len(), 8);
+    assert_eq!(statements.len(), 10);
+    let [
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        Statement::MaterializedView(MaterializedViewStatement::ExplainRefresh(default)),
+        Statement::MaterializedView(MaterializedViewStatement::ExplainRefresh(verbose)),
+        Statement::MaterializedView(MaterializedViewStatement::ExplainRefresh(costs)),
+    ] = statements.as_slice()
+    else {
+        panic!("expected typed EXPLAIN REFRESH statements");
+    };
+    assert_eq!(default.level, MaterializedViewExplainLevel::Default);
+    assert_eq!(verbose.level, MaterializedViewExplainLevel::Verbose);
+    assert_eq!(costs.level, MaterializedViewExplainLevel::Costs);
     let printed = print_statements(&statements);
     assert_eq!(
         printed,
@@ -54,7 +74,9 @@ fn mv_command_family_round_trips_through_the_typed_ast() {
          ALTER MATERIALIZED VIEW analytics.mv REPARTITION BY (truncate(name, 4)); \
          REFRESH MATERIALIZED VIEW analytics.mv FULL WITH SYNC MODE; \
          SHOW MATERIALIZED VIEWS FROM analytics; \
-         EXPLAIN REFRESH MATERIALIZED VIEW analytics.mv"
+         EXPLAIN REFRESH MATERIALIZED VIEW analytics.mv; \
+         EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW analytics.mv; \
+         EXPLAIN COSTS REFRESH MATERIALIZED VIEW analytics.mv"
     );
     let reparsed = parse(&printed).expect("printed MV commands should parse");
     assert_eq!(reparsed.len(), statements.len());
@@ -128,6 +150,7 @@ fn mv_drift_corpus_rejections_remain_parser_domain_failures() {
         "ALTER MATERIALIZED VIEW reject_mv SET FOO",
         "REFRESH MATERIALIZED VIEW reject_mv WITH BROKEN",
         "SHOW MATERIALIZED VIEWS LIKE 'reject%'",
+        "EXPLAIN ANALYZE REFRESH MATERIALIZED VIEW reject_mv",
         "CREATE MATERIALIZED VIEW reject_mv DISTRIBUTED BY HASH (k1) BUCKETS 1 PRIMARY KEY () AS SELECT k1 FROM source_table",
     ] {
         let error = parse(source).expect_err(source);

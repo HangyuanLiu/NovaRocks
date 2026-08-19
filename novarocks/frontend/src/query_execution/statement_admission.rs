@@ -77,22 +77,18 @@ fn is_deferred_family(source: &str) -> bool {
         Some("ALTER") if words.get(1).map(String::as_str) == Some("TABLE") => {
             !is_admitted_iceberg_alter(&words) && !is_admitted_maintenance_alter(&words)
         }
-        Some("CREATE" | "DROP" | "REFRESH") => {
-            words.get(1).map(String::as_str) == Some("MATERIALIZED")
-        }
         Some("SHOW") => {
-            matches!(
-                words.get(1).map(String::as_str),
-                Some("MATERIALIZED")
-                    | Some("ALTER")
-                        if !matches!(
-                            (words.get(2).map(String::as_str), words.get(3).map(String::as_str)),
-                            (Some("TABLE"), Some("OPTIMIZE"))
-                        )
-            ) || (words.get(1).map(String::as_str) == Some("CREATE")
-                && words.get(2).map(String::as_str) == Some("TABLE"))
+            (words.get(1).map(String::as_str) == Some("ALTER")
+                && !matches!(
+                    (
+                        words.get(2).map(String::as_str),
+                        words.get(3).map(String::as_str)
+                    ),
+                    (Some("TABLE"), Some("OPTIMIZE"))
+                ))
+                || (words.get(1).map(String::as_str) == Some("CREATE")
+                    && words.get(2).map(String::as_str) == Some("TABLE"))
         }
-        Some("EXPLAIN") => words.iter().any(|word| word == "REFRESH"),
         _ => false,
     }
 }
@@ -204,7 +200,6 @@ mod tests {
     fn later_command_families_are_deferred_without_parsing() {
         for source in [
             "ALTER TABLE ice.db.t ADD EQUALITY DELETE (id) VALUES (1)",
-            "CREATE MATERIALIZED VIEW mv DISTRIBUTED BY HASH(k) BUCKETS 1 AS SELECT k FROM t",
             "SHOW CREATE TABLE ice.db.t",
         ] {
             assert_eq!(
@@ -212,6 +207,23 @@ mod tests {
                     .expect("later family must remain deferred")
                     .0,
                 StatementAdmission::DeferredFamily,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn materialized_view_family_is_admitted_after_its_owner_cut() {
+        for source in [
+            "CREATE MATERIALIZED VIEW mv DISTRIBUTED BY HASH(k) BUCKETS 1 AS SELECT k FROM t",
+            "DROP MATERIALIZED VIEW mv",
+            "REFRESH MATERIALIZED VIEW mv",
+            "SHOW MATERIALIZED VIEWS",
+            "EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW mv",
+        ] {
+            assert_eq!(
+                admit_statement(source).expect("MV command should parse").0,
+                StatementAdmission::Parsed,
                 "{source}"
             );
         }

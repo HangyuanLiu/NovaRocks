@@ -10,9 +10,9 @@ use crate::{
     ast::materialized_view::{
         AlterMaterializedView, CreateMaterializedView, DropMaterializedView,
         ExplainRefreshMaterializedView, MaterializedViewAlterAction, MaterializedViewDistribution,
-        MaterializedViewPartitionArgument, MaterializedViewPartitionField,
-        MaterializedViewProperty, MaterializedViewRefreshMode, MaterializedViewRefreshPolicy,
-        RefreshMaterializedView, ShowMaterializedViews,
+        MaterializedViewExplainLevel, MaterializedViewPartitionArgument,
+        MaterializedViewPartitionField, MaterializedViewProperty, MaterializedViewRefreshMode,
+        MaterializedViewRefreshPolicy, RefreshMaterializedView, ShowMaterializedViews,
     },
     ast::{Ident, Literal, LiteralKind, MaterializedViewStatement, RawQuerySlice, Statement},
     token::Symbol,
@@ -37,8 +37,11 @@ pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<State
         return parse_show(parser).map(Some);
     }
     if parser.current_is_word("EXPLAIN")
-        && parser.peek_word(1, "REFRESH")
-        && parser.peek_word(2, "MATERIALIZED")
+        && (parser.peek_word(1, "REFRESH")
+            || (["VERBOSE", "COSTS", "ANALYZE"]
+                .iter()
+                .any(|word| parser.peek_word(1, word))
+                && parser.peek_word(2, "REFRESH")))
     {
         return parse_explain_refresh(parser).map(Some);
     }
@@ -223,13 +226,26 @@ fn parse_show(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseEr
 
 fn parse_explain_refresh(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseError> {
     let start = parser.consume_word("EXPLAIN")?.start();
+    let level = if parser.consume_if_word("VERBOSE") {
+        MaterializedViewExplainLevel::Verbose
+    } else if parser.consume_if_word("COSTS") {
+        MaterializedViewExplainLevel::Costs
+    } else if parser.current_is_word("ANALYZE") {
+        return Err(parser.unexpected("VERBOSE, COSTS, or REFRESH MATERIALIZED VIEW"));
+    } else {
+        MaterializedViewExplainLevel::Default
+    };
     let refresh = match parse_refresh(parser)? {
         Statement::MaterializedView(MaterializedViewStatement::Refresh(refresh)) => refresh,
         _ => unreachable!("REFRESH parser must produce a refresh AST"),
     };
     let span = Span::new(start, refresh.span.end());
     Ok(Statement::MaterializedView(
-        MaterializedViewStatement::ExplainRefresh(ExplainRefreshMaterializedView { refresh, span }),
+        MaterializedViewStatement::ExplainRefresh(ExplainRefreshMaterializedView {
+            level,
+            refresh,
+            span,
+        }),
     ))
 }
 

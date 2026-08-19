@@ -2532,6 +2532,24 @@ fn format_parser_error(raw: &str) -> String {
 }
 
 #[cfg(test)]
+fn consume_leading_keyword<'a>(sql: &'a str, keyword: &str) -> Option<&'a str> {
+    let trimmed = sql.trim_start();
+    let head = trimmed.as_bytes().get(..keyword.len())?;
+    if !head.eq_ignore_ascii_case(keyword.as_bytes()) {
+        return None;
+    }
+    let rest = &trimmed[keyword.len()..];
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(rest)
+}
+
+#[cfg(test)]
 fn split_explain_costs_sql(sql: &str) -> Option<(String, novarocks_sql::compiler::ExplainLevel)> {
     let body = consume_leading_keyword(consume_leading_keyword(sql, "EXPLAIN")?, "COSTS")?;
     Some((
@@ -2556,82 +2574,6 @@ fn split_explain_logical_sql(sql: &str) -> Option<(String, novarocks_sql::compil
     }
 
     Some((format!("EXPLAIN {}", body.trim_start()), level))
-}
-
-#[cfg(test)]
-fn consume_leading_keyword<'a>(sql: &'a str, keyword: &str) -> Option<&'a str> {
-    let trimmed = sql.trim_start();
-    let head = trimmed.as_bytes().get(..keyword.len())?;
-    if !head.eq_ignore_ascii_case(keyword.as_bytes()) {
-        return None;
-    }
-
-    let rest = &trimmed[keyword.len()..];
-    if rest
-        .chars()
-        .next()
-        .is_some_and(|ch| !ch.is_ascii_whitespace())
-    {
-        return None;
-    }
-    Some(rest)
-}
-
-fn parse_explain_refresh_materialized_view(
-    sql: &str,
-) -> Option<
-    Result<
-        (
-            novarocks_sql::syntax::RefreshMaterializedViewStmt,
-            novarocks_sql::compiler::ExplainLevel,
-            bool,
-        ),
-        String,
-    >,
-> {
-    let trimmed = sql.trim_start();
-    let prefixes = [
-        (
-            "EXPLAIN ANALYZE REFRESH ",
-            novarocks_sql::compiler::ExplainLevel::Analyze,
-            true,
-        ),
-        (
-            "EXPLAIN VERBOSE REFRESH ",
-            novarocks_sql::compiler::ExplainLevel::Verbose,
-            false,
-        ),
-        (
-            "EXPLAIN COSTS REFRESH ",
-            novarocks_sql::compiler::ExplainLevel::Costs,
-            false,
-        ),
-        (
-            "EXPLAIN REFRESH ",
-            novarocks_sql::compiler::ExplainLevel::Normal,
-            false,
-        ),
-    ];
-    for (prefix, level, analyze) in prefixes {
-        if trimmed
-            .as_bytes()
-            .get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
-        {
-            let body = format!("REFRESH {}", trimmed[prefix.len()..].trim_start());
-            let statement = match novarocks_sql::syntax::parse_mv_admitted_statement(&body) {
-                Ok(novarocks_sql::syntax::MvAdmittedStatement::Refresh(statement)) => statement,
-                Ok(_) => {
-                    return Some(Err(
-                        "EXPLAIN REFRESH only supports REFRESH MATERIALIZED VIEW".to_string(),
-                    ));
-                }
-                Err(error) => return Some(Err(error)),
-            };
-            return Some(Ok((statement, level, analyze)));
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -2679,38 +2621,6 @@ mod tests {
             super::query_options_for_explain_analyze(Some(options)),
             expected
         );
-    }
-
-    #[test]
-    fn parse_explain_refresh_materialized_view_supports_verbose_and_costs() {
-        let verbose = super::parse_explain_refresh_materialized_view(
-            "EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW mv1",
-        )
-        .expect("recognized")
-        .expect("parsed");
-        assert_eq!(verbose.0.name.parts, vec!["mv1"]);
-        assert_eq!(verbose.1, novarocks_sql::compiler::ExplainLevel::Verbose);
-        assert!(!verbose.2);
-
-        let costs = super::parse_explain_refresh_materialized_view(
-            "EXPLAIN COSTS REFRESH MATERIALIZED VIEW db.mv1",
-        )
-        .expect("recognized")
-        .expect("parsed");
-        assert_eq!(costs.0.name.parts, vec!["db", "mv1"]);
-        assert_eq!(costs.1, novarocks_sql::compiler::ExplainLevel::Costs);
-        assert!(!costs.2);
-    }
-
-    #[test]
-    fn parse_explain_refresh_materialized_view_marks_analyze() {
-        let parsed = super::parse_explain_refresh_materialized_view(
-            "EXPLAIN ANALYZE REFRESH MATERIALIZED VIEW mv1",
-        )
-        .expect("recognized")
-        .expect("parsed");
-        assert_eq!(parsed.1, novarocks_sql::compiler::ExplainLevel::Analyze);
-        assert!(parsed.2);
     }
 
     #[test]
