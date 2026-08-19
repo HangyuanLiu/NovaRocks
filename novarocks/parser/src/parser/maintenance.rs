@@ -88,8 +88,10 @@ fn parse_procedure_argument(
     let start = parser.current_offset();
     let name = if named_argument_ahead(parser) {
         let name = parser.parse_ident()?;
-        parser.consume_symbol(Symbol::Eq)?;
-        parser.consume_symbol(Symbol::Gt)?;
+        if !parser.consume_if_symbol(Symbol::FatArrow) {
+            parser.consume_symbol(Symbol::Eq)?;
+            parser.consume_symbol(Symbol::Gt)?;
+        }
         Some(name)
     } else {
         None
@@ -123,6 +125,12 @@ fn named_argument_ahead(parser: &StatementParser<'_, '_>) -> bool {
                 kind: TokenKind::Symbol(Symbol::Gt),
                 ..
             }),
+        ) if matches!(first.kind, TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::Keyword(_))
+    ) || matches!(
+        (first, second),
+        (
+            Some(first),
+            Some(crate::Token { kind: TokenKind::Symbol(Symbol::FatArrow), .. }),
         ) if matches!(first.kind, TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::Keyword(_))
     )
 }

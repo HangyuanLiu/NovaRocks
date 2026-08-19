@@ -91,7 +91,6 @@ pub const fn class(keyword: Keyword) -> KeywordClass {
         | Keyword::True
         | Keyword::Truncate
         | Keyword::Union
-        | Keyword::Unknown
         | Keyword::Using
         | Keyword::Values
         | Keyword::When
