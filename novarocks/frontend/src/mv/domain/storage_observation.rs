@@ -1621,7 +1621,7 @@ mod tests {
                 crate::common::persisted_query_definition::PersistedQueryDefinition::new(
                     "select 1",
                     crate::common::persisted_query_definition::PersistedQueryDialect::StarRocks,
-                    "iceberg.rest",
+                    "iceberg",
                     "db",
                 )
                 .unwrap(),
