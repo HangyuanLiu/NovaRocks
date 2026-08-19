@@ -20,6 +20,7 @@
 pub(crate) mod backend;
 pub(crate) mod catalog;
 pub(crate) mod command;
+mod equivalence;
 mod expr;
 pub(crate) mod iceberg;
 pub(crate) mod maintenance;
@@ -38,6 +39,7 @@ pub use catalog::{
     DropTable, ShowCreateTable, TruncateTable,
 };
 pub use command::{Property, PropertyKeyValue};
+pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_eq_query};
 pub use expr::{
     AccessExpr, AccessKind, ArrayExpr, BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr,
     CastKind, CompoundIdentifier, ExistsExpr, Expr, FunctionCall, FunctionOrderBy,
