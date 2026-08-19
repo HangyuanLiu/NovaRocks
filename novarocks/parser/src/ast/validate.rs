@@ -236,7 +236,15 @@ fn validate_table_factor(table_factor: &TableFactor) -> Result<(), ValidateError
             Ok(())
         }
         TableFactor::Derived { subquery, .. } => validate_query(subquery),
-        TableFactor::TableFunction { expr, .. } => validate_expr(expr),
+        TableFactor::TableFunction { expr, hints, .. } => {
+            validate_expr(expr)?;
+            for hint in hints {
+                for argument in &hint.arguments {
+                    validate_expr(argument)?;
+                }
+            }
+            Ok(())
+        }
         TableFactor::Unnest { array_exprs, .. } => {
             if array_exprs.is_empty() {
                 return Err(ValidateError::invalid_structure(

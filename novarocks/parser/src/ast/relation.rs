@@ -35,6 +35,7 @@ pub enum TableFactor {
     TableFunction {
         lateral: bool,
         expr: Expr,
+        hints: Vec<TableHint>,
         alias: Option<TableAlias>,
         span: Span,
     },

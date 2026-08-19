@@ -345,8 +345,16 @@ pub fn walk_table_factor<V: Visit + ?Sized>(visitor: &mut V, factor: &TableFacto
                 walk_table_alias(visitor, alias);
             }
         }
-        TableFactor::TableFunction { expr, alias, .. } => {
+        TableFactor::TableFunction {
+            expr, hints, alias, ..
+        } => {
             visitor.visit_expr(expr);
+            for hint in hints {
+                visitor.visit_ident(&hint.name);
+                for argument in &hint.arguments {
+                    visitor.visit_expr(argument);
+                }
+            }
             if let Some(alias) = alias {
                 walk_table_alias(visitor, alias);
             }
@@ -1015,11 +1023,24 @@ pub fn fold_table_factor<F: Fold + ?Sized>(folder: &mut F, factor: TableFactor) 
         TableFactor::TableFunction {
             lateral,
             expr,
+            hints,
             alias,
             span,
         } => TableFactor::TableFunction {
             lateral,
             expr: folder.fold_expr(expr),
+            hints: hints
+                .into_iter()
+                .map(|mut hint| {
+                    hint.name = folder.fold_ident(hint.name);
+                    hint.arguments = hint
+                        .arguments
+                        .into_iter()
+                        .map(|argument| folder.fold_expr(argument))
+                        .collect();
+                    hint
+                })
+                .collect(),
             alias: alias.map(|alias| fold_table_alias(folder, alias)),
             span,
         },

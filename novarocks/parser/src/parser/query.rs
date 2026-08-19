@@ -22,8 +22,8 @@ use crate::{
     ast::{
         Cte, ExplainFormat, ExplainQuery, Expr, Fetch, GroupBy, Join, JoinConstraint, JoinOperator,
         NamedWindow, Offset, OffsetRows, OrderByExpr, Query, Select, SelectItem, SelectQuantifier,
-        SetExpr, SetOperation, SetOperator, SetQuantifier, Statement, TableFactor, TableWithJoins,
-        Values, WildcardOptions, With,
+        SetExpr, SetOperation, SetOperator, SetQuantifier, Statement, TableFactor, TableHint,
+        TableVersion, TableVersionKind, TableWithJoins, Values, WildcardOptions, With,
     },
     token::{Keyword, Symbol},
 };
@@ -438,10 +438,23 @@ fn parse_from(
         let relation = parse_table_factor(parser)?;
         let start = relation.span().start();
         let mut joins = Vec::new();
-        while let Some(operator) = parse_join_operator(parser) {
+        loop {
             let join_start = parser.current_span().start();
+            let natural = if parser.current_is_keyword(Keyword::Natural) {
+                Some(parser.consume_word("NATURAL")?)
+            } else {
+                None
+            };
+            let Some(operator) = parse_join_operator(parser) else {
+                if natural.is_some() {
+                    return Err(parser.unexpected("JOIN after NATURAL"));
+                }
+                break;
+            };
             let relation = parse_table_factor(parser)?;
-            let constraint = if parser.consume_if_word("ON") {
+            let constraint = if let Some(span) = natural {
+                JoinConstraint::Natural(span)
+            } else if parser.consume_if_word("ON") {
                 JoinConstraint::On(parse_expression_until(
                     parser,
                     join_or_query_clause_words(),
@@ -491,8 +504,12 @@ fn parse_from(
 fn parse_table_factor(
     parser: &mut StatementParser<'_, '_>,
 ) -> Result<TableFactor, crate::ParseError> {
+    let mut hints = parse_table_hints(parser)?;
     let lateral = parser.consume_if_word("LATERAL");
     if parser.current_is_symbol(Symbol::LParen) {
+        if !hints.is_empty() {
+            return Err(parser.unexpected("table after table hint"));
+        }
         let start = parser.consume_symbol(Symbol::LParen)?.start();
         if !(parser.current_is_keyword(Keyword::Select)
             || parser.current_is_keyword(Keyword::Values)
@@ -512,6 +529,9 @@ fn parse_table_factor(
         });
     }
     if parser.current_is_keyword(Keyword::Unnest) {
+        if !hints.is_empty() {
+            return Err(parser.unexpected("table after table hint"));
+        }
         let start = parser.consume_word("UNNEST")?.start();
         parser.consume_symbol(Symbol::LParen)?;
         let mut array_exprs = Vec::new();
@@ -535,8 +555,26 @@ fn parse_table_factor(
             span: Span::new(start, span_end),
         });
     }
+    if parser.current_is_word("TABLE") {
+        let start = parser.consume_word("TABLE")?.start();
+        parser.consume_symbol(Symbol::LParen)?;
+        let expr = parse_expression_until(parser, &[], &[Symbol::RParen])?;
+        let end = parser.consume_symbol(Symbol::RParen)?.end();
+        hints.extend(parse_table_hints(parser)?);
+        let alias = parse_optional_table_alias(parser)?;
+        let span_end = alias.as_ref().map_or(end, |alias| alias.span.end());
+        return Ok(TableFactor::TableFunction {
+            lateral,
+            expr,
+            hints,
+            alias,
+            span: Span::new(start, span_end),
+        });
+    }
     let name = parser.parse_object_name()?;
     let start = name.span.start();
+    let version = parse_table_version(parser)?;
+    hints.extend(parse_table_hints(parser)?);
     let alias = parse_optional_table_alias(parser)?;
     let end = alias
         .as_ref()
@@ -544,10 +582,105 @@ fn parse_table_factor(
     Ok(TableFactor::Table {
         name,
         alias,
-        version: None,
-        hints: Vec::new(),
+        version,
+        hints,
         span: Span::new(start, end),
     })
+}
+
+fn parse_table_version(
+    parser: &mut StatementParser<'_, '_>,
+) -> Result<Option<TableVersion>, crate::ParseError> {
+    if !parser.current_is_keyword(Keyword::For) {
+        return Ok(None);
+    }
+    let start = parser.consume_word("FOR")?.start();
+    let kind = if parser.consume_if_word("VERSION") {
+        TableVersionKind::ForVersionAsOf
+    } else if parser.consume_if_word("SYSTEM_TIME") {
+        TableVersionKind::ForSystemTimeAsOf
+    } else if parser.consume_if_word("SYSTEM") {
+        parser.consume_word("TIME")?;
+        TableVersionKind::ForSystemTimeAsOf
+    } else {
+        return Err(parser.unexpected("VERSION or SYSTEM_TIME after FOR"));
+    };
+    parser.consume_word("AS")?;
+    parser.consume_word("OF")?;
+    let value = parse_atomic_expression(parser)?;
+    Ok(Some(TableVersion {
+        kind,
+        span: Span::new(start, value.span().end()),
+        value,
+    }))
+}
+
+fn parse_atomic_expression(
+    parser: &mut StatementParser<'_, '_>,
+) -> Result<Expr, crate::ParseError> {
+    let begin = parser.position;
+    let mut end = begin;
+    let mut significant = 0usize;
+    while let Some(token) = parser.tokens.get(end) {
+        if !matches!(token.kind, TokenKind::Trivia(_)) {
+            significant += 1;
+            if significant == 1
+                && matches!(token.kind, TokenKind::Symbol(Symbol::Plus | Symbol::Minus))
+            {
+                end += 1;
+                continue;
+            }
+            end += 1;
+            break;
+        }
+        end += 1;
+    }
+    if significant == 0 {
+        return Err(parser.unexpected("table version expression"));
+    }
+    let boundary = parser
+        .tokens
+        .get(end)
+        .map_or_else(|| parser.current_span(), |token| token.span);
+    let mut tokens = parser.tokens[begin..end].to_vec();
+    tokens.push(Token::new(TokenKind::End, boundary));
+    let expression = PrattParser::new(parser.source, &tokens).parse()?;
+    parser.position = end;
+    parser.skip_trivia();
+    Ok(expression)
+}
+
+fn parse_table_hints(
+    parser: &mut StatementParser<'_, '_>,
+) -> Result<Vec<TableHint>, crate::ParseError> {
+    let mut hints = Vec::new();
+    while parser.current_is_symbol(Symbol::LBracket) {
+        let start = parser.consume_symbol(Symbol::LBracket)?.start();
+        let name = parser.parse_ident()?;
+        let mut arguments = Vec::new();
+        if parser.consume_if_symbol(Symbol::LParen) {
+            if !parser.current_is_symbol(Symbol::RParen) {
+                loop {
+                    arguments.push(parse_expression_until(
+                        parser,
+                        &[],
+                        &[Symbol::Comma, Symbol::RParen],
+                    )?);
+                    if !parser.consume_if_symbol(Symbol::Comma) {
+                        break;
+                    }
+                }
+            }
+            parser.consume_symbol(Symbol::RParen)?;
+        }
+        let end = parser.consume_symbol(Symbol::RBracket)?.end();
+        hints.push(TableHint {
+            name,
+            arguments,
+            span: Span::new(start, end),
+        });
+    }
+    Ok(hints)
 }
 
 fn parse_optional_table_alias(
@@ -595,11 +728,27 @@ fn parse_join_operator(parser: &mut StatementParser<'_, '_>) -> Option<JoinOpera
     }
     if parser.consume_if_word("LEFT") {
         parser.consume_if_word("OUTER");
+        if parser.consume_if_word("SEMI") {
+            parser.consume_if_word("JOIN");
+            return Some(JoinOperator::LeftSemi);
+        }
+        if parser.consume_if_word("ANTI") {
+            parser.consume_if_word("JOIN");
+            return Some(JoinOperator::LeftAnti);
+        }
         parser.consume_if_word("JOIN");
         return Some(JoinOperator::LeftOuter);
     }
     if parser.consume_if_word("RIGHT") {
         parser.consume_if_word("OUTER");
+        if parser.consume_if_word("SEMI") {
+            parser.consume_if_word("JOIN");
+            return Some(JoinOperator::RightSemi);
+        }
+        if parser.consume_if_word("ANTI") {
+            parser.consume_if_word("JOIN");
+            return Some(JoinOperator::RightAnti);
+        }
         parser.consume_if_word("JOIN");
         return Some(JoinOperator::RightOuter);
     }

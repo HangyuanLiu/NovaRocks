@@ -430,6 +430,7 @@ impl Printer {
             TableFactor::TableFunction {
                 lateral,
                 expr,
+                hints,
                 alias,
                 ..
             } => {
@@ -439,6 +440,9 @@ impl Printer {
                 self.output.push_str("TABLE(");
                 self.write_expr(expr);
                 self.output.push(')');
+                for hint in hints {
+                    self.write_table_hint(hint);
+                }
                 if let Some(alias) = alias {
                     self.output.push(' ');
                     self.write_table_alias(alias);
@@ -495,14 +499,14 @@ impl Printer {
     }
 
     fn write_table_hint(&mut self, hint: &TableHint) {
-        self.output.push_str(" /*+ ");
+        self.output.push_str(" [");
         self.write_ident(&hint.name);
         if !hint.arguments.is_empty() {
             self.output.push('(');
             self.write_expr_list(&hint.arguments);
             self.output.push(')');
         }
-        self.output.push_str(" */");
+        self.output.push(']');
     }
 
     fn write_join(&mut self, join: &Join) {
