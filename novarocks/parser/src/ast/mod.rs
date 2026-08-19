@@ -74,8 +74,8 @@ pub use query::{
     SetQuantifier, Values, WildcardOptions, With,
 };
 pub use relation::{
-    Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableHint, TableVersion,
-    TableVersionKind, TableWithJoins,
+    Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableFunctionSyntax, TableHint,
+    TableVersion, TableVersionKind, TableWithJoins,
 };
 pub use statistics::{
     AnalyzeMode, AnalyzeTable, CancelAnalyze, DropHistogram, DropMultipleColumnsStats, DropStats,

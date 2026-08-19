@@ -1061,12 +1061,14 @@ pub fn fold_table_factor<F: Fold + ?Sized>(folder: &mut F, factor: TableFactor) 
         },
         TableFactor::TableFunction {
             lateral,
+            syntax,
             expr,
             hints,
             alias,
             span,
         } => TableFactor::TableFunction {
             lateral,
+            syntax,
             expr: folder.fold_expr(expr),
             hints: hints
                 .into_iter()

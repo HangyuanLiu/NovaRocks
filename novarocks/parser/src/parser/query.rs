@@ -699,14 +699,35 @@ fn parse_table_factor(
         let span_end = alias.as_ref().map_or(end, |alias| alias.span.end());
         return Ok(TableFactor::TableFunction {
             lateral,
+            syntax: crate::ast::TableFunctionSyntax::TableWrapper,
             expr,
             hints,
             alias,
             span: Span::new(start, span_end),
         });
     }
+    let function_start = parser.position;
     let name = parser.parse_object_name()?;
     let start = name.span.start();
+    if parser.current_is_symbol(Symbol::LParen) {
+        let end = table_function_end(parser)?;
+        let expr = parse_expression_range(parser, function_start, end)?;
+        parser.position = end;
+        parser.skip_trivia();
+        hints.extend(parse_table_hints(parser)?);
+        let alias = parse_optional_table_alias(parser)?;
+        let span_end = alias
+            .as_ref()
+            .map_or(expr.span().end(), |alias| alias.span.end());
+        return Ok(TableFactor::TableFunction {
+            lateral,
+            syntax: crate::ast::TableFunctionSyntax::BareCall,
+            expr,
+            hints,
+            alias,
+            span: Span::new(start, span_end),
+        });
+    }
     let version = parse_table_version(parser)?;
     hints.extend(parse_table_hints(parser)?);
     let alias = parse_optional_table_alias(parser)?;
@@ -720,6 +741,28 @@ fn parse_table_factor(
         hints,
         span: Span::new(start, end),
     })
+}
+
+fn table_function_end(parser: &StatementParser<'_, '_>) -> Result<usize, crate::ParseError> {
+    let mut index = parser.position;
+    let mut depth = 0usize;
+    while let Some(token) = parser.tokens.get(index) {
+        match token.kind {
+            TokenKind::Symbol(Symbol::LParen) => depth += 1,
+            TokenKind::Symbol(Symbol::RParen) => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| parser.unexpected("table function"))?;
+                if depth == 0 {
+                    return Ok(index + 1);
+                }
+            }
+            TokenKind::End => break,
+            _ => {}
+        }
+        index += 1;
+    }
+    Err(parser.unexpected(") after table function"))
 }
 
 fn parse_table_version(

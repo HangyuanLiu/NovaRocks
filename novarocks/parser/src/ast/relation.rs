@@ -35,6 +35,7 @@ pub enum TableFactor {
     },
     TableFunction {
         lateral: bool,
+        syntax: TableFunctionSyntax,
         expr: Expr,
         hints: Vec<TableHint>,
         alias: Option<TableAlias>,
@@ -52,6 +53,13 @@ pub enum TableFactor {
         alias: Option<TableAlias>,
         span: Span,
     },
+}
+
+/// The source form used for a table-valued function.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TableFunctionSyntax {
+    TableWrapper,
+    BareCall,
 }
 
 impl TableFactor {

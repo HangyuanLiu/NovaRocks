@@ -337,6 +337,7 @@ impl SyntaxEq for TableFactor {
             (
                 Self::TableFunction {
                     lateral: left_lateral,
+                    syntax: left_syntax,
                     expr: left_expr,
                     hints: left_hints,
                     alias: left_alias,
@@ -344,6 +345,7 @@ impl SyntaxEq for TableFactor {
                 },
                 Self::TableFunction {
                     lateral: right_lateral,
+                    syntax: right_syntax,
                     expr: right_expr,
                     hints: right_hints,
                     alias: right_alias,
@@ -351,6 +353,7 @@ impl SyntaxEq for TableFactor {
                 },
             ) => {
                 left_lateral == right_lateral
+                    && left_syntax == right_syntax
                     && left_expr.syntax_eq(right_expr)
                     && syntax_eq_slice(left_hints, right_hints)
                     && syntax_eq_option(left_alias, right_alias)

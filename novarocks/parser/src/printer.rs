@@ -463,6 +463,7 @@ impl Printer {
             }
             TableFactor::TableFunction {
                 lateral,
+                syntax,
                 expr,
                 hints,
                 alias,
@@ -471,9 +472,14 @@ impl Printer {
                 if *lateral {
                     self.output.push_str("LATERAL ");
                 }
-                self.output.push_str("TABLE(");
-                self.write_expr(expr);
-                self.output.push(')');
+                match syntax {
+                    crate::ast::TableFunctionSyntax::TableWrapper => {
+                        self.output.push_str("TABLE(");
+                        self.write_expr(expr);
+                        self.output.push(')');
+                    }
+                    crate::ast::TableFunctionSyntax::BareCall => self.write_expr(expr),
+                }
                 for hint in hints {
                     self.output.push(' ');
                     self.write_table_hint(hint);
@@ -612,6 +618,7 @@ impl Printer {
             }
             TableFactor::TableFunction {
                 lateral,
+                syntax,
                 expr,
                 hints,
                 alias,
@@ -624,9 +631,14 @@ impl Printer {
                 if *lateral {
                     self.output.push_str("LATERAL ");
                 }
-                self.output.push_str("TABLE(");
-                self.write_expr(expr);
-                self.output.push(')');
+                match syntax {
+                    crate::ast::TableFunctionSyntax::TableWrapper => {
+                        self.output.push_str("TABLE(");
+                        self.write_expr(expr);
+                        self.output.push(')');
+                    }
+                    crate::ast::TableFunctionSyntax::BareCall => self.write_expr(expr),
+                }
                 if let Some(alias) = alias {
                     self.output.push(' ');
                     self.write_table_alias(alias);
