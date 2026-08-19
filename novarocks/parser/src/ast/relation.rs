@@ -41,6 +41,7 @@ pub enum TableFactor {
         span: Span,
     },
     Unnest {
+        lateral: bool,
         array_exprs: Vec<Expr>,
         with_offset: bool,
         alias: Option<TableAlias>,
@@ -69,6 +70,7 @@ impl TableFactor {
 pub struct TableAlias {
     pub name: Ident,
     pub columns: Vec<Ident>,
+    pub explicit_as: bool,
     pub span: Span,
 }
 
@@ -105,9 +107,13 @@ pub struct Join {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JoinOperator {
     Inner,
+    InnerExplicit,
     LeftOuter,
+    LeftOuterExplicit,
     RightOuter,
+    RightOuterExplicit,
     FullOuter,
+    FullOuterExplicit,
     Cross,
     LeftSemi,
     RightSemi,

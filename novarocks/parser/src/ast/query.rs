@@ -130,6 +130,7 @@ pub enum SelectItem {
     ExprWithAlias {
         expr: Expr,
         alias: Ident,
+        explicit_as: bool,
         span: Span,
     },
     Wildcard {

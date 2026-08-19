@@ -440,10 +440,20 @@ fn parse_projection(
             if parser.consume_if_word("AS") {
                 let alias = parser.parse_ident()?;
                 let span = Span::new(expr.span().start(), alias.span.end());
-                items.push(SelectItem::ExprWithAlias { expr, alias, span });
+                items.push(SelectItem::ExprWithAlias {
+                    expr,
+                    alias,
+                    explicit_as: true,
+                    span,
+                });
             } else if let Some(alias) = implicit_alias {
                 let span = Span::new(expr.span().start(), alias.span.end());
-                items.push(SelectItem::ExprWithAlias { expr, alias, span });
+                items.push(SelectItem::ExprWithAlias {
+                    expr,
+                    alias,
+                    explicit_as: false,
+                    span,
+                });
             } else {
                 items.push(SelectItem::UnnamedExpr(expr));
             }
@@ -603,6 +613,7 @@ fn parse_table_factor(
         let alias = parse_optional_table_alias(parser)?;
         let span_end = alias.as_ref().map_or(end, |alias| alias.span.end());
         return Ok(TableFactor::Unnest {
+            lateral,
             array_exprs,
             with_offset: false,
             alias,
@@ -768,22 +779,24 @@ fn parse_optional_table_alias(
     Ok(Some(crate::ast::TableAlias {
         name,
         columns,
+        explicit_as,
         span: Span::new(start, end),
     }))
 }
 
 fn parse_join_operator(parser: &mut StatementParser<'_, '_>) -> Option<JoinOperator> {
-    if parser.consume_if_word("JOIN")
-        || (parser.consume_if_word("INNER") && { parser.consume_if_word("JOIN") })
-    {
+    if parser.consume_if_word("JOIN") {
         return Some(JoinOperator::Inner);
+    }
+    if parser.consume_if_word("INNER") && parser.consume_if_word("JOIN") {
+        return Some(JoinOperator::InnerExplicit);
     }
     if parser.consume_if_word("CROSS") {
         parser.consume_if_word("JOIN");
         return Some(JoinOperator::Cross);
     }
     if parser.consume_if_word("LEFT") {
-        parser.consume_if_word("OUTER");
+        let explicit_outer = parser.consume_if_word("OUTER");
         if parser.consume_if_word("SEMI") {
             parser.consume_if_word("JOIN");
             return Some(JoinOperator::LeftSemi);
@@ -793,10 +806,14 @@ fn parse_join_operator(parser: &mut StatementParser<'_, '_>) -> Option<JoinOpera
             return Some(JoinOperator::LeftAnti);
         }
         parser.consume_if_word("JOIN");
-        return Some(JoinOperator::LeftOuter);
+        return Some(if explicit_outer {
+            JoinOperator::LeftOuterExplicit
+        } else {
+            JoinOperator::LeftOuter
+        });
     }
     if parser.consume_if_word("RIGHT") {
-        parser.consume_if_word("OUTER");
+        let explicit_outer = parser.consume_if_word("OUTER");
         if parser.consume_if_word("SEMI") {
             parser.consume_if_word("JOIN");
             return Some(JoinOperator::RightSemi);
@@ -806,12 +823,20 @@ fn parse_join_operator(parser: &mut StatementParser<'_, '_>) -> Option<JoinOpera
             return Some(JoinOperator::RightAnti);
         }
         parser.consume_if_word("JOIN");
-        return Some(JoinOperator::RightOuter);
+        return Some(if explicit_outer {
+            JoinOperator::RightOuterExplicit
+        } else {
+            JoinOperator::RightOuter
+        });
     }
     if parser.consume_if_word("FULL") {
-        parser.consume_if_word("OUTER");
+        let explicit_outer = parser.consume_if_word("OUTER");
         parser.consume_if_word("JOIN");
-        return Some(JoinOperator::FullOuter);
+        return Some(if explicit_outer {
+            JoinOperator::FullOuterExplicit
+        } else {
+            JoinOperator::FullOuter
+        });
     }
     None
 }

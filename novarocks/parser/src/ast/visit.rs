@@ -876,9 +876,15 @@ pub fn fold_select<F: Fold + ?Sized>(folder: &mut F, mut select: Select) -> Sele
         .into_iter()
         .map(|item| match item {
             SelectItem::UnnamedExpr(expr) => SelectItem::UnnamedExpr(folder.fold_expr(expr)),
-            SelectItem::ExprWithAlias { expr, alias, span } => SelectItem::ExprWithAlias {
+            SelectItem::ExprWithAlias {
+                expr,
+                alias,
+                explicit_as,
+                span,
+            } => SelectItem::ExprWithAlias {
                 expr: folder.fold_expr(expr),
                 alias: folder.fold_ident(alias),
+                explicit_as,
                 span,
             },
             SelectItem::Wildcard { mut options, span } => {
@@ -1079,11 +1085,13 @@ pub fn fold_table_factor<F: Fold + ?Sized>(folder: &mut F, factor: TableFactor) 
             span,
         },
         TableFactor::Unnest {
+            lateral,
             array_exprs,
             with_offset,
             alias,
             span,
         } => TableFactor::Unnest {
+            lateral,
             array_exprs: array_exprs
                 .into_iter()
                 .map(|expr| folder.fold_expr(expr))

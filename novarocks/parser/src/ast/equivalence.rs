@@ -175,14 +175,20 @@ impl SyntaxEq for SelectItem {
                 Self::ExprWithAlias {
                     expr: left_expr,
                     alias: left_alias,
+                    explicit_as: left_explicit_as,
                     ..
                 },
                 Self::ExprWithAlias {
                     expr: right_expr,
                     alias: right_alias,
+                    explicit_as: right_explicit_as,
                     ..
                 },
-            ) => left_expr.syntax_eq(right_expr) && left_alias.syntax_eq(right_alias),
+            ) => {
+                left_expr.syntax_eq(right_expr)
+                    && left_alias.syntax_eq(right_alias)
+                    && left_explicit_as == right_explicit_as
+            }
             (Self::Wildcard { options: left, .. }, Self::Wildcard { options: right, .. }) => {
                 left.syntax_eq(right)
             }
@@ -350,19 +356,22 @@ impl SyntaxEq for TableFactor {
             }
             (
                 Self::Unnest {
+                    lateral: left_lateral,
                     array_exprs: left_exprs,
                     with_offset: left_offset,
                     alias: left_alias,
                     ..
                 },
                 Self::Unnest {
+                    lateral: right_lateral,
                     array_exprs: right_exprs,
                     with_offset: right_offset,
                     alias: right_alias,
                     ..
                 },
             ) => {
-                syntax_eq_slice(left_exprs, right_exprs)
+                left_lateral == right_lateral
+                    && syntax_eq_slice(left_exprs, right_exprs)
                     && left_offset == right_offset
                     && syntax_eq_option(left_alias, right_alias)
             }
@@ -387,7 +396,9 @@ impl SyntaxEq for TableFactor {
 
 impl SyntaxEq for TableAlias {
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.name.syntax_eq(&other.name) && syntax_eq_slice(&self.columns, &other.columns)
+        self.name.syntax_eq(&other.name)
+            && syntax_eq_slice(&self.columns, &other.columns)
+            && self.explicit_as == other.explicit_as
     }
 }
 
@@ -845,6 +856,7 @@ mod tests {
                 projection: vec![SelectItem::ExprWithAlias {
                     expr: sample_expr(start + 9),
                     alias: ident("result", start + 10),
+                    explicit_as: true,
                     span: span(start + 11),
                 }],
                 from: Vec::new(),

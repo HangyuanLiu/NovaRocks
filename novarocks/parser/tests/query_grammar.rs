@@ -66,3 +66,14 @@ fn query_forms_parse_and_print_as_typed_syntax() {
         ));
     }
 }
+
+#[test]
+fn source_significant_query_forms_are_retained_by_the_typed_ast() {
+    let source = "SELECT t.id AS value FROM source AS t INNER JOIN LATERAL UNNEST(t.items) AS u(item) ON true LEFT OUTER JOIN target AS r ON r.id = t.id";
+    let statements = parse(source).expect("source-significant query should parse");
+
+    assert_eq!(
+        Printer::new().statements(&statements),
+        "SELECT t.id AS value FROM source AS t INNER JOIN LATERAL UNNEST(t.items) AS u(item) ON TRUE LEFT OUTER JOIN target AS r ON r.id = t.id"
+    );
+}

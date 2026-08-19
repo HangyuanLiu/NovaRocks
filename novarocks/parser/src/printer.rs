@@ -282,9 +282,18 @@ impl Printer {
     fn write_select_item(&mut self, item: &SelectItem) {
         match item {
             SelectItem::UnnamedExpr(expr) => self.write_expr(expr),
-            SelectItem::ExprWithAlias { expr, alias, .. } => {
+            SelectItem::ExprWithAlias {
+                expr,
+                alias,
+                explicit_as,
+                ..
+            } => {
                 self.write_expr(expr);
-                self.output.push_str(" AS ");
+                if *explicit_as {
+                    self.output.push_str(" AS ");
+                } else {
+                    self.output.push(' ');
+                }
                 self.write_ident(alias);
             }
             SelectItem::Wildcard { options, .. } => {
@@ -460,11 +469,15 @@ impl Printer {
                 }
             }
             TableFactor::Unnest {
+                lateral,
                 array_exprs,
                 with_offset,
                 alias,
                 ..
             } => {
+                if *lateral {
+                    self.output.push_str("LATERAL ");
+                }
                 self.output.push_str("UNNEST(");
                 self.write_expr_list(array_exprs);
                 self.output.push(')');
@@ -493,6 +506,9 @@ impl Printer {
     }
 
     fn write_table_alias(&mut self, alias: &TableAlias) {
+        if alias.explicit_as {
+            self.output.push_str("AS ");
+        }
         self.write_ident(&alias.name);
         if !alias.columns.is_empty() {
             self.output.push('(');
@@ -529,9 +545,13 @@ impl Printer {
         }
         self.output.push_str(match join.operator {
             JoinOperator::Inner => "JOIN ",
+            JoinOperator::InnerExplicit => "INNER JOIN ",
             JoinOperator::LeftOuter => "LEFT JOIN ",
+            JoinOperator::LeftOuterExplicit => "LEFT OUTER JOIN ",
             JoinOperator::RightOuter => "RIGHT JOIN ",
+            JoinOperator::RightOuterExplicit => "RIGHT OUTER JOIN ",
             JoinOperator::FullOuter => "FULL JOIN ",
+            JoinOperator::FullOuterExplicit => "FULL OUTER JOIN ",
             JoinOperator::Cross => "CROSS JOIN ",
             JoinOperator::LeftSemi => "LEFT SEMI JOIN ",
             JoinOperator::RightSemi => "RIGHT SEMI JOIN ",
@@ -1401,6 +1421,7 @@ mod tests {
                 projection: vec![SelectItem::ExprWithAlias {
                     expr: identifier("s"),
                     alias: ident("value"),
+                    explicit_as: true,
                     span: span(),
                 }],
                 from: vec![TableWithJoins {
@@ -1409,6 +1430,7 @@ mod tests {
                         alias: Some(TableAlias {
                             name: ident("s"),
                             columns: Vec::new(),
+                            explicit_as: false,
                             span: span(),
                         }),
                         version: None,
