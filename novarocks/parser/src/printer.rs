@@ -403,6 +403,7 @@ impl Printer {
                     self.write_table_version(version);
                 }
                 for hint in hints {
+                    self.output.push(' ');
                     self.write_table_hint(hint);
                 }
                 if let Some(alias) = alias {
@@ -441,6 +442,7 @@ impl Printer {
                 self.write_expr(expr);
                 self.output.push(')');
                 for hint in hints {
+                    self.output.push(' ');
                     self.write_table_hint(hint);
                 }
                 if let Some(alias) = alias {
@@ -499,7 +501,7 @@ impl Printer {
     }
 
     fn write_table_hint(&mut self, hint: &TableHint) {
-        self.output.push_str(" [");
+        self.output.push('[');
         self.write_ident(&hint.name);
         if !hint.arguments.is_empty() {
             self.output.push('(');
@@ -524,7 +526,7 @@ impl Printer {
             JoinOperator::LeftAnti => "LEFT ANTI JOIN ",
             JoinOperator::RightAnti => "RIGHT ANTI JOIN ",
         });
-        self.write_table_factor(&join.relation);
+        self.write_join_relation(&join.relation);
         match &join.constraint {
             JoinConstraint::None | JoinConstraint::Natural(_) => {}
             JoinConstraint::On(expr) => {
@@ -536,6 +538,54 @@ impl Printer {
                 self.write_ident_list(columns);
                 self.output.push(')');
             }
+        }
+    }
+
+    fn write_join_relation(&mut self, relation: &TableFactor) {
+        match relation {
+            TableFactor::Table {
+                name,
+                alias,
+                version,
+                hints,
+                ..
+            } if !hints.is_empty() => {
+                for hint in hints {
+                    self.write_table_hint(hint);
+                    self.output.push(' ');
+                }
+                self.write_object_name(name);
+                if let Some(version) = version {
+                    self.write_table_version(version);
+                }
+                if let Some(alias) = alias {
+                    self.output.push(' ');
+                    self.write_table_alias(alias);
+                }
+            }
+            TableFactor::TableFunction {
+                lateral,
+                expr,
+                hints,
+                alias,
+                ..
+            } if !hints.is_empty() => {
+                for hint in hints {
+                    self.write_table_hint(hint);
+                    self.output.push(' ');
+                }
+                if *lateral {
+                    self.output.push_str("LATERAL ");
+                }
+                self.output.push_str("TABLE(");
+                self.write_expr(expr);
+                self.output.push(')');
+                if let Some(alias) = alias {
+                    self.output.push(' ');
+                    self.write_table_alias(alias);
+                }
+            }
+            _ => self.write_table_factor(relation),
         }
     }
 

@@ -39,6 +39,11 @@ fn query_forms_parse_and_print_as_typed_syntax() {
         "SELECT group_concat(DISTINCT a ORDER BY b DESC SEPARATOR ',') FILTER (WHERE a IS NOT NULL) FROM t",
         "SELECT first_value(v) OVER (ORDER BY x) window_value FROM t",
         "WITH c AS (SELECT 1 AS a) SELECT a FROM c UNION ALL SELECT 2 ORDER BY a LIMIT 3",
+        "SELECT * FROM t ORDER BY id LIMIT 5, 10",
+        "SELECT * FROM t ORDER BY id DESC NULLS LAST",
+        "SELECT * FROM left_table l JOIN right_table r ON l.id = r.id WHERE r.id IS NOT NULL",
+        "((SELECT 1 UNION ALL SELECT 2)) ORDER BY 1",
+        "SELECT * FROM (((SELECT 1 UNION ALL SELECT 2))) AS source",
         "SELECT l.id FROM left_table l LEFT JOIN right_table r ON l.id = r.id JOIN third_table s ON s.id = l.id",
         "EXPLAIN ANALYZE VALUES (1), (2)",
     ] {

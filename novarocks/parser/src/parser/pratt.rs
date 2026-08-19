@@ -23,9 +23,10 @@ use crate::{
         AccessExpr, AccessKind, ArrayExpr, BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr,
         CastExpr, CastKind, ExistsExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier,
         Ident, InListExpr, InSubqueryExpr, IsPredicate, IsPredicateExpr, JsonOperator, LambdaExpr,
-        LikeExpr, LikeOperator, Literal, LiteralKind, NestedExpr, NullTreatment, ObjectName,
-        SubqueryExpr, TupleExpr, TypeName, TypeNameArgument, UnaryExpr, UnaryOperator, WindowFrame,
-        WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
+        LikeExpr, LikeOperator, Literal, LiteralKind, MapEntry, MapExpr, NestedExpr, NullTreatment,
+        ObjectName, StructField, SubqueryExpr, TupleExpr, TypeName, TypeNameArgument, UnaryExpr,
+        UnaryOperator, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits,
+        WindowSpec,
     },
     error::ParseError,
     keyword_class,
@@ -217,6 +218,7 @@ pub(super) struct PrattParser<'source, 'tokens> {
     source: &'source str,
     tokens: &'tokens [Token],
     position: usize,
+    pending_type_gt: Option<Span>,
 }
 
 impl<'source, 'tokens> PrattParser<'source, 'tokens> {
@@ -225,6 +227,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             source,
             tokens,
             position: 0,
+            pending_type_gt: None,
         }
     }
 
@@ -263,6 +266,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             if self.current_is_symbol(Symbol::LBracket)
                 || self.current_is_symbol(Symbol::Arrow)
                 || self.current_is_symbol(Symbol::LongArrow)
+                || self.current_is_symbol(Symbol::Dot)
             {
                 left = self.parse_postfix_access(left)?;
                 continue;
@@ -312,6 +316,24 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 expr: Box::new(expr),
                 kind: AccessKind::Subscript(Box::new(index)),
                 span: Span::new(start, end),
+            }));
+        } else if self.current_is_symbol(Symbol::Dot) {
+            self.advance();
+            self.skip_trivia();
+            let Some(token) = self.current().cloned() else {
+                return Err(self.unexpected("field name after '.'"));
+            };
+            if !matches!(
+                token.kind,
+                TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::Keyword(_)
+            ) {
+                return Err(self.unexpected("field name after '.'"));
+            }
+            let field = self.parse_identifier(token.span);
+            return Ok(Expr::Access(AccessExpr {
+                expr: Box::new(expr),
+                span: Span::new(start, field.span.end()),
+                kind: AccessKind::Field(field),
             }));
         } else if self.current_is_symbol(Symbol::Arrow) {
             JsonOperator::Arrow
@@ -897,6 +919,45 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             end = self.current_span().end();
             self.advance();
             self.skip_trivia();
+        } else if self.current_is_symbol(Symbol::Lt) {
+            self.advance();
+            self.skip_trivia();
+            let is_struct = name
+                .parts
+                .last()
+                .is_some_and(|part| part.value.eq_ignore_ascii_case("STRUCT"));
+            loop {
+                if is_struct {
+                    let field_start = self.current_span().start();
+                    let Some(token) = self.current().cloned() else {
+                        return Err(self.unexpected("STRUCT field name"));
+                    };
+                    if !matches!(
+                        token.kind,
+                        TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::Keyword(_)
+                    ) {
+                        return Err(self.unexpected("STRUCT field name"));
+                    }
+                    let field_name = self.parse_identifier(token.span);
+                    self.skip_trivia();
+                    let data_type = self.parse_type_name()?;
+                    let field_end = data_type.span.end();
+                    arguments.push(TypeNameArgument::Field(StructField {
+                        name: field_name,
+                        data_type,
+                        span: Span::new(field_start, field_end),
+                    }));
+                } else {
+                    arguments.push(TypeNameArgument::Type(self.parse_type_name()?));
+                }
+                self.skip_trivia();
+                if !self.current_is_symbol(Symbol::Comma) {
+                    break;
+                }
+                self.advance();
+                self.skip_trivia();
+            }
+            end = self.consume_type_gt()?;
         }
         Ok(TypeName {
             name,
@@ -949,6 +1010,12 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             span: Span::new(span.start(), end),
         };
         self.skip_trivia();
+        if name.parts.len() == 1
+            && name.parts[0].value.eq_ignore_ascii_case("MAP")
+            && self.current_is_symbol(Symbol::LBrace)
+        {
+            return self.parse_map_expression(name.span.start());
+        }
         if !self.current_is_symbol(Symbol::LParen) {
             return Ok(if name.parts.len() == 1 {
                 Expr::Identifier(name.parts.into_iter().next().expect("one identifier"))
@@ -1363,6 +1430,64 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             elements,
             span: Span::new(opening_span.start(), end),
         }))
+    }
+
+    fn parse_map_expression(&mut self, start: usize) -> Result<Expr, ParseError> {
+        self.advance();
+        self.skip_trivia();
+        let mut entries = Vec::new();
+        while !self.current_is_symbol(Symbol::RBrace) {
+            let entry_start = self.current_span().start();
+            let key = self.parse_binding_power(0)?;
+            self.skip_trivia();
+            if !self.current_is_symbol(Symbol::Colon) {
+                return Err(self.unexpected("':' after map key"));
+            }
+            self.advance();
+            self.skip_trivia();
+            let value = self.parse_binding_power(0)?;
+            let entry_end = value.span().end();
+            entries.push(MapEntry {
+                key,
+                value,
+                span: Span::new(entry_start, entry_end),
+            });
+            self.skip_trivia();
+            if !self.current_is_symbol(Symbol::Comma) {
+                break;
+            }
+            self.advance();
+            self.skip_trivia();
+        }
+        if !self.current_is_symbol(Symbol::RBrace) {
+            return Err(self.unexpected("'}' after map expression"));
+        }
+        let end = self.current_span().end();
+        self.advance();
+        Ok(Expr::Map(MapExpr {
+            entries,
+            span: Span::new(start, end),
+        }))
+    }
+
+    fn consume_type_gt(&mut self) -> Result<usize, ParseError> {
+        if let Some(span) = self.pending_type_gt.take() {
+            return Ok(span.end());
+        }
+        if self.current_is_symbol(Symbol::Gt) {
+            let end = self.current_span().end();
+            self.advance();
+            self.skip_trivia();
+            return Ok(end);
+        }
+        if self.current_is_symbol(Symbol::ShiftRight) {
+            let span = self.current_span();
+            self.advance();
+            self.skip_trivia();
+            self.pending_type_gt = Some(Span::new(span.start() + 1, span.end()));
+            return Ok(span.start() + 1);
+        }
+        Err(self.unexpected("'>' after type parameters"))
     }
 
     fn current(&self) -> Option<&Token> {

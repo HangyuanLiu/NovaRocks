@@ -39,7 +39,8 @@ pub(super) fn parse(
     if !(parser.current_is_keyword(Keyword::Select)
         || parser.current_is_keyword(Keyword::Values)
         || parser.current_is_keyword(Keyword::With)
-        || parser.current_is_keyword(Keyword::Explain))
+        || parser.current_is_keyword(Keyword::Explain)
+        || parser.current_is_symbol(Symbol::LParen))
     {
         return Ok(None);
     }
@@ -103,16 +104,37 @@ pub(super) fn parse_query(
         parser.consume_word("BY")?;
         order_by = parse_order_by(parser)?;
     }
-    let limit = if parser.consume_if_word("LIMIT") {
-        Some(parse_expression_until(
+    let (limit, limit_offset) = if parser.consume_if_word("LIMIT") {
+        let first = parse_expression_until(
             parser,
             &["OFFSET", "FETCH"],
             &[Symbol::Comma, Symbol::Semicolon, Symbol::RParen],
-        )?)
+        )?;
+        if parser.consume_if_symbol(Symbol::Comma) {
+            let limit = parse_expression_until(
+                parser,
+                &["OFFSET", "FETCH"],
+                &[Symbol::Semicolon, Symbol::RParen],
+            )?;
+            let offset_span = Span::new(first.span().start(), first.span().end());
+            (
+                Some(limit),
+                Some(Offset {
+                    value: first,
+                    rows: OffsetRows::None,
+                    span: offset_span,
+                }),
+            )
+        } else {
+            (Some(first), None)
+        }
     } else {
-        None
+        (None, None)
     };
     let offset = if parser.consume_if_word("OFFSET") {
+        if limit_offset.is_some() {
+            return Err(parser.unexpected("end of LIMIT offset syntax"));
+        }
         let value = parse_expression_until(
             parser,
             &["ROW", "ROWS", "FETCH"],
@@ -132,7 +154,7 @@ pub(super) fn parse_query(
             span: Span::new(start, end),
         })
     } else {
-        None
+        limit_offset
     };
     let fetch = if parser.consume_if_word("FETCH") {
         Some(parse_fetch(parser, start)?)
@@ -546,7 +568,8 @@ fn parse_table_factor(
         let start = parser.consume_symbol(Symbol::LParen)?.start();
         if !(parser.current_is_keyword(Keyword::Select)
             || parser.current_is_keyword(Keyword::Values)
-            || parser.current_is_keyword(Keyword::With))
+            || parser.current_is_keyword(Keyword::With)
+            || parser.current_is_symbol(Symbol::LParen))
         {
             return Err(parser.unexpected("query after '(' in FROM"));
         }
@@ -883,6 +906,7 @@ fn parse_order_by(
             &[
                 "ASC",
                 "DESC",
+                "NULLS",
                 "LIMIT",
                 "OFFSET",
                 "FETCH",
@@ -899,11 +923,22 @@ fn parse_order_by(
         } else {
             None
         };
+        let nulls_first = if parser.consume_if_word("NULLS") {
+            if parser.consume_if_word("FIRST") {
+                Some(true)
+            } else if parser.consume_if_word("LAST") {
+                Some(false)
+            } else {
+                return Err(parser.unexpected("FIRST or LAST after NULLS"));
+            }
+        } else {
+            None
+        };
         let span = Span::new(expr.span().start(), parser.current_offset());
         items.push(OrderByExpr {
             expr,
             asc,
-            nulls_first: None,
+            nulls_first,
             span,
         });
         if !parser.consume_if_symbol(Symbol::Comma) {
@@ -1054,6 +1089,7 @@ fn join_or_query_clause_words() -> &'static [&'static str] {
         "RIGHT",
         "FULL",
         "CROSS",
+        "WHERE",
         "GROUP",
         "HAVING",
         "QUALIFY",
