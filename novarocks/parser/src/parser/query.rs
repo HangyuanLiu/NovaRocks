@@ -396,7 +396,7 @@ fn parse_projection(
                 span,
             });
         } else {
-            let expr = parse_expression_until(
+            let (expr, implicit_alias) = parse_projection_expression(
                 parser,
                 &[
                     "AS",
@@ -419,6 +419,9 @@ fn parse_projection(
                 let alias = parser.parse_ident()?;
                 let span = Span::new(expr.span().start(), alias.span.end());
                 items.push(SelectItem::ExprWithAlias { expr, alias, span });
+            } else if let Some(alias) = implicit_alias {
+                let span = Span::new(expr.span().start(), alias.span.end());
+                items.push(SelectItem::ExprWithAlias { expr, alias, span });
             } else {
                 items.push(SelectItem::UnnamedExpr(expr));
             }
@@ -428,6 +431,36 @@ fn parse_projection(
         }
     }
     Ok(items)
+}
+
+fn parse_projection_expression(
+    parser: &mut StatementParser<'_, '_>,
+    words: &[&str],
+    symbols: &[Symbol],
+) -> Result<(Expr, Option<crate::ast::Ident>), crate::ParseError> {
+    let begin = parser.position;
+    let end = expression_end(parser, words, symbols);
+    let full = parse_expression_range(parser, begin, end);
+    if let Ok(expression) = full {
+        parser.position = end;
+        parser.skip_trivia();
+        return Ok((expression, None));
+    }
+    let alias_index = (begin..end)
+        .rev()
+        .find(|index| !matches!(parser.tokens[*index].kind, TokenKind::Trivia(_)))
+        .filter(|index| {
+            matches!(
+                parser.tokens[*index].kind,
+                TokenKind::Ident | TokenKind::QuotedIdent
+            )
+        })
+        .ok_or_else(|| parser.unexpected("expression"))?;
+    let expression = parse_expression_range(parser, begin, alias_index)?;
+    parser.position = alias_index;
+    parser.skip_trivia();
+    let alias = parser.parse_ident()?;
+    Ok((expression, Some(alias)))
 }
 
 fn parse_from(
@@ -638,13 +671,7 @@ fn parse_atomic_expression(
     if significant == 0 {
         return Err(parser.unexpected("table version expression"));
     }
-    let boundary = parser
-        .tokens
-        .get(end)
-        .map_or_else(|| parser.current_span(), |token| token.span);
-    let mut tokens = parser.tokens[begin..end].to_vec();
-    tokens.push(Token::new(TokenKind::End, boundary));
-    let expression = PrattParser::new(parser.source, &tokens).parse()?;
+    let expression = parse_expression_range(parser, begin, end)?;
     parser.position = end;
     parser.skip_trivia();
     Ok(expression)
@@ -950,6 +977,18 @@ fn parse_expression_until(
     symbols: &[Symbol],
 ) -> Result<Expr, crate::ParseError> {
     let begin = parser.position;
+    let end = expression_end(parser, words, symbols);
+    if end == begin {
+        return Err(parser.unexpected("expression"));
+    }
+    let expression = parse_expression_range(parser, begin, end)?;
+    parser.position = end;
+    parser.skip_trivia();
+    Ok(expression)
+}
+
+fn expression_end(parser: &StatementParser<'_, '_>, words: &[&str], symbols: &[Symbol]) -> usize {
+    let begin = parser.position;
     let mut end = begin;
     let mut nesting = 0usize;
     while let Some(token) = parser.tokens.get(end) {
@@ -969,19 +1008,21 @@ fn parse_expression_until(
         }
         end += 1;
     }
-    if end == begin {
-        return Err(parser.unexpected("expression"));
-    }
+    end
+}
+
+fn parse_expression_range(
+    parser: &StatementParser<'_, '_>,
+    begin: usize,
+    end: usize,
+) -> Result<Expr, crate::ParseError> {
     let mut expression_tokens: Vec<Token> = parser.tokens[begin..end].to_vec();
     let boundary = parser
         .tokens
         .get(end)
         .map_or_else(|| parser.current_span(), |token| token.span);
     expression_tokens.push(Token::new(TokenKind::End, boundary));
-    let expression = PrattParser::new(parser.source, &expression_tokens).parse()?;
-    parser.position = end;
-    parser.skip_trivia();
-    Ok(expression)
+    PrattParser::new(parser.source, &expression_tokens).parse()
 }
 
 fn token_is_word(parser: &StatementParser<'_, '_>, token: &Token, word: &str) -> bool {
