@@ -18,7 +18,6 @@
 
 pub(crate) mod ast;
 pub(crate) mod dialect;
-pub(crate) mod procedure;
 pub(crate) mod query_refs;
 pub(crate) mod raw;
 pub(crate) mod recursive_cte;

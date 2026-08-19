@@ -73,9 +73,9 @@ fn is_deferred_family(source: &str) -> bool {
     let words = significant_words(source);
     let first = words.first().map(String::as_str);
     match first {
-        Some("CALL") => true,
+        Some("CALL") => false,
         Some("ALTER") if words.get(1).map(String::as_str) == Some("TABLE") => {
-            !is_admitted_iceberg_alter(&words)
+            !is_admitted_iceberg_alter(&words) && !is_admitted_maintenance_alter(&words)
         }
         Some("CREATE" | "DROP" | "REFRESH") => {
             words.get(1).map(String::as_str) == Some("MATERIALIZED")
@@ -83,13 +83,27 @@ fn is_deferred_family(source: &str) -> bool {
         Some("SHOW") => {
             matches!(
                 words.get(1).map(String::as_str),
-                Some("ALTER" | "MATERIALIZED")
+                Some("MATERIALIZED")
+                    | Some("ALTER")
+                        if !matches!(
+                            (words.get(2).map(String::as_str), words.get(3).map(String::as_str)),
+                            (Some("TABLE"), Some("OPTIMIZE"))
+                        )
             ) || (words.get(1).map(String::as_str) == Some("CREATE")
                 && words.get(2).map(String::as_str) == Some("TABLE"))
         }
         Some("EXPLAIN") => words.iter().any(|word| word == "REFRESH"),
         _ => false,
     }
+}
+
+fn is_admitted_maintenance_alter(words: &[String]) -> bool {
+    words.windows(2).any(|pair| {
+        matches!(
+            (pair[0].as_str(), pair[1].as_str()),
+            ("REWRITE", "MANIFESTS") | ("EXPIRE", "SNAPSHOTS") | ("REMOVE", "ORPHAN")
+        )
+    }) || words.iter().any(|word| word == "OPTIMIZE")
 }
 
 /// The Iceberg owner cut is intentionally narrower than the `ALTER TABLE`
@@ -189,8 +203,7 @@ mod tests {
     #[test]
     fn later_command_families_are_deferred_without_parsing() {
         for source in [
-            "ALTER TABLE ice.db.t OPTIMIZE",
-            "CALL ice.system.rewrite_manifests()",
+            "ALTER TABLE ice.db.t ADD EQUALITY DELETE (id) VALUES (1)",
             "CREATE MATERIALIZED VIEW mv DISTRIBUTED BY HASH(k) BUCKETS 1 AS SELECT k FROM t",
             "SHOW CREATE TABLE ice.db.t",
         ] {
@@ -199,6 +212,24 @@ mod tests {
                     .expect("later family must remain deferred")
                     .0,
                 StatementAdmission::DeferredFamily,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn maintenance_family_is_admitted_after_its_owner_cut() {
+        for source in [
+            "CALL ice.system.rewrite_manifests(table => 'db.t')",
+            "ALTER TABLE ice.db.t OPTIMIZE",
+            "ALTER TABLE ice.db.t EXPIRE SNAPSHOTS RETAIN LAST 3",
+            "SHOW ALTER TABLE OPTIMIZE",
+        ] {
+            assert_eq!(
+                admit_statement(source)
+                    .expect("maintenance command should parse")
+                    .0,
+                StatementAdmission::Parsed,
                 "{source}"
             );
         }

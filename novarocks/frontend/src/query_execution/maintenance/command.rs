@@ -39,17 +39,22 @@ impl MaintenanceCommandExecutor {
         Self { kernel }
     }
 
-    pub fn try_execute(
+    /// Executes one parser-admitted maintenance write without reparsing SQL.
+    pub fn execute(
         &self,
-        sql: &str,
+        statement: &novarocks_parser::ast::MaintenanceStatement,
         current_catalog: Option<&str>,
         current_database: &str,
         execution: &crate::common::admitted_query_context::QueryExecutionContext,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<Option<StatementResult>, String> {
-        if !super::looks_like_maintenance_statement(sql) {
-            return Ok(None);
-        }
+    ) -> Result<StatementResult, String> {
+        let lowered = crate::table_maintenance::lower_typed_maintenance_statement(
+            statement,
+            MaintenanceRequestContext {
+                current_catalog,
+                current_database,
+            },
+        )?;
         let engine = RequestScopedMaintenanceEngine::new(
             self.kernel.clone(),
             execution.clone(),
@@ -57,15 +62,16 @@ impl MaintenanceCommandExecutor {
         );
         self.kernel
             .service()
-            .try_handle_statement(
+            .handle_typed_statement(
                 &engine,
-                sql,
+                lowered,
+                crate::table_maintenance::is_typed_spark_maintenance_call(statement),
                 MaintenanceRequestContext {
                     current_catalog,
                     current_database,
                 },
             )
-            .map(|result| result.map(statement_result))
+            .map(statement_result)
     }
 }
 
@@ -79,24 +85,23 @@ impl MaintenanceReadCommandExecutor {
         Self { service }
     }
 
-    pub fn try_execute(
+    /// Executes a parser-admitted `SHOW ALTER TABLE OPTIMIZE` presentation
+    /// without recreating a raw parser or a maintenance engine.
+    pub fn execute(
         &self,
-        sql: &str,
+        statement: &novarocks_parser::ast::ShowAlterTableOptimize,
         current_catalog: Option<&str>,
         current_database: &str,
-    ) -> Result<Option<StatementResult>, String> {
-        if !crate::catalog_application::statement::looks_like_show_alter_table_optimize(sql) {
-            return Ok(None);
-        }
+    ) -> Result<StatementResult, String> {
         self.service
-            .try_handle_readonly_statement(
-                sql,
+            .handle_typed_show_optimize(
+                crate::table_maintenance::lower_typed_show_optimize(statement)?,
                 MaintenanceRequestContext {
                     current_catalog,
                     current_database,
                 },
             )
-            .map(|result| result.map(statement_result))
+            .map(statement_result)
     }
 }
 
@@ -109,17 +114,15 @@ fn statement_result(result: MaintenanceStatementResult) -> StatementResult {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use super::super::{
         MaintenanceActionOutcome, MaintenanceActionRequest, OptimizeSubmission,
         TableMaintenanceEngine,
     };
     use super::*;
+    use std::sync::Arc;
 
     struct ReadOnlyService {
-        called: AtomicBool,
+        called: std::sync::atomic::AtomicBool,
     }
 
     impl TableMaintenanceService for ReadOnlyService {
@@ -127,22 +130,13 @@ mod tests {
             Ok(())
         }
 
-        fn try_handle_statement(
+        fn handle_typed_show_optimize(
             &self,
-            _engine: &dyn TableMaintenanceEngine,
-            _sql: &str,
+            _statement: crate::table_maintenance::ParsedShowOptimize,
             _context: MaintenanceRequestContext<'_>,
-        ) -> Result<Option<MaintenanceStatementResult>, String> {
-            unreachable!("read-only executor must not request a maintenance engine")
-        }
-
-        fn try_handle_readonly_statement(
-            &self,
-            _sql: &str,
-            _context: MaintenanceRequestContext<'_>,
-        ) -> Result<Option<MaintenanceStatementResult>, String> {
-            self.called.store(true, Ordering::SeqCst);
-            Ok(Some(MaintenanceStatementResult::Ok))
+        ) -> Result<MaintenanceStatementResult, String> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(MaintenanceStatementResult::Ok)
         }
 
         fn execute_automatic_action(
@@ -169,13 +163,23 @@ mod tests {
     #[test]
     fn show_optimize_uses_read_only_service_without_engine() {
         let service = Arc::new(ReadOnlyService {
-            called: AtomicBool::new(false),
+            called: std::sync::atomic::AtomicBool::new(false),
         });
         let executor = MaintenanceReadCommandExecutor::new(Arc::clone(&service) as Arc<_>);
+        let statements =
+            novarocks_parser::parse("SHOW ALTER TABLE OPTIMIZE").expect("parser statement");
+        let [
+            novarocks_parser::ast::Statement::Maintenance(
+                novarocks_parser::ast::MaintenanceStatement::ShowOptimize(statement),
+            ),
+        ] = statements.as_slice()
+        else {
+            panic!("expected SHOW ALTER TABLE OPTIMIZE");
+        };
         let result = executor
-            .try_execute("SHOW ALTER TABLE OPTIMIZE", Some("ice"), "db")
+            .execute(statement, Some("ice"), "db")
             .expect("execute");
-        assert!(matches!(result, Some(StatementResult::Ok)));
-        assert!(service.called.load(Ordering::SeqCst));
+        assert!(matches!(result, StatementResult::Ok));
+        assert!(service.called.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

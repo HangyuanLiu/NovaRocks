@@ -23,18 +23,18 @@ use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::repository::MvRepository;
 use crate::runtime::statement_result::StatementResult;
+use novarocks_parser::ast::CallStatement;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::syntax::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, MvAdmittedStatement, ObjectName,
-    RefreshMaterializedViewStmt, parse_call_procedure_sql, parse_mv_admitted_statement,
-    parse_optional_mv_admitted_statement,
+    RefreshMaterializedViewStmt, parse_mv_admitted_statement, parse_optional_mv_admitted_statement,
 };
 
 use super::FrontendMvService;
 use crate::mv::domain::refresh::resolve_refresh_mv_target;
 use crate::mv::domain::{
-    PROCEDURE_NAME, alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports,
-    execute_novarocks_imv_stateless_rebuild, list_mvs_with_backend,
+    alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports,
+    execute_typed_novarocks_imv_stateless_rebuild, list_mvs_with_backend,
 };
 use crate::runtime::query_result::build_string_query_result;
 use std::sync::Arc;
@@ -100,20 +100,6 @@ impl MvCommandExecutor {
                 .map(StatementResult::Query)
                 .map(Some);
         }
-        if novarocks_sql::syntax::looks_like_call_procedure(&normalized) {
-            let statement = parse_call_procedure_sql(&normalized)?;
-            if statement.procedure == PROCEDURE_NAME {
-                return execute_novarocks_imv_stateless_rebuild(
-                    self.ports.connector_control(),
-                    self.storage_observation.as_ref(),
-                    self.repository.as_ref(),
-                    &statement,
-                    current_database,
-                    connector_context.clone(),
-                )
-                .map(Some);
-            }
-        }
         let statement = match parse_mv_statement_for_execution(&normalized)? {
             Some(statement) => statement,
             None => return Ok(None),
@@ -176,6 +162,24 @@ impl MvCommandExecutor {
                     .map(Some)
             }
         }
+    }
+
+    /// Executes the test-only stateless rebuild directly from parser-owned
+    /// `CALL` syntax. Other procedures remain a route miss.
+    pub fn try_execute_typed_call(
+        &self,
+        statement: &CallStatement,
+        current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<Option<StatementResult>, String> {
+        execute_typed_novarocks_imv_stateless_rebuild(
+            self.ports.connector_control(),
+            self.storage_observation.as_ref(),
+            self.repository.as_ref(),
+            statement,
+            current_database,
+            connector_context.clone(),
+        )
     }
 
     fn execute_repartition(

@@ -16,9 +16,6 @@ pub use crate::parser::ast::{
     TableKeyKind, UpdateAssignment, UpdateStmt,
 };
 pub use crate::parser::dialect::StarRocksDialect;
-pub use crate::parser::procedure::{
-    CallProcedureStmt, ProcedureArg, ProcedureArgMode, ProcedureArgValue,
-};
 
 pub use crate::parser::dialect::substitute_user_variables;
 
@@ -119,10 +116,6 @@ pub fn three_part_table_ref_occurrences(
         return Err("three-part table reference extraction requires a SELECT query".to_string());
     };
     Ok(crate::parser::query_refs::extract_three_part_table_ref_occurrences(&query))
-}
-
-pub fn parse_call_procedure_sql(sql: &str) -> Result<CallProcedureStmt, String> {
-    crate::parser::procedure::parse_call_procedure_sql(sql)
 }
 
 pub fn extract_allow_throw_exception_hint(sql: &str) -> bool {
@@ -242,10 +235,6 @@ pub fn peek_word_eq(parser: &Parser<'_>, offset: usize, word: &str) -> bool {
 
 pub fn looks_like_create_table(parser: &Parser<'_>) -> bool {
     crate::parser::dialect::looks_like_create_table(parser)
-}
-
-pub fn looks_like_call_procedure(sql: &str) -> bool {
-    crate::parser::procedure::looks_like_call_procedure(sql)
 }
 
 pub fn parse_create_table_statement(parser: &mut Parser<'_>) -> Result<CreateTableStmt, String> {

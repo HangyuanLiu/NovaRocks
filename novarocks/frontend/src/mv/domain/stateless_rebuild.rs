@@ -58,11 +58,12 @@ use crate::mv::domain::repository::MvRepository;
 use crate::mv::domain::storage_observation::{MvLakePackageObservation, MvLakePublication};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::runtime::statement_result::StatementResult;
+use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue};
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
 };
-use novarocks_sql::syntax::CallProcedureStmt;
 
 pub const PROCEDURE_NAME: &str = "novarocks_imv_stateless_rebuild";
 const TEST_ENABLE_ENV: &str = "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD";
@@ -121,24 +122,57 @@ pub(crate) struct ImvStatelessRebuildRequest {
 }
 
 impl ImvStatelessRebuildRequest {
-    fn from_call(stmt: &CallProcedureStmt, current_database: &str) -> Result<Self, String> {
-        let catalog = stmt.catalog.clone();
-        let table = stmt
-            .arg("table")
-            .and_then(|value| value.as_string())
+    /// Lowers the one test-only procedure directly from parser-owned syntax.
+    /// A non-target procedure remains a route miss for the command router.
+    pub(crate) fn from_typed_call(
+        statement: &CallStatement,
+        current_database: &str,
+    ) -> Result<Option<Self>, String> {
+        let name_parts = statement
+            .procedure
+            .parts
+            .iter()
+            .map(|part| normalize_identifier(&part.value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let [catalog, namespace, procedure] = name_parts.as_slice() else {
+            return Err("CALL procedure name must be catalog.system.procedure".to_string());
+        };
+        if procedure != PROCEDURE_NAME {
+            return Ok(None);
+        }
+        if namespace != "system" {
+            return Err("Iceberg procedures must use system namespace".to_string());
+        }
+
+        let table = typed_string_argument(statement, "table")
             .ok_or_else(|| format!("{PROCEDURE_NAME} requires a `table` argument"))?;
         let (namespace, mv) = split_table_reference(table, current_database)?;
-        let required_level = match stmt.arg("level").and_then(|value| value.as_string()) {
+        let required_level = match typed_string_argument(statement, "level") {
             Some(level) => StatelessLevel::from_sql(level)?,
             None => StatelessLevel::Package,
         };
-        Ok(Self {
-            catalog,
+        Ok(Some(Self {
+            catalog: catalog.clone(),
             namespace,
             mv,
             required_level,
-        })
+        }))
     }
+}
+
+fn typed_string_argument<'a>(statement: &'a CallStatement, name: &str) -> Option<&'a str> {
+    statement.arguments.iter().find_map(|argument| {
+        let argument_name = argument.name.as_ref()?;
+        (normalize_identifier(&argument_name.value).ok()?.as_str() == name).then(|| {
+            let MaintenanceValue::Literal(literal) = &argument.value else {
+                return None;
+            };
+            let LiteralKind::String(value) = &literal.kind else {
+                return None;
+            };
+            Some(value.as_str())
+        })?
+    })
 }
 
 /// Split a `table` argument into `(namespace, mv)`. A bare name inherits the
@@ -155,16 +189,19 @@ fn split_table_reference(table: &str, current_database: &str) -> Result<(String,
     }
 }
 
-pub fn execute_novarocks_imv_stateless_rebuild(
+pub fn execute_typed_novarocks_imv_stateless_rebuild(
     connector_control: &dyn ConnectorControlResolver,
     mv_storage_observation: &dyn MvStorageObservationPort,
     mv_repository: &dyn MvRepository,
-    stmt: &CallProcedureStmt,
+    statement: &CallStatement,
     current_database: &str,
     connector_context: ConnectorRequestContext,
-) -> Result<StatementResult, String> {
+) -> Result<Option<StatementResult>, String> {
+    let Some(req) = ImvStatelessRebuildRequest::from_typed_call(statement, current_database)?
+    else {
+        return Ok(None);
+    };
     ensure_stateless_rebuild_enabled(std::env::var(TEST_ENABLE_ENV).ok().as_deref())?;
-    let req = ImvStatelessRebuildRequest::from_call(stmt, current_database)?;
     execute_request_with_context(
         connector_control,
         mv_storage_observation,
@@ -172,9 +209,10 @@ pub fn execute_novarocks_imv_stateless_rebuild(
         &req,
         connector_context,
     )
+    .map(Some)
 }
 
-/// Guard-free core of the procedure. `execute_novarocks_imv_stateless_rebuild`
+/// Guard-free core of the procedure. `execute_typed_novarocks_imv_stateless_rebuild`
 /// checks the test-only env flag before calling this; the lib-harness tests
 /// call it directly so they can exercise the `full` round-trip without racing
 /// on process env.
@@ -421,7 +459,10 @@ mod tests {
         MvLakePublication, MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
     };
     use bytes::Bytes;
-    use novarocks_sql::syntax::parse_call_procedure_sql;
+    use novarocks_parser::{
+        ast::{MaintenanceStatement, Statement},
+        parse,
+    };
 
     fn object_id(bytes: &[u8]) -> novarocks_spi::connector::ConnectorTableObjectId {
         novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes))
@@ -508,8 +549,13 @@ mod tests {
         sql: &str,
         current_database: &str,
     ) -> Result<ImvStatelessRebuildRequest, String> {
-        let stmt = parse_call_procedure_sql(sql).unwrap();
-        ImvStatelessRebuildRequest::from_call(&stmt, current_database)
+        let statements = parse(sql).map_err(|error| error.to_string())?;
+        let [Statement::Maintenance(MaintenanceStatement::Call(statement))] = statements.as_slice()
+        else {
+            return Err("expected typed CALL statement".to_string());
+        };
+        ImvStatelessRebuildRequest::from_typed_call(statement, current_database)?
+            .ok_or_else(|| "expected stateless rebuild procedure".to_string())
     }
 
     #[test]
@@ -547,6 +593,19 @@ mod tests {
     }
 
     #[test]
+    fn typed_call_normalizes_quoted_procedure_and_argument_identifiers() {
+        let req = parse_request(
+            "CALL `ICE`.`SYSTEM`.`NOVAROCKS_IMV_STATELESS_REBUILD`(\
+                `TABLE` => 'analytics.mv_orders', `LEVEL` => 'FULL')",
+            "default_db",
+        )
+        .unwrap();
+
+        assert_eq!(req.catalog, "ice");
+        assert_eq!(req.required_level, StatelessLevel::Full);
+    }
+
+    #[test]
     fn from_call_requires_table_argument() {
         let err = parse_request(
             "CALL ice.system.novarocks_imv_stateless_rebuild(level => 'package')",
@@ -566,6 +625,21 @@ mod tests {
         assert!(
             err.contains("`table` must be `<mv>` or `<namespace>.<mv>`"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn typed_call_lowerer_defers_non_target_procedures() {
+        let statements = parse("CALL ice.system.rewrite_manifests(table => 'analytics.mv_orders')")
+            .expect("generic typed CALL should parse");
+        let [Statement::Maintenance(MaintenanceStatement::Call(statement))] = statements.as_slice()
+        else {
+            panic!("expected typed CALL statement");
+        };
+
+        assert_eq!(
+            ImvStatelessRebuildRequest::from_typed_call(statement, "default_db").unwrap(),
+            None
         );
     }
 }

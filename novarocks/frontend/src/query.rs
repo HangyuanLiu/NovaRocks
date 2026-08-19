@@ -162,22 +162,6 @@ impl CoreCommandRoute for TypedCommandRoute {
         )? {
             return Ok(result);
         }
-        if let Some(result) = self.maintenance.try_execute(
-            sql,
-            context.session().current_catalog(),
-            context.session().current_database(),
-            context.execution(),
-            &connector_context,
-        )? {
-            return Ok(result);
-        }
-        if let Some(result) = self.maintenance_read.try_execute(
-            sql,
-            context.session().current_catalog(),
-            context.session().current_database(),
-        )? {
-            return Ok(result);
-        }
         Err("unsupported SQL command for the frontend capability router".to_string())
     }
 
@@ -249,9 +233,49 @@ impl CoreCommandRoute for TypedCommandRoute {
                     &connector_context,
                 )
             }
-            ParsedStatement::Maintenance(_)
-            | ParsedStatement::MaterializedView(_)
-            | ParsedStatement::RawQuery(_) => {
+            ParsedStatement::Maintenance(
+                novarocks_parser::ast::MaintenanceStatement::ShowOptimize(statement),
+            ) => self.maintenance_read.execute(
+                statement,
+                context.session().current_catalog(),
+                context.session().current_database(),
+            ),
+            ParsedStatement::Maintenance(novarocks_parser::ast::MaintenanceStatement::Call(
+                statement,
+            )) => {
+                let connector_context = crate::connector::connector_request_context_for_query(
+                    Some(&query_options),
+                    context.execution().cancellation().clone(),
+                )?;
+                if let Some(result) = self.mv.try_execute_typed_call(
+                    statement,
+                    context.session().current_database(),
+                    &connector_context,
+                )? {
+                    return Ok(result);
+                }
+                self.maintenance.execute(
+                    &novarocks_parser::ast::MaintenanceStatement::Call(statement.clone()),
+                    context.session().current_catalog(),
+                    context.session().current_database(),
+                    context.execution(),
+                    &connector_context,
+                )
+            }
+            ParsedStatement::Maintenance(statement) => {
+                let connector_context = crate::connector::connector_request_context_for_query(
+                    Some(&query_options),
+                    context.execution().cancellation().clone(),
+                )?;
+                self.maintenance.execute(
+                    statement,
+                    context.session().current_catalog(),
+                    context.session().current_database(),
+                    context.execution(),
+                    &connector_context,
+                )
+            }
+            ParsedStatement::MaterializedView(_) | ParsedStatement::RawQuery(_) => {
                 Err("statement was admitted before its command-family owner cut".to_string())
             }
         }
