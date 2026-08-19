@@ -79,6 +79,7 @@ FROM orders GROUP BY region, day;
 
 -- query 8
 -- @skip_result_check=true
+-- @nova_extension=synchronous materialized-view refresh
 REFRESH MATERIALIZED VIEW agg_mv WITH SYNC MODE;
 
 -- query 9

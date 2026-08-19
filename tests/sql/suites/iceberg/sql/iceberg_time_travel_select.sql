@@ -44,6 +44,7 @@ SELECT id, v FROM t_tt_${uuid0} ORDER BY id;
 SELECT id, v FROM t_tt_${uuid0} FOR VERSION AS OF 'main' ORDER BY id;
 
 -- query 7 FOR VERSION AS OF 'backup' sees only the pre-third-row state (2 rows).
+-- @nova_extension=iceberg version-reference reads
 SELECT id, v FROM t_tt_${uuid0} FOR VERSION AS OF 'backup' ORDER BY id;
 
 -- query 8 cross-ref join main (3 rows) LEFT JOIN backup (2 rows) on id.

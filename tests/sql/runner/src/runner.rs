@@ -16,9 +16,12 @@
 // under the License.
 
 use crate::engine_error_codes::EngineErrorCode;
-use crate::types::ConnectionConfig;
+use crate::sql_error_codes::is_sql_error_code_token;
+use crate::types::{ConnectionConfig, SqlErrorLocation};
 use anyhow::{Result, bail};
+use regex::Regex;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 pub fn error_message_matches(actual: &str, expected_substring: &str) -> bool {
     if expected_substring.trim().is_empty() {
@@ -39,6 +42,29 @@ pub fn extract_engine_error_code(actual: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+pub fn extract_sql_error_code(actual: &str) -> Option<String> {
+    let message = engine_error_message_body(actual);
+    let candidate_start = message.strip_prefix('[')?;
+    let close_idx = candidate_start.find(']')?;
+    let candidate = &candidate_start[..close_idx];
+    is_sql_error_code_token(candidate).then(|| candidate.to_string())
+}
+
+/// Extract a line/column pair only from an explicitly rendered SQL error
+/// position clause.  The accepted spellings cover the native user-error
+/// rendering without treating a bare line number as a source location.
+pub fn extract_sql_error_location(actual: &str) -> Option<SqlErrorLocation> {
+    static LOCATION_RE: OnceLock<Regex> = OnceLock::new();
+    let re = LOCATION_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:at\s+)?line\s+(\d+)\s*(?:,?\s*(?:column|col)\s+|:)(\d+)\b")
+            .expect("static SQL error location regex compiles")
+    });
+    let captures = re.captures(engine_error_message_body(actual))?;
+    let line = captures.get(1)?.as_str().parse().ok()?;
+    let column = captures.get(2)?.as_str().parse().ok()?;
+    (line > 0 && column > 0).then_some(SqlErrorLocation { line, column })
 }
 
 fn engine_error_message_body(actual: &str) -> &str {
@@ -177,6 +203,34 @@ mod tests {
         assert_eq!(
             extract_engine_error_code(actual),
             Some("UnsupportedDistributedDmlShape".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_sql_error_code_keeps_dotted_codes_separate_from_engine_codes() {
+        assert_eq!(
+            extract_sql_error_code(
+                "ERROR 1064 (42000): [sql.parse.unexpected_token] unexpected FROM"
+            ),
+            Some("sql.parse.unexpected_token".to_string())
+        );
+        assert_eq!(extract_sql_error_code("[CommitUnknown] unavailable"), None);
+    }
+
+    #[test]
+    fn extract_sql_error_location_requires_line_and_column() {
+        assert_eq!(
+            extract_sql_error_location(
+                "ERROR 1064 (42000): [sql.parse.unexpected_token] at line 7, column 11: unexpected FROM"
+            ),
+            Some(SqlErrorLocation {
+                line: 7,
+                column: 11
+            })
+        );
+        assert_eq!(
+            extract_sql_error_location("ERROR 1064 (42000): at line 7: incomplete location"),
+            None
         );
     }
 

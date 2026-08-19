@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::sql_error_codes::SqlErrorPhase;
 use crate::suite_manifest::SuiteManifest;
 pub use novarocks_failpoint::QueryLifecycleFaultKind;
 use std::collections::HashMap;
@@ -149,6 +150,13 @@ pub struct QueryMeta {
     pub db: Option<String>,
     pub expect_error: Option<String>,
     pub expect_error_code: Option<String>,
+    pub expect_sql_code: Option<String>,
+    pub expect_sql_phase: Option<SqlErrorPhase>,
+    pub expect_error_at: Option<SqlErrorLocation>,
+    pub expect_error_tier: Option<SqlErrorTier>,
+    /// Declarative NovaRocks-only syntax label. It is consumed only by the
+    /// extension-manifest listing path and never changes execution behavior.
+    pub nova_extension: Option<String>,
     pub result_contains: Vec<String>,
     pub result_contains_any: Vec<String>,
     pub result_not_contains: Vec<String>,
@@ -255,6 +263,37 @@ pub struct QueryMeta {
     pub be_log_exact_fragment_cancellation: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqlErrorLocation {
+    pub line: usize,
+    pub column: usize,
+}
+
+impl SqlErrorLocation {
+    pub fn parse(value: &str) -> Option<Self> {
+        let (line, column) = value.split_once(':')?;
+        let line = line.parse::<usize>().ok()?;
+        let column = column.parse::<usize>().ok()?;
+        (line > 0 && column > 0).then_some(Self { line, column })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlErrorTier {
+    Drift,
+    Target,
+}
+
+impl SqlErrorTier {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "drift" => Some(Self::Drift),
+            "target" => Some(Self::Target),
+            _ => None,
+        }
+    }
+}
+
 pub use novarocks_cluster_harness::QueryLifecyclePhase;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +343,22 @@ pub struct FencedCatalogFaultDirective {
 }
 
 impl QueryMeta {
+    pub fn sql_error_tier(&self) -> SqlErrorTier {
+        self.expect_error_tier.unwrap_or(SqlErrorTier::Drift)
+    }
+
+    pub fn has_error_expectation(&self) -> bool {
+        self.expect_error.is_some()
+            || self.expect_error_code.is_some()
+            || self.has_sql_error_assertion()
+    }
+
+    pub fn has_sql_error_assertion(&self) -> bool {
+        self.expect_sql_code.is_some()
+            || self.expect_sql_phase.is_some()
+            || self.expect_error_at.is_some()
+    }
+
     pub fn has_be_log_directives(&self) -> bool {
         !self.be_log_contains.is_empty()
             || !self.be_log_not_contains.is_empty()

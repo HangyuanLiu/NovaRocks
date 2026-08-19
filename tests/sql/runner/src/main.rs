@@ -19,6 +19,7 @@ mod be_log_directive;
 mod benchmark_bootstrap;
 mod cluster;
 mod config;
+mod extension_manifest;
 mod fault_injection;
 mod fenced_catalog;
 mod iceberg_orphan_fixture;
@@ -27,6 +28,7 @@ mod results;
 mod runner;
 mod session;
 mod shell;
+mod sql_error_codes;
 mod suite_manifest;
 mod types;
 
@@ -50,9 +52,13 @@ use crate::results::{
     step_retry_interval, verify_text_assertions, write_mismatch_artifacts, write_result_file,
 };
 use crate::runner::{
-    error_message_matches, extract_engine_error_code, parse_selector_list, summarize_connection,
+    error_message_matches, extract_engine_error_code, extract_sql_error_code,
+    extract_sql_error_location, parse_selector_list, summarize_connection,
 };
 use crate::session::{MysqlSession, drop_case_database, execute_suite_hook, reset_case_database};
+use crate::sql_error_codes::{
+    SQL_ERROR_DESCRIPTORS, SqlErrorDescriptor, SqlErrorPhase, lookup_sql_error_descriptor,
+};
 use crate::suite_manifest::select_suite_names;
 use crate::types::*;
 use anyhow::{Context, Result, bail};
@@ -116,29 +122,164 @@ fn expected_engine_error_code_result(err_msg: &str, expected_code: &str) -> Resu
     }
 }
 
+fn expected_sql_error_code_result(err_msg: &str, expected_code: &str) -> Result<(), String> {
+    let actual_code = extract_sql_error_code(err_msg);
+    if actual_code.as_deref() == Some(expected_code) {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected SQL error code {:?}, got {:?}: {}",
+            expected_code, actual_code, err_msg
+        ))
+    }
+}
+
+fn expected_sql_error_phase_result(
+    err_msg: &str,
+    expected_phase: SqlErrorPhase,
+    sql_error_descriptors: &[SqlErrorDescriptor],
+) -> Result<(), String> {
+    let actual_code = extract_sql_error_code(err_msg);
+    let actual_descriptor = actual_code
+        .as_deref()
+        .and_then(|code| lookup_sql_error_descriptor(sql_error_descriptors, code));
+    if actual_descriptor.is_some_and(|descriptor| descriptor.phase == expected_phase) {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected SQL error phase {}, got code {:?} with phase {:?}: {}",
+            expected_phase.as_str(),
+            actual_code,
+            actual_descriptor.map(|descriptor| descriptor.phase),
+            err_msg
+        ))
+    }
+}
+
+fn expected_error_location_result(
+    err_msg: &str,
+    expected_location: SqlErrorLocation,
+) -> Result<(), String> {
+    let actual_location = extract_sql_error_location(err_msg);
+    if actual_location == Some(expected_location) {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected error at {}:{}, got {:?}: {}",
+            expected_location.line, expected_location.column, actual_location, err_msg
+        ))
+    }
+}
+
+fn expected_error_expectation_label(meta: &QueryMeta) -> String {
+    let mut labels = Vec::new();
+    if let Some(code) = meta.expect_error_code.as_deref() {
+        labels.push(format!("engine_error_code={code}"));
+    }
+    if let Some(code) = meta.expect_sql_code.as_deref() {
+        labels.push(format!("sql_error_code={code}"));
+    }
+    if let Some(phase) = meta.expect_sql_phase {
+        labels.push(format!("sql_error_phase={}", phase.as_str()));
+    }
+    if let Some(location) = meta.expect_error_at {
+        labels.push(format!("error_at={}:{}", location.line, location.column));
+    }
+    if let Some(expected) = meta.expect_error.as_deref()
+        && meta.expect_error_code.is_none()
+    {
+        labels.push(format!("error_contains={expected:?}"));
+    }
+    labels.join(", ")
+}
+
 fn evaluate_expected_error_branch(
     meta: &QueryMeta,
     ok: bool,
     err_msg: &str,
 ) -> Option<Result<(), String>> {
-    if let Some(expected_code) = meta.expect_error_code.as_deref() {
-        return Some(if ok {
-            Err(format!(
-                "expected engine error code {:?}, but query succeeded",
-                expected_code
-            ))
-        } else {
-            expected_engine_error_code_result(err_msg, expected_code)
-        });
+    evaluate_expected_error_branch_with_sql_error_descriptors(
+        meta,
+        ok,
+        err_msg,
+        SQL_ERROR_DESCRIPTORS,
+    )
+}
+
+fn evaluate_expected_error_branch_with_sql_error_descriptors(
+    meta: &QueryMeta,
+    ok: bool,
+    err_msg: &str,
+    sql_error_descriptors: &[SqlErrorDescriptor],
+) -> Option<Result<(), String>> {
+    if !meta.has_error_expectation() {
+        return None;
     }
 
-    let expected_error = meta.expect_error.as_deref()?;
-    Some(if ok {
-        Err(format!(
+    if ok {
+        if let Some(expected_code) = meta.expect_error_code.as_deref() {
+            return Some(Err(format!(
+                "expected engine error code {:?}, but query succeeded",
+                expected_code
+            )));
+        }
+        if let Some(expected_code) = meta.expect_sql_code.as_deref() {
+            return Some(Err(format!(
+                "expected SQL error code {:?}, but query succeeded",
+                expected_code
+            )));
+        }
+        if let Some(expected_phase) = meta.expect_sql_phase {
+            return Some(Err(format!(
+                "expected SQL error phase {}, but query succeeded",
+                expected_phase.as_str()
+            )));
+        }
+        if let Some(expected_location) = meta.expect_error_at {
+            return Some(Err(format!(
+                "expected error at {}:{}, but query succeeded",
+                expected_location.line, expected_location.column
+            )));
+        }
+        let expected_error = meta
+            .expect_error
+            .as_deref()
+            .expect("error expectation checked");
+        return Some(Err(format!(
             "expected error containing {:?}, but query succeeded",
             expected_error
-        ))
-    } else if error_message_matches(err_msg, expected_error) {
+        )));
+    }
+
+    if let Some(expected_code) = meta.expect_error_code.as_deref() {
+        if let Err(error) = expected_engine_error_code_result(err_msg, expected_code) {
+            return Some(Err(error));
+        }
+    }
+    if let Some(expected_code) = meta.expect_sql_code.as_deref()
+        && let Err(error) = expected_sql_error_code_result(err_msg, expected_code)
+    {
+        return Some(Err(error));
+    }
+    if let Some(expected_phase) = meta.expect_sql_phase
+        && let Err(error) =
+            expected_sql_error_phase_result(err_msg, expected_phase, sql_error_descriptors)
+    {
+        return Some(Err(error));
+    }
+    if let Some(expected_location) = meta.expect_error_at
+        && let Err(error) = expected_error_location_result(err_msg, expected_location)
+    {
+        return Some(Err(error));
+    }
+    if meta.expect_error_code.is_some() {
+        // Preserve the old precedence rule when both legacy directives exist.
+        return Some(Ok(()));
+    }
+    let Some(expected_error) = meta.expect_error.as_deref() else {
+        return Some(Ok(()));
+    };
+    Some(if error_message_matches(err_msg, expected_error) {
         Ok(())
     } else {
         Err(format!(
@@ -201,8 +342,12 @@ fn expected_engine_error_code_diff_result(
 )]
 struct Cli {
     /// Suite name(s), comma-separated.  Use "all" to run every discovered suite.
-    #[arg(long)]
-    suite: String,
+    #[arg(long, required_unless_present = "list_extensions")]
+    suite: Option<String>,
+
+    /// Print the deterministic manifest derived from @nova_extension annotations and exit.
+    #[arg(long, action = ArgAction::SetTrue)]
+    list_extensions: bool,
 
     #[arg(long)]
     config: Option<String>,
@@ -1332,19 +1477,12 @@ fn finish_expected_error_step(
         let _ = writeln!(log, "    ❌ FAIL: {reason}");
         return false;
     }
-    if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
-        let _ = writeln!(
-            log,
-            "    ✅ PASS (expected error matched): engine_error_code={} {}",
-            expected_code, last_failure
-        );
-    } else {
-        let _ = writeln!(
-            log,
-            "    ✅ PASS (expected error matched): {}",
-            last_failure
-        );
-    }
+    let _ = writeln!(
+        log,
+        "    ✅ PASS (expected error matched): {} {}",
+        expected_error_expectation_label(&step.meta),
+        last_failure
+    );
     true
 }
 
@@ -1963,7 +2101,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 }
 
-                if step.meta.expect_error_code.is_some() || step.meta.expect_error.is_some() {
+                if step.meta.has_error_expectation() {
                     let expected_ok = finish_expected_error_step(
                         step,
                         matched_expected_error,
@@ -2301,20 +2439,14 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         true
                     };
 
-                if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
+                if step.meta.has_error_expectation() {
                     if matched_expected_error && expected_error_be_log_ok {
                         let _ = writeln!(
                             log,
-                            "    ✅ RECORDED EXPECTED ERROR: engine_error_code={} {}",
-                            expected_code, last_failure
+                            "    ✅ RECORDED EXPECTED ERROR: {} {}",
+                            expected_error_expectation_label(&step.meta),
+                            last_failure
                         );
-                    } else {
-                        case_failed = true;
-                        let _ = writeln!(log, "    ❌ {}", last_failure);
-                    }
-                } else if step.meta.expect_error.is_some() {
-                    if matched_expected_error && expected_error_be_log_ok {
-                        let _ = writeln!(log, "    ✅ RECORDED EXPECTED ERROR: {}", last_failure);
                     } else {
                         case_failed = true;
                         let _ = writeln!(log, "    ❌ {}", last_failure);
@@ -2492,6 +2624,50 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             "    ❌ DIFF FAILED {}",
                             expected_code_result.expect_err("checked mismatch above")
                         );
+                    }
+                } else if step.meta.has_sql_error_assertion() {
+                    // SQL codes, phases, and source locations are NovaRocks
+                    // conformance contracts. A reference engine cannot be
+                    // required to emit NovaRocks-owned descriptors, so Diff
+                    // validates this branch against the target only.
+                    let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
+                        let cmd = step
+                            .sql
+                            .trim_start()
+                            .strip_prefix("shell:")
+                            .unwrap_or("")
+                            .trim();
+                        let exec = shell::execute_shell_command(cmd);
+                        (true, Some(exec), String::new())
+                    } else {
+                        execute_target_query_with_fault(
+                            &step.meta,
+                            &ctx.server_handle,
+                            &mut target_session,
+                            ctx.query_timeout,
+                            &step.sql,
+                            step.meta.db.as_deref(),
+                            be_log_snapshot.evidence_deadline(),
+                        )
+                    };
+                    case_elapsed += execution_t
+                        .as_ref()
+                        .map(|result| result.elapsed)
+                        .unwrap_or_default();
+
+                    match evaluate_expected_error_branch(&step.meta, ok_t, &err_t) {
+                        Some(Ok(())) => {
+                            let _ = writeln!(
+                                log,
+                                "    ✅ DIFF PASS (target SQL error contract matched: {})",
+                                expected_error_expectation_label(&step.meta)
+                            );
+                        }
+                        Some(Err(reason)) => {
+                            case_failed = true;
+                            let _ = writeln!(log, "    ❌ DIFF FAILED {reason}");
+                        }
+                        None => unreachable!("checked has_sql_error_assertion above"),
                     }
                 } else if let Some(expected_error) = step.meta.expect_error.as_deref() {
                     let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
@@ -3392,18 +3568,35 @@ fn finish_run_with_server_cleanup(
 fn run() -> Result<i32> {
     let cli = Cli::parse();
     let base_dir = resolve_repo_root()?;
-    let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
-    let mut runner_config = load_runner_config(config_path.as_deref())?;
-
-    ensure_iceberg_object_store_prereqs(&runner_config)?;
-
     let suite_configs = build_suite_configs(&base_dir)?;
     if suite_configs.is_empty() {
         println!("❌ ERROR: no suite directories found under tests/sql/suites");
         return Ok(1);
     }
 
-    let suite_names = match select_suite_names(&cli.suite, &suite_configs) {
+    if cli.list_extensions {
+        let meta_re = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$")?;
+        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$")?;
+        let entries =
+            extension_manifest::derive_extension_manifest(&suite_configs, &meta_re, &marker_re)?;
+        print!(
+            "{}",
+            extension_manifest::render_extension_manifest(&entries)
+        );
+        return Ok(0);
+    }
+
+    let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
+    let mut runner_config = load_runner_config(config_path.as_deref())?;
+
+    ensure_iceberg_object_store_prereqs(&runner_config)?;
+
+    let suite_names = match select_suite_names(
+        cli.suite
+            .as_deref()
+            .expect("clap requires --suite unless --list-extensions is set"),
+        &suite_configs,
+    ) {
         Ok(suite_names) => suite_names,
         Err(error) => {
             println!("❌ ERROR: {error}");
@@ -4160,15 +4353,19 @@ mod tests {
     use crate::parser::{extract_suite_hook, load_sql_case_from_file};
     use crate::results::{load_expected_results, parse_output, write_result_file};
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
-    use crate::types::{QueryExecution, QueryMeta, ResultSet, RunnerConfig, SqlCase, SqlStep};
+    use crate::sql_error_codes::SqlErrorPhase;
+    use crate::types::{
+        QueryExecution, QueryMeta, ResultSet, RunnerConfig, SqlCase, SqlErrorLocation,
+        SqlErrorTier, SqlStep,
+    };
     use crate::{
         AlterJobPollState, Cli, annotate_failure_with_engine_error_code,
         bounded_fault_query_timeout, classify_alter_job_poll, evaluate_expected_error_branch,
-        execute_target_session_sql_with, expected_engine_error_code_diff_result,
-        expected_engine_error_code_result, finish_expected_error_step,
-        sql_text_has_query_lifecycle_fault_directive, statement_starts_dml_operation,
-        validate_ctas_takeover_preflight, validate_dml_cluster_jobs, validate_fault_injection_jobs,
-        validate_selected_suite_cluster,
+        evaluate_expected_error_branch_with_sql_error_descriptors, execute_target_session_sql_with,
+        expected_engine_error_code_diff_result, expected_engine_error_code_result,
+        finish_expected_error_step, sql_text_has_query_lifecycle_fault_directive,
+        statement_starts_dml_operation, validate_ctas_takeover_preflight,
+        validate_dml_cluster_jobs, validate_fault_injection_jobs, validate_selected_suite_cluster,
     };
     use clap::Parser;
     use regex::Regex;
@@ -4522,6 +4719,98 @@ mod tests {
     }
 
     #[test]
+    fn sql_error_assertions_match_code_phase_and_location() {
+        let meta = QueryMeta {
+            expect_sql_code: Some("sql.test.fixture".to_string()),
+            expect_sql_phase: Some(SqlErrorPhase::Parse),
+            expect_error_at: Some(SqlErrorLocation {
+                line: 7,
+                column: 11,
+            }),
+            expect_error_tier: Some(SqlErrorTier::Target),
+            ..QueryMeta::default()
+        };
+        let error = "ERROR 1064 (42000): [sql.test.fixture] at line 7, column 11: unexpected token";
+
+        assert_eq!(
+            evaluate_expected_error_branch_with_sql_error_descriptors(
+                &meta,
+                false,
+                error,
+                crate::sql_error_codes::TEST_SQL_ERROR_DESCRIPTORS,
+            ),
+            Some(Ok(()))
+        );
+    }
+
+    #[test]
+    fn sql_error_assertions_report_code_phase_and_location_mismatches() {
+        let code_meta = QueryMeta {
+            expect_sql_code: Some("sql.test.fixture".to_string()),
+            ..QueryMeta::default()
+        };
+        let error = evaluate_expected_error_branch_with_sql_error_descriptors(
+            &code_meta,
+            false,
+            "[sql.test.analyze] wrong code",
+            crate::sql_error_codes::TEST_SQL_ERROR_DESCRIPTORS,
+        )
+        .expect("SQL assertion branch should be active")
+        .expect_err("different code must fail");
+        assert!(error.contains("expected SQL error code"), "{error}");
+
+        let phase_meta = QueryMeta {
+            expect_sql_code: Some("sql.test.analyze".to_string()),
+            expect_sql_phase: Some(SqlErrorPhase::Parse),
+            ..QueryMeta::default()
+        };
+        let error = evaluate_expected_error_branch_with_sql_error_descriptors(
+            &phase_meta,
+            false,
+            "[sql.test.analyze] wrong phase",
+            crate::sql_error_codes::TEST_SQL_ERROR_DESCRIPTORS,
+        )
+        .expect("SQL assertion branch should be active")
+        .expect_err("different phase must fail");
+        assert!(error.contains("expected SQL error phase Parse"), "{error}");
+
+        let location_meta = QueryMeta {
+            expect_error_at: Some(SqlErrorLocation { line: 2, column: 3 }),
+            ..QueryMeta::default()
+        };
+        let error = evaluate_expected_error_branch_with_sql_error_descriptors(
+            &location_meta,
+            false,
+            "[sql.test.fixture] at line 2, column 4: wrong location",
+            crate::sql_error_codes::TEST_SQL_ERROR_DESCRIPTORS,
+        )
+        .expect("SQL assertion branch should be active")
+        .expect_err("different location must fail");
+        assert!(error.contains("expected error at 2:3"), "{error}");
+    }
+
+    #[test]
+    fn sql_error_assertion_fails_when_query_succeeds() {
+        let meta = QueryMeta {
+            expect_sql_code: Some("sql.test.fixture".to_string()),
+            ..QueryMeta::default()
+        };
+
+        let error = evaluate_expected_error_branch_with_sql_error_descriptors(
+            &meta,
+            true,
+            "",
+            crate::sql_error_codes::TEST_SQL_ERROR_DESCRIPTORS,
+        )
+        .expect("SQL assertion branch should be active")
+        .expect_err("unexpected success must fail");
+        assert!(
+            error.contains("expected SQL error code \"sql.test.fixture\", but query succeeded"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn expect_error_code_diff_requires_both_sides_to_match() {
         expected_engine_error_code_diff_result(
             "CommitUnknown",
@@ -4698,6 +4987,15 @@ mod tests {
 
         assert!(help.contains("--cluster-mode <CLUSTER_MODE>"));
         assert!(help.contains("cross-process"));
+    }
+
+    #[test]
+    fn cli_allows_extension_listing_without_a_suite() {
+        let cli = crate::Cli::try_parse_from(["novarocks-sql-test", "--list-extensions"])
+            .expect("extension listing should not require a suite");
+
+        assert!(cli.list_extensions);
+        assert_eq!(cli.suite, None);
     }
 
     #[test]
