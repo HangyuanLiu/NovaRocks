@@ -13,8 +13,8 @@
 use novarocks_parser::{
     Span,
     ast::{
-        BinaryExpr, BinaryOperator, Expr, Ident, Literal, LiteralKind, RawQuerySlice, ShowBackends,
-        Statement,
+        BackendStatement, BinaryExpr, BinaryOperator, Expr, Ident, Literal, LiteralKind,
+        RawQuerySlice, ShowBackends, Statement,
     },
     printer::{print_expr, print_statement},
 };
@@ -42,7 +42,9 @@ fn binary(left: Expr, operator: BinaryOperator, right: Expr) -> Expr {
 
 #[test]
 fn roundtrip_seed_ast_printer_contracts_cover_vertical_slice_and_expressions() {
-    let show_backends = Statement::ShowBackends(ShowBackends { span: span() });
+    let show_backends = Statement::Backend(BackendStatement::ShowBackends(ShowBackends {
+        span: span(),
+    }));
     assert_eq!(print_statement(&show_backends), "SHOW BACKENDS");
 
     let raw_query = Statement::RawQuery(RawQuerySlice {

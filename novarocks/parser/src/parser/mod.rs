@@ -8,14 +8,21 @@
 //! The public statement `parse()` entry point is added by SQLP-1 T6 after the
 //! expression and printer foundations have converged.
 
+mod backend;
+mod catalog;
+mod command;
 mod expr;
+mod iceberg;
+mod maintenance;
+mod materialized_view;
 mod pratt;
 mod show_backends;
+mod statistics;
 
 use crate::{
     ParseError, ParserError, Span, Token, TokenKind,
-    ast::Statement,
-    lex,
+    ast::{Ident, Literal, LiteralKind, ObjectName, Statement},
+    keyword_class, lex,
     token::{Keyword, Symbol},
 };
 
@@ -62,16 +69,29 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
         Ok(statements)
     }
 
-    /// `statement ::= show-backends | recognized-unsupported-statement`
+    /// Dispatches one owned command family without legacy fallthrough.
+    ///
+    /// Family parsers return `None` only when the input is not their family.
+    /// Once a parser has recognized a family, every malformed form is an
+    /// immediate typed error from that parser.
     fn parse_statement(&mut self) -> Result<Statement, ParserError> {
-        match self.current().map(|token| &token.kind) {
-            Some(TokenKind::Keyword(Keyword::Show)) => Ok(show_backends::parse(self)?),
-            _ => Err(ParseError::UnsupportedStatement {
-                statement: self.current_description(),
-                span: self.current_span(),
+        for parser in [
+            backend::parse as FamilyParser,
+            statistics::parse,
+            catalog::parse,
+            iceberg::parse,
+            maintenance::parse,
+            materialized_view::parse,
+        ] {
+            if let Some(statement) = parser(self)? {
+                return Ok(statement);
             }
-            .into()),
         }
+        Err(ParseError::UnsupportedStatement {
+            statement: self.current_description(),
+            span: self.current_span(),
+        }
+        .into())
     }
 
     pub(super) fn current(&self) -> Option<&Token> {
@@ -86,6 +106,137 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
 
     pub(super) fn current_is_keyword(&self, keyword: Keyword) -> bool {
         matches!(self.current().map(|token| &token.kind), Some(TokenKind::Keyword(found)) if *found == keyword)
+    }
+
+    pub(super) fn current_is_word(&self, word: &str) -> bool {
+        self.current().is_some_and(|token| {
+            matches!(token.kind, TokenKind::Ident | TokenKind::Keyword(_))
+                && self.source[token.span.start()..token.span.end()].eq_ignore_ascii_case(word)
+        })
+    }
+
+    pub(super) fn peek_word(&self, offset: usize, word: &str) -> bool {
+        self.significant_token(offset).is_some_and(|token| {
+            matches!(token.kind, TokenKind::Ident | TokenKind::Keyword(_))
+                && self.source[token.span.start()..token.span.end()].eq_ignore_ascii_case(word)
+        })
+    }
+
+    pub(super) fn consume_word(&mut self, word: &'static str) -> Result<Span, ParseError> {
+        if !self.current_is_word(word) {
+            return Err(self.unexpected(word));
+        }
+        let span = self.current_span();
+        self.advance();
+        self.skip_trivia();
+        Ok(span)
+    }
+
+    pub(super) fn consume_symbol(&mut self, symbol: Symbol) -> Result<Span, ParseError> {
+        if !self.current_is_symbol(symbol) {
+            return Err(self.unexpected(symbol.sql()));
+        }
+        let span = self.current_span();
+        self.advance();
+        self.skip_trivia();
+        Ok(span)
+    }
+
+    pub(super) fn consume_if_word(&mut self, word: &str) -> bool {
+        if !self.current_is_word(word) {
+            return false;
+        }
+        self.advance();
+        self.skip_trivia();
+        true
+    }
+
+    pub(super) fn consume_if_symbol(&mut self, symbol: Symbol) -> bool {
+        if !self.current_is_symbol(symbol) {
+            return false;
+        }
+        self.advance();
+        self.skip_trivia();
+        true
+    }
+
+    pub(super) fn parse_ident(&mut self) -> Result<Ident, ParseError> {
+        let token = self
+            .current()
+            .ok_or_else(|| self.unexpected("identifier"))?;
+        match token.kind {
+            TokenKind::Ident | TokenKind::QuotedIdent => {
+                let source = &self.source[token.span.start()..token.span.end()];
+                let (value, quoted) = if matches!(token.kind, TokenKind::QuotedIdent) {
+                    (source[1..source.len() - 1].replace("``", "`"), true)
+                } else {
+                    (source.to_owned(), false)
+                };
+                let ident = Ident {
+                    value,
+                    quoted,
+                    span: token.span,
+                };
+                self.advance();
+                self.skip_trivia();
+                Ok(ident)
+            }
+            TokenKind::Keyword(keyword)
+                if keyword_class(keyword) == crate::KeywordClass::NonReserved =>
+            {
+                let ident = Ident {
+                    value: self.source[token.span.start()..token.span.end()].to_owned(),
+                    quoted: false,
+                    span: token.span,
+                };
+                self.advance();
+                self.skip_trivia();
+                Ok(ident)
+            }
+            _ => Err(self.unexpected("identifier")),
+        }
+    }
+
+    pub(super) fn parse_object_name(&mut self) -> Result<ObjectName, ParseError> {
+        let first = self.parse_ident()?;
+        let start = first.span.start();
+        let mut end = first.span.end();
+        let mut parts = vec![first];
+        while self.consume_if_symbol(Symbol::Dot) {
+            let part = self.parse_ident()?;
+            end = part.span.end();
+            parts.push(part);
+        }
+        Ok(ObjectName {
+            parts,
+            span: Span::new(start, end),
+        })
+    }
+
+    pub(super) fn parse_literal(&mut self) -> Result<Literal, ParseError> {
+        let token = self.current().ok_or_else(|| self.unexpected("literal"))?;
+        let span = token.span;
+        let source = &self.source[span.start()..span.end()];
+        let kind = match token.kind {
+            TokenKind::Keyword(Keyword::Null) => LiteralKind::Null,
+            TokenKind::Keyword(Keyword::True) => LiteralKind::Boolean(true),
+            TokenKind::Keyword(Keyword::False) => LiteralKind::Boolean(false),
+            TokenKind::Number => LiteralKind::Number(source.to_owned()),
+            TokenKind::HexNumber => LiteralKind::HexString(source.to_owned()),
+            TokenKind::String => LiteralKind::String(unquote_string(source)),
+            _ => return Err(self.unexpected("literal")),
+        };
+        self.advance();
+        self.skip_trivia();
+        Ok(Literal { kind, span })
+    }
+
+    pub(super) fn current_offset(&self) -> usize {
+        self.current_span().start()
+    }
+
+    pub(super) fn source_slice(&self, span: Span) -> &str {
+        &self.source[span.start()..span.end()]
     }
 
     pub(super) fn current_is_symbol(&self, symbol: Symbol) -> bool {
@@ -106,13 +257,21 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
         }
     }
 
-    fn skip_trivia(&mut self) {
+    pub(super) fn skip_trivia(&mut self) {
         while matches!(
             self.current().map(|token| &token.kind),
             Some(TokenKind::Trivia(_))
         ) {
             self.advance();
         }
+    }
+
+    fn significant_token(&self, offset: usize) -> Option<&Token> {
+        self.tokens
+            .iter()
+            .skip(self.position)
+            .filter(|token| !matches!(token.kind, TokenKind::Trivia(_)))
+            .nth(offset)
     }
 
     fn is_end(&self) -> bool {
@@ -132,11 +291,33 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
     }
 }
 
+type FamilyParser = for<'source, 'tokens> fn(
+    &mut StatementParser<'source, 'tokens>,
+) -> Result<Option<Statement>, ParseError>;
+
+fn unquote_string(source: &str) -> String {
+    let body = &source[1..source.len() - 1];
+    let quote = source.as_bytes()[0] as char;
+    let mut output = String::with_capacity(body.len());
+    let mut characters = body.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == quote && characters.peek() == Some(&quote) {
+            output.push(character);
+            characters.next();
+        } else if character == '\\' {
+            output.push(characters.next().unwrap_or(character));
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
         ParserError, Span,
-        ast::{ShowBackends, Statement},
+        ast::{BackendStatement, ShowBackends, Statement},
         lex,
         printer::print_statements,
     };
@@ -200,9 +381,11 @@ mod tests {
         );
         assert_eq!(
             parse("SHOW BACKENDS").unwrap(),
-            vec![Statement::ShowBackends(ShowBackends {
-                span: Span::new(0, 13),
-            })]
+            vec![Statement::Backend(BackendStatement::ShowBackends(
+                ShowBackends {
+                    span: Span::new(0, 13),
+                },
+            ))]
         );
     }
 
@@ -217,7 +400,12 @@ mod tests {
         statements
             .iter()
             .map(|statement| match statement {
-                Statement::ShowBackends(_) => "SHOW BACKENDS",
+                Statement::Backend(BackendStatement::ShowBackends(_)) => "SHOW BACKENDS",
+                Statement::Statistics(_) => "STATISTICS",
+                Statement::Catalog(_) => "CATALOG",
+                Statement::Iceberg(_) => "ICEBERG",
+                Statement::Maintenance(_) => "MAINTENANCE",
+                Statement::MaterializedView(_) => "MATERIALIZED VIEW",
                 Statement::RawQuery(_) => "RAW QUERY",
             })
             .collect()

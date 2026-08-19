@@ -23,46 +23,105 @@ pub enum KeywordClass {
 /// Identifiers retain their original source spelling; only the comparison here
 /// is case-insensitive.
 pub fn lookup(word: &str) -> Option<Keyword> {
-    if word.eq_ignore_ascii_case("AND") {
-        Some(Keyword::And)
-    } else if word.eq_ignore_ascii_case("AS") {
-        Some(Keyword::As)
-    } else if word.eq_ignore_ascii_case("BACKENDS") {
-        Some(Keyword::Backends)
-    } else if word.eq_ignore_ascii_case("FALSE") {
-        Some(Keyword::False)
-    } else if word.eq_ignore_ascii_case("FROM") {
-        Some(Keyword::From)
-    } else if word.eq_ignore_ascii_case("NOT") {
-        Some(Keyword::Not)
-    } else if word.eq_ignore_ascii_case("NULL") {
-        Some(Keyword::Null)
-    } else if word.eq_ignore_ascii_case("OR") {
-        Some(Keyword::Or)
-    } else if word.eq_ignore_ascii_case("SHOW") {
-        Some(Keyword::Show)
-    } else if word.eq_ignore_ascii_case("TRUE") {
-        Some(Keyword::True)
-    } else {
-        None
-    }
+    KEYWORDS
+        .iter()
+        .find(|(spelling, _)| word.eq_ignore_ascii_case(spelling))
+        .map(|(_, keyword)| *keyword)
 }
 
 /// Returns the reservedness recorded for a recognized keyword.
 pub const fn class(keyword: Keyword) -> KeywordClass {
     match keyword {
-        Keyword::Backends => KeywordClass::NonReserved,
-        Keyword::And
+        Keyword::Add
+        | Keyword::Alter
+        | Keyword::Analyze
+        | Keyword::And
         | Keyword::As
+        | Keyword::Call
+        | Keyword::Cancel
+        | Keyword::Create
+        | Keyword::Drop
+        | Keyword::Explain
         | Keyword::False
         | Keyword::From
+        | Keyword::Kill
         | Keyword::Not
         | Keyword::Null
         | Keyword::Or
         | Keyword::Show
-        | Keyword::True => KeywordClass::Reserved,
+        | Keyword::True
+        | Keyword::Truncate => KeywordClass::Reserved,
+        _ => KeywordClass::NonReserved,
     }
 }
+
+const KEYWORDS: &[(&str, Keyword)] = &[
+    ("ADD", Keyword::Add),
+    ("ALTER", Keyword::Alter),
+    ("ANALYZE", Keyword::Analyze),
+    ("AND", Keyword::And),
+    ("AS", Keyword::As),
+    ("ASYNC", Keyword::Async),
+    ("BACKEND", Keyword::Backend),
+    ("BACKENDS", Keyword::Backends),
+    ("BASIC", Keyword::Basic),
+    ("BRANCH", Keyword::Branch),
+    ("BUCKETS", Keyword::Buckets),
+    ("BY", Keyword::By),
+    ("CALL", Keyword::Call),
+    ("CANCEL", Keyword::Cancel),
+    ("CATALOG", Keyword::Catalog),
+    ("COLUMN", Keyword::Column),
+    ("COLUMNS", Keyword::Columns),
+    ("COMMENT", Keyword::Comment),
+    ("COSTS", Keyword::Costs),
+    ("CREATE", Keyword::Create),
+    ("DATABASE", Keyword::Database),
+    ("DEFAULT", Keyword::Default),
+    ("DROP", Keyword::Drop),
+    ("EXISTS", Keyword::Exists),
+    ("EXPIRE", Keyword::Expire),
+    ("EXPLAIN", Keyword::Explain),
+    ("EXTERNAL", Keyword::External),
+    ("FALSE", Keyword::False),
+    ("FILES", Keyword::Files),
+    ("FORCE", Keyword::Force),
+    ("FROM", Keyword::From),
+    ("FULL", Keyword::Full),
+    ("HISTOGRAM", Keyword::Histogram),
+    ("IF", Keyword::If),
+    ("JOBS", Keyword::Jobs),
+    ("KILL", Keyword::Kill),
+    ("MANIFESTS", Keyword::Manifests),
+    ("MATERIALIZED", Keyword::Materialized),
+    ("META", Keyword::Meta),
+    ("NOT", Keyword::Not),
+    ("NULL", Keyword::Null),
+    ("OR", Keyword::Or),
+    ("ORPHAN", Keyword::Orphan),
+    ("PARTITION", Keyword::Partition),
+    ("PROPERTIES", Keyword::Properties),
+    ("REFRESH", Keyword::Refresh),
+    ("REMOVE", Keyword::Remove),
+    ("REWRITE", Keyword::Rewrite),
+    ("SAMPLE", Keyword::Sample),
+    ("SET", Keyword::Set),
+    ("SHOW", Keyword::Show),
+    ("SNAPSHOTS", Keyword::Snapshots),
+    ("STATS", Keyword::Stats),
+    ("SYNC", Keyword::Sync),
+    ("TABLE", Keyword::Table),
+    ("TABLES", Keyword::Tables),
+    ("TAG", Keyword::Tag),
+    ("TO", Keyword::To),
+    ("TRUE", Keyword::True),
+    ("TRUNCATE", Keyword::Truncate),
+    ("UNSET", Keyword::Unset),
+    ("VERBOSE", Keyword::Verbose),
+    ("VIEW", Keyword::View),
+    ("VIEWS", Keyword::Views),
+    ("WITH", Keyword::With),
+];
 
 #[cfg(test)]
 mod tests {

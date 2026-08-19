@@ -5,12 +5,26 @@
 
 //! Syntax-only SQL abstract syntax tree nodes.
 
+pub(crate) mod backend;
+pub(crate) mod catalog;
+pub(crate) mod command;
 mod expr;
+pub(crate) mod iceberg;
+pub(crate) mod maintenance;
+pub(crate) mod materialized_view;
+pub(crate) mod statistics;
 mod visit;
 
+pub use backend::{BackendStatement, ShowBackends};
+pub use catalog::CatalogStatement;
+pub use command::{Property, PropertyKeyValue};
 pub use expr::{
     BinaryExpr, BinaryOperator, Expr, FunctionCall, NestedExpr, UnaryExpr, UnaryOperator,
 };
+pub use iceberg::IcebergStatement;
+pub use maintenance::MaintenanceStatement;
+pub use materialized_view::MaterializedViewStatement;
+pub use statistics::StatisticsStatement;
 pub use visit::{
     Fold, Visit, fold_binary_expr, fold_expr, fold_function_call, fold_ident, fold_literal,
     fold_nested_expr, fold_object_name, fold_show_backends, fold_statement, fold_type_name,
@@ -24,23 +38,27 @@ use crate::Span;
 /// A top-level SQL statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
-    ShowBackends(ShowBackends),
+    Backend(BackendStatement),
+    Statistics(StatisticsStatement),
+    Catalog(CatalogStatement),
+    Iceberg(IcebergStatement),
+    Maintenance(MaintenanceStatement),
+    MaterializedView(MaterializedViewStatement),
     RawQuery(RawQuerySlice),
 }
 
 impl Statement {
     pub const fn span(&self) -> Span {
         match self {
-            Self::ShowBackends(statement) => statement.span,
+            Self::Backend(statement) => statement.span(),
+            Self::Statistics(statement) => statement.span(),
+            Self::Catalog(statement) => statement.span(),
+            Self::Iceberg(statement) => statement.span(),
+            Self::Maintenance(statement) => statement.span(),
+            Self::MaterializedView(statement) => statement.span(),
             Self::RawQuery(query) => query.span,
         }
     }
-}
-
-/// The initial vertical-slice statement family: `SHOW BACKENDS`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ShowBackends {
-    pub span: Span,
 }
 
 /// An SQL identifier preserving its source spelling.
@@ -121,7 +139,9 @@ mod tests {
             span: span(8, 10),
         };
         let expression = Expr::Literal(literal.clone());
-        let statement = Statement::ShowBackends(ShowBackends { span: span(11, 24) });
+        let statement = Statement::Backend(BackendStatement::ShowBackends(ShowBackends {
+            span: span(11, 24),
+        }));
         let raw_query = RawQuerySlice {
             text: "SELECT 42".to_owned(),
             span: span(25, 34),

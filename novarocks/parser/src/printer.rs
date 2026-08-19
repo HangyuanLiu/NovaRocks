@@ -7,7 +7,7 @@
 
 use crate::ast::{
     BinaryExpr, BinaryOperator, Expr, FunctionCall, Ident, Literal, LiteralKind, NestedExpr,
-    ObjectName, RawQuerySlice, ShowBackends, Statement, TypeName, UnaryExpr, UnaryOperator,
+    ObjectName, RawQuerySlice, Statement, TypeName, UnaryExpr, UnaryOperator,
 };
 
 /// Renders parser AST nodes into one stable SQL spelling.
@@ -63,13 +63,26 @@ impl Printer {
 
     fn write_statement(&mut self, statement: &Statement) {
         match statement {
-            Statement::ShowBackends(statement) => self.write_show_backends(statement),
+            Statement::Backend(statement) => {
+                crate::ast::backend::write_sql(statement, &mut self.output)
+            }
+            Statement::Statistics(statement) => {
+                crate::ast::statistics::write_sql(statement, &mut self.output)
+            }
+            Statement::Catalog(statement) => {
+                crate::ast::catalog::write_sql(statement, &mut self.output)
+            }
+            Statement::Iceberg(statement) => {
+                crate::ast::iceberg::write_sql(statement, &mut self.output)
+            }
+            Statement::Maintenance(statement) => {
+                crate::ast::maintenance::write_sql(statement, &mut self.output)
+            }
+            Statement::MaterializedView(statement) => {
+                crate::ast::materialized_view::write_sql(statement, &mut self.output)
+            }
             Statement::RawQuery(query) => self.write_raw_query(query),
         }
-    }
-
-    fn write_show_backends(&mut self, _: &ShowBackends) {
-        self.output.push_str("SHOW BACKENDS");
     }
 
     fn write_raw_query(&mut self, query: &RawQuerySlice) {
@@ -230,6 +243,27 @@ pub fn print_type_name(type_name: &TypeName) -> String {
     Printer::new().type_name(type_name)
 }
 
+/// Renders one syntax literal into canonical SQL.
+pub fn print_literal(literal: &Literal) -> String {
+    match &literal.kind {
+        LiteralKind::Null => "NULL".to_owned(),
+        LiteralKind::Boolean(value) => if *value { "TRUE" } else { "FALSE" }.to_owned(),
+        LiteralKind::Number(value) | LiteralKind::HexString(value) => value.clone(),
+        LiteralKind::String(value) => {
+            let mut output = String::from("'");
+            for character in value.chars() {
+                match character {
+                    '\\' => output.push_str("\\\\"),
+                    '\'' => output.push_str("''"),
+                    _ => output.push(character),
+                }
+            }
+            output.push('\'');
+            output
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BinarySide {
     Left,
@@ -273,7 +307,10 @@ impl BinaryOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Span, ast::LiteralKind};
+    use crate::{
+        Span,
+        ast::{BackendStatement, LiteralKind, ShowBackends},
+    };
 
     fn span() -> Span {
         Span::new(0, 0)
@@ -389,7 +426,9 @@ mod tests {
 
     #[test]
     fn renders_vertical_slice_and_statement_sequences() {
-        let show = Statement::ShowBackends(ShowBackends { span: span() });
+        let show = Statement::Backend(BackendStatement::ShowBackends(ShowBackends {
+            span: span(),
+        }));
         assert_eq!(print_statement(&show), "SHOW BACKENDS");
         assert_eq!(
             print_statements(&[show.clone(), show]),

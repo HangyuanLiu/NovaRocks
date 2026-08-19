@@ -5,7 +5,7 @@
 
 use crate::{
     ParseError,
-    ast::{ShowBackends, Statement},
+    ast::{BackendStatement, ShowBackends, Statement},
     token::Keyword,
 };
 
@@ -21,9 +21,11 @@ pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Statement, P
     }
     let end = parser.current_span().end();
     parser.advance();
-    Ok(Statement::ShowBackends(ShowBackends {
-        span: crate::Span::new(start, end),
-    }))
+    Ok(Statement::Backend(BackendStatement::ShowBackends(
+        ShowBackends {
+            span: crate::Span::new(start, end),
+        },
+    )))
 }
 
 fn skip_trivia(parser: &mut StatementParser<'_, '_>) {

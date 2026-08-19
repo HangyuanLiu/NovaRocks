@@ -6,8 +6,9 @@
 //! Recursive traversal and rebuilding helpers for every AST node.
 
 use super::{
-    BinaryExpr, Expr, FunctionCall, Ident, Literal, NestedExpr, ObjectName, RawQuerySlice,
-    ShowBackends, Statement, TypeName, UnaryExpr,
+    BackendStatement, BinaryExpr, CatalogStatement, Expr, FunctionCall, IcebergStatement, Ident,
+    Literal, MaintenanceStatement, MaterializedViewStatement, NestedExpr, ObjectName,
+    RawQuerySlice, ShowBackends, Statement, StatisticsStatement, TypeName, UnaryExpr,
 };
 
 /// Visits AST nodes by shared reference.
@@ -18,6 +19,30 @@ pub trait Visit {
 
     fn visit_show_backends(&mut self, statement: &ShowBackends) {
         walk_show_backends(self, statement);
+    }
+
+    fn visit_backend_statement(&mut self, statement: &BackendStatement) {
+        walk_backend_statement(self, statement);
+    }
+
+    fn visit_statistics_statement(&mut self, statement: &StatisticsStatement) {
+        walk_statistics_statement(self, statement);
+    }
+
+    fn visit_catalog_statement(&mut self, statement: &CatalogStatement) {
+        walk_catalog_statement(self, statement);
+    }
+
+    fn visit_iceberg_statement(&mut self, statement: &IcebergStatement) {
+        walk_iceberg_statement(self, statement);
+    }
+
+    fn visit_maintenance_statement(&mut self, statement: &MaintenanceStatement) {
+        walk_maintenance_statement(self, statement);
+    }
+
+    fn visit_materialized_view_statement(&mut self, statement: &MaterializedViewStatement) {
+        walk_materialized_view_statement(self, statement);
     }
 
     fn visit_raw_query_slice(&mut self, query: &RawQuerySlice) {
@@ -63,12 +88,52 @@ pub trait Visit {
 
 pub fn walk_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Statement) {
     match statement {
-        Statement::ShowBackends(statement) => visitor.visit_show_backends(statement),
+        Statement::Backend(statement) => visitor.visit_backend_statement(statement),
+        Statement::Statistics(statement) => visitor.visit_statistics_statement(statement),
+        Statement::Catalog(statement) => visitor.visit_catalog_statement(statement),
+        Statement::Iceberg(statement) => visitor.visit_iceberg_statement(statement),
+        Statement::Maintenance(statement) => visitor.visit_maintenance_statement(statement),
+        Statement::MaterializedView(statement) => {
+            visitor.visit_materialized_view_statement(statement)
+        }
         Statement::RawQuery(query) => visitor.visit_raw_query_slice(query),
     }
 }
 
 pub fn walk_show_backends<V: Visit + ?Sized>(_: &mut V, _: &ShowBackends) {}
+
+pub fn walk_backend_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &BackendStatement) {
+    super::backend::walk(visitor, statement);
+}
+
+pub fn walk_statistics_statement<V: Visit + ?Sized>(
+    visitor: &mut V,
+    statement: &StatisticsStatement,
+) {
+    super::statistics::walk(visitor, statement);
+}
+
+pub fn walk_catalog_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &CatalogStatement) {
+    super::catalog::walk(visitor, statement);
+}
+
+pub fn walk_iceberg_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &IcebergStatement) {
+    super::iceberg::walk(visitor, statement);
+}
+
+pub fn walk_maintenance_statement<V: Visit + ?Sized>(
+    visitor: &mut V,
+    statement: &MaintenanceStatement,
+) {
+    super::maintenance::walk(visitor, statement);
+}
+
+pub fn walk_materialized_view_statement<V: Visit + ?Sized>(
+    visitor: &mut V,
+    statement: &MaterializedViewStatement,
+) {
+    super::materialized_view::walk(visitor, statement);
+}
 
 pub fn walk_ident<V: Visit + ?Sized>(_: &mut V, _: &Ident) {}
 
@@ -125,6 +190,36 @@ pub trait Fold {
         fold_show_backends(self, statement)
     }
 
+    fn fold_backend_statement(&mut self, statement: BackendStatement) -> BackendStatement {
+        fold_backend_statement(self, statement)
+    }
+
+    fn fold_statistics_statement(&mut self, statement: StatisticsStatement) -> StatisticsStatement {
+        fold_statistics_statement(self, statement)
+    }
+
+    fn fold_catalog_statement(&mut self, statement: CatalogStatement) -> CatalogStatement {
+        fold_catalog_statement(self, statement)
+    }
+
+    fn fold_iceberg_statement(&mut self, statement: IcebergStatement) -> IcebergStatement {
+        fold_iceberg_statement(self, statement)
+    }
+
+    fn fold_maintenance_statement(
+        &mut self,
+        statement: MaintenanceStatement,
+    ) -> MaintenanceStatement {
+        fold_maintenance_statement(self, statement)
+    }
+
+    fn fold_materialized_view_statement(
+        &mut self,
+        statement: MaterializedViewStatement,
+    ) -> MaterializedViewStatement {
+        fold_materialized_view_statement(self, statement)
+    }
+
     fn fold_raw_query_slice(&mut self, query: RawQuerySlice) -> RawQuerySlice {
         query
     }
@@ -168,8 +263,23 @@ pub trait Fold {
 
 pub fn fold_statement<F: Fold + ?Sized>(folder: &mut F, statement: Statement) -> Statement {
     match statement {
-        Statement::ShowBackends(statement) => {
-            Statement::ShowBackends(folder.fold_show_backends(statement))
+        Statement::Backend(statement) => {
+            Statement::Backend(folder.fold_backend_statement(statement))
+        }
+        Statement::Statistics(statement) => {
+            Statement::Statistics(folder.fold_statistics_statement(statement))
+        }
+        Statement::Catalog(statement) => {
+            Statement::Catalog(folder.fold_catalog_statement(statement))
+        }
+        Statement::Iceberg(statement) => {
+            Statement::Iceberg(folder.fold_iceberg_statement(statement))
+        }
+        Statement::Maintenance(statement) => {
+            Statement::Maintenance(folder.fold_maintenance_statement(statement))
+        }
+        Statement::MaterializedView(statement) => {
+            Statement::MaterializedView(folder.fold_materialized_view_statement(statement))
         }
         Statement::RawQuery(query) => Statement::RawQuery(folder.fold_raw_query_slice(query)),
     }
@@ -177,6 +287,48 @@ pub fn fold_statement<F: Fold + ?Sized>(folder: &mut F, statement: Statement) ->
 
 pub fn fold_show_backends<F: Fold + ?Sized>(_: &mut F, statement: ShowBackends) -> ShowBackends {
     statement
+}
+
+pub fn fold_backend_statement<F: Fold + ?Sized>(
+    folder: &mut F,
+    statement: BackendStatement,
+) -> BackendStatement {
+    super::backend::fold(folder, statement)
+}
+
+pub fn fold_statistics_statement<F: Fold + ?Sized>(
+    folder: &mut F,
+    statement: StatisticsStatement,
+) -> StatisticsStatement {
+    super::statistics::fold(folder, statement)
+}
+
+pub fn fold_catalog_statement<F: Fold + ?Sized>(
+    folder: &mut F,
+    statement: CatalogStatement,
+) -> CatalogStatement {
+    super::catalog::fold(folder, statement)
+}
+
+pub fn fold_iceberg_statement<F: Fold + ?Sized>(
+    folder: &mut F,
+    statement: IcebergStatement,
+) -> IcebergStatement {
+    super::iceberg::fold(folder, statement)
+}
+
+pub fn fold_maintenance_statement<F: Fold + ?Sized>(
+    folder: &mut F,
+    statement: MaintenanceStatement,
+) -> MaintenanceStatement {
+    super::maintenance::fold(folder, statement)
+}
+
+pub fn fold_materialized_view_statement<F: Fold + ?Sized>(
+    folder: &mut F,
+    statement: MaterializedViewStatement,
+) -> MaterializedViewStatement {
+    super::materialized_view::fold(folder, statement)
 }
 
 pub fn fold_ident<F: Fold + ?Sized>(_: &mut F, ident: Ident) -> Ident {
