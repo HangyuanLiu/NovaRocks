@@ -31,7 +31,7 @@ TBLPROPERTIES (
 );
 
 -- query 2
--- @expect_error=DEFAULT
+-- @expect_error=[sql.parse.unexpected_token] expected literal
 ALTER TABLE ${case_db}.t_v3_default_complex ADD COLUMN c ARRAY<INT> DEFAULT [1,2];
 
 -- query 3

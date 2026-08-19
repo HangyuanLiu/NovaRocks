@@ -305,7 +305,16 @@ fn unquote_string(source: &str) -> String {
             output.push(character);
             characters.next();
         } else if character == '\\' {
-            output.push(characters.next().unwrap_or(character));
+            let escaped = characters.next().unwrap_or(character);
+            output.push(match escaped {
+                '0' => '\0',
+                'b' => '\u{0008}',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'Z' => '\u{001a}',
+                other => other,
+            });
         } else {
             output.push(character);
         }
@@ -322,7 +331,7 @@ mod tests {
         printer::print_statements,
     };
 
-    use super::parse;
+    use super::{parse, unquote_string};
 
     #[test]
     fn show_backends_is_a_complete_round_trip_vertical_slice() {
@@ -394,6 +403,13 @@ mod tests {
         let error = parse("SHOW `unterminated").expect_err("lexing must fail");
         assert!(matches!(error, ParserError::Lex(_)));
         assert!(lex("SHOW `unterminated").is_err());
+    }
+
+    #[test]
+    fn mysql_string_escapes_are_decoded_in_literal_values() {
+        assert_eq!(unquote_string("'a,b\\nc'"), "a,b\nc");
+        assert_eq!(unquote_string("'a\\tb\\r\\0\\Z'"), "a\tb\r\0\u{001a}");
+        assert_eq!(unquote_string(r"'it''s \\ safe'"), "it's \\ safe");
     }
 
     fn statement_shapes(statements: &[Statement]) -> Vec<&'static str> {

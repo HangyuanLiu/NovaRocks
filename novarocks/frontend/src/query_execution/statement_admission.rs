@@ -115,11 +115,13 @@ fn is_admitted_iceberg_alter(words: &[String]) -> bool {
                 | ("RENAME", "COLUMN")
                 | ("MODIFY", "COLUMN")
                 | ("ALTER", "COLUMN")
-                | ("SET", "TBLPROPERTIES")
                 | ("UNSET", "TBLPROPERTIES")
                 | ("CREATE", "BRANCH" | "TAG")
         )
-    }) || words.iter().skip(2).any(|word| word == "COMMENT")
+    }) || words
+        .iter()
+        .skip(2)
+        .any(|word| word == "COMMENT" || word == "SET")
 }
 
 fn explain_targets_query(words: &[String]) -> bool {
@@ -251,6 +253,7 @@ mod tests {
     fn iceberg_alter_table_family_is_admitted_after_its_owner_cut() {
         for source in [
             "ALTER TABLE ice.db.t ADD COLUMN c INT",
+            "ALTER TABLE ice.db.t SET ('format' = 'parquet')",
             "ALTER TABLE ice.db.t SET TBLPROPERTIES ('format' = 'parquet')",
             "ALTER TABLE ice.db.t CREATE BRANCH dev",
             "ALTER TABLE ice.db.t ADD FILES FROM 's3://warehouse/staged'",

@@ -41,6 +41,10 @@ use novarocks_frontend::table_maintenance::repository::{
     MetadataMaintenanceOperationRepository, OptimizeJobRepository,
     metadata_maintenance_payload_digest,
 };
+use novarocks_parser::{
+    ast::{MaintenanceStatement, Statement},
+    parse,
+};
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceId,
     ConnectorInstanceIncarnation, ConnectorMetadataMaintenanceOperation,
@@ -363,14 +367,31 @@ fn connector_context() -> ConnectorRequestContext {
     .expect("connector request context")
 }
 
-fn expect_ok(result: Option<MaintenanceStatementResult>) {
-    assert!(matches!(result, Some(MaintenanceStatementResult::Ok)));
+fn typed_maintenance(source: &str) -> MaintenanceStatement {
+    let statements = parse(source).expect("typed maintenance statement should parse");
+    let [Statement::Maintenance(statement)] = statements.as_slice() else {
+        panic!("expected one typed maintenance statement for {source}");
+    };
+    statement.clone()
+}
+
+fn execute_typed(
+    service: &FrontendTableMaintenanceService,
+    engine: &dyn TableMaintenanceEngine,
+    source: &str,
+    context: MaintenanceRequestContext<'_>,
+) -> Result<MaintenanceStatementResult, String> {
+    service.execute_typed_statement(engine, &typed_maintenance(source), context)
+}
+
+fn expect_ok(result: MaintenanceStatementResult) {
+    assert!(matches!(result, MaintenanceStatementResult::Ok));
 }
 
 fn expect_query(
-    result: Option<MaintenanceStatementResult>,
+    result: MaintenanceStatementResult,
 ) -> novarocks_frontend::runtime::query_result::QueryResult {
-    let Some(MaintenanceStatementResult::Query(result)) = result else {
+    let MaintenanceStatementResult::Query(result) = result else {
         panic!("expected query result");
     };
     result
@@ -386,16 +407,11 @@ fn column_names(result: &novarocks_frontend::runtime::query_result::QueryResult)
 
 #[tokio::test(flavor = "multi_thread")]
 async fn non_maintenance_sql_is_not_claimed() {
-    let service = FrontendTableMaintenanceService::open(None, tokio::runtime::Handle::current())
-        .await
-        .unwrap();
     let engine = FakeMaintenanceEngine::default();
 
     assert!(
-        service
-            .try_handle_statement(&engine, "SELECT 1", context())
-            .unwrap()
-            .is_none()
+        parse("SELECT 1").is_err(),
+        "ordinary SQL must not be admitted as a typed maintenance statement"
     );
     assert!(engine.resolved_name_parts().is_empty());
     assert!(engine.requests().is_empty());
@@ -417,9 +433,7 @@ async fn a_finished_statement_releases_the_table_for_the_next_statement() {
          OLDER THAN '2026-01-01 00:00:00' RETAIN LAST 2",
         "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES OLDER THAN 1767225600000",
     ] {
-        let error = service
-            .try_handle_statement(&engine, sql, context())
-            .unwrap_err();
+        let error = execute_typed(&service, &engine, sql, context()).unwrap_err();
         assert!(
             !error.contains("owned by another frontend attempt"),
             "statement {sql} was refused by a lease its own predecessor should have released: \
@@ -440,32 +454,34 @@ async fn legacy_alter_statements_require_durable_engine_ports_and_optimize_only_
         "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES OLDER THAN 1767225600000",
     ] {
         assert_eq!(
-            service
-                .try_handle_statement(&engine, sql, context())
-                .unwrap_err(),
+            execute_typed(&service, &engine, sql, context()).unwrap_err(),
             "table maintenance service is not injected"
         );
     }
     expect_ok(
-        service
-            .try_handle_statement(&engine, "ALTER TABLE ice.db.orders OPTIMIZE", context())
-            .unwrap(),
+        execute_typed(
+            &service,
+            &engine,
+            "ALTER TABLE ice.db.orders OPTIMIZE",
+            context(),
+        )
+        .unwrap(),
     );
 
     assert!(engine.requests().is_empty());
     assert_eq!(engine.guarded_targets().len(), 4);
 
     let show = expect_query(
-        service
-            .try_handle_statement(
-                &engine,
-                "SHOW ALTER TABLE OPTIMIZE",
-                MaintenanceRequestContext {
-                    current_catalog: Some("ice"),
-                    current_database: "db",
-                },
-            )
-            .unwrap(),
+        execute_typed(
+            &service,
+            &engine,
+            "SHOW ALTER TABLE OPTIMIZE",
+            MaintenanceRequestContext {
+                current_catalog: Some("ice"),
+                current_database: "db",
+            },
+        )
+        .unwrap(),
     );
     assert_eq!(show.row_count(), 1);
     let batch = &show.chunks[0].batch;
@@ -488,9 +504,13 @@ async fn show_uses_repository_snapshot_and_preserves_legacy_wire_shape() {
     let (_temp, _host, store, service) = durable_service().await;
     let engine = FakeMaintenanceEngine::default();
     expect_ok(
-        service
-            .try_handle_statement(&engine, "ALTER TABLE ice.db.orders OPTIMIZE", context())
-            .unwrap(),
+        execute_typed(
+            &service,
+            &engine,
+            "ALTER TABLE ice.db.orders OPTIMIZE",
+            context(),
+        )
+        .unwrap(),
     );
 
     let repository = OptimizeJobRepository::open(store).await.unwrap();
@@ -512,14 +532,14 @@ async fn show_uses_repository_snapshot_and_preserves_legacy_wire_shape() {
     repository.finish(job.job_id, 300).await.unwrap();
 
     let result = expect_query(
-        service
-            .try_handle_statement(
-                &engine,
-                "SHOW ALTER TABLE OPTIMIZE FROM ice.db \
-                 WHERE TableName = 'orders' ORDER BY CreateTime DESC LIMIT 1",
-                context(),
-            )
-            .unwrap(),
+        execute_typed(
+            &service,
+            &engine,
+            "SHOW ALTER TABLE OPTIMIZE FROM ice.db \
+             WHERE TableName = 'orders' ORDER BY CreateTime DESC LIMIT 1",
+            context(),
+        )
+        .unwrap(),
     );
 
     assert_eq!(
@@ -700,9 +720,7 @@ async fn spark_procedures_route_to_their_durable_frontend_owners() {
 
     for (sql, expected_error) in cases {
         assert_eq!(
-            service
-                .try_handle_statement(&engine, sql, context())
-                .unwrap_err(),
+            execute_typed(&service, &engine, sql, context()).unwrap_err(),
             expected_error
         );
     }
@@ -721,14 +739,14 @@ async fn remove_orphan_files_requires_frontend_state_store_before_dispatch() {
         .unwrap();
     let engine = FakeMaintenanceEngine::default();
 
-    let error = service
-        .try_handle_statement(
-            &engine,
-            "CALL ice.system.remove_orphan_files(\
-             table => 'db.orders', older_than => TIMESTAMP '2026-01-01 00:00:00')",
-            context(),
-        )
-        .unwrap_err();
+    let error = execute_typed(
+        &service,
+        &engine,
+        "CALL ice.system.remove_orphan_files(\
+         table => 'db.orders', older_than => TIMESTAMP '2026-01-01 00:00:00')",
+        context(),
+    )
+    .unwrap_err();
 
     assert_eq!(
         error,
@@ -744,14 +762,14 @@ async fn action_exclusive_options_do_not_leak_between_variants() {
         .unwrap();
     let engine = FakeMaintenanceEngine::default();
 
-    let error = service
-        .try_handle_statement(
-            &engine,
-            "CALL ice.system.rewrite_manifests(\
-             table => 'db.orders', options => map('rewrite-all', 'true'))",
-            context(),
-        )
-        .unwrap_err();
+    let error = execute_typed(
+        &service,
+        &engine,
+        "CALL ice.system.rewrite_manifests(\
+         table => 'db.orders', options => map('rewrite-all', 'true'))",
+        context(),
+    )
+    .unwrap_err();
     assert_eq!(
         error,
         "unsupported argument `options` for Iceberg system procedure `rewrite_manifests`"
@@ -766,13 +784,13 @@ async fn user_actions_are_rejected_by_mv_guard_before_dispatch() {
         .unwrap();
     let engine = FakeMaintenanceEngine::default();
 
-    let error = service
-        .try_handle_statement(
-            &engine,
-            "CALL ice.system.rewrite_manifests(table => 'db.mv_table')",
-            context(),
-        )
-        .unwrap_err();
+    let error = execute_typed(
+        &service,
+        &engine,
+        "CALL ice.system.rewrite_manifests(table => 'db.mv_table')",
+        context(),
+    )
+    .unwrap_err();
 
     assert_eq!(
         error,
@@ -878,13 +896,13 @@ async fn missing_state_store_blocks_every_durable_maintenance_operation() {
     let engine = FakeMaintenanceEngine::default();
 
     assert_eq!(
-        service
-            .try_handle_statement(
-                &engine,
-                "ALTER TABLE ice.db.orders REWRITE MANIFESTS",
-                context(),
-            )
-            .unwrap_err(),
+        execute_typed(
+            &service,
+            &engine,
+            "ALTER TABLE ice.db.orders REWRITE MANIFESTS",
+            context(),
+        )
+        .unwrap_err(),
         "connector metadata maintenance requires frontend StateStore"
     );
     assert_eq!(
@@ -903,16 +921,15 @@ async fn missing_state_store_blocks_every_durable_maintenance_operation() {
 
     let resolved_before_optimize = engine.resolved_name_parts().len();
     let guarded_before_optimize = engine.guarded_targets().len();
-    let optimize = service
-        .try_handle_statement(
-            &engine,
-            "ALTER TABLE too.many.name.parts OPTIMIZE",
-            context(),
-        )
-        .unwrap_err();
-    let show = service
-        .try_handle_statement(&engine, "SHOW ALTER TABLE OPTIMIZE", context())
-        .unwrap_err();
+    let optimize = execute_typed(
+        &service,
+        &engine,
+        "ALTER TABLE too.many.name.parts OPTIMIZE",
+        context(),
+    )
+    .unwrap_err();
+    let show =
+        execute_typed(&service, &engine, "SHOW ALTER TABLE OPTIMIZE", context()).unwrap_err();
     let automatic = service
         .submit_automatic_optimize(&engine, target("ice", "db", "orders"))
         .unwrap_err();
@@ -932,14 +949,22 @@ async fn user_duplicate_optimize_remains_a_compatible_string_error() {
     let (_temp, _host, _store, service) = durable_service().await;
     let engine = FakeMaintenanceEngine::default();
     expect_ok(
-        service
-            .try_handle_statement(&engine, "ALTER TABLE ice.db.orders OPTIMIZE", context())
-            .unwrap(),
+        execute_typed(
+            &service,
+            &engine,
+            "ALTER TABLE ice.db.orders OPTIMIZE",
+            context(),
+        )
+        .unwrap(),
     );
 
-    let error = service
-        .try_handle_statement(&engine, "ALTER TABLE ice.db.orders OPTIMIZE", context())
-        .unwrap_err();
+    let error = execute_typed(
+        &service,
+        &engine,
+        "ALTER TABLE ice.db.orders OPTIMIZE",
+        context(),
+    )
+    .unwrap_err();
 
     assert!(error.starts_with("ALTER TABLE OPTIMIZE: create iceberg optimize job failed:"));
     assert!(error.contains("ice.db.orders"));

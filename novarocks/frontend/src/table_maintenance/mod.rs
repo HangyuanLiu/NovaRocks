@@ -202,6 +202,28 @@ impl FrontendTableMaintenanceService {
         })
     }
 
+    /// Executes one parser-owned maintenance statement without accepting raw
+    /// command text. This test-facing composition helper keeps integration
+    /// coverage on the same typed lowering path as query admission.
+    pub fn execute_typed_statement(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+        statement: &novarocks_parser::ast::MaintenanceStatement,
+        context: MaintenanceRequestContext<'_>,
+    ) -> Result<MaintenanceStatementResult, String> {
+        match statement {
+            novarocks_parser::ast::MaintenanceStatement::ShowOptimize(statement) => {
+                self.handle_typed_show_optimize(lower_typed_show_optimize(statement)?, context)
+            }
+            _ => self.handle_typed_statement(
+                engine,
+                lower_typed_maintenance_statement(statement, context)?,
+                is_typed_spark_maintenance_call(statement),
+                context,
+            ),
+        }
+    }
+
     /// Fail closed when a durable maintenance path runs without installed
     /// authority. There is no unfenced fallback: a frontend that owns durable
     /// maintenance records must also own a lease attempt for the target.
