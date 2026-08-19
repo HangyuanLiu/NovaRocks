@@ -737,12 +737,11 @@ fn parse_optional_table_alias(
     parser: &mut StatementParser<'_, '_>,
 ) -> Result<Option<crate::ast::TableAlias>, crate::ParseError> {
     let explicit_as = parser.consume_if_word("AS");
-    if !explicit_as
-        && !matches!(
-            parser.current().map(|token| &token.kind),
-            Some(TokenKind::Ident | TokenKind::QuotedIdent)
-        )
-    {
+    let has_alias = matches!(
+        parser.current().map(|token| &token.kind),
+        Some(TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::Keyword(Keyword::Unnest))
+    );
+    if !explicit_as && !has_alias {
         return Ok(None);
     }
     let name = parser.parse_ident()?;

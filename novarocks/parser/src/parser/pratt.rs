@@ -24,9 +24,9 @@ use crate::{
         CastExpr, CastKind, ExistsExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier,
         Ident, InListExpr, InSubqueryExpr, IsPredicate, IsPredicateExpr, JsonOperator, LambdaExpr,
         LikeExpr, LikeOperator, Literal, LiteralKind, MapEntry, MapExpr, NestedExpr, NullTreatment,
-        ObjectName, StructField, SubqueryExpr, TupleExpr, TypeName, TypeNameArgument, UnaryExpr,
-        UnaryOperator, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits,
-        WindowSpec,
+        ObjectName, StructField, SubqueryExpr, TupleExpr, TypeName, TypeNameArgument,
+        TypedStringExpr, UnaryExpr, UnaryOperator, WindowFrame, WindowFrameBound,
+        WindowFrameExclusion, WindowFrameUnits, WindowSpec,
     },
     error::ParseError,
     keyword_class,
@@ -683,6 +683,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 ..
             }) => self.parse_cast_expression(CastKind::TryCast),
             Some(Token {
+                kind: TokenKind::Keyword(Keyword::Date | Keyword::Time | Keyword::Timestamp),
+                ..
+            }) => self.parse_typed_string_expression(),
+            Some(Token {
                 kind: TokenKind::Keyword(Keyword::Exists),
                 span,
             }) => self.parse_exists_expression(span.start(), false),
@@ -853,6 +857,27 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             kind,
             format: None,
             span: Span::new(start, end),
+        }))
+    }
+
+    fn parse_typed_string_expression(&mut self) -> Result<Expr, ParseError> {
+        let start = self.current_span().start();
+        let data_type = self.parse_type_name()?;
+        self.skip_trivia();
+        let Some(token) = self.current().cloned() else {
+            return Err(self.unexpected("string literal after type name"));
+        };
+        if token.kind != TokenKind::String {
+            return Err(self.unexpected("string literal after type name"));
+        }
+        self.advance();
+        Ok(Expr::TypedString(TypedStringExpr {
+            data_type,
+            value: Literal {
+                kind: LiteralKind::String(self.string_value(token.span)),
+                span: token.span,
+            },
+            span: Span::new(start, token.span.end()),
         }))
     }
 
@@ -1249,11 +1274,28 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 } else {
                     None
                 };
+                let nulls_first = if self.current_is_keyword(Keyword::Nulls) {
+                    self.advance();
+                    self.skip_trivia();
+                    if self.current_is_keyword(Keyword::First) {
+                        self.advance();
+                        self.skip_trivia();
+                        Some(true)
+                    } else if self.current_is_keyword(Keyword::Last) {
+                        self.advance();
+                        self.skip_trivia();
+                        Some(false)
+                    } else {
+                        return Err(self.unexpected("FIRST or LAST after NULLS"));
+                    }
+                } else {
+                    None
+                };
                 let span = Span::new(expr.span().start(), self.current_span().start());
                 order_by.push(crate::ast::OrderByExpr {
                     expr,
                     asc,
-                    nulls_first: None,
+                    nulls_first,
                     span,
                 });
                 if !self.current_is_symbol(Symbol::Comma) {

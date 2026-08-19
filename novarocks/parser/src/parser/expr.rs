@@ -159,7 +159,7 @@ mod tests {
         ));
 
         let Expr::FunctionCall(call) = parse(
-            "sum(v) OVER (PARTITION BY k ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+            "sum(v) OVER (PARTITION BY k ORDER BY ts DESC NULLS LAST ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
         ) else {
             panic!("expected window function");
         };
@@ -180,6 +180,8 @@ mod tests {
         ));
         assert!(matches!(parse("items[1]"), Expr::Access(_)));
         assert!(matches!(parse("items[1].field"), Expr::Access(_)));
+        assert!(matches!(parse("left('value', 2)"), Expr::FunctionCall(_)));
+        assert!(matches!(parse("DATE '2024-01-10'"), Expr::TypedString(_)));
         assert!(matches!(parse("payload->>'$.name'"), Expr::Access(_)));
         let Expr::FunctionCall(call) = parse("array_map((x, y) -> x + y, input)") else {
             panic!("expected lambda function argument");

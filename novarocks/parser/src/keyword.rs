@@ -74,7 +74,6 @@ pub const fn class(keyword: Keyword) -> KeywordClass {
         | Keyword::Is
         | Keyword::Join
         | Keyword::Kill
-        | Keyword::Left
         | Keyword::Like
         | Keyword::Limit
         | Keyword::Not
