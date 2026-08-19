@@ -500,6 +500,7 @@ impl Printer {
                 }
             }
             TableFactor::Unnest {
+                keyword,
                 lateral,
                 array_exprs,
                 with_offset,
@@ -509,7 +510,8 @@ impl Printer {
                 if *lateral {
                     self.output.push_str("LATERAL ");
                 }
-                self.output.push_str("UNNEST(");
+                self.write_ident(keyword);
+                self.output.push('(');
                 self.write_expr_list(array_exprs);
                 self.output.push(')');
                 if *with_offset {
@@ -768,10 +770,11 @@ impl Printer {
     }
 
     fn write_ident(&mut self, ident: &Ident) {
-        if ident.quoted {
-            self.output.push('`');
-            self.output.push_str(&ident.value.replace('`', "``"));
-            self.output.push('`');
+        if let Some(quote) = ident.quote_style {
+            self.output.push(quote);
+            self.output
+                .push_str(&ident.value.replace(quote, &format!("{quote}{quote}")));
+            self.output.push(quote);
         } else {
             self.output.push_str(&ident.value);
         }
@@ -798,7 +801,12 @@ impl Printer {
         self.output.push(if generic { '<' } else { '(' });
         for (index, argument) in type_name.arguments.iter().enumerate() {
             if index != 0 {
-                self.output.push_str(", ");
+                self.output
+                    .push_str(if type_name.argument_separator_spaces[index - 1] {
+                        ", "
+                    } else {
+                        ","
+                    });
             }
             match argument {
                 TypeNameArgument::Type(data_type) => self.write_type_name(data_type),
@@ -1204,7 +1212,7 @@ impl Printer {
     }
 
     fn write_lambda_expr(&mut self, expression: &LambdaExpr) {
-        if expression.parameters.len() == 1 {
+        if expression.parameters.len() == 1 && !expression.parenthesized_single_parameter {
             self.write_ident(&expression.parameters[0]);
         } else {
             self.output.push('(');
@@ -1360,6 +1368,7 @@ mod tests {
         Ident {
             value: value.to_owned(),
             quoted: false,
+            quote_style: None,
             span: span(),
         }
     }
@@ -1449,6 +1458,7 @@ mod tests {
         assert_eq!(
             print_expr(&Expr::Lambda(LambdaExpr {
                 parameters: vec![ident("value")],
+                parenthesized_single_parameter: false,
                 body: Box::new(identifier("value")),
                 span: span(),
             })),

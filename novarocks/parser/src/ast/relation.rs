@@ -42,6 +42,7 @@ pub enum TableFactor {
         span: Span,
     },
     Unnest {
+        keyword: Ident,
         lateral: bool,
         array_exprs: Vec<Expr>,
         with_offset: bool,

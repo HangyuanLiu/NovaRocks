@@ -55,6 +55,8 @@ fn query_forms_parse_and_print_as_typed_syntax() {
         "SELECT * FROM (SELECT 1) catalog",
         "EXPLAIN VERBOSE SELECT k1 FROM __nr_ivm_delta('orders', 0, 0)",
         "SELECT @@time_zone, @user_name",
+        "SELECT 1 AS \"order count\"",
+        "SELECT array_sortby((x) -> x.item, x)",
         "SELECT l.id FROM left_table l LEFT JOIN right_table r ON l.id = r.id JOIN third_table s ON s.id = l.id",
         "EXPLAIN ANALYZE VALUES (1), (2)",
     ] {

@@ -317,6 +317,8 @@ pub struct StructExprField {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LambdaExpr {
     pub parameters: Vec<Ident>,
+    /// Whether a single parameter appeared in parentheses in the source.
+    pub parenthesized_single_parameter: bool,
     pub body: Box<Expr>,
     pub span: Span,
 }

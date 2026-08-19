@@ -45,7 +45,9 @@ pub fn syntax_eq_explain_query(left: &ExplainQuery, right: &ExplainQuery) -> boo
 
 impl SyntaxEq for Ident {
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.value == other.value && self.quoted == other.quoted
+        self.value == other.value
+            && self.quoted == other.quoted
+            && self.quote_style == other.quote_style
     }
 }
 
@@ -69,7 +71,9 @@ impl SyntaxEq for UserVariable {
 
 impl SyntaxEq for TypeName {
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.name.syntax_eq(&other.name) && syntax_eq_slice(&self.arguments, &other.arguments)
+        self.name.syntax_eq(&other.name)
+            && syntax_eq_slice(&self.arguments, &other.arguments)
+            && self.argument_separator_spaces == other.argument_separator_spaces
     }
 }
 
@@ -373,6 +377,7 @@ impl SyntaxEq for TableFactor {
             }
             (
                 Self::Unnest {
+                    keyword: left_keyword,
                     lateral: left_lateral,
                     array_exprs: left_exprs,
                     with_offset: left_offset,
@@ -380,6 +385,7 @@ impl SyntaxEq for TableFactor {
                     ..
                 },
                 Self::Unnest {
+                    keyword: right_keyword,
                     lateral: right_lateral,
                     array_exprs: right_exprs,
                     with_offset: right_offset,
@@ -387,7 +393,8 @@ impl SyntaxEq for TableFactor {
                     ..
                 },
             ) => {
-                left_lateral == right_lateral
+                left_keyword.syntax_eq(right_keyword)
+                    && left_lateral == right_lateral
                     && syntax_eq_slice(left_exprs, right_exprs)
                     && left_offset == right_offset
                     && syntax_eq_option(left_alias, right_alias)
@@ -694,7 +701,9 @@ impl SyntaxEq for StructExprField {
 
 impl SyntaxEq for LambdaExpr {
     fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_slice(&self.parameters, &other.parameters) && self.body.syntax_eq(&other.body)
+        syntax_eq_slice(&self.parameters, &other.parameters)
+            && self.parenthesized_single_parameter == other.parenthesized_single_parameter
+            && self.body.syntax_eq(&other.body)
     }
 }
 
@@ -773,6 +782,7 @@ mod tests {
         Ident {
             value: value.to_owned(),
             quoted: false,
+            quote_style: None,
             span: span(start),
         }
     }

@@ -256,6 +256,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             if self.current_is_symbol(Symbol::Arrow) && self.arrow_starts_lambda(&left) {
                 let parameters = Self::lambda_parameters(&left)
                     .expect("arrow_starts_lambda only accepts identifier parameters");
+                let parenthesized_single_parameter =
+                    parameters.len() == 1 && matches!(left, Expr::Nested(_));
                 let start = left.span().start();
                 self.advance();
                 self.skip_trivia();
@@ -263,6 +265,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 let span = Span::new(start, body.span().end());
                 left = Expr::Lambda(LambdaExpr {
                     parameters,
+                    parenthesized_single_parameter,
                     body: Box::new(body),
                     span,
                 });
@@ -980,6 +983,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 parts: vec![Ident {
                     value: "EXTRACT".to_owned(),
                     quoted: false,
+                    quote_style: None,
                     span: Span::new(start, start + "EXTRACT".len()),
                 }],
                 span: Span::new(start, start + "EXTRACT".len()),
@@ -1038,6 +1042,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 parts: vec![Ident {
                     value: self.token_text(name_span).to_owned(),
                     quoted: false,
+                    quote_style: None,
                     span: name_span,
                 }],
                 span: name_span,
@@ -1086,6 +1091,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             span: Span::new(start, name_end),
         };
         let mut arguments = Vec::new();
+        let mut argument_separator_spaces = Vec::new();
         let mut end = name_end;
         if self.current_is_symbol(Symbol::LParen) {
             self.advance();
@@ -1109,6 +1115,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     break;
                 }
                 self.advance();
+                argument_separator_spaces.push(matches!(
+                    self.current().map(|token| &token.kind),
+                    Some(TokenKind::Trivia(crate::TriviaKind::Whitespace))
+                ));
                 self.skip_trivia();
             }
             if !self.current_is_symbol(Symbol::RParen) {
@@ -1153,6 +1163,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     break;
                 }
                 self.advance();
+                argument_separator_spaces.push(matches!(
+                    self.current().map(|token| &token.kind),
+                    Some(TokenKind::Trivia(crate::TriviaKind::Whitespace))
+                ));
                 self.skip_trivia();
             }
             end = self.consume_type_gt()?;
@@ -1160,6 +1174,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         Ok(TypeName {
             name,
             arguments,
+            argument_separator_spaces,
             span: Span::new(start, end),
         })
     }
@@ -1178,6 +1193,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 self.token_text(span).to_owned()
             },
             quoted,
+            quote_style: quoted.then_some('`'),
             span,
         }
     }
@@ -1245,6 +1261,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     arguments.push(Expr::Identifier(Ident {
                         value: "*".to_owned(),
                         quoted: false,
+                        quote_style: None,
                         span: star,
                     }));
                 } else {

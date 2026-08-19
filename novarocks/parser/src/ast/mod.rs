@@ -134,6 +134,8 @@ impl Statement {
 pub struct Ident {
     pub value: String,
     pub quoted: bool,
+    /// Original delimiter when the identifier was quoted.
+    pub quote_style: Option<char>,
     pub span: Span,
 }
 
@@ -149,6 +151,8 @@ pub struct ObjectName {
 pub struct TypeName {
     pub name: ObjectName,
     pub arguments: Vec<TypeNameArgument>,
+    /// Trivia after each argument comma, retained for canonical reparse compatibility.
+    pub argument_separator_spaces: Vec<bool>,
     pub span: Span,
 }
 
@@ -211,6 +215,7 @@ mod tests {
             parts: vec![Ident {
                 value: "catalog".to_owned(),
                 quoted: false,
+                quote_style: None,
                 span: span(0, 7),
             }],
             span: span(0, 7),
@@ -218,6 +223,7 @@ mod tests {
         let type_name = TypeName {
             name: name.clone(),
             arguments: Vec::new(),
+            argument_separator_spaces: Vec::new(),
             span: span(0, 7),
         };
         let literal = Literal {
@@ -259,6 +265,7 @@ mod tests {
             left: Box::new(Expr::Identifier(Ident {
                 value: "a".to_owned(),
                 quoted: false,
+                quote_style: None,
                 span: span(0, 1),
             })),
             operator: BinaryOperator::Add,
@@ -267,6 +274,7 @@ mod tests {
                     parts: vec![Ident {
                         value: "abs".to_owned(),
                         quoted: false,
+                        quote_style: None,
                         span: span(4, 7),
                     }],
                     span: span(4, 7),
@@ -309,6 +317,7 @@ mod tests {
             expression: Box::new(Expr::Identifier(Ident {
                 value: "old".to_owned(),
                 quoted: false,
+                quote_style: None,
                 span: span(1, 4),
             })),
             span: span(0, 5),
@@ -321,6 +330,7 @@ mod tests {
                 expression: Box::new(Expr::Identifier(Ident {
                     value: "new".to_owned(),
                     quoted: false,
+                    quote_style: None,
                     span: span(1, 4),
                 })),
                 span: span(0, 5),

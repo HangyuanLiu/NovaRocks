@@ -390,8 +390,12 @@ pub fn walk_table_factor<V: Visit + ?Sized>(visitor: &mut V, factor: &TableFacto
             }
         }
         TableFactor::Unnest {
-            array_exprs, alias, ..
+            keyword,
+            array_exprs,
+            alias,
+            ..
         } => {
+            visitor.visit_ident(keyword);
             for expr in array_exprs {
                 visitor.visit_expr(expr);
             }
@@ -1121,12 +1125,14 @@ pub fn fold_table_factor<F: Fold + ?Sized>(folder: &mut F, factor: TableFactor) 
             span,
         },
         TableFactor::Unnest {
+            keyword,
             lateral,
             array_exprs,
             with_offset,
             alias,
             span,
         } => TableFactor::Unnest {
+            keyword: folder.fold_ident(keyword),
             lateral,
             array_exprs: array_exprs
                 .into_iter()

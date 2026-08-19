@@ -758,7 +758,8 @@ fn parse_table_factor(
         if !hints.is_empty() {
             return Err(parser.unexpected("table after table hint"));
         }
-        let start = parser.consume_word("UNNEST")?.start();
+        let keyword_span = parser.consume_word("UNNEST")?;
+        let start = keyword_span.start();
         parser.consume_symbol(Symbol::LParen)?;
         let mut array_exprs = Vec::new();
         loop {
@@ -775,6 +776,12 @@ fn parse_table_factor(
         let alias = parse_optional_table_alias(parser)?;
         let span_end = alias.as_ref().map_or(end, |alias| alias.span.end());
         return Ok(TableFactor::Unnest {
+            keyword: crate::ast::Ident {
+                value: parser.source_slice(keyword_span).to_owned(),
+                quoted: false,
+                quote_style: None,
+                span: keyword_span,
+            },
             lateral,
             array_exprs,
             with_offset: false,
