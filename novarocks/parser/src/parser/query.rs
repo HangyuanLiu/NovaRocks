@@ -104,7 +104,7 @@ pub(super) fn parse_query(
         parser.consume_word("BY")?;
         order_by = parse_order_by(parser)?;
     }
-    let (limit, limit_offset) = if parser.consume_if_word("LIMIT") {
+    let (limit, limit_offset, limit_comma_offset) = if parser.consume_if_word("LIMIT") {
         let first = parse_expression_until(
             parser,
             &["OFFSET", "FETCH"],
@@ -124,12 +124,13 @@ pub(super) fn parse_query(
                     rows: OffsetRows::None,
                     span: offset_span,
                 }),
+                true,
             )
         } else {
-            (Some(first), None)
+            (Some(first), None, false)
         }
     } else {
-        (None, None)
+        (None, None, false)
     };
     let offset = if parser.consume_if_word("OFFSET") {
         if limit_offset.is_some() {
@@ -184,6 +185,7 @@ pub(super) fn parse_query(
         order_by,
         limit,
         offset,
+        limit_comma_offset,
         fetch,
         span: Span::new(start, end),
     })

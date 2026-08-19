@@ -124,11 +124,26 @@ impl Printer {
             self.output.push_str(" ORDER BY ");
             self.write_order_by_list(&query.order_by);
         }
-        if let Some(limit) = &query.limit {
+        if query.limit_comma_offset {
+            let offset = query
+                .offset
+                .as_ref()
+                .expect("comma LIMIT syntax requires an offset");
+            let limit = query
+                .limit
+                .as_ref()
+                .expect("comma LIMIT syntax requires a limit");
+            self.output.push_str(" LIMIT ");
+            self.write_expr(&offset.value);
+            self.output.push_str(", ");
+            self.write_expr(limit);
+        } else if let Some(limit) = &query.limit {
             self.output.push_str(" LIMIT ");
             self.write_expr(limit);
         }
-        if let Some(offset) = &query.offset {
+        if !query.limit_comma_offset
+            && let Some(offset) = &query.offset
+        {
             self.output.push_str(" OFFSET ");
             self.write_expr(&offset.value);
             match offset.rows {
@@ -1408,6 +1423,7 @@ mod tests {
                         order_by: Vec::new(),
                         limit: None,
                         offset: None,
+                        limit_comma_offset: false,
                         fetch: None,
                         span: span(),
                     }),
@@ -1461,6 +1477,7 @@ mod tests {
                 rows: OffsetRows::Rows,
                 span: span(),
             }),
+            limit_comma_offset: false,
             fetch: Some(Fetch {
                 quantity: Some(number("3")),
                 percent: false,

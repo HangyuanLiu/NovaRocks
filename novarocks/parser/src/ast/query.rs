@@ -19,6 +19,8 @@ pub struct Query {
     pub order_by: Vec<OrderByExpr>,
     pub limit: Option<Expr>,
     pub offset: Option<Offset>,
+    /// Whether this query used MySQL `LIMIT offset, count` spelling.
+    pub limit_comma_offset: bool,
     pub fetch: Option<Fetch>,
     pub span: Span,
 }

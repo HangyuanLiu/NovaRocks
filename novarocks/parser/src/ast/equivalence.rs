@@ -97,6 +97,7 @@ impl SyntaxEq for Query {
             && syntax_eq_slice(&self.order_by, &other.order_by)
             && syntax_eq_option(&self.limit, &other.limit)
             && syntax_eq_option(&self.offset, &other.offset)
+            && self.limit_comma_offset == other.limit_comma_offset
             && syntax_eq_option(&self.fetch, &other.fetch)
     }
 }
@@ -841,6 +842,7 @@ mod tests {
                         order_by: Vec::new(),
                         limit: None,
                         offset: None,
+                        limit_comma_offset: false,
                         fetch: None,
                         span: span(start + 4),
                     }),
@@ -882,6 +884,7 @@ mod tests {
                 rows: OffsetRows::Rows,
                 span: span(start + 19),
             }),
+            limit_comma_offset: false,
             fetch: Some(Fetch {
                 quantity: Some(number("4", start + 20)),
                 percent: true,

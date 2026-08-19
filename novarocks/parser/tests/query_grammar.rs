@@ -78,3 +78,13 @@ fn source_significant_query_forms_are_retained_by_the_typed_ast() {
         "SELECT t.id AS value FROM source AS t INNER JOIN LATERAL UNNEST(t.items) AS u(item) ON TRUE LEFT OUTER JOIN target AS r ON r.id = t.id"
     );
 }
+
+#[test]
+fn comma_limit_syntax_is_retained_by_the_typed_ast() {
+    let statements = parse("SELECT * FROM t LIMIT 2, 10").expect("comma LIMIT should parse");
+
+    assert_eq!(
+        Printer::new().statements(&statements),
+        "SELECT * FROM t LIMIT 2, 10"
+    );
+}

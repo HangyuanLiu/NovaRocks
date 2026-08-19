@@ -100,6 +100,7 @@ fn construction_only_empty_lists_retain_the_generic_structure_code() {
         order_by: Vec::new(),
         limit: None,
         offset: None,
+        limit_comma_offset: false,
         fetch: None,
         span: SPAN,
     });
@@ -178,6 +179,7 @@ fn select_statement(windows: Vec<NamedWindow>) -> Statement {
         order_by: Vec::new(),
         limit: None,
         offset: None,
+        limit_comma_offset: false,
         fetch: None,
         span: SPAN,
     })
