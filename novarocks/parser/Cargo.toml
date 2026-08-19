@@ -1,0 +1,10 @@
+[package]
+name = "novarocks-parser"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+novarocks-user-error = { path = "../user-error" }
+
+[lib]
+doctest = false

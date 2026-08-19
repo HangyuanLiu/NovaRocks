@@ -1,0 +1,215 @@
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to you under the Apache License, Version 2.0.
+
+use std::fmt;
+
+use novarocks_user_error::{
+    ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserError,
+};
+
+use crate::{Span, messages};
+
+const LEX_UNEXPECTED_CHARACTER: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.lex.unexpected_character"),
+    phase: ErrorPhase::Lex,
+    status: ErrorCodeStatus::Active,
+};
+const LEX_UNTERMINATED_STRING: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.lex.unterminated_string"),
+    phase: ErrorPhase::Lex,
+    status: ErrorCodeStatus::Active,
+};
+const LEX_UNTERMINATED_COMMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.lex.unterminated_comment"),
+    phase: ErrorPhase::Lex,
+    status: ErrorCodeStatus::Active,
+};
+const PARSE_UNEXPECTED_TOKEN: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.parse.unexpected_token"),
+    phase: ErrorPhase::Parse,
+    status: ErrorCodeStatus::Active,
+};
+const PARSE_UNSUPPORTED_STATEMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.parse.unsupported_statement"),
+    phase: ErrorPhase::Parse,
+    status: ErrorCodeStatus::Active,
+};
+const VALIDATE_INVALID_STRUCTURE: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.validate.invalid_structure"),
+    phase: ErrorPhase::Validate,
+    status: ErrorCodeStatus::Active,
+};
+
+/// All parser-domain descriptors. The independent manifest tool is their only
+/// permitted aggregate owner.
+pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
+    LEX_UNEXPECTED_CHARACTER,
+    LEX_UNTERMINATED_STRING,
+    LEX_UNTERMINATED_COMMENT,
+    PARSE_UNEXPECTED_TOKEN,
+    PARSE_UNSUPPORTED_STATEMENT,
+    VALIDATE_INVALID_STRUCTURE,
+];
+
+/// A lexical failure with its source range.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LexError {
+    UnexpectedCharacter { character: char, span: Span },
+    UnterminatedString { span: Span },
+    UnterminatedComment { span: Span },
+}
+
+/// A syntax failure with expected and found token descriptions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseError {
+    UnexpectedToken {
+        expected: &'static str,
+        found: String,
+        span: Span,
+    },
+    UnsupportedStatement {
+        statement: String,
+        span: Span,
+    },
+}
+
+/// A source-independent structural AST validation failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidateError {
+    detail: String,
+    span: Span,
+}
+
+impl ValidateError {
+    pub fn new(detail: impl Into<String>, span: Span) -> Self {
+        Self {
+            detail: detail.into(),
+            span,
+        }
+    }
+}
+
+/// The parser-domain error union returned by public parsing APIs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParserError {
+    Lex(LexError),
+    Parse(ParseError),
+    Validate(ValidateError),
+}
+
+impl ParserError {
+    /// Converts the parser-owned span into a transport-neutral user error.
+    pub fn to_user_error(&self, source: &str) -> UserError {
+        let (descriptor, message, span) = match self {
+            Self::Lex(LexError::UnexpectedCharacter { character, span }) => (
+                LEX_UNEXPECTED_CHARACTER,
+                messages::unexpected_character(*character),
+                *span,
+            ),
+            Self::Lex(LexError::UnterminatedString { span }) => (
+                LEX_UNTERMINATED_STRING,
+                messages::unterminated("string literal"),
+                *span,
+            ),
+            Self::Lex(LexError::UnterminatedComment { span }) => (
+                LEX_UNTERMINATED_COMMENT,
+                messages::unterminated("block comment"),
+                *span,
+            ),
+            Self::Parse(ParseError::UnexpectedToken {
+                expected,
+                found,
+                span,
+            }) => (
+                PARSE_UNEXPECTED_TOKEN,
+                messages::unexpected_token(expected, found),
+                *span,
+            ),
+            Self::Parse(ParseError::UnsupportedStatement { statement, span }) => (
+                PARSE_UNSUPPORTED_STATEMENT,
+                messages::unsupported_statement(statement),
+                *span,
+            ),
+            Self::Validate(error) => (
+                VALIDATE_INVALID_STRUCTURE,
+                messages::invalid_structure(&error.detail),
+                error.span,
+            ),
+        };
+        UserError::from_descriptor(
+            descriptor,
+            message,
+            Some(span.to_user_error_location(source)),
+            RetryClass::Never,
+        )
+    }
+}
+
+impl From<LexError> for ParserError {
+    fn from(value: LexError) -> Self {
+        Self::Lex(value)
+    }
+}
+
+impl From<ParseError> for ParserError {
+    fn from(value: ParseError) -> Self {
+        Self::Parse(value)
+    }
+}
+
+impl From<ValidateError> for ParserError {
+    fn from(value: ValidateError) -> Self {
+        Self::Validate(value)
+    }
+}
+
+impl fmt::Display for ParserError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::Lex(LexError::UnexpectedCharacter { character, .. }) => {
+                messages::unexpected_character(*character)
+            }
+            Self::Lex(LexError::UnterminatedString { .. }) => {
+                messages::unterminated("string literal")
+            }
+            Self::Lex(LexError::UnterminatedComment { .. }) => {
+                messages::unterminated("block comment")
+            }
+            Self::Parse(ParseError::UnexpectedToken {
+                expected, found, ..
+            }) => messages::unexpected_token(expected, found),
+            Self::Parse(ParseError::UnsupportedStatement { statement, .. }) => {
+                messages::unsupported_statement(statement)
+            }
+            Self::Validate(error) => messages::invalid_structure(&error.detail),
+        };
+        formatter.write_str(&message)
+    }
+}
+
+impl std::error::Error for ParserError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_user_error::ErrorPhase;
+
+    #[test]
+    fn parser_error_uses_descriptor_phase_and_parser_location() {
+        let error = ParserError::Parse(ParseError::UnexpectedToken {
+            expected: "BACKENDS",
+            found: "EOF".to_owned(),
+            span: Span::new(5, 5),
+        });
+
+        let user_error = error.to_user_error("SHOW ");
+        assert_eq!(user_error.code().as_str(), "sql.parse.unexpected_token");
+        assert_eq!(user_error.phase(), ErrorPhase::Parse);
+        assert_eq!(
+            user_error.to_string(),
+            "[sql.parse.unexpected_token] expected BACKENDS, found EOF at line 1 column 6"
+        );
+    }
+}
