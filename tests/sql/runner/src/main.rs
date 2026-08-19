@@ -1289,6 +1289,164 @@ fn capture_lifecycle_structured_snapshot(
         .map(Some)
 }
 
+fn await_lifecycle_structured_snapshot_after(
+    meta: &QueryMeta,
+    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    before: Option<&novarocks_cluster_harness::QueryLifecycleStructuredSnapshot>,
+    deadline: Instant,
+) -> Result<Option<novarocks_cluster_harness::QueryLifecycleStructuredSnapshot>> {
+    if meta.query_lifecycle_structured_assertion.is_none() {
+        return Ok(None);
+    }
+    let before_execution_id = before.and_then(|snapshot| snapshot.execution_id.as_deref());
+    let mut server = server_handle
+        .lock()
+        .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
+    server
+        .await_query_lifecycle_structured_snapshot_after(before_execution_id, deadline)
+        .map(Some)
+}
+
+fn runtime_filter_details<'a>(
+    rollup: &'a novarocks_cluster_harness::RuntimeFilterTerminalRollup,
+) -> Result<Vec<&'a novarocks_cluster_harness::RuntimeFilterParticipantTerminalDetails>> {
+    let novarocks_cluster_harness::RuntimeFilterTerminalRollup::Available {
+        participants,
+        ..
+    } = rollup
+    else {
+        bail!("runtime-filter terminal facts are unavailable: {rollup:?}");
+    };
+    participants
+        .iter()
+        .map(|participant| match &participant.telemetry {
+            novarocks_cluster_harness::RuntimeFilterParticipantTerminalTelemetryValue::Available(
+                details,
+            ) => Ok(details),
+            novarocks_cluster_harness::RuntimeFilterParticipantTerminalTelemetryValue::Unavailable(
+                unavailable,
+            ) => bail!(
+                "runtime-filter participant telemetry is unavailable for {:?}: {unavailable:?}",
+                participant.participant
+            ),
+        })
+        .collect()
+}
+
+fn runtime_filter_total_value(
+    totals: &novarocks_cluster_harness::RuntimeFilterTerminalTotals,
+    metric: RuntimeFilterTotalMetric,
+) -> u64 {
+    match metric {
+        RuntimeFilterTotalMetric::ChannelCount => totals.channels.count,
+        RuntimeFilterTotalMetric::ChannelCompletedCount => totals.channels.completed_count,
+        RuntimeFilterTotalMetric::ProducerStreamCount => totals.producer_streams.count,
+        RuntimeFilterTotalMetric::ProducerAcceptedCount => totals.producer_streams.accepted_count,
+        RuntimeFilterTotalMetric::TransportRouteCount => totals.transport_routes.count,
+        RuntimeFilterTotalMetric::TransportSentCount => totals.transport_routes.sent_count,
+        RuntimeFilterTotalMetric::TransportAckedCount => totals.transport_routes.acked_count,
+        RuntimeFilterTotalMetric::ConsumerCount => totals.consumers.count,
+        RuntimeFilterTotalMetric::ConsumerRowEvaluations => totals.consumers.row_evaluations,
+        RuntimeFilterTotalMetric::ConsumerInputRows => totals.consumers.input_rows,
+        RuntimeFilterTotalMetric::ConsumerOutputRows => totals.consumers.output_rows,
+        RuntimeFilterTotalMetric::ConsumerScanEvaluated => totals.consumers.scan_evaluated,
+        RuntimeFilterTotalMetric::ConsumerScanPruned => totals.consumers.scan_pruned,
+    }
+}
+
+fn verify_runtime_filter_structured_assertion(
+    assertion: &QueryLifecycleStructuredAssertion,
+    after: &novarocks_cluster_harness::QueryLifecycleStructuredSnapshot,
+) -> Result<()> {
+    let has_runtime_filter_assertion = assertion.runtime_filter_availability.is_some()
+        || !assertion.runtime_filter_details.is_empty()
+        || !assertion.runtime_filter_totals_at_least.is_empty();
+    if !has_runtime_filter_assertion {
+        return Ok(());
+    }
+
+    if assertion.runtime_filter_availability.is_some()
+        && !matches!(
+            after.runtime_filter,
+            novarocks_cluster_harness::RuntimeFilterTerminalRollup::Available { .. }
+        )
+    {
+        bail!(
+            "runtime-filter availability mismatch: expected {}, actual {:?}, execution_id={:?}",
+            assertion
+                .runtime_filter_availability
+                .expect("checked")
+                .as_str(),
+            after.runtime_filter,
+            after.execution_id
+        );
+    }
+
+    let details = runtime_filter_details(&after.runtime_filter)?;
+    for expected in &assertion.runtime_filter_details {
+        let present = match expected {
+            RuntimeFilterDetailExpectation::CompletedChannel => details.iter().any(|details| {
+                details.channels.iter().any(|channel| {
+                    channel.terminal_state
+                        == novarocks_cluster_harness::RuntimeFilterChannelTerminalState::Completed
+                })
+            }),
+            RuntimeFilterDetailExpectation::AcceptedProducer => details.iter().any(|details| {
+                details
+                    .producer_streams
+                    .iter()
+                    .any(|producer| producer.accepted_count > 0)
+            }),
+            RuntimeFilterDetailExpectation::SentAckedTransport => details.iter().any(|details| {
+                details
+                    .transport_routes
+                    .iter()
+                    .any(|transport| transport.sent_count > 0 && transport.acked_count > 0)
+            }),
+            RuntimeFilterDetailExpectation::DeliveredAppliedConsumer => details.iter().any(|details| {
+                details.consumers.iter().any(|consumer| {
+                    consumer.latest_delivered_logical_version.is_some()
+                        && consumer.latest_applied_logical_version.is_some()
+                })
+            }),
+        };
+        if !present {
+            bail!(
+                "runtime-filter detail assertion failed: expected {} in execution_id={:?}, actual {:?}",
+                expected.as_str(),
+                after.execution_id,
+                after.runtime_filter
+            );
+        }
+    }
+
+    if !assertion.runtime_filter_totals_at_least.is_empty() {
+        let novarocks_cluster_harness::RuntimeFilterTerminalRollup::Available { totals, .. } =
+            &after.runtime_filter
+        else {
+            bail!("runtime-filter totals are unavailable: {:?}", after.runtime_filter);
+        };
+        let novarocks_cluster_harness::RuntimeFilterTerminalTotalsTelemetry::Available(totals) =
+            totals
+        else {
+            bail!("runtime-filter totals are unavailable: {totals:?}");
+        };
+        for expected in &assertion.runtime_filter_totals_at_least {
+            let actual = runtime_filter_total_value(totals, expected.metric);
+            if actual < expected.value {
+                bail!(
+                    "runtime-filter total assertion failed: expected {} >= {}, actual {} (execution_id={:?})",
+                    expected.metric.as_str(),
+                    expected.value,
+                    actual,
+                    after.execution_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn verify_lifecycle_structured_assertion(
     meta: &QueryMeta,
     before: Option<&novarocks_cluster_harness::QueryLifecycleStructuredSnapshot>,
@@ -1394,6 +1552,7 @@ fn verify_lifecycle_structured_assertion(
             }
         }
     }
+    verify_runtime_filter_structured_assertion(assertion, after)?;
     Ok(())
 }
 
@@ -2923,19 +3082,23 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         }
 
         if step.meta.query_lifecycle_structured_assertion.is_some() {
-            let assertion_result =
-                capture_lifecycle_structured_snapshot(&step.meta, &ctx.server_handle).and_then(
-                    |after| {
-                        let after = after.context(
-                            "structured lifecycle assertion snapshot disappeared after the step",
-                        )?;
-                        verify_lifecycle_structured_assertion(
-                            &step.meta,
-                            structured_lifecycle_baseline.as_ref(),
-                            &after,
-                        )
-                    },
-                );
+            let assertion_deadline = Instant::now() + Duration::from_secs(ctx.query_timeout);
+            let assertion_result = await_lifecycle_structured_snapshot_after(
+                &step.meta,
+                &ctx.server_handle,
+                structured_lifecycle_baseline.as_ref(),
+                assertion_deadline,
+            )
+            .and_then(|after| {
+                let after = after.context(
+                    "structured lifecycle assertion snapshot disappeared after the step",
+                )?;
+                verify_lifecycle_structured_assertion(
+                    &step.meta,
+                    structured_lifecycle_baseline.as_ref(),
+                    &after,
+                )
+            });
             match assertion_result {
                 Ok(()) => {
                     let _ = writeln!(log, "    ✅ structured lifecycle assertion passed");

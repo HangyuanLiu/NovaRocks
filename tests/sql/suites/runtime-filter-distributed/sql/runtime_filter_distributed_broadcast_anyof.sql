@@ -69,6 +69,16 @@ SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (BROADCAST
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
+-- @expect_runtime_filter_available=available
+-- @expect_runtime_filter_detail=completed-channel
+-- @expect_runtime_filter_detail=accepted-producer
+-- @expect_runtime_filter_detail=sent-acked-transport
+-- @expect_runtime_filter_detail=delivered-applied-consumer
+-- @expect_runtime_filter_total_at_least=channel_completed_count,1
+-- @expect_runtime_filter_total_at_least=producer_accepted_count,1
+-- @expect_runtime_filter_total_at_least=transport_sent_count,1
+-- @expect_runtime_filter_total_at_least=transport_acked_count,1
+-- @expect_runtime_filter_total_at_least=consumer_input_rows,1
 SELECT 'broadcast_anyof' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum
 FROM ${case_db}.rf_dist_broadcast_probe p
 JOIN ${case_db}.rf_dist_broadcast_build b ON p.k = b.k

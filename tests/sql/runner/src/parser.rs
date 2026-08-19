@@ -239,6 +239,31 @@ fn parse_lifecycle_telemetry_unavailable(
     })
 }
 
+fn parse_runtime_filter_total_at_least(
+    raw: &str,
+) -> anyhow::Result<RuntimeFilterTotalAtLeastExpectation> {
+    let (metric, value) = raw.split_once(',').ok_or_else(|| {
+        anyhow::anyhow!(
+            "@expect_runtime_filter_total_at_least requires <metric>,<positive-value>; received {raw:?}"
+        )
+    })?;
+    let metric = RuntimeFilterTotalMetric::parse(metric.trim()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid runtime-filter total metric {:?}; expected one of {}",
+            metric.trim(),
+            RuntimeFilterTotalMetric::valid_names()
+        )
+    })?;
+    let value = value
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("invalid runtime-filter total lower bound {:?}", value.trim()))?;
+    if value == 0 {
+        bail!("runtime-filter total lower bound must be positive");
+    }
+    Ok(RuntimeFilterTotalAtLeastExpectation { metric, value })
+}
+
 fn structured_assertion_mut(meta: &mut QueryMeta) -> &mut QueryLifecycleStructuredAssertion {
     meta.query_lifecycle_structured_assertion
         .get_or_insert_with(|| QueryLifecycleStructuredAssertion {
@@ -246,6 +271,9 @@ fn structured_assertion_mut(meta: &mut QueryMeta) -> &mut QueryLifecycleStructur
             participant_outcome: None,
             telemetry_unavailable: Vec::new(),
             metric_deltas: Vec::new(),
+            runtime_filter_availability: None,
+            runtime_filter_details: Vec::new(),
+            runtime_filter_totals_at_least: Vec::new(),
         })
 }
 
@@ -542,6 +570,31 @@ fn parse_meta_with_sql_error_descriptors(
                     .metric_deltas
                     .push(parse_lifecycle_metric_delta(&raw_value)?);
             }
+            "expect_runtime_filter_available" => {
+                let availability = RuntimeFilterAvailabilityExpectation::parse(&raw_value)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid expect_runtime_filter_available: {raw_value}; expected available"
+                        )
+                    })?;
+                structured_assertion_mut(&mut meta).runtime_filter_availability = Some(availability);
+            }
+            "expect_runtime_filter_detail" => {
+                let detail = RuntimeFilterDetailExpectation::parse(&raw_value).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid expect_runtime_filter_detail: {raw_value}; expected one of {}",
+                        RuntimeFilterDetailExpectation::valid_names()
+                    )
+                })?;
+                structured_assertion_mut(&mut meta)
+                    .runtime_filter_details
+                    .push(detail);
+            }
+            "expect_runtime_filter_total_at_least" => {
+                structured_assertion_mut(&mut meta)
+                    .runtime_filter_totals_at_least
+                    .push(parse_runtime_filter_total_at_least(&raw_value)?);
+            }
             "kill_query_at_lifecycle_phase" => {
                 meta.kill_query_at_lifecycle_phase = QueryLifecyclePhase::parse(&raw_value)
                     .ok_or_else(|| {
@@ -725,6 +778,19 @@ fn merge_lifecycle_structured_assertion(
             base.metric_deltas.clone()
         } else {
             override_meta.metric_deltas.clone()
+        },
+        runtime_filter_availability: override_meta
+            .runtime_filter_availability
+            .or(base.runtime_filter_availability),
+        runtime_filter_details: if override_meta.runtime_filter_details.is_empty() {
+            base.runtime_filter_details.clone()
+        } else {
+            override_meta.runtime_filter_details.clone()
+        },
+        runtime_filter_totals_at_least: if override_meta.runtime_filter_totals_at_least.is_empty() {
+            base.runtime_filter_totals_at_least.clone()
+        } else {
+            override_meta.runtime_filter_totals_at_least.clone()
         },
     })
 }
@@ -2061,6 +2127,59 @@ mod opt5_directive_tests {
                 delta: 1,
             }]
         );
+    }
+
+    #[test]
+    fn runtime_filter_terminal_directives_use_closed_typed_categories() {
+        let re = meta_re();
+        let lines = vec![
+            "-- @expect_runtime_filter_available=available".to_string(),
+            "-- @expect_runtime_filter_detail=completed-channel".to_string(),
+            "-- @expect_runtime_filter_detail=accepted-producer".to_string(),
+            "-- @expect_runtime_filter_total_at_least=transport_acked_count,1".to_string(),
+            "-- @expect_runtime_filter_total_at_least=consumer_input_rows,20".to_string(),
+        ];
+
+        let meta = parse_meta(&lines, &re).expect("parse typed runtime-filter directives");
+        let assertion = meta
+            .query_lifecycle_structured_assertion
+            .expect("structured runtime-filter assertion");
+        assert_eq!(
+            assertion.runtime_filter_availability,
+            Some(RuntimeFilterAvailabilityExpectation::Available)
+        );
+        assert_eq!(
+            assertion.runtime_filter_details,
+            vec![
+                RuntimeFilterDetailExpectation::CompletedChannel,
+                RuntimeFilterDetailExpectation::AcceptedProducer,
+            ]
+        );
+        assert_eq!(
+            assertion.runtime_filter_totals_at_least,
+            vec![
+                RuntimeFilterTotalAtLeastExpectation {
+                    metric: RuntimeFilterTotalMetric::TransportAckedCount,
+                    value: 1,
+                },
+                RuntimeFilterTotalAtLeastExpectation {
+                    metric: RuntimeFilterTotalMetric::ConsumerInputRows,
+                    value: 20,
+                },
+            ]
+        );
+
+        for line in [
+            "-- @expect_runtime_filter_available=partial",
+            "-- @expect_runtime_filter_detail=json.path",
+            "-- @expect_runtime_filter_total_at_least=raw_json,1",
+            "-- @expect_runtime_filter_total_at_least=consumer_input_rows,0",
+        ] {
+            assert!(
+                parse_meta(&[line.to_string()], &re).is_err(),
+                "invalid typed runtime-filter directive must fail: {line}"
+            );
+        }
     }
 
     #[test]

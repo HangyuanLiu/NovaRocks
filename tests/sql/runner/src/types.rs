@@ -80,6 +80,127 @@ pub struct QueryLifecycleStructuredAssertion {
     pub participant_outcome: Option<ParticipantOutcomeExpectation>,
     pub telemetry_unavailable: Vec<QueryLifecycleTelemetryUnavailableExpectation>,
     pub metric_deltas: Vec<QueryLifecycleMetricDeltaExpectation>,
+    /// Runtime Filter facts are asserted from the typed query-terminal
+    /// projection supplied by the cluster harness, never from profile text.
+    pub runtime_filter_availability: Option<RuntimeFilterAvailabilityExpectation>,
+    pub runtime_filter_details: Vec<RuntimeFilterDetailExpectation>,
+    pub runtime_filter_totals_at_least: Vec<RuntimeFilterTotalAtLeastExpectation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeFilterAvailabilityExpectation {
+    Available,
+}
+
+impl RuntimeFilterAvailabilityExpectation {
+    pub fn parse(value: &str) -> Option<Self> {
+        (value == "available").then_some(Self::Available)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeFilterDetailExpectation {
+    CompletedChannel,
+    AcceptedProducer,
+    SentAckedTransport,
+    DeliveredAppliedConsumer,
+}
+
+impl RuntimeFilterDetailExpectation {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "completed-channel" => Some(Self::CompletedChannel),
+            "accepted-producer" => Some(Self::AcceptedProducer),
+            "sent-acked-transport" => Some(Self::SentAckedTransport),
+            "delivered-applied-consumer" => Some(Self::DeliveredAppliedConsumer),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CompletedChannel => "completed-channel",
+            Self::AcceptedProducer => "accepted-producer",
+            Self::SentAckedTransport => "sent-acked-transport",
+            Self::DeliveredAppliedConsumer => "delivered-applied-consumer",
+        }
+    }
+
+    pub const fn valid_names() -> &'static str {
+        "completed-channel, accepted-producer, sent-acked-transport, delivered-applied-consumer"
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeFilterTotalMetric {
+    ChannelCount,
+    ChannelCompletedCount,
+    ProducerStreamCount,
+    ProducerAcceptedCount,
+    TransportRouteCount,
+    TransportSentCount,
+    TransportAckedCount,
+    ConsumerCount,
+    ConsumerRowEvaluations,
+    ConsumerInputRows,
+    ConsumerOutputRows,
+    ConsumerScanEvaluated,
+    ConsumerScanPruned,
+}
+
+impl RuntimeFilterTotalMetric {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "channel_count" => Some(Self::ChannelCount),
+            "channel_completed_count" => Some(Self::ChannelCompletedCount),
+            "producer_stream_count" => Some(Self::ProducerStreamCount),
+            "producer_accepted_count" => Some(Self::ProducerAcceptedCount),
+            "transport_route_count" => Some(Self::TransportRouteCount),
+            "transport_sent_count" => Some(Self::TransportSentCount),
+            "transport_acked_count" => Some(Self::TransportAckedCount),
+            "consumer_count" => Some(Self::ConsumerCount),
+            "consumer_row_evaluations" => Some(Self::ConsumerRowEvaluations),
+            "consumer_input_rows" => Some(Self::ConsumerInputRows),
+            "consumer_output_rows" => Some(Self::ConsumerOutputRows),
+            "consumer_scan_evaluated" => Some(Self::ConsumerScanEvaluated),
+            "consumer_scan_pruned" => Some(Self::ConsumerScanPruned),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChannelCount => "channel_count",
+            Self::ChannelCompletedCount => "channel_completed_count",
+            Self::ProducerStreamCount => "producer_stream_count",
+            Self::ProducerAcceptedCount => "producer_accepted_count",
+            Self::TransportRouteCount => "transport_route_count",
+            Self::TransportSentCount => "transport_sent_count",
+            Self::TransportAckedCount => "transport_acked_count",
+            Self::ConsumerCount => "consumer_count",
+            Self::ConsumerRowEvaluations => "consumer_row_evaluations",
+            Self::ConsumerInputRows => "consumer_input_rows",
+            Self::ConsumerOutputRows => "consumer_output_rows",
+            Self::ConsumerScanEvaluated => "consumer_scan_evaluated",
+            Self::ConsumerScanPruned => "consumer_scan_pruned",
+        }
+    }
+
+    pub const fn valid_names() -> &'static str {
+        "channel_count, channel_completed_count, producer_stream_count, producer_accepted_count, transport_route_count, transport_sent_count, transport_acked_count, consumer_count, consumer_row_evaluations, consumer_input_rows, consumer_output_rows, consumer_scan_evaluated, consumer_scan_pruned"
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeFilterTotalAtLeastExpectation {
+    pub metric: RuntimeFilterTotalMetric,
+    pub value: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
