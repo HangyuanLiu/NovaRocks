@@ -3529,6 +3529,12 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "expect_participant_outcome",
         "expect_lifecycle_telemetry_unavailable",
         "expect_lifecycle_metric_delta",
+        // Structured runtime-filter assertions read the same debug projection
+        // as the lifecycle fault assertions, even when the query itself has no
+        // injected fault.
+        "expect_runtime_filter_available",
+        "expect_runtime_filter_detail",
+        "expect_runtime_filter_total_at_least",
         "kill_query_at_lifecycle_phase",
         "kill_fe_at_lifecycle_phase",
         "kill_be_at_lifecycle_phase",
@@ -4785,6 +4791,16 @@ mod tests {
         assert!(sql_text_has_query_lifecycle_fault_directive(
             "-- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,3\nSELECT 1;"
         ));
+        for directive in [
+            "expect_runtime_filter_available=available",
+            "expect_runtime_filter_detail=completed-channel",
+            "expect_runtime_filter_total_at_least=transport_acked_count,1",
+        ] {
+            assert!(
+                sql_text_has_query_lifecycle_fault_directive(&format!("-- @{directive}\nSELECT 1;")),
+                "structured runtime-filter directive must enable lifecycle debug scope: {directive}"
+            );
+        }
         assert!(!sql_text_has_query_lifecycle_fault_directive(
             "-- query-control-heartbeat-loss is only a case name\nSELECT 1;"
         ));
