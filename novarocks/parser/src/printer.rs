@@ -1233,6 +1233,7 @@ enum BinarySide {
 impl BinaryOperator {
     const fn precedence(self) -> u8 {
         match self {
+            Self::NamedArgument => 1,
             Self::Or => 10,
             Self::And => 20,
             Self::Equal
@@ -1254,6 +1255,7 @@ impl BinaryOperator {
     }
     const fn sql(self) -> &'static str {
         match self {
+            Self::NamedArgument => "=>",
             Self::Or => "OR",
             Self::And => "AND",
             Self::Equal => "=",

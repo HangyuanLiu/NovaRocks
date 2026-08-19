@@ -351,6 +351,7 @@ pub enum UnaryOperator {
 /// Infix operators initially recognized by the Pratt parser.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BinaryOperator {
+    NamedArgument,
     Or,
     And,
     Equal,

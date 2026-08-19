@@ -76,6 +76,11 @@ struct PrefixBinding {
 // SQLP-4 extends this table without changing the Pratt loop below.
 const INFIX_BINDINGS: &[InfixBinding] = &[
     InfixBinding {
+        token: TokenPattern::Symbol(Symbol::FatArrow),
+        operator: BinaryOperator::NamedArgument,
+        precedence: 1,
+    },
+    InfixBinding {
         token: TokenPattern::Keyword(Keyword::Or),
         operator: BinaryOperator::Or,
         precedence: OR_PRECEDENCE,
@@ -716,6 +721,12 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 kind: TokenKind::Keyword(keyword),
                 span,
             }) if keyword_class(keyword) == crate::KeywordClass::NonReserved => {
+                self.parse_identifier_or_function_call(span)
+            }
+            Some(Token {
+                kind: TokenKind::Keyword(_),
+                span,
+            }) if self.peek_nontrivia_is_symbol(1, Symbol::FatArrow) => {
                 self.parse_identifier_or_function_call(span)
             }
             Some(Token {
