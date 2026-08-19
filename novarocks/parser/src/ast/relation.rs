@@ -88,6 +88,8 @@ pub enum TableVersionKind {
 pub struct TableHint {
     pub name: Ident,
     pub arguments: Vec<Expr>,
+    /// The expression selected by a pipe-style hint such as `[skew|key(1, 2)]`.
+    pub target: Option<Expr>,
     pub span: Span,
 }
 

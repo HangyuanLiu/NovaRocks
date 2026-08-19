@@ -396,7 +396,13 @@ impl SyntaxEq for TableVersion {
 
 impl SyntaxEq for TableHint {
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.name.syntax_eq(&other.name) && syntax_eq_slice(&self.arguments, &other.arguments)
+        self.name.syntax_eq(&other.name)
+            && syntax_eq_slice(&self.arguments, &other.arguments)
+            && match (&self.target, &other.target) {
+                (Some(left), Some(right)) => left.syntax_eq(right),
+                (None, None) => true,
+                _ => false,
+            }
     }
 }
 

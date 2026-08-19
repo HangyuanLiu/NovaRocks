@@ -507,7 +507,10 @@ impl Printer {
     fn write_table_hint(&mut self, hint: &TableHint) {
         self.output.push('[');
         self.write_ident(&hint.name);
-        if !hint.arguments.is_empty() {
+        if let Some(target) = &hint.target {
+            self.output.push('|');
+            self.write_expr(target);
+        } else if !hint.arguments.is_empty() {
             self.output.push('(');
             self.write_expr_list(&hint.arguments);
             self.output.push(')');

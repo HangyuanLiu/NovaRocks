@@ -723,10 +723,16 @@ fn parse_table_hints(
             }
             parser.consume_symbol(Symbol::RParen)?;
         }
+        let target = if parser.consume_if_symbol(Symbol::Pipe) {
+            Some(parse_expression_until(parser, &[], &[Symbol::RBracket])?)
+        } else {
+            None
+        };
         let end = parser.consume_symbol(Symbol::RBracket)?.end();
         hints.push(TableHint {
             name,
             arguments,
+            target,
             span: Span::new(start, end),
         });
     }
