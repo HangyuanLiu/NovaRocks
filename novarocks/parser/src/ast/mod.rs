@@ -103,6 +103,23 @@ pub struct ObjectName {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypeName {
     pub name: ObjectName,
+    pub arguments: Vec<TypeNameArgument>,
+    pub span: Span,
+}
+
+/// A type parameter retained without lowering it into an execution type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypeNameArgument {
+    Type(TypeName),
+    Literal(Literal),
+    Field(StructField),
+}
+
+/// One named field in a `STRUCT<...>` type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StructField {
+    pub name: Ident,
+    pub data_type: TypeName,
     pub span: Span,
 }
 
@@ -155,6 +172,7 @@ mod tests {
         };
         let type_name = TypeName {
             name: name.clone(),
+            arguments: Vec::new(),
             span: span(0, 7),
         };
         let literal = Literal {

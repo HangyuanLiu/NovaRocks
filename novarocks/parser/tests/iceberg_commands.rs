@@ -50,6 +50,19 @@ fn quoted_identifiers_case_and_semicolon_round_trip_canonically() {
 }
 
 #[test]
+fn schema_types_preserve_parameterized_and_nested_shapes() {
+    let parsed = statement(
+        "ALTER TABLE ice.db.orders ADD COLUMN profile STRUCT<name VARCHAR(32), attrs MAP<STRING, ARRAY<DECIMAL(12, 3)>>>",
+    );
+    let canonical = print_statement(&parsed);
+    assert_eq!(
+        canonical,
+        "ALTER TABLE ice.db.orders ADD COLUMN profile STRUCT<name VARCHAR(32), attrs MAP<STRING, ARRAY<DECIMAL(12, 3)>>>"
+    );
+    assert_eq!(print_statement(&statement(&canonical)), canonical);
+}
+
+#[test]
 fn malformed_owned_iceberg_commands_are_typed_errors() {
     for sql in [
         "ALTER TABLE t ADD FILES FROM not_a_string",

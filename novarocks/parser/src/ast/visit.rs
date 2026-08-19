@@ -8,7 +8,8 @@
 use super::{
     BackendStatement, BinaryExpr, CatalogStatement, Expr, FunctionCall, IcebergStatement, Ident,
     Literal, MaintenanceStatement, MaterializedViewStatement, NestedExpr, ObjectName,
-    RawQuerySlice, ShowBackends, Statement, StatisticsStatement, TypeName, UnaryExpr,
+    RawQuerySlice, ShowBackends, Statement, StatisticsStatement, StructField, TypeName,
+    TypeNameArgument, UnaryExpr,
 };
 
 /// Visits AST nodes by shared reference.
@@ -145,6 +146,16 @@ pub fn walk_object_name<V: Visit + ?Sized>(visitor: &mut V, name: &ObjectName) {
 
 pub fn walk_type_name<V: Visit + ?Sized>(visitor: &mut V, type_name: &TypeName) {
     visitor.visit_object_name(&type_name.name);
+    for argument in &type_name.arguments {
+        match argument {
+            TypeNameArgument::Type(data_type) => visitor.visit_type_name(data_type),
+            TypeNameArgument::Literal(literal) => visitor.visit_literal(literal),
+            TypeNameArgument::Field(field) => {
+                visitor.visit_ident(&field.name);
+                visitor.visit_type_name(&field.data_type);
+            }
+        }
+    }
 }
 
 pub fn walk_literal<V: Visit + ?Sized>(_: &mut V, _: &Literal) {}
@@ -346,6 +357,23 @@ pub fn fold_object_name<F: Fold + ?Sized>(folder: &mut F, mut name: ObjectName) 
 
 pub fn fold_type_name<F: Fold + ?Sized>(folder: &mut F, mut type_name: TypeName) -> TypeName {
     type_name.name = folder.fold_object_name(type_name.name);
+    type_name.arguments = type_name
+        .arguments
+        .into_iter()
+        .map(|argument| match argument {
+            TypeNameArgument::Type(data_type) => {
+                TypeNameArgument::Type(folder.fold_type_name(data_type))
+            }
+            TypeNameArgument::Literal(literal) => {
+                TypeNameArgument::Literal(folder.fold_literal(literal))
+            }
+            TypeNameArgument::Field(field) => TypeNameArgument::Field(StructField {
+                name: folder.fold_ident(field.name),
+                data_type: folder.fold_type_name(field.data_type),
+                span: field.span,
+            }),
+        })
+        .collect();
     type_name
 }
 

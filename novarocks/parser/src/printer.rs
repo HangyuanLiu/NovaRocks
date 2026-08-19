@@ -7,7 +7,7 @@
 
 use crate::ast::{
     BinaryExpr, BinaryOperator, Expr, FunctionCall, Ident, Literal, LiteralKind, NestedExpr,
-    ObjectName, RawQuerySlice, Statement, TypeName, UnaryExpr, UnaryOperator,
+    ObjectName, RawQuerySlice, Statement, TypeName, TypeNameArgument, UnaryExpr, UnaryOperator,
 };
 
 /// Renders parser AST nodes into one stable SQL spelling.
@@ -121,6 +121,34 @@ impl Printer {
 
     fn write_type_name(&mut self, type_name: &TypeName) {
         self.write_object_name(&type_name.name);
+        if type_name.arguments.is_empty() {
+            return;
+        }
+        let generic = matches!(
+            type_name
+                .name
+                .parts
+                .last()
+                .map(|part| part.value.to_ascii_uppercase())
+                .as_deref(),
+            Some("ARRAY" | "MAP" | "STRUCT")
+        );
+        self.output.push(if generic { '<' } else { '(' });
+        for (index, argument) in type_name.arguments.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            match argument {
+                TypeNameArgument::Type(data_type) => self.write_type_name(data_type),
+                TypeNameArgument::Literal(literal) => self.write_literal(literal),
+                TypeNameArgument::Field(field) => {
+                    self.write_ident(&field.name);
+                    self.output.push(' ');
+                    self.write_type_name(&field.data_type);
+                }
+            }
+        }
+        self.output.push(if generic { '>' } else { ')' });
     }
 
     fn write_literal(&mut self, literal: &Literal) {
@@ -453,7 +481,11 @@ mod tests {
             ],
             span: span(),
         };
-        let type_name = TypeName { name, span: span() };
+        let type_name = TypeName {
+            name,
+            arguments: Vec::new(),
+            span: span(),
+        };
 
         assert_eq!(print_type_name(&type_name), "catalog.`table`");
         assert_eq!(print_object_name(&type_name.name), "catalog.`table`");

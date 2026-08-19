@@ -8,7 +8,8 @@
 use crate::Span;
 
 use super::{
-    Fold, Ident, Literal, LiteralKind, ObjectName, Property, PropertyKeyValue, TypeName, Visit,
+    Fold, Ident, Literal, LiteralKind, ObjectName, Property, PropertyKeyValue, TypeName,
+    TypeNameArgument, Visit,
 };
 
 /// Iceberg table commands owned by SQLP-3.
@@ -461,6 +462,34 @@ fn write_column_path(path: &ColumnPath, output: &mut String) {
 }
 fn write_type_name(type_name: &TypeName, output: &mut String) {
     write_object_name(&type_name.name, output);
+    if type_name.arguments.is_empty() {
+        return;
+    }
+    let generic = matches!(
+        type_name
+            .name
+            .parts
+            .last()
+            .map(|part| part.value.to_ascii_uppercase())
+            .as_deref(),
+        Some("ARRAY" | "MAP" | "STRUCT")
+    );
+    output.push(if generic { '<' } else { '(' });
+    for (index, argument) in type_name.arguments.iter().enumerate() {
+        if index != 0 {
+            output.push_str(", ");
+        }
+        match argument {
+            TypeNameArgument::Type(data_type) => write_type_name(data_type, output),
+            TypeNameArgument::Literal(literal) => write_literal(literal, output),
+            TypeNameArgument::Field(field) => {
+                write_ident(&field.name, output);
+                output.push(' ');
+                write_type_name(&field.data_type, output);
+            }
+        }
+    }
+    output.push(if generic { '>' } else { ')' });
 }
 fn write_ident(ident: &Ident, output: &mut String) {
     if ident.quoted {

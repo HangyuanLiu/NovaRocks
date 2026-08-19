@@ -731,7 +731,10 @@ mod tests {
         let command = lower_create_catalog(&statement).expect("lower catalog command");
         assert_eq!(command.instance_id.as_str(), "warehouse");
         assert_eq!(command.display_name, "Warehouse");
-        assert_eq!(command.properties, [("type".to_string(), "iceberg".to_string())]);
+        assert_eq!(
+            command.properties,
+            [("type".to_string(), "iceberg".to_string())]
+        );
         assert!(command.if_not_exists);
     }
 }

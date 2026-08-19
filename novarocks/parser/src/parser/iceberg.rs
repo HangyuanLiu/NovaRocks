@@ -13,7 +13,10 @@ use crate::{
         IcebergReferenceAction, IcebergReferenceKind, IcebergSchemaChange, IcebergStatement,
         IcebergTableAction, RawReferenceOptions, ReferenceAnchor,
     },
-    ast::{Ident, Literal, LiteralKind, Property, PropertyKeyValue, Statement, TypeName},
+    ast::{
+        Ident, Literal, LiteralKind, Property, PropertyKeyValue, Statement, StructField, TypeName,
+        TypeNameArgument,
+    },
     token::Symbol,
 };
 
@@ -448,8 +451,56 @@ fn parse_column_path(parser: &mut StatementParser<'_, '_>) -> Result<ColumnPath,
 
 fn parse_type_name(parser: &mut StatementParser<'_, '_>) -> Result<TypeName, ParseError> {
     let name = parser.parse_object_name()?;
-    let span = name.span;
-    Ok(TypeName { name, span })
+    let type_word = name
+        .parts
+        .last()
+        .expect("object names always contain one part")
+        .value
+        .to_ascii_uppercase();
+    let mut arguments = Vec::new();
+    let end = if matches!(type_word.as_str(), "ARRAY" | "MAP" | "STRUCT")
+        && parser.consume_if_symbol(Symbol::Lt)
+    {
+        if type_word == "STRUCT" {
+            loop {
+                let field_name = parser.parse_ident()?;
+                let data_type = parse_type_name(parser)?;
+                let field_span = Span::new(field_name.span.start(), data_type.span.end());
+                arguments.push(TypeNameArgument::Field(StructField {
+                    name: field_name,
+                    data_type,
+                    span: field_span,
+                }));
+                if parser.consume_if_symbol(Symbol::Comma) {
+                    continue;
+                }
+                break parser.consume_symbol(Symbol::Gt)?;
+            }
+        } else {
+            loop {
+                arguments.push(TypeNameArgument::Type(parse_type_name(parser)?));
+                if parser.consume_if_symbol(Symbol::Comma) {
+                    continue;
+                }
+                break parser.consume_symbol(Symbol::Gt)?;
+            }
+        }
+    } else if parser.consume_if_symbol(Symbol::LParen) {
+        loop {
+            arguments.push(TypeNameArgument::Literal(parser.parse_literal()?));
+            if parser.consume_if_symbol(Symbol::Comma) {
+                continue;
+            }
+            break parser.consume_symbol(Symbol::RParen)?;
+        }
+    } else {
+        name.span
+    };
+    Ok(TypeName {
+        span: Span::new(name.span.start(), end.end()),
+        name,
+        arguments,
+    })
 }
 
 /// Partition-transform names are grammar words, so a keyword such as
