@@ -299,11 +299,11 @@ impl ParticipantManifest {
             backend: Some(backend.as_proto().clone()),
             participant_roles: roles.into_iter().map(|role| role as i32).collect(),
             expected_fragment_instance_ids: expected_fragment_instance_ids.into_iter().collect(),
-            query_options: Some(query_options.as_proto().clone()),
+            query_options: Some(*query_options.as_proto()),
             query_deadline_unix_ms,
             exchange_routes: exchange_routes
                 .into_iter()
-                .map(|route| route.as_proto().clone())
+                .map(|route| *route.as_proto())
                 .collect(),
             runtime_filter: runtime_filter.map(|contribution| contribution.as_proto().clone()),
             pre_start_timeout_ms,
@@ -351,7 +351,6 @@ impl ParticipantManifest {
 
         let options = raw
             .query_options
-            .clone()
             .ok_or_else(|| ContractError::invalid_value("query options are required"))?;
         QueryOptions::parse(options)?;
 
@@ -428,7 +427,6 @@ impl ParticipantManifest {
         let raw = self
             .raw
             .query_options
-            .clone()
             .ok_or_else(|| ContractError::invalid_value("query options are required"))?;
         QueryOptions::parse(raw)
     }
@@ -512,8 +510,7 @@ fn required_unique_id(
     raw: &Option<common::UniqueId>,
     missing_detail: &'static str,
 ) -> Result<common::UniqueId, ContractError> {
-    raw.clone()
-        .ok_or_else(|| ContractError::invalid_value(missing_detail))
+    (*raw).ok_or_else(|| ContractError::invalid_value(missing_detail))
 }
 
 fn parse_role(raw: i32) -> Result<ParticipantRole, ContractError> {

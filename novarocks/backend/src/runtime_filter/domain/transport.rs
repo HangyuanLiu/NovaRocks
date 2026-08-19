@@ -548,12 +548,17 @@ impl BackendReliableTransport {
             ));
         }
         let bytes = frame.envelope().retained_bytes();
-        if self.pending_bytes.saturating_add(bytes) > self.policy.max_pending_bytes {
+        let Some(next_pending_bytes) = self.pending_bytes.checked_add(bytes) else {
+            return Ok(BackendRetrySendOutcome::ResourceLimit(
+                BackendTransportResourceLimit::PendingBytes,
+            ));
+        };
+        if next_pending_bytes > self.policy.max_pending_bytes {
             return Ok(BackendRetrySendOutcome::ResourceLimit(
                 BackendTransportResourceLimit::PendingBytes,
             ));
         }
-        self.pending_bytes += bytes;
+        self.pending_bytes = next_pending_bytes;
         self.pending.insert(
             key,
             PendingEnvelope {
@@ -632,7 +637,10 @@ mod tests {
     use super::*;
     use crate::runtime_filter::domain::BackendParticipantIdentity;
 
-    fn delivery_frame(sequence: u64) -> Arc<BackendTransportEnvelope> {
+    fn delivery_frame_with_payload(
+        sequence: u64,
+        payload: impl Into<Arc<[u8]>>,
+    ) -> Arc<BackendTransportEnvelope> {
         let participant = BackendParticipantIdentity::new(UniqueId::new(1, 2), 3);
         let channel = BackendChannelIdentity::new(
             participant,
@@ -654,7 +662,7 @@ mod tests {
                         None,
                         None,
                         [7; 32],
-                        Arc::<[u8]>::from([8, 9]),
+                        payload,
                     )
                     .unwrap(),
                 ),
@@ -662,6 +670,10 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    fn delivery_frame(sequence: u64) -> Arc<BackendTransportEnvelope> {
+        delivery_frame_with_payload(sequence, Arc::<[u8]>::from([8, 9]))
     }
 
     #[test]
@@ -748,5 +760,138 @@ mod tests {
         );
         assert_eq!(identity.stream().partition_id(), PartitionId::new(8));
         assert_eq!(identity.sequence().get(), 9);
+    }
+
+    #[test]
+    fn reliable_transport_capacity_entries_preserve_identity_and_release_on_ack() {
+        let policy = BackendRetryPolicy::new(
+            Duration::from_millis(1),
+            1,
+            Duration::from_millis(10),
+            1,
+            usize::MAX,
+        )
+        .unwrap();
+        let start = Instant::now();
+        let first = delivery_frame(1);
+        let first_key = first.envelope().route_identity();
+        let second = delivery_frame(2);
+        let conflicting_first = delivery_frame_with_payload(1, Arc::<[u8]>::from([9, 8]));
+        let mut transport = BackendReliableTransport::new(policy);
+
+        assert_eq!(
+            transport.send(Arc::clone(&first), start).unwrap(),
+            BackendRetrySendOutcome::Buffered
+        );
+        assert_eq!(
+            transport.send(Arc::clone(&first), start).unwrap(),
+            BackendRetrySendOutcome::Duplicate
+        );
+        assert_eq!(
+            transport.send(conflicting_first, start),
+            Err(BackendTransportError::IdentityConflict)
+        );
+        assert_eq!(
+            transport.send(Arc::clone(&second), start).unwrap(),
+            BackendRetrySendOutcome::ResourceLimit(BackendTransportResourceLimit::PendingEntries)
+        );
+        assert_eq!(
+            transport.acknowledge(first_key, BackendAcceptStatus::Accepted),
+            BackendAckOutcome::Released
+        );
+        assert_eq!(
+            transport.send(second, start).unwrap(),
+            BackendRetrySendOutcome::Buffered
+        );
+    }
+
+    #[test]
+    fn reliable_transport_capacity_bytes_do_not_charge_duplicates_and_release_on_deadline() {
+        let start = Instant::now();
+        let first = delivery_frame(1);
+        let first_bytes = first.envelope().retained_bytes();
+        let first_key = first.envelope().route_identity();
+        let second = delivery_frame(2);
+        let policy = BackendRetryPolicy::new(
+            Duration::from_millis(1),
+            1,
+            Duration::from_millis(10),
+            2,
+            first_bytes,
+        )
+        .unwrap();
+        let mut transport = BackendReliableTransport::new(policy);
+
+        assert_eq!(
+            transport.send(Arc::clone(&first), start).unwrap(),
+            BackendRetrySendOutcome::Buffered
+        );
+        assert_eq!(
+            transport.send(first, start).unwrap(),
+            BackendRetrySendOutcome::Duplicate
+        );
+        assert_eq!(
+            transport.send(Arc::clone(&second), start).unwrap(),
+            BackendRetrySendOutcome::ResourceLimit(BackendTransportResourceLimit::PendingBytes)
+        );
+        assert_eq!(
+            transport
+                .drive(start + Duration::from_millis(10))
+                .failed_open(),
+            &[(first_key, BackendTransportFailOpenReason::Deadline)]
+        );
+        assert_eq!(
+            transport.send(second, start).unwrap(),
+            BackendRetrySendOutcome::Buffered
+        );
+    }
+
+    #[test]
+    fn reliable_transport_capacity_overflow_returns_typed_byte_limit() {
+        let policy = BackendRetryPolicy::new(
+            Duration::from_millis(1),
+            1,
+            Duration::from_millis(10),
+            2,
+            usize::MAX,
+        )
+        .unwrap();
+        let mut transport = BackendReliableTransport::new(policy);
+        transport.pending_bytes = usize::MAX;
+
+        assert_eq!(
+            transport.send(delivery_frame(1), Instant::now()).unwrap(),
+            BackendRetrySendOutcome::ResourceLimit(BackendTransportResourceLimit::PendingBytes)
+        );
+    }
+
+    #[test]
+    fn reliable_transport_capacity_shutdown_is_terminal() {
+        let policy = BackendRetryPolicy::new(
+            Duration::from_millis(1),
+            1,
+            Duration::from_millis(10),
+            2,
+            usize::MAX,
+        )
+        .unwrap();
+        let start = Instant::now();
+        let first = delivery_frame(1);
+        let first_key = first.envelope().route_identity();
+        let mut transport = BackendReliableTransport::new(policy);
+
+        assert_eq!(
+            transport.send(first, start).unwrap(),
+            BackendRetrySendOutcome::Buffered
+        );
+        transport.shutdown();
+        assert_eq!(
+            transport.acknowledge(first_key, BackendAcceptStatus::Accepted),
+            BackendAckOutcome::Unknown
+        );
+        assert_eq!(
+            transport.send(delivery_frame(2), start).unwrap(),
+            BackendRetrySendOutcome::Shutdown
+        );
     }
 }

@@ -26,9 +26,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -682,6 +682,9 @@ fn array_hashes(array: &ArrayRef) -> Result<Vec<u64>, StatisticsFragmentError> {
     if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
         hash_values!(array);
     }
+    if let Some(array) = array.as_any().downcast_ref::<Decimal128Array>() {
+        hash_values!(array);
+    }
     if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
         for value in array.iter().flatten() {
             values.push(statistics_value_hash(value.as_bytes()));
@@ -913,7 +916,7 @@ fn decode_fragment_column(
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::Int64Array;
+    use arrow::array::{Decimal128Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use novarocks_spi::connector::{StatisticsMetric, StatisticsMetricRequest};
@@ -944,6 +947,37 @@ mod tests {
         let payload = collector.finish_fragment_payload().expect("payload");
         let partial =
             StatisticsFragmentPartial::try_from_payload(&payload).expect("decode payload");
+        assert_eq!(payload, partial.to_payload().expect("re-encode payload"));
+    }
+
+    #[test]
+    fn fragment_payload_collects_decimal_theta_ndv() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            DataType::Decimal128(18, 2),
+            true,
+        )]));
+        let metrics = StatisticsMetricRequest::try_new(vec![
+            StatisticsMetric::RowCount,
+            StatisticsMetric::ThetaNdv { column: "d".into() },
+        ])
+        .expect("metrics");
+        let values = Decimal128Array::from(vec![Some(110_i128), Some(220), Some(110), None])
+            .with_precision_and_scale(18, 2)
+            .expect("decimal values");
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values)]).expect("batch");
+
+        let mut collector = StatisticsBatchCollector::try_new(schema, metrics).expect("collector");
+        collector.push_batch(&batch).expect("push decimal batch");
+        let payload = collector.finish_fragment_payload().expect("payload");
+        let partial =
+            StatisticsFragmentPartial::try_from_payload(&payload).expect("decode payload");
+        assert_eq!(
+            partial.theta["d"].retained_hashes.len(),
+            2,
+            "Theta NDV must deduplicate equal Decimal128 values"
+        );
         assert_eq!(payload, partial.to_payload().expect("re-encode payload"));
     }
 
