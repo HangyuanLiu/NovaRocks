@@ -33,7 +33,7 @@ pub fn parse_expression(source: &str, tokens: &[Token]) -> Result<Expr, ParseErr
 mod tests {
     use crate::{
         ParseError, ParserError, Span,
-        ast::{BinaryOperator, Expr, LiteralKind, UnaryOperator},
+        ast::{BinaryOperator, Expr, FunctionQuantifier, LiteralKind, UnaryOperator},
         lex,
     };
 
@@ -173,5 +173,21 @@ mod tests {
         assert!(matches!(parse("(SELECT 1) + 2"), Expr::Binary(_)));
         assert!(matches!(parse("[1, 2, 3]"), Expr::Array(_)));
         assert!(matches!(parse("(a, b)"), Expr::Tuple(_)));
+        let Expr::FunctionCall(call) = parse(
+            "group_concat(DISTINCT a ORDER BY b DESC SEPARATOR ',') FILTER (WHERE a IS NOT NULL)",
+        ) else {
+            panic!("expected function modifiers");
+        };
+        assert_eq!(call.quantifier, FunctionQuantifier::Distinct);
+        assert_eq!(call.order_by.len(), 1);
+        assert!(call.separator.is_some());
+        assert!(call.filter.is_some());
+        let Expr::FunctionCall(call) = parse("lead(v IGNORE NULLS, 1) OVER (ORDER BY x)") else {
+            panic!("expected null-treatment function");
+        };
+        assert_eq!(
+            call.null_treatment,
+            Some(crate::ast::NullTreatment::IgnoreNulls)
+        );
     }
 }

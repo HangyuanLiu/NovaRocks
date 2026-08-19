@@ -36,6 +36,7 @@ fn query_forms_parse_and_print_as_typed_syntax() {
         "SELECT * FROM a NATURAL LEFT JOIN b",
         "SELECT * FROM events FOR VERSION AS OF 'release_7' AS e",
         "SELECT * FROM events FOR SYSTEM_TIME AS OF 42",
+        "SELECT group_concat(DISTINCT a ORDER BY b DESC SEPARATOR ',') FILTER (WHERE a IS NOT NULL) FROM t",
         "WITH c AS (SELECT 1 AS a) SELECT a FROM c UNION ALL SELECT 2 ORDER BY a LIMIT 3",
         "SELECT l.id FROM left_table l LEFT JOIN right_table r ON l.id = r.id JOIN third_table s ON s.id = l.id",
         "EXPLAIN ANALYZE VALUES (1), (2)",

@@ -21,10 +21,11 @@ use crate::{
     Span, Symbol, Token, TokenKind,
     ast::{
         ArrayExpr, BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr, CastKind,
-        ExistsExpr, Expr, FunctionCall, FunctionQuantifier, Ident, InListExpr, InSubqueryExpr,
-        IsPredicate, IsPredicateExpr, LikeExpr, LikeOperator, Literal, LiteralKind, NestedExpr,
-        ObjectName, SubqueryExpr, TupleExpr, TypeName, TypeNameArgument, UnaryExpr, UnaryOperator,
-        WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
+        ExistsExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier, Ident, InListExpr,
+        InSubqueryExpr, IsPredicate, IsPredicateExpr, LikeExpr, LikeOperator, Literal, LiteralKind,
+        NestedExpr, NullTreatment, ObjectName, SubqueryExpr, TupleExpr, TypeName, TypeNameArgument,
+        UnaryExpr, UnaryOperator, WindowFrame, WindowFrameBound, WindowFrameExclusion,
+        WindowFrameUnits, WindowSpec,
     },
     error::ParseError,
     keyword_class,
@@ -874,7 +875,22 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         self.advance();
         let mut arguments = Vec::new();
         self.skip_trivia();
-        if !self.current_is_symbol(Symbol::RParen) {
+        let quantifier = if self.current_is_keyword(Keyword::Distinct) {
+            self.advance();
+            self.skip_trivia();
+            FunctionQuantifier::Distinct
+        } else if self.current_is_word("ALL") {
+            self.advance();
+            self.skip_trivia();
+            FunctionQuantifier::All
+        } else {
+            FunctionQuantifier::None
+        };
+        let mut null_treatment = None;
+        if !self.current_is_symbol(Symbol::RParen)
+            && !self.current_is_keyword(Keyword::Order)
+            && !self.current_is_word("SEPARATOR")
+        {
             loop {
                 if self.current_is_symbol(Symbol::Star) {
                     let star = self.current_span();
@@ -888,6 +904,9 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     arguments.push(self.parse_binding_power(0)?);
                 }
                 self.skip_trivia();
+                if null_treatment.is_none() {
+                    null_treatment = self.consume_null_treatment()?;
+                }
                 if !self.current_is_symbol(Symbol::Comma) {
                     break;
                 }
@@ -899,6 +918,48 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }
         }
 
+        let mut order_by = Vec::new();
+        if self.current_is_keyword(Keyword::Order) {
+            self.advance();
+            self.skip_trivia();
+            if !self.current_is_keyword(Keyword::By) {
+                return Err(self.unexpected("BY after function ORDER"));
+            }
+            self.advance();
+            self.skip_trivia();
+            loop {
+                let expr = self.parse_binding_power(0)?;
+                let asc = if self.current_is_keyword(Keyword::Asc) {
+                    self.advance();
+                    self.skip_trivia();
+                    Some(true)
+                } else if self.current_is_keyword(Keyword::Desc) {
+                    self.advance();
+                    self.skip_trivia();
+                    Some(false)
+                } else {
+                    None
+                };
+                order_by.push(FunctionOrderBy {
+                    span: Span::new(expr.span().start(), self.current_span().start()),
+                    expr,
+                    asc,
+                });
+                if !self.current_is_symbol(Symbol::Comma) {
+                    break;
+                }
+                self.advance();
+                self.skip_trivia();
+            }
+        }
+        let separator = if self.current_is_word("SEPARATOR") {
+            self.advance();
+            self.skip_trivia();
+            Some(Box::new(self.parse_binding_power(0)?))
+        } else {
+            None
+        };
+
         self.skip_trivia();
         if !self.current_is_symbol(Symbol::RParen) {
             return Err(self.unexpected("')'"));
@@ -906,6 +967,33 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let end = self.current_span().end();
         self.advance();
         self.skip_trivia();
+        if null_treatment.is_none() {
+            null_treatment = self.consume_null_treatment()?;
+        }
+        let filter = if self.current_is_keyword(Keyword::Filter) {
+            self.advance();
+            self.skip_trivia();
+            if !self.current_is_symbol(Symbol::LParen) {
+                return Err(self.unexpected("'(' after FILTER"));
+            }
+            self.advance();
+            self.skip_trivia();
+            if !self.current_is_keyword(Keyword::Where) {
+                return Err(self.unexpected("WHERE in FILTER"));
+            }
+            self.advance();
+            self.skip_trivia();
+            let filter = self.parse_binding_power(0)?;
+            self.skip_trivia();
+            if !self.current_is_symbol(Symbol::RParen) {
+                return Err(self.unexpected("')' after FILTER"));
+            }
+            self.advance();
+            self.skip_trivia();
+            Some(Box::new(filter))
+        } else {
+            None
+        };
         let over = if self.current_is_keyword(Keyword::Over) {
             self.advance();
             self.skip_trivia();
@@ -927,15 +1015,23 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         } else {
             None
         };
-        let span_end = over.as_ref().map_or(end, |window| window.span.end());
+        let span_end = over.as_ref().map_or_else(
+            || {
+                filter.as_ref().map_or_else(
+                    || separator.as_ref().map_or(end, |value| value.span().end()),
+                    |value| value.span().end(),
+                )
+            },
+            |window| window.span.end(),
+        );
         Ok(Expr::FunctionCall(FunctionCall {
             name,
             arguments,
-            quantifier: FunctionQuantifier::None,
-            order_by: Vec::new(),
-            separator: None,
-            filter: None,
-            null_treatment: None,
+            quantifier,
+            order_by,
+            separator,
+            filter,
+            null_treatment,
             over,
             span: Span::new(span.start(), span_end),
         }))
@@ -1197,6 +1293,31 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
 
     fn current_is_keyword(&self, keyword: Keyword) -> bool {
         matches!(self.current().map(|token| &token.kind), Some(TokenKind::Keyword(found)) if *found == keyword)
+    }
+
+    fn current_is_word(&self, word: &str) -> bool {
+        self.current().is_some_and(|token| {
+            matches!(token.kind, TokenKind::Ident | TokenKind::Keyword(_))
+                && self.token_text(token.span).eq_ignore_ascii_case(word)
+        })
+    }
+
+    fn consume_null_treatment(&mut self) -> Result<Option<NullTreatment>, ParseError> {
+        let treatment = if self.current_is_keyword(Keyword::Ignore) {
+            NullTreatment::IgnoreNulls
+        } else if self.current_is_keyword(Keyword::Respect) {
+            NullTreatment::RespectNulls
+        } else {
+            return Ok(None);
+        };
+        self.advance();
+        self.skip_trivia();
+        if !self.current_is_keyword(Keyword::Nulls) {
+            return Err(self.unexpected("NULLS after null treatment"));
+        }
+        self.advance();
+        self.skip_trivia();
+        Ok(Some(treatment))
     }
 
     fn peek_keyword(&self, offset: usize, keyword: Keyword) -> bool {
