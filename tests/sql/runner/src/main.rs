@@ -1307,9 +1307,9 @@ fn await_lifecycle_structured_snapshot_after(
         .map(Some)
 }
 
-fn runtime_filter_details<'a>(
-    rollup: &'a novarocks_cluster_harness::RuntimeFilterTerminalRollup,
-) -> Result<Vec<&'a novarocks_cluster_harness::RuntimeFilterParticipantTerminalDetails>> {
+fn runtime_filter_details(
+    rollup: &novarocks_cluster_harness::RuntimeFilterTerminalRollup,
+) -> Result<Vec<&novarocks_cluster_harness::RuntimeFilterParticipantTerminalDetails>> {
     let novarocks_cluster_harness::RuntimeFilterTerminalRollup::Available {
         participants,
         ..

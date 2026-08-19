@@ -63,6 +63,7 @@ struct LifecycleTelemetryUnavailableWire {
 
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[allow(clippy::large_enum_variant)]
 enum RuntimeFilterTerminalRollupWire {
     Available {
         participants: Vec<RuntimeFilterParticipantTerminalWire>,
@@ -169,6 +170,7 @@ struct RuntimeFilterUniqueIdWire {
 
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[allow(clippy::large_enum_variant)]
 enum RuntimeFilterTerminalTotalsWire {
     Available {
         channels: RuntimeFilterChannelTotalsWire,
@@ -420,6 +422,7 @@ pub struct QueryLifecycleStructuredSnapshot {
 
 /// Runtime Filter telemetry availability for a completed query.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum RuntimeFilterTerminalRollup {
     Available {
         participants: Vec<RuntimeFilterParticipantTerminalTelemetry>,
@@ -567,6 +570,7 @@ pub struct RuntimeFilterUniqueId {
 /// Checked totals from the FE read model. A caller must explicitly match
 /// `Unavailable`; a partial sum is never exposed as a query total.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum RuntimeFilterTerminalTotalsTelemetry {
     Available(RuntimeFilterTerminalTotals),
     Unavailable(RuntimeFilterTerminalTotalsUnavailable),
