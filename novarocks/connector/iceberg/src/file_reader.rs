@@ -230,6 +230,10 @@ pub fn connector_metrics(
         row_groups_read: metrics.row_groups_read,
         row_groups_pruned: metrics.row_groups_pruned,
         delayed_materialization_ranges: metrics.delayed_materialization_ranges,
+        page_index_attempts: metrics.page_index_attempts,
+        page_index_fallbacks: metrics.page_index_fallbacks,
+        page_index_rows_considered: metrics.page_index_rows_considered,
+        page_index_rows_pruned: metrics.page_index_rows_pruned,
     }
 }
 
@@ -273,6 +277,7 @@ pub fn read_parquet_batches(
         },
         predicates: Vec::new(),
         pruning: PhysicalPruning::default(),
+        options: Default::default(),
         cache: None,
         context,
     })

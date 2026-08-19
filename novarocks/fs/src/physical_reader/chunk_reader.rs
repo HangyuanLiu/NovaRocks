@@ -45,6 +45,10 @@ pub(crate) struct ReaderMetrics {
     row_groups_read: AtomicU64,
     row_groups_pruned: AtomicU64,
     delayed_materialization_ranges: AtomicU64,
+    page_index_attempts: AtomicU64,
+    page_index_fallbacks: AtomicU64,
+    page_index_rows_considered: AtomicU64,
+    page_index_rows_pruned: AtomicU64,
 }
 
 impl ReaderMetrics {
@@ -63,6 +67,10 @@ impl ReaderMetrics {
             delayed_materialization_ranges: self
                 .delayed_materialization_ranges
                 .load(Ordering::Relaxed),
+            page_index_attempts: self.page_index_attempts.load(Ordering::Relaxed),
+            page_index_fallbacks: self.page_index_fallbacks.load(Ordering::Relaxed),
+            page_index_rows_considered: self.page_index_rows_considered.load(Ordering::Relaxed),
+            page_index_rows_pruned: self.page_index_rows_pruned.load(Ordering::Relaxed),
         }
     }
 

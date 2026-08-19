@@ -67,7 +67,7 @@ pub use predicate::{
 };
 pub use read::{
     FileBatch, FileBatchReader, FileFormat, FileMetricsSnapshot, FileProjection, FileReadBudget,
-    FileReadContext, FileReadRange, FileReadRequest,
+    FileReadContext, FileReadRange, FileReadRequest, FileReaderOptions,
 };
 pub use resources::FsAccessResources;
 pub use runtime::{

@@ -32,8 +32,8 @@ use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use novarocks_fs::{
     FileBatchReader, FileCancellation, FileFormat, FileIdentity, FileProjection, FileReadBudget,
-    FileReadContext, FileReadRange, FileReadRequest, FsAccessHandle, PhysicalPruning,
-    open_file_reader,
+    FileReadContext, FileReadRange, FileReadRequest, FileReaderOptions, FsAccessHandle,
+    PhysicalPruning, open_file_reader,
 };
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
@@ -241,6 +241,9 @@ impl IcebergBatchReader {
             pruning: PhysicalPruning {
                 row_groups: row_groups.map(ToOwned::to_owned),
                 pages: Vec::new(),
+            },
+            options: FileReaderOptions {
+                enable_parquet_reader_page_index: request.options.enable_parquet_reader_page_index,
             },
             cache: None,
             context: file_context,

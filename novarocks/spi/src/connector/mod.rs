@@ -281,9 +281,9 @@ pub use read::{
     ConnectorChangePartitionValue, ConnectorChangeWindow, ConnectorChangeWindowAdmission,
     ConnectorChangeWindowFullRebuildReason, ConnectorChangeWindowPartitionImpact,
     ConnectorChangeWindowReplaceFailure, ConnectorOpenReaderRequest, ConnectorReadPurpose,
-    ConnectorReadSelector, ConnectorReaderMetricsSnapshot, ConnectorScan, ConnectorScanAdmission,
-    ConnectorScanSelection, ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult,
+    ConnectorReadSelector, ConnectorReaderMetricsSnapshot, ConnectorReaderOptions, ConnectorScan,
+    ConnectorScanAdmission, ConnectorScanSelection, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
 };
 pub use read_session::{
     ConnectorReadSession, ConnectorReadSessionFinalizationContext, ConnectorReadSessionLease,

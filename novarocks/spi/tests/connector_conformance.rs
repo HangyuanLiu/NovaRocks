@@ -1150,11 +1150,19 @@ fn reader_metrics_snapshot_add_and_delta_are_saturating() {
     let second = ConnectorReaderMetricsSnapshot {
         bytes_read: 7,
         rows_decoded: 3,
+        page_index_attempts: u64::MAX,
+        page_index_fallbacks: 2,
+        page_index_rows_considered: 9,
+        page_index_rows_pruned: 4,
         ..ConnectorReaderMetricsSnapshot::default()
     };
     let total = first.saturating_add(second);
     assert_eq!(total.bytes_read, 17);
     assert_eq!(total.rows_decoded, 5);
+    assert_eq!(total.page_index_attempts, u64::MAX);
+    assert_eq!(total.page_index_fallbacks, 2);
+    assert_eq!(total.page_index_rows_considered, 9);
+    assert_eq!(total.page_index_rows_pruned, 4);
     assert_eq!(
         total
             .saturating_delta_since(ConnectorReaderMetricsSnapshot {
@@ -1165,6 +1173,17 @@ fn reader_metrics_snapshot_add_and_delta_are_saturating() {
             .bytes_read,
         0
     );
+    let page_delta = total.saturating_delta_since(ConnectorReaderMetricsSnapshot {
+        page_index_attempts: u64::MAX,
+        page_index_fallbacks: 3,
+        page_index_rows_considered: 10,
+        page_index_rows_pruned: 7,
+        ..ConnectorReaderMetricsSnapshot::default()
+    });
+    assert_eq!(page_delta.page_index_attempts, 0);
+    assert_eq!(page_delta.page_index_fallbacks, 0);
+    assert_eq!(page_delta.page_index_rows_considered, 0);
+    assert_eq!(page_delta.page_index_rows_pruned, 0);
 }
 
 fn static_int_predicate(id: u32) -> ConnectorStaticPredicate {

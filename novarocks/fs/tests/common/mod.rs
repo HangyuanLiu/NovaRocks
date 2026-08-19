@@ -127,6 +127,7 @@ impl Fixture {
             },
             predicates: Vec::new(),
             pruning: PhysicalPruning::default(),
+            options: Default::default(),
             cache: None,
             context: FileReadContext {
                 cancellation: FileCancellation::new(),

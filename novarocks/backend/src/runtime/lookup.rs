@@ -136,6 +136,7 @@ fn execute_connector_lookup_request(
             max_rows: NonZeroUsize::new(4096).expect("constant is nonzero"),
             max_bytes: NonZeroUsize::new(64 * 1024 * 1024).expect("constant is nonzero"),
         },
+        options: Default::default(),
         context,
     };
 

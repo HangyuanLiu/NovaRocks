@@ -584,6 +584,11 @@ impl FrontendQuerySession {
                 })?;
                 state.execution_settings.set_pipeline_dop(value);
             }
+            "enable_parquet_reader_page_index" => {
+                state
+                    .execution_settings
+                    .set_enable_parquet_reader_page_index(parse_bool(value)?);
+            }
             "runtime_filter_scan_wait_time" => {
                 let value = value.parse::<i64>().map_err(|_| {
                     QueryServiceError::new(
