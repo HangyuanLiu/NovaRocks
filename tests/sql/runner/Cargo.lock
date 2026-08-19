@@ -1774,12 +1774,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "mysql",
+ "novarocks-failpoint",
  "novarocks-test-support",
  "reqwest",
  "serde",
  "serde_json",
  "toml",
 ]
+
+[[package]]
+name = "novarocks-failpoint"
+version = "0.1.0"
 
 [[package]]
 name = "novarocks-sql-test-runner"
@@ -1790,6 +1795,7 @@ dependencies = [
  "clap",
  "mysql",
  "novarocks-cluster-harness",
+ "novarocks-failpoint",
  "opendal",
  "rayon",
  "regex",

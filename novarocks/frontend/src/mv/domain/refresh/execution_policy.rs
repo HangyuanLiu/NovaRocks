@@ -47,7 +47,7 @@ pub fn select_join_incremental_execution_mode(
     }
 }
 
-#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+#[cfg(test)]
 pub fn should_use_join_delta_append_only_fast_path(
     query: &sqlparser::ast::Query,
     left_has_delete_changes: bool,

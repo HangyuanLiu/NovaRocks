@@ -8,8 +8,8 @@ build = "build.rs"
 doctest = false
 
 [dependencies]
-novarocks = { path = "../core" }
 novarocks-execution = { path = "../execution" }
+novarocks-failpoint = { path = "../failpoint" }
 novarocks-protocol = { path = "../protocol" }
 novarocks-spi = { path = "../spi" }
 bytes = "1"
@@ -17,17 +17,19 @@ arrow = "58.2.0"
 arrow-buffer = "58.2.0"
 async-trait = "0.1"
 axum = "0.7"
+once_cell = "1.19"
+hex = "0.4"
 novarocks-types = { path = "../types" }
+novarocks-version = { path = "../version" }
 parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
+prometheus = "0.13"
 prost = "0.13"
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.12", features = ["transport"] }
-
-[dev-dependencies]
-novarocks = { path = "../core" }
+tracing = "0.1"
 
 [build-dependencies]
 protoc-bin-vendored = "3"

@@ -14,17 +14,5 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#[cfg(test)]
-mod tests;
-
-pub mod common;
-pub mod connector;
-pub mod maintenance;
-pub mod runtime;
-pub mod service;
-pub use novarocks_version as version;
-// StarRocks-BE-like folder layout, with `novarocks_*` convenience aliases.
-pub use common::logging as novarocks_logging;
-pub use connector as novarocks_connectors;
-
-pub use common::types::FetchResult;
+// Design: ADR-0088 (docs/adr/ADR-0088-neutral-tail-owner-cut.md)
+// Core is intentionally empty after the neutral owner cut; boundaries are enforced by the Cargo DAG.

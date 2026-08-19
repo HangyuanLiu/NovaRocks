@@ -24,12 +24,12 @@
 
 pub(crate) mod recovery;
 
+use crate::common::admitted_query_context::RequestContext;
 use crate::query_execution::dml::ctas::{
     CtasCommand, CtasEngine, CtasFailure, CtasFailureKind, CtasTargetFacts,
     CtasTargetPreflightOutcome, CtasWriteOutcome, PrepareCtasSourceRequest, PreparedCtasSource,
     PreparedCtasTarget, PreparedCtasWrite,
 };
-use ::novarocks::common::admitted_query_context::RequestContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorCtasAbortDisposition, ConnectorCtasActionId, ConnectorCtasConflictKind,
@@ -418,7 +418,7 @@ fn execute_ctas_operation(
         OperationPayload::CtasSaga(saga),
         None,
     )?;
-    let historical_context = novarocks::connector::connector_request_context_for_execution(
+    let historical_context = crate::connector::connector_request_context_for_execution(
         query_options,
         context.execution(),
     )

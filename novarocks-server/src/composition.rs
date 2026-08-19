@@ -20,12 +20,10 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::app_config::NovaRocksConfig;
+use crate::network;
 use anyhow::Context;
-use novarocks::common::backend_topology::BackendTopologyPort;
-use novarocks::common::network;
 use novarocks_backend::{
-    BackendApplicationHost, BackendDataRuntime, BackendServerConfig, BackendStoreSettings,
-    QueryLifecycleRegistryConfig,
+    BackendApplicationHost, BackendDataRuntime, BackendServerConfig, QueryLifecycleRegistryConfig,
 };
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::control_factory::IcebergControlFactory;
@@ -41,7 +39,7 @@ use novarocks_execution::runtime::execution_runtime::{
 };
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendExecutionConfig, FrontendQueryControlTimeouts,
-    FrontendServerConfig,
+    FrontendServerConfig, common::backend_topology::BackendTopologyPort,
 };
 use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
 use novarocks_spi::connector::{
@@ -401,11 +399,6 @@ pub fn compose_backend_server_config(
         grpc_port: config.server.grpc_port,
         metrics_http_port: config.server.http_port,
         advertise_endpoint,
-        store_settings: BackendStoreSettings::new(
-            runtime_config.enable_tablet_write_log,
-            runtime_config.tablet_write_log_buffer_size,
-            runtime_config.be_txn_info_history_size,
-        ),
         query_lifecycle_sweep_interval: Duration::from_millis(
             runtime_config.query_control_heartbeat_interval_ms,
         ),
@@ -545,6 +538,7 @@ pub fn compose_frontend_server_config(
         backend_open,
         report_bind_host: config.server.host.clone(),
         report_grpc_port: config.server.grpc_port,
+        metrics_http_port: config.server.http_port,
         mysql_listener,
         connector_control_factories: compose_frontend_control_factories(config, runtime)?,
         mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),

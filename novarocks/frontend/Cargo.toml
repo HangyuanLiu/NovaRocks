@@ -22,15 +22,16 @@ datasketches = "0.2.0"
 futures = "0.3"
 hex = "0.4"
 libc = "0.2"
-novarocks = { path = "../core" }
 novarocks-fs = { path = "../fs" }
 novarocks-catalog = { path = "../catalog" }
 novarocks-execution = { path = "../execution" }
+novarocks-failpoint = { path = "../failpoint" }
 novarocks-protocol = { path = "../protocol" }
 novarocks-spi = { path = "../spi" }
 novarocks-sql = { path = "../sql" }
 novarocks-state-store = { path = "../state-store" }
 novarocks-types = { path = "../types" }
+novarocks-version = { path = "../version" }
 mysql_common = "0.32"
 opensrv-mysql = { version = "0.7", default-features = false }
 prost = "0.13"
@@ -46,7 +47,6 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v7", "serde"] }
 
 [dev-dependencies]
-novarocks = { path = "../core", features = ["query-execution-contract-test-support"] }
 novarocks-connector-starrocks = { path = "../connector/starrocks" }
 novarocks-spi = { path = "../spi", features = ["state-store-conformance"] }
 novarocks-sql = { path = "../sql", features = ["test-support"] }

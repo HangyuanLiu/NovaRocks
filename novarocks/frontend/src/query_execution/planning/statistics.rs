@@ -23,11 +23,11 @@ use crate::catalog_application::query_bindings::{QueryTableBinding, QueryTableBi
 use crate::catalog_application::query_bindings::{
     QueryTableBindingAdmission, parse_time_travel_overlay_identity,
 };
+use crate::connector::unified_statistics::{
+    ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
+};
 use crate::query_execution::kernels::{
     DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
-};
-use novarocks::connector::unified_statistics::{
-    ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
 };
 use novarocks_spi::connector::{StatisticsMetric, StatisticsMetricRequest};
 use novarocks_sql::planning::catalog::materialization_statistics_facts;
@@ -482,7 +482,7 @@ mod unified_tests {
         );
         let planning_lease = ConnectorControlPlanningLease::new(control, || {});
         let mut binding = local_binding("ice.main", "db", "orders", 73);
-        binding.statistics_pin = Some(novarocks::connector::backend::ResolvedTableStatisticsPin {
+        binding.statistics_pin = Some(crate::connector::backend::ResolvedTableStatisticsPin {
             table: ConnectorTableHandle::try_new(
                 provider.descriptor.instance_id.clone(),
                 Bytes::from_static(b"orders"),
@@ -541,7 +541,7 @@ mod unified_tests {
             local_binding("iceberg", "db", "mv_target", 72),
         );
         let captured = bindings.captured_bindings();
-        let connector_context = novarocks::connector::connector_request_context(
+        let connector_context = crate::connector::connector_request_context(
             None,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )

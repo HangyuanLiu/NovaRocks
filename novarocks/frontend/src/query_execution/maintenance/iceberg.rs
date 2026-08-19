@@ -23,8 +23,8 @@
 //! the neutral outcome the frontend reports.
 
 use super::{MaintenanceActionOutcome, MaintenanceActionRequest};
-use novarocks::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer;
-use novarocks::maintenance::MaintenanceTarget;
+use crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer;
+use crate::maintenance::MaintenanceTarget;
 
 /// Execute a non-rewrite maintenance action through explicit frontend-owned
 /// connector and cache-finalization ports. The caller owns the request context;
@@ -79,8 +79,8 @@ pub(crate) fn current_snapshot_id_with_ports(
     context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<i64, String> {
     let exact_lease =
-        novarocks::connector::acquire_metadata_planning_lease(connector_control, &target.catalog)?;
-    let facts = novarocks::connector::metadata_read_reference_facts_with_planning_lease(
+        crate::connector::acquire_metadata_planning_lease(connector_control, &target.catalog)?;
+    let facts = crate::connector::metadata_read_reference_facts_with_planning_lease(
         exact_lease,
         context,
         &target.namespace,
@@ -112,7 +112,7 @@ fn run_rewrite_manifests_action_with_ports(
     }
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| error.to_string())?;
-    let completed = novarocks::connector::metadata_maintenance::execute_metadata_maintenance(
+    let completed = crate::connector::metadata_maintenance::execute_metadata_maintenance(
         connector_control,
         cache_finalizer,
         &instance_id,
@@ -122,7 +122,7 @@ fn run_rewrite_manifests_action_with_ports(
             namespace: target.namespace.clone().into(),
             table: target.table.clone().into(),
         },
-        novarocks::connector::metadata_maintenance::MetadataMaintenanceIntent::rewrite_metadata_layout(
+        crate::connector::metadata_maintenance::MetadataMaintenanceIntent::rewrite_metadata_layout(
         ),
         connector_context,
     )?;
@@ -146,7 +146,7 @@ fn run_expire_snapshots_action_with_ports(
 ) -> Result<MaintenanceActionOutcome, String> {
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| error.to_string())?;
-    novarocks::connector::metadata_maintenance::execute_metadata_maintenance(
+    crate::connector::metadata_maintenance::execute_metadata_maintenance(
         connector_control,
         cache_finalizer,
         &instance_id,
@@ -156,7 +156,7 @@ fn run_expire_snapshots_action_with_ports(
             namespace: target.namespace.clone().into(),
             table: target.table.clone().into(),
         },
-        novarocks::connector::metadata_maintenance::MetadataMaintenanceIntent::expire_table_versions(
+        crate::connector::metadata_maintenance::MetadataMaintenanceIntent::expire_table_versions(
             older_than_ms,
             retain_last,
         ),

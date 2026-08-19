@@ -30,7 +30,7 @@ use crate::mv::domain::model::MvStorageEngine;
 use crate::mv::domain::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::mv::domain::persistence::refresh::MvRefreshState;
 use crate::mv::domain::repository::MvRepository;
-use novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use novarocks_sql::syntax::ShowMaterializedViewsStmt;
 
 /// Lightweight projection of the iceberg base table that

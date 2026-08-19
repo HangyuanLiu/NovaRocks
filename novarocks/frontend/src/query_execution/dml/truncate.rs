@@ -30,12 +30,12 @@ use novarocks_spi::connector::{
     ExternalMutationFinalization,
 };
 
-use crate::query_execution::kernels::DmlExecutionKernel;
-use ::novarocks::common::admitted_query_context::QueryExecutionContext;
-use novarocks::connector::data_mutation::{
+use crate::common::admitted_query_context::QueryExecutionContext;
+use crate::connector::data_mutation::{
     CompletedDataMutation, DataMutationDispatchState, DataMutationIntent, DataMutationSession,
     KnownUncommittedDataMutation, ResolvedDataMutation,
 };
+use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_sql::syntax::ObjectName;
 
@@ -301,7 +301,7 @@ impl TruncateEngine for DmlExecutionKernel {
             crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Truncate,
         )
         .map_err(plan_string_failure)?;
-        let connector_context = novarocks::connector::connector_request_context_for_execution(
+        let connector_context = crate::connector::connector_request_context_for_execution(
             request.query_options.as_ref(),
             &request.execution,
         )

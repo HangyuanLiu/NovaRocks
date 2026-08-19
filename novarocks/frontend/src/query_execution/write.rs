@@ -31,9 +31,9 @@ use sha2::{Digest, Sha256};
 
 use crate::query_execution::artifact::WriterRegistrationSet;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use ::novarocks::common::types::UniqueId;
 use novarocks_protocol::lifecycle::QueryExecutionId;
 use novarocks_protocol::novarocks;
+use novarocks_types::UniqueId;
 
 // This is deliberately a wire-level value rather than an Iceberg enum.  The
 // SPI's first terminal state is `Staged`; coordinator code must never count a

@@ -21,18 +21,18 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::connector::cleanup_maintenance::CleanupBatchExecution;
+use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
+use crate::connector::metadata_maintenance::MetadataMaintenanceIntent;
+use crate::maintenance::MaintenanceTarget;
 use crate::query_execution::maintenance::{
     HistoricalMaintenanceInspection, MaintenanceActionOutcome, MaintenanceActionRequest,
     MaintenanceAttemptCancellationSource, MaintenanceRequestContext, MaintenanceStatementResult,
     MaintenanceTargetRebind, OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
 };
-use ::novarocks::common::cleanup_fault::{
-    CleanupFaultKind, claim_configured as claim_cleanup_fault,
+use novarocks_failpoint::{
+    CleanupFaultKind, claim_configured_cleanup_fault as claim_cleanup_fault,
 };
-use novarocks::connector::cleanup_maintenance::CleanupBatchExecution;
-use novarocks::connector::distributed_rewrite_application::DistributedRewriteIntent;
-use novarocks::connector::metadata_maintenance::MetadataMaintenanceIntent;
-use novarocks::maintenance::MaintenanceTarget;
 use novarocks_spi::connector::{
     BatchReceipt, ConnectorCleanupOperationId, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
@@ -2659,7 +2659,7 @@ fn cleanup_receipt_checkpoint(
 
 fn cleanup_candidate_locations(
     engine: &dyn TableMaintenanceEngine,
-    session: &novarocks::connector::cleanup_maintenance::CleanupMaintenanceSession,
+    session: &crate::connector::cleanup_maintenance::CleanupMaintenanceSession,
 ) -> Result<Vec<String>, String> {
     let mut offset = 0u64;
     let mut locations = Vec::new();

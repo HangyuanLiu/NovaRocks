@@ -262,6 +262,7 @@ fallback 模糊 owner 和故障语义。
 - ADR-0069 — 共享测试机械能力为何使用零产品依赖的独立叶子 crate，而领域断言仍跟随其 owner（active）
 - ADR-0071 — 分布式测试编排为何由唯一 cluster harness 拥有、SQL runner 只作 frontend adapter（active）
 - ADR-0085 — native DTO 的字段路径与验证错误为何由 Protocol 独占、而不保留 Core family 门面（active）
+- ADR-0088 — 聚合 Core 退场后为何按真实 owner 物理切断依赖（active）
 
 ### configuration
 

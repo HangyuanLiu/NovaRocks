@@ -31,7 +31,6 @@ use crate::runtime::query_context::{
     QueryContextManager, QueryExecutionKey, QueryId, query_context_manager,
 };
 use crate::runtime::sink_commit::BackendSinkCommitPort;
-use novarocks::common::types::UniqueId;
 use novarocks_execution::exec::node::scan::ConnectorRowPositionLookup;
 use novarocks_execution::exec::node::scan::ScanOp;
 use novarocks_execution::exec::operators::scan::ScanDispatchState;
@@ -45,6 +44,7 @@ use novarocks_execution::runtime::profile::Profiler;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_protocol::lifecycle::QueryExecutionId;
 use novarocks_types::SlotId;
+use novarocks_types::UniqueId;
 
 #[derive(Clone)]
 pub struct NativeFragmentQueryRuntime {
@@ -98,15 +98,15 @@ impl NativeFragmentQueryRuntime {
 
     pub fn publish_resource_snapshot(&self) {
         let snapshot = self.manager.native_execution_resource_snapshot();
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "native_query_contexts_active",
             snapshot.active_contexts,
         );
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "native_query_contexts_second_chance",
             snapshot.second_chance_contexts,
         );
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "native_query_active_fragments",
             snapshot.active_fragments,
         );
@@ -353,7 +353,7 @@ impl NativeFragmentAdmissionResources {
         )
         .with_scan_registration_port(self.scan_registration)
         .with_fragment_commit_port(Arc::new(BackendSinkCommitPort))
-        .with_debug_exec_node_output(novarocks::common::config::debug_exec_node_output())
+        .with_debug_exec_node_output(crate::config::debug_exec_node_output())
     }
 }
 
@@ -363,7 +363,7 @@ mod tests {
 
     use super::NativeFragmentQueryRuntime;
     use crate::runtime::query_context::{QueryContextManager, QueryId};
-    use novarocks::common::types::UniqueId;
+    use novarocks_types::UniqueId;
 
     #[test]
     fn pre_start_registration_lease_drop_rolls_back_only_its_fragment() {

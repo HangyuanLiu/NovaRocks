@@ -51,7 +51,7 @@ pub struct ConnectorQueryTableMaterialization {
     pub read_schema: arrow::datatypes::SchemaRef,
     pub read_selector: novarocks_spi::connector::ConnectorReadSelector,
     pub sql_planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts,
-    pub statistics_pin: Option<novarocks::connector::backend::ResolvedTableStatisticsPin>,
+    pub statistics_pin: Option<crate::connector::backend::ResolvedTableStatisticsPin>,
     pub planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 }
 
@@ -157,7 +157,7 @@ pub fn connector_table_materialization_from_metadata(
             name: field.name().to_string(),
             data_type: field.data_type().clone(),
             nullable: field.is_nullable(),
-            write_default: novarocks::connector::connector_write_default_at(
+            write_default: crate::connector::connector_write_default_at(
                 &metadata.planning_facts,
                 ordinal,
             ),
@@ -178,7 +178,7 @@ pub fn connector_table_materialization_from_metadata(
         .statistics_data_version
         .clone()
         .map(
-            |data_version| novarocks::connector::backend::ResolvedTableStatisticsPin {
+            |data_version| crate::connector::backend::ResolvedTableStatisticsPin {
                 table: metadata.table.clone(),
                 data_version,
             },
@@ -304,7 +304,7 @@ impl Catalog<CatalogRuntimeMetadata> for ConnectorCatalog {
         let identity = TableIdentity::new(&self.name, namespace, table);
         let materialization = load_connector_table_materialization_with_lease(
             self.controls.as_ref(),
-            novarocks::connector::connector_request_context(
+            crate::connector::connector_request_context(
                 None,
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )?,

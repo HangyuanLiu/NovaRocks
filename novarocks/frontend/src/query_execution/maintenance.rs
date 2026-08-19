@@ -32,16 +32,16 @@ use std::time::Instant;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 
-use crate::query_execution::ConnectorWriteCompletion;
-use crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession;
-use ::novarocks::common::query_cancellation::QueryCancellationView;
-use ::novarocks::runtime::query_result::QueryResult;
-use novarocks::connector::cleanup_maintenance::{CleanupBatchExecution, CleanupMaintenanceSession};
-use novarocks::connector::distributed_rewrite_application::DistributedRewriteIntent;
-use novarocks::connector::metadata_maintenance::{
+use crate::common::query_cancellation::QueryCancellationView;
+use crate::connector::cleanup_maintenance::{CleanupBatchExecution, CleanupMaintenanceSession};
+use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
+use crate::connector::metadata_maintenance::{
     CompletedMetadataMaintenance, MetadataMaintenanceIntent, MetadataMaintenanceSession,
 };
-use novarocks::maintenance::MaintenanceTarget;
+use crate::maintenance::MaintenanceTarget;
+use crate::query_execution::ConnectorWriteCompletion;
+use crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession;
+use crate::runtime::query_result::QueryResult;
 use novarocks_spi::connector::{
     BatchReceipt, CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupPlan,
     ConnectorControlResolver, ConnectorDistributedRewriteAttemptCheckpoint,
@@ -63,7 +63,7 @@ pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance servi
 pub struct PreparedDistributedRewriteCohort {
     encoding: crate::query_execution::compiler::NativeFragmentEncodingInput,
     query_execution: crate::query_execution::service::QueryExecutionService,
-    execution: ::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: crate::common::admitted_query_context::QueryExecutionContext,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
 }
 
@@ -71,7 +71,7 @@ impl PreparedDistributedRewriteCohort {
     fn new(
         encoding: crate::query_execution::compiler::NativeFragmentEncodingInput,
         query_execution: crate::query_execution::service::QueryExecutionService,
-        execution: ::novarocks::common::admitted_query_context::QueryExecutionContext,
+        execution: crate::common::admitted_query_context::QueryExecutionContext,
         connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
     ) -> Self {
         Self {
@@ -247,7 +247,7 @@ impl MaintenanceAttemptContext {
     fn connector_request_context(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
-        novarocks::connector::connector_request_context(None, Arc::clone(&self.cancelled))
+        crate::connector::connector_request_context(None, Arc::clone(&self.cancelled))
     }
 
     /// Preserve the statement's admitted connector deadline and cancellation
@@ -716,14 +716,14 @@ pub trait TableMaintenanceService: Send + Sync {
 #[derive(Clone)]
 pub(crate) struct RequestScopedMaintenanceEngine {
     kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
-    execution: ::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: crate::common::admitted_query_context::QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 impl RequestScopedMaintenanceEngine {
     pub fn new(
         kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
-        execution: ::novarocks::common::admitted_query_context::QueryExecutionContext,
+        execution: crate::common::admitted_query_context::QueryExecutionContext,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Self {
         Self {
@@ -860,13 +860,13 @@ fn maintenance_target_rebind_from_connector_result(
 /// generation and execution identity for recovery.
 #[derive(Clone)]
 pub struct BackgroundMaintenanceAttempt {
-    execution: ::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: crate::common::admitted_query_context::QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 impl BackgroundMaintenanceAttempt {
     pub fn new(
-        execution: ::novarocks::common::admitted_query_context::QueryExecutionContext,
+        execution: crate::common::admitted_query_context::QueryExecutionContext,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Self {
         Self {
@@ -918,14 +918,14 @@ impl BackgroundMaintenanceEngine {
     }
 }
 
-impl novarocks::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer
+impl crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer
     for RequestScopedMaintenanceEngine
 {
     fn invalidate_generic_table(
         &self,
         table: &novarocks_spi::connector::ConnectorTableIdentity,
     ) -> Result<(), novarocks_spi::connector::ConnectorError> {
-        novarocks::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer::invalidate_generic_table(
+        crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer::invalidate_generic_table(
             &self.kernel,
             table,
         )
@@ -991,7 +991,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             namespace: Arc::from(target.namespace.as_str()),
             table: Arc::from(target.table.as_str()),
         };
-        let metadata = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+        let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
             &exact_lease,
             self.connector_context.clone(),
             &target.namespace,
@@ -1069,7 +1069,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         attempt: &MaintenanceAttemptContext,
     ) -> Result<MetadataMaintenanceSession, String> {
         let identity = Self::target_identity(target)?;
-        novarocks::connector::metadata_maintenance::plan_metadata_maintenance_session(
+        crate::connector::metadata_maintenance::plan_metadata_maintenance_session(
             self.kernel.connector_control().as_ref(),
             &identity.instance_id.clone(),
             operation_id,
@@ -1083,9 +1083,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         &self,
         session: MetadataMaintenanceSession,
     ) -> Result<CompletedMetadataMaintenance, String> {
-        novarocks::connector::metadata_maintenance::execute_planned_metadata_maintenance(
-            session, self,
-        )
+        crate::connector::metadata_maintenance::execute_planned_metadata_maintenance(session, self)
     }
 
     fn reconcile_metadata_maintenance(
@@ -1106,7 +1104,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         plan: ConnectorMetadataMaintenancePlan,
         attempt: &MaintenanceAttemptContext,
     ) -> Result<CompletedMetadataMaintenance, String> {
-        novarocks::connector::metadata_maintenance::reconcile_metadata_maintenance_session(
+        crate::connector::metadata_maintenance::reconcile_metadata_maintenance_session(
             self.kernel.connector_control().as_ref(),
             self,
             Self::target_identity(target)?,
@@ -1370,7 +1368,7 @@ impl RequestScopedMaintenanceEngine {
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<DistributedRewriteMaintenanceSession, String> {
         let identity = Self::target_identity(target)?;
-        novarocks::connector::distributed_rewrite_application::plan_distributed_rewrite_session(
+        crate::connector::distributed_rewrite_application::plan_distributed_rewrite_session(
             self.kernel.query_execution(),
             self.kernel.connector_control().as_ref(),
             &identity.instance_id.clone(),
@@ -1649,7 +1647,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
     cohort_id: ConnectorWriteCohortId,
-    execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedDistributedRewriteCohort, String> {
     let cohort = session
@@ -1700,7 +1698,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     let registration = session
         .execution_registration(cohort_id)
         .map_err(|error| format!("register frozen rewrite cohort: {error}"))?;
-    novarocks::connector::validate_request_context(context)?;
+    crate::connector::validate_request_context(context)?;
     let mut optimizer_settings = execution.optimizer_settings().clone();
     if optimizer_settings.cbo_broadcast_backend_count.is_none() {
         optimizer_settings.effective_backend_count =
@@ -1865,7 +1863,7 @@ mod maintenance_attempt_context_tests {
     fn attempt_context_preserves_request_cancellation_and_deadline() {
         let request_cancelled = Arc::new(AtomicBool::new(false));
         let request =
-            novarocks::connector::connector_request_context(None, Arc::clone(&request_cancelled))
+            crate::connector::connector_request_context(None, Arc::clone(&request_cancelled))
                 .expect("request connector context");
         let source = MaintenanceAttemptCancellationSource::new();
         let combined = source
@@ -1888,7 +1886,7 @@ mod maintenance_attempt_context_tests {
         assert!(combined.cancellation().is_cancelled());
 
         let request =
-            novarocks::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))
+            crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))
                 .expect("fresh request connector context");
         let source = MaintenanceAttemptCancellationSource::new();
         let combined = source

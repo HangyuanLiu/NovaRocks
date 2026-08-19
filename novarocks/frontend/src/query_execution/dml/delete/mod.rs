@@ -23,8 +23,8 @@ pub(crate) mod standard;
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
-use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 
 /// DELETE statements recognized by the frontend command router.
@@ -264,7 +264,7 @@ impl DeleteEngine for DmlExecutionKernel {
     }
 
     fn prepare_delete(&self, request: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String> {
-        let connector_context = novarocks::connector::connector_request_context_for_execution(
+        let connector_context = crate::connector::connector_request_context_for_execution(
             request.query_options.as_ref(),
             &request.execution,
         )?;

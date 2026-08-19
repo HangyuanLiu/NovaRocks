@@ -340,12 +340,12 @@ mod tests {
                 .fragment_output_columns(9)
                 .is_some_and(|columns| !columns.is_empty())
         );
-        let registry = novarocks::connector::ConnectorRegistry::new();
-        let controls = novarocks::connector::FixtureControlResolver::new(registry.clone());
+        let registry = crate::connector::FixtureConnectorRegistry::new();
+        let controls = crate::connector::FixtureControlResolver::new(registry.clone());
         let prepared = prepare_fragments(
             &plan,
             &controls,
-            &novarocks::connector::test_request_context(),
+            &crate::connector::test_request_context(),
             None,
             None,
             ScanPreparationOptions::single_backend_fixture(),
@@ -367,12 +367,12 @@ mod tests {
             novarocks_sql::test_support::NativePreparationFixture::MissingResultOutput,
         )
         .expect("closed missing-output preparation fixture");
-        let registry = novarocks::connector::ConnectorRegistry::new();
-        let controls = novarocks::connector::FixtureControlResolver::new(registry.clone());
+        let registry = crate::connector::FixtureConnectorRegistry::new();
+        let controls = crate::connector::FixtureControlResolver::new(registry.clone());
         let error = match prepare_fragments(
             &plan,
             &controls,
-            &novarocks::connector::test_request_context(),
+            &crate::connector::test_request_context(),
             None,
             None,
             ScanPreparationOptions::single_backend_fixture(),

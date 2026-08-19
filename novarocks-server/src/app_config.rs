@@ -26,7 +26,7 @@ use novarocks_state_store::config::{
 use novarocks_types::ClusterRole;
 use uuid::Uuid;
 
-pub use novarocks::common::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
+pub use crate::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
 
 fn default_log_level() -> String {
     "info".to_string()
@@ -468,15 +468,15 @@ impl NovaRocksConfig {
 /// Reject runner-owned fault-injection environment variables in release builds.
 ///
 /// The fault hooks themselves read these variables directly (see
-/// `common::query_lifecycle_fault` and `common::cleanup_fault`) and are compiled
+/// `novarocks-failpoint`) and are compiled
 /// out of release builds. Failing startup here keeps a release binary from
 /// silently ignoring an armed fault and letting a cross-process test pass
 /// vacuously.
 #[cfg(not(debug_assertions))]
 fn reject_fault_injection_environment() -> Result<()> {
     for name in [
-        "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR",
-        "NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR",
+        novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
+        novarocks_failpoint::CLEANUP_FAULT_DIR_ENV,
         "NOVAROCKS_SQL_TEST_FAULT_INJECT_FETCH_NOT_READY_COUNT",
         "NOVAROCKS_SQL_TEST_EMIT_CANCEL_MARKER",
         "NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER",
@@ -845,12 +845,6 @@ pub struct RuntimeConfig {
     pub olap_sink_max_tablet_write_chunk_bytes: usize,
     #[serde(default = "default_pipeline_scan_thread_pool_thread_num")]
     pub pipeline_scan_thread_pool_thread_num: usize,
-    #[serde(default = "default_enable_tablet_write_log")]
-    pub enable_tablet_write_log: bool,
-    #[serde(default = "default_tablet_write_log_buffer_size")]
-    pub tablet_write_log_buffer_size: usize,
-    #[serde(default = "default_be_txn_info_history_size")]
-    pub be_txn_info_history_size: usize,
     #[serde(default = "default_connector_io_tasks_per_scan_operator")]
     pub connector_io_tasks_per_scan_operator: i32,
     #[serde(default = "default_io_coalesce_read_enable")]
@@ -1308,18 +1302,6 @@ fn default_pipeline_scan_thread_pool_thread_num() -> usize {
     0 // 0 means use CPU cores, aligned with StarRocks pipeline_scan_thread_pool_thread_num
 }
 
-fn default_enable_tablet_write_log() -> bool {
-    false // aligned with StarRocks enable_tablet_write_log
-}
-
-fn default_tablet_write_log_buffer_size() -> usize {
-    100_000 // aligned with StarRocks tablet_write_log_buffer_size
-}
-
-fn default_be_txn_info_history_size() -> usize {
-    20_000 // aligned with StarRocks txn_info_history_size
-}
-
 fn default_connector_io_tasks_per_scan_operator() -> i32 {
     16 // aligned with StarRocks BE config::connector_io_tasks_per_scan_operator
 }
@@ -1428,9 +1410,6 @@ impl Default for RuntimeConfig {
             olap_sink_max_tablet_write_chunk_bytes: default_olap_sink_max_tablet_write_chunk_bytes(
             ),
             pipeline_scan_thread_pool_thread_num: default_pipeline_scan_thread_pool_thread_num(),
-            enable_tablet_write_log: default_enable_tablet_write_log(),
-            tablet_write_log_buffer_size: default_tablet_write_log_buffer_size(),
-            be_txn_info_history_size: default_be_txn_info_history_size(),
             connector_io_tasks_per_scan_operator: default_connector_io_tasks_per_scan_operator(),
             io_coalesce_read_enable: default_io_coalesce_read_enable(),
             io_coalesce_read_max_buffer_size: default_io_coalesce_read_max_buffer_size(),
@@ -1542,7 +1521,7 @@ impl RuntimeConfig {
             return Ok(self.be_mem_limit_bytes);
         }
 
-        novarocks::common::memory_limit::resolve_starrocks_process_mem_limit_bytes(&self.mem_limit)
+        crate::memory_limit::resolve_starrocks_process_mem_limit_bytes(&self.mem_limit)
             .with_context(|| format!("resolve runtime.mem_limit '{}'", self.mem_limit))
     }
 
@@ -1554,7 +1533,7 @@ impl RuntimeConfig {
             return Ok(self.be_mem_limit_bytes);
         }
 
-        novarocks::common::memory_limit::resolve_starrocks_process_mem_limit_bytes_for_visible_memory(
+        crate::memory_limit::resolve_starrocks_process_mem_limit_bytes_for_visible_memory(
             &self.mem_limit,
             visible_memory_bytes,
         )

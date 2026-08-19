@@ -19,9 +19,9 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::maintenance::MaintenanceTarget;
 use crate::query_execution::maintenance::OptimizeJobState;
 use bytes::Bytes;
-use novarocks::maintenance::MaintenanceTarget;
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteAttemptCheckpoint as SpiRewriteCheckpoint,
     ConnectorDistributedRewriteAttemptDisposition as SpiRewriteDisposition, ConnectorInstanceId,

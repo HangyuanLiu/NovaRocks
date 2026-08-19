@@ -16,6 +16,7 @@ use novarocks_frontend::mv::domain::persistence::schema::{
 };
 use novarocks_frontend::mv::domain::repository::MvRepository;
 use novarocks_frontend::mv::repository::StateStoreMvRepository;
+use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_spi::state_store::FeDeploymentView;
 use novarocks_sql::planning::mv::ApplyKeySource;
 use novarocks_state_store::{
@@ -44,7 +45,10 @@ fn schema_contract(partition: MvPartitionContract) -> MvSchemaContract {
         contract_version: 1,
         base: BaseContract {
             table_fqn: "ice.sales.orders".to_string(),
-            table_uuid: "11111111-1111-1111-1111-111111111111".to_string(),
+            table_object_id: ConnectorTableObjectId::try_new(Bytes::from_static(
+                b"11111111-1111-1111-1111-111111111111",
+            ))
+            .expect("valid base object id"),
             alias_at_create: Some("orders".to_string()),
             schema_id_at_create: 7,
             schema_at_create: BaseSchemaSnapshot {

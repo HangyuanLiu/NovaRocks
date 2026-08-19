@@ -18,7 +18,7 @@
 use std::sync::{Arc, Barrier, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
-use novarocks::service::query_lifecycle_metrics::BackendQueryLifecycleMetricsSnapshot;
+use crate::metrics::query_lifecycle::BackendQueryLifecycleMetricsSnapshot;
 use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };
@@ -54,7 +54,7 @@ use crate::native::runtime_filter_install::DecodedRuntimeFilterContribution;
 use crate::runtime_filter::participant::{
     BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipantFactory,
 };
-use novarocks::common::query_lifecycle_fault::QueryLifecycleFaultKind;
+use novarocks_failpoint::QueryLifecycleFaultKind;
 
 const LOCAL_BACKEND_ID: u64 = 7;
 const LOCAL_START_EPOCH: u64 = 11;

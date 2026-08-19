@@ -4,23 +4,23 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use novarocks::common::network::AdvertiseEndpoint;
-use novarocks::connector::ConnectorRegistry;
-use novarocks::service::MetricsHttpServer;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_protocol::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest, QueryStageAck,
     QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminationAck,
 };
 use novarocks_spi::connector::ConnectorExecutionInstaller;
+use novarocks_types::AdvertiseEndpoint;
 
 use crate::BackendDataRuntime;
+use crate::connector::ConnectorRegistry;
 use crate::exchange_receiver::BackendExchangeReceiverPort;
 use crate::fragment::control::FragmentControlRegistry;
 use crate::fragment::{
     NativeFragmentService, grpc_exchange_transmitter, grpc_fragment_lookup_client,
     native_result_writer,
 };
+use crate::metrics::MetricsHttpServer;
 use crate::native::runtime_filter_adapter::BackendRuntimeFilterEnvelopeIngress;
 use crate::native::service::{NativeBackendGrpcService, NativeGrpcServerHandle};
 use crate::query_lifecycle::{
@@ -38,7 +38,6 @@ pub struct BackendServerConfig {
     pub grpc_port: u16,
     pub metrics_http_port: u16,
     pub advertise_endpoint: AdvertiseEndpoint,
-    pub store_settings: BackendStoreSettings,
     pub query_lifecycle_sweep_interval: Duration,
     pub query_lifecycle_config: QueryLifecycleRegistryConfig,
     /// Server-resolved per-fragment terminal write evidence budget.
@@ -49,36 +48,6 @@ pub struct BackendServerConfig {
     /// Backend only owns registration and lifecycle of these contributions; it
     /// never constructs a provider-specific installer or catalog binding.
     pub execution_installers: Vec<Arc<dyn ConnectorExecutionInstaller>>,
-}
-
-/// BE-local schema-store policies resolved by application composition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BackendStoreSettings {
-    enable_tablet_write_log: bool,
-    tablet_write_log_buffer_size: usize,
-    txn_info_history_size: usize,
-}
-
-impl BackendStoreSettings {
-    pub const fn new(
-        enable_tablet_write_log: bool,
-        tablet_write_log_buffer_size: usize,
-        txn_info_history_size: usize,
-    ) -> Self {
-        Self {
-            enable_tablet_write_log,
-            tablet_write_log_buffer_size,
-            txn_info_history_size,
-        }
-    }
-
-    fn install(self) {
-        novarocks::connector::schema::install_be_store_settings(
-            self.enable_tablet_write_log,
-            self.tablet_write_log_buffer_size,
-            self.txn_info_history_size,
-        );
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -397,14 +366,12 @@ impl BackendApplicationHost {
             grpc_port,
             metrics_http_port,
             advertise_endpoint,
-            store_settings,
             query_lifecycle_sweep_interval,
             query_lifecycle_config,
             write_commit_evidence_limits,
             execution_runtime_config,
             execution_installers,
         } = config;
-        store_settings.install();
         let readiness_addr =
             advertised_probe_addr(&advertise_endpoint.host, advertise_endpoint.port).map_err(
                 |error| {
@@ -647,7 +614,6 @@ mod tests {
         compose_backend_application_services,
     };
     use crate::native::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
-    use novarocks::common::network::AdvertiseEndpoint;
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
@@ -663,6 +629,7 @@ mod tests {
     };
     use novarocks_protocol::{lifecycle as protocol_lifecycle, novarocks as protocol};
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
+    use novarocks_types::AdvertiseEndpoint;
     use novarocks_types::QueryId;
     use tokio_stream::wrappers::ReceiverStream;
 
@@ -743,7 +710,6 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: advertise_port,
             },
-            store_settings: super::BackendStoreSettings::new(false, 0, 0),
             query_lifecycle_sweep_interval: Duration::from_millis(1_000),
             query_lifecycle_config: query_lifecycle_registry_config(Duration::from_millis(5_000)),
             write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),

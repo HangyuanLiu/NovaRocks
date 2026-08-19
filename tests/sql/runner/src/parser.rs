@@ -19,6 +19,10 @@ use crate::config::{case_placeholder_variables, parse_bool, substitute_placehold
 use crate::engine_error_codes::EngineErrorCode;
 use crate::types::*;
 use anyhow::{Context, Result, bail};
+use novarocks_failpoint::{
+    cleanup_fault_directive_names, parse_cleanup_fault_directive, parse_runner_rfo_kind,
+    runner_rfo_kind_names,
+};
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -132,23 +136,11 @@ fn parse_query_lifecycle_fault(raw: &str) -> anyhow::Result<QueryLifecycleFaultD
     let (kind, index) = raw.split_once(',').ok_or_else(|| {
         anyhow::anyhow!("@query_lifecycle_fault requires <kind>,<be_index>; received {raw:?}")
     })?;
-    let kind = QueryLifecycleFaultKind::parse(kind.trim()).ok_or_else(|| {
+    let kind = parse_runner_rfo_kind(kind.trim()).ok_or_else(|| {
         anyhow::anyhow!(
             "invalid query_lifecycle_fault kind {:?}; expected one of {}",
             kind.trim(),
-            [
-                "observation-p2-assembly-failure",
-                "observation-p2-budget-pressure",
-                "terminal-p0-retained-slot-exhausted",
-                "terminal-p0-bytes-exhausted",
-                "terminal-p0-delivery-permit-exhausted",
-                "terminal-p1-encode-failure",
-                "terminal-p1-retention-exhausted",
-                "terminal-proof-stream-drop",
-                "terminal-attestation-stream-drop",
-                "terminal-outcome-suppress",
-            ]
-            .join(", ")
+            runner_rfo_kind_names().collect::<Vec<_>>().join(", ")
         )
     })?;
     let be_index = index
@@ -385,17 +377,12 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                 meta.restart_fe_after_step = parse_bool(&raw_value)?;
             }
             "cleanup_fault" => {
-                const ALLOWED: &[&str] = &[
-                    "delete_failed",
-                    "drop_delete_response",
-                    "receipt_write_failed",
-                    "checkpoint_failed",
-                    "kill_fe_after_delete",
-                ];
-                if !ALLOWED.contains(&raw_value.as_str()) {
+                if parse_cleanup_fault_directive(&raw_value).is_none() {
                     bail!(
                         "invalid cleanup_fault: {raw_value}; expected one of {}",
-                        ALLOWED.join(", ")
+                        cleanup_fault_directive_names()
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 }
                 meta.cleanup_fault = Some(raw_value);

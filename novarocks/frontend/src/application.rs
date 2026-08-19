@@ -946,13 +946,13 @@ impl FrontendApplicationHost {
 
     pub fn backend_query_event_sink(
         &self,
-    ) -> Arc<dyn ::novarocks::common::backend_topology::BackendQueryEventSink> {
+    ) -> Arc<dyn crate::common::backend_topology::BackendQueryEventSink> {
         Arc::new(self.backend_query_activity())
     }
 
     pub fn coordinator_report_endpoint_sink(
         &self,
-    ) -> Arc<dyn ::novarocks::common::backend_topology::CoordinatorReportEndpointSink> {
+    ) -> Arc<dyn crate::common::backend_topology::CoordinatorReportEndpointSink> {
         self.coordinator
             .as_ref()
             .expect("frontend coordinator is installed before host open returns")
@@ -962,10 +962,8 @@ impl FrontendApplicationHost {
     /// Frontend composition-time topology leaf.  The all-in-one server uses it
     /// only to register its separately owned backend endpoint before it builds
     /// the same ready SQL session factory as role=fe.
-    pub fn backend_topology_port(
-        &self,
-    ) -> ::novarocks::common::backend_topology::BackendTopologyService {
-        Arc::clone(self.topology()) as ::novarocks::common::backend_topology::BackendTopologyService
+    pub fn backend_topology_port(&self) -> crate::common::backend_topology::BackendTopologyService {
+        Arc::clone(self.topology()) as crate::common::backend_topology::BackendTopologyService
     }
 
     pub async fn shutdown(mut self) -> Result<(), FrontendApplicationError> {

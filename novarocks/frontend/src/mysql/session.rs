@@ -27,8 +27,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use ::novarocks::common::query_cancellation::QueryCancellationReason;
-use ::novarocks::runtime::statement_result::StatementResult;
+use crate::common::query_cancellation::QueryCancellationReason;
+use crate::runtime::statement_result::StatementResult;
 use novarocks_protocol::{lifecycle::QueryOptions, novarocks};
 
 #[derive(Clone, Debug, Eq, PartialEq)]

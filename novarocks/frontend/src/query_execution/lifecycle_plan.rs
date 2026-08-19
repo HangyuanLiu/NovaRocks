@@ -19,11 +19,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use crate::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, ResolvedQueryOptions,
 };
 use crate::query_execution::schedule::FragmentLifecycleProjection;
-use ::novarocks::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::common;
@@ -108,7 +108,7 @@ fn protocol_backend_identity(
     .map_err(protocol_contract_error)
 }
 
-fn protocol_unique_id(id: ::novarocks::common::types::UniqueId) -> common::UniqueId {
+fn protocol_unique_id(id: novarocks_types::UniqueId) -> common::UniqueId {
     common::UniqueId {
         hi: id.high(),
         lo: id.low(),
@@ -618,14 +618,14 @@ mod tests {
     use std::time::Duration;
 
     use super::{QueryInitOptions, compile_query_init_plan};
+    use crate::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
     use crate::query_execution::contract::{QueryId, ResolvedQueryOptions};
     use crate::query_execution::schedule::FragmentLifecycleProjection;
-    use ::novarocks::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
-    use ::novarocks::common::types::UniqueId;
     use novarocks_protocol::lifecycle::{
         AttemptId, ParticipantRole, QueryExecutionId, QueryOptions, RuntimeFilterContribution,
     };
     use novarocks_protocol::novarocks;
+    use novarocks_types::UniqueId;
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(

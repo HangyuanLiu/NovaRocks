@@ -574,7 +574,7 @@ fn prepare_frontend_first_refresh_write(
     }
     let planning_lease = match retained_repartition_target {
         Some(retained) => retained.binding.lease().clone(),
-        None => novarocks::connector::acquire_metadata_planning_lease(
+        None => crate::connector::acquire_metadata_planning_lease(
             source.connector_control(),
             &target.catalog,
         )?,

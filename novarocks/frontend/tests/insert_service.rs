@@ -23,11 +23,11 @@ use std::time::{Duration, Instant};
 use arrow::datatypes::DataType;
 use bytes::Bytes;
 use common::coordination_fixture::JournalInspect;
-use novarocks::common::admitted_query_context::{RequestAdmission, RequestContext};
-use novarocks::common::backend_topology::BackendTopologySnapshot;
-use novarocks::common::query_cancellation::QueryCancellationSource;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_frontend::FrontendStatisticsService;
+use novarocks_frontend::common::admitted_query_context::{RequestAdmission, RequestContext};
+use novarocks_frontend::common::backend_topology::BackendTopologySnapshot;
+use novarocks_frontend::common::query_cancellation::QueryCancellationSource;
 use novarocks_frontend::dml::model::DML_OPERATION_SCHEMA_VERSION;
 use novarocks_frontend::dml::{
     CreatePreparingRequest, DmlError, DmlErrorKind, DmlOperationId, DmlService, OperationFact,

@@ -23,7 +23,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::mv::domain::refresh::execution_context::MvRefreshPruningLimits;
-use novarocks::runtime::query_result::record_batch_to_chunk;
+use crate::runtime::query_result::record_batch_to_chunk;
 use novarocks_execution::exec::change_op::{ChangeOp, change_op_array, change_op_field};
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_execution::exec::mv::aggregate_state::{

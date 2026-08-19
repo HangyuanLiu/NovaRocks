@@ -46,7 +46,7 @@ pub(crate) const INFORMATION_SCHEMA_DB: &str = "information_schema";
 // AST rewriter: substitute virtual-table refs with a VALUES derived table.
 // ---------------------------------------------------------------------------
 //
-// StarRocks routes information_schema scans through a `SchemaScanNode` that
+// StarRocks routes information_schema scans through a dedicated scan node that
 // produces rows at the BE; NovaRocks standalone has no equivalent BE-side
 // generator, so we materialize rows here against the frontend-injected leaf
 // ports
@@ -183,17 +183,15 @@ fn rewrite_table_factor(
                     // Unknown catalogs remain untouched so downstream resolution
                     // preserves its normal error. Every successful admission keeps
                     // one lease for the complete namespace lookup.
-                    let context = novarocks::connector::connector_request_context(
+                    let context = crate::connector::connector_request_context(
                         None,
                         Arc::new(AtomicBool::new(false)),
                     )?;
-                    match novarocks::connector::acquire_metadata_planning_lease(
-                        connector_control,
-                        cat,
-                    ) {
+                    match crate::connector::acquire_metadata_planning_lease(connector_control, cat)
+                    {
                         Ok(lease) => {
                             let namespaces =
-                                novarocks::connector::metadata_list_namespaces_with_planning_lease(
+                                crate::connector::metadata_list_namespaces_with_planning_lease(
                                     lease, context,
                                 )?;
                             let mut databases = namespaces

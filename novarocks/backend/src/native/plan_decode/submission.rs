@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use novarocks::connector::ConnectorRegistry;
+use crate::connector::ConnectorRegistry;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::fragment::program::{
     FragmentContractVersion, FragmentProgram, FragmentProgramOptions, FragmentSinkSpec,
@@ -187,8 +187,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::connector::ConnectorRegistry;
     use arrow::datatypes::DataType;
-    use novarocks::connector::ConnectorRegistry;
     use novarocks_execution::exec::fragment::program::FragmentSinkKind;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_protocol::ProtocolErrorKind;

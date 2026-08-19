@@ -28,8 +28,8 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::connector::backend::ResolvedTableStatisticsPin;
 use arrow::datatypes::SchemaRef;
-use novarocks::connector::backend::ResolvedTableStatisticsPin;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
     ConnectorWritePreparation,
@@ -320,7 +320,7 @@ impl QueryTableBinding {
 /// tests. The SQL scan itself comes from a sealed SQL fixture; this helper
 /// only pairs its opaque request-local token with one provider-sealed change
 /// window and never exposes a planner table constructor.
-#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+#[cfg(test)]
 pub fn admitted_change_window_binding_for_test(
     binding: SqlTableBindingId,
     from_snapshot_id: i64,
@@ -387,7 +387,7 @@ impl QueryTableBindingStore {
     /// fixtures.  Production admission must always use `try_new`, which
     /// allocates a process-unique scope.  Tests use this only alongside
     /// `test_sql_scan_source`, whose token has the same fixed scope.
-    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+    #[cfg(test)]
     pub fn try_new_with_scope_for_test(scope: NonZeroU64) -> Self {
         Self {
             allocator: Mutex::new(
@@ -696,7 +696,7 @@ impl QueryTableBindingStore {
         self.binding(id).ok()
     }
 
-    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+    #[cfg(test)]
     pub fn insert_strict_base_binding_for_test(
         &self,
         catalog: &str,

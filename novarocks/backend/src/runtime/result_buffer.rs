@@ -18,10 +18,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
-use novarocks::common::result_batch::ResultBatch;
-use novarocks::common::types::{FetchResult, UniqueId};
+use crate::runtime::result_batch::{FetchResult, ResultBatch};
 use novarocks_execution::runtime::fragment::io::ResultAbort;
 use novarocks_execution::runtime::mem_tracker::{MemTracker, TrackedBytes};
+use novarocks_types::UniqueId;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum ResultBufferMode {

@@ -16,7 +16,30 @@
 // under the License.
 
 mod execution_host;
+pub(crate) mod runtime;
+
+#[cfg(test)]
+mod runtime_test;
 
 pub use execution_host::{
     ConnectorExecutionHost, ConnectorExecutionLease, ConnectorExecutionQueryResolver,
 };
+
+/// Backend-local token passed through native plan decoding.
+///
+/// Connector execution bindings are resolved by the backend execution host;
+/// this value only preserves the established decode assembly boundary.
+#[derive(Clone, Default)]
+pub(crate) struct ConnectorRegistry;
+
+impl ConnectorRegistry {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+}
+
+impl std::fmt::Debug for ConnectorRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ConnectorRegistry").finish()
+    }
+}

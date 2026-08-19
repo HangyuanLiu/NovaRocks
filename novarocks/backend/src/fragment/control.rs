@@ -63,11 +63,11 @@ impl FragmentControlRegistry {
                     .count(),
             )
         };
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "fragment_controls_reserved",
             reserved,
         );
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "fragment_controls_running",
             running,
         );
@@ -107,11 +107,11 @@ impl FragmentControlRegistry {
                 .count(),
         );
         drop(state);
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "fragment_controls_reserved",
             snapshot.0,
         );
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "fragment_controls_running",
             snapshot.1,
         );
@@ -185,11 +185,11 @@ impl FragmentControlRegistry {
                 .count(),
         );
         drop(state);
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "fragment_controls_reserved",
             snapshot.0,
         );
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "fragment_controls_running",
             snapshot.1,
         );
@@ -218,11 +218,11 @@ impl FragmentControlRegistry {
                 .count(),
         );
         drop(state);
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "fragment_controls_reserved",
             snapshot.0,
         );
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "fragment_controls_running",
             snapshot.1,
         );

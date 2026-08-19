@@ -16,8 +16,8 @@
 // under the License.
 
 use bytes::Bytes;
-use novarocks::maintenance::MaintenanceTarget;
 use novarocks_frontend::dml::{DmlErrorKind, DmlOperationId};
+use novarocks_frontend::maintenance::MaintenanceTarget;
 use novarocks_frontend::query_execution::maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
     MaintenanceTargetRebind, TableMaintenanceEngine,

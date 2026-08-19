@@ -139,7 +139,7 @@ pub(crate) fn load_mv_target_binding_with_ports(
     connector_context: &ConnectorRequestContext,
 ) -> Result<MvTargetBinding, String> {
     let exact_lease =
-        novarocks::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
+        crate::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
     load_mv_target_binding_with_lease_and_ports(
         storage_observation,
         table,
@@ -166,7 +166,7 @@ pub fn load_mv_target_binding_with_lease_and_ports(
             table.catalog
         ));
     }
-    let metadata = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &exact_lease,
         connector_context.clone(),
         &table.namespace,
@@ -321,7 +321,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
-            &novarocks::connector::test_request_context(),
+            &crate::connector::test_request_context(),
         )
         .expect("valid planning facts");
 

@@ -38,6 +38,7 @@ use sqlparser::ast as sqlast;
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::catalog_application::resolver::{TargetBackend, resolve_existing_table_target};
+use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::dml::delete::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
@@ -46,7 +47,6 @@ use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
     admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
-use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::ConnectorRowMutationStrategy;
 use novarocks_spi::connector::ConnectorWriteOperationId;
@@ -93,7 +93,7 @@ pub(crate) fn prepare_delete_statement(
             target.backend_name
         ));
     }
-    let target_binding = novarocks::connector::write_target::load_write_target_binding(
+    let target_binding = crate::connector::write_target::load_write_target_binding(
         state.connector_control().as_ref(),
         &target.catalog,
         &target.namespace,

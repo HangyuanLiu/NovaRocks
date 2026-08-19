@@ -242,14 +242,14 @@ fn parse_query(sql: &str) -> Query {
 
 fn query_result(
     result: Option<ViewStatementResult>,
-) -> novarocks::runtime::query_result::QueryResult {
+) -> novarocks_frontend::runtime::query_result::QueryResult {
     let Some(ViewStatementResult::Query(result)) = result else {
         panic!("expected query result");
     };
     result
 }
 
-fn query_rows(result: &novarocks::runtime::query_result::QueryResult) -> Vec<String> {
+fn query_rows(result: &novarocks_frontend::runtime::query_result::QueryResult) -> Vec<String> {
     result
         .chunks
         .iter()
@@ -268,7 +268,7 @@ fn query_rows(result: &novarocks::runtime::query_result::QueryResult) -> Vec<Str
 }
 
 fn query_rows_at(
-    result: &novarocks::runtime::query_result::QueryResult,
+    result: &novarocks_frontend::runtime::query_result::QueryResult,
     column: usize,
 ) -> Vec<String> {
     result

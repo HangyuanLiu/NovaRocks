@@ -1108,7 +1108,7 @@ mod tests {
             _prepared: crate::query_execution::mv_assembly::refresh_handoff::PreparedMvRefreshWrite,
             _planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
             _exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
-            _execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+            _execution: &crate::common::admitted_query_context::QueryExecutionContext,
         ) -> Result<crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly, String>
         {
             unreachable!("recovery never activates a writer")

@@ -42,8 +42,8 @@ pub(crate) fn observe_schema_validation_for_table(
     connector_context: &ConnectorRequestContext,
 ) -> Result<MvSchemaValidationObservation, String> {
     let exact_lease =
-        novarocks::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
-    let metadata = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+        crate::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &exact_lease,
         connector_context.clone(),
         &table.namespace,

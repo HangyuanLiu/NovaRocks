@@ -74,11 +74,11 @@ impl ConnectorExecutionHost {
                 state.query_leases.values().map(BTreeSet::len).sum(),
             )
         };
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "connector_query_leases",
             query_leases,
         );
-        novarocks::service::publish_backend_query_execution_resource(
+        crate::metrics::publish_backend_query_execution_resource(
             "connector_binding_leases",
             binding_leases,
         );
@@ -371,11 +371,11 @@ fn release_query(
             .sum::<usize>(),
     );
     drop(guard);
-    novarocks::service::publish_backend_query_execution_resource(
+    crate::metrics::publish_backend_query_execution_resource(
         "connector_query_leases",
         query_leases,
     );
-    novarocks::service::publish_backend_query_execution_resource(
+    crate::metrics::publish_backend_query_execution_resource(
         "connector_binding_leases",
         binding_leases,
     );

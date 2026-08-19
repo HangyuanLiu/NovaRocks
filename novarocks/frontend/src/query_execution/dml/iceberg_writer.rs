@@ -26,6 +26,8 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::Field;
 
 use crate::catalog_application::resolver::TargetBackend;
+use crate::common::admitted_query_context::QueryExecutionContext;
+use crate::connector::backend::ResolvedTable;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
@@ -35,8 +37,6 @@ use crate::query_execution::write_transaction::{
     IcebergWriteCommitPolicy, IcebergWriteSource, IcebergWriteTransactionSpec,
     IcebergWriteValidationPolicy,
 };
-use ::novarocks::common::admitted_query_context::QueryExecutionContext;
-use novarocks::connector::backend::ResolvedTable;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::ColumnDefault;
 use novarocks_catalog::schema::SqlType;
@@ -157,8 +157,8 @@ pub(crate) fn prepare_iceberg_write_with_options(
     // commit must not be able to split one statement across two generations.
     // What comes back is neutral -- Arrow schema, bounded planning facts and an
     // opaque handle -- so this layer no longer holds a concrete Iceberg table.
-    let write_target = novarocks::connector::write_target::ConnectorWriteTargetBinding::new(
-        novarocks::connector::metadata_load_connector_table_with_planning_lease(
+    let write_target = crate::connector::write_target::ConnectorWriteTargetBinding::new(
+        crate::connector::metadata_load_connector_table_with_planning_lease(
             &planning_lease,
             connector_context.clone(),
             &target.namespace,
@@ -209,7 +209,7 @@ fn prepare_iceberg_distributed_write(
     source: &IcebergWriteInput,
     overwrite_mode: IcebergWriteMode,
     target_ref: &str,
-    write_target: &novarocks::connector::write_target::ConnectorWriteTargetBinding,
+    write_target: &crate::connector::write_target::ConnectorWriteTargetBinding,
     execution: Option<QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     options: IcebergWritePreparationOptions,

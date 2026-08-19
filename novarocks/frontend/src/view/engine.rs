@@ -27,7 +27,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::catalog_application::query_catalog::CatalogServiceSource;
 use crate::query_execution::kernels::ViewExecutionKernel;
-use ::novarocks::runtime::query_result::QueryResult;
+use crate::runtime::query_result::QueryResult;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
@@ -218,11 +218,11 @@ where
         target: &ViewTarget,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalViewResolution, String> {
-        let lease = novarocks::connector::acquire_metadata_planning_lease(
+        let lease = crate::connector::acquire_metadata_planning_lease(
             self.connector_control(),
             &target.catalog,
         )?;
-        if novarocks::connector::metadata_table_exists_with_planning_lease(
+        if crate::connector::metadata_table_exists_with_planning_lease(
             lease.clone(),
             context.clone(),
             &target.database,
@@ -285,7 +285,7 @@ where
             .collect::<Result<Vec<_>, String>>()?;
         let instance_id = ConnectorInstanceId::parse(&request.target.catalog)
             .map_err(|error| error.to_string())?;
-        novarocks::connector::mutation::execute_catalog_mutation(
+        crate::connector::mutation::execute_catalog_mutation(
             self.connector_control(),
             &instance_id,
             ConnectorCatalogMutationOperation::CreateView {
@@ -326,7 +326,7 @@ where
     ) -> Result<(), String> {
         let instance_id =
             ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
-        novarocks::connector::mutation::execute_catalog_mutation(
+        crate::connector::mutation::execute_catalog_mutation(
             self.connector_control(),
             &instance_id,
             ConnectorCatalogMutationOperation::DropView {
@@ -347,7 +347,7 @@ where
         target: &ViewTarget,
         context: &ConnectorRequestContext,
     ) -> Result<Option<ResolvedExternalView>, String> {
-        let lease = novarocks::connector::acquire_metadata_planning_lease(
+        let lease = crate::connector::acquire_metadata_planning_lease(
             self.connector_control(),
             &target.catalog,
         )?;
@@ -389,10 +389,8 @@ where
         database: &str,
         context: &ConnectorRequestContext,
     ) -> Result<Vec<String>, String> {
-        let lease = novarocks::connector::acquire_metadata_planning_lease(
-            self.connector_control(),
-            catalog,
-        )?;
+        let lease =
+            crate::connector::acquire_metadata_planning_lease(self.connector_control(), catalog)?;
         let binding = lease.binding();
         let Some(capability) = binding.view_metadata() else {
             return Err(ConnectorError::new(

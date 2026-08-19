@@ -23,6 +23,12 @@ use std::time::{Duration, Instant};
 
 use crate::catalog_application::command::CatalogCommandExecutor;
 use crate::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
+use crate::common::admitted_query_context::{
+    RequestAdmission, RequestContext, SessionOptimizerSettings,
+};
+use crate::common::backend_topology::BackendTopologyService;
+use crate::common::engine_error::EngineError;
+use crate::common::query_cancellation::QueryCancellationReason;
 use crate::mv::command::MvCommandExecutor;
 use crate::query_execution::backend_command::BackendCommandExecutor;
 use crate::query_execution::control::{
@@ -41,17 +47,11 @@ use crate::query_execution::maintenance::command::{
 };
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::{PreparedQueryOperation, StatementResult};
+use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
     QuerySessionOpenRequest, SessionExecutionSettings,
 };
-use ::novarocks::common::admitted_query_context::{
-    RequestAdmission, RequestContext, SessionOptimizerSettings,
-};
-use ::novarocks::common::backend_topology::BackendTopologyService;
-use ::novarocks::common::engine_error::{EngineError, EngineErrorCode};
-use ::novarocks::common::query_cancellation::QueryCancellationReason;
-use ::novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -59,7 +59,7 @@ use async_trait::async_trait;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 use novarocks_protocol::lifecycle::QueryOptions;
-use novarocks_types::ClusterRole;
+use novarocks_types::{ClusterRole, EngineErrorCode};
 use tokio::task;
 
 use crate::dml::DmlService;
@@ -123,7 +123,7 @@ impl CoreCommandRoute for TypedCommandRoute {
         context: &RequestContext,
         query_options: QueryOptions,
     ) -> Result<StatementResult, String> {
-        let connector_context = novarocks::connector::connector_request_context_for_query(
+        let connector_context = crate::connector::connector_request_context_for_query(
             Some(&query_options),
             context.execution().cancellation().clone(),
         )?;
@@ -1377,6 +1377,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::common::admitted_query_context::QueryExecutionContext;
+    use crate::common::backend_topology::BackendTopologySnapshot;
+    use crate::common::query_cancellation::QueryCancellationSource;
     use crate::query_execution::dml::delete::{
         DeleteCommit, DeleteEngine, DeleteOperation, DeletePrepared, DeleteWriteReport,
         PrepareDeleteRequest, PreparedDelete,
@@ -1389,9 +1392,6 @@ mod tests {
         MutationAbort, MutationCommit, MutationEngine, MutationPrepared, MutationStageOutcome,
         PrepareMutationRequest, PreparedMutation,
     };
-    use ::novarocks::common::admitted_query_context::QueryExecutionContext;
-    use ::novarocks::common::backend_topology::BackendTopologySnapshot;
-    use ::novarocks::common::query_cancellation::QueryCancellationSource;
     use novarocks_catalog::schema::ColumnDef;
 
     fn default_query_options() -> QueryOptions {

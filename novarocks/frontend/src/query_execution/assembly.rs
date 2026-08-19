@@ -30,9 +30,9 @@ use crate::query_execution::preparation::{
     PreparedFragmentRole, PreparedFragmentSet, PreparedOutputColumn,
 };
 use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
-use novarocks::novarocks_logging::debug;
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdge, FragmentEdgeKind, FragmentId};
+use tracing::debug;
 
 pub(crate) fn align_fetch_chunks_to_output_columns(
     chunks: Vec<Chunk>,
@@ -216,7 +216,7 @@ pub fn ensure_native_fragment_sink_supported(
 pub fn patch_native_connector_write_sink(
     fragment: &mut novarocks_protocol::plan::PlanFragment,
     fragment_id: FragmentId,
-    fragment_instance_id: ::novarocks::common::types::UniqueId,
+    fragment_instance_id: novarocks_types::UniqueId,
     backend_num: i32,
     handle: &ConnectorWriterHandle,
 ) -> Result<(), String> {
@@ -235,7 +235,7 @@ pub fn patch_native_connector_write_sink(
 fn patch_native_connector_write_sink_in_place(
     fragment: &mut novarocks_protocol::plan::PlanFragment,
     fragment_id: FragmentId,
-    fragment_instance_id: ::novarocks::common::types::UniqueId,
+    fragment_instance_id: novarocks_types::UniqueId,
     backend_num: i32,
     handle: &ConnectorWriterHandle,
 ) -> Result<(), String> {
@@ -330,7 +330,7 @@ fn patch_native_connector_write_sink_in_place(
     Ok(())
 }
 
-fn unique_id_bytes(value: ::novarocks::common::types::UniqueId) -> [u8; 16] {
+fn unique_id_bytes(value: novarocks_types::UniqueId) -> [u8; 16] {
     let mut bytes = [0; 16];
     bytes[..8].copy_from_slice(&value.high().to_be_bytes());
     bytes[8..].copy_from_slice(&value.low().to_be_bytes());
@@ -935,12 +935,12 @@ mod tests {
     };
 
     use super::*;
-    use ::novarocks::common::types::UniqueId;
     use novarocks_execution::exec::chunk::ChunkSchema;
     use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
     use novarocks_protocol::plan as native_plan;
     use novarocks_sql::plan_read::{DataPartition, FragmentStreamKind};
     use novarocks_types::SlotId;
+    use novarocks_types::UniqueId;
 
     fn placement(fragment_id: FragmentId, instance_lo: i64) -> FragmentInstancePlacement {
         FragmentInstancePlacement {

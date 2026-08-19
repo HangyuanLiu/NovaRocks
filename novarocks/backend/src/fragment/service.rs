@@ -22,12 +22,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+use crate::connector::ConnectorRegistry;
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use crate::runtime::sink_commit::{BackendSinkCommitPort, ConfiguredBackendSinkCommitPort};
-use novarocks::connector::ConnectorRegistry;
-use novarocks::novarocks_logging::error;
-#[cfg(test)]
-use novarocks::novarocks_logging::warn;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_execution::runtime::fragment::io::{
     ExchangeFrameTransmitter, ExchangeReceiverPort, FragmentCommitPort, FragmentResultWriter,
@@ -43,6 +40,9 @@ use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorRequestContext,
     WriteCommitEvidenceLimits,
 };
+use tracing::error;
+#[cfg(test)]
+use tracing::warn;
 
 use super::control::{FragmentControlHandle, FragmentControlRegistry};
 #[cfg(test)]
@@ -100,27 +100,18 @@ fn test_execution_runtime() -> Arc<ExecutionRuntime> {
 #[cfg(debug_assertions)]
 fn runner_stage_prepare_failure(
     available_fragments: usize,
-) -> Result<
-    Option<novarocks::common::query_lifecycle_fault::StagePrepareFailure>,
-    NativeFragmentIngressError,
-> {
-    let Some(root) = novarocks::common::query_lifecycle_fault::configured_root() else {
+) -> Result<Option<novarocks_failpoint::StagePrepareFailure>, NativeFragmentIngressError> {
+    let Some(root) = novarocks_failpoint::configured_root() else {
         return Ok(None);
     };
-    novarocks::common::query_lifecycle_fault::claim_stage_prepare_failure(
-        &root,
-        available_fragments,
-    )
-    .map_err(NativeFragmentIngressError::new)
+    novarocks_failpoint::claim_stage_prepare_failure(&root, available_fragments)
+        .map_err(NativeFragmentIngressError::new)
 }
 
 #[cfg(not(debug_assertions))]
 fn runner_stage_prepare_failure(
     _available_fragments: usize,
-) -> Result<
-    Option<novarocks::common::query_lifecycle_fault::StagePrepareFailure>,
-    NativeFragmentIngressError,
-> {
+) -> Result<Option<novarocks_failpoint::StagePrepareFailure>, NativeFragmentIngressError> {
     Ok(None)
 }
 
@@ -814,7 +805,7 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
-    use novarocks::connector::ConnectorRegistry;
+    use crate::connector::ConnectorRegistry;
     use novarocks_execution::runtime::fragment::{
         DormantFragmentHandle, FragmentOutcome, prepare_fragment,
     };

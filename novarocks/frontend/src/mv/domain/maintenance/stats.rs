@@ -114,7 +114,7 @@ pub fn collect_table_stats_with_ports(
     table: &str,
     definitions: &[StoredMvDefinition],
 ) -> Result<TableMaintenanceStats, String> {
-    let context = novarocks::connector::connector_request_context(
+    let context = crate::connector::connector_request_context(
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )?;
@@ -126,7 +126,7 @@ pub fn collect_table_stats_with_ports(
     };
 
     let max_compactable_data_files =
-        novarocks::connector::metadata_maintenance::read_max_compactable_data_files(
+        crate::connector::metadata_maintenance::read_max_compactable_data_files(
             connector_control,
             &instance_id,
             identity,
@@ -139,8 +139,8 @@ pub fn collect_table_stats_with_ports(
         })?;
 
     let exact_lease =
-        novarocks::connector::acquire_metadata_planning_lease(connector_control, catalog)?;
-    let metadata = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+        crate::connector::acquire_metadata_planning_lease(connector_control, catalog)?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &exact_lease,
         context.clone(),
         namespace,

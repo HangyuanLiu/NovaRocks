@@ -24,6 +24,11 @@ use super::background::{
     MvBackgroundBindings, MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
     MvBackgroundEngineSink,
 };
+use crate::common::admitted_query_context::{
+    RequestAdmission, RequestContext, SessionOptimizerSettings,
+};
+use crate::common::backend_topology::BackendTopologyService;
+use crate::common::query_cancellation::QueryCancellationSource;
 use crate::mv::domain::application::{
     MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine, MvRequestContext,
     MvStatementResult,
@@ -35,11 +40,6 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefresh, PreparedMvRefreshWork,
 };
 use crate::query_execution::service::QueryExecutionService;
-use ::novarocks::common::admitted_query_context::{
-    RequestAdmission, RequestContext, SessionOptimizerSettings,
-};
-use ::novarocks::common::backend_topology::BackendTopologyService;
-use ::novarocks::common::query_cancellation::QueryCancellationSource;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 
 use super::{
@@ -257,7 +257,7 @@ impl FrontendMvService {
         &self,
         refresh_plan: PreparedMvRefresh,
         connector_context: ConnectorRequestContext,
-        execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+        execution: &crate::common::admitted_query_context::QueryExecutionContext,
     ) -> Result<MvStatementResult, MvApplicationError> {
         let dependencies = self.refresh.as_ref().ok_or_else(|| {
             MvApplicationError::new(
@@ -280,7 +280,7 @@ impl FrontendMvService {
         statement: novarocks_sql::planning::mv::MvRefreshStatement,
         target: crate::mv::domain::repository::MvTarget,
         connector_context: ConnectorRequestContext,
-        execution: &::novarocks::common::admitted_query_context::QueryExecutionContext,
+        execution: &crate::common::admitted_query_context::QueryExecutionContext,
     ) -> Result<MvStatementResult, MvApplicationError> {
         let mut gate_ticket = self
             .activity_gate
@@ -592,7 +592,7 @@ fn run_scheduled_refreshes(
 fn execute_scheduled_refresh(
     dependencies: &RefreshWorkerDependencies,
     request: &ScheduledRefreshRequest,
-    cancellation: Option<::novarocks::common::query_cancellation::QueryCancellationView>,
+    cancellation: Option<crate::common::query_cancellation::QueryCancellationView>,
 ) -> ScheduledRefreshDisposition {
     let cancellation = cancellation.unwrap_or_else(|| QueryCancellationSource::new().view());
     if scheduled_refresh_test_barrier(&request.target, &cancellation) {
@@ -624,7 +624,7 @@ fn execute_scheduled_refresh(
             ..SessionOptimizerSettings::default()
         },
     ));
-    let connector_context = match novarocks::connector::connector_request_context_for_execution(
+    let connector_context = match crate::connector::connector_request_context_for_execution(
         None,
         context.execution(),
     ) {
@@ -677,7 +677,7 @@ fn execute_scheduled_refresh(
 #[cfg(debug_assertions)]
 fn scheduled_refresh_test_barrier(
     target: &crate::mv::domain::repository::MvTarget,
-    cancellation: &::novarocks::common::query_cancellation::QueryCancellationView,
+    cancellation: &crate::common::query_cancellation::QueryCancellationView,
 ) -> bool {
     let Some(directory) = std::env::var_os("NOVAROCKS_MVX4_SCHEDULER_TEST_DIR") else {
         return false;
@@ -698,7 +698,7 @@ fn scheduled_refresh_test_barrier(
 #[cfg(not(debug_assertions))]
 fn scheduled_refresh_test_barrier(
     _target: &crate::mv::domain::repository::MvTarget,
-    _cancellation: &::novarocks::common::query_cancellation::QueryCancellationView,
+    _cancellation: &crate::common::query_cancellation::QueryCancellationView,
 ) -> bool {
     false
 }

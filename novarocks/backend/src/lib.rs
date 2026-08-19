@@ -1,7 +1,9 @@
 mod application;
+mod config;
 pub mod connector;
 mod exchange_receiver;
 mod fragment;
+mod metrics;
 pub(crate) mod native;
 mod query_lifecycle;
 mod runtime;
@@ -10,8 +12,7 @@ mod service;
 
 pub use application::{
     BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-    BackendServerConfig, BackendStoreSettings, run_backend_server_until_shutdown,
-    run_backend_server_until_signal,
+    BackendServerConfig, run_backend_server_until_shutdown, run_backend_server_until_signal,
 };
 pub use connector::{
     ConnectorExecutionHost, ConnectorExecutionLease, ConnectorExecutionQueryResolver,

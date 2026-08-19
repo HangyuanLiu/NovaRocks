@@ -98,7 +98,7 @@ fn provider_neutral_repository_preserves_create_refresh_partition_and_dependency
                     refresh_id: refresh.refresh_id,
                     rows: 3,
                     base_snapshots: BTreeMap::new(),
-                    base_table_uuids: BTreeMap::new(),
+                    base_table_object_ids: BTreeMap::new(),
                     target_snapshot_id: Some(7),
                     partition_spec: None,
                 },

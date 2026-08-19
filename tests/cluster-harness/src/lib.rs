@@ -18,6 +18,10 @@
 use anyhow::{Context, Result, bail};
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
+use novarocks_failpoint::{
+    QueryLifecycleFaultKind, arm_path as lifecycle_arm_path, cleanup_trigger_path,
+    parse_cleanup_fault_directive, parse_runner_rfo_kind,
+};
 use novarocks_test_support::{ManagedProcess, ReadyMarker, ReservedTcpPort};
 use std::collections::BTreeMap;
 use std::fs;
@@ -578,33 +582,102 @@ fn scrape_prometheus_metrics(port: u16) -> Result<String> {
     let mut stream = TcpStream::connect_timeout(
         &address
             .parse()
-            .with_context(|| format!("parse BE metrics address {address}"))?,
+            .with_context(|| format!("parse metrics address {address}"))?,
         TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
     )
-    .with_context(|| format!("connect BE metrics endpoint {address}"))?;
+    .with_context(|| format!("connect metrics endpoint {address}"))?;
     stream
         .set_read_timeout(Some(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP))
-        .context("set BE metrics read timeout")?;
+        .context("set metrics read timeout")?;
     stream
         .set_write_timeout(Some(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP))
-        .context("set BE metrics write timeout")?;
+        .context("set metrics write timeout")?;
     stream
         .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .context("request BE /metrics")?;
+        .context("request /metrics")?;
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
-        .context("read BE /metrics response")?;
+        .context("read /metrics response")?;
     let (headers, body) = response
         .split_once("\r\n\r\n")
-        .context("malformed BE /metrics HTTP response")?;
+        .context("malformed /metrics HTTP response")?;
     if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
         bail!(
-            "BE /metrics returned non-success status: {}",
+            "/metrics returned non-success status: {}",
             headers.lines().next().unwrap_or("<missing status>")
         );
     }
     Ok(body.to_string())
+}
+
+const FRONTEND_METRIC_FAMILIES: [&str; 8] = [
+    "novarocks_fragment_scheduled_total",
+    "novarocks_heartbeat_rtt_seconds",
+    "novarocks_live_backends",
+    "novarocks_backends",
+    "novarocks_frontend_query_lifecycle_active_attempts",
+    "novarocks_frontend_query_lifecycle_init_total",
+    "novarocks_frontend_query_lifecycle_control_total",
+    "novarocks_frontend_query_lifecycle_latency_micros",
+];
+
+const BACKEND_METRIC_FAMILIES: [&str; 5] = [
+    "novarocks_backend_query_lifecycle_entries",
+    "novarocks_backend_query_lifecycle_rejections",
+    "novarocks_backend_query_lifecycle_terminations",
+    "novarocks_backend_query_lifecycle_terminal_total",
+    "novarocks_backend_query_execution_resources",
+];
+
+fn assert_contains_metric_families(body: &str, families: &[&str], endpoint: &str) -> Result<()> {
+    for family in families {
+        if !body.contains(family) {
+            bail!("{endpoint} is missing required metric family {family}");
+        }
+    }
+    Ok(())
+}
+
+fn assert_excludes_metric_families(body: &str, families: &[&str], endpoint: &str) -> Result<()> {
+    for family in families {
+        if body.contains(family) {
+            bail!("{endpoint} unexpectedly exposes foreign metric family {family}");
+        }
+    }
+    Ok(())
+}
+
+/// The harness owns the production-shaped role boundary: every 1FE+NBE start
+/// must prove the process metrics listener did not leak the other role's
+/// registered metric families before a query is admitted.
+fn assert_role_scoped_metrics(runtime: &CrossProcessRuntime) -> Result<()> {
+    let frontend = scrape_prometheus_metrics(runtime.fe_http_port)
+        .context("scrape cross-process FE /metrics")?;
+    assert_contains_metric_families(
+        &frontend,
+        &FRONTEND_METRIC_FAMILIES,
+        "cross-process FE /metrics",
+    )?;
+    assert_excludes_metric_families(
+        &frontend,
+        &BACKEND_METRIC_FAMILIES,
+        "cross-process FE /metrics",
+    )?;
+
+    for (index, be) in runtime.be.iter().enumerate() {
+        let backend = scrape_prometheus_metrics(be.http)
+            .with_context(|| format!("scrape cross-process BE[{index}] /metrics"))?;
+        let endpoint = format!("cross-process BE[{index}] /metrics");
+        assert_contains_metric_families(&backend, &BACKEND_METRIC_FAMILIES, &endpoint)?;
+        assert_excludes_metric_families(&backend, &FRONTEND_METRIC_FAMILIES, &endpoint)?;
+    }
+    println!(
+        "cross-process role-scoped metrics barrier PASS: FE={} BE={}",
+        runtime.fe_http_port,
+        runtime.be.len()
+    );
+    Ok(())
 }
 
 fn prometheus_labeled_gauge(
@@ -1102,47 +1175,49 @@ impl QueryLifecycleFaultFiles {
     }
 
     fn init_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "init-ack-drop")
+        self.be_path(index, QueryLifecycleFaultKind::InitAckDrop)
     }
 
     fn heartbeat_stop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "heartbeat-stop")
+        self.be_path(index, QueryLifecycleFaultKind::HeartbeatStop)
     }
 
     fn restart_after_init_ack_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "restart-after-init-ack")
+        self.be_path(index, QueryLifecycleFaultKind::RestartAfterInitAck)
     }
 
     fn stage_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "stage-ack-drop")
+        self.be_path(index, QueryLifecycleFaultKind::StageAckDrop)
     }
 
     fn start_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "start-ack-drop")
+        self.be_path(index, QueryLifecycleFaultKind::StartAckDrop)
     }
 
     fn start_ack_suppress_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "start-ack-suppress")
+        self.be_path(index, QueryLifecycleFaultKind::StartAckSuppress)
     }
 
     fn terminal_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "terminal-ack-drop")
+        self.be_path(index, QueryLifecycleFaultKind::TerminalAckDrop)
     }
 
     fn terminal_snapshot_stream_drop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "terminal-snapshot-stream-drop")
+        self.be_path(index, QueryLifecycleFaultKind::TerminalSnapshotStreamDrop)
     }
 
     fn terminal_snapshot_conflict_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "terminal-snapshot-conflict")
+        self.be_path(index, QueryLifecycleFaultKind::TerminalSnapshotConflict)
     }
 
     fn heartbeat_stop_after_stage_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, "heartbeat-stop-after-stage")
+        self.be_path(index, QueryLifecycleFaultKind::HeartbeatStopAfterStage)
     }
 
     fn rfo_8r2_fault_path(&self, index: usize, kind: &'static str) -> Result<PathBuf> {
-        validate_rfo_8r2_fault_kind(kind)?;
+        let kind = parse_runner_rfo_kind(kind).ok_or_else(|| {
+            anyhow::anyhow!("unsupported RFO-8R2 query lifecycle fault kind {kind}")
+        })?;
         self.be_path(index, kind)
     }
 
@@ -1301,40 +1376,20 @@ impl QueryLifecycleFaultFiles {
         Ok(())
     }
 
-    fn be_path(&self, index: usize, kind: &str) -> Result<PathBuf> {
+    fn be_path(&self, index: usize, kind: QueryLifecycleFaultKind) -> Result<PathBuf> {
         if index >= self.be_count {
             bail!(
                 "BE index {index} is out of bounds for query lifecycle fault scope with {} BE(s)",
                 self.be_count
             );
         }
-        Ok(self.root.join(format!("be-{index}.{kind}.arm")))
+        Ok(lifecycle_arm_path(&self.root, index, kind))
     }
 }
 
 impl Drop for QueryLifecycleFaultFiles {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
-fn validate_rfo_8r2_fault_kind(kind: &str) -> Result<()> {
-    const KINDS: &[&str] = &[
-        "observation-p2-assembly-failure",
-        "observation-p2-budget-pressure",
-        "terminal-p0-retained-slot-exhausted",
-        "terminal-p0-bytes-exhausted",
-        "terminal-p0-delivery-permit-exhausted",
-        "terminal-p1-encode-failure",
-        "terminal-p1-retention-exhausted",
-        "terminal-proof-stream-drop",
-        "terminal-attestation-stream-drop",
-        "terminal-outcome-suppress",
-    ];
-    if KINDS.contains(&kind) {
-        Ok(())
-    } else {
-        bail!("unsupported RFO-8R2 query lifecycle fault kind {kind}")
     }
 }
 
@@ -1356,21 +1411,12 @@ impl CleanupFaultFiles {
     }
 
     fn arm(&self, kind: &str) -> Result<()> {
-        const ALLOWED: &[&str] = &[
-            "delete_failed",
-            "drop_delete_response",
-            "receipt_write_failed",
-            "checkpoint_failed",
-            "kill_fe_after_delete",
-        ];
-        if !ALLOWED.contains(&kind) {
-            bail!("unsupported connector cleanup fault {kind}");
-        }
-        let stem = kind.replace('_', "-");
-        let path = self.root.join(format!("{stem}.trigger"));
+        let kind = parse_cleanup_fault_directive(kind)
+            .ok_or_else(|| anyhow::anyhow!("unsupported connector cleanup fault {kind}"))?;
+        let path = cleanup_trigger_path(&self.root, kind);
         let token = next_fragment_failure_token(0);
         publish_query_lifecycle_fault_token(&path, &token, token.as_bytes())
-            .with_context(|| format!("publish connector cleanup fault {kind}"))
+            .with_context(|| format!("publish connector cleanup fault {}", kind.directive_name()))
     }
 
     fn clear(&self) -> Result<()> {
@@ -1631,6 +1677,8 @@ impl CrossProcessServerHandle {
             startup_timeout,
         )
         .context("cross-process backend topology barrier")?;
+        assert_role_scoped_metrics(&runtime)
+            .context("cross-process role-scoped metrics barrier")?;
 
         Ok(Self {
             target_host: "127.0.0.1".to_string(),
@@ -2438,7 +2486,7 @@ impl ServerHandle for CrossProcessServerHandle {
         if self.query_lifecycle_faults_enabled {
             command
                 .env(
-                    "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR",
+                    novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
                     self.query_lifecycle_fault_files.root(),
                 )
                 .env(
@@ -2542,7 +2590,7 @@ impl ServerHandle for CrossProcessServerHandle {
         let mut command = build_novarocks_command(&self.novarocks_bin, "fe", &self.fe_config_path);
         if self.query_lifecycle_faults_enabled {
             command.env(
-                "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR",
+                novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
                 self.query_lifecycle_fault_files.root(),
             );
         }
@@ -2551,7 +2599,7 @@ impl ServerHandle for CrossProcessServerHandle {
                 .cleanup_fault_files
                 .as_ref()
                 .expect("cleanup fault scope enabled");
-            command.env("NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR", files.root());
+            command.env(novarocks_failpoint::CLEANUP_FAULT_DIR_ENV, files.root());
         }
         apply_child_environment(&mut command, &self.fe_environment);
         self.fe_process
@@ -2728,7 +2776,10 @@ fn spawn_novarocks_process(launch: ProcessLaunch<'_>) -> Result<ManagedProcess> 
         );
     }
     if let Some((fault_dir, backend_index)) = query_lifecycle_fault_scope {
-        command.env("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR", fault_dir);
+        command.env(
+            novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
+            fault_dir,
+        );
         if let Some(backend_index) = backend_index {
             command.env(
                 "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
@@ -2737,7 +2788,7 @@ fn spawn_novarocks_process(launch: ProcessLaunch<'_>) -> Result<ManagedProcess> 
         }
     }
     if let Some(fault_dir) = cleanup_fault_dir {
-        command.env("NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR", fault_dir);
+        command.env(novarocks_failpoint::CLEANUP_FAULT_DIR_ENV, fault_dir);
     }
     apply_child_environment(&mut command, child_environment);
     let result = ManagedProcess::spawn(
@@ -3857,6 +3908,31 @@ enable_path_style_access = true
                 "native_query_contexts_active"
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn role_scoped_metrics_reject_foreign_role_families() {
+        let frontend = FRONTEND_METRIC_FAMILIES.join("\n");
+        assert_contains_metric_families(&frontend, &FRONTEND_METRIC_FAMILIES, "FE")
+            .expect("frontend body includes every frontend family");
+        assert_excludes_metric_families(&frontend, &BACKEND_METRIC_FAMILIES, "FE")
+            .expect("frontend body excludes backend families");
+
+        let backend = BACKEND_METRIC_FAMILIES.join("\n");
+        assert_contains_metric_families(&backend, &BACKEND_METRIC_FAMILIES, "BE")
+            .expect("backend body includes every backend family");
+        assert_excludes_metric_families(&backend, &FRONTEND_METRIC_FAMILIES, "BE")
+            .expect("backend body excludes frontend families");
+        let error = assert_excludes_metric_families(
+            &format!("{backend}\n{}", FRONTEND_METRIC_FAMILIES[0]),
+            &FRONTEND_METRIC_FAMILIES,
+            "BE",
+        )
+        .expect_err("backend leak must fail the role boundary");
+        assert!(
+            error.to_string().contains(FRONTEND_METRIC_FAMILIES[0]),
+            "{error:#}"
         );
     }
 

@@ -338,11 +338,11 @@ fn rewrite_time_travel_in_factor(
             // Time-travel fact resolution is catalog admission.  Resolve all
             // facts from one exact control generation; the synthetic table is
             // subsequently admitted by the query-local materializer.
-            let lease = novarocks::connector::acquire_metadata_planning_lease(
+            let lease = crate::connector::acquire_metadata_planning_lease(
                 resolver.connector_control(),
                 &target.catalog,
             )?;
-            let facts = novarocks::connector::metadata_read_reference_facts_with_planning_lease(
+            let facts = crate::connector::metadata_read_reference_facts_with_planning_lease(
                 lease,
                 connector_context.clone(),
                 &target.namespace,
@@ -429,7 +429,7 @@ pub(crate) fn external_schema_columns_for_statement(
     let materialization =
         crate::catalog_application::query_catalog::load_connector_table_materialization_with_lease(
             resolver.connector_control(),
-            novarocks::connector::connector_request_context(
+            crate::connector::connector_request_context(
                 None,
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )?,

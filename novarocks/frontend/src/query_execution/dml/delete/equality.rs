@@ -23,6 +23,7 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::catalog_application::resolver::resolve_existing_table_target;
 use crate::catalog_application::statement::AddEqualityDeleteStmt;
+use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::dml::delete::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
@@ -31,7 +32,6 @@ use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
     admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
-use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
@@ -57,7 +57,7 @@ pub(crate) fn prepare_equality_delete_statement(
             target.backend_name
         ));
     }
-    let planning_lease = novarocks::connector::acquire_metadata_planning_lease(
+    let planning_lease = crate::connector::acquire_metadata_planning_lease(
         state.connector_control().as_ref(),
         &target.catalog,
     )?;
@@ -83,7 +83,7 @@ pub(crate) fn prepare_equality_delete_statement(
     // arrive with the `Iceberg write admission denied:` prefix the SPI `Denied`
     // outcome adds, and they fire after column and literal validation rather
     // than before it.
-    let table_metadata = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+    let table_metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &planning_lease,
         connector_context.clone(),
         &target.namespace,
@@ -100,14 +100,13 @@ pub(crate) fn prepare_equality_delete_statement(
     // The durable operation journal records the snapshot this attempt is based
     // on. It is read through the same planning lease rather than a concrete
     // table, so this entry point no longer opens an Iceberg catalog.
-    let current_snapshot_id =
-        novarocks::connector::metadata_read_reference_facts_with_planning_lease(
-            planning_lease.clone(),
-            connector_context.clone(),
-            &target.namespace,
-            &target.table,
-        )?
-        .current_snapshot_id();
+    let current_snapshot_id = crate::connector::metadata_read_reference_facts_with_planning_lease(
+        planning_lease.clone(),
+        connector_context.clone(),
+        &target.namespace,
+        &target.table,
+    )?
+    .current_snapshot_id();
     // Route non-empty input through the distributed sink transaction.
     prepare_equality_delete_distributed_write(
         state,

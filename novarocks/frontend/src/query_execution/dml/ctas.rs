@@ -44,8 +44,8 @@ use novarocks_spi::connector::{
     CreatePolicy, ExternalMutationEvidence,
 };
 
+use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
-use ::novarocks::common::admitted_query_context::QueryExecutionContext;
 use novarocks_protocol::lifecycle::QueryOptions;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1374,7 +1374,7 @@ impl CtasEngine for DmlExecutionKernel {
         )
         .map_err(internal_failure)?;
         let context =
-            novarocks::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))
+            crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))
                 .map_err(internal_failure)?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(connector_failure)?;
@@ -1386,7 +1386,7 @@ impl CtasEngine for DmlExecutionKernel {
         // retained lease is the only foreground route; ordinary staged create
         // is intentionally not consulted.
         let (lease, write_lease) = derive_ctas_foreground_leases(&planning)?;
-        let exists = novarocks::connector::metadata_table_exists_with_planning_lease(
+        let exists = crate::connector::metadata_table_exists_with_planning_lease(
             planning.clone(),
             context.clone(),
             &target.namespace,
@@ -1453,7 +1453,7 @@ impl CtasEngine for DmlExecutionKernel {
         let query = parser
             .parse_query()
             .map_err(|error| internal_failure(error.to_string()))?;
-        let connector_context = novarocks::connector::connector_request_context_for_execution(
+        let connector_context = crate::connector::connector_request_context_for_execution(
             request.query_options.as_ref(),
             &request.execution,
         )
@@ -2172,9 +2172,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use ::novarocks::common::backend_topology::BackendTopologySnapshot;
-    use ::novarocks::common::backend_topology::LiveBackendTarget;
-    use ::novarocks::common::query_cancellation::QueryCancellationSource;
+    use crate::common::backend_topology::BackendTopologySnapshot;
+    use crate::common::backend_topology::LiveBackendTarget;
+    use crate::common::query_cancellation::QueryCancellationSource;
     use bytes::Bytes;
     use novarocks_spi::connector::*;
     use novarocks_sql::compiler::SessionOptimizerSettings;
@@ -2251,9 +2251,7 @@ mod tests {
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::clone(&connector_control),
-            Arc::new(
-                novarocks::connector::unified_statistics::UnifiedStatisticsResolver::default(),
-            ),
+            Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
             crate::query_execution::compiler::test_query_execution_service(),
         )
@@ -3144,7 +3142,7 @@ mod tests {
             owner: ordinary.owner(),
             calls: Arc::clone(&historical_calls),
         });
-        let binding = novarocks::connector::scan_model::planned_files_fixture_binding_for_provider(
+        let binding = crate::connector::scan_model::planned_files_fixture_binding_for_provider(
             descriptor.provider_id.clone(),
             descriptor.instance_id.as_str(),
             Default::default(),

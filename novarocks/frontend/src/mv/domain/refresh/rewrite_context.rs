@@ -129,8 +129,8 @@ pub(crate) fn observe_and_admit_change_window_for_table(
     String,
 > {
     let exact_lease =
-        novarocks::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
-    let metadata = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+        crate::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &exact_lease,
         connector_context.clone(),
         &table.namespace,
@@ -138,7 +138,7 @@ pub(crate) fn observe_and_admit_change_window_for_table(
         ConnectorTableResolution::StrictBaseTable,
     )?;
     let window = ConnectorChangeWindow::new(from_snapshot_id, to_snapshot_id);
-    let scan = novarocks::connector::scan_admission::admit_connector_change_window(
+    let scan = crate::connector::scan_admission::admit_connector_change_window(
         &metadata.table,
         &metadata.schema,
         &exact_lease,

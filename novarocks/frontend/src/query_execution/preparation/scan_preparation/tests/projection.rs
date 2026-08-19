@@ -160,12 +160,12 @@ fn hidden_equality_key_remains_provider_owned_without_plan_mutation() {
     let planned = bindings
         .connector_read(0, 10)
         .expect("opaque connector read");
-    let file = novarocks::connector::scan_model::planned_split_file_for_test(&planned.splits[0])
+    let file = crate::connector::scan_model::planned_split_file_for_test(&planned.splits[0])
         .expect("decode fixture split");
     assert_eq!(file.deletes.len(), 1);
     assert_eq!(
         file.deletes[0].kind,
-        novarocks::connector::scan_model::FixtureDeleteKind::Equality
+        crate::connector::scan_model::FixtureDeleteKind::Equality
     );
     assert_eq!(
         seen_column_names

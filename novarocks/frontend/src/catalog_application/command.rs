@@ -37,8 +37,8 @@ use crate::catalog_application::statement::{
 };
 use crate::catalog_application::{CatalogApplicationPort, CatalogCreateCommand};
 use crate::mv::domain::repository::MvRepository;
-use novarocks::runtime::query_result::QueryResultColumn;
-use novarocks::runtime::statement_result::StatementResult;
+use crate::runtime::query_result::QueryResultColumn;
+use crate::runtime::statement_result::StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::syntax::{
     StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
@@ -322,7 +322,7 @@ fn execute_alter_iceberg_properties(
     };
     let instance_id =
         ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
-    novarocks::connector::mutation::execute_catalog_mutation(
+    crate::connector::mutation::execute_catalog_mutation(
         executor.connector_control.as_ref(),
         &instance_id,
         novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
@@ -443,7 +443,7 @@ fn execute_alter_iceberg_schema(
             comment: Arc::from(comment),
         },
     };
-    novarocks::connector::mutation::execute_catalog_mutation(
+    crate::connector::mutation::execute_catalog_mutation(
         executor.connector_control.as_ref(),
         &instance_id,
         novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterSchema {
@@ -509,7 +509,7 @@ fn execute_alter_partition_spec(
         crate::catalog_application::statement::connector_partition_transform(partition_field);
     let instance_id =
         ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
-    novarocks::connector::mutation::execute_catalog_mutation(
+    crate::connector::mutation::execute_catalog_mutation(
         executor.connector_control.as_ref(),
         &instance_id,
         novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterPartitionSpec {
@@ -545,7 +545,7 @@ fn execute_create_table_like(
         current_catalog,
         current_database,
     )?;
-    let source_table = novarocks::connector::metadata_load_table(
+    let source_table = crate::connector::metadata_load_table(
         executor.connector_control.as_ref(),
         connector_context.clone(),
         &source_target.catalog,
@@ -652,7 +652,7 @@ fn execute_show_create_table(
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
         .map_err(|error| format!("build SHOW CREATE TABLE result failed: {error}"))?;
     Ok(StatementResult::Query(
-        novarocks::runtime::query_result::QueryResult {
+        crate::runtime::query_result::QueryResult {
             columns: vec![
                 QueryResultColumn {
                     name: "Table".to_string(),
@@ -667,9 +667,7 @@ fn execute_show_create_table(
                     logical_type: None,
                 },
             ],
-            chunks: vec![novarocks::runtime::query_result::record_batch_to_chunk(
-                batch,
-            )?],
+            chunks: vec![crate::runtime::query_result::record_batch_to_chunk(batch)?],
         },
     ))
 }

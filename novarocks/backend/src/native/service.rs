@@ -28,6 +28,7 @@ use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
+use crate::metrics::handle_metrics;
 use crate::service::native_data_plane::NativeDataPlaneKernel;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
@@ -276,13 +277,13 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
         self.query_lifecycle_ingress
             .bind_backend_identity(u64::from(request.assigned_be_id))
             .map_err(status_from_lifecycle_error)?;
-        novarocks::runtime::backend_id::set_backend_id(i64::from(request.assigned_be_id));
+        crate::runtime::backend_id::set_backend_id(i64::from(request.assigned_be_id));
         let num_cores = std::thread::available_parallelism()
             .map(|count| count.get() as u32)
             .unwrap_or(1);
         Ok(tonic::Response::new(proto::HeartbeatResponse {
             start_epoch: crate::runtime::start_epoch::start_epoch(),
-            version: novarocks::version::short_version().to_string(),
+            version: novarocks_version::short_version().to_string(),
             num_cores,
             status_code: 0,
         }))
@@ -435,7 +436,7 @@ impl NativeGrpcServerHandle {
                         );
                         let app = Router::new()
                             .route_service(&grpc_path, AxumGrpcService::new(service))
-                            .route("/metrics", get(novarocks::service::handle_metrics))
+                            .route("/metrics", get(handle_metrics))
                             .fallback(grpc_unimplemented_fallback);
                         axum::serve(listener, app)
                             .with_graceful_shutdown(async move {

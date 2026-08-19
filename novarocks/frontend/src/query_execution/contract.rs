@@ -22,6 +22,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::common::admitted_query_context::QueryExecutionContext;
+use crate::common::query_cancellation::QueryCancellationView;
 use crate::query_execution::artifact::PreparedDistributedQuery;
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 pub use crate::query_execution::outcome::DistributedQueryOutcome;
@@ -32,8 +34,6 @@ pub use crate::query_execution::profile::ProfileTerminalBuilder;
 pub use crate::query_execution::statistics::StatisticsCollectionProgram;
 pub use crate::query_execution::statistics::StatisticsExecutionMode;
 pub use crate::query_execution::statistics::StatisticsExecutionPolicy;
-use ::novarocks::common::admitted_query_context::QueryExecutionContext;
-use ::novarocks::common::query_cancellation::QueryCancellationView;
 use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::query_options::{
     QueryCacheOptions, QueryOptions as RuntimeQueryOptions,
@@ -661,7 +661,7 @@ impl ConnectorWriteExecutionRegistration {
 pub struct DistributedQueryRequest {
     artifacts: PreparedDistributedQuery,
     options: ResolvedQueryOptions,
-    topology: ::novarocks::common::backend_topology::BackendTopologySnapshot,
+    topology: crate::common::backend_topology::BackendTopologySnapshot,
     deadline: Option<Instant>,
     cancellation: QueryCancellationView,
     completion: QueryOutcomeFactory,
@@ -686,7 +686,7 @@ impl DistributedQueryRequest {
         &self.cancellation
     }
 
-    pub fn topology(&self) -> &::novarocks::common::backend_topology::BackendTopologySnapshot {
+    pub fn topology(&self) -> &crate::common::backend_topology::BackendTopologySnapshot {
         &self.topology
     }
 
@@ -721,7 +721,7 @@ impl DistributedQueryRequest {
 pub struct DistributedQueryRequestParts {
     pub artifacts: PreparedDistributedQuery,
     pub options: ResolvedQueryOptions,
-    pub topology: ::novarocks::common::backend_topology::BackendTopologySnapshot,
+    pub topology: crate::common::backend_topology::BackendTopologySnapshot,
     pub deadline: Option<Instant>,
     pub cancellation: QueryCancellationView,
     pub completion: QueryOutcomeFactory,

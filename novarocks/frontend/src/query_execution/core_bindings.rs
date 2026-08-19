@@ -18,8 +18,8 @@
 //! Frontend-local implementations of Core domain contracts for query kernels.
 
 use crate::catalog_application::statement::{CatalogDropContext, CatalogMutationContext};
-use novarocks::connector::data_mutation::DataMutationCacheFinalizer;
-use novarocks::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer;
+use crate::connector::data_mutation::DataMutationCacheFinalizer;
+use crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer;
 use novarocks_spi::connector::{
     ConnectorControlRegistry, ConnectorError, ConnectorErrorKind, ConnectorTableIdentity,
 };

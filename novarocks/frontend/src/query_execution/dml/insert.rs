@@ -28,13 +28,13 @@ use std::sync::Arc;
 use novarocks_catalog::schema::ColumnDef;
 
 use crate::catalog_application::resolver::TargetBackend;
+use crate::common::admitted_query_context::{QueryExecutionContext, RequestContext};
+use crate::connector::backend::ResolvedTable;
 use crate::query_execution::dml::external_write_fence::{
     ExternalWriteFenceProposal, external_fence_authority_unavailable, invalid_fence_request,
 };
 use crate::query_execution::dml::iceberg_writer;
 use crate::query_execution::kernels::DmlExecutionKernel;
-use ::novarocks::common::admitted_query_context::{QueryExecutionContext, RequestContext};
-use novarocks::connector::backend::ResolvedTable;
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_sql::planning::dml::parse_raw_statement;
 use novarocks_sql::syntax::{Literal, ObjectName};
@@ -295,11 +295,11 @@ impl InsertEngine for DmlExecutionKernel {
         let name = ObjectName {
             parts: request.target.parts,
         };
-        let connector_context = novarocks::connector::connector_request_context_for_execution(
+        let connector_context = crate::connector::connector_request_context_for_execution(
             request.query_options.as_ref(),
             &request.execution,
         )?;
-        novarocks::connector::validate_request_context(&connector_context)?;
+        crate::connector::validate_request_context(&connector_context)?;
 
         let target = crate::catalog_application::resolver::resolve_existing_table_target(
             self,
@@ -307,11 +307,11 @@ impl InsertEngine for DmlExecutionKernel {
             request.current_catalog.as_deref(),
             &request.current_database,
         )?;
-        let planning_lease = novarocks::connector::acquire_metadata_planning_lease(
+        let planning_lease = crate::connector::acquire_metadata_planning_lease(
             self.connector_control().as_ref(),
             &target.catalog,
         )?;
-        let metadata = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+        let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
             &planning_lease,
             connector_context,
             &target.namespace,
@@ -355,11 +355,11 @@ impl InsertEngine for DmlExecutionKernel {
                 iceberg_writer::IcebergWriteMode::DynamicPartitionOverwrite
             }
         };
-        let connector_context = novarocks::connector::connector_request_context_for_execution(
+        let connector_context = crate::connector::connector_request_context_for_execution(
             request.query_options.as_ref(),
             &request.execution,
         )?;
-        novarocks::connector::validate_request_context(&connector_context)?;
+        crate::connector::validate_request_context(&connector_context)?;
         let prepared = iceberg_writer::prepare_iceberg_write(
             self,
             &target,
@@ -493,7 +493,7 @@ fn insert_columns_from_connector_metadata(
                 .cloned()
                 .unwrap_or_else(|| field.data_type().clone()),
             nullable: field.is_nullable(),
-            write_default: novarocks::connector::connector_write_default_at(
+            write_default: crate::connector::connector_write_default_at(
                 &metadata.planning_facts,
                 ordinal,
             ),
@@ -578,19 +578,17 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
+    use crate::common::backend_topology::BackendTopologySnapshot;
+    use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
     use crate::query_execution::outcome::QueryExecutionResult;
     use crate::query_execution::write::{
         WriteAbortInput, WriteCommitInput, WriterCommitInput, WriterKey,
     };
-    use ::novarocks::common::admitted_query_context::{RequestAdmission, RequestContext};
-    use ::novarocks::common::backend_topology::BackendTopologySnapshot;
-    use ::novarocks::common::query_cancellation::{
-        QueryCancellationReason, QueryCancellationSource,
-    };
-    use ::novarocks::common::types::UniqueId;
-    use ::novarocks::runtime::query_result::QueryResult;
+    use crate::runtime::query_result::QueryResult;
     use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::ClusterRole;
+    use novarocks_types::UniqueId;
 
     fn cancelled_execution() -> QueryExecutionContext {
         let cancellation = QueryCancellationSource::new();
@@ -614,9 +612,7 @@ mod tests {
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::clone(&connector_control),
-            Arc::new(
-                novarocks::connector::unified_statistics::UnifiedStatisticsResolver::default(),
-            ),
+            Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
             crate::query_execution::compiler::test_query_execution_service(),
         )

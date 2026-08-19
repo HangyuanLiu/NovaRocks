@@ -28,9 +28,9 @@ use crate::catalog_application::query_bindings::{
 use crate::catalog_application::query_materializer::{
     QueryLocalTableOverlay, connector_query_binding_from_materialization,
 };
+use crate::connector::scan_admission::admit_connector_change_window;
 use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
 use crate::mv::domain::rewrite::context::IcebergMvRewriteContext;
-use novarocks::connector::scan_admission::admit_connector_change_window;
 
 /// Freeze the IMV target exactly once for one compilation request. The SQL
 /// planner receives only the returned scoped token; provider table/files and
@@ -45,7 +45,7 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
     let target_table_uuid = rewrite.target_table_uuid.clone();
     let frozen_snapshot_id = rewrite.target_snapshot_id;
     let planning_lease = planning_lease.clone();
-    let metadata = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
         &planning_lease,
         connector_context.clone(),
         &target.namespace,
@@ -151,7 +151,7 @@ pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
             &instance_id,
         )
         .map_err(|error| error.to_string())?;
-        let metadata = novarocks::connector::metadata_load_connector_table_with_planning_lease(
+        let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
             &planning_lease,
             connector_context.clone(),
             &base.namespace,

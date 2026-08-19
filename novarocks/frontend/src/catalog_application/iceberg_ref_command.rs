@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::ConnectorControlRegistry;
 
-use novarocks::runtime::statement_result::StatementResult;
+use crate::runtime::statement_result::StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 
 #[derive(Clone)]
