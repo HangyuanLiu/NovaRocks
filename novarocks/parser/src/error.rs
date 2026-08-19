@@ -58,6 +58,21 @@ const VALIDATE_INVALID_STRUCTURE: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Validate,
     status: ErrorCodeStatus::Active,
 };
+const VALIDATE_DUPLICATE_CTE_NAME: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.validate.duplicate_cte_name"),
+    phase: ErrorPhase::Validate,
+    status: ErrorCodeStatus::Active,
+};
+const VALIDATE_DUPLICATE_WINDOW_NAME: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.validate.duplicate_window_name"),
+    phase: ErrorPhase::Validate,
+    status: ErrorCodeStatus::Active,
+};
+const VALIDATE_INVALID_WINDOW_FRAME_BOUNDS: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.validate.invalid_window_frame_bounds"),
+    phase: ErrorPhase::Validate,
+    status: ErrorCodeStatus::Active,
+};
 
 /// All parser-domain descriptors. The independent manifest tool is their only
 /// permitted aggregate owner.
@@ -69,6 +84,9 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     PARSE_UNEXPECTED_TOKEN,
     PARSE_UNSUPPORTED_STATEMENT,
     VALIDATE_INVALID_STRUCTURE,
+    VALIDATE_DUPLICATE_CTE_NAME,
+    VALIDATE_DUPLICATE_WINDOW_NAME,
+    VALIDATE_INVALID_WINDOW_FRAME_BOUNDS,
 ];
 
 /// A lexical failure with its source range.
@@ -94,18 +112,62 @@ pub enum ParseError {
     },
 }
 
+/// A construction-only invariant which has no independently addressable SQL
+/// validation code. Keep this list typed so a public AST cannot reintroduce
+/// arbitrary parser-domain error text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StructuralViolation {
+    EmptyWithCteList,
+    EmptyValuesRowList,
+    EmptyValuesRow,
+    EmptySelectProjection,
+    EmptyUnnestExpressionList,
+    MismatchedCaseArms,
+}
+
 /// A source-independent structural AST validation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValidateError {
-    detail: String,
-    span: Span,
+pub enum ValidateError {
+    InvalidStructure {
+        violation: StructuralViolation,
+        span: Span,
+    },
+    DuplicateCteName {
+        name: String,
+        span: Span,
+    },
+    DuplicateWindowName {
+        name: String,
+        span: Span,
+    },
+    InvalidWindowFrameBounds {
+        span: Span,
+    },
 }
 
 impl ValidateError {
-    pub fn new(detail: impl Into<String>, span: Span) -> Self {
-        Self {
-            detail: detail.into(),
-            span,
+    pub const fn invalid_structure(violation: StructuralViolation, span: Span) -> Self {
+        Self::InvalidStructure { violation, span }
+    }
+
+    pub fn duplicate_cte_name(name: String, span: Span) -> Self {
+        Self::DuplicateCteName { name, span }
+    }
+
+    pub fn duplicate_window_name(name: String, span: Span) -> Self {
+        Self::DuplicateWindowName { name, span }
+    }
+
+    pub const fn invalid_window_frame_bounds(span: Span) -> Self {
+        Self::InvalidWindowFrameBounds { span }
+    }
+
+    pub const fn span(&self) -> Span {
+        match self {
+            Self::InvalidStructure { span, .. }
+            | Self::DuplicateCteName { span, .. }
+            | Self::DuplicateWindowName { span, .. }
+            | Self::InvalidWindowFrameBounds { span } => *span,
         }
     }
 }
@@ -156,10 +218,25 @@ impl ParserError {
                 messages::unsupported_statement(statement),
                 *span,
             ),
-            Self::Validate(error) => (
+            Self::Validate(ValidateError::InvalidStructure { violation, span }) => (
                 VALIDATE_INVALID_STRUCTURE,
-                messages::invalid_structure(&error.detail),
-                error.span,
+                messages::invalid_structure(*violation),
+                *span,
+            ),
+            Self::Validate(ValidateError::DuplicateCteName { name, span }) => (
+                VALIDATE_DUPLICATE_CTE_NAME,
+                messages::duplicate_cte_name(name),
+                *span,
+            ),
+            Self::Validate(ValidateError::DuplicateWindowName { name, span }) => (
+                VALIDATE_DUPLICATE_WINDOW_NAME,
+                messages::duplicate_window_name(name),
+                *span,
+            ),
+            Self::Validate(ValidateError::InvalidWindowFrameBounds { span }) => (
+                VALIDATE_INVALID_WINDOW_FRAME_BOUNDS,
+                messages::invalid_window_frame_bounds(),
+                *span,
             ),
         };
         UserError::from_descriptor(
@@ -210,7 +287,18 @@ impl fmt::Display for ParserError {
             Self::Parse(ParseError::UnsupportedStatement { statement, .. }) => {
                 messages::unsupported_statement(statement)
             }
-            Self::Validate(error) => messages::invalid_structure(&error.detail),
+            Self::Validate(ValidateError::InvalidStructure { violation, .. }) => {
+                messages::invalid_structure(*violation)
+            }
+            Self::Validate(ValidateError::DuplicateCteName { name, .. }) => {
+                messages::duplicate_cte_name(name)
+            }
+            Self::Validate(ValidateError::DuplicateWindowName { name, .. }) => {
+                messages::duplicate_window_name(name)
+            }
+            Self::Validate(ValidateError::InvalidWindowFrameBounds { .. }) => {
+                messages::invalid_window_frame_bounds()
+            }
         };
         formatter.write_str(&message)
     }

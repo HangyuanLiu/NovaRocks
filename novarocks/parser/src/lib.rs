@@ -28,7 +28,10 @@ mod messages;
 mod span;
 mod token;
 
-pub use error::{ERROR_CODE_DESCRIPTORS, LexError, ParseError, ParserError, ValidateError};
+pub use ast::{validate_statement, validate_statements};
+pub use error::{
+    ERROR_CODE_DESCRIPTORS, LexError, ParseError, ParserError, StructuralViolation, ValidateError,
+};
 pub use keyword::{KeywordClass, class as keyword_class};
 pub use lexer::lex;
 pub use parser::parse;

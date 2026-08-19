@@ -157,5 +157,12 @@ mod tests {
             parse("CASE WHEN a THEN CAST(b AS DECIMAL(10, 2)) ELSE TRY_CAST(c AS INT) END"),
             Expr::Case(_)
         ));
+
+        let Expr::FunctionCall(call) = parse(
+            "sum(v) OVER (PARTITION BY k ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+        ) else {
+            panic!("expected window function");
+        };
+        assert!(call.over.is_some());
     }
 }

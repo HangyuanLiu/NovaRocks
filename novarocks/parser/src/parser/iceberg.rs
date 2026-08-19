@@ -512,7 +512,7 @@ fn parse_type_name(parser: &mut StatementParser<'_, '_>) -> Result<TypeName, Par
                 if parser.consume_if_symbol(Symbol::Comma) {
                     continue;
                 }
-                break parser.consume_symbol(Symbol::Gt)?;
+                break parser.consume_type_gt()?;
             }
         } else {
             loop {
@@ -520,7 +520,7 @@ fn parse_type_name(parser: &mut StatementParser<'_, '_>) -> Result<TypeName, Par
                 if parser.consume_if_symbol(Symbol::Comma) {
                     continue;
                 }
-                break parser.consume_symbol(Symbol::Gt)?;
+                break parser.consume_type_gt()?;
             }
         }
     } else if parser.consume_if_symbol(Symbol::LParen) {

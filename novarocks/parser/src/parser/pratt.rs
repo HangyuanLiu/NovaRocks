@@ -23,7 +23,8 @@ use crate::{
         BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr, CastKind, Expr, FunctionCall,
         FunctionQuantifier, Ident, InListExpr, IsPredicate, IsPredicateExpr, LikeExpr,
         LikeOperator, Literal, LiteralKind, NestedExpr, ObjectName, TypeName, TypeNameArgument,
-        UnaryExpr, UnaryOperator,
+        UnaryExpr, UnaryOperator, WindowFrame, WindowFrameBound, WindowFrameExclusion,
+        WindowFrameUnits, WindowSpec,
     },
     error::ParseError,
     keyword_class,
@@ -809,6 +810,15 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }
         let end = self.current_span().end();
         self.advance();
+        self.skip_trivia();
+        let over = if self.current_is_keyword(Keyword::Over) {
+            self.advance();
+            self.skip_trivia();
+            Some(Box::new(self.parse_window_spec()?))
+        } else {
+            None
+        };
+        let span_end = over.as_ref().map_or(end, |window| window.span.end());
         Ok(Expr::FunctionCall(FunctionCall {
             name,
             arguments,
@@ -817,9 +827,188 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             separator: None,
             filter: None,
             null_treatment: None,
-            over: None,
-            span: Span::new(span.start(), end),
+            over,
+            span: Span::new(span.start(), span_end),
         }))
+    }
+
+    fn parse_window_spec(&mut self) -> Result<WindowSpec, ParseError> {
+        let start = self.current_span().start();
+        if !self.current_is_symbol(Symbol::LParen) {
+            return Err(self.unexpected("'(' after OVER"));
+        }
+        self.advance();
+        self.skip_trivia();
+        let mut existing_window_name = None;
+        let mut partition_by = Vec::new();
+        let mut order_by = Vec::new();
+        let mut window_frame = None;
+        if matches!(
+            self.current().map(|token| &token.kind),
+            Some(TokenKind::Ident | TokenKind::QuotedIdent)
+        ) && !self.peek_keyword(1, Keyword::By)
+        {
+            existing_window_name = Some(self.parse_identifier(self.current_span()));
+        }
+        if self.current_is_keyword(Keyword::Partition) {
+            self.advance();
+            self.skip_trivia();
+            if !self.current_is_keyword(Keyword::By) {
+                return Err(self.unexpected("BY after PARTITION"));
+            }
+            self.advance();
+            self.skip_trivia();
+            loop {
+                partition_by.push(self.parse_binding_power(0)?);
+                self.skip_trivia();
+                if !self.current_is_symbol(Symbol::Comma) {
+                    break;
+                }
+                self.advance();
+                self.skip_trivia();
+            }
+        }
+        if self.current_is_keyword(Keyword::Order) {
+            self.advance();
+            self.skip_trivia();
+            if !self.current_is_keyword(Keyword::By) {
+                return Err(self.unexpected("BY after ORDER"));
+            }
+            self.advance();
+            self.skip_trivia();
+            loop {
+                let expr = self.parse_binding_power(0)?;
+                let asc = if self.current_is_keyword(Keyword::Asc) {
+                    self.advance();
+                    self.skip_trivia();
+                    Some(true)
+                } else if self.current_is_keyword(Keyword::Desc) {
+                    self.advance();
+                    self.skip_trivia();
+                    Some(false)
+                } else {
+                    None
+                };
+                let span = Span::new(expr.span().start(), self.current_span().start());
+                order_by.push(crate::ast::OrderByExpr {
+                    expr,
+                    asc,
+                    nulls_first: None,
+                    span,
+                });
+                if !self.current_is_symbol(Symbol::Comma) {
+                    break;
+                }
+                self.advance();
+                self.skip_trivia();
+            }
+        }
+        if let Some(units) = self.parse_window_frame_units() {
+            let frame_start = self.current_span().start();
+            let (start_bound, end_bound) = if self.current_is_keyword(Keyword::Between) {
+                self.advance();
+                self.skip_trivia();
+                let start_bound = self.parse_window_frame_bound()?;
+                if !self.current_is_keyword(Keyword::And) {
+                    return Err(self.unexpected("AND in window frame"));
+                }
+                self.advance();
+                self.skip_trivia();
+                (start_bound, Some(self.parse_window_frame_bound()?))
+            } else {
+                (self.parse_window_frame_bound()?, None)
+            };
+            let frame_end = end_bound
+                .as_ref()
+                .map_or_else(|| start_bound.span().end(), |bound| bound.span().end());
+            window_frame = Some(WindowFrame {
+                units,
+                start_bound,
+                end_bound,
+                exclusion: WindowFrameExclusion::NoOthers,
+                span: Span::new(frame_start, frame_end),
+            });
+        }
+        if !self.current_is_symbol(Symbol::RParen) {
+            return Err(self.unexpected("')' after window specification"));
+        }
+        let end = self.current_span().end();
+        self.advance();
+        self.skip_trivia();
+        Ok(WindowSpec {
+            existing_window_name,
+            partition_by,
+            order_by,
+            window_frame,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_window_frame_units(&mut self) -> Option<WindowFrameUnits> {
+        let units = if self.current_is_keyword(Keyword::Rows) {
+            WindowFrameUnits::Rows
+        } else if self.current_is_keyword(Keyword::Range) {
+            WindowFrameUnits::Range
+        } else if self.current_is_keyword(Keyword::Groups) {
+            WindowFrameUnits::Groups
+        } else {
+            return None;
+        };
+        self.advance();
+        self.skip_trivia();
+        Some(units)
+    }
+
+    fn parse_window_frame_bound(&mut self) -> Result<WindowFrameBound, ParseError> {
+        let start = self.current_span().start();
+        if self.current_is_keyword(Keyword::Current) {
+            self.advance();
+            self.skip_trivia();
+            if !self.current_is_keyword(Keyword::Row) {
+                return Err(self.unexpected("ROW after CURRENT"));
+            }
+            let end = self.current_span().end();
+            self.advance();
+            self.skip_trivia();
+            return Ok(WindowFrameBound::CurrentRow(Span::new(start, end)));
+        }
+        if self.current_is_keyword(Keyword::Unbounded) {
+            self.advance();
+            self.skip_trivia();
+            if self.current_is_keyword(Keyword::Preceding) {
+                let end = self.current_span().end();
+                self.advance();
+                self.skip_trivia();
+                return Ok(WindowFrameBound::Preceding(None, Span::new(start, end)));
+            }
+            if self.current_is_keyword(Keyword::Following) {
+                let end = self.current_span().end();
+                self.advance();
+                self.skip_trivia();
+                return Ok(WindowFrameBound::Following(None, Span::new(start, end)));
+            }
+            return Err(self.unexpected("PRECEDING or FOLLOWING after UNBOUNDED"));
+        }
+        let value = self.parse_binding_power(0)?;
+        if self.current_is_keyword(Keyword::Preceding) {
+            let end = self.current_span().end();
+            self.advance();
+            self.skip_trivia();
+            return Ok(WindowFrameBound::Preceding(
+                Some(value),
+                Span::new(start, end),
+            ));
+        }
+        if self.current_is_keyword(Keyword::Following) {
+            let end = self.current_span().end();
+            self.advance();
+            self.skip_trivia();
+            return Ok(WindowFrameBound::Following(
+                Some(value),
+                Span::new(start, end),
+            ));
+        }
+        Err(self.unexpected("PRECEDING or FOLLOWING in window frame"))
     }
 
     /// `nested-expression ::= "(" expression ")"`

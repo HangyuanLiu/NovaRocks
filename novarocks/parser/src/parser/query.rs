@@ -415,31 +415,56 @@ fn parse_from(
 fn parse_table_factor(
     parser: &mut StatementParser<'_, '_>,
 ) -> Result<TableFactor, crate::ParseError> {
+    let lateral = parser.consume_if_word("LATERAL");
+    if parser.current_is_symbol(Symbol::LParen) {
+        let start = parser.consume_symbol(Symbol::LParen)?.start();
+        if !(parser.current_is_keyword(Keyword::Select)
+            || parser.current_is_keyword(Keyword::Values)
+            || parser.current_is_keyword(Keyword::With))
+        {
+            return Err(parser.unexpected("query after '(' in FROM"));
+        }
+        let subquery = parse_query(parser)?;
+        let end = parser.consume_symbol(Symbol::RParen)?.end();
+        let alias = parse_optional_table_alias(parser)?;
+        let span_end = alias.as_ref().map_or(end, |alias| alias.span.end());
+        return Ok(TableFactor::Derived {
+            lateral,
+            subquery: Box::new(subquery),
+            alias,
+            span: Span::new(start, span_end),
+        });
+    }
+    if parser.current_is_keyword(Keyword::Unnest) {
+        let start = parser.consume_word("UNNEST")?.start();
+        parser.consume_symbol(Symbol::LParen)?;
+        let mut array_exprs = Vec::new();
+        loop {
+            array_exprs.push(parse_expression_until(
+                parser,
+                &[],
+                &[Symbol::Comma, Symbol::RParen],
+            )?);
+            if !parser.consume_if_symbol(Symbol::Comma) {
+                break;
+            }
+        }
+        let end = parser.consume_symbol(Symbol::RParen)?.end();
+        let alias = parse_optional_table_alias(parser)?;
+        let span_end = alias.as_ref().map_or(end, |alias| alias.span.end());
+        return Ok(TableFactor::Unnest {
+            array_exprs,
+            with_offset: false,
+            alias,
+            span: Span::new(start, span_end),
+        });
+    }
     let name = parser.parse_object_name()?;
     let start = name.span.start();
-    let mut end = name.span.end();
-    let alias = if parser.consume_if_word("AS") {
-        let alias = parser.parse_ident()?;
-        end = alias.span.end();
-        Some(crate::ast::TableAlias {
-            span: alias.span,
-            name: alias,
-            columns: Vec::new(),
-        })
-    } else if matches!(
-        parser.current().map(|token| &token.kind),
-        Some(TokenKind::Ident | TokenKind::QuotedIdent)
-    ) {
-        let alias = parser.parse_ident()?;
-        end = alias.span.end();
-        Some(crate::ast::TableAlias {
-            span: alias.span,
-            name: alias,
-            columns: Vec::new(),
-        })
-    } else {
-        None
-    };
+    let alias = parse_optional_table_alias(parser)?;
+    let end = alias
+        .as_ref()
+        .map_or(name.span.end(), |alias| alias.span.end());
     Ok(TableFactor::Table {
         name,
         alias,
@@ -447,6 +472,39 @@ fn parse_table_factor(
         hints: Vec::new(),
         span: Span::new(start, end),
     })
+}
+
+fn parse_optional_table_alias(
+    parser: &mut StatementParser<'_, '_>,
+) -> Result<Option<crate::ast::TableAlias>, crate::ParseError> {
+    let explicit_as = parser.consume_if_word("AS");
+    if !explicit_as
+        && !matches!(
+            parser.current().map(|token| &token.kind),
+            Some(TokenKind::Ident | TokenKind::QuotedIdent)
+        )
+    {
+        return Ok(None);
+    }
+    let name = parser.parse_ident()?;
+    let start = name.span.start();
+    let mut columns = Vec::new();
+    let mut end = name.span.end();
+    if parser.consume_if_symbol(Symbol::LParen) {
+        loop {
+            let column = parser.parse_ident()?;
+            columns.push(column);
+            if !parser.consume_if_symbol(Symbol::Comma) {
+                break;
+            }
+        }
+        end = parser.consume_symbol(Symbol::RParen)?.end();
+    }
+    Ok(Some(crate::ast::TableAlias {
+        name,
+        columns,
+        span: Span::new(start, end),
+    }))
 }
 
 fn parse_join_operator(parser: &mut StatementParser<'_, '_>) -> Option<JoinOperator> {
@@ -479,6 +537,51 @@ fn parse_join_operator(parser: &mut StatementParser<'_, '_>) -> Option<JoinOpera
 
 fn parse_group_by(parser: &mut StatementParser<'_, '_>) -> Result<GroupBy, crate::ParseError> {
     let start = parser.current_span().start();
+    if parser.consume_if_word("ROLLUP") {
+        let (expressions, span) = parse_parenthesized_expressions(parser)?;
+        return Ok(GroupBy::Rollup {
+            expressions,
+            span: Span::new(start, span.end()),
+        });
+    }
+    if parser.consume_if_word("CUBE") {
+        let (expressions, span) = parse_parenthesized_expressions(parser)?;
+        return Ok(GroupBy::Cube {
+            expressions,
+            span: Span::new(start, span.end()),
+        });
+    }
+    if parser.consume_if_word("GROUPING") {
+        parser.consume_word("SETS")?;
+        parser.consume_symbol(Symbol::LParen)?;
+        let mut sets = Vec::new();
+        loop {
+            parser.consume_symbol(Symbol::LParen)?;
+            let mut set = Vec::new();
+            if !parser.current_is_symbol(Symbol::RParen) {
+                loop {
+                    set.push(parse_expression_until(
+                        parser,
+                        query_clause_words(),
+                        &[Symbol::Comma, Symbol::RParen],
+                    )?);
+                    if !parser.consume_if_symbol(Symbol::Comma) {
+                        break;
+                    }
+                }
+            }
+            parser.consume_symbol(Symbol::RParen)?;
+            sets.push(set);
+            if !parser.consume_if_symbol(Symbol::Comma) {
+                break;
+            }
+        }
+        let end = parser.consume_symbol(Symbol::RParen)?.end();
+        return Ok(GroupBy::GroupingSets {
+            sets,
+            span: Span::new(start, end),
+        });
+    }
     let mut expressions = Vec::new();
     loop {
         expressions.push(parse_expression_until(
@@ -495,6 +598,27 @@ fn parse_group_by(parser: &mut StatementParser<'_, '_>) -> Result<GroupBy, crate
         expressions,
         span: Span::new(start, end),
     })
+}
+
+fn parse_parenthesized_expressions(
+    parser: &mut StatementParser<'_, '_>,
+) -> Result<(Vec<Expr>, Span), crate::ParseError> {
+    let start = parser.consume_symbol(Symbol::LParen)?.start();
+    let mut expressions = Vec::new();
+    if !parser.current_is_symbol(Symbol::RParen) {
+        loop {
+            expressions.push(parse_expression_until(
+                parser,
+                query_clause_words(),
+                &[Symbol::Comma, Symbol::RParen],
+            )?);
+            if !parser.consume_if_symbol(Symbol::Comma) {
+                break;
+            }
+        }
+    }
+    let end = parser.consume_symbol(Symbol::RParen)?.end();
+    Ok((expressions, Span::new(start, end)))
 }
 
 fn parse_order_by(

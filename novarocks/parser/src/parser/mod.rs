@@ -35,7 +35,7 @@ mod view;
 
 use crate::{
     ParseError, ParserError, Span, Token, TokenKind,
-    ast::{Ident, Literal, LiteralKind, ObjectName, Statement},
+    ast::{Ident, Literal, LiteralKind, ObjectName, Statement, validate_statements},
     keyword_class, lex,
     token::{Keyword, Symbol},
 };
@@ -49,13 +49,16 @@ pub use expr::parse_expression;
 /// outcome rather than a route miss or a text-classified fallback.
 pub fn parse(source: &str) -> Result<Vec<Statement>, ParserError> {
     let tokens = lex(source)?;
-    StatementParser::new(source, &tokens).parse_statements()
+    let statements = StatementParser::new(source, &tokens).parse_statements()?;
+    validate_statements(&statements)?;
+    Ok(statements)
 }
 
 struct StatementParser<'source, 'tokens> {
     source: &'source str,
     tokens: &'tokens [Token],
     position: usize,
+    pending_type_gt: Option<Span>,
 }
 
 impl<'source, 'tokens> StatementParser<'source, 'tokens> {
@@ -64,6 +67,7 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
             source,
             tokens,
             position: 0,
+            pending_type_gt: None,
         }
     }
 
@@ -174,6 +178,27 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
         self.advance();
         self.skip_trivia();
         true
+    }
+
+    /// Consumes one generic-type closing delimiter. The lexer correctly owns
+    /// `>>` as a shift operator, while nested generic types need to consume it
+    /// as two adjacent `>` delimiters without changing lexical ownership.
+    pub(super) fn consume_type_gt(&mut self) -> Result<Span, ParseError> {
+        if let Some(span) = self.pending_type_gt.take() {
+            return Ok(span);
+        }
+        if self.current_is_symbol(Symbol::Gt) {
+            return self.consume_symbol(Symbol::Gt);
+        }
+        if self.current_is_symbol(Symbol::ShiftRight) {
+            let span = self.current_span();
+            let first = Span::new(span.start(), span.start() + 1);
+            self.pending_type_gt = Some(Span::new(span.start() + 1, span.end()));
+            self.advance();
+            self.skip_trivia();
+            return Ok(first);
+        }
+        Err(self.unexpected("'>'"))
     }
 
     pub(super) fn parse_ident(&mut self) -> Result<Ident, ParseError> {
