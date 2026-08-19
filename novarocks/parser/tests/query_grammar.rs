@@ -33,6 +33,7 @@ fn query_forms_parse_and_print_as_typed_syntax() {
         "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id) AND a IN (SELECT b FROM v)",
         "SELECT t1.c_int FROM t1 LEFT SEMI JOIN [broadcast] t2 ON t1.c_int = t2.c_int",
         "SELECT t1.c_int FROM t1 JOIN [skew|t1.c_int(1, 2, 8)] t2 ON t1.c_int = t2.c_int",
+        "SELECT t1.c_int FROM t1 JOIN [broadcast] (SELECT c_int FROM t2) AS t2 ON t1.c_int = t2.c_int",
         "SELECT * FROM TABLE(generate_series(1, 10)) AS g(x)",
         "SELECT * FROM a NATURAL LEFT JOIN b",
         "SELECT * FROM events FOR VERSION AS OF 'release_7' AS e",

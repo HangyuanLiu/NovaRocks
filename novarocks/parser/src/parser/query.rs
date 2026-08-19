@@ -562,9 +562,6 @@ fn parse_table_factor(
     let mut hints = parse_table_hints(parser)?;
     let lateral = parser.consume_if_word("LATERAL");
     if parser.current_is_symbol(Symbol::LParen) {
-        if !hints.is_empty() {
-            return Err(parser.unexpected("table after table hint"));
-        }
         let start = parser.consume_symbol(Symbol::LParen)?.start();
         if !(parser.current_is_keyword(Keyword::Select)
             || parser.current_is_keyword(Keyword::Values)
@@ -580,6 +577,7 @@ fn parse_table_factor(
         return Ok(TableFactor::Derived {
             lateral,
             subquery: Box::new(subquery),
+            hints,
             alias,
             span: Span::new(start, span_end),
         });

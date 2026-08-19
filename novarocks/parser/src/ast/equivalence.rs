@@ -310,18 +310,21 @@ impl SyntaxEq for TableFactor {
                 Self::Derived {
                     lateral: left_lateral,
                     subquery: left_query,
+                    hints: left_hints,
                     alias: left_alias,
                     ..
                 },
                 Self::Derived {
                     lateral: right_lateral,
                     subquery: right_query,
+                    hints: right_hints,
                     alias: right_alias,
                     ..
                 },
             ) => {
                 left_lateral == right_lateral
                     && left_query.syntax_eq(right_query)
+                    && syntax_eq_slice(left_hints, right_hints)
                     && syntax_eq_option(left_alias, right_alias)
             }
             (

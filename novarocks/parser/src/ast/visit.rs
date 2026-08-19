@@ -335,12 +335,27 @@ pub fn walk_table_factor<V: Visit + ?Sized>(visitor: &mut V, factor: &TableFacto
                 for argument in &hint.arguments {
                     visitor.visit_expr(argument);
                 }
+                if let Some(target) = &hint.target {
+                    visitor.visit_expr(target);
+                }
             }
         }
         TableFactor::Derived {
-            subquery, alias, ..
+            subquery,
+            hints,
+            alias,
+            ..
         } => {
             visitor.visit_query(subquery);
+            for hint in hints {
+                visitor.visit_ident(&hint.name);
+                for argument in &hint.arguments {
+                    visitor.visit_expr(argument);
+                }
+                if let Some(target) = &hint.target {
+                    visitor.visit_expr(target);
+                }
+            }
             if let Some(alias) = alias {
                 walk_table_alias(visitor, alias);
             }
@@ -353,6 +368,9 @@ pub fn walk_table_factor<V: Visit + ?Sized>(visitor: &mut V, factor: &TableFacto
                 visitor.visit_ident(&hint.name);
                 for argument in &hint.arguments {
                     visitor.visit_expr(argument);
+                }
+                if let Some(target) = &hint.target {
+                    visitor.visit_expr(target);
                 }
             }
             if let Some(alias) = alias {
@@ -1004,6 +1022,7 @@ pub fn fold_table_factor<F: Fold + ?Sized>(folder: &mut F, factor: TableFactor) 
                         .into_iter()
                         .map(|argument| folder.fold_expr(argument))
                         .collect();
+                    hint.target = hint.target.map(|target| folder.fold_expr(target));
                     hint
                 })
                 .collect(),
@@ -1012,11 +1031,25 @@ pub fn fold_table_factor<F: Fold + ?Sized>(folder: &mut F, factor: TableFactor) 
         TableFactor::Derived {
             lateral,
             subquery,
+            hints,
             alias,
             span,
         } => TableFactor::Derived {
             lateral,
             subquery: Box::new(folder.fold_query(*subquery)),
+            hints: hints
+                .into_iter()
+                .map(|mut hint| {
+                    hint.name = folder.fold_ident(hint.name);
+                    hint.arguments = hint
+                        .arguments
+                        .into_iter()
+                        .map(|argument| folder.fold_expr(argument))
+                        .collect();
+                    hint.target = hint.target.map(|target| folder.fold_expr(target));
+                    hint
+                })
+                .collect(),
             alias: alias.map(|alias| fold_table_alias(folder, alias)),
             span,
         },
@@ -1038,6 +1071,7 @@ pub fn fold_table_factor<F: Fold + ?Sized>(folder: &mut F, factor: TableFactor) 
                         .into_iter()
                         .map(|argument| folder.fold_expr(argument))
                         .collect();
+                    hint.target = hint.target.map(|target| folder.fold_expr(target));
                     hint
                 })
                 .collect(),

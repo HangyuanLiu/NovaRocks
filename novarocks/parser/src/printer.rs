@@ -418,9 +418,14 @@ impl Printer {
             TableFactor::Derived {
                 lateral,
                 subquery,
+                hints,
                 alias,
                 ..
             } => {
+                for hint in hints {
+                    self.write_table_hint(hint);
+                    self.output.push(' ');
+                }
                 if *lateral {
                     self.output.push_str("LATERAL ");
                 }

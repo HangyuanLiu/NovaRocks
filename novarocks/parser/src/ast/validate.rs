@@ -232,15 +232,34 @@ fn validate_table_factor(table_factor: &TableFactor) -> Result<(), ValidateError
                 for argument in &hint.arguments {
                     validate_expr(argument)?;
                 }
+                if let Some(target) = &hint.target {
+                    validate_expr(target)?;
+                }
             }
             Ok(())
         }
-        TableFactor::Derived { subquery, .. } => validate_query(subquery),
+        TableFactor::Derived {
+            subquery, hints, ..
+        } => {
+            validate_query(subquery)?;
+            for hint in hints {
+                for argument in &hint.arguments {
+                    validate_expr(argument)?;
+                }
+                if let Some(target) = &hint.target {
+                    validate_expr(target)?;
+                }
+            }
+            Ok(())
+        }
         TableFactor::TableFunction { expr, hints, .. } => {
             validate_expr(expr)?;
             for hint in hints {
                 for argument in &hint.arguments {
                     validate_expr(argument)?;
+                }
+                if let Some(target) = &hint.target {
+                    validate_expr(target)?;
                 }
             }
             Ok(())

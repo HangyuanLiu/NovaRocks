@@ -29,6 +29,7 @@ pub enum TableFactor {
     Derived {
         lateral: bool,
         subquery: Box<Query>,
+        hints: Vec<TableHint>,
         alias: Option<TableAlias>,
         span: Span,
     },
