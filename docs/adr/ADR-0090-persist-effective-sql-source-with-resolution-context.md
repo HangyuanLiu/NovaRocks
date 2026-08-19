@@ -7,7 +7,7 @@ supersedes: []
 superseded-by: null
 date: 2026-08-19
 provenance:
-  - "PR: pending — raw MV and View definition persistence"
+  - "PR: #941 — raw MV and View definition persistence"
   - "discussion: 2026-08-19 SQL definition persistence boundary"
 code-anchors:
   - "novarocks/parser/src/ast/mod.rs (RawQuerySlice)"
