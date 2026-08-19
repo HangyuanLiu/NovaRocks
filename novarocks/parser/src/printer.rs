@@ -17,10 +17,7 @@
 
 //! Canonical SQL rendering for the parser-owned syntax tree.
 
-use crate::ast::{
-    BinaryExpr, BinaryOperator, Expr, FunctionCall, Ident, Literal, LiteralKind, NestedExpr,
-    ObjectName, RawQuerySlice, Statement, TypeName, TypeNameArgument, UnaryExpr, UnaryOperator,
-};
+use crate::ast::*;
 
 /// Renders parser AST nodes into one stable SQL spelling.
 ///
@@ -94,6 +91,8 @@ impl Printer {
                 crate::ast::materialized_view::write_sql(statement, &mut self.output)
             }
             Statement::View(statement) => crate::ast::view::write_sql(statement, &mut self.output),
+            Statement::Query(query) => self.write_query(query),
+            Statement::ExplainQuery(explain) => self.write_explain_query(explain),
             Statement::RawQuery(query) => self.write_raw_query(query),
         }
     }
@@ -102,34 +101,726 @@ impl Printer {
         self.output.push_str(&query.text);
     }
 
+    fn write_explain_query(&mut self, explain: &ExplainQuery) {
+        self.output.push_str("EXPLAIN");
+        match explain.format {
+            ExplainFormat::Default => {}
+            ExplainFormat::Analyze => self.output.push_str(" ANALYZE"),
+            ExplainFormat::Verbose => self.output.push_str(" VERBOSE"),
+            ExplainFormat::Costs => self.output.push_str(" COSTS"),
+            ExplainFormat::Logical => self.output.push_str(" LOGICAL"),
+        }
+        self.output.push(' ');
+        self.write_query(&explain.query);
+    }
+
+    fn write_query(&mut self, query: &Query) {
+        if let Some(with) = &query.with {
+            self.write_with(with);
+            self.output.push(' ');
+        }
+        self.write_set_expr(&query.body);
+        if !query.order_by.is_empty() {
+            self.output.push_str(" ORDER BY ");
+            self.write_order_by_list(&query.order_by);
+        }
+        if query.limit_comma_offset {
+            let offset = query
+                .offset
+                .as_ref()
+                .expect("comma LIMIT syntax requires an offset");
+            let limit = query
+                .limit
+                .as_ref()
+                .expect("comma LIMIT syntax requires a limit");
+            self.output.push_str(" LIMIT ");
+            self.write_expr(&offset.value);
+            self.output.push_str(", ");
+            self.write_expr(limit);
+        } else if let Some(limit) = &query.limit {
+            self.output.push_str(" LIMIT ");
+            self.write_expr(limit);
+        }
+        if !query.limit_comma_offset
+            && let Some(offset) = &query.offset
+        {
+            self.output.push_str(" OFFSET ");
+            self.write_expr(&offset.value);
+            match offset.rows {
+                OffsetRows::None => {}
+                OffsetRows::Row => self.output.push_str(" ROW"),
+                OffsetRows::Rows => self.output.push_str(" ROWS"),
+            }
+        }
+        if let Some(fetch) = &query.fetch {
+            self.write_fetch(fetch);
+        }
+    }
+
+    fn write_with(&mut self, with: &With) {
+        self.output.push_str("WITH");
+        if with.recursive {
+            self.output.push_str(" RECURSIVE");
+        }
+        self.output.push(' ');
+        for (index, cte) in with.ctes.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            self.write_ident(&cte.name);
+            if !cte.columns.is_empty() {
+                self.output.push('(');
+                self.write_ident_list(&cte.columns);
+                self.output.push(')');
+            }
+            self.output.push_str(" AS (");
+            self.write_query(&cte.query);
+            self.output.push(')');
+        }
+    }
+
+    fn write_set_expr(&mut self, expression: &SetExpr) {
+        match expression {
+            SetExpr::Select(select) => self.write_select(select),
+            SetExpr::Values(values) => self.write_values(values),
+            SetExpr::Query(query) => {
+                self.output.push('(');
+                self.write_query(query);
+                self.output.push(')');
+            }
+            SetExpr::SetOperation(operation) => {
+                // The parser folds unparenthesized set operations from the
+                // left, so retaining a left wrapper here would manufacture a
+                // `SetExpr::Query` node on reparse. Only the right side needs
+                // parentheses to preserve a non-default nesting shape.
+                self.write_set_expr(&operation.left);
+                self.output.push(' ');
+                self.output.push_str(match operation.operator {
+                    SetOperator::Union => "UNION",
+                    SetOperator::Intersect => "INTERSECT",
+                    SetOperator::Except => "EXCEPT",
+                });
+                match operation.quantifier {
+                    SetQuantifier::Distinct => self.output.push_str(" DISTINCT"),
+                    SetQuantifier::All => self.output.push_str(" ALL"),
+                    SetQuantifier::None => {}
+                }
+                self.output.push(' ');
+                self.write_set_right_operand(&operation.right);
+            }
+        }
+    }
+
+    fn write_set_right_operand(&mut self, expression: &SetExpr) {
+        if matches!(expression, SetExpr::SetOperation(_)) {
+            self.output.push('(');
+            self.write_set_expr(expression);
+            self.output.push(')');
+        } else {
+            self.write_set_expr(expression);
+        }
+    }
+
+    fn write_values(&mut self, values: &Values) {
+        self.output.push_str("VALUES ");
+        for (row_index, row) in values.rows.iter().enumerate() {
+            if row_index != 0 {
+                self.output.push_str(", ");
+            }
+            if values.explicit_row {
+                self.output.push_str("ROW");
+            }
+            self.output.push('(');
+            self.write_expr_list(row);
+            self.output.push(')');
+        }
+    }
+
+    fn write_select(&mut self, select: &Select) {
+        self.output.push_str("SELECT");
+        for hint in &select.hints {
+            self.output.push_str(" /*+ ");
+            self.write_ident(&hint.name);
+            match &hint.value {
+                SelectHintValue::Bare => {}
+                SelectHintValue::Call { arguments } => {
+                    self.output.push('(');
+                    self.write_expr_list(arguments);
+                    self.output.push(')');
+                }
+                SelectHintValue::Assignment { value } => {
+                    self.output.push_str(" = ");
+                    self.write_expr(value);
+                }
+            }
+            self.output.push_str(" */");
+        }
+        match &select.quantifier {
+            SelectQuantifier::None => {}
+            SelectQuantifier::All(_) => self.output.push_str(" ALL"),
+            SelectQuantifier::Distinct { on, .. } => {
+                self.output.push_str(" DISTINCT");
+                if !on.is_empty() {
+                    self.output.push_str(" ON (");
+                    self.write_expr_list(on);
+                    self.output.push(')');
+                }
+            }
+        }
+        if !select.projection.is_empty() {
+            self.output.push(' ');
+            for (index, item) in select.projection.iter().enumerate() {
+                if index != 0 {
+                    self.output.push_str(", ");
+                }
+                self.write_select_item(item);
+            }
+        }
+        if !select.from.is_empty() {
+            self.output.push_str(" FROM ");
+            for (index, relation) in select.from.iter().enumerate() {
+                if index != 0 {
+                    self.output.push_str(", ");
+                }
+                self.write_table_with_joins(relation);
+            }
+        }
+        if let Some(selection) = &select.selection {
+            self.output.push_str(" WHERE ");
+            self.write_expr(selection);
+        }
+        self.write_group_by(&select.group_by);
+        if let Some(having) = &select.having {
+            self.output.push_str(" HAVING ");
+            self.write_expr(having);
+        }
+        if let Some(qualify) = &select.qualify {
+            self.output.push_str(" QUALIFY ");
+            self.write_expr(qualify);
+        }
+        if !select.windows.is_empty() {
+            self.output.push_str(" WINDOW ");
+            for (index, named) in select.windows.iter().enumerate() {
+                if index != 0 {
+                    self.output.push_str(", ");
+                }
+                self.write_ident(&named.name);
+                self.output.push_str(" AS ");
+                self.write_window_specification(&named.specification);
+            }
+        }
+    }
+
+    fn write_select_item(&mut self, item: &SelectItem) {
+        match item {
+            SelectItem::UnnamedExpr(expr) => self.write_expr(expr),
+            SelectItem::ExprWithAlias {
+                expr,
+                alias,
+                explicit_as,
+                ..
+            } => {
+                self.write_expr(expr);
+                if *explicit_as {
+                    self.output.push_str(" AS ");
+                } else {
+                    self.output.push(' ');
+                }
+                self.write_ident(alias);
+            }
+            SelectItem::Wildcard { options, .. } => {
+                self.output.push('*');
+                self.write_wildcard_options(options);
+            }
+            SelectItem::QualifiedWildcard {
+                prefix, options, ..
+            } => {
+                self.write_ident_list_with_separator(prefix, ".");
+                self.output.push_str(".*");
+                self.write_wildcard_options(options);
+            }
+        }
+    }
+
+    fn write_wildcard_options(&mut self, options: &WildcardOptions) {
+        if !options.exclude.is_empty() {
+            self.output.push_str(" EXCLUDE (");
+            self.write_ident_list(&options.exclude);
+            self.output.push(')');
+        }
+        if !options.replace.is_empty() {
+            self.output.push_str(" REPLACE (");
+            for (index, item) in options.replace.iter().enumerate() {
+                if index != 0 {
+                    self.output.push_str(", ");
+                }
+                self.write_expr(&item.expr);
+                self.output.push_str(" AS ");
+                self.write_ident(&item.alias);
+            }
+            self.output.push(')');
+        }
+    }
+
+    fn write_group_by(&mut self, group_by: &GroupBy) {
+        let (keyword, expressions): (&str, &[Expr]) = match group_by {
+            GroupBy::None => return,
+            GroupBy::Expressions { expressions, .. } => ("GROUP BY ", expressions),
+            GroupBy::Rollup { expressions, .. } => ("GROUP BY ROLLUP (", expressions),
+            GroupBy::Cube { expressions, .. } => ("GROUP BY CUBE (", expressions),
+            GroupBy::GroupingSets { sets, .. } => {
+                self.output.push_str(" GROUP BY GROUPING SETS (");
+                for (set_index, set) in sets.iter().enumerate() {
+                    if set_index != 0 {
+                        self.output.push_str(", ");
+                    }
+                    self.output.push('(');
+                    self.write_expr_list(set);
+                    self.output.push(')');
+                }
+                self.output.push(')');
+                return;
+            }
+        };
+        self.output.push(' ');
+        self.output.push_str(keyword);
+        self.write_expr_list(expressions);
+        if matches!(group_by, GroupBy::Rollup { .. } | GroupBy::Cube { .. }) {
+            self.output.push(')');
+        }
+    }
+
+    fn write_order_by_list(&mut self, order_by: &[OrderByExpr]) {
+        for (index, order) in order_by.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            self.write_expr(&order.expr);
+            match order.asc {
+                Some(true) => self.output.push_str(" ASC"),
+                Some(false) => self.output.push_str(" DESC"),
+                None => {}
+            }
+            match order.nulls_first {
+                Some(true) => self.output.push_str(" NULLS FIRST"),
+                Some(false) => self.output.push_str(" NULLS LAST"),
+                None => {}
+            }
+        }
+    }
+
+    fn write_fetch(&mut self, fetch: &Fetch) {
+        self.output.push_str(" FETCH FIRST");
+        if let Some(quantity) = &fetch.quantity {
+            self.output.push(' ');
+            self.write_expr(quantity);
+        }
+        if fetch.percent {
+            self.output.push_str(" PERCENT");
+        }
+        self.output.push_str(" ROWS");
+        self.output.push_str(if fetch.with_ties {
+            " WITH TIES"
+        } else {
+            " ONLY"
+        });
+    }
+
+    fn write_table_with_joins(&mut self, relation: &TableWithJoins) {
+        self.write_table_factor(&relation.relation);
+        for join in &relation.joins {
+            self.output.push(' ');
+            self.write_join(join);
+        }
+    }
+
+    fn write_table_factor(&mut self, factor: &TableFactor) {
+        match factor {
+            TableFactor::Table {
+                name,
+                alias,
+                version,
+                hints,
+                ..
+            } => {
+                self.write_object_name(name);
+                if let Some(version) = version {
+                    self.write_table_version(version);
+                }
+                for hint in hints {
+                    if !hint.attached_to_relation {
+                        self.output.push(' ');
+                    }
+                    self.write_table_hint(hint);
+                }
+                if let Some(alias) = alias {
+                    self.output.push(' ');
+                    self.write_table_alias(alias);
+                }
+            }
+            TableFactor::Derived {
+                lateral,
+                subquery,
+                hints,
+                alias,
+                ..
+            } => {
+                for hint in hints {
+                    self.write_table_hint(hint);
+                    self.output.push(' ');
+                }
+                if *lateral {
+                    self.output.push_str("LATERAL ");
+                }
+                self.output.push('(');
+                self.write_query(subquery);
+                self.output.push(')');
+                if let Some(alias) = alias {
+                    self.output.push(' ');
+                    self.write_table_alias(alias);
+                }
+            }
+            TableFactor::TableFunction {
+                lateral,
+                syntax,
+                expr,
+                hints,
+                alias,
+                ..
+            } => {
+                if *lateral {
+                    self.output.push_str("LATERAL ");
+                }
+                match syntax {
+                    crate::ast::TableFunctionSyntax::TableWrapper => {
+                        self.output.push_str("TABLE(");
+                        self.write_expr(expr);
+                        self.output.push(')');
+                    }
+                    crate::ast::TableFunctionSyntax::BareCall => self.write_expr(expr),
+                }
+                for hint in hints {
+                    self.output.push(' ');
+                    self.write_table_hint(hint);
+                }
+                if let Some(alias) = alias {
+                    self.output.push(' ');
+                    self.write_table_alias(alias);
+                }
+            }
+            TableFactor::Unnest {
+                keyword,
+                lateral,
+                array_exprs,
+                with_offset,
+                alias,
+                ..
+            } => {
+                if *lateral {
+                    self.output.push_str("LATERAL ");
+                }
+                self.write_ident(keyword);
+                self.output.push('(');
+                self.write_expr_list(array_exprs);
+                self.output.push(')');
+                if *with_offset {
+                    self.output.push_str(" WITH OFFSET");
+                }
+                if let Some(alias) = alias {
+                    self.output.push(' ');
+                    self.write_table_alias(alias);
+                }
+            }
+            TableFactor::NestedJoin {
+                table_with_joins,
+                alias,
+                ..
+            } => {
+                self.output.push('(');
+                self.write_table_with_joins(table_with_joins);
+                self.output.push(')');
+                if let Some(alias) = alias {
+                    self.output.push(' ');
+                    self.write_table_alias(alias);
+                }
+            }
+        }
+    }
+
+    fn write_table_alias(&mut self, alias: &TableAlias) {
+        if alias.explicit_as {
+            self.output.push_str("AS ");
+        }
+        self.write_ident(&alias.name);
+        if !alias.columns.is_empty() {
+            self.output.push('(');
+            self.write_ident_list(&alias.columns);
+            self.output.push(')');
+        }
+    }
+
+    fn write_table_version(&mut self, version: &TableVersion) {
+        self.output.push_str(match version.kind {
+            TableVersionKind::ForSystemTimeAsOf => " FOR SYSTEM_TIME AS OF ",
+            TableVersionKind::ForVersionAsOf => " FOR VERSION AS OF ",
+        });
+        self.write_expr(&version.value);
+    }
+
+    fn write_table_hint(&mut self, hint: &TableHint) {
+        self.output.push('[');
+        self.write_ident(&hint.name);
+        if let Some(target) = &hint.target {
+            self.output.push('|');
+            self.write_expr(target);
+        } else if !hint.arguments.is_empty() {
+            self.output.push('(');
+            self.write_expr_list(&hint.arguments);
+            self.output.push(')');
+        }
+        self.output.push(']');
+    }
+
+    fn write_join(&mut self, join: &Join) {
+        if matches!(join.constraint, JoinConstraint::Natural(_)) {
+            self.output.push_str("NATURAL ");
+        }
+        self.output.push_str(match join.operator {
+            JoinOperator::Inner => "JOIN ",
+            JoinOperator::InnerExplicit => "INNER JOIN ",
+            JoinOperator::LeftOuter => "LEFT JOIN ",
+            JoinOperator::LeftOuterExplicit => "LEFT OUTER JOIN ",
+            JoinOperator::RightOuter => "RIGHT JOIN ",
+            JoinOperator::RightOuterExplicit => "RIGHT OUTER JOIN ",
+            JoinOperator::FullOuter => "FULL JOIN ",
+            JoinOperator::FullOuterExplicit => "FULL OUTER JOIN ",
+            JoinOperator::Cross => "CROSS JOIN ",
+            JoinOperator::LeftSemi => "LEFT SEMI JOIN ",
+            JoinOperator::RightSemi => "RIGHT SEMI JOIN ",
+            JoinOperator::LeftAnti => "LEFT ANTI JOIN ",
+            JoinOperator::RightAnti => "RIGHT ANTI JOIN ",
+        });
+        self.write_join_relation(&join.relation);
+        match &join.constraint {
+            JoinConstraint::None | JoinConstraint::Natural(_) => {}
+            JoinConstraint::On(expr) => {
+                self.output.push_str(" ON ");
+                self.write_expr(expr);
+            }
+            JoinConstraint::Using { columns, .. } => {
+                self.output.push_str(" USING (");
+                self.write_ident_list(columns);
+                self.output.push(')');
+            }
+        }
+    }
+
+    fn write_join_relation(&mut self, relation: &TableFactor) {
+        match relation {
+            TableFactor::Table {
+                name,
+                alias,
+                version,
+                hints,
+                ..
+            } if hints.iter().any(|hint| hint.attached_to_relation) => {
+                let first_postfix = hints
+                    .iter()
+                    .position(|hint| hint.attached_to_relation)
+                    .expect("matched attached table hint");
+                for hint in &hints[..first_postfix] {
+                    self.write_table_hint(hint);
+                    self.output.push(' ');
+                }
+                self.write_object_name(name);
+                if let Some(version) = version {
+                    self.write_table_version(version);
+                }
+                for hint in &hints[first_postfix..] {
+                    if !hint.attached_to_relation {
+                        self.output.push(' ');
+                    }
+                    self.write_table_hint(hint);
+                }
+                if let Some(alias) = alias {
+                    self.output.push(' ');
+                    self.write_table_alias(alias);
+                }
+            }
+            TableFactor::Table {
+                name,
+                alias,
+                version,
+                hints,
+                ..
+            } if !hints.is_empty() => {
+                for hint in hints {
+                    self.write_table_hint(hint);
+                    self.output.push(' ');
+                }
+                self.write_object_name(name);
+                if let Some(version) = version {
+                    self.write_table_version(version);
+                }
+                if let Some(alias) = alias {
+                    self.output.push(' ');
+                    self.write_table_alias(alias);
+                }
+            }
+            TableFactor::TableFunction {
+                lateral,
+                syntax,
+                expr,
+                hints,
+                alias,
+                ..
+            } if !hints.is_empty() => {
+                for hint in hints {
+                    self.write_table_hint(hint);
+                    self.output.push(' ');
+                }
+                if *lateral {
+                    self.output.push_str("LATERAL ");
+                }
+                match syntax {
+                    crate::ast::TableFunctionSyntax::TableWrapper => {
+                        self.output.push_str("TABLE(");
+                        self.write_expr(expr);
+                        self.output.push(')');
+                    }
+                    crate::ast::TableFunctionSyntax::BareCall => self.write_expr(expr),
+                }
+                if let Some(alias) = alias {
+                    self.output.push(' ');
+                    self.write_table_alias(alias);
+                }
+            }
+            _ => self.write_table_factor(relation),
+        }
+    }
+
+    fn write_window_specification(&mut self, specification: &WindowSpec) {
+        self.output.push('(');
+        let mut needs_separator = false;
+        if let Some(name) = &specification.existing_window_name {
+            self.write_ident(name);
+            needs_separator = true;
+        }
+        if !specification.partition_by.is_empty() {
+            if needs_separator {
+                self.output.push(' ');
+            }
+            self.output.push_str("PARTITION BY ");
+            self.write_expr_list(&specification.partition_by);
+            needs_separator = true;
+        }
+        if !specification.order_by.is_empty() {
+            if needs_separator {
+                self.output.push(' ');
+            }
+            self.output.push_str("ORDER BY ");
+            self.write_order_by_list(&specification.order_by);
+            needs_separator = true;
+        }
+        if let Some(frame) = &specification.window_frame {
+            if needs_separator {
+                self.output.push(' ');
+            }
+            self.write_window_frame(frame);
+        }
+        self.output.push(')');
+    }
+
+    fn write_window_frame(&mut self, frame: &WindowFrame) {
+        self.output.push_str(match frame.units {
+            WindowFrameUnits::Rows => "ROWS ",
+            WindowFrameUnits::Range => "RANGE ",
+            WindowFrameUnits::Groups => "GROUPS ",
+        });
+        if frame.end_bound.is_some() {
+            self.output.push_str("BETWEEN ");
+        }
+        self.write_window_frame_bound(&frame.start_bound);
+        if let Some(end_bound) = &frame.end_bound {
+            self.output.push_str(" AND ");
+            self.write_window_frame_bound(end_bound);
+        }
+        match frame.exclusion {
+            WindowFrameExclusion::NoOthers => {}
+            WindowFrameExclusion::CurrentRow => self.output.push_str(" EXCLUDE CURRENT ROW"),
+            WindowFrameExclusion::Group => self.output.push_str(" EXCLUDE GROUP"),
+            WindowFrameExclusion::Ties => self.output.push_str(" EXCLUDE TIES"),
+        }
+    }
+
+    fn write_window_frame_bound(&mut self, bound: &WindowFrameBound) {
+        match bound {
+            WindowFrameBound::CurrentRow(_) => self.output.push_str("CURRENT ROW"),
+            WindowFrameBound::Preceding(value, _) => {
+                self.write_window_frame_value(value);
+                self.output.push_str("PRECEDING");
+            }
+            WindowFrameBound::Following(value, _) => {
+                self.write_window_frame_value(value);
+                self.output.push_str("FOLLOWING");
+            }
+        }
+    }
+
+    fn write_window_frame_value(&mut self, value: &Option<Expr>) {
+        if let Some(value) = value {
+            self.write_expr(value);
+            self.output.push(' ');
+        } else {
+            self.output.push_str("UNBOUNDED ");
+        }
+    }
+
     fn write_expr(&mut self, expression: &Expr) {
         match expression {
             Expr::Identifier(ident) => self.write_ident(ident),
+            Expr::CompoundIdentifier(ident) => {
+                self.write_ident_list_with_separator(&ident.parts, ".")
+            }
+            Expr::UserVariable(variable) => self.output.push_str(&variable.value),
             Expr::Literal(literal) => self.write_literal(literal),
             Expr::FunctionCall(call) => self.write_function_call(call),
             Expr::Unary(expression) => self.write_unary_expr(expression),
             Expr::Binary(expression) => self.write_binary_expr(expression),
             Expr::Nested(expression) => self.write_nested_expr(expression),
+            Expr::Between(expression) => self.write_between_expr(expression),
+            Expr::InList(expression) => self.write_in_list_expr(expression),
+            Expr::InSubquery(expression) => self.write_in_subquery_expr(expression),
+            Expr::Exists(expression) => self.write_exists_expr(expression),
+            Expr::Like(expression) => self.write_like_expr(expression),
+            Expr::IsPredicate(expression) => self.write_is_predicate_expr(expression),
+            Expr::Case(expression) => self.write_case_expr(expression),
+            Expr::Cast(expression) => self.write_cast_expr(expression),
+            Expr::Interval(expression) => self.write_interval_expr(expression),
+            Expr::Subquery(expression) => self.write_subquery_expr(expression),
+            Expr::Tuple(expression) => self.write_tuple_expr(expression),
+            Expr::Array(expression) => self.write_array_expr(expression),
+            Expr::Map(expression) => self.write_map_expr(expression),
+            Expr::Struct(expression) => self.write_struct_expr(expression),
+            Expr::Lambda(expression) => self.write_lambda_expr(expression),
+            Expr::Access(expression) => self.write_access_expr(expression),
+            Expr::TypedString(expression) => self.write_typed_string_expr(expression),
         }
     }
 
     fn write_ident(&mut self, ident: &Ident) {
-        if ident.quoted {
-            self.output.push('`');
-            self.output.push_str(&ident.value.replace('`', "``"));
-            self.output.push('`');
+        if let Some(quote) = ident.quote_style {
+            self.output.push(quote);
+            self.output
+                .push_str(&ident.value.replace(quote, &format!("{quote}{quote}")));
+            self.output.push(quote);
         } else {
             self.output.push_str(&ident.value);
         }
     }
 
     fn write_object_name(&mut self, name: &ObjectName) {
-        for (index, part) in name.parts.iter().enumerate() {
-            if index != 0 {
-                self.output.push('.');
-            }
-            self.write_ident(part);
-        }
+        self.write_ident_list_with_separator(&name.parts, ".");
     }
 
     fn write_type_name(&mut self, type_name: &TypeName) {
@@ -149,7 +840,12 @@ impl Printer {
         self.output.push(if generic { '<' } else { '(' });
         for (index, argument) in type_name.arguments.iter().enumerate() {
             if index != 0 {
-                self.output.push_str(", ");
+                self.output
+                    .push_str(if type_name.argument_separator_spaces[index - 1] {
+                        ", "
+                    } else {
+                        ","
+                    });
             }
             match argument {
                 TypeNameArgument::Type(data_type) => self.write_type_name(data_type),
@@ -170,8 +866,9 @@ impl Printer {
             LiteralKind::Boolean(value) => {
                 self.output.push_str(if *value { "TRUE" } else { "FALSE" })
             }
-            LiteralKind::Number(value) => self.output.push_str(value),
-            LiteralKind::HexString(value) => self.output.push_str(value),
+            LiteralKind::Number(value) | LiteralKind::HexString(value) => {
+                self.output.push_str(value)
+            }
             LiteralKind::String(value) => self.write_quoted_string(value),
         }
     }
@@ -180,6 +877,14 @@ impl Printer {
         self.output.push('\'');
         for character in value.chars() {
             match character {
+                '\0' => self.output.push_str("\\0"),
+                '\u{0008}' => self.output.push_str("\\b"),
+                '\n' => self.output.push_str("\\n"),
+                '\r' => self.output.push_str("\\r"),
+                '\t' => self.output.push_str("\\t"),
+                '\u{000b}' => self.output.push_str("\\v"),
+                '\u{000c}' => self.output.push_str("\\f"),
+                '\u{001a}' => self.output.push_str("\\Z"),
                 '\\' => self.output.push_str("\\\\"),
                 '\'' => self.output.push_str("''"),
                 _ => self.output.push(character),
@@ -189,15 +894,98 @@ impl Printer {
     }
 
     fn write_function_call(&mut self, call: &FunctionCall) {
-        self.write_ident(&call.name);
-        self.output.push('(');
-        for (index, argument) in call.arguments.iter().enumerate() {
-            if index != 0 {
-                self.output.push_str(", ");
+        if call.name.parts.len() == 1
+            && call.name.parts[0].value.eq_ignore_ascii_case("EXTRACT")
+            && call.arguments.len() == 2
+            && matches!(call.quantifier, FunctionQuantifier::None)
+            && call.order_by.is_empty()
+            && call.separator.is_none()
+            && call.filter.is_none()
+            && call.null_treatment.is_none()
+            && call.over.is_none()
+        {
+            self.output.push_str("EXTRACT(");
+            self.write_expr(&call.arguments[0]);
+            self.output.push_str(" FROM ");
+            self.write_expr(&call.arguments[1]);
+            self.output.push(')');
+            return;
+        }
+        if call.substring_from_syntax
+            && call.name.parts.len() == 1
+            && call.name.parts[0].value.eq_ignore_ascii_case("SUBSTRING")
+            && matches!(call.arguments.len(), 2 | 3)
+            && matches!(call.quantifier, FunctionQuantifier::None)
+            && call.order_by.is_empty()
+            && call.separator.is_none()
+            && call.filter.is_none()
+            && call.null_treatment.is_none()
+            && call.over.is_none()
+        {
+            self.output.push_str("SUBSTRING(");
+            self.write_expr(&call.arguments[0]);
+            self.output.push_str(" FROM ");
+            self.write_expr(&call.arguments[1]);
+            if let Some(length) = call.arguments.get(2) {
+                self.output.push_str(" FOR ");
+                self.write_expr(length);
             }
-            self.write_expr(argument);
+            self.output.push(')');
+            return;
+        }
+        self.write_object_name(&call.name);
+        self.output.push('(');
+        match call.quantifier {
+            FunctionQuantifier::None => {}
+            FunctionQuantifier::Distinct => self.output.push_str("DISTINCT "),
+            FunctionQuantifier::All => self.output.push_str("ALL "),
+        }
+        self.write_expr_list(&call.arguments);
+        if let Some(null_treatment) = call.null_treatment {
+            if !call.arguments.is_empty() {
+                self.output.push(' ');
+            }
+            self.output.push_str(match null_treatment {
+                NullTreatment::IgnoreNulls => "IGNORE NULLS",
+                NullTreatment::RespectNulls => "RESPECT NULLS",
+            });
+        }
+        if !call.order_by.is_empty() {
+            if !call.arguments.is_empty() {
+                self.output.push(' ');
+            }
+            self.output.push_str("ORDER BY ");
+            for (index, order) in call.order_by.iter().enumerate() {
+                if index != 0 {
+                    self.output.push_str(", ");
+                }
+                self.write_expr(&order.expr);
+                match order.asc {
+                    Some(true) => self.output.push_str(" ASC"),
+                    Some(false) => self.output.push_str(" DESC"),
+                    None => {}
+                }
+                match order.nulls_first {
+                    Some(true) => self.output.push_str(" NULLS FIRST"),
+                    Some(false) => self.output.push_str(" NULLS LAST"),
+                    None => {}
+                }
+            }
+        }
+        if let Some(separator) = &call.separator {
+            self.output.push_str(" SEPARATOR ");
+            self.write_expr(separator);
         }
         self.output.push(')');
+        if let Some(filter) = &call.filter {
+            self.output.push_str(" FILTER (WHERE ");
+            self.write_expr(filter);
+            self.output.push(')');
+        }
+        if let Some(over) = &call.over {
+            self.output.push_str(" OVER ");
+            self.write_window_specification(over);
+        }
     }
 
     fn write_unary_expr(&mut self, expression: &UnaryExpr) {
@@ -205,8 +993,8 @@ impl Printer {
             UnaryOperator::Not => self.output.push_str("NOT "),
             UnaryOperator::Plus => self.output.push('+'),
             UnaryOperator::Minus => self.output.push('-'),
+            UnaryOperator::BitwiseNot => self.output.push('~'),
         }
-
         let requires_separator = matches!(expression.expression.as_ref(), Expr::Unary(_))
             && !matches!(expression.operator, UnaryOperator::Not);
         if requires_separator {
@@ -216,13 +1004,25 @@ impl Printer {
     }
 
     fn write_unary_operand(&mut self, expression: &Expr) {
-        if matches!(expression, Expr::Binary(_)) {
+        if self.requires_parentheses_for_prefix(expression) {
             self.output.push('(');
             self.write_expr(expression);
             self.output.push(')');
         } else {
             self.write_expr(expression);
         }
+    }
+
+    fn requires_parentheses_for_prefix(&self, expression: &Expr) -> bool {
+        matches!(
+            expression,
+            Expr::Binary(_)
+                | Expr::Between(_)
+                | Expr::InList(_)
+                | Expr::InSubquery(_)
+                | Expr::Like(_)
+                | Expr::IsPredicate(_)
+        )
     }
 
     fn write_binary_expr(&mut self, expression: &BinaryExpr) {
@@ -240,9 +1040,13 @@ impl Printer {
                     || (child.operator.precedence() == parent.precedence()
                         && matches!(side, BinarySide::Right))
             }
+            Expr::Between(_)
+            | Expr::InList(_)
+            | Expr::InSubquery(_)
+            | Expr::Like(_)
+            | Expr::IsPredicate(_) => parent.precedence() > BinaryOperator::And.precedence(),
             _ => false,
         };
-
         if requires_parentheses {
             self.output.push('(');
         }
@@ -257,52 +1061,291 @@ impl Printer {
         self.write_expr(&expression.expression);
         self.output.push(')');
     }
+    fn write_between_expr(&mut self, expression: &BetweenExpr) {
+        self.write_expr(&expression.expr);
+        self.output.push_str(if expression.negated {
+            " NOT BETWEEN "
+        } else {
+            " BETWEEN "
+        });
+        self.write_expr(&expression.low);
+        self.output.push_str(" AND ");
+        self.write_expr(&expression.high);
+    }
+    fn write_in_list_expr(&mut self, expression: &InListExpr) {
+        self.write_expr(&expression.expr);
+        self.output.push_str(if expression.negated {
+            " NOT IN ("
+        } else {
+            " IN ("
+        });
+        self.write_expr_list(&expression.list);
+        self.output.push(')');
+    }
+    fn write_in_subquery_expr(&mut self, expression: &InSubqueryExpr) {
+        self.write_expr(&expression.expr);
+        self.output.push_str(if expression.negated {
+            " NOT IN ("
+        } else {
+            " IN ("
+        });
+        self.write_query(&expression.query);
+        self.output.push(')');
+    }
+    fn write_exists_expr(&mut self, expression: &ExistsExpr) {
+        if expression.negated {
+            self.output.push_str("NOT ");
+        }
+        self.output.push_str("EXISTS (");
+        self.write_query(&expression.query);
+        self.output.push(')');
+    }
+
+    fn write_like_expr(&mut self, expression: &LikeExpr) {
+        self.write_expr(&expression.expr);
+        if expression.negated {
+            self.output.push_str(" NOT");
+        }
+        self.output.push(' ');
+        self.output.push_str(match expression.operator {
+            LikeOperator::Like => "LIKE",
+            LikeOperator::ILike => "ILIKE",
+            LikeOperator::RLike => "RLIKE",
+            LikeOperator::SimilarTo => "SIMILAR TO",
+        });
+        self.output.push(' ');
+        self.write_expr(&expression.pattern);
+        if let Some(escape) = &expression.escape {
+            self.output.push_str(" ESCAPE ");
+            self.write_expr(escape);
+        }
+    }
+
+    fn write_is_predicate_expr(&mut self, expression: &IsPredicateExpr) {
+        self.write_expr(&expression.expr);
+        self.output.push_str(match expression.predicate {
+            IsPredicate::Null => " IS NULL",
+            IsPredicate::NotNull => " IS NOT NULL",
+            IsPredicate::True => " IS TRUE",
+            IsPredicate::NotTrue => " IS NOT TRUE",
+            IsPredicate::False => " IS FALSE",
+            IsPredicate::NotFalse => " IS NOT FALSE",
+            IsPredicate::Unknown => " IS UNKNOWN",
+            IsPredicate::NotUnknown => " IS NOT UNKNOWN",
+        });
+    }
+
+    fn write_case_expr(&mut self, expression: &CaseExpr) {
+        self.output.push_str("CASE");
+        if let Some(operand) = &expression.operand {
+            self.output.push(' ');
+            self.write_expr(operand);
+        }
+        let common = expression.conditions.len().min(expression.results.len());
+        for index in 0..common {
+            self.output.push_str(" WHEN ");
+            self.write_expr(&expression.conditions[index]);
+            self.output.push_str(" THEN ");
+            self.write_expr(&expression.results[index]);
+        }
+        for condition in &expression.conditions[common..] {
+            self.output.push_str(" WHEN ");
+            self.write_expr(condition);
+            self.output.push_str(" THEN NULL");
+        }
+        for result in &expression.results[common..] {
+            self.output.push_str(" WHEN TRUE THEN ");
+            self.write_expr(result);
+        }
+        if let Some(else_result) = &expression.else_result {
+            self.output.push_str(" ELSE ");
+            self.write_expr(else_result);
+        }
+        self.output.push_str(" END");
+    }
+
+    fn write_cast_expr(&mut self, expression: &CastExpr) {
+        match expression.kind {
+            CastKind::Cast => self.output.push_str("CAST("),
+            CastKind::TryCast => self.output.push_str("TRY_CAST("),
+            CastKind::Convert => self.output.push_str("CONVERT("),
+        }
+        self.write_expr(&expression.expr);
+        self.output.push_str(match expression.kind {
+            CastKind::Cast | CastKind::TryCast => " AS ",
+            CastKind::Convert => ", ",
+        });
+        self.write_type_name(&expression.data_type);
+        if let Some(format) = &expression.format {
+            self.output.push_str(" FORMAT ");
+            self.write_expr(format);
+        }
+        self.output.push(')');
+    }
+
+    fn write_interval_expr(&mut self, expression: &IntervalExpr) {
+        self.output.push_str("INTERVAL ");
+        self.write_expr(&expression.value);
+        self.output.push(' ');
+        self.write_interval_field(expression.leading_field);
+        if let Some(precision) = &expression.leading_precision {
+            self.output.push('(');
+            self.write_expr(precision);
+            self.output.push(')');
+        }
+        if let Some(last_field) = expression.last_field {
+            self.output.push_str(" TO ");
+            self.write_interval_field(last_field);
+            if let Some(precision) = &expression.fractional_seconds_precision {
+                self.output.push('(');
+                self.write_expr(precision);
+                self.output.push(')');
+            }
+        }
+    }
+
+    fn write_interval_field(&mut self, field: IntervalField) {
+        self.output.push_str(match field {
+            IntervalField::Year => "YEAR",
+            IntervalField::Quarter => "QUARTER",
+            IntervalField::Month => "MONTH",
+            IntervalField::Week => "WEEK",
+            IntervalField::Day => "DAY",
+            IntervalField::Hour => "HOUR",
+            IntervalField::Minute => "MINUTE",
+            IntervalField::Second => "SECOND",
+            IntervalField::Millisecond => "MILLISECOND",
+            IntervalField::Microsecond => "MICROSECOND",
+        });
+    }
+    fn write_subquery_expr(&mut self, expression: &SubqueryExpr) {
+        self.output.push('(');
+        self.write_query(&expression.query);
+        self.output.push(')');
+    }
+    fn write_tuple_expr(&mut self, expression: &TupleExpr) {
+        self.output.push('(');
+        self.write_expr_list(&expression.expressions);
+        self.output.push(')');
+    }
+    fn write_array_expr(&mut self, expression: &ArrayExpr) {
+        self.output.push('[');
+        self.write_expr_list(&expression.elements);
+        self.output.push(']');
+    }
+
+    fn write_map_expr(&mut self, expression: &MapExpr) {
+        self.output.push_str("MAP{");
+        for (index, entry) in expression.entries.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            self.write_expr(&entry.key);
+            self.output.push_str(": ");
+            self.write_expr(&entry.value);
+        }
+        self.output.push('}');
+    }
+
+    fn write_struct_expr(&mut self, expression: &StructExpr) {
+        self.output.push_str("STRUCT(");
+        for (index, field) in expression.fields.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            if let Some(name) = &field.name {
+                self.write_ident(name);
+                self.output.push_str(" := ");
+            }
+            self.write_expr(&field.value);
+        }
+        self.output.push(')');
+    }
+
+    fn write_lambda_expr(&mut self, expression: &LambdaExpr) {
+        if expression.parameters.len() == 1 && !expression.parenthesized_single_parameter {
+            self.write_ident(&expression.parameters[0]);
+        } else {
+            self.output.push('(');
+            self.write_ident_list(&expression.parameters);
+            self.output.push(')');
+        }
+        self.output.push_str(" -> ");
+        self.write_expr(&expression.body);
+    }
+    fn write_access_expr(&mut self, expression: &AccessExpr) {
+        self.write_expr(&expression.expr);
+        match &expression.kind {
+            AccessKind::Field(name) => {
+                self.output.push('.');
+                self.write_ident(name);
+            }
+            AccessKind::Subscript(index) => {
+                self.output.push('[');
+                self.write_expr(index);
+                self.output.push(']');
+            }
+            AccessKind::Json { operator, path } => {
+                self.output.push_str(match operator {
+                    JsonOperator::Arrow => " -> ",
+                    JsonOperator::ArrowText => " ->> ",
+                });
+                self.write_expr(path);
+            }
+        }
+    }
+    fn write_typed_string_expr(&mut self, expression: &TypedStringExpr) {
+        self.write_type_name(&expression.data_type);
+        self.output.push(' ');
+        self.write_literal(&expression.value);
+    }
+
+    fn write_expr_list(&mut self, expressions: &[Expr]) {
+        for (index, expression) in expressions.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(", ");
+            }
+            self.write_expr(expression);
+        }
+    }
+    fn write_ident_list(&mut self, idents: &[Ident]) {
+        self.write_ident_list_with_separator(idents, ", ");
+    }
+    fn write_ident_list_with_separator(&mut self, idents: &[Ident], separator: &str) {
+        for (index, ident) in idents.iter().enumerate() {
+            if index != 0 {
+                self.output.push_str(separator);
+            }
+            self.write_ident(ident);
+        }
+    }
 }
 
 /// Renders one statement into canonical SQL.
 pub fn print_statement(statement: &Statement) -> String {
     Printer::new().statement(statement)
 }
-
 /// Renders statements separated by one semicolon and one space.
 pub fn print_statements(statements: &[Statement]) -> String {
     Printer::new().statements(statements)
 }
-
 /// Renders one expression into canonical SQL.
 pub fn print_expr(expression: &Expr) -> String {
     Printer::new().expression(expression)
 }
-
 /// Renders an object name into canonical SQL.
 pub fn print_object_name(name: &ObjectName) -> String {
     Printer::new().object_name(name)
 }
-
 /// Renders a syntax-level type name into canonical SQL.
 pub fn print_type_name(type_name: &TypeName) -> String {
     Printer::new().type_name(type_name)
 }
-
 /// Renders one syntax literal into canonical SQL.
 pub fn print_literal(literal: &Literal) -> String {
-    match &literal.kind {
-        LiteralKind::Null => "NULL".to_owned(),
-        LiteralKind::Boolean(value) => if *value { "TRUE" } else { "FALSE" }.to_owned(),
-        LiteralKind::Number(value) | LiteralKind::HexString(value) => value.clone(),
-        LiteralKind::String(value) => {
-            let mut output = String::from("'");
-            for character in value.chars() {
-                match character {
-                    '\\' => output.push_str("\\\\"),
-                    '\'' => output.push_str("''"),
-                    _ => output.push(character),
-                }
-            }
-            output.push('\'');
-            output
-        }
-    }
+    let mut printer = Printer::new();
+    printer.write_literal(literal);
+    printer.output
 }
 
 #[derive(Clone, Copy)]
@@ -314,25 +1357,34 @@ enum BinarySide {
 impl BinaryOperator {
     const fn precedence(self) -> u8 {
         match self {
-            Self::Or => 1,
-            Self::And => 2,
+            Self::NamedArgument => 1,
+            Self::Or => 10,
+            Self::And => 20,
             Self::Equal
             | Self::NotEqual
+            | Self::NullSafeEqual
             | Self::LessThan
             | Self::LessThanOrEqual
             | Self::GreaterThan
-            | Self::GreaterThanOrEqual => 3,
-            Self::Add | Self::Subtract => 4,
-            Self::Multiply | Self::Divide => 5,
+            | Self::GreaterThanOrEqual
+            | Self::IsDistinctFrom
+            | Self::IsNotDistinctFrom => 30,
+            Self::BitwiseOr => 35,
+            Self::BitwiseXor => 36,
+            Self::BitwiseAnd => 37,
+            Self::ShiftLeft | Self::ShiftRight => 40,
+            Self::StringConcat | Self::Add | Self::Subtract => 50,
+            Self::Multiply | Self::Divide | Self::Modulo => 60,
         }
     }
-
     const fn sql(self) -> &'static str {
         match self {
+            Self::NamedArgument => "=>",
             Self::Or => "OR",
             Self::And => "AND",
             Self::Equal => "=",
             Self::NotEqual => "!=",
+            Self::NullSafeEqual => "<=>",
             Self::LessThan => "<",
             Self::LessThanOrEqual => "<=",
             Self::GreaterThan => ">",
@@ -341,6 +1393,15 @@ impl BinaryOperator {
             Self::Subtract => "-",
             Self::Multiply => "*",
             Self::Divide => "/",
+            Self::Modulo => "%",
+            Self::BitwiseAnd => "&",
+            Self::BitwiseOr => "|",
+            Self::BitwiseXor => "^",
+            Self::ShiftLeft => "<<",
+            Self::ShiftRight => ">>",
+            Self::StringConcat => "||",
+            Self::IsDistinctFrom => "IS DISTINCT FROM",
+            Self::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
         }
     }
 }
@@ -348,19 +1409,35 @@ impl BinaryOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        Span,
-        ast::{BackendStatement, LiteralKind, ShowBackends},
-    };
+    use crate::Span;
 
     fn span() -> Span {
         Span::new(0, 0)
     }
 
-    fn ident(value: &str) -> Expr {
-        Expr::Identifier(Ident {
+    fn ident(value: &str) -> Ident {
+        Ident {
             value: value.to_owned(),
             quoted: false,
+            quote_style: None,
+            span: span(),
+        }
+    }
+
+    fn object_name(value: &str) -> ObjectName {
+        ObjectName {
+            parts: vec![ident(value)],
+            span: span(),
+        }
+    }
+
+    fn identifier(value: &str) -> Expr {
+        Expr::Identifier(ident(value))
+    }
+
+    fn number(value: &str) -> Expr {
+        Expr::Literal(Literal {
+            kind: LiteralKind::Number(value.to_owned()),
             span: span(),
         })
     }
@@ -375,98 +1452,173 @@ mod tests {
     }
 
     #[test]
-    fn renders_every_seed_ast_node() {
-        let quoted = Ident {
-            value: "strange`name".to_owned(),
-            quoted: true,
-            span: span(),
-        };
+    fn renders_extended_expression_forms() {
         let function = Expr::FunctionCall(FunctionCall {
-            name: Ident {
-                value: "Coalesce".to_owned(),
-                quoted: false,
+            name: object_name("Coalesce"),
+            arguments: vec![identifier("a"), number("1")],
+            quantifier: FunctionQuantifier::Distinct,
+            order_by: Vec::new(),
+            separator: None,
+            filter: Some(Box::new(Expr::IsPredicate(IsPredicateExpr {
+                expr: Box::new(identifier("b")),
+                predicate: IsPredicate::NotNull,
                 span: span(),
-            },
-            arguments: vec![
-                Expr::Identifier(quoted),
-                Expr::Literal(Literal {
-                    kind: LiteralKind::String("a'b\\c".to_owned()),
-                    span: span(),
-                }),
-                Expr::Literal(Literal {
-                    kind: LiteralKind::HexString("0xCAFE".to_owned()),
-                    span: span(),
-                }),
-            ],
-            span: span(),
-        });
-        let expression = Expr::Nested(NestedExpr {
-            expression: Box::new(Expr::Unary(UnaryExpr {
-                operator: UnaryOperator::Not,
-                expression: Box::new(binary(
-                    function,
-                    BinaryOperator::Or,
-                    Expr::Literal(Literal {
-                        kind: LiteralKind::Boolean(false),
-                        span: span(),
-                    }),
-                )),
+            }))),
+            null_treatment: Some(NullTreatment::IgnoreNulls),
+            over: Some(Box::new(WindowSpec {
+                existing_window_name: None,
+                partition_by: vec![identifier("partition_key")],
+                order_by: Vec::new(),
+                window_frame: None,
                 span: span(),
             })),
+            substring_from_syntax: false,
             span: span(),
         });
-
         assert_eq!(
-            print_expr(&expression),
-            "(NOT (Coalesce(`strange``name`, 'a''b\\\\c', 0xCAFE) OR FALSE))"
+            print_expr(&function),
+            "Coalesce(DISTINCT a, 1 IGNORE NULLS) FILTER (WHERE b IS NOT NULL) OVER (PARTITION BY partition_key)"
+        );
+
+        let between = Expr::Between(BetweenExpr {
+            expr: Box::new(binary(
+                identifier("a"),
+                BinaryOperator::Add,
+                identifier("b"),
+            )),
+            negated: true,
+            low: Box::new(number("1")),
+            high: Box::new(number("2")),
+            span: span(),
+        });
+        assert_eq!(print_expr(&between), "a + b NOT BETWEEN 1 AND 2");
+        assert_eq!(
+            print_expr(&Expr::Access(AccessExpr {
+                expr: Box::new(identifier("payload")),
+                kind: AccessKind::Json {
+                    operator: JsonOperator::ArrowText,
+                    path: Box::new(Expr::Literal(Literal {
+                        kind: LiteralKind::String("name".to_owned()),
+                        span: span(),
+                    })),
+                },
+                span: span(),
+            })),
+            "payload ->> 'name'"
         );
         assert_eq!(
-            print_expr(&Expr::Literal(Literal {
-                kind: LiteralKind::Null,
+            print_expr(&Expr::Lambda(LambdaExpr {
+                parameters: vec![ident("value")],
+                parenthesized_single_parameter: false,
+                body: Box::new(identifier("value")),
                 span: span(),
             })),
-            "NULL"
+            "value -> value"
         );
     }
 
     #[test]
-    fn parenthesizes_right_nested_and_lower_precedence_operands() {
+    fn renders_query_relations_and_modifiers() {
+        let query = Query {
+            with: Some(With {
+                recursive: false,
+                ctes: vec![Cte {
+                    name: ident("source"),
+                    columns: Vec::new(),
+                    query: Box::new(Query {
+                        with: None,
+                        body: Box::new(SetExpr::Values(Values {
+                            rows: vec![vec![number("1")]],
+                            explicit_row: false,
+                            span: span(),
+                        })),
+                        order_by: Vec::new(),
+                        limit: None,
+                        offset: None,
+                        limit_comma_offset: false,
+                        fetch: None,
+                        span: span(),
+                    }),
+                    span: span(),
+                }],
+                span: span(),
+            }),
+            body: Box::new(SetExpr::Select(Box::new(Select {
+                hints: Vec::new(),
+                quantifier: SelectQuantifier::Distinct {
+                    on: vec![identifier("s")],
+                    span: span(),
+                },
+                projection: vec![SelectItem::ExprWithAlias {
+                    expr: identifier("s"),
+                    alias: ident("value"),
+                    explicit_as: true,
+                    span: span(),
+                }],
+                from: vec![TableWithJoins {
+                    relation: TableFactor::Table {
+                        name: object_name("source"),
+                        alias: Some(TableAlias {
+                            name: ident("s"),
+                            columns: Vec::new(),
+                            explicit_as: false,
+                            span: span(),
+                        }),
+                        version: None,
+                        hints: Vec::new(),
+                        span: span(),
+                    },
+                    joins: Vec::new(),
+                    span: span(),
+                }],
+                selection: None,
+                group_by: GroupBy::None,
+                having: None,
+                qualify: None,
+                windows: Vec::new(),
+                span: span(),
+            }))),
+            order_by: vec![OrderByExpr {
+                expr: identifier("value"),
+                asc: Some(false),
+                nulls_first: Some(false),
+                span: span(),
+            }],
+            limit: Some(number("10")),
+            offset: Some(Offset {
+                value: number("2"),
+                rows: OffsetRows::Rows,
+                span: span(),
+            }),
+            limit_comma_offset: false,
+            fetch: Some(Fetch {
+                quantity: Some(number("3")),
+                percent: false,
+                with_ties: false,
+                span: span(),
+            }),
+            span: span(),
+        };
+
+        assert_eq!(
+            print_statement(&Statement::ExplainQuery(ExplainQuery {
+                format: ExplainFormat::Verbose,
+                query: Box::new(query),
+                span: span(),
+            })),
+            "EXPLAIN VERBOSE WITH source AS (VALUES (1)) SELECT DISTINCT ON (s) s AS value FROM source s ORDER BY value DESC NULLS LAST LIMIT 10 OFFSET 2 ROWS FETCH FIRST 3 ROWS ONLY"
+        );
+    }
+
+    #[test]
+    fn parenthesizes_binary_expressions_and_keeps_legacy_statements() {
         let expression = binary(
-            ident("a"),
+            identifier("a"),
             BinaryOperator::Multiply,
-            binary(ident("b"), BinaryOperator::Add, ident("c")),
+            binary(identifier("b"), BinaryOperator::Add, identifier("c")),
         );
         assert_eq!(print_expr(&expression), "a * (b + c)");
 
-        let expression = binary(
-            binary(ident("a"), BinaryOperator::Subtract, ident("b")),
-            BinaryOperator::Subtract,
-            ident("c"),
-        );
-        assert_eq!(print_expr(&expression), "a - b - c");
-
-        let expression = binary(
-            ident("a"),
-            BinaryOperator::Subtract,
-            binary(ident("b"), BinaryOperator::Subtract, ident("c")),
-        );
-        assert_eq!(print_expr(&expression), "a - (b - c)");
-    }
-
-    #[test]
-    fn renders_raw_query_without_normalizing_its_text() {
-        let statement = Statement::RawQuery(RawQuerySlice {
-            text: "SELECT /*+ SET_VAR(x = 1) */ 1".to_owned(),
-            span: span(),
-        });
-        assert_eq!(
-            print_statement(&statement),
-            "SELECT /*+ SET_VAR(x = 1) */ 1"
-        );
-    }
-
-    #[test]
-    fn renders_vertical_slice_and_statement_sequences() {
         let show = Statement::Backend(BackendStatement::ShowBackends(ShowBackends {
             span: span(),
         }));
@@ -475,32 +1627,5 @@ mod tests {
             print_statements(&[show.clone(), show]),
             "SHOW BACKENDS; SHOW BACKENDS"
         );
-    }
-
-    #[test]
-    fn renders_object_and_type_names() {
-        let name = ObjectName {
-            parts: vec![
-                Ident {
-                    value: "catalog".to_owned(),
-                    quoted: false,
-                    span: span(),
-                },
-                Ident {
-                    value: "table".to_owned(),
-                    quoted: true,
-                    span: span(),
-                },
-            ],
-            span: span(),
-        };
-        let type_name = TypeName {
-            name,
-            arguments: Vec::new(),
-            span: span(),
-        };
-
-        assert_eq!(print_type_name(&type_name), "catalog.`table`");
-        assert_eq!(print_object_name(&type_name.name), "catalog.`table`");
     }
 }

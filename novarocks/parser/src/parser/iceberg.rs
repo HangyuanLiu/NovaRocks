@@ -294,6 +294,7 @@ fn parse_property_key(parser: &mut StatementParser<'_, '_>) -> Result<Ident, Par
     Ok(Ident {
         value,
         quoted: false,
+        quote_style: None,
         span: literal.span,
     })
 }
@@ -512,7 +513,7 @@ fn parse_type_name(parser: &mut StatementParser<'_, '_>) -> Result<TypeName, Par
                 if parser.consume_if_symbol(Symbol::Comma) {
                     continue;
                 }
-                break parser.consume_symbol(Symbol::Gt)?;
+                break parser.consume_type_gt()?;
             }
         } else {
             loop {
@@ -520,7 +521,7 @@ fn parse_type_name(parser: &mut StatementParser<'_, '_>) -> Result<TypeName, Par
                 if parser.consume_if_symbol(Symbol::Comma) {
                     continue;
                 }
-                break parser.consume_symbol(Symbol::Gt)?;
+                break parser.consume_type_gt()?;
             }
         }
     } else if parser.consume_if_symbol(Symbol::LParen) {
@@ -538,6 +539,7 @@ fn parse_type_name(parser: &mut StatementParser<'_, '_>) -> Result<TypeName, Par
         span: Span::new(name.span.start(), end.end()),
         name,
         arguments,
+        argument_separator_spaces: Vec::new(),
     })
 }
 
@@ -554,14 +556,19 @@ fn parse_transform_ident(parser: &mut StatementParser<'_, '_>) -> Result<Ident, 
         return Err(parser.unexpected("partition transform"));
     }
     let source = parser.source_slice(token.span);
-    let (value, quoted) = if matches!(token.kind, TokenKind::QuotedIdent) {
-        (source[1..source.len() - 1].replace("``", "`"), true)
+    let (value, quoted, quote_style) = if matches!(token.kind, TokenKind::QuotedIdent) {
+        (
+            source[1..source.len() - 1].replace("``", "`"),
+            true,
+            Some('`'),
+        )
     } else {
-        (source.to_owned(), false)
+        (source.to_owned(), false, None)
     };
     let ident = Ident {
         value,
         quoted,
+        quote_style,
         span: token.span,
     };
     parser.advance();

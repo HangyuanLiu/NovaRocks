@@ -7,4 +7,7 @@ sql.lex.unterminated_quoted_identifier	Lex
 sql.lex.unterminated_string	Lex
 sql.parse.unexpected_token	Parse
 sql.parse.unsupported_statement	Parse
+sql.validate.duplicate_cte_name	Validate
+sql.validate.duplicate_window_name	Validate
 sql.validate.invalid_structure	Validate
+sql.validate.invalid_window_frame_bounds	Validate

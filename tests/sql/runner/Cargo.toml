@@ -44,6 +44,8 @@ clap = { version = "4.5", features = ["derive"] }
 mysql = "25.0.1"
 novarocks-cluster-harness = { path = "../../cluster-harness" }
 novarocks-failpoint = { path = "../../../novarocks/failpoint", default-features = false }
+novarocks-parser = { path = "../../../novarocks/parser" }
+novarocks-sql = { path = "../../../novarocks/sql" }
 rayon = "1.10"
 regex = "1.10"
 serde = { version = "1", features = ["derive"] }
@@ -54,6 +56,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "signal"] }
+sqlparser = "0.61.0"
 
 [dev-dependencies]
 tempfile = "3"

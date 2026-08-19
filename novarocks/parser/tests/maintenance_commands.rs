@@ -41,13 +41,14 @@ fn generic_call_retains_named_args_maps_and_timestamp_literals() {
     let source = "call `ice`.system.rewrite_manifests(\
         `table` => 'db.orders',\
         options => map('rewrite-all', 'true'),\
-        older_than => timestamp '2026-01-01 00:00:00')";
+        older_than => timestamp '2026-01-01 00:00:00',\
+        where => 'id > 10')";
     let statements = parse(source).expect("generic CALL should parse without procedure admission");
     let [Statement::Maintenance(MaintenanceStatement::Call(call))] = statements.as_slice() else {
         panic!("expected CALL maintenance statement");
     };
     assert_eq!(call.procedure.parts.len(), 3);
-    assert_eq!(call.arguments.len(), 3);
+    assert_eq!(call.arguments.len(), 4);
     assert!(
         call.arguments
             .iter()
@@ -55,7 +56,7 @@ fn generic_call_retains_named_args_maps_and_timestamp_literals() {
     );
     assert_eq!(
         roundtrip(source),
-        "CALL `ice`.system.rewrite_manifests(`table` => 'db.orders', options => MAP('rewrite-all', 'true'), older_than => TIMESTAMP '2026-01-01 00:00:00')"
+        "CALL `ice`.system.rewrite_manifests(`table` => 'db.orders', options => MAP('rewrite-all', 'true'), older_than => TIMESTAMP '2026-01-01 00:00:00', where => 'id > 10')"
     );
 }
 

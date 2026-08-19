@@ -33,7 +33,7 @@ pub fn parse_expression(source: &str, tokens: &[Token]) -> Result<Expr, ParseErr
 mod tests {
     use crate::{
         ParseError, ParserError, Span,
-        ast::{BinaryOperator, Expr, LiteralKind, UnaryOperator},
+        ast::{BinaryOperator, Expr, FunctionQuantifier, LiteralKind, UnaryOperator},
         lex,
     };
 
@@ -138,6 +138,75 @@ mod tests {
                 found: "`)`".to_owned(),
                 span: Span::new(5, 6),
             }
+        );
+    }
+
+    #[test]
+    fn comparison_special_forms_keep_their_dedicated_ast_nodes() {
+        assert!(matches!(parse("a NOT BETWEEN 1 AND 3"), Expr::Between(_)));
+        assert!(matches!(parse("a IN (1, 2, 3)"), Expr::InList(_)));
+        assert!(matches!(parse("a NOT LIKE 'x%' ESCAPE '_'"), Expr::Like(_)));
+        assert!(matches!(parse("a IS NOT NULL"), Expr::IsPredicate(_)));
+
+        let Expr::Binary(expression) = parse("a IS DISTINCT FROM b") else {
+            panic!("expected binary IS DISTINCT FROM");
+        };
+        assert_eq!(expression.operator, BinaryOperator::IsDistinctFrom);
+
+        assert!(matches!(
+            parse("CASE WHEN a THEN CAST(b AS DECIMAL(10, 2)) ELSE TRY_CAST(c AS INT) END"),
+            Expr::Case(_)
+        ));
+
+        let Expr::FunctionCall(call) = parse(
+            "sum(v) OVER (PARTITION BY k ORDER BY ts DESC NULLS LAST ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+        ) else {
+            panic!("expected window function");
+        };
+        assert!(call.over.is_some());
+
+        assert!(matches!(parse("EXISTS (SELECT 1)"), Expr::Exists(_)));
+        assert!(matches!(
+            parse("a NOT IN (SELECT b FROM t)"),
+            Expr::InSubquery(_)
+        ));
+        assert!(matches!(parse("(SELECT 1) + 2"), Expr::Binary(_)));
+        assert!(matches!(parse("[1, 2, 3]"), Expr::Array(_)));
+        assert!(matches!(parse("map{1: [2, 3], NULL: 4}"), Expr::Map(_)));
+        assert!(matches!(parse("(a, b)"), Expr::Tuple(_)));
+        assert!(matches!(
+            parse("CAST(map{1: NULL} AS MAP<INT, ARRAY<INT>>)"),
+            Expr::Cast(_)
+        ));
+        assert!(matches!(parse("items[1]"), Expr::Access(_)));
+        assert!(matches!(parse("items[1].field"), Expr::Access(_)));
+        assert!(matches!(parse("left('value', 2)"), Expr::FunctionCall(_)));
+        assert!(matches!(parse("right('value', 2)"), Expr::FunctionCall(_)));
+        assert!(matches!(parse("DATE '2024-01-10'"), Expr::TypedString(_)));
+        assert!(matches!(
+            parse("EXTRACT(YEAR FROM created_at)"),
+            Expr::FunctionCall(_)
+        ));
+        assert!(matches!(parse("payload->>'$.name'"), Expr::Access(_)));
+        let Expr::FunctionCall(call) = parse("array_map((x, y) -> x + y, input)") else {
+            panic!("expected lambda function argument");
+        };
+        assert!(matches!(call.arguments[0], Expr::Lambda(_)));
+        let Expr::FunctionCall(call) = parse(
+            "group_concat(DISTINCT a ORDER BY b DESC SEPARATOR ',') FILTER (WHERE a IS NOT NULL)",
+        ) else {
+            panic!("expected function modifiers");
+        };
+        assert_eq!(call.quantifier, FunctionQuantifier::Distinct);
+        assert_eq!(call.order_by.len(), 1);
+        assert!(call.separator.is_some());
+        assert!(call.filter.is_some());
+        let Expr::FunctionCall(call) = parse("lead(v IGNORE NULLS, 1) OVER (ORDER BY x)") else {
+            panic!("expected null-treatment function");
+        };
+        assert_eq!(
+            call.null_treatment,
+            Some(crate::ast::NullTreatment::IgnoreNulls)
         );
     }
 }

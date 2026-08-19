@@ -20,13 +20,18 @@
 pub(crate) mod backend;
 pub(crate) mod catalog;
 pub(crate) mod command;
+mod equivalence;
 mod expr;
 pub(crate) mod iceberg;
 pub(crate) mod maintenance;
 pub(crate) mod materialized_view;
+mod query;
+mod relation;
 pub(crate) mod statistics;
+mod validate;
 pub(crate) mod view;
 mod visit;
+mod window;
 
 pub use backend::{AddBackend, BackendStatement, DropBackend, ShowBackends};
 pub use catalog::{
@@ -34,8 +39,14 @@ pub use catalog::{
     DropTable, ShowCreateTable, TruncateTable,
 };
 pub use command::{Property, PropertyKeyValue};
+pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_eq_query};
 pub use expr::{
-    BinaryExpr, BinaryOperator, Expr, FunctionCall, NestedExpr, UnaryExpr, UnaryOperator,
+    AccessExpr, AccessKind, ArrayExpr, BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr,
+    CastKind, CompoundIdentifier, ExistsExpr, Expr, FunctionCall, FunctionOrderBy,
+    FunctionQuantifier, InListExpr, InSubqueryExpr, IntervalExpr, IntervalField, IsPredicate,
+    IsPredicateExpr, JsonOperator, LambdaExpr, LikeExpr, LikeOperator, MapEntry, MapExpr,
+    NestedExpr, NullTreatment, StructExpr, StructExprField, SubqueryExpr, TupleExpr,
+    TypedStringExpr, UnaryExpr, UnaryOperator, UserVariable,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
@@ -57,11 +68,21 @@ pub use materialized_view::{
     MaterializedViewRefreshPolicy, MaterializedViewStatement, RefreshMaterializedView,
     ShowMaterializedViews,
 };
+pub use query::{
+    Cte, ExplainFormat, ExplainQuery, Fetch, GroupBy, Offset, OffsetRows, OrderByExpr, Query,
+    ReplaceSelectItem, Select, SelectHint, SelectHintValue, SelectItem, SelectQuantifier, SetExpr,
+    SetOperation, SetOperator, SetQuantifier, Values, WildcardOptions, With,
+};
+pub use relation::{
+    Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableFunctionSyntax, TableHint,
+    TableVersion, TableVersionKind, TableWithJoins,
+};
 pub use statistics::{
     AnalyzeMode, AnalyzeTable, CancelAnalyze, DropHistogram, DropMultipleColumnsStats, DropStats,
     ShowAnalyzeJobs, ShowBasicStatsMeta, ShowHistogramStatsMeta, ShowTableStats,
     StatisticsStatement,
 };
+pub use validate::{validate_statement, validate_statements};
 pub use view::{CreateView, DropView, ShowCreateView, ShowViews, ViewStatement};
 pub use visit::{
     Fold, Visit, fold_binary_expr, fold_expr, fold_function_call, fold_ident, fold_literal,
@@ -69,6 +90,9 @@ pub use visit::{
     fold_unary_expr, fold_view_statement, walk_binary_expr, walk_expr, walk_function_call,
     walk_ident, walk_literal, walk_nested_expr, walk_object_name, walk_show_backends,
     walk_statement, walk_type_name, walk_unary_expr, walk_view_statement,
+};
+pub use window::{
+    NamedWindow, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
 };
 
 use crate::Span;
@@ -83,6 +107,8 @@ pub enum Statement {
     Maintenance(MaintenanceStatement),
     MaterializedView(MaterializedViewStatement),
     View(ViewStatement),
+    Query(Query),
+    ExplainQuery(ExplainQuery),
     RawQuery(RawQuerySlice),
 }
 
@@ -96,6 +122,8 @@ impl Statement {
             Self::Maintenance(statement) => statement.span(),
             Self::MaterializedView(statement) => statement.span(),
             Self::View(statement) => statement.span(),
+            Self::Query(query) => query.span,
+            Self::ExplainQuery(query) => query.span,
             Self::RawQuery(query) => query.span,
         }
     }
@@ -106,6 +134,8 @@ impl Statement {
 pub struct Ident {
     pub value: String,
     pub quoted: bool,
+    /// Original delimiter when the identifier was quoted.
+    pub quote_style: Option<char>,
     pub span: Span,
 }
 
@@ -121,6 +151,8 @@ pub struct ObjectName {
 pub struct TypeName {
     pub name: ObjectName,
     pub arguments: Vec<TypeNameArgument>,
+    /// Trivia after each argument comma, retained for canonical reparse compatibility.
+    pub argument_separator_spaces: Vec<bool>,
     pub span: Span,
 }
 
@@ -183,6 +215,7 @@ mod tests {
             parts: vec![Ident {
                 value: "catalog".to_owned(),
                 quoted: false,
+                quote_style: None,
                 span: span(0, 7),
             }],
             span: span(0, 7),
@@ -190,6 +223,7 @@ mod tests {
         let type_name = TypeName {
             name: name.clone(),
             arguments: Vec::new(),
+            argument_separator_spaces: Vec::new(),
             span: span(0, 7),
         };
         let literal = Literal {
@@ -231,19 +265,31 @@ mod tests {
             left: Box::new(Expr::Identifier(Ident {
                 value: "a".to_owned(),
                 quoted: false,
+                quote_style: None,
                 span: span(0, 1),
             })),
             operator: BinaryOperator::Add,
             right: Box::new(Expr::FunctionCall(FunctionCall {
-                name: Ident {
-                    value: "abs".to_owned(),
-                    quoted: false,
+                name: ObjectName {
+                    parts: vec![Ident {
+                        value: "abs".to_owned(),
+                        quoted: false,
+                        quote_style: None,
+                        span: span(4, 7),
+                    }],
                     span: span(4, 7),
                 },
                 arguments: vec![Expr::Literal(Literal {
                     kind: LiteralKind::Number("1".to_owned()),
                     span: span(8, 9),
                 })],
+                quantifier: FunctionQuantifier::None,
+                order_by: Vec::new(),
+                separator: None,
+                filter: None,
+                null_treatment: None,
+                over: None,
+                substring_from_syntax: false,
                 span: span(4, 10),
             })),
             span: span(0, 10),
@@ -271,6 +317,7 @@ mod tests {
             expression: Box::new(Expr::Identifier(Ident {
                 value: "old".to_owned(),
                 quoted: false,
+                quote_style: None,
                 span: span(1, 4),
             })),
             span: span(0, 5),
@@ -283,6 +330,7 @@ mod tests {
                 expression: Box::new(Expr::Identifier(Ident {
                     value: "new".to_owned(),
                     quoted: false,
+                    quote_style: None,
                     span: span(1, 4),
                 })),
                 span: span(0, 5),

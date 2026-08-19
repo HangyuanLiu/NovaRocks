@@ -55,7 +55,9 @@ fn is_legacy_frontier(source: &str) -> bool {
     let words = significant_words(source);
     let first = words.first().map(String::as_str);
     match first {
-        Some("SELECT" | "WITH" | "INSERT" | "DELETE" | "UPDATE" | "MERGE" | "SET" | "USE") => true,
+        Some(
+            "SELECT" | "WITH" | "VALUES" | "INSERT" | "DELETE" | "UPDATE" | "MERGE" | "SET" | "USE",
+        ) => true,
         Some("KILL") => words.get(1).map(String::as_str) != Some("ANALYZE"),
         Some("EXPLAIN") => explain_targets_query(&words),
         Some("CREATE") => {
@@ -134,7 +136,7 @@ fn explain_targets_query(words: &[String]) -> bool {
         .skip(1)
         .map(String::as_str)
         .find(|word| !matches!(*word, "ANALYZE" | "VERBOSE" | "COSTS" | "LOGICAL"))
-        .is_some_and(|word| matches!(word, "SELECT" | "WITH"))
+        .is_some_and(|word| matches!(word, "SELECT" | "WITH" | "VALUES"))
 }
 
 fn significant_words(source: &str) -> Vec<String> {
@@ -157,12 +159,14 @@ mod tests {
         for source in [
             "SELECT 1",
             "WITH c AS (SELECT 1) SELECT * FROM c",
+            "VALUES (1)",
             "CREATE TABLE t (k INT)",
             "CREATE TEMPORARY TABLE t (k INT)",
             "INSERT INTO t VALUES (1)",
             "SET query_timeout = 1",
             "KILL QUERY 1",
             "EXPLAIN VERBOSE SELECT 1",
+            "EXPLAIN ANALYZE VALUES (1)",
         ] {
             assert_eq!(
                 admit_statement(source)

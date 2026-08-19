@@ -283,8 +283,13 @@ async fn absent_config_opens_disabled_host() {
     assert!(host.state_store().is_none());
     assert_eq!(host.state_store_provider_id(), None);
     assert!(
-        parse_typed_statement("SELECT 1").is_err(),
-        "ordinary SQL must not be admitted as a typed maintenance statement"
+        matches!(
+            parse_typed_statement("SELECT 1")
+                .expect("the parser-owned Query AST should construct SELECT")
+                .as_slice(),
+            [novarocks_parser::ast::Statement::Query(_)]
+        ),
+        "ordinary SQL must remain a typed Query, not a typed maintenance statement"
     );
     let _query_execution = host.query_execution_service();
     let _backend_activity = host.backend_query_activity();

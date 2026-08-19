@@ -31,6 +31,37 @@ pub(crate) fn unsupported_statement(statement: &str) -> String {
     format!("recognized but unsupported statement {statement}")
 }
 
-pub(crate) fn invalid_structure(detail: &str) -> String {
-    format!("invalid SQL structure: {detail}")
+use crate::StructuralViolation;
+
+pub(crate) fn invalid_structure(violation: StructuralViolation) -> String {
+    match violation {
+        StructuralViolation::EmptyWithCteList => {
+            "invalid SQL structure: empty WITH common-table-expression list".to_owned()
+        }
+        StructuralViolation::EmptyValuesRowList => {
+            "invalid SQL structure: empty VALUES row list".to_owned()
+        }
+        StructuralViolation::EmptyValuesRow => "invalid SQL structure: empty VALUES row".to_owned(),
+        StructuralViolation::EmptySelectProjection => {
+            "invalid SQL structure: empty SELECT projection list".to_owned()
+        }
+        StructuralViolation::EmptyUnnestExpressionList => {
+            "invalid SQL structure: empty UNNEST expression list".to_owned()
+        }
+        StructuralViolation::MismatchedCaseArms => {
+            "invalid SQL structure: mismatched CASE condition and result arms".to_owned()
+        }
+    }
+}
+
+pub(crate) fn duplicate_cte_name(name: &str) -> String {
+    format!("duplicate common table expression name `{name}`")
+}
+
+pub(crate) fn duplicate_window_name(name: &str) -> String {
+    format!("duplicate named window `{name}`")
+}
+
+pub(crate) fn invalid_window_frame_bounds() -> String {
+    "invalid window frame bounds".to_owned()
 }
