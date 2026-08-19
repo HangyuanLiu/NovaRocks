@@ -21,7 +21,7 @@ use super::{
     BackendStatement, BinaryExpr, CatalogStatement, Expr, FunctionCall, IcebergStatement, Ident,
     Literal, MaintenanceStatement, MaterializedViewStatement, NestedExpr, ObjectName,
     RawQuerySlice, ShowBackends, Statement, StatisticsStatement, StructField, TypeName,
-    TypeNameArgument, UnaryExpr,
+    TypeNameArgument, UnaryExpr, ViewStatement,
 };
 
 /// Visits AST nodes by shared reference.
@@ -56,6 +56,10 @@ pub trait Visit {
 
     fn visit_materialized_view_statement(&mut self, statement: &MaterializedViewStatement) {
         walk_materialized_view_statement(self, statement);
+    }
+
+    fn visit_view_statement(&mut self, statement: &ViewStatement) {
+        walk_view_statement(self, statement);
     }
 
     fn visit_raw_query_slice(&mut self, query: &RawQuerySlice) {
@@ -109,6 +113,7 @@ pub fn walk_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Statement)
         Statement::MaterializedView(statement) => {
             visitor.visit_materialized_view_statement(statement)
         }
+        Statement::View(statement) => visitor.visit_view_statement(statement),
         Statement::RawQuery(query) => visitor.visit_raw_query_slice(query),
     }
 }
@@ -146,6 +151,10 @@ pub fn walk_materialized_view_statement<V: Visit + ?Sized>(
     statement: &MaterializedViewStatement,
 ) {
     super::materialized_view::walk(visitor, statement);
+}
+
+pub fn walk_view_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &ViewStatement) {
+    super::view::walk(visitor, statement);
 }
 
 pub fn walk_ident<V: Visit + ?Sized>(_: &mut V, _: &Ident) {}
@@ -243,6 +252,10 @@ pub trait Fold {
         fold_materialized_view_statement(self, statement)
     }
 
+    fn fold_view_statement(&mut self, statement: ViewStatement) -> ViewStatement {
+        fold_view_statement(self, statement)
+    }
+
     fn fold_raw_query_slice(&mut self, query: RawQuerySlice) -> RawQuerySlice {
         query
     }
@@ -304,6 +317,7 @@ pub fn fold_statement<F: Fold + ?Sized>(folder: &mut F, statement: Statement) ->
         Statement::MaterializedView(statement) => {
             Statement::MaterializedView(folder.fold_materialized_view_statement(statement))
         }
+        Statement::View(statement) => Statement::View(folder.fold_view_statement(statement)),
         Statement::RawQuery(query) => Statement::RawQuery(folder.fold_raw_query_slice(query)),
     }
 }
@@ -352,6 +366,13 @@ pub fn fold_materialized_view_statement<F: Fold + ?Sized>(
     statement: MaterializedViewStatement,
 ) -> MaterializedViewStatement {
     super::materialized_view::fold(folder, statement)
+}
+
+pub fn fold_view_statement<F: Fold + ?Sized>(
+    folder: &mut F,
+    statement: ViewStatement,
+) -> ViewStatement {
+    super::view::fold(folder, statement)
 }
 
 pub fn fold_ident<F: Fold + ?Sized>(_: &mut F, ident: Ident) -> Ident {

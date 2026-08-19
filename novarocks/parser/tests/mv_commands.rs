@@ -45,6 +45,26 @@ fn create_materialized_view_preserves_the_embedded_query_slice() {
 }
 
 #[test]
+fn materialized_view_query_slice_excludes_outside_trivia_and_semicolon() {
+    let source = "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH (id) BUCKETS 1 AS \
+        /* outside query */ SELECT id /* inside */ FROM orders  /* trailing */ ;";
+    let statements = parse(source).expect("CREATE MATERIALIZED VIEW should parse");
+    let [Statement::MaterializedView(MaterializedViewStatement::Create(create))] =
+        statements.as_slice()
+    else {
+        panic!("expected typed CREATE MATERIALIZED VIEW");
+    };
+    assert_eq!(create.query.text, "SELECT id /* inside */ FROM orders");
+    assert_eq!(
+        create.query.span,
+        novarocks_parser::Span::new(
+            source.find("SELECT").expect("query start"),
+            source.find("  /* trailing */").expect("query end"),
+        )
+    );
+}
+
+#[test]
 fn mv_command_family_round_trips_through_the_typed_ast() {
     let source = "DROP MATERIALIZED VIEW IF EXISTS analytics.mv; \
         ALTER MATERIALIZED VIEW analytics.mv SET TBLPROPERTIES ('ttl' = '7'); \

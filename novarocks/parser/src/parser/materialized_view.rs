@@ -26,7 +26,7 @@ use crate::{
         MaterializedViewPartitionField, MaterializedViewProperty, MaterializedViewRefreshMode,
         MaterializedViewRefreshPolicy, RefreshMaterializedView, ShowMaterializedViews,
     },
-    ast::{Ident, Literal, LiteralKind, MaterializedViewStatement, RawQuerySlice, Statement},
+    ast::{Ident, Literal, LiteralKind, MaterializedViewStatement, Statement},
     token::Symbol,
 };
 
@@ -109,7 +109,7 @@ fn parse_create(parser: &mut StatementParser<'_, '_>) -> Result<Statement, Parse
             }
             properties = parse_properties(parser)?;
         } else if parser.consume_if_word("AS") {
-            query = parse_raw_query(parser)?;
+            query = parser.parse_raw_query_slice()?;
             break;
         } else {
             return Err(parser.unexpected("materialized view clause or AS"));
@@ -458,28 +458,5 @@ fn parse_property_value(parser: &mut StatementParser<'_, '_>) -> Result<Literal,
     Ok(Literal {
         kind: LiteralKind::String(ident.value),
         span: ident.span,
-    })
-}
-
-fn parse_raw_query(parser: &mut StatementParser<'_, '_>) -> Result<RawQuerySlice, ParseError> {
-    let start = parser.current_span().start();
-    let mut end = start;
-    while let Some(token) = parser.current() {
-        if matches!(
-            token.kind,
-            TokenKind::End | TokenKind::Symbol(Symbol::Semicolon)
-        ) {
-            break;
-        }
-        end = token.span.end();
-        parser.advance();
-    }
-    if start == end {
-        return Err(parser.unexpected("query"));
-    }
-    let span = Span::new(start, end);
-    Ok(RawQuerySlice {
-        text: parser.source_slice(span).to_owned(),
-        span,
     })
 }

@@ -93,6 +93,7 @@ impl Printer {
             Statement::MaterializedView(statement) => {
                 crate::ast::materialized_view::write_sql(statement, &mut self.output)
             }
+            Statement::View(statement) => crate::ast::view::write_sql(statement, &mut self.output),
             Statement::RawQuery(query) => self.write_raw_query(query),
         }
     }
