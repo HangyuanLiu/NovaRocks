@@ -140,4 +140,22 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn comparison_special_forms_keep_their_dedicated_ast_nodes() {
+        assert!(matches!(parse("a NOT BETWEEN 1 AND 3"), Expr::Between(_)));
+        assert!(matches!(parse("a IN (1, 2, 3)"), Expr::InList(_)));
+        assert!(matches!(parse("a NOT LIKE 'x%' ESCAPE '_'"), Expr::Like(_)));
+        assert!(matches!(parse("a IS NOT NULL"), Expr::IsPredicate(_)));
+
+        let Expr::Binary(expression) = parse("a IS DISTINCT FROM b") else {
+            panic!("expected binary IS DISTINCT FROM");
+        };
+        assert_eq!(expression.operator, BinaryOperator::IsDistinctFrom);
+
+        assert!(matches!(
+            parse("CASE WHEN a THEN CAST(b AS DECIMAL(10, 2)) ELSE TRY_CAST(c AS INT) END"),
+            Expr::Case(_)
+        ));
+    }
 }

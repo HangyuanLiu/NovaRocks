@@ -20,8 +20,10 @@
 use crate::{
     Span, Symbol, Token, TokenKind,
     ast::{
-        BinaryExpr, BinaryOperator, Expr, FunctionCall, FunctionQuantifier, Ident, Literal,
-        LiteralKind, NestedExpr, ObjectName, UnaryExpr, UnaryOperator,
+        BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr, CastKind, Expr, FunctionCall,
+        FunctionQuantifier, Ident, InListExpr, IsPredicate, IsPredicateExpr, LikeExpr,
+        LikeOperator, Literal, LiteralKind, NestedExpr, ObjectName, TypeName, TypeNameArgument,
+        UnaryExpr, UnaryOperator,
     },
     error::ParseError,
     keyword_class,
@@ -239,6 +241,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
 
         loop {
             self.skip_trivia();
+            if minimum_precedence <= COMPARISON_PRECEDENCE && self.starts_comparison_special() {
+                left = self.parse_comparison_special(left)?;
+                continue;
+            }
             let Some(binding) = self.current().and_then(|token| infix_binding(&token.kind)) else {
                 break;
             };
@@ -261,6 +267,195 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }
 
         Ok(left)
+    }
+
+    fn starts_comparison_special(&self) -> bool {
+        self.current_is_keyword(Keyword::Between)
+            || self.current_is_keyword(Keyword::In)
+            || self.current_is_keyword(Keyword::Like)
+            || self.current_is_keyword(Keyword::Ilike)
+            || self.current_is_keyword(Keyword::Rlike)
+            || self.current_is_keyword(Keyword::Similar)
+            || self.current_is_keyword(Keyword::Is)
+            || (self.current_is_keyword(Keyword::Not)
+                && (self.peek_keyword(1, Keyword::Between)
+                    || self.peek_keyword(1, Keyword::In)
+                    || self.peek_keyword(1, Keyword::Like)
+                    || self.peek_keyword(1, Keyword::Ilike)
+                    || self.peek_keyword(1, Keyword::Rlike)
+                    || self.peek_keyword(1, Keyword::Similar)))
+    }
+
+    fn parse_comparison_special(&mut self, left: Expr) -> Result<Expr, ParseError> {
+        let negated = if self.current_is_keyword(Keyword::Not) {
+            let is_special = self.peek_keyword(1, Keyword::Between)
+                || self.peek_keyword(1, Keyword::In)
+                || self.peek_keyword(1, Keyword::Like)
+                || self.peek_keyword(1, Keyword::Ilike)
+                || self.peek_keyword(1, Keyword::Rlike)
+                || self.peek_keyword(1, Keyword::Similar);
+            if is_special {
+                self.advance();
+                self.skip_trivia();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if self.current_is_keyword(Keyword::Between) {
+            self.advance();
+            self.skip_trivia();
+            let low = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
+            if !self.current_is_keyword(Keyword::And) {
+                return Err(self.unexpected("AND in BETWEEN expression"));
+            }
+            self.advance();
+            self.skip_trivia();
+            let high = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
+            let span = Span::new(left.span().start(), high.span().end());
+            return Ok(Expr::Between(BetweenExpr {
+                expr: Box::new(left),
+                negated,
+                low: Box::new(low),
+                high: Box::new(high),
+                span,
+            }));
+        }
+        if self.current_is_keyword(Keyword::In) {
+            self.advance();
+            self.skip_trivia();
+            if !self.current_is_symbol(Symbol::LParen) {
+                return Err(self.unexpected("'(' after IN"));
+            }
+            self.advance();
+            self.skip_trivia();
+            let mut list = Vec::new();
+            if !self.current_is_symbol(Symbol::RParen) {
+                loop {
+                    list.push(self.parse_binding_power(0)?);
+                    self.skip_trivia();
+                    if !self.current_is_symbol(Symbol::Comma) {
+                        break;
+                    }
+                    self.advance();
+                    self.skip_trivia();
+                }
+            }
+            if !self.current_is_symbol(Symbol::RParen) {
+                return Err(self.unexpected("')' after IN list"));
+            }
+            let end = self.current_span().end();
+            self.advance();
+            let start = left.span().start();
+            return Ok(Expr::InList(InListExpr {
+                expr: Box::new(left),
+                negated,
+                list,
+                span: Span::new(start, end),
+            }));
+        }
+        let operator = if self.current_is_keyword(Keyword::Like) {
+            Some(LikeOperator::Like)
+        } else if self.current_is_keyword(Keyword::Ilike) {
+            Some(LikeOperator::ILike)
+        } else if self.current_is_keyword(Keyword::Rlike) {
+            Some(LikeOperator::RLike)
+        } else if self.current_is_keyword(Keyword::Similar) {
+            Some(LikeOperator::SimilarTo)
+        } else {
+            None
+        };
+        if let Some(operator) = operator {
+            self.advance();
+            self.skip_trivia();
+            if operator == LikeOperator::SimilarTo && self.current_is_keyword(Keyword::To) {
+                self.advance();
+                self.skip_trivia();
+            }
+            let pattern = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
+            let escape = if self.current_is_keyword(Keyword::Escape) {
+                self.advance();
+                self.skip_trivia();
+                Some(Box::new(
+                    self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?,
+                ))
+            } else {
+                None
+            };
+            let end = escape
+                .as_ref()
+                .map_or_else(|| pattern.span().end(), |escape| escape.span().end());
+            let start = left.span().start();
+            return Ok(Expr::Like(LikeExpr {
+                expr: Box::new(left),
+                negated,
+                operator,
+                pattern: Box::new(pattern),
+                escape,
+                span: Span::new(start, end),
+            }));
+        }
+        if self.current_is_keyword(Keyword::Is) {
+            if negated {
+                return Err(self.unexpected("BETWEEN, IN, or LIKE after NOT"));
+            }
+            self.advance();
+            self.skip_trivia();
+            let negated = if self.current_is_keyword(Keyword::Not) {
+                self.advance();
+                self.skip_trivia();
+                true
+            } else {
+                false
+            };
+            if self.current_is_keyword(Keyword::Distinct) {
+                self.advance();
+                self.skip_trivia();
+                if !self.current_is_keyword(Keyword::From) {
+                    return Err(self.unexpected("FROM after IS DISTINCT"));
+                }
+                self.advance();
+                self.skip_trivia();
+                let right = self.parse_binding_power(COMPARISON_PRECEDENCE + 1)?;
+                let operator = if negated {
+                    BinaryOperator::IsNotDistinctFrom
+                } else {
+                    BinaryOperator::IsDistinctFrom
+                };
+                let span = Span::new(left.span().start(), right.span().end());
+                return Ok(Expr::Binary(BinaryExpr {
+                    left: Box::new(left),
+                    operator,
+                    right: Box::new(right),
+                    span,
+                }));
+            }
+            let predicate = match (negated, self.current().map(|token| &token.kind)) {
+                (false, Some(TokenKind::Keyword(Keyword::Null))) => IsPredicate::Null,
+                (true, Some(TokenKind::Keyword(Keyword::Null))) => IsPredicate::NotNull,
+                (false, Some(TokenKind::Keyword(Keyword::True))) => IsPredicate::True,
+                (true, Some(TokenKind::Keyword(Keyword::True))) => IsPredicate::NotTrue,
+                (false, Some(TokenKind::Keyword(Keyword::False))) => IsPredicate::False,
+                (true, Some(TokenKind::Keyword(Keyword::False))) => IsPredicate::NotFalse,
+                (false, Some(TokenKind::Keyword(Keyword::Unknown))) => IsPredicate::Unknown,
+                (true, Some(TokenKind::Keyword(Keyword::Unknown))) => IsPredicate::NotUnknown,
+                _ => {
+                    return Err(self.unexpected("NULL, TRUE, FALSE, UNKNOWN, or DISTINCT after IS"));
+                }
+            };
+            let end = self.current_span().end();
+            self.advance();
+            let start = left.span().start();
+            return Ok(Expr::IsPredicate(IsPredicateExpr {
+                expr: Box::new(left),
+                predicate,
+                span: Span::new(start, end),
+            }));
+        }
+        Err(self.unexpected("comparison special form"))
     }
 
     /// `prefix-expression ::= unary-operator expression | primary-expression`
@@ -347,6 +542,18 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 }))
             }
             Some(Token {
+                kind: TokenKind::Keyword(Keyword::Case),
+                ..
+            }) => self.parse_case_expression(),
+            Some(Token {
+                kind: TokenKind::Keyword(Keyword::Cast),
+                ..
+            }) => self.parse_cast_expression(CastKind::Cast),
+            Some(Token {
+                kind: TokenKind::Keyword(Keyword::TryCast),
+                ..
+            }) => self.parse_cast_expression(CastKind::TryCast),
+            Some(Token {
                 kind: TokenKind::Ident | TokenKind::QuotedIdent,
                 span,
             }) => self.parse_identifier_or_function_call(span),
@@ -362,6 +569,155 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }) => self.parse_nested_expression(span),
             _ => Err(self.unexpected("expression")),
         }
+    }
+
+    fn parse_case_expression(&mut self) -> Result<Expr, ParseError> {
+        let start = self.current_span().start();
+        self.advance();
+        self.skip_trivia();
+        let operand = if self.current_is_keyword(Keyword::When) {
+            None
+        } else {
+            Some(Box::new(self.parse_binding_power(0)?))
+        };
+        let mut conditions = Vec::new();
+        let mut results = Vec::new();
+        while self.current_is_keyword(Keyword::When) {
+            self.advance();
+            self.skip_trivia();
+            let condition = self.parse_binding_power(0)?;
+            if !self.current_is_keyword(Keyword::Then) {
+                return Err(self.unexpected("THEN in CASE expression"));
+            }
+            self.advance();
+            self.skip_trivia();
+            let result = self.parse_binding_power(0)?;
+            conditions.push(condition);
+            results.push(result);
+        }
+        if conditions.is_empty() {
+            return Err(self.unexpected("WHEN in CASE expression"));
+        }
+        let else_result = if self.current_is_keyword(Keyword::Else) {
+            self.advance();
+            self.skip_trivia();
+            Some(Box::new(self.parse_binding_power(0)?))
+        } else {
+            None
+        };
+        if !self.current_is_keyword(Keyword::End) {
+            return Err(self.unexpected("END in CASE expression"));
+        }
+        let end = self.current_span().end();
+        self.advance();
+        Ok(Expr::Case(CaseExpr {
+            operand,
+            conditions,
+            results,
+            else_result,
+            span: Span::new(start, end),
+        }))
+    }
+
+    fn parse_cast_expression(&mut self, kind: CastKind) -> Result<Expr, ParseError> {
+        let start = self.current_span().start();
+        self.advance();
+        self.skip_trivia();
+        if !self.current_is_symbol(Symbol::LParen) {
+            return Err(self.unexpected("'(' after CAST"));
+        }
+        self.advance();
+        self.skip_trivia();
+        let expr = self.parse_binding_power(0)?;
+        if !self.current_is_keyword(Keyword::As) {
+            return Err(self.unexpected("AS in CAST expression"));
+        }
+        self.advance();
+        self.skip_trivia();
+        let data_type = self.parse_type_name()?;
+        if !self.current_is_symbol(Symbol::RParen) {
+            return Err(self.unexpected("')' after CAST type"));
+        }
+        let end = self.current_span().end();
+        self.advance();
+        Ok(Expr::Cast(CastExpr {
+            expr: Box::new(expr),
+            data_type,
+            kind,
+            format: None,
+            span: Span::new(start, end),
+        }))
+    }
+
+    fn parse_type_name(&mut self) -> Result<TypeName, ParseError> {
+        let start = self.current_span().start();
+        let Some(token) = self.current().cloned() else {
+            return Err(self.unexpected("type name"));
+        };
+        if !matches!(
+            token.kind,
+            TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::Keyword(_)
+        ) {
+            return Err(self.unexpected("type name"));
+        }
+        let mut parts = vec![self.parse_identifier(token.span)];
+        while self.current_is_symbol(Symbol::Dot) {
+            self.advance();
+            self.skip_trivia();
+            let Some(token) = self.current().cloned() else {
+                return Err(self.unexpected("type name segment"));
+            };
+            if !matches!(
+                token.kind,
+                TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::Keyword(_)
+            ) {
+                return Err(self.unexpected("type name segment"));
+            }
+            parts.push(self.parse_identifier(token.span));
+        }
+        let name_end = parts.last().map_or(start, |part| part.span.end());
+        let name = ObjectName {
+            parts,
+            span: Span::new(start, name_end),
+        };
+        let mut arguments = Vec::new();
+        let mut end = name_end;
+        if self.current_is_symbol(Symbol::LParen) {
+            self.advance();
+            self.skip_trivia();
+            loop {
+                let literal = match self.current().map(|token| &token.kind) {
+                    Some(TokenKind::Number) => {
+                        let span = self.current_span();
+                        let value = self.token_text(span).to_owned();
+                        self.advance();
+                        self.skip_trivia();
+                        Literal {
+                            kind: LiteralKind::Number(value),
+                            span,
+                        }
+                    }
+                    _ => return Err(self.unexpected("type parameter")),
+                };
+                arguments.push(TypeNameArgument::Literal(literal));
+                if !self.current_is_symbol(Symbol::Comma) {
+                    break;
+                }
+                self.advance();
+                self.skip_trivia();
+            }
+            if !self.current_is_symbol(Symbol::RParen) {
+                return Err(self.unexpected("')' after type parameters"));
+            }
+            end = self.current_span().end();
+            self.advance();
+            self.skip_trivia();
+        }
+        Ok(TypeName {
+            name,
+            arguments,
+            span: Span::new(start, end),
+        })
     }
 
     /// `identifier ::= IDENT | QUOTED_IDENT`
@@ -494,6 +850,21 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
 
     fn current_is_symbol(&self, symbol: Symbol) -> bool {
         matches!(self.current().map(|token| &token.kind), Some(TokenKind::Symbol(found)) if *found == symbol)
+    }
+
+    fn current_is_keyword(&self, keyword: Keyword) -> bool {
+        matches!(self.current().map(|token| &token.kind), Some(TokenKind::Keyword(found)) if *found == keyword)
+    }
+
+    fn peek_keyword(&self, offset: usize, keyword: Keyword) -> bool {
+        self.tokens
+            .iter()
+            .skip(self.position)
+            .filter(|token| !matches!(token.kind, TokenKind::Trivia(_)))
+            .nth(offset)
+            .is_some_and(
+                |token| matches!(token.kind, TokenKind::Keyword(found) if found == keyword),
+            )
     }
 
     fn is_end(&self) -> bool {

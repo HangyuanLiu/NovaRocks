@@ -200,6 +200,7 @@ pub enum Keyword {
     Union,
     Unnest,
     Unset,
+    Unknown,
     Using,
     Verbose,
     Version,

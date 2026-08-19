@@ -91,6 +91,7 @@ pub const fn class(keyword: Keyword) -> KeywordClass {
         | Keyword::True
         | Keyword::Truncate
         | Keyword::Union
+        | Keyword::Unknown
         | Keyword::Using
         | Keyword::Values
         | Keyword::When
@@ -244,6 +245,7 @@ const KEYWORDS: &[(&str, Keyword)] = &[
     ("UNION", Keyword::Union),
     ("UNNEST", Keyword::Unnest),
     ("UNSET", Keyword::Unset),
+    ("UNKNOWN", Keyword::Unknown),
     ("USING", Keyword::Using),
     ("VERBOSE", Keyword::Verbose),
     ("VERSION", Keyword::Version),
