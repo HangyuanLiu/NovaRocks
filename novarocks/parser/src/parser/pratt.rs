@@ -20,16 +20,18 @@
 use crate::{
     Span, Symbol, Token, TokenKind,
     ast::{
-        BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr, CastKind, Expr, FunctionCall,
-        FunctionQuantifier, Ident, InListExpr, IsPredicate, IsPredicateExpr, LikeExpr,
-        LikeOperator, Literal, LiteralKind, NestedExpr, ObjectName, TypeName, TypeNameArgument,
-        UnaryExpr, UnaryOperator, WindowFrame, WindowFrameBound, WindowFrameExclusion,
-        WindowFrameUnits, WindowSpec,
+        BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr, CastKind, ExistsExpr, Expr,
+        FunctionCall, FunctionQuantifier, Ident, InListExpr, InSubqueryExpr, IsPredicate,
+        IsPredicateExpr, LikeExpr, LikeOperator, Literal, LiteralKind, NestedExpr, ObjectName,
+        SubqueryExpr, TypeName, TypeNameArgument, UnaryExpr, UnaryOperator, WindowFrame,
+        WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
     },
     error::ParseError,
     keyword_class,
     token::Keyword,
 };
+
+use super::{StatementParser, query};
 
 const OR_PRECEDENCE: u8 = 10;
 const AND_PRECEDENCE: u8 = 20;
@@ -331,8 +333,18 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             if !self.current_is_symbol(Symbol::LParen) {
                 return Err(self.unexpected("'(' after IN"));
             }
+            let start = left.span().start();
             self.advance();
             self.skip_trivia();
+            if self.query_follows() {
+                let (query, span) = self.parse_subquery_body(start)?;
+                return Ok(Expr::InSubquery(InSubqueryExpr {
+                    expr: Box::new(left),
+                    negated,
+                    query,
+                    span,
+                }));
+            }
             let mut list = Vec::new();
             if !self.current_is_symbol(Symbol::RParen) {
                 loop {
@@ -350,7 +362,6 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }
             let end = self.current_span().end();
             self.advance();
-            let start = left.span().start();
             return Ok(Expr::InList(InListExpr {
                 expr: Box::new(left),
                 negated,
@@ -462,6 +473,12 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
     /// `prefix-expression ::= unary-operator expression | primary-expression`
     fn parse_prefix_expression(&mut self) -> Result<Expr, ParseError> {
         self.skip_trivia();
+        if self.current_is_keyword(Keyword::Not) && self.peek_keyword(1, Keyword::Exists) {
+            let start = self.current_span().start();
+            self.advance();
+            self.skip_trivia();
+            return self.parse_exists_expression(start, true);
+        }
         if let Some(binding) = self.current().and_then(|token| prefix_binding(&token.kind)) {
             let start = self.current_span().start();
             self.advance();
@@ -555,6 +572,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 ..
             }) => self.parse_cast_expression(CastKind::TryCast),
             Some(Token {
+                kind: TokenKind::Keyword(Keyword::Exists),
+                span,
+            }) => self.parse_exists_expression(span.start(), false),
+            Some(Token {
                 kind: TokenKind::Ident | TokenKind::QuotedIdent,
                 span,
             }) => self.parse_identifier_or_function_call(span),
@@ -567,9 +588,79 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             Some(Token {
                 kind: TokenKind::Symbol(Symbol::LParen),
                 span,
+            }) if self.parenthesized_query_follows() => self.parse_scalar_subquery(span),
+            Some(Token {
+                kind: TokenKind::Symbol(Symbol::LParen),
+                span,
             }) => self.parse_nested_expression(span),
             _ => Err(self.unexpected("expression")),
         }
+    }
+
+    fn parse_exists_expression(&mut self, start: usize, negated: bool) -> Result<Expr, ParseError> {
+        if !self.current_is_keyword(Keyword::Exists) {
+            return Err(self.unexpected("EXISTS"));
+        }
+        self.advance();
+        self.skip_trivia();
+        if !self.current_is_symbol(Symbol::LParen) {
+            return Err(self.unexpected("'(' after EXISTS"));
+        }
+        self.advance();
+        self.skip_trivia();
+        if !self.query_follows() {
+            return Err(self.unexpected("query after EXISTS ("));
+        }
+        let (query, span) = self.parse_subquery_body(start)?;
+        Ok(Expr::Exists(ExistsExpr {
+            negated,
+            query,
+            span,
+        }))
+    }
+
+    fn parse_scalar_subquery(&mut self, opening_span: Span) -> Result<Expr, ParseError> {
+        self.advance();
+        self.skip_trivia();
+        let (query, span) = self.parse_subquery_body(opening_span.start())?;
+        Ok(Expr::Subquery(SubqueryExpr { query, span }))
+    }
+
+    fn parse_subquery_body(
+        &mut self,
+        start: usize,
+    ) -> Result<(Box<crate::ast::Query>, Span), ParseError> {
+        let mut parser = StatementParser::new(self.source, &self.tokens[self.position..]);
+        let query = query::parse_query(&mut parser)?;
+        self.position += parser.position;
+        self.skip_trivia();
+        if !self.current_is_symbol(Symbol::RParen) {
+            return Err(self.unexpected("')' after subquery"));
+        }
+        let end = self.current_span().end();
+        self.advance();
+        self.skip_trivia();
+        Ok((Box::new(query), Span::new(start, end)))
+    }
+
+    fn parenthesized_query_follows(&self) -> bool {
+        self.tokens
+            .iter()
+            .skip(self.position + 1)
+            .find(|token| !matches!(token.kind, TokenKind::Trivia(_)))
+            .is_some_and(|token| Self::token_starts_query(&token.kind))
+    }
+
+    fn query_follows(&self) -> bool {
+        self.current()
+            .is_some_and(|token| Self::token_starts_query(&token.kind))
+    }
+
+    fn token_starts_query(kind: &TokenKind) -> bool {
+        matches!(
+            kind,
+            TokenKind::Keyword(Keyword::Select | Keyword::Values | Keyword::With)
+        )
     }
 
     fn parse_case_expression(&mut self) -> Result<Expr, ParseError> {

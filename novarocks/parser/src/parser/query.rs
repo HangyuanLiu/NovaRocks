@@ -68,7 +68,9 @@ pub(super) fn parse(
     Ok(Some(Statement::Query(parse_query(parser)?)))
 }
 
-fn parse_query(parser: &mut StatementParser<'_, '_>) -> Result<Query, crate::ParseError> {
+pub(super) fn parse_query(
+    parser: &mut StatementParser<'_, '_>,
+) -> Result<Query, crate::ParseError> {
     let start = parser.current_span().start();
     let with = if parser.consume_if_word("WITH") {
         Some(parse_with(parser, start)?)

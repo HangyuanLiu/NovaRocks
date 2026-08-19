@@ -30,6 +30,7 @@ fn query_forms_parse_and_print_as_typed_syntax() {
         "SELECT k, sum(v) FROM t GROUP BY ROLLUP(k) UNION ALL SELECT k, sum(v) FROM t GROUP BY CUBE(k)",
         "SELECT u.x FROM t CROSS JOIN LATERAL UNNEST(t.arr) AS u(x)",
         "SELECT x.a FROM (SELECT 1 AS a) AS x",
+        "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id) AND a IN (SELECT b FROM v)",
         "WITH c AS (SELECT 1 AS a) SELECT a FROM c UNION ALL SELECT 2 ORDER BY a LIMIT 3",
         "SELECT l.id FROM left_table l LEFT JOIN right_table r ON l.id = r.id JOIN third_table s ON s.id = l.id",
         "EXPLAIN ANALYZE VALUES (1), (2)",

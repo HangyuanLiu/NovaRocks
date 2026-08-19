@@ -164,5 +164,12 @@ mod tests {
             panic!("expected window function");
         };
         assert!(call.over.is_some());
+
+        assert!(matches!(parse("EXISTS (SELECT 1)"), Expr::Exists(_)));
+        assert!(matches!(
+            parse("a NOT IN (SELECT b FROM t)"),
+            Expr::InSubquery(_)
+        ));
+        assert!(matches!(parse("(SELECT 1) + 2"), Expr::Binary(_)));
     }
 }
