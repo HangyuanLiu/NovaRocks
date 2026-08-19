@@ -523,6 +523,7 @@ impl SyntaxEq for FunctionCall {
             && syntax_eq_option(&self.filter, &other.filter)
             && self.null_treatment == other.null_treatment
             && syntax_eq_option(&self.over, &other.over)
+            && self.substring_from_syntax == other.substring_from_syntax
     }
 }
 
@@ -824,6 +825,7 @@ mod tests {
                 }),
                 span: span(start + 21),
             })),
+            substring_from_syntax: false,
             span: span(start + 22),
         })
     }

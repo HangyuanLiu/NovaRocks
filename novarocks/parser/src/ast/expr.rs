@@ -97,6 +97,8 @@ pub struct FunctionCall {
     pub filter: Option<Box<Expr>>,
     pub null_treatment: Option<NullTreatment>,
     pub over: Option<Box<WindowSpec>>,
+    /// Whether SUBSTRING used its `value FROM start [FOR length]` spelling.
+    pub substring_from_syntax: bool,
     pub span: Span,
 }
 

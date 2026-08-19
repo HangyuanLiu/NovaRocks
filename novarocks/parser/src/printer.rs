@@ -833,6 +833,28 @@ impl Printer {
             self.output.push(')');
             return;
         }
+        if call.substring_from_syntax
+            && call.name.parts.len() == 1
+            && call.name.parts[0].value.eq_ignore_ascii_case("SUBSTRING")
+            && matches!(call.arguments.len(), 2 | 3)
+            && matches!(call.quantifier, FunctionQuantifier::None)
+            && call.order_by.is_empty()
+            && call.separator.is_none()
+            && call.filter.is_none()
+            && call.null_treatment.is_none()
+            && call.over.is_none()
+        {
+            self.output.push_str("SUBSTRING(");
+            self.write_expr(&call.arguments[0]);
+            self.output.push_str(" FROM ");
+            self.write_expr(&call.arguments[1]);
+            if let Some(length) = call.arguments.get(2) {
+                self.output.push_str(" FOR ");
+                self.write_expr(length);
+            }
+            self.output.push(')');
+            return;
+        }
         self.write_object_name(&call.name);
         self.output.push('(');
         match call.quantifier {
@@ -1367,6 +1389,7 @@ mod tests {
                 window_frame: None,
                 span: span(),
             })),
+            substring_from_syntax: false,
             span: span(),
         });
         assert_eq!(

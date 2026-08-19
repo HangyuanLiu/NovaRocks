@@ -281,6 +281,7 @@ mod tests {
                 filter: None,
                 null_treatment: None,
                 over: None,
+                substring_from_syntax: false,
                 span: span(4, 10),
             })),
             span: span(0, 10),

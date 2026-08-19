@@ -981,6 +981,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             filter: None,
             null_treatment: None,
             over: None,
+            substring_from_syntax: false,
             span: Span::new(start, end),
         }))
     }
@@ -1038,6 +1039,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             filter: None,
             null_treatment: None,
             over: None,
+            substring_from_syntax: true,
             span: Span::new(start, end),
         }))
     }
@@ -1386,6 +1388,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             filter,
             null_treatment,
             over,
+            substring_from_syntax: false,
             span: Span::new(span.start(), span_end),
         }))
     }
@@ -1883,13 +1886,16 @@ mod tests {
     }
 
     #[test]
-    fn substring_from_for_form_canonicalizes_to_function_arguments_and_reparses() {
+    fn substring_from_for_form_preserves_its_syntax_and_reparses() {
         for (source, canonical) in [
             (
                 "SUBSTRING('STARROCKS' FROM 2 FOR 3)",
-                "SUBSTRING('STARROCKS', 2, 3)",
+                "SUBSTRING('STARROCKS' FROM 2 FOR 3)",
             ),
-            ("SUBSTRING('STARROCKS' FROM 5)", "SUBSTRING('STARROCKS', 5)"),
+            (
+                "SUBSTRING('STARROCKS' FROM 5)",
+                "SUBSTRING('STARROCKS' FROM 5)",
+            ),
             (
                 "SUBSTRING('STARROCKS', 2, 3)",
                 "SUBSTRING('STARROCKS', 2, 3)",
