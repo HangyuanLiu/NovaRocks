@@ -195,6 +195,79 @@ pub trait SqlFunctionCatalog: Send + Sync {
     fn volatility(&self, name: &str) -> crate::functions::FunctionVolatility;
 }
 
+pub use crate::common::expr::{BinOp, LiteralValue, UnOp};
+
+/// One scalar node shape the optimizer may ask a constant evaluator to fold.
+///
+/// The vocabulary is deliberately SQL-owned: it never names an execution
+/// expression node, kernel, or arena handle. Growing it is a compiler-boundary
+/// decision, not an execution-layer one.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FoldNodeKind {
+    BinaryOp(BinOp),
+    UnaryOp(UnOp),
+    Cast,
+    Function { name: String },
+}
+
+/// One already-folded argument of a fold request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FoldArg {
+    pub value: LiteralValue,
+    pub data_type: arrow::datatypes::DataType,
+    pub nullable: bool,
+}
+
+/// A single-node constant evaluation request.
+///
+/// Every argument is already a literal: recursion, volatility gating and the
+/// foldable-shape policy stay on the SQL side, so an evaluator is a pure
+/// per-node calculator with no traversal knowledge.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FoldRequest {
+    pub kind: FoldNodeKind,
+    pub args: Vec<FoldArg>,
+    pub out_type: arrow::datatypes::DataType,
+    pub out_nullable: bool,
+}
+
+/// Evaluates one constant scalar node on behalf of the optimizer.
+///
+/// The implementation must reuse the same kernels the runtime uses, so a
+/// folded literal is bit-identical to what execution would have produced.
+/// Implementations are process-lifetime, stateless singletons: the analyzed
+/// query carries the reference into the optimize phase, which outlives the
+/// analyze request.
+///
+/// Fail-open contract:
+/// - `Ok(Some(literal))` — folded; the literal has type `request.out_type`.
+/// - `Ok(None)` — evaluator declines (unmapped node shape or literal type).
+/// - `Err(_)` — evaluation failed. Callers keep the original expression and
+///   must never surface this as a planning error, because the runtime is
+///   still allowed to produce a value or its own error for that expression.
+pub trait SqlConstantEvaluator: Send + Sync {
+    fn eval_scalar(&self, request: &FoldRequest) -> Result<Option<LiteralValue>, String>;
+}
+
+/// A constant evaluator that never folds.
+///
+/// Used by compiler paths that have no execution capability attached; the
+/// folding rule degrades to a no-op rather than changing plan semantics.
+#[derive(Debug, Default)]
+struct NoopConstantEvaluator;
+
+impl SqlConstantEvaluator for NoopConstantEvaluator {
+    fn eval_scalar(&self, _request: &FoldRequest) -> Result<Option<LiteralValue>, String> {
+        Ok(None)
+    }
+}
+
+static NOOP_CONSTANT_EVALUATOR: NoopConstantEvaluator = NoopConstantEvaluator;
+
+pub fn noop_constant_evaluator() -> &'static dyn SqlConstantEvaluator {
+    &NOOP_CONSTANT_EVALUATOR
+}
+
 /// Statement material already owned by the SQL boundary.
 ///
 /// The public constructors accept only source syntax. SQL-internal logical
@@ -346,6 +419,7 @@ pub struct SqlAnalyzeRequest<'a> {
     pub(crate) environment: SqlPlanningEnvironment,
     pub(crate) catalog: Option<&'a dyn SqlCatalogSnapshot>,
     pub(crate) functions: Option<&'a dyn SqlFunctionCatalog>,
+    pub(crate) constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
     pub(crate) mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
     pub(crate) imv_rewrite: Option<&'a SqlImvPlanningInput>,
     pub(crate) control: SqlCompileControl,
@@ -360,6 +434,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
         environment: SqlPlanningEnvironment,
         catalog: &'a dyn SqlCatalogSnapshot,
         functions: &'a dyn SqlFunctionCatalog,
+        constant_evaluator: &'static dyn SqlConstantEvaluator,
         mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
         control: SqlCompileControl,
     ) -> Self {
@@ -370,6 +445,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
             environment,
             catalog: Some(catalog),
             functions: Some(functions),
+            constant_evaluator: Some(constant_evaluator),
             mv_rewrite,
             imv_rewrite: None,
             control,
@@ -379,12 +455,18 @@ impl<'a> SqlAnalyzeRequest<'a> {
     /// Build a phase-one request for an already SQL-owned logical plan. It has
     /// no catalog, function, or MV-candidate capability and therefore cannot
     /// materialize another binding.
+    ///
+    /// Constant evaluation stays available: it materializes no binding and
+    /// touches no catalog, and withholding it would make a re-entered plan
+    /// fold differently from the same plan compiled directly.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_logical(
         plan: crate::planner::logical::LogicalPlanNode,
         factory: crate::column_id::ColumnRefFactory,
         intent: SqlCompileIntent,
         session: SqlSessionContext,
         environment: SqlPlanningEnvironment,
+        constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
         control: SqlCompileControl,
     ) -> Self {
         Self {
@@ -394,6 +476,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
             environment,
             catalog: None,
             functions: None,
+            constant_evaluator,
             mv_rewrite: None,
             imv_rewrite: None,
             control,
@@ -423,6 +506,9 @@ pub struct SqlAnalyzedQuery {
     settings: SessionOptimizerSettings,
     change_stream: crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     mv_rewrite: mv_rewrite::SqlMvRewriteAnalysis,
+    /// Carried from the analyze request because folding runs in the optimize
+    /// phase, which outlives the analyze request borrow.
+    constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
     control: SqlCompileControl,
 }
 
@@ -521,6 +607,7 @@ pub struct SqlImvRefreshExplainContext<'a> {
     pub environment: SqlPlanningEnvironment,
     pub catalog: &'a dyn SqlCatalogSnapshot,
     pub functions: &'a dyn SqlFunctionCatalog,
+    pub constant_evaluator: &'static dyn SqlConstantEvaluator,
     pub control: SqlCompileControl,
     pub level: ExplainLevel,
 }
@@ -563,6 +650,7 @@ pub fn compile_imv_refresh_explain_lines(
         environment,
         catalog,
         functions,
+        constant_evaluator,
         control,
         level,
     } = context;
@@ -577,6 +665,7 @@ pub fn compile_imv_refresh_explain_lines(
         environment,
         catalog,
         functions,
+        constant_evaluator,
         control,
     );
     let output = SqlCompiler::analyze(request)?.into_complete()?;
@@ -593,6 +682,7 @@ fn imv_refresh_explain_request<'a>(
     environment: SqlPlanningEnvironment,
     catalog: &'a dyn SqlCatalogSnapshot,
     functions: &'a dyn SqlFunctionCatalog,
+    constant_evaluator: &'static dyn SqlConstantEvaluator,
     control: SqlCompileControl,
 ) -> SqlAnalyzeRequest<'a> {
     SqlAnalyzeRequest::new(
@@ -606,6 +696,7 @@ fn imv_refresh_explain_request<'a>(
         environment,
         catalog,
         functions,
+        constant_evaluator,
         None,
         control,
     )
@@ -1111,6 +1202,7 @@ impl SqlCompiler {
             settings,
             change_stream,
             mv_rewrite,
+            constant_evaluator: request.constant_evaluator,
             control: request.control,
         }))
     }
@@ -1123,6 +1215,7 @@ impl SqlCompiler {
             settings,
             change_stream,
             mv_rewrite,
+            constant_evaluator,
             control,
         } = request.analyzed;
         control.check()?;
@@ -1159,6 +1252,7 @@ impl SqlCompiler {
                 factory,
                 root_distribution,
                 &settings,
+                constant_evaluator,
             ),
             None => crate::optimizer::optimize(
                 optimizer_expr,
@@ -1167,6 +1261,7 @@ impl SqlCompiler {
                 factory,
                 mv_candidates,
                 &settings,
+                constant_evaluator,
             ),
         }
         .map_err(SqlCompileError::Compilation)?;
@@ -1506,6 +1601,7 @@ mod tests {
             },
             &CATALOG,
             &FUNCTIONS,
+            noop_constant_evaluator(),
             None,
             control,
         )
@@ -1535,6 +1631,7 @@ mod tests {
             },
             catalog,
             &FUNCTIONS,
+            noop_constant_evaluator(),
             None,
             control,
         )
@@ -1803,6 +1900,7 @@ mod tests {
             SqlPlanningEnvironment::NotApplicable,
             &CATALOG,
             &FUNCTIONS,
+            noop_constant_evaluator(),
             control(None, &cancellation),
         );
 
@@ -1955,6 +2053,7 @@ mod tests {
             },
             &catalog_snapshot,
             crate::functions::builtin_sql_function_catalog(),
+            noop_constant_evaluator(),
             None,
             control(None, &cancellation),
         ))
@@ -2006,6 +2105,7 @@ mod tests {
             },
             &catalog_snapshot,
             crate::functions::builtin_sql_function_catalog(),
+            noop_constant_evaluator(),
             None,
             control(None, &cancellation),
         );
@@ -2035,6 +2135,7 @@ mod tests {
             },
             &catalog_snapshot,
             crate::functions::builtin_sql_function_catalog(),
+            noop_constant_evaluator(),
             None,
             control(None, &cancellation),
         );
@@ -2083,6 +2184,7 @@ mod tests {
             },
             &catalog_snapshot,
             crate::functions::builtin_sql_function_catalog(),
+            noop_constant_evaluator(),
             None,
             control(None, &cancellation),
         );

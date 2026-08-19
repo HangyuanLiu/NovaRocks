@@ -224,6 +224,7 @@ pub struct SqlMvFirstRefreshAnalyzeContext<'a> {
     pub environment: crate::compiler::SqlPlanningEnvironment,
     pub catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    pub constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
     pub control: crate::compiler::SqlCompileControl,
     pub sink: crate::planning::dml::DmlWritePlanInput,
 }
@@ -256,6 +257,7 @@ pub fn analyze_mv_first_refresh_connector_write(
         context.environment,
         context.catalog,
         context.functions,
+        context.constant_evaluator,
         None,
         context.control,
     );
@@ -294,6 +296,7 @@ pub struct SqlMvJoinFirstRefreshAnalyzeContext<'a> {
     pub environment: crate::compiler::SqlPlanningEnvironment,
     pub catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    pub constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
     pub control: crate::compiler::SqlCompileControl,
     pub sink: crate::planning::dml::DmlWritePlanInput,
 }
@@ -334,6 +337,7 @@ pub fn analyze_join_first_refresh_connector_write(
         context.environment,
         context.catalog,
         context.functions,
+        context.constant_evaluator,
         context.control.clone(),
     );
     let logical_output = crate::compiler::SqlCompiler::analyze(request)
@@ -365,6 +369,7 @@ pub fn analyze_join_first_refresh_connector_write(
             optimizer_settings: context.optimizer_settings,
         },
         context.environment,
+        Some(context.constant_evaluator),
         context.control,
     );
     let analyzed = crate::compiler::SqlCompiler::analyze(logical_request)
@@ -423,6 +428,7 @@ pub struct SqlMvJoinIncrementalRefreshAnalyzeContext<'a> {
     pub environment: crate::compiler::SqlPlanningEnvironment,
     pub catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    pub constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
     pub control: crate::compiler::SqlCompileControl,
 }
 
@@ -454,6 +460,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
         context.environment,
         context.catalog,
         context.functions,
+        context.constant_evaluator,
         context.control.clone(),
     );
     let logical_output = crate::compiler::SqlCompiler::analyze(request)
@@ -483,6 +490,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
             optimizer_settings: crate::planning::dml::dml_change_stream_optimizer_settings(),
         },
         crate::compiler::SqlPlanningEnvironment::NotApplicable,
+        Some(context.constant_evaluator),
         context.control,
     );
     let analyzed = crate::compiler::SqlCompiler::analyze(logical_request)
@@ -539,6 +547,7 @@ pub struct SqlMvIncrementalRefreshAnalyzeContext<'a> {
     pub environment: crate::compiler::SqlPlanningEnvironment,
     pub catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     pub functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    pub constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
     pub control: crate::compiler::SqlCompileControl,
 }
 
@@ -577,6 +586,7 @@ pub fn analyze_mv_incremental_refresh_change_stream(
         context.environment,
         context.catalog,
         context.functions,
+        context.constant_evaluator,
         context.control,
     );
     let analyzed = crate::compiler::SqlCompiler::analyze(request)
@@ -624,6 +634,7 @@ fn canonical_incremental_change_stream_request<'a>(
     environment: crate::compiler::SqlPlanningEnvironment,
     catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
     control: crate::compiler::SqlCompileControl,
 ) -> crate::compiler::SqlAnalyzeRequest<'a> {
     crate::compiler::SqlAnalyzeRequest::new(
@@ -637,6 +648,7 @@ fn canonical_incremental_change_stream_request<'a>(
         environment,
         catalog,
         functions,
+        constant_evaluator,
         None,
         control,
     )
@@ -1205,6 +1217,7 @@ fn plain_join_first_refresh_logical_request<'a>(
     environment: crate::compiler::SqlPlanningEnvironment,
     catalog: &'a dyn crate::compiler::SqlCatalogSnapshot,
     functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    constant_evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
     control: crate::compiler::SqlCompileControl,
 ) -> crate::compiler::SqlAnalyzeRequest<'a> {
     crate::compiler::SqlAnalyzeRequest::new(
@@ -1218,6 +1231,7 @@ fn plain_join_first_refresh_logical_request<'a>(
         environment,
         catalog,
         functions,
+        constant_evaluator,
         None,
         control,
     )
@@ -2521,6 +2535,7 @@ mod tests {
             },
             &catalog,
             &functions,
+            crate::compiler::noop_constant_evaluator(),
             crate::compiler::SqlCompileControl::unbounded(),
         );
         assert!(request.imv_rewrite.is_none());
@@ -2554,6 +2569,7 @@ mod tests {
             },
             &catalog,
             &functions,
+            crate::compiler::noop_constant_evaluator(),
             crate::compiler::SqlCompileControl::unbounded(),
         );
         assert!(request.imv_rewrite.is_none());
@@ -2591,6 +2607,7 @@ mod tests {
             },
             &catalog,
             &functions,
+            crate::compiler::noop_constant_evaluator(),
             crate::compiler::SqlCompileControl::unbounded(),
         );
         assert!(request.imv_rewrite.is_some());

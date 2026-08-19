@@ -132,6 +132,7 @@ fn external_sql_contract_analyzes_freezes_and_reads_a_sealed_plan() {
             },
             &catalog,
             functions,
+            novarocks_sql::compiler::noop_constant_evaluator(),
             None,
             SqlCompileControl::unbounded(),
         );

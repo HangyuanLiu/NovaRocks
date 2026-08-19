@@ -1732,6 +1732,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
         novarocks_sql::compiler::builtin_sql_function_catalog(),
+        novarocks_sql::compiler::noop_constant_evaluator(),
         None,
         novarocks_sql::compiler::SqlCompileControl::new(
             execution.deadline(),
@@ -2156,6 +2157,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
         novarocks_sql::compiler::builtin_sql_function_catalog(),
+        novarocks_sql::compiler::noop_constant_evaluator(),
         mv_definitions.as_ref(),
         novarocks_sql::compiler::SqlCompileControl::new(
             execution.deadline(),
@@ -2255,6 +2257,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
             novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
             &catalog_snapshot,
             novarocks_sql::compiler::builtin_sql_function_catalog(),
+            novarocks_sql::compiler::noop_constant_evaluator(),
             Some(&mv_definitions),
             novarocks_sql::compiler::SqlCompileControl::new(
                 execution.deadline(),
