@@ -758,18 +758,7 @@ impl RuntimeFilterParticipant {
     ) -> RuntimeFilterObservationSnapshot {
         self.outbound.drain_transport_completions();
         if reason != QueryTerminationReason::QueryTerminationCoordinatorFinalize {
-            for channel in self.install.channels().values() {
-                for binding_id in channel.producers().keys().chain(channel.consumers().keys()) {
-                    self.observation
-                        .record(BackendRuntimeFilterEvent::ChannelCancelled {
-                            channel: BackendChannelIdentity::new(
-                                self.install.participant(),
-                                *binding_id,
-                                channel.channel_id(),
-                            ),
-                        });
-                }
-            }
+            return self.observation.cancel_open_channels_and_seal();
         }
         self.observation.seal()
     }
@@ -1711,8 +1700,8 @@ mod tests {
     use arrow::datatypes::DataType;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_execution::runtime_filter::{
-        RuntimeFilterBindOutcome, RuntimeFilterChannelId, RuntimeFilterConsumerContract,
-        RuntimeFilterExecutionContract, RuntimeFilterFinalDomain,
+        LogicalVersion, RuntimeFilterBindOutcome, RuntimeFilterChannelId,
+        RuntimeFilterConsumerContract, RuntimeFilterExecutionContract, RuntimeFilterFinalDomain,
         RuntimeFilterFinalDomainCompletionHandle, RuntimeFilterFinalDomainOpenRequest,
         RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics, RuntimeFilterProducerContract,
         RuntimeFilterProducerFailure, RuntimeFilterSubscriptionHandle,
@@ -2055,6 +2044,45 @@ mod tests {
             participant.capture_runtime_filter_observation(),
             first,
             "late writes cannot alter the retained terminal proof"
+        );
+    }
+
+    #[test]
+    fn terminal_prepare_preserves_completed_channel_during_cancellation() {
+        let (participant, producer, _) = final_domain_participant(1024);
+        let channel = BackendChannelIdentity::new(
+            participant.install.participant(),
+            producer.binding_id(),
+            producer.channel_id(),
+        );
+        participant
+            .observation
+            .record(BackendRuntimeFilterEvent::ChannelCompleted {
+                channel,
+                version: LogicalVersion::FIRST,
+            });
+
+        let first = participant.prepare_terminal_capture(QueryTerminationReason::LocalFailure);
+        let channel = first
+            .channels()
+            .iter()
+            .find(|candidate| candidate.identity() == channel)
+            .expect("installed channel is retained");
+        assert_eq!(
+            channel.terminal(),
+            Some(
+                super::super::observation::RuntimeFilterChannelTerminal::Completed(
+                    LogicalVersion::FIRST
+                )
+            )
+        );
+        assert_eq!(channel.completed(), 1);
+        assert_eq!(channel.cancelled(), 0);
+
+        let second = participant.prepare_terminal_capture(QueryTerminationReason::LocalFailure);
+        assert_eq!(
+            second, first,
+            "repeated cancellation capture preserves the same completed proof"
         );
     }
 

@@ -666,6 +666,45 @@ impl RuntimeFilterObservationStore {
         frozen
     }
 
+    /// Atomically records cancellation for channels that have not reached a
+    /// terminal result and freezes the terminal contribution. A query abort
+    /// does not retroactively change an already completed or unavailable
+    /// Runtime Filter channel into a cancelled one.
+    fn cancel_open_channels_and_seal(
+        &self,
+    ) -> (
+        RuntimeFilterObservationSnapshot,
+        Vec<BackendRuntimeFilterEvent>,
+    ) {
+        let mut state = self.lock();
+        if let Some(snapshot) = &state.sealed {
+            return (snapshot.clone(), Vec::new());
+        }
+        let channels: Vec<_> = state
+            .channels
+            .values()
+            .filter(|channel| channel.terminal.is_none() && !channel.terminal_conflicted)
+            .map(|channel| channel.identity)
+            .collect();
+        for channel in &channels {
+            let channel = state
+                .channels
+                .get_mut(channel)
+                .expect("installed Runtime Filter channel remains present");
+            channel.cancelled = increment(channel.cancelled, 1, &self.saturated);
+            channel.terminal = Some(RuntimeFilterChannelTerminal::Cancelled);
+        }
+        let frozen = snapshot(&state, self.saturated.load(Ordering::Relaxed));
+        state.sealed = Some(frozen.clone());
+        (
+            frozen,
+            channels
+                .into_iter()
+                .map(|channel| BackendRuntimeFilterEvent::ChannelCancelled { channel })
+                .collect(),
+        )
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ObservationState> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
@@ -705,6 +744,18 @@ impl RuntimeFilterObservationEmitter {
         self.store.seal()
     }
 
+    /// Records the cancellation terminal fact for unresolved channels and
+    /// seals the contribution as one store transaction. Observer notification
+    /// follows the freeze because it is diagnostic-only and must not reopen
+    /// the retained terminal proof.
+    pub(crate) fn cancel_open_channels_and_seal(&self) -> RuntimeFilterObservationSnapshot {
+        let (snapshot, events) = self.store.cancel_open_channels_and_seal();
+        for event in events {
+            self.notify(event);
+        }
+        snapshot
+    }
+
     pub(crate) fn reject(&self, error: RuntimeFilterObservationError) {
         self.store.reject(error);
     }
@@ -716,6 +767,15 @@ impl BackendRuntimeFilterEventObserver for RuntimeFilterObservationEmitter {
             return;
         }
         self.store.fold(&event);
+        self.notify(event);
+    }
+}
+
+impl RuntimeFilterObservationEmitter {
+    fn notify(&self, event: BackendRuntimeFilterEvent) {
+        if OBSERVER_CALLBACK_DEPTH.with(|depth| depth.get() != 0) {
+            return;
+        }
         let Some(observer) = &self.observer else {
             return;
         };
