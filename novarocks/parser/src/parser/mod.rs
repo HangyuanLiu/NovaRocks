@@ -253,6 +253,28 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
         }
     }
 
+    /// Parses an identifier in a grammar-local contextual position. Named
+    /// procedure arguments may use a clause word such as `where`; accepting it
+    /// here does not make that word generally non-reserved.
+    pub(super) fn parse_contextual_ident(&mut self) -> Result<Ident, ParseError> {
+        let token = self
+            .current()
+            .cloned()
+            .ok_or_else(|| self.unexpected("identifier"))?;
+        if matches!(token.kind, TokenKind::Keyword(_)) {
+            let ident = Ident {
+                value: self.source[token.span.start()..token.span.end()].to_owned(),
+                quoted: false,
+                quote_style: None,
+                span: token.span,
+            };
+            self.advance();
+            self.skip_trivia();
+            return Ok(ident);
+        }
+        self.parse_ident()
+    }
+
     pub(super) fn parse_object_name(&mut self) -> Result<ObjectName, ParseError> {
         let first = self.parse_ident()?;
         let start = first.span.start();

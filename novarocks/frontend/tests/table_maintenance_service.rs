@@ -410,8 +410,13 @@ async fn non_maintenance_sql_is_not_claimed() {
     let engine = FakeMaintenanceEngine::default();
 
     assert!(
-        parse("SELECT 1").is_err(),
-        "ordinary SQL must not be admitted as a typed maintenance statement"
+        matches!(
+            parse("SELECT 1")
+                .expect("the parser-owned Query AST should construct SELECT")
+                .as_slice(),
+            [Statement::Query(_)]
+        ),
+        "ordinary SQL must remain a typed Query, not a typed maintenance statement"
     );
     assert!(engine.resolved_name_parts().is_empty());
     assert!(engine.requests().is_empty());

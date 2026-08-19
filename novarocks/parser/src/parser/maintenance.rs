@@ -87,7 +87,7 @@ fn parse_procedure_argument(
 ) -> Result<ProcedureArgument, ParseError> {
     let start = parser.current_offset();
     let name = if named_argument_ahead(parser) {
-        let name = parser.parse_ident()?;
+        let name = parser.parse_contextual_ident()?;
         if !parser.consume_if_symbol(Symbol::FatArrow) {
             parser.consume_symbol(Symbol::Eq)?;
             parser.consume_symbol(Symbol::Gt)?;
