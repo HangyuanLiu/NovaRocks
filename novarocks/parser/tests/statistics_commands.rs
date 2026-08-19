@@ -1,0 +1,68 @@
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+
+use novarocks_parser::{
+    ast::{Statement, StatisticsStatement},
+    parse,
+    printer::print_statements,
+};
+
+#[test]
+fn statistics_command_corpus_is_typed_and_round_trips() {
+    let source = "analyze full table `ice`.db.t (`a`, b) with sync mode; SHOW ANALYZE JOBS; KILL ANALYZE 018f8c30-8a95-7b4e-b515-4da6f2aeb419; SHOW TABLE STATS db.t; SHOW BASIC STATS META; SHOW HISTOGRAM STATS META; DROP STATS db.t; DROP HISTOGRAM ON db.t (`a`, b); DROP MULTIPLE COLUMNS STATS db.t";
+    let statements = parse(source).expect("statistics corpus parse");
+    assert!(matches!(
+        statements[0],
+        Statement::Statistics(StatisticsStatement::AnalyzeTable(_))
+    ));
+    assert!(matches!(
+        statements[1],
+        Statement::Statistics(StatisticsStatement::ShowAnalyzeJobs(_))
+    ));
+    assert!(matches!(
+        statements[2],
+        Statement::Statistics(StatisticsStatement::CancelAnalyze(_))
+    ));
+    assert!(matches!(
+        statements[3],
+        Statement::Statistics(StatisticsStatement::ShowTableStats(_))
+    ));
+    assert!(matches!(
+        statements[4],
+        Statement::Statistics(StatisticsStatement::ShowBasicStatsMeta(_))
+    ));
+    assert!(matches!(
+        statements[5],
+        Statement::Statistics(StatisticsStatement::ShowHistogramStatsMeta(_))
+    ));
+    assert!(matches!(
+        statements[6],
+        Statement::Statistics(StatisticsStatement::DropStats(_))
+    ));
+    assert!(matches!(
+        statements[7],
+        Statement::Statistics(StatisticsStatement::DropHistogram(_))
+    ));
+    assert!(matches!(
+        statements[8],
+        Statement::Statistics(StatisticsStatement::DropMultipleColumnsStats(_))
+    ));
+    let printed = print_statements(&statements);
+    let reparsed = parse(&printed).expect("printed statistics corpus parse");
+    assert_eq!(print_statements(&reparsed), printed);
+}
+
+#[test]
+fn malformed_statistics_forms_have_parse_errors() {
+    let error = parse("ANALYZE TABLE t (a,").expect_err("unterminated columns");
+    assert_eq!(
+        error.to_user_error("ANALYZE TABLE t (a,").code().as_str(),
+        "sql.parse.unexpected_token"
+    );
+    let error = parse("SHOW BASIC STATS").expect_err("META is required");
+    assert_eq!(
+        error.to_user_error("SHOW BASIC STATS").code().as_str(),
+        "sql.parse.unexpected_token"
+    );
+}

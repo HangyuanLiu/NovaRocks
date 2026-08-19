@@ -332,91 +332,6 @@ pub fn parse_raw_statement(sql: &str) -> Result<sqlparser::ast::Statement, Strin
     crate::parser::parse_sql_raw(sql)
 }
 
-/// Application-owned DTO for the only custom statement shape that DML needs
-/// to inspect before catalog resolution.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TruncateCommand {
-    pub target_parts: Vec<String>,
-    pub target_ref: String,
-}
-
-/// Classify one `TRUNCATE TABLE` command without performing a catalog lookup
-/// or opening a connector session.
-pub fn parse_truncate_command(sql: &str) -> Result<Option<TruncateCommand>, String> {
-    let trimmed = sql.trim_start();
-    let keyword_end = trimmed
-        .char_indices()
-        .find_map(|(index, ch)| (!ch.is_ascii_alphabetic()).then_some(index))
-        .unwrap_or(trimmed.len());
-    if !trimmed[..keyword_end].eq_ignore_ascii_case("truncate") {
-        return Ok(None);
-    }
-    let mut statements = crate::parser::parse_sql(trimmed)?;
-    if statements.len() != 1 {
-        return Err("TRUNCATE request must contain exactly one statement".to_string());
-    }
-    match statements.remove(0) {
-        crate::parser::ast::Statement::Truncate { name, target_ref } => Ok(Some(TruncateCommand {
-            target_parts: name.parts,
-            target_ref,
-        })),
-        _ => Ok(None),
-    }
-}
-
-/// Application-neutral classification of the statistics statements recognized
-/// by NovaRocks' dialect.  Catalog resolution and durable-job ownership stay
-/// outside SQL.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum StatisticsCommand {
-    AnalyzeTable {
-        target_parts: Vec<String>,
-        columns: Vec<String>,
-    },
-    ShowAnalyzeJobs,
-    CancelAnalyze {
-        job_id: String,
-    },
-    ShowTableStats {
-        target_parts: Vec<String>,
-    },
-}
-
-/// Parse one complete statistics command.  A statement outside this dialect
-/// subset is reported as `None`, preserving the caller's normal SQL routing.
-pub fn parse_statistics_command(sql: &str) -> Result<Option<StatisticsCommand>, String> {
-    let normalized = crate::parser::dialect::normalize_for_raw_parse(sql)?;
-    let mut statements = match crate::parser::parse_sql(&normalized) {
-        Ok(statements) => statements,
-        Err(_) => return Ok(None),
-    };
-    if statements.len() != 1 {
-        return Err("statistics command accepts exactly one statement".to_string());
-    }
-    match statements.pop().expect("one checked statement") {
-        crate::parser::ast::Statement::AnalyzeTable(statement) => {
-            Ok(Some(StatisticsCommand::AnalyzeTable {
-                target_parts: statement.name.parts,
-                columns: statement.columns,
-            }))
-        }
-        crate::parser::ast::Statement::ShowAnalyzeJobs(_) => {
-            Ok(Some(StatisticsCommand::ShowAnalyzeJobs))
-        }
-        crate::parser::ast::Statement::CancelAnalyze(statement) => {
-            Ok(Some(StatisticsCommand::CancelAnalyze {
-                job_id: statement.job_id,
-            }))
-        }
-        crate::parser::ast::Statement::ShowTableStats(statement) => {
-            Ok(Some(StatisticsCommand::ShowTableStats {
-                target_parts: statement.name.parts,
-            }))
-        }
-        _ => Ok(None),
-    }
-}
-
 /// The SQL-visible kind of terminal row-mutation writer.  This maps one
 /// provider-signed Arrow input shape to its immutable SQL write contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1437,9 +1352,8 @@ pub fn build_statistics_connector_plan(
 #[cfg(test)]
 mod tests {
     use super::{
-        DmlStatisticsSnapshot, StatisticsCommand, dml_change_stream_optimizer_settings,
-        evidence_to_base_statistics, optimizer_settings_stable_digest_material,
-        parse_statistics_command, parse_truncate_command,
+        DmlStatisticsSnapshot, dml_change_stream_optimizer_settings, evidence_to_base_statistics,
+        optimizer_settings_stable_digest_material,
     };
     use crate::compiler::SessionOptimizerSettings;
     use crate::optimizer::statistics::Confidence;
@@ -1680,29 +1594,6 @@ mod tests {
     #[test]
     fn empty_statistics_snapshot_is_the_default_without_implying_zero_rows() {
         let _snapshot = DmlStatisticsSnapshot::default();
-    }
-
-    #[test]
-    fn dml_facade_parses_truncate_without_exposing_the_custom_ast() {
-        let command = parse_truncate_command("TRUNCATE TABLE ice.db.orders.branch_dev")
-            .expect("parse truncate")
-            .expect("truncate command");
-        assert_eq!(command.target_parts, ["ice", "db", "orders"]);
-        assert_eq!(command.target_ref, "dev");
-    }
-
-    #[test]
-    fn dml_facade_projects_statistics_command_to_dto() {
-        let command = parse_statistics_command("ANALYZE TABLE ice.db.orders (id, amount)")
-            .expect("parse analyze")
-            .expect("statistics command");
-        assert_eq!(
-            command,
-            StatisticsCommand::AnalyzeTable {
-                target_parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()],
-                columns: vec!["id".to_string(), "amount".to_string()],
-            }
-        );
     }
 
     #[test]

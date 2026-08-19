@@ -401,6 +401,7 @@ mod tests {
             .iter()
             .map(|statement| match statement {
                 Statement::Backend(BackendStatement::ShowBackends(_)) => "SHOW BACKENDS",
+                Statement::Backend(_) => "BACKEND",
                 Statement::Statistics(_) => "STATISTICS",
                 Statement::Catalog(_) => "CATALOG",
                 Statement::Iceberg(_) => "ICEBERG",

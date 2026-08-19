@@ -1,0 +1,111 @@
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to you under the Apache License, Version 2.0.
+
+use novarocks_parser::{
+    ParserError,
+    ast::{MaintenanceStatement, Statement},
+    parse,
+    printer::print_statements,
+};
+
+fn roundtrip(source: &str) -> String {
+    let statements = parse(source).expect("maintenance statement should parse");
+    let printed = print_statements(&statements);
+    let reparsed = parse(&printed).expect("printed maintenance statement should parse");
+    assert_eq!(print_statements(&reparsed), printed);
+    printed
+}
+
+fn parse_error_code(source: &str) -> String {
+    let error = parse(source).expect_err("owned malformed maintenance input must fail");
+    assert!(matches!(error, ParserError::Parse(_)));
+    error.to_user_error(source).code().as_str().to_owned()
+}
+
+#[test]
+fn generic_call_retains_named_args_maps_and_timestamp_literals() {
+    let source = "call `ice`.system.rewrite_manifests(\
+        `table` => 'db.orders',\
+        options => map('rewrite-all', 'true'),\
+        older_than => timestamp '2026-01-01 00:00:00')";
+    let statements = parse(source).expect("generic CALL should parse without procedure admission");
+    let [Statement::Maintenance(MaintenanceStatement::Call(call))] = statements.as_slice() else {
+        panic!("expected CALL maintenance statement");
+    };
+    assert_eq!(call.procedure.parts.len(), 3);
+    assert_eq!(call.arguments.len(), 3);
+    assert!(
+        call.arguments
+            .iter()
+            .all(|argument| argument.name.is_some())
+    );
+    assert_eq!(
+        roundtrip(source),
+        "CALL `ice`.system.rewrite_manifests(`table` => 'db.orders', options => MAP('rewrite-all', 'true'), older_than => TIMESTAMP '2026-01-01 00:00:00')"
+    );
+}
+
+#[test]
+fn generic_call_allows_positional_args_without_procedure_support_lookup() {
+    assert_eq!(
+        roundtrip("CALL unknown.admin.any_procedure('db.orders', FALSE, NULL)"),
+        "CALL unknown.admin.any_procedure('db.orders', FALSE, NULL)"
+    );
+}
+
+#[test]
+fn alter_table_maintenance_forms_roundtrip() {
+    let cases = [
+        (
+            "ALTER TABLE `ice`.`db`.`orders` OPTIMIZE;",
+            "ALTER TABLE `ice`.`db`.`orders` OPTIMIZE",
+        ),
+        (
+            "ALTER TABLE ice.db.orders REWRITE MANIFESTS",
+            "ALTER TABLE ice.db.orders REWRITE MANIFESTS",
+        ),
+        (
+            "ALTER TABLE ice.db.orders EXPIRE SNAPSHOTS RETAIN LAST 3 OLDER THAN '2026-01-01T00:00:00Z'",
+            "ALTER TABLE ice.db.orders EXPIRE SNAPSHOTS RETAIN LAST 3 OLDER THAN '2026-01-01T00:00:00Z'",
+        ),
+        (
+            "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES OLDER THAN 1700000000000",
+            "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES OLDER THAN 1700000000000",
+        ),
+    ];
+
+    for (source, expected) in cases {
+        assert_eq!(roundtrip(source), expected);
+    }
+}
+
+#[test]
+fn show_alter_table_optimize_keeps_presentation_structure() {
+    let source = "show alter table optimize in `ice`.`analytics` \
+        where `TableName` = 'orders' order by `CreateTime` desc limit 20;";
+    assert_eq!(
+        roundtrip(source),
+        "SHOW ALTER TABLE OPTIMIZE FROM `ice`.`analytics` WHERE `TableName` = 'orders' ORDER BY `CreateTime` DESC LIMIT 20"
+    );
+}
+
+#[test]
+fn malformed_owned_forms_have_stable_typed_parse_errors() {
+    for source in [
+        "CALL ice.system.rewrite_manifests(table => 'db.orders', 'extra')",
+        "CALL ice.system.rewrite_manifests(table => 'db.orders', TABLE => 'db.other')",
+        "CALL ice.system.rewrite_manifests(options => MAP('only-a-key'))",
+        "ALTER TABLE ice.db.orders EXPIRE SNAPSHOTS",
+        "ALTER TABLE ice.db.orders EXPIRE SNAPSHOTS OLDER THAN 1 OLDER THAN 2",
+        "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES",
+        "SHOW ALTER TABLE OPTIMIZE WHERE TableName 'orders'",
+    ] {
+        assert_eq!(
+            parse_error_code(source),
+            "sql.parse.unexpected_token",
+            "{source}"
+        );
+    }
+}

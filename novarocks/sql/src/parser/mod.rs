@@ -84,41 +84,6 @@ pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>, String> {
         return Ok(vec![stmt]);
     }
 
-    if dialect::truncate::looks_like_truncate_table(&parser) {
-        let stmt = dialect::truncate::parse_truncate_table(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-
-    if dialect::backend::looks_like_add_backend(&parser) {
-        let stmt = dialect::backend::parse_add_backend(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-    if dialect::backend::looks_like_drop_backend(&parser) {
-        let stmt = dialect::backend::parse_drop_backend(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-    if dialect::backend::looks_like_show_backends(&parser) {
-        let stmt = dialect::backend::parse_show_backends(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-
-    if dialect::statistics::looks_like_analyze_table(&parser) {
-        let stmt = dialect::statistics::parse_analyze_table(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-    if dialect::statistics::looks_like_show_analyze_jobs(&parser) {
-        let stmt = dialect::statistics::parse_show_analyze_jobs(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-    if dialect::statistics::looks_like_cancel_analyze(&parser) {
-        let stmt = dialect::statistics::parse_cancel_analyze(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-    if dialect::statistics::looks_like_show_table_stats(&parser) {
-        let stmt = dialect::statistics::parse_show_table_stats(&mut parser)?;
-        return Ok(vec![stmt]);
-    }
-
     Err("parse_sql: only materialized-view DDL is recognized in Phase 1".to_string())
 }
 
@@ -511,28 +476,6 @@ mod tests {
             func.null_treatment,
         );
         assert!(func.over.is_some(), "OVER clause must still be parsed");
-    }
-
-    #[test]
-    fn parse_sql_recognizes_backend_management_statements() {
-        let add = parse_sql("ADD BACKEND '127.0.0.1:19070'").expect("parse ADD BACKEND");
-        match &add[0] {
-            Statement::AddBackend(stmt) => assert_eq!(stmt.addr, "127.0.0.1:19070"),
-            other => panic!("expected AddBackend, got {other:?}"),
-        }
-
-        let drop =
-            parse_sql("DROP BACKEND '127.0.0.1:19070' FORCE").expect("parse DROP BACKEND FORCE");
-        match &drop[0] {
-            Statement::DropBackend(stmt) => {
-                assert_eq!(stmt.addr, "127.0.0.1:19070");
-                assert!(stmt.force);
-            }
-            other => panic!("expected DropBackend, got {other:?}"),
-        }
-
-        let show = parse_sql("SHOW BACKENDS").expect("parse SHOW BACKENDS");
-        assert!(matches!(show[0], Statement::ShowBackends(_)));
     }
 
     #[test]

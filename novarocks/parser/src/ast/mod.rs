@@ -15,16 +15,39 @@ pub(crate) mod materialized_view;
 pub(crate) mod statistics;
 mod visit;
 
-pub use backend::{BackendStatement, ShowBackends};
-pub use catalog::CatalogStatement;
+pub use backend::{AddBackend, BackendStatement, DropBackend, ShowBackends};
+pub use catalog::{
+    CatalogProperty, CatalogStatement, CreateCatalog, CreateDatabase, DropCatalog, DropDatabase,
+    DropTable, ShowCreateTable, TruncateTable,
+};
 pub use command::{Property, PropertyKeyValue};
 pub use expr::{
     BinaryExpr, BinaryOperator, Expr, FunctionCall, NestedExpr, UnaryExpr, UnaryOperator,
 };
-pub use iceberg::IcebergStatement;
-pub use maintenance::MaintenanceStatement;
-pub use materialized_view::MaterializedViewStatement;
-pub use statistics::StatisticsStatement;
+pub use iceberg::{
+    AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
+    IcebergPartitionChange, IcebergPartitionField, IcebergPropertiesAction, IcebergReferenceAction,
+    IcebergReferenceKind, IcebergSchemaChange, IcebergStatement, IcebergTableAction,
+    RawReferenceOptions, ReferenceAnchor,
+};
+pub use maintenance::{
+    CallStatement, ExpireSnapshots, ExpireSnapshotsOption, MaintenanceStatement, MaintenanceValue,
+    OptimizeTable, ProcedureArgument, ProcedureArgumentMode, ProcedureMap, ProcedureMapEntry,
+    RemoveOrphanFiles, RewriteManifests, ShowAlterTableOptimize, ShowOptimizeFilter,
+    ShowOptimizeOrder, SortDirection,
+};
+pub use materialized_view::{
+    AlterMaterializedView, CreateMaterializedView, DropMaterializedView,
+    ExplainRefreshMaterializedView, MaterializedViewAlterAction, MaterializedViewDistribution,
+    MaterializedViewPartitionArgument, MaterializedViewPartitionField, MaterializedViewProperty,
+    MaterializedViewRefreshMode, MaterializedViewRefreshPolicy, MaterializedViewStatement,
+    RefreshMaterializedView, ShowMaterializedViews,
+};
+pub use statistics::{
+    AnalyzeMode, AnalyzeTable, CancelAnalyze, DropHistogram, DropMultipleColumnsStats, DropStats,
+    ShowAnalyzeJobs, ShowBasicStatsMeta, ShowHistogramStatsMeta, ShowTableStats,
+    StatisticsStatement,
+};
 pub use visit::{
     Fold, Visit, fold_binary_expr, fold_expr, fold_function_call, fold_ident, fold_literal,
     fold_nested_expr, fold_object_name, fold_show_backends, fold_statement, fold_type_name,

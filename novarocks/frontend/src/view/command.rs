@@ -59,4 +59,9 @@ impl ViewCommandExecutor {
                 })
             })
     }
+
+    /// Removes view metadata when typed catalog admission drops a database.
+    pub(crate) fn drop_database(&self, catalog: &str, database: &str) -> Result<(), String> {
+        self.kernel.view_service().drop_database(catalog, database)
+    }
 }

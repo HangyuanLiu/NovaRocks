@@ -27,10 +27,12 @@ novarocks-catalog = { path = "../catalog" }
 novarocks-execution = { path = "../execution" }
 novarocks-failpoint = { path = "../failpoint" }
 novarocks-protocol = { path = "../protocol" }
+novarocks-parser = { path = "../parser" }
 novarocks-spi = { path = "../spi" }
 novarocks-sql = { path = "../sql" }
 novarocks-state-store = { path = "../state-store" }
 novarocks-types = { path = "../types" }
+novarocks-user-error = { path = "../user-error" }
 novarocks-version = { path = "../version" }
 mysql_common = "0.32"
 opensrv-mysql = { version = "0.7", default-features = false }

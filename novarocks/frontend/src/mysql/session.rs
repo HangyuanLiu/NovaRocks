@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use crate::common::query_cancellation::QueryCancellationReason;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_protocol::{lifecycle::QueryOptions, novarocks};
+use novarocks_user_error::UserError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuerySessionOpenRequest {
@@ -169,6 +170,7 @@ pub enum QueryServiceErrorKind {
 pub struct QueryServiceError {
     kind: QueryServiceErrorKind,
     message: String,
+    user_error: Option<UserError>,
 }
 
 impl QueryServiceError {
@@ -176,6 +178,16 @@ impl QueryServiceError {
         Self {
             kind,
             message: message.into(),
+            user_error: None,
+        }
+    }
+
+    /// Retains parser-owned facts until MySQL encodes the broad error class.
+    pub fn from_user_error(error: UserError) -> Self {
+        Self {
+            kind: QueryServiceErrorKind::Parse,
+            message: error.to_string(),
+            user_error: Some(error),
         }
     }
 
@@ -185,6 +197,10 @@ impl QueryServiceError {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub fn user_error(&self) -> Option<&UserError> {
+        self.user_error.as_ref()
     }
 }
 
@@ -232,6 +248,19 @@ mod tests {
         let error = QueryServiceError::new(QueryServiceErrorKind::Timeout, "deadline elapsed");
         assert_eq!(error.kind(), QueryServiceErrorKind::Timeout);
         assert_eq!(error.message(), "deadline elapsed");
+        assert!(error.user_error().is_none());
+    }
+
+    #[test]
+    fn parser_user_error_is_preserved_without_message_classification() {
+        let parser_error = novarocks_parser::parse("SHOW")
+            .expect_err("incomplete SHOW command must be a parser error")
+            .to_user_error("SHOW");
+        let error = QueryServiceError::from_user_error(parser_error.clone());
+
+        assert_eq!(error.kind(), QueryServiceErrorKind::Parse);
+        assert_eq!(error.user_error(), Some(&parser_error));
+        assert_eq!(error.message(), parser_error.to_string());
     }
 
     #[test]

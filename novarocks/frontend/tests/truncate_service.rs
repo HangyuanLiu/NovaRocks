@@ -43,7 +43,7 @@ use novarocks_frontend::query_execution::dml::truncate::{
     PlanTruncateRequest, PreparedTruncate, TruncateCommand, TruncateDispatchState, TruncateEffect,
     TruncateEngine, TruncateEvidence, TruncateFailure, TruncateFailureKind, TruncateFinalization,
     TruncateOutcome, TruncatePlanError, TruncatePlanFacts, TruncatePlanSummary, TruncatePrepared,
-    TruncateReceipt, parse_truncate_command,
+    TruncateReceipt,
 };
 use novarocks_spi::connector::{
     ConnectorDataMutationPlanSummary, ConnectorDataMutationReceipt, ConnectorInstanceDescriptor,
@@ -91,7 +91,6 @@ struct FakeTruncateEngine {
     plan_error: Mutex<Option<TruncatePlanError>>,
     execute_behavior: Behavior,
     reconcile_behavior: Behavior,
-    classify_calls: AtomicUsize,
     plan_calls: AtomicUsize,
     execute_calls: AtomicUsize,
     reconcile_calls: AtomicUsize,
@@ -106,7 +105,6 @@ impl FakeTruncateEngine {
             plan_error: Mutex::new(None),
             execute_behavior,
             reconcile_behavior,
-            classify_calls: AtomicUsize::new(0),
             plan_calls: AtomicUsize::new(0),
             execute_calls: AtomicUsize::new(0),
             reconcile_calls: AtomicUsize::new(0),
@@ -125,9 +123,8 @@ impl FakeTruncateEngine {
         engine
     }
 
-    fn counts(&self) -> (usize, usize, usize, usize) {
+    fn counts(&self) -> (usize, usize, usize) {
         (
-            self.classify_calls.load(Ordering::SeqCst),
             self.plan_calls.load(Ordering::SeqCst),
             self.execute_calls.load(Ordering::SeqCst),
             self.reconcile_calls.load(Ordering::SeqCst),
@@ -152,11 +149,6 @@ impl TruncateEngine for FakeTruncateEngine {
             &fence,
             Bytes::from_static(b"truncate-fence-marker"),
         )
-    }
-
-    fn classify_truncate(&self, sql: &str) -> Result<Option<TruncateCommand>, String> {
-        self.classify_calls.fetch_add(1, Ordering::SeqCst);
-        parse_truncate_command(sql)
     }
 
     fn plan_truncate(
@@ -709,6 +701,20 @@ fn admitted_context() -> (RequestContext, QueryCancellationSource, Instant) {
     )
 }
 
+fn truncate() -> TruncateCommand {
+    TruncateCommand {
+        target_parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()],
+        target_ref: "main".to_string(),
+    }
+}
+
+fn truncate_branch(target_ref: &str) -> TruncateCommand {
+    TruncateCommand {
+        target_ref: target_ref.to_string(),
+        ..truncate()
+    }
+}
+
 fn truncate_record(
     operation: &StoredOperation,
 ) -> &novarocks_frontend::dml::TruncateLifecycleRecord {
@@ -743,29 +749,6 @@ fn assert_bounded_failure_projection(encoded: &str, original: &str) {
 }
 
 #[test]
-fn non_truncate_has_no_plan_execute_reconcile_or_journal_calls() {
-    let mut engine = FakeTruncateEngine::new(
-        Behavior::Committed {
-            finalization_failure: None,
-        },
-        Behavior::Committed {
-            finalization_failure: None,
-        },
-    );
-    let (service, journal) = harness(&mut engine);
-    let (context, _, _) = admitted_context();
-    assert_eq!(
-        service
-            .try_execute_truncate(&engine, "SELECT 1", &context, None)
-            .unwrap(),
-        None
-    );
-    assert_eq!(engine.counts(), (1, 0, 0, 0));
-    assert_eq!(journal.create_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(journal.mutation_calls.load(Ordering::SeqCst), 0);
-}
-
-#[test]
 fn truncate_requires_journal_before_plan_and_reports_stable_operation_id() {
     let engine = FakeTruncateEngine::new(
         Behavior::Committed {
@@ -778,7 +761,7 @@ fn truncate_requires_journal_before_plan_and_reports_stable_operation_id() {
     let service = DmlService::compose(None, Arc::new(FrontendStatisticsService::new()));
     let (context, _, _) = admitted_context();
     let error = service
-        .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)
+        .execute_truncate(&engine, truncate(), &context, None)
         .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
     assert!(error.operation_id().is_some());
@@ -786,7 +769,7 @@ fn truncate_requires_journal_before_plan_and_reports_stable_operation_id() {
         error.next_action(),
         Some(StatementNextAction::ManualInspect)
     );
-    assert_eq!(engine.counts(), (1, 0, 0, 0));
+    assert_eq!(engine.counts(), (0, 0, 0));
 }
 
 #[test]
@@ -797,17 +780,12 @@ fn plan_failure_is_terminal_known_uncommitted_without_execute() {
     let (service, journal) = harness(&mut engine);
     let (context, _, _) = admitted_context();
     let error = service
-        .try_execute_truncate(
-            &engine,
-            "TRUNCATE TABLE ice.db.orders.branch_missing",
-            &context,
-            None,
-        )
+        .execute_truncate(&engine, truncate_branch("missing"), &context, None)
         .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::Executor);
     assert!(error.operation_id().is_some());
     assert_eq!(error.next_action(), Some(StatementNextAction::None));
-    assert_eq!(engine.counts(), (1, 1, 0, 0));
+    assert_eq!(engine.counts(), (1, 0, 0));
     let operation = journal.only_operation();
     assert_eq!(operation.state, OperationState::FailedKnownUncommitted);
     assert_eq!(
@@ -830,11 +808,11 @@ fn execute_known_uncommitted_is_terminal_and_never_reconciles() {
     let (service, journal) = harness(&mut engine);
     let (context, _, _) = admitted_context();
     let error = service
-        .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)
+        .execute_truncate(&engine, truncate(), &context, None)
         .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::Executor);
     assert_eq!(error.next_action(), Some(StatementNextAction::None));
-    assert_eq!(engine.counts(), (1, 1, 1, 0));
+    assert_eq!(engine.counts(), (1, 1, 0));
     let operation = journal.only_operation();
     assert_eq!(operation.state, OperationState::FailedKnownUncommitted);
     assert_eq!(
@@ -861,11 +839,11 @@ fn committed_truncate_persists_exact_plan_and_versioned_receipt_then_finishes() 
     let (context, _, deadline) = admitted_context();
     assert_eq!(
         service
-            .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)
+            .execute_truncate(&engine, truncate(), &context, None)
             .unwrap(),
-        Some(())
+        ()
     );
-    assert_eq!(engine.counts(), (1, 1, 1, 0));
+    assert_eq!(engine.counts(), (1, 1, 0));
     let plan_context = engine.plan_context.lock().unwrap();
     assert_eq!(plan_context[0].0, 83);
     assert_eq!(plan_context[0].1, Some(deadline));
@@ -923,7 +901,7 @@ fn committed_finalization_failure_stays_known_committed_and_retry_finalize() {
     let (service, journal) = harness(&mut engine);
     let (context, _, _) = admitted_context();
     let error = service
-        .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)
+        .execute_truncate(&engine, truncate(), &context, None)
         .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::CommittedButUnfinalized);
     assert_eq!(
@@ -938,7 +916,7 @@ fn committed_finalization_failure_stays_known_committed_and_retry_finalize() {
     let fact = truncate_record(&operation).outcome.as_ref().unwrap();
     assert!(fact.receipt.is_some());
     assert!(fact.finalization_failure.is_some());
-    assert_eq!(engine.counts(), (1, 1, 1, 0));
+    assert_eq!(engine.counts(), (1, 1, 0));
 }
 
 #[test]
@@ -952,9 +930,9 @@ fn unknown_evidence_is_durable_before_one_reconcile_and_matching_marker_converge
     let (service, journal) = harness(&mut engine);
     let (context, _, _) = admitted_context();
     service
-        .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)
+        .execute_truncate(&engine, truncate(), &context, None)
         .unwrap();
-    assert_eq!(engine.counts(), (1, 1, 1, 1));
+    assert_eq!(engine.counts(), (1, 1, 1));
     let reconciled_evidence = engine.reconcile_evidence.lock().unwrap();
     assert_eq!(reconciled_evidence.len(), 1);
     let history = journal.history();
@@ -1001,14 +979,14 @@ fn missing_or_conflicting_marker_remains_unresolved_without_reexecute() {
         let (service, journal) = harness(&mut engine);
         let (context, _, _) = admitted_context();
         let error = service
-            .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)
+            .execute_truncate(&engine, truncate(), &context, None)
             .unwrap_err();
         assert_eq!(error.kind(), DmlErrorKind::Commit);
         assert_eq!(
             error.next_action(),
             Some(StatementNextAction::ManualInspect)
         );
-        assert_eq!(engine.counts(), (1, 1, 1, 1));
+        assert_eq!(engine.counts(), (1, 1, 1));
         let operation = journal.only_operation();
         assert_eq!(operation.state, OperationState::CommitUnknown);
         assert_eq!(
@@ -1032,13 +1010,13 @@ fn possibly_dispatched_without_evidence_stays_unresolved_and_never_reconciles() 
     let (service, journal) = harness(&mut engine);
     let (context, _, _) = admitted_context();
     let error = service
-        .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)
+        .execute_truncate(&engine, truncate(), &context, None)
         .unwrap_err();
     assert_eq!(
         error.next_action(),
         Some(StatementNextAction::ManualInspect)
     );
-    assert_eq!(engine.counts(), (1, 1, 1, 0));
+    assert_eq!(engine.counts(), (1, 1, 0));
     assert_eq!(
         journal.only_operation().state,
         OperationState::CommitUnknown
@@ -1057,13 +1035,13 @@ fn reconcile_possibly_dispatched_preserves_first_durable_evidence() {
     let (service, journal) = harness(&mut engine);
     let (context, _, _) = admitted_context();
     let error = service
-        .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)
+        .execute_truncate(&engine, truncate(), &context, None)
         .unwrap_err();
     assert_eq!(
         error.next_action(),
         Some(StatementNextAction::ManualInspect)
     );
-    assert_eq!(engine.counts(), (1, 1, 1, 1));
+    assert_eq!(engine.counts(), (1, 1, 1));
     let evidence = truncate_record(&journal.only_operation())
         .outcome
         .as_ref()
@@ -1086,14 +1064,14 @@ fn reconcile_different_evidence_is_corrupt_and_cannot_replace_first_evidence() {
     let (service, journal) = harness(&mut engine);
     let (context, _, _) = admitted_context();
     let error = service
-        .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)
+        .execute_truncate(&engine, truncate(), &context, None)
         .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::Commit);
     assert_eq!(
         error.next_action(),
         Some(StatementNextAction::ManualInspect)
     );
-    assert_eq!(engine.counts(), (1, 1, 1, 1));
+    assert_eq!(engine.counts(), (1, 1, 1));
     let history = journal.history();
     let first = history
         .iter()
@@ -1123,10 +1101,10 @@ fn oversized_unknown_failure_cannot_block_evidence_durability_or_trigger_reconci
     journal.fail_mutation_at(4);
     let (context, _, _) = admitted_context();
     let error = service
-        .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)
+        .execute_truncate(&engine, truncate(), &context, None)
         .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
-    assert_eq!(engine.counts(), (1, 1, 1, 0));
+    assert_eq!(engine.counts(), (1, 1, 0));
     let operation = journal.only_operation();
     assert_eq!(operation.state, OperationState::CommitUnknown);
     let fact = truncate_record(&operation).outcome.as_ref().unwrap();
@@ -1150,10 +1128,10 @@ fn oversized_finalization_failure_keeps_committed_truth_durable() {
     let (service, journal) = harness(&mut engine);
     let (context, _, _) = admitted_context();
     let error = service
-        .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)
+        .execute_truncate(&engine, truncate(), &context, None)
         .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::CommittedButUnfinalized);
-    assert_eq!(engine.counts(), (1, 1, 1, 0));
+    assert_eq!(engine.counts(), (1, 1, 0));
     let operation = journal.only_operation();
     assert_eq!(
         operation.state,
@@ -1180,11 +1158,11 @@ fn worst_case_journal_envelope_is_preflighted_before_execute() {
     journal.set_max_statement_bytes(4 * 1024);
     let (context, _, _) = admitted_context();
     let error = service
-        .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)
+        .execute_truncate(&engine, truncate(), &context, None)
         .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::Executor);
     assert_eq!(error.next_action(), Some(StatementNextAction::None));
-    assert_eq!(engine.counts(), (1, 1, 0, 0));
+    assert_eq!(engine.counts(), (1, 0, 0));
     assert_eq!(
         journal.only_operation().state,
         OperationState::FailedKnownUncommitted
@@ -1207,14 +1185,14 @@ fn invalid_committed_receipt_keeps_committed_truth_without_trusting_receipt() {
         let (service, journal) = harness(&mut engine);
         let (context, _, _) = admitted_context();
         let error = service
-            .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)
+            .execute_truncate(&engine, truncate(), &context, None)
             .unwrap_err();
         assert_eq!(error.kind(), DmlErrorKind::CommittedButUnfinalized);
         assert_eq!(
             error.next_action(),
             Some(StatementNextAction::ManualInspect)
         );
-        assert_eq!(engine.counts(), (1, 1, 1, 0));
+        assert_eq!(engine.counts(), (1, 1, 0));
 
         let operation = journal.only_operation();
         assert_eq!(
@@ -1247,7 +1225,7 @@ fn journal_uncertainty_blocks_execute_and_reconcile_at_each_external_barrier() {
     journal.fail_mutation_at(1);
     let (context, _, _) = admitted_context();
     let error = service
-        .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)
+        .execute_truncate(&engine, truncate(), &context, None)
         .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
     assert!(error.operation_id().is_some());
@@ -1255,7 +1233,7 @@ fn journal_uncertainty_blocks_execute_and_reconcile_at_each_external_barrier() {
         error.next_action(),
         Some(StatementNextAction::ManualInspect)
     );
-    assert_eq!(engine.counts(), (1, 1, 0, 0));
+    assert_eq!(engine.counts(), (1, 0, 0));
 
     let mut engine = FakeTruncateEngine::new(
         Behavior::CommitUnknown(failure(TruncateFailureKind::Unavailable, "response lost")),
@@ -1267,7 +1245,7 @@ fn journal_uncertainty_blocks_execute_and_reconcile_at_each_external_barrier() {
     journal.fail_mutation_at(3);
     let (context, _, _) = admitted_context();
     let error = service
-        .try_execute_truncate(&engine, "TRUNCATE TABLE ice.db.orders", &context, None)
+        .execute_truncate(&engine, truncate(), &context, None)
         .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
     assert!(error.operation_id().is_some());
@@ -1275,7 +1253,7 @@ fn journal_uncertainty_blocks_execute_and_reconcile_at_each_external_barrier() {
         error.next_action(),
         Some(StatementNextAction::ManualInspect)
     );
-    assert_eq!(engine.counts(), (1, 1, 1, 0));
+    assert_eq!(engine.counts(), (1, 1, 0));
     assert!(!journal.unknown_is_durable.load(Ordering::SeqCst));
 }
 
