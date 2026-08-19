@@ -1032,6 +1032,8 @@ const RESOURCE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LIFECYCLE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const QUERY_EXECUTION_RESOURCE_METRIC: &str = "novarocks_backend_query_execution_resources";
 const QUERY_LIFECYCLE_TERMINAL_METRIC: &str = "novarocks_backend_query_lifecycle_terminal_total";
+const FRONTEND_QUERY_LIFECYCLE_CONTROL_METRIC: &str =
+    "novarocks_frontend_query_lifecycle_control_total";
 
 const HEAVY_QUERY_EXECUTION_RESOURCES: [&str; 10] = [
     "stage_active_builders",
@@ -1066,6 +1068,7 @@ pub struct BackendResourceSnapshot {
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryExecutionResourceSnapshot {
     pub fe_running: bool,
+    pub frontend_control_ready: f64,
     pub backends: Vec<BackendResourceSnapshot>,
 }
 
@@ -2527,6 +2530,19 @@ impl CrossProcessServerHandle {
             .fe_process
             .is_running()
             .context("inspect FE process state")?;
+        let frontend_control_ready = if fe_running {
+            let metrics = scrape_prometheus_metrics(self.runtime.fe_http_port)
+                .context("scrape cross-process FE /metrics")?;
+            prometheus_labeled_gauge(
+                &metrics,
+                FRONTEND_QUERY_LIFECYCLE_CONTROL_METRIC,
+                "outcome",
+                "control_ready",
+            )
+            .context("read FE query lifecycle control-ready count")?
+        } else {
+            0.0
+        };
         let mut backends = Vec::with_capacity(self.be_processes.len());
         for (index, (process, ports)) in self
             .be_processes
@@ -2602,6 +2618,7 @@ impl CrossProcessServerHandle {
         }
         Ok(QueryExecutionResourceSnapshot {
             fe_running,
+            frontend_control_ready,
             backends,
         })
     }
@@ -4882,6 +4899,8 @@ enable_path_style_access = true
         let metrics = concat!(
             "novarocks_backend_query_execution_resources{resource=\"stage_active_builders\"} 7\n",
             "novarocks_backend_query_execution_resources{resource=\"stage_encoded_bytes\"} 11\n",
+            "novarocks_backend_query_execution_resources{resource=\"native_query_active_fragments\"} 3\n",
+            "novarocks_frontend_query_lifecycle_control_total{outcome=\"control_ready\"} 13\n",
         );
         assert_eq!(
             prometheus_labeled_gauge(
@@ -4892,6 +4911,26 @@ enable_path_style_access = true
             )
             .expect("read exact resource sample"),
             7.0
+        );
+        assert_eq!(
+            prometheus_labeled_gauge(
+                metrics,
+                QUERY_EXECUTION_RESOURCE_METRIC,
+                "resource",
+                "native_query_active_fragments"
+            )
+            .expect("read exact native fragment activity sample"),
+            3.0
+        );
+        assert_eq!(
+            prometheus_labeled_gauge(
+                metrics,
+                FRONTEND_QUERY_LIFECYCLE_CONTROL_METRIC,
+                "outcome",
+                "control_ready"
+            )
+            .expect("read exact frontend control-ready sample"),
+            13.0
         );
         assert!(
             prometheus_labeled_gauge(
@@ -4999,6 +5038,7 @@ enable_path_style_access = true
     fn resource_convergence_allows_a_killed_backend_but_not_a_live_leak() {
         let baseline = QueryExecutionResourceSnapshot {
             fe_running: true,
+            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,
@@ -5011,6 +5051,7 @@ enable_path_style_access = true
         };
         let exited = QueryExecutionResourceSnapshot {
             fe_running: true,
+            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: false,
@@ -5025,6 +5066,7 @@ enable_path_style_access = true
 
         let leaked = QueryExecutionResourceSnapshot {
             fe_running: true,
+            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,
@@ -5047,6 +5089,7 @@ enable_path_style_access = true
     fn resource_convergence_allows_bounded_terminal_retention_after_frontend_crash() {
         let baseline = QueryExecutionResourceSnapshot {
             fe_running: true,
+            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,
@@ -5059,6 +5102,7 @@ enable_path_style_access = true
         };
         let retained = QueryExecutionResourceSnapshot {
             fe_running: true,
+            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,
@@ -5078,6 +5122,7 @@ enable_path_style_access = true
     fn resource_convergence_allows_existing_terminal_retention_to_expire() {
         let baseline = QueryExecutionResourceSnapshot {
             fe_running: true,
+            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,
@@ -5090,6 +5135,7 @@ enable_path_style_access = true
         };
         let expired = QueryExecutionResourceSnapshot {
             fe_running: true,
+            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,

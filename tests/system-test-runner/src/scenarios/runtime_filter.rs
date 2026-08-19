@@ -35,6 +35,7 @@ const REQUIRED_BACKENDS: usize = 3;
 const ACK_DROP_TARGET_BACKEND: usize = 1;
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RUNTIME_FILTER_SERVICE_RESOURCE: &str = "native_runtime_filter_services";
+const NATIVE_QUERY_ACTIVE_FRAGMENTS_RESOURCE: &str = "native_query_active_fragments";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -133,7 +134,7 @@ impl Scenario for CancelWithTerminalAckReplay {
         context.action("started an in-flight native Runtime Filter query through public MySQL");
         await_runtime_filter_activity(context, &baseline)?;
         context.action(
-            "observed active native Runtime Filter services through the typed resource oracle",
+            "observed active Runtime Filter services, all participant ControlReady events, and an admitted native fragment through the typed resource oracle",
         );
 
         control
@@ -376,10 +377,32 @@ fn await_runtime_filter_activity(
                             .copied()
                             .unwrap_or_default()
                 });
-        if runtime_filter_active {
+        let required_control_ready = u64::try_from(context.handle().be_count())?;
+        let control_ready = current.frontend_control_ready
+            >= baseline.frontend_control_ready + required_control_ready as f64;
+        let native_fragment_active =
+            current
+                .backends
+                .iter()
+                .zip(&baseline.backends)
+                .any(|(current, baseline)| {
+                    current
+                        .resources
+                        .get(NATIVE_QUERY_ACTIVE_FRAGMENTS_RESOURCE)
+                        .copied()
+                        .unwrap_or_default()
+                        > baseline
+                            .resources
+                            .get(NATIVE_QUERY_ACTIVE_FRAGMENTS_RESOURCE)
+                            .copied()
+                            .unwrap_or_default()
+                });
+        if runtime_filter_active && control_ready && native_fragment_active {
             return Ok(());
         }
-        let remaining = context.remaining("observe active Runtime Filter services")?;
+        let remaining = context.remaining(
+            "observe active Runtime Filter services, ControlReady, and native fragment admission",
+        )?;
         thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
     }
 }
