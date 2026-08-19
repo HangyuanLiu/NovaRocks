@@ -28,8 +28,8 @@ pub(crate) mod materialized_view;
 mod query;
 mod relation;
 pub(crate) mod statistics;
-pub(crate) mod view;
 mod validate;
+pub(crate) mod view;
 mod visit;
 mod window;
 
@@ -82,8 +82,8 @@ pub use statistics::{
     ShowAnalyzeJobs, ShowBasicStatsMeta, ShowHistogramStatsMeta, ShowTableStats,
     StatisticsStatement,
 };
-pub use view::{CreateView, DropView, ShowCreateView, ShowViews, ViewStatement};
 pub use validate::{validate_statement, validate_statements};
+pub use view::{CreateView, DropView, ShowCreateView, ShowViews, ViewStatement};
 pub use visit::{
     Fold, Visit, fold_binary_expr, fold_expr, fold_function_call, fold_ident, fold_literal,
     fold_nested_expr, fold_object_name, fold_show_backends, fold_statement, fold_type_name,

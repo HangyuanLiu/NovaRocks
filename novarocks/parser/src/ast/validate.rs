@@ -49,6 +49,7 @@ pub fn validate_statement(statement: &Statement) -> Result<(), ValidateError> {
         | Statement::Iceberg(_)
         | Statement::Maintenance(_)
         | Statement::MaterializedView(_)
+        | Statement::View(_)
         | Statement::RawQuery(_) => Ok(()),
     }
 }
