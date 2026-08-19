@@ -265,6 +265,7 @@ impl<'source> Lexer<'source> {
         } else {
             match self.current()? {
                 ',' => (1, Symbol::Comma),
+                '\\' => (1, Symbol::Backslash),
                 ':' => (1, Symbol::Colon),
                 '.' => (1, Symbol::Dot),
                 '=' => (1, Symbol::Eq),
@@ -297,7 +298,11 @@ impl<'source> Lexer<'source> {
 }
 
 fn is_identifier_start(character: char) -> bool {
-    character.is_alphabetic() || character == '_'
+    // SQL test corpus files intentionally retain runner placeholders such as
+    // `${case_db}` before substitution. Tokenizing `$` here keeps the lexer
+    // lossless; grammar/admission decides whether a resulting identifier is
+    // legal in a statement position.
+    character.is_alphabetic() || matches!(character, '_' | '$')
 }
 
 fn is_identifier_part(character: char) -> bool {

@@ -6,6 +6,8 @@
 //! The dependency-light owner for NovaRocks SQL source facts.
 
 pub mod ast;
+pub mod parser;
+pub mod printer;
 
 mod error;
 mod keyword;
@@ -15,6 +17,8 @@ mod span;
 mod token;
 
 pub use error::{ERROR_CODE_DESCRIPTORS, LexError, ParseError, ParserError, ValidateError};
+pub use keyword::{KeywordClass, class as keyword_class};
 pub use lexer::lex;
+pub use parser::parse;
 pub use span::{LineCol, Span};
 pub use token::{Keyword, Symbol, Token, TokenKind, TriviaKind};

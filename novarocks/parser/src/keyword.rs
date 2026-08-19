@@ -23,7 +23,9 @@ pub enum KeywordClass {
 /// Identifiers retain their original source spelling; only the comparison here
 /// is case-insensitive.
 pub fn lookup(word: &str) -> Option<Keyword> {
-    if word.eq_ignore_ascii_case("AS") {
+    if word.eq_ignore_ascii_case("AND") {
+        Some(Keyword::And)
+    } else if word.eq_ignore_ascii_case("AS") {
         Some(Keyword::As)
     } else if word.eq_ignore_ascii_case("BACKENDS") {
         Some(Keyword::Backends)
@@ -31,6 +33,12 @@ pub fn lookup(word: &str) -> Option<Keyword> {
         Some(Keyword::False)
     } else if word.eq_ignore_ascii_case("FROM") {
         Some(Keyword::From)
+    } else if word.eq_ignore_ascii_case("NOT") {
+        Some(Keyword::Not)
+    } else if word.eq_ignore_ascii_case("NULL") {
+        Some(Keyword::Null)
+    } else if word.eq_ignore_ascii_case("OR") {
+        Some(Keyword::Or)
     } else if word.eq_ignore_ascii_case("SHOW") {
         Some(Keyword::Show)
     } else if word.eq_ignore_ascii_case("TRUE") {
@@ -44,9 +52,15 @@ pub fn lookup(word: &str) -> Option<Keyword> {
 pub const fn class(keyword: Keyword) -> KeywordClass {
     match keyword {
         Keyword::Backends => KeywordClass::NonReserved,
-        Keyword::As | Keyword::False | Keyword::From | Keyword::Show | Keyword::True => {
-            KeywordClass::Reserved
-        }
+        Keyword::And
+        | Keyword::As
+        | Keyword::False
+        | Keyword::From
+        | Keyword::Not
+        | Keyword::Null
+        | Keyword::Or
+        | Keyword::Show
+        | Keyword::True => KeywordClass::Reserved,
     }
 }
 

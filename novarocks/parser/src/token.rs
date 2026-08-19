@@ -45,10 +45,14 @@ pub enum TriviaKind {
 /// Keywords initially needed by the parser foundation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Keyword {
+    And,
     As,
     Backends,
     False,
     From,
+    Not,
+    Null,
+    Or,
     Show,
     True,
 }
@@ -58,6 +62,7 @@ pub enum Keyword {
 pub enum Symbol {
     Ampersand,
     Bang,
+    Backslash,
     Caret,
     Colon,
     Comma,
