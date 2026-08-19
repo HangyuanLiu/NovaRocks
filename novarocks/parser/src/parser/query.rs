@@ -419,6 +419,22 @@ fn parse_projection(
                 options: WildcardOptions::default(),
                 span,
             });
+        } else if qualified_wildcard_ahead(parser) {
+            let start = parser.current_span().start();
+            let mut prefix = vec![parser.parse_ident()?];
+            loop {
+                parser.consume_symbol(Symbol::Dot)?;
+                if parser.current_is_symbol(Symbol::Star) {
+                    let end = parser.consume_symbol(Symbol::Star)?.end();
+                    items.push(SelectItem::QualifiedWildcard {
+                        prefix,
+                        options: WildcardOptions::default(),
+                        span: Span::new(start, end),
+                    });
+                    break;
+                }
+                prefix.push(parser.parse_ident()?);
+            }
         } else {
             let (expr, implicit_alias) = parse_projection_expression(
                 parser,
@@ -465,6 +481,57 @@ fn parse_projection(
         }
     }
     Ok(items)
+}
+
+fn qualified_wildcard_ahead(parser: &StatementParser<'_, '_>) -> bool {
+    let mut position = parser.position;
+    loop {
+        while matches!(
+            parser.tokens.get(position).map(|token| &token.kind),
+            Some(TokenKind::Trivia(_))
+        ) {
+            position += 1;
+        }
+        let Some(token) = parser.tokens.get(position) else {
+            return false;
+        };
+        let identifier = match token.kind {
+            TokenKind::Ident | TokenKind::QuotedIdent => true,
+            TokenKind::Keyword(keyword) => {
+                crate::keyword_class(keyword) == crate::KeywordClass::NonReserved
+            }
+            _ => false,
+        };
+        if !identifier {
+            return false;
+        }
+        position += 1;
+        while matches!(
+            parser.tokens.get(position).map(|token| &token.kind),
+            Some(TokenKind::Trivia(_))
+        ) {
+            position += 1;
+        }
+        if !matches!(
+            parser.tokens.get(position).map(|token| &token.kind),
+            Some(TokenKind::Symbol(Symbol::Dot))
+        ) {
+            return false;
+        }
+        position += 1;
+        while matches!(
+            parser.tokens.get(position).map(|token| &token.kind),
+            Some(TokenKind::Trivia(_))
+        ) {
+            position += 1;
+        }
+        if matches!(
+            parser.tokens.get(position).map(|token| &token.kind),
+            Some(TokenKind::Symbol(Symbol::Star))
+        ) {
+            return true;
+        }
+    }
 }
 
 fn parse_projection_expression(
