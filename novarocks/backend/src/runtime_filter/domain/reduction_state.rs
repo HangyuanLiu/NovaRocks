@@ -308,3 +308,272 @@ fn contribution_digest(contribution: &TypedContribution) -> [u8; 32] {
         TypedContribution::FinalDomain(shard) => shard.replay_digest(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::DataType;
+    use novarocks_execution::runtime_filter::{
+        LogicalVersion, PartitionId, ProducerSequence, RuntimeFilterBindingId,
+        RuntimeFilterChannelId, RuntimeFilterContribution, RuntimeFilterContributionKind,
+        RuntimeFilterExecutionContract, RuntimeFilterProducerContract,
+        contribution::{
+            ContributionCodecExpectation, OrderedScalar, OrderedTuple,
+            RuntimeFilterContribution as TypedContribution, RuntimeOrderContract, RuntimeOrderKey,
+            RuntimeTopKSummaryContract, TopKSummary, encode_contribution,
+        },
+    };
+    use novarocks_types::UniqueId;
+
+    use super::*;
+    use crate::runtime_filter::domain::{
+        BackendCoverage, BackendCoverageWitnessId, BackendParticipantIdentity,
+        BackendReducedLogicalDomain,
+    };
+
+    const CONTRIBUTION_BUDGET: usize = 4096;
+
+    fn topk_policy(k: u32) -> (BackendInstallPolicy, Arc<RuntimeOrderContract>) {
+        let order = Arc::new(RuntimeOrderContract::new(
+            [RuntimeOrderKey::new(DataType::Int64)],
+            [0xA1; 32],
+        ));
+        let producer = RuntimeFilterProducerContract::top_k_summary(
+            RuntimeFilterBindingId::new(7),
+            RuntimeFilterChannelId::new(11),
+            k,
+            RuntimeFilterExecutionContract::Ordered(Arc::clone(&order)),
+        )
+        .expect("TopK producer contract is valid");
+        let policy = BackendInstallPolicy::new(
+            BackendParticipantIdentity::new(UniqueId::new(17, 19), 23),
+            producer,
+            BackendCoverage::witness(BackendCoverageWitnessId::new(29)),
+            CONTRIBUTION_BUDGET,
+        )
+        .expect("Backend install policy is valid");
+        (policy, order)
+    }
+
+    fn stream(policy: &BackendInstallPolicy, fragment: i64) -> BackendProducerStreamIdentity {
+        BackendProducerStreamIdentity::new(
+            policy.channel(),
+            UniqueId::new(fragment, fragment + 1),
+            PartitionId::new(0),
+        )
+    }
+
+    fn tuple(value: i64) -> OrderedTuple {
+        OrderedTuple::new([Some(OrderedScalar::Int64(value))])
+    }
+
+    fn contribution(
+        order: &RuntimeOrderContract,
+        contract_k: u32,
+        values: impl IntoIterator<Item = i64>,
+    ) -> RuntimeFilterContribution {
+        let contract = RuntimeTopKSummaryContract::new(order.clone(), contract_k, order.digest());
+        let summary = TopKSummary::try_new(&contract, values.into_iter().map(tuple))
+            .expect("test contribution is canonical");
+        let encoded = encode_contribution(
+            &TypedContribution::top_k_summary(summary),
+            ContributionCodecExpectation::TopKSummary(&contract),
+            CONTRIBUTION_BUDGET,
+        )
+        .expect("test contribution fits its budget");
+        RuntimeFilterContribution::new(
+            RuntimeFilterContributionKind::TopKSummary,
+            *encoded.schema_digest(),
+            encoded.into_parts().1,
+        )
+    }
+
+    fn ordered_bound(snapshot: BackendReducedLogicalSnapshot) -> i64 {
+        match snapshot.domain() {
+            BackendReducedLogicalDomain::OrderedBound(bound) => match bound.values() {
+                [Some(OrderedScalar::Int64(value))] => *value,
+                actual => panic!("expected one Int64 ordered bound, got {actual:?}"),
+            },
+            actual => panic!("expected ordered bound snapshot, got {actual:?}"),
+        }
+    }
+
+    #[test]
+    fn topk_reduction_waits_for_k_then_tightens_the_global_bound() {
+        let (policy, order) = topk_policy(2);
+        let first = stream(&policy, 31);
+        let second = stream(&policy, 41);
+        let mut state = BackendReductionState::new(policy).expect("valid TopK state");
+
+        let (outcome, snapshot) = state
+            .submit(
+                first,
+                ProducerSequence::new(0),
+                contribution(&order, 2, [3]),
+            )
+            .expect("first shard is accepted");
+        assert_eq!(outcome, BackendReductionApply::SequenceAdvancedEqual);
+        assert!(
+            snapshot.is_none(),
+            "fewer than K candidates must not publish"
+        );
+
+        let (outcome, snapshot) = state
+            .submit(
+                second,
+                ProducerSequence::new(0),
+                contribution(&order, 2, [7]),
+            )
+            .expect("second shard reaches K");
+        assert_eq!(
+            outcome,
+            BackendReductionApply::Applied {
+                version: LogicalVersion::FIRST
+            }
+        );
+        assert_eq!(ordered_bound(snapshot.expect("K candidates publish")), 7);
+
+        let (outcome, snapshot) = state
+            .submit(
+                first,
+                ProducerSequence::new(1),
+                contribution(&order, 2, [2, 3]),
+            )
+            .expect("monotonic shard replacement is accepted");
+        assert_eq!(
+            outcome,
+            BackendReductionApply::Applied {
+                version: LogicalVersion::new(2)
+            }
+        );
+        assert_eq!(
+            ordered_bound(snapshot.expect("a tighter global bound publishes")),
+            3
+        );
+    }
+
+    #[test]
+    fn topk_reduction_tracks_duplicate_stale_and_equal_replay_without_publication() {
+        let (policy, order) = topk_policy(2);
+        let stream = stream(&policy, 31);
+        let initial = contribution(&order, 2, [3, 7]);
+        let mut state = BackendReductionState::new(policy).expect("valid TopK state");
+
+        let (outcome, snapshot) = state
+            .submit(stream, ProducerSequence::new(0), initial.clone())
+            .expect("initial summary is accepted");
+        assert_eq!(
+            outcome,
+            BackendReductionApply::Applied {
+                version: LogicalVersion::FIRST
+            }
+        );
+        assert_eq!(ordered_bound(snapshot.expect("initial bound publishes")), 7);
+
+        assert_eq!(
+            state
+                .submit(stream, ProducerSequence::new(0), initial.clone())
+                .expect("identical replay is accepted"),
+            (BackendReductionApply::Duplicate, None)
+        );
+        assert_eq!(
+            state
+                .submit(stream, ProducerSequence::new(1), initial)
+                .expect("new sequence with equal bound is accepted"),
+            (BackendReductionApply::SequenceAdvancedEqual, None)
+        );
+        assert_eq!(
+            state
+                .submit(
+                    stream,
+                    ProducerSequence::new(0),
+                    contribution(&order, 2, [2, 3])
+                )
+                .expect("older sequence is ignored"),
+            (BackendReductionApply::Stale, None)
+        );
+        assert_eq!(
+            ordered_bound(
+                state
+                    .latest_snapshot()
+                    .expect("published snapshot is retained")
+            ),
+            7
+        );
+    }
+
+    #[test]
+    fn topk_reduction_rejects_invalid_contributions_without_consuming_stream_state() {
+        let (policy, order) = topk_policy(2);
+        let stream = stream(&policy, 31);
+        let mut state = BackendReductionState::new(policy.clone()).expect("valid TopK state");
+
+        let overfull = contribution(&order, 3, [1, 2, 3]);
+        assert!(matches!(
+            state.submit(stream, ProducerSequence::new(0), overfull),
+            Err(BackendReductionStateError::Install(
+                BackendInstallPolicyError::ContributionDecodeFailed(_)
+            ))
+        ));
+
+        let first = contribution(&order, 2, [2]);
+        assert_eq!(
+            state
+                .submit(stream, ProducerSequence::new(0), first.clone())
+                .expect("rejected contribution did not consume sequence"),
+            (BackendReductionApply::SequenceAdvancedEqual, None)
+        );
+
+        let digest_mismatch = RuntimeFilterContribution::new(
+            RuntimeFilterContributionKind::TopKSummary,
+            [0xF1; 32],
+            first.canonical_bytes().clone(),
+        );
+        assert!(matches!(
+            state.submit(stream, ProducerSequence::new(1), digest_mismatch),
+            Err(BackendReductionStateError::Install(
+                BackendInstallPolicyError::ContributionDigestMismatch
+            ))
+        ));
+
+        let replay_conflict = contribution(&order, 2, [1]);
+        assert_eq!(
+            state.submit(stream, ProducerSequence::new(0), replay_conflict),
+            Err(BackendReductionStateError::ReplayConflict)
+        );
+        let (outcome, snapshot) = state
+            .submit(
+                stream,
+                ProducerSequence::new(1),
+                contribution(&order, 2, [1, 2]),
+            )
+            .expect("valid next sequence remains admissible");
+        assert_eq!(
+            outcome,
+            BackendReductionApply::Applied {
+                version: LogicalVersion::FIRST
+            }
+        );
+        assert_eq!(ordered_bound(snapshot.expect("valid summary publishes")), 2);
+
+        assert_eq!(
+            state.submit(
+                stream,
+                ProducerSequence::new(2),
+                contribution(&order, 2, [2, 3])
+            ),
+            Err(BackendReductionStateError::OrderedContract)
+        );
+        assert_eq!(
+            state
+                .submit(
+                    stream,
+                    ProducerSequence::new(2),
+                    contribution(&order, 2, [1, 2])
+                )
+                .expect("rejected non-monotonic replacement did not consume sequence"),
+            (BackendReductionApply::SequenceAdvancedEqual, None)
+        );
+    }
+}
