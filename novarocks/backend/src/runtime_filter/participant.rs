@@ -1612,10 +1612,15 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use arrow::datatypes::DataType;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_execution::runtime_filter::{
-        RuntimeFilterBindOutcome, RuntimeFilterConsumerContract, RuntimeFilterSubscriptionHandle,
-        RuntimeFilterSubscriptionRequest, SnapshotAcquireOutcome,
+        RuntimeFilterBindOutcome, RuntimeFilterChannelId, RuntimeFilterConsumerContract,
+        RuntimeFilterExecutionContract, RuntimeFilterFinalDomain,
+        RuntimeFilterFinalDomainCompletionHandle, RuntimeFilterFinalDomainOpenRequest,
+        RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics, RuntimeFilterProducerContract,
+        RuntimeFilterProducerFailure, RuntimeFilterSubscriptionHandle,
+        RuntimeFilterSubscriptionRequest, SnapshotAcquireOutcome, UnavailableReason, contribution,
     };
     use novarocks_protocol::lifecycle::AttemptId;
     use novarocks_types::QueryId;
@@ -1628,9 +1633,9 @@ mod tests {
     use crate::runtime_filter::domain::{
         BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall, BackendCoverage,
         BackendMaterializationOwner, BackendMaterializationPolicy,
-        BackendOutboundMaterializationGroup, BackendRemoteRoute, BackendRouteEdgeId,
-        BackendRouteEndpoint, BackendRoutePeer, BackendRouteRole, BackendRoutingChannel,
-        BackendRoutingEdge, BackendRoutingShard,
+        BackendOutboundMaterializationGroup, BackendParticipantIdentity, BackendRemoteRoute,
+        BackendRouteEdgeId, BackendRouteEndpoint, BackendRoutePeer, BackendRouteRole,
+        BackendRoutingChannel, BackendRoutingEdge, BackendRoutingShard,
     };
     use crate::runtime_filter::test_support::BackendRuntimeFilterFixture;
 
@@ -1703,6 +1708,339 @@ mod tests {
 
     fn endpoint(port: i32) -> RuntimeEndpoint {
         RuntimeEndpoint::new("127.0.0.1", port).expect("valid endpoint")
+    }
+
+    fn final_domain_participant(
+        max_contribution_bytes: usize,
+    ) -> (
+        Arc<RuntimeFilterParticipant>,
+        RuntimeFilterProducerContract,
+        UniqueId,
+    ) {
+        let participant_identity = BackendParticipantIdentity::new(UniqueId::new(701, 703), 23);
+        let fragment_instance = UniqueId::new(709, 711);
+        let schema = RuntimeFilterMembershipSchema::new(
+            &DataType::Int64,
+            RuntimeFilterNullSemantics::NeverMatches,
+        )
+        .expect("Int64 membership schema is supported");
+        let contract = RuntimeFilterExecutionContract::Membership(schema);
+        let producer = RuntimeFilterProducerContract::final_domain(
+            novarocks_execution::runtime_filter::RuntimeFilterBindingId::new(71),
+            RuntimeFilterChannelId::new(73),
+            contract.clone(),
+        )
+        .expect("FinalDomain producer contract is valid");
+        let coverage_witness = super::super::domain::BackendCoverageWitnessId::new(79);
+        let coverage = BackendCoverage::witness(coverage_witness);
+        let channel = BackendChannelInstall::new(
+            producer.channel_id(),
+            contract,
+            BackendChannelLifecycle::CompleteOnce,
+            coverage.clone(),
+            coverage,
+            BackendMaterializationPolicy::new(8, 3, 5, 1, 4096, 4096, 1)
+                .expect("materialization policy"),
+            max_contribution_bytes,
+            4096,
+            [super::super::domain::BackendProducerInstall::new(
+                producer.clone(),
+                coverage_witness,
+                [fragment_instance],
+                max_contribution_bytes,
+            )
+            .expect("FinalDomain producer install")],
+            [],
+            [],
+        )
+        .expect("FinalDomain channel install");
+        let routing = BackendRoutingShard::new(
+            participant_identity,
+            1,
+            [BackendRoutingChannel::new(
+                producer.channel_id(),
+                [BackendRouteRole::Producer(producer.binding_id())],
+                [],
+                [],
+                [((producer.binding_id(), fragment_instance), 1)],
+            )
+            .expect("FinalDomain routing channel")],
+        )
+        .expect("FinalDomain routing install");
+        let install = BackendParticipantInstall::new(participant_identity, 1, [channel], routing)
+            .expect("FinalDomain participant install");
+        let observation = RuntimeFilterObservationEmitter::from_install(&install, None);
+        let session = Arc::new(
+            BackendRuntimeFilterSession::from_channel_install(
+                participant_identity,
+                install.channels()[&producer.channel_id()].clone(),
+                observation.clone(),
+            )
+            .expect("FinalDomain Backend session"),
+        );
+        let participant = RuntimeFilterParticipant::from_installed(
+            execution_id(),
+            install,
+            observation,
+            Duration::from_secs(1),
+            BTreeMap::from([(producer.binding_id(), session)]),
+            BTreeMap::new(),
+            MemTracker::new_root("runtime_filter_final_domain_completion_test"),
+            Arc::new(DiscardSink),
+        )
+        .expect("FinalDomain participant");
+        (participant, producer, fragment_instance)
+    }
+
+    fn open_final_domain_completion(
+        participant: &Arc<RuntimeFilterParticipant>,
+        producer: RuntimeFilterProducerContract,
+        fragment_instance: UniqueId,
+        local_partition_count: u32,
+    ) -> RuntimeFilterFinalDomainCompletionHandle {
+        let session = participant
+            .session_for_fragment(execution_id(), fragment_instance, true)
+            .expect("participant session")
+            .expect("required participant session");
+        let RuntimeFilterBindOutcome::Bound(completion) = session
+            .open_final_domain_completion(RuntimeFilterFinalDomainOpenRequest::new(
+                producer,
+                local_partition_count,
+            ))
+            .expect("FinalDomain completion binding")
+        else {
+            panic!("installed FinalDomain completion must bind");
+        };
+        completion
+    }
+
+    fn final_domain(
+        values: impl IntoIterator<Item = i64>,
+        digest: [u8; 32],
+        max_canonical_bytes: usize,
+    ) -> RuntimeFilterFinalDomain {
+        RuntimeFilterFinalDomain::from_value_domain(
+            &contribution::ValueDomainDelta::new(
+                contribution::MembershipValues::int64(values),
+                false,
+            ),
+            digest,
+            max_canonical_bytes,
+        )
+        .expect("FinalDomain payload is canonical")
+    }
+
+    #[test]
+    fn final_domain_completion_requires_every_partition_to_seal_and_close() {
+        let (participant, producer, fragment_instance) = final_domain_participant(1024);
+        let completion = open_final_domain_completion(&participant, producer, fragment_instance, 2);
+
+        let mut first = completion
+            .claim_partition(novarocks_execution::runtime_filter::PartitionId::new(0))
+            .expect("first partition claim");
+        let error = first.close().expect_err("close before seal is rejected");
+        assert_eq!(
+            error.kind(),
+            RuntimeFilterContractViolationKind::ContractMismatch
+        );
+        first
+            .seal(final_domain(
+                [3, 9],
+                completion.contract_digest(),
+                completion.max_domain_canonical_bytes(),
+            ))
+            .expect("first partition seal");
+        first.close().expect("first partition close");
+        assert!(
+            participant
+                .capture_runtime_filter_observation()
+                .channels()
+                .iter()
+                .all(|channel| channel.completed() == 0)
+        );
+
+        let mut second = completion
+            .claim_partition(novarocks_execution::runtime_filter::PartitionId::new(1))
+            .expect("second partition claim");
+        second
+            .seal(final_domain(
+                [11],
+                completion.contract_digest(),
+                completion.max_domain_canonical_bytes(),
+            ))
+            .expect("second partition seal");
+        second.close().expect("second partition close");
+
+        let snapshot = participant.capture_runtime_filter_observation();
+        assert!(
+            snapshot
+                .channels()
+                .iter()
+                .any(|channel| channel.completed() == 1)
+        );
+        assert!(snapshot.producer_streams().iter().all(|stream| {
+            stream.latest_accepted_sequence() == Some(0) && stream.accepted() == 1
+        }));
+    }
+
+    #[test]
+    fn final_domain_completion_rejects_duplicate_and_out_of_range_claims() {
+        let (participant, producer, fragment_instance) = final_domain_participant(1024);
+        let completion = open_final_domain_completion(&participant, producer, fragment_instance, 2);
+
+        completion
+            .claim_partition(novarocks_execution::runtime_filter::PartitionId::new(0))
+            .expect("first claim");
+        let Err(duplicate) =
+            completion.claim_partition(novarocks_execution::runtime_filter::PartitionId::new(0))
+        else {
+            panic!("duplicate partition claim must be rejected");
+        };
+        assert_eq!(
+            duplicate.kind(),
+            RuntimeFilterContractViolationKind::ContractMismatch
+        );
+        let Err(out_of_range) =
+            completion.claim_partition(novarocks_execution::runtime_filter::PartitionId::new(2))
+        else {
+            panic!("partition outside the declared count must be rejected");
+        };
+        assert_eq!(
+            out_of_range.kind(),
+            RuntimeFilterContractViolationKind::ContractMismatch
+        );
+        assert!(
+            participant
+                .capture_runtime_filter_observation()
+                .channels()
+                .iter()
+                .all(|channel| channel.completed() == 0)
+        );
+    }
+
+    #[test]
+    fn final_domain_completion_rejects_double_seal_and_schema_or_digest_drift() {
+        let (participant, producer, fragment_instance) = final_domain_participant(1024);
+        let completion = open_final_domain_completion(&participant, producer, fragment_instance, 3);
+
+        let mut schema_drift = completion
+            .claim_partition(novarocks_execution::runtime_filter::PartitionId::new(0))
+            .expect("schema-drift partition claim");
+        let wrong_schema = RuntimeFilterFinalDomain::from_value_domain(
+            &contribution::ValueDomainDelta::new(contribution::MembershipValues::int32([3]), false),
+            completion.contract_digest(),
+            completion.max_domain_canonical_bytes(),
+        )
+        .expect("Int32 FinalDomain payload is canonical");
+        let error = schema_drift
+            .seal(wrong_schema)
+            .expect_err("schema drift is rejected");
+        assert_eq!(
+            error.kind(),
+            RuntimeFilterContractViolationKind::ContractMismatch
+        );
+        schema_drift
+            .seal(final_domain(
+                [3],
+                completion.contract_digest(),
+                completion.max_domain_canonical_bytes(),
+            ))
+            .expect("valid seal after schema rejection");
+        let double_seal = schema_drift
+            .seal(final_domain(
+                [5],
+                completion.contract_digest(),
+                completion.max_domain_canonical_bytes(),
+            ))
+            .expect_err("second seal is rejected");
+        assert_eq!(
+            double_seal.kind(),
+            RuntimeFilterContractViolationKind::ContractMismatch
+        );
+        schema_drift.close().expect("schema-drift partition close");
+
+        let mut digest_drift = completion
+            .claim_partition(novarocks_execution::runtime_filter::PartitionId::new(1))
+            .expect("digest-drift partition claim");
+        let error = digest_drift
+            .seal(final_domain(
+                [7],
+                [99; 32],
+                completion.max_domain_canonical_bytes(),
+            ))
+            .expect_err("digest drift is rejected");
+        assert_eq!(
+            error.kind(),
+            RuntimeFilterContractViolationKind::ContractMismatch
+        );
+        digest_drift
+            .seal(final_domain(
+                [7],
+                completion.contract_digest(),
+                completion.max_domain_canonical_bytes(),
+            ))
+            .expect("valid seal after digest rejection");
+        digest_drift.close().expect("digest-drift partition close");
+
+        assert!(
+            participant
+                .capture_runtime_filter_observation()
+                .channels()
+                .iter()
+                .all(|channel| channel.completed() == 0)
+        );
+    }
+
+    #[test]
+    fn final_domain_completion_rejects_payload_above_installed_canonical_budget() {
+        let (participant, producer, fragment_instance) = final_domain_participant(64);
+        let completion = open_final_domain_completion(&participant, producer, fragment_instance, 1);
+        let mut partition = completion
+            .claim_partition(novarocks_execution::runtime_filter::PartitionId::new(0))
+            .expect("partition claim");
+        let oversized = final_domain(0_i64..128, completion.contract_digest(), 16 * 1024);
+        assert!(oversized.canonical_bytes().len() > completion.max_domain_canonical_bytes());
+        let error = partition
+            .seal(oversized)
+            .expect_err("payload above installed canonical budget is rejected");
+        assert_eq!(
+            error.kind(),
+            RuntimeFilterContractViolationKind::ContractMismatch
+        );
+        assert!(
+            participant
+                .capture_runtime_filter_observation()
+                .channels()
+                .iter()
+                .all(|channel| channel.completed() == 0)
+        );
+    }
+
+    #[test]
+    fn final_domain_completion_fail_opens_after_failure_or_participant_cancellation() {
+        let (participant, producer, fragment_instance) = final_domain_participant(1024);
+        let completion =
+            open_final_domain_completion(&participant, producer.clone(), fragment_instance, 1);
+        assert_eq!(
+            completion
+                .fail(RuntimeFilterProducerFailure::Cancelled)
+                .expect("producer failure is admitted"),
+            novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome::CompletedWithoutArtifact
+        );
+
+        participant
+            .close(QueryTerminationReason::LocalFailure)
+            .expect("participant cancellation");
+        let session = participant
+            .session_for_fragment(execution_id(), fragment_instance, true)
+            .expect("participant session")
+            .expect("required participant session");
+        assert!(matches!(
+            session
+                .open_final_domain_completion(RuntimeFilterFinalDomainOpenRequest::new(producer, 1))
+                .expect("cancelled participant fails open"),
+            RuntimeFilterBindOutcome::Unavailable(UnavailableReason::RouteUnavailable)
+        ));
     }
 
     #[test]
