@@ -192,6 +192,7 @@ mod tests {
                 max_rows: NonZeroUsize::new(8).expect("rows"),
                 max_bytes: NonZeroUsize::new(4096).expect("bytes"),
             },
+            options: Default::default(),
             context: ConnectorRequestContext::try_new(
                 Instant::now() + Duration::from_secs(5),
                 Arc::new(NeverCancelled),

@@ -27,8 +27,8 @@ use arrow::ipc::reader::StreamReader;
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorExecutionBindingKey, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorOpenReaderRequest, ConnectorRequestContext,
-    ConnectorScanHandle, ConnectorSplit,
+    ConnectorInstanceIncarnation, ConnectorOpenReaderRequest, ConnectorReaderOptions,
+    ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
 };
 
 use crate::connector::runtime::{ConnectorBatchTransform, ConnectorReadScanSource};
@@ -246,6 +246,11 @@ pub(super) fn lower_connector_read_scan(
     let request = ConnectorOpenReaderRequest {
         expected_schema: reader_schema,
         batch,
+        options: ConnectorReaderOptions {
+            enable_parquet_reader_page_index: ctx
+                .query_options()
+                .is_some_and(|options| options.enable_parquet_reader_page_index()),
+        },
         context: request_context,
     };
     let predicate = lower_scan_predicate(scan, arena, &layout, ctx)?;

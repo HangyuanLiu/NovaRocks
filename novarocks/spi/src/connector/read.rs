@@ -837,7 +837,14 @@ impl ConnectorSplitPlanningResult {
 pub struct ConnectorOpenReaderRequest {
     pub expected_schema: SchemaRef,
     pub batch: ConnectorBatchBudget,
+    pub options: ConnectorReaderOptions,
     pub context: ConnectorRequestContext,
+}
+
+/// Reader-open policy carried through the provider-neutral read contract.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectorReaderOptions {
+    pub enable_parquet_reader_page_index: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -853,6 +860,10 @@ pub struct ConnectorReaderMetricsSnapshot {
     pub row_groups_read: u64,
     pub row_groups_pruned: u64,
     pub delayed_materialization_ranges: u64,
+    pub page_index_attempts: u64,
+    pub page_index_fallbacks: u64,
+    pub page_index_rows_considered: u64,
+    pub page_index_rows_pruned: u64,
 }
 
 impl ConnectorReaderMetricsSnapshot {
@@ -875,6 +886,18 @@ impl ConnectorReaderMetricsSnapshot {
             delayed_materialization_ranges: self
                 .delayed_materialization_ranges
                 .saturating_add(other.delayed_materialization_ranges),
+            page_index_attempts: self
+                .page_index_attempts
+                .saturating_add(other.page_index_attempts),
+            page_index_fallbacks: self
+                .page_index_fallbacks
+                .saturating_add(other.page_index_fallbacks),
+            page_index_rows_considered: self
+                .page_index_rows_considered
+                .saturating_add(other.page_index_rows_considered),
+            page_index_rows_pruned: self
+                .page_index_rows_pruned
+                .saturating_add(other.page_index_rows_pruned),
         }
     }
 
@@ -899,6 +922,18 @@ impl ConnectorReaderMetricsSnapshot {
             delayed_materialization_ranges: self
                 .delayed_materialization_ranges
                 .saturating_sub(previous.delayed_materialization_ranges),
+            page_index_attempts: self
+                .page_index_attempts
+                .saturating_sub(previous.page_index_attempts),
+            page_index_fallbacks: self
+                .page_index_fallbacks
+                .saturating_sub(previous.page_index_fallbacks),
+            page_index_rows_considered: self
+                .page_index_rows_considered
+                .saturating_sub(previous.page_index_rows_considered),
+            page_index_rows_pruned: self
+                .page_index_rows_pruned
+                .saturating_sub(previous.page_index_rows_pruned),
         }
     }
 }

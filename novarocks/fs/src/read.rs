@@ -109,8 +109,15 @@ pub struct FileReadRequest {
     pub budget: FileReadBudget,
     pub predicates: Vec<ScanPredicate>,
     pub pruning: PhysicalPruning,
+    pub options: FileReaderOptions,
     pub cache: Option<DataCacheContext>,
     pub context: FileReadContext,
+}
+
+/// Reader-open policy that remains local to the neutral filesystem boundary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FileReaderOptions {
+    pub enable_parquet_reader_page_index: bool,
 }
 
 #[derive(Debug)]
@@ -132,6 +139,10 @@ pub struct FileMetricsSnapshot {
     pub row_groups_read: u64,
     pub row_groups_pruned: u64,
     pub delayed_materialization_ranges: u64,
+    pub page_index_attempts: u64,
+    pub page_index_fallbacks: u64,
+    pub page_index_rows_considered: u64,
+    pub page_index_rows_pruned: u64,
 }
 
 pub trait FileBatchReader: Send {

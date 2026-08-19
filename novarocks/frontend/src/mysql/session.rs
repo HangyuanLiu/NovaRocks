@@ -46,6 +46,7 @@ pub struct SessionExecutionSettings {
     query_timeout_secs: Option<u64>,
     group_concat_max_len: i64,
     pipeline_dop: Option<i32>,
+    enable_parquet_reader_page_index: bool,
     runtime_filter_scan_wait_time_ms: Option<i64>,
     runtime_filter_wait_timeout_ms: Option<i32>,
 }
@@ -56,6 +57,7 @@ impl Default for SessionExecutionSettings {
             query_timeout_secs: None,
             group_concat_max_len: 1024,
             pipeline_dop: None,
+            enable_parquet_reader_page_index: false,
             runtime_filter_scan_wait_time_ms: None,
             runtime_filter_wait_timeout_ms: None,
         }
@@ -79,6 +81,10 @@ impl SessionExecutionSettings {
 
     pub fn set_pipeline_dop(&mut self, value: i32) {
         self.pipeline_dop = (value > 0).then_some(value);
+    }
+
+    pub fn set_enable_parquet_reader_page_index(&mut self, enabled: bool) {
+        self.enable_parquet_reader_page_index = enabled;
     }
 
     pub fn set_runtime_filter_scan_wait_time_ms(
@@ -119,6 +125,7 @@ impl SessionExecutionSettings {
             pipeline_dop: self.pipeline_dop.unwrap_or_default(),
             runtime_filter_scan_wait_time_ms: self.runtime_filter_scan_wait_time_ms,
             runtime_filter_wait_timeout_ms: self.runtime_filter_wait_timeout_ms,
+            enable_parquet_reader_page_index: self.enable_parquet_reader_page_index,
             ..Default::default()
         })
         // Session settings never enable spilling, so the Protocol validation
@@ -242,5 +249,32 @@ mod tests {
             Some(-1)
         );
         let _validated_protocol_options = settings.query_options();
+    }
+
+    #[test]
+    fn execution_settings_projects_the_page_index_switch() {
+        let mut settings = SessionExecutionSettings::default();
+        assert!(
+            !settings
+                .query_options()
+                .as_proto()
+                .enable_parquet_reader_page_index
+        );
+
+        settings.set_enable_parquet_reader_page_index(true);
+        assert!(
+            settings
+                .query_options()
+                .as_proto()
+                .enable_parquet_reader_page_index
+        );
+
+        settings.set_enable_parquet_reader_page_index(false);
+        assert!(
+            !settings
+                .query_options()
+                .as_proto()
+                .enable_parquet_reader_page_index
+        );
     }
 }

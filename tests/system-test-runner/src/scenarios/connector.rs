@@ -17,6 +17,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(DistributedReaderCancel),
         Box::new(GenerationReplacement),
+        Box::new(PredicatePageIndexPruning),
     ]
 }
 
@@ -114,6 +115,74 @@ impl Scenario for DistributedReaderCancel {
 }
 
 struct GenerationReplacement;
+
+struct PredicatePageIndexPruning;
+
+impl Scenario for PredicatePageIndexPruning {
+    fn name(&self) -> &'static str {
+        "connector/predicate-page-index-pruning"
+    }
+
+    fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        Ok(connector_launch_config())
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect page-index control session")?,
+        )?;
+        let warehouse = create_warehouse(context, "predicate-page-index-pruning")?;
+        const CATALOG: &str = "page_index_catalog";
+        const DATABASE: &str = "page_index_db";
+        const TABLE: &str = "page_index_data";
+        const PREDICATE: &str = "v >= 199000";
+
+        context.action("create three dense Iceberg files that each require page-level pruning");
+        create_catalog_table_and_dense_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
+
+        let select = format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE} WHERE {PREDICATE}");
+        context.action("run the static predicate with page-index reader disabled");
+        control
+            .query_drop("SET enable_parquet_reader_page_index = false")
+            .context("disable predicate-driven page-index pruning")?;
+        let disabled: Vec<i64> = control
+            .query(&select)
+            .context("query dense Iceberg files with page-index disabled")?;
+
+        context.action("run the same static predicate with page-index reader enabled");
+        control
+            .query_drop("SET enable_parquet_reader_page_index = true")
+            .context("enable predicate-driven page-index pruning")?;
+        let enabled: Vec<i64> = control
+            .query(&select)
+            .context("query dense Iceberg files with page-index enabled")?;
+        if enabled != disabled || enabled != [3_003] {
+            bail!(
+                "page-index toggle changed query correctness: disabled={disabled:?}, enabled={enabled:?}, expected=[3003]"
+            );
+        }
+
+        context.action("assert EXPLAIN ANALYZE surfaces native page-index reader activity");
+        let explain: Vec<String> = control
+            .query(format!("EXPLAIN ANALYZE {select}"))
+            .context("collect native page-index EXPLAIN ANALYZE profile")?;
+        let explain = explain.join("\n");
+        if !explain.contains("ConnectorFileMetrics:") {
+            bail!("page-index EXPLAIN ANALYZE has no connector metrics; profile={explain}");
+        }
+        for counter in [
+            "ConnectorFilePageIndexAttempts",
+            "ConnectorFilePageIndexRowsConsidered",
+        ] {
+            assert_positive_profile_counter(&explain, counter)?;
+        }
+        Ok(())
+    }
+}
 
 impl Scenario for GenerationReplacement {
     fn name(&self) -> &'static str {
@@ -338,6 +407,36 @@ fn create_catalog_table_and_data(
     Ok(())
 }
 
+fn create_catalog_table_and_dense_data(
+    control: &mut mysql::Conn,
+    catalog: &str,
+    database: &str,
+    table: &str,
+    warehouse: &std::path::Path,
+) -> Result<()> {
+    create_catalog(control, catalog, warehouse)?;
+    control
+        .query_drop(format!("CREATE DATABASE {catalog}.{database}"))
+        .with_context(|| format!("create {catalog}.{database}"))?;
+    control
+        .query_drop(format!(
+            "CREATE TABLE {catalog}.{database}.{table} (v BIGINT)"
+        ))
+        .with_context(|| format!("create {catalog}.{database}.{table}"))?;
+    // Each transaction writes one file. The duplicated ordered range prevents
+    // Iceberg file-metric pruning from eliminating an entire file, while its
+    // size forces multiple Parquet data pages per file for the FS page-index
+    // path under test.
+    for _ in 0..3 {
+        control
+            .query_drop(format!(
+                "INSERT INTO {catalog}.{database}.{table} SELECT generate_series FROM TABLE(generate_series(1, 200000))"
+            ))
+            .with_context(|| format!("write dense page-index data to {catalog}.{database}.{table}"))?;
+    }
+    Ok(())
+}
+
 fn create_catalog(
     control: &mut mysql::Conn,
     catalog: &str,
@@ -349,6 +448,27 @@ fn create_catalog(
             "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{warehouse}\")"
         ))
         .with_context(|| format!("create Hadoop Iceberg catalog {catalog}"))
+}
+
+fn assert_positive_profile_counter(profile: &str, name: &str) -> Result<()> {
+    let marker = format!("{name}=");
+    let value = profile
+        .split(&marker)
+        .nth(1)
+        .and_then(|tail| {
+            tail.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u64>()
+                .ok()
+        })
+        .context(format!(
+            "page-index EXPLAIN ANALYZE profile is missing {marker}; profile={profile}"
+        ))?;
+    if value == 0 {
+        bail!("page-index EXPLAIN ANALYZE counter {name} must be positive; profile={profile}");
+    }
+    Ok(())
 }
 
 fn start_connector_read(

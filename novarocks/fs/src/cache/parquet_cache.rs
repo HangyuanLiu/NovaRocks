@@ -56,6 +56,7 @@ pub fn init_parquet_cache(options: ParquetCacheOptions) -> bool {
 pub(crate) fn metadata_get(
     request_cache_enabled: bool,
     identity: &FileIdentity,
+    require_page_index: bool,
 ) -> Option<ArrowReaderMetadata> {
     if !request_cache_enabled || !options().enable_metadata {
         return None;
@@ -65,7 +66,19 @@ pub(crate) fn metadata_get(
     if cached.expire_at <= Instant::now() {
         return None;
     }
-    Some(cached.metadata.clone())
+    let metadata = cached.metadata.clone();
+    // A footer-only metadata entry was decoded with `PageIndexPolicy::Skip`.
+    // It is a valid cache hit for footer consumers, but cannot satisfy a
+    // reader that needs both index structures to make a pruning decision.
+    // Returning it here would silently turn an enabled page-index read into a
+    // fallback, so require a complete capability match instead.
+    if require_page_index
+        && (metadata.metadata().column_index().is_none()
+            || metadata.metadata().offset_index().is_none())
+    {
+        return None;
+    }
+    Some(metadata)
 }
 
 pub(crate) fn metadata_put(

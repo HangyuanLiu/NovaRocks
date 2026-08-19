@@ -718,6 +718,7 @@ mod tests {
                         max_rows: NonZeroUsize::new(32).unwrap(),
                         max_bytes: NonZeroUsize::new(4096).unwrap(),
                     },
+                    options: Default::default(),
                     context: context(),
                 },
             )
@@ -754,6 +755,7 @@ mod tests {
                     max_rows: NonZeroUsize::new(32).unwrap(),
                     max_bytes: NonZeroUsize::new(4096).unwrap(),
                 },
+                options: Default::default(),
                 context: context(),
             },
         ) {
@@ -797,6 +799,7 @@ mod tests {
                         max_rows: NonZeroUsize::new(32).unwrap(),
                         max_bytes: NonZeroUsize::new(4096).unwrap(),
                     },
+                    options: Default::default(),
                     context: context(),
                 },
             )
@@ -834,6 +837,7 @@ mod tests {
                         max_rows: NonZeroUsize::new(32).unwrap(),
                         max_bytes: NonZeroUsize::new(4096).unwrap(),
                     },
+                    options: Default::default(),
                     context: context(),
                 },
             )

@@ -1849,6 +1849,55 @@ mod tests {
     }
 
     #[test]
+    fn sums_connector_page_index_counters_across_native_trees_saturating() {
+        let make_tree = |attempts: i64, fallbacks: i64, considered: i64, pruned: i64| {
+            let profiler = Profiler::new("fragment");
+            let common = profiler
+                .child("Pipeline (id=0)")
+                .child("PipelineDriver (id=0)")
+                .child("SCAN (plan_node_id=1)")
+                .child("CommonMetrics");
+            common.counter_set(
+                "ConnectorFilePageIndexAttempts",
+                ProfileUnit::Unit,
+                attempts,
+            );
+            common.counter_set(
+                "ConnectorFilePageIndexFallbacks",
+                ProfileUnit::Unit,
+                fallbacks,
+            );
+            common.counter_set(
+                "ConnectorFilePageIndexRowsConsidered",
+                ProfileUnit::Unit,
+                considered,
+            );
+            common.counter_set(
+                "ConnectorFilePageIndexRowsPruned",
+                ProfileUnit::Unit,
+                pruned,
+            );
+            profiler.to_native_tree()
+        };
+        let names = [
+            "ConnectorFilePageIndexAttempts",
+            "ConnectorFilePageIndexFallbacks",
+            "ConnectorFilePageIndexRowsConsidered",
+            "ConnectorFilePageIndexRowsPruned",
+        ];
+
+        let sums = super::sum_profile_counters_by_name_from_profile_trees(
+            &[make_tree(i64::MAX, 1, 40, 25), make_tree(1, 2, 60, 35)],
+            &names,
+        );
+
+        assert_eq!(sums["ConnectorFilePageIndexAttempts"], i64::MAX);
+        assert_eq!(sums["ConnectorFilePageIndexFallbacks"], 3);
+        assert_eq!(sums["ConnectorFilePageIndexRowsConsidered"], 100);
+        assert_eq!(sums["ConnectorFilePageIndexRowsPruned"], 60);
+    }
+
+    #[test]
     fn collects_phase_timers_and_minmax_from_native_tree() {
         let profiler = Profiler::new("Fragment");
         let op = profiler.child("HASH JOIN (plan_node_id=9)");

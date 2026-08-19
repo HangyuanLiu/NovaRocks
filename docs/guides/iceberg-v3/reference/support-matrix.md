@@ -145,7 +145,7 @@ under the License.
 | Parquet 写 | ✅ | |
 | ORC 写 | ❌ | |
 | Parquet bloom filter index | ❌ | |
-| Parquet page index | ❌ | |
+| Parquet page index | ✅ | 默认关闭；仅对已下推的 BOOLEAN/INT32/INT64 static predicate 做保守 pruning，缺失或不可比索引保持整页 |
 | Parquet column index 跳过空 page | ❌ | |
 
 ### 7.2 Iceberg 扫描

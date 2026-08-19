@@ -45,6 +45,10 @@ pub(crate) struct ReaderMetrics {
     row_groups_read: AtomicU64,
     row_groups_pruned: AtomicU64,
     delayed_materialization_ranges: AtomicU64,
+    page_index_attempts: AtomicU64,
+    page_index_fallbacks: AtomicU64,
+    page_index_rows_considered: AtomicU64,
+    page_index_rows_pruned: AtomicU64,
 }
 
 impl ReaderMetrics {
@@ -63,6 +67,10 @@ impl ReaderMetrics {
             delayed_materialization_ranges: self
                 .delayed_materialization_ranges
                 .load(Ordering::Relaxed),
+            page_index_attempts: self.page_index_attempts.load(Ordering::Relaxed),
+            page_index_fallbacks: self.page_index_fallbacks.load(Ordering::Relaxed),
+            page_index_rows_considered: self.page_index_rows_considered.load(Ordering::Relaxed),
+            page_index_rows_pruned: self.page_index_rows_pruned.load(Ordering::Relaxed),
         }
     }
 
@@ -87,6 +95,21 @@ impl ReaderMetrics {
         self.delayed_materialization_ranges
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    pub(crate) fn record_page_index(&self, fallback: bool, rows_considered: u64, rows_pruned: u64) {
+        saturating_add(&self.page_index_attempts, 1);
+        if fallback {
+            saturating_add(&self.page_index_fallbacks, 1);
+        }
+        saturating_add(&self.page_index_rows_considered, rows_considered);
+        saturating_add(&self.page_index_rows_pruned, rows_pruned);
+    }
+}
+
+fn saturating_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
 }
 
 #[derive(Clone)]

@@ -254,6 +254,7 @@ mod tests {
                 max_rows: NonZeroUsize::new(1).unwrap(),
                 max_bytes: NonZeroUsize::new(1024).unwrap(),
             },
+            options: Default::default(),
             context: ConnectorRequestContext::try_new(
                 Instant::now() + Duration::from_secs(1),
                 Arc::new(NeverCancelled),

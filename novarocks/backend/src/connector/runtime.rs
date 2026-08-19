@@ -641,6 +641,26 @@ impl ConnectorBatchReaderIter {
                 ProfileUnit::Unit,
                 delta.delayed_materialization_ranges,
             ),
+            (
+                "ConnectorFilePageIndexAttempts",
+                ProfileUnit::Unit,
+                delta.page_index_attempts,
+            ),
+            (
+                "ConnectorFilePageIndexFallbacks",
+                ProfileUnit::Unit,
+                delta.page_index_fallbacks,
+            ),
+            (
+                "ConnectorFilePageIndexRowsConsidered",
+                ProfileUnit::Unit,
+                delta.page_index_rows_considered,
+            ),
+            (
+                "ConnectorFilePageIndexRowsPruned",
+                ProfileUnit::Unit,
+                delta.page_index_rows_pruned,
+            ),
         ] {
             if value > 0 {
                 profile.counter_add(name, unit, value.min(i64::MAX as u64) as i64);
