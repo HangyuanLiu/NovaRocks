@@ -171,5 +171,7 @@ mod tests {
             Expr::InSubquery(_)
         ));
         assert!(matches!(parse("(SELECT 1) + 2"), Expr::Binary(_)));
+        assert!(matches!(parse("[1, 2, 3]"), Expr::Array(_)));
+        assert!(matches!(parse("(a, b)"), Expr::Tuple(_)));
     }
 }

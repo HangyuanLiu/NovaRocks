@@ -20,11 +20,11 @@
 use crate::{
     Span, Symbol, Token, TokenKind,
     ast::{
-        BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr, CastKind, ExistsExpr, Expr,
-        FunctionCall, FunctionQuantifier, Ident, InListExpr, InSubqueryExpr, IsPredicate,
-        IsPredicateExpr, LikeExpr, LikeOperator, Literal, LiteralKind, NestedExpr, ObjectName,
-        SubqueryExpr, TypeName, TypeNameArgument, UnaryExpr, UnaryOperator, WindowFrame,
-        WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
+        ArrayExpr, BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr, CastKind,
+        ExistsExpr, Expr, FunctionCall, FunctionQuantifier, Ident, InListExpr, InSubqueryExpr,
+        IsPredicate, IsPredicateExpr, LikeExpr, LikeOperator, Literal, LiteralKind, NestedExpr,
+        ObjectName, SubqueryExpr, TupleExpr, TypeName, TypeNameArgument, UnaryExpr, UnaryOperator,
+        WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
     },
     error::ParseError,
     keyword_class,
@@ -593,6 +593,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 kind: TokenKind::Symbol(Symbol::LParen),
                 span,
             }) => self.parse_nested_expression(span),
+            Some(Token {
+                kind: TokenKind::Symbol(Symbol::LBracket),
+                span,
+            }) => self.parse_array_expression(span),
             _ => Err(self.unexpected("expression")),
         }
     }
@@ -1116,18 +1120,63 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         Err(self.unexpected("PRECEDING or FOLLOWING in window frame"))
     }
 
-    /// `nested-expression ::= "(" expression ")"`
+    /// `nested-expression ::= "(" expression ")" | "(" expression { "," expression } ")"`
     fn parse_nested_expression(&mut self, opening_span: Span) -> Result<Expr, ParseError> {
         self.advance();
-        let expression = self.parse_binding_power(0)?;
         self.skip_trivia();
+        let first = self.parse_binding_power(0)?;
+        self.skip_trivia();
+        if self.current_is_symbol(Symbol::Comma) {
+            let mut expressions = vec![first];
+            while self.current_is_symbol(Symbol::Comma) {
+                self.advance();
+                self.skip_trivia();
+                expressions.push(self.parse_binding_power(0)?);
+                self.skip_trivia();
+            }
+            if !self.current_is_symbol(Symbol::RParen) {
+                return Err(self.unexpected("')' after tuple expression"));
+            }
+            let end = self.current_span().end();
+            self.advance();
+            return Ok(Expr::Tuple(TupleExpr {
+                expressions,
+                span: Span::new(opening_span.start(), end),
+            }));
+        }
         if !self.current_is_symbol(Symbol::RParen) {
             return Err(self.unexpected("')'"));
         }
         let end = self.current_span().end();
         self.advance();
         Ok(Expr::Nested(NestedExpr {
-            expression: Box::new(expression),
+            expression: Box::new(first),
+            span: Span::new(opening_span.start(), end),
+        }))
+    }
+
+    fn parse_array_expression(&mut self, opening_span: Span) -> Result<Expr, ParseError> {
+        self.advance();
+        self.skip_trivia();
+        let mut elements = Vec::new();
+        if !self.current_is_symbol(Symbol::RBracket) {
+            loop {
+                elements.push(self.parse_binding_power(0)?);
+                self.skip_trivia();
+                if !self.current_is_symbol(Symbol::Comma) {
+                    break;
+                }
+                self.advance();
+                self.skip_trivia();
+            }
+        }
+        if !self.current_is_symbol(Symbol::RBracket) {
+            return Err(self.unexpected("']' after array expression"));
+        }
+        let end = self.current_span().end();
+        self.advance();
+        Ok(Expr::Array(ArrayExpr {
+            elements,
             span: Span::new(opening_span.start(), end),
         }))
     }
