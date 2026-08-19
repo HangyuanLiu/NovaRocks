@@ -174,7 +174,11 @@ impl Printer {
                 self.output.push(')');
             }
             SetExpr::SetOperation(operation) => {
-                self.write_set_operand(&operation.left);
+                // The parser folds unparenthesized set operations from the
+                // left, so retaining a left wrapper here would manufacture a
+                // `SetExpr::Query` node on reparse. Only the right side needs
+                // parentheses to preserve a non-default nesting shape.
+                self.write_set_expr(&operation.left);
                 self.output.push(' ');
                 self.output.push_str(match operation.operator {
                     SetOperator::Union => "UNION",
@@ -187,12 +191,12 @@ impl Printer {
                     SetQuantifier::None => {}
                 }
                 self.output.push(' ');
-                self.write_set_operand(&operation.right);
+                self.write_set_right_operand(&operation.right);
             }
         }
     }
 
-    fn write_set_operand(&mut self, expression: &SetExpr) {
+    fn write_set_right_operand(&mut self, expression: &SetExpr) {
         if matches!(expression, SetExpr::SetOperation(_)) {
             self.output.push('(');
             self.write_set_expr(expression);
@@ -769,6 +773,23 @@ impl Printer {
     }
 
     fn write_function_call(&mut self, call: &FunctionCall) {
+        if call.name.parts.len() == 1
+            && call.name.parts[0].value.eq_ignore_ascii_case("EXTRACT")
+            && call.arguments.len() == 2
+            && matches!(call.quantifier, FunctionQuantifier::None)
+            && call.order_by.is_empty()
+            && call.separator.is_none()
+            && call.filter.is_none()
+            && call.null_treatment.is_none()
+            && call.over.is_none()
+        {
+            self.output.push_str("EXTRACT(");
+            self.write_expr(&call.arguments[0]);
+            self.output.push_str(" FROM ");
+            self.write_expr(&call.arguments[1]);
+            self.output.push(')');
+            return;
+        }
         self.write_object_name(&call.name);
         self.output.push('(');
         match call.quantifier {

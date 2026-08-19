@@ -383,6 +383,15 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             .is_some_and(|token| matches!(token.kind, TokenKind::String))
     }
 
+    fn peek_nontrivia_is_symbol(&self, offset: usize, symbol: Symbol) -> bool {
+        self.tokens
+            .iter()
+            .skip(self.position)
+            .filter(|token| !matches!(token.kind, TokenKind::Trivia(_)))
+            .nth(offset)
+            .is_some_and(|token| matches!(token.kind, TokenKind::Symbol(found) if found == symbol))
+    }
+
     fn starts_comparison_special(&self) -> bool {
         self.current_is_keyword(Keyword::Between)
             || self.current_is_keyword(Keyword::In)
@@ -608,6 +617,9 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
     /// `primary-expression ::= literal | identifier [ function-call ] | "(" expression ")"`
     fn parse_primary_expression(&mut self) -> Result<Expr, ParseError> {
         self.skip_trivia();
+        if self.current_is_word("EXTRACT") && self.peek_nontrivia_is_symbol(1, Symbol::LParen) {
+            return self.parse_extract_expression();
+        }
         let token = self.current().cloned();
         match token {
             Some(Token {
@@ -878,6 +890,59 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 span: token.span,
             },
             span: Span::new(start, token.span.end()),
+        }))
+    }
+
+    fn parse_extract_expression(&mut self) -> Result<Expr, ParseError> {
+        let start = self.current_span().start();
+        self.advance();
+        self.skip_trivia();
+        if !self.current_is_symbol(Symbol::LParen) {
+            return Err(self.unexpected("'(' after EXTRACT"));
+        }
+        self.advance();
+        self.skip_trivia();
+        let field_span = self.current_span();
+        let Some(field_token) = self.current().cloned() else {
+            return Err(self.unexpected("EXTRACT field"));
+        };
+        if !matches!(
+            field_token.kind,
+            TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::Keyword(_)
+        ) {
+            return Err(self.unexpected("EXTRACT field"));
+        }
+        let field = Expr::Identifier(self.parse_identifier(field_span));
+        self.skip_trivia();
+        if !self.current_is_keyword(Keyword::From) {
+            return Err(self.unexpected("FROM in EXTRACT"));
+        }
+        self.advance();
+        self.skip_trivia();
+        let expression = self.parse_binding_power(0)?;
+        self.skip_trivia();
+        if !self.current_is_symbol(Symbol::RParen) {
+            return Err(self.unexpected("')' after EXTRACT"));
+        }
+        let end = self.current_span().end();
+        self.advance();
+        Ok(Expr::FunctionCall(FunctionCall {
+            name: ObjectName {
+                parts: vec![Ident {
+                    value: "EXTRACT".to_owned(),
+                    quoted: false,
+                    span: Span::new(start, start + "EXTRACT".len()),
+                }],
+                span: Span::new(start, start + "EXTRACT".len()),
+            },
+            arguments: vec![field, expression],
+            quantifier: FunctionQuantifier::None,
+            order_by: Vec::new(),
+            separator: None,
+            filter: None,
+            null_treatment: None,
+            over: None,
+            span: Span::new(start, end),
         }))
     }
 
