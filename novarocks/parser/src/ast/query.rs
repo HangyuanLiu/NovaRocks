@@ -108,6 +108,11 @@ pub struct Values {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Select {
+    /// Optimizer directives attached to this `SELECT` by `/*+ ... */` syntax.
+    ///
+    /// These remain syntax facts only: they do not grant the parser, planner,
+    /// or execution owner any capability.
+    pub hints: Vec<SelectHint>,
     pub quantifier: SelectQuantifier,
     pub projection: Vec<SelectItem>,
     pub from: Vec<TableWithJoins>,
@@ -116,6 +121,14 @@ pub struct Select {
     pub having: Option<Expr>,
     pub qualify: Option<Expr>,
     pub windows: Vec<NamedWindow>,
+    pub span: Span,
+}
+
+/// One structured optimizer directive in a `SELECT /*+ ... */` comment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectHint {
+    pub name: Ident,
+    pub arguments: Vec<Expr>,
     pub span: Span,
 }
 

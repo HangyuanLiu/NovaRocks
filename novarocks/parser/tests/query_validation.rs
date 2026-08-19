@@ -166,6 +166,7 @@ fn select_statement(windows: Vec<NamedWindow>) -> Statement {
     Statement::Query(Query {
         with: None,
         body: Box::new(SetExpr::Select(Box::new(Select {
+            hints: Vec::new(),
             quantifier: SelectQuantifier::None,
             projection: vec![SelectItem::UnnamedExpr(number("1"))],
             from: Vec::new(),

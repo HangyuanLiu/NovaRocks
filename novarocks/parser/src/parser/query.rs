@@ -21,10 +21,12 @@ use crate::{
     Span, Token, TokenKind,
     ast::{
         Cte, ExplainFormat, ExplainQuery, Expr, Fetch, GroupBy, Join, JoinConstraint, JoinOperator,
-        NamedWindow, Offset, OffsetRows, OrderByExpr, Query, Select, SelectItem, SelectQuantifier,
-        SetExpr, SetOperation, SetOperator, SetQuantifier, Statement, TableFactor, TableHint,
-        TableVersion, TableVersionKind, TableWithJoins, Values, WildcardOptions, With,
+        NamedWindow, Offset, OffsetRows, OrderByExpr, Query, Select, SelectHint, SelectItem,
+        SelectQuantifier, SetExpr, SetOperation, SetOperator, SetQuantifier, Statement,
+        TableFactor, TableHint, TableVersion, TableVersionKind, TableWithJoins, Values,
+        WildcardOptions, With,
     },
+    lex,
     token::{Keyword, Symbol},
 };
 
@@ -261,7 +263,9 @@ fn parse_set_operator(parser: &mut StatementParser<'_, '_>) -> Option<SetOperato
 }
 
 fn parse_select(parser: &mut StatementParser<'_, '_>) -> Result<Select, crate::ParseError> {
-    let start = parser.consume_word("SELECT")?.start();
+    let select = parser.consume_word("SELECT")?;
+    let start = select.start();
+    let hints = parse_select_hints(parser, select)?;
     let quantifier = if parser.consume_if_word("ALL") {
         SelectQuantifier::All(Span::new(start, parser.current_offset()))
     } else if parser.consume_if_word("DISTINCT") {
@@ -335,6 +339,7 @@ fn parse_select(parser: &mut StatementParser<'_, '_>) -> Result<Select, crate::P
             |expr| expr.span().end(),
         );
     Ok(Select {
+        hints,
         quantifier,
         projection,
         from,
@@ -345,6 +350,94 @@ fn parse_select(parser: &mut StatementParser<'_, '_>) -> Result<Select, crate::P
         windows,
         span: Span::new(start, end),
     })
+}
+
+/// Parses typed optimizer directives embedded in trivia immediately following
+/// `SELECT`. The lexer deliberately keeps a hint comment as one trivia token,
+/// so this bounded grammar reparses only the comment payload rather than
+/// retaining comment text or tokens in the AST.
+fn parse_select_hints(
+    parser: &StatementParser<'_, '_>,
+    select: Span,
+) -> Result<Vec<SelectHint>, crate::ParseError> {
+    let trivia = parser.source_slice(Span::new(select.end(), parser.current_offset()));
+    let mut hints = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative_start) = trivia[cursor..].find("/*+") {
+        let comment_start = cursor + relative_start;
+        let payload_start = comment_start + 3;
+        let Some(relative_end) = trivia[payload_start..].find("*/") else {
+            return Err(crate::ParseError::UnexpectedToken {
+                expected: "closed SELECT optimizer hint",
+                found: "EOF".to_owned(),
+                span: Span::new(select.end() + comment_start, parser.current_offset()),
+            });
+        };
+        let payload_end = payload_start + relative_end;
+        let comment_span = Span::new(select.end() + comment_start, select.end() + payload_end + 2);
+        hints.extend(parse_select_hint_payload(
+            parser.source,
+            &trivia[payload_start..payload_end],
+            select.end() + payload_start,
+            comment_span,
+        )?);
+        cursor = payload_end + 2;
+    }
+    Ok(hints)
+}
+
+fn parse_select_hint_payload(
+    source: &str,
+    payload: &str,
+    payload_start: usize,
+    comment_span: Span,
+) -> Result<Vec<SelectHint>, crate::ParseError> {
+    let tokens = lex(payload)
+        .map_err(|error| crate::ParseError::UnexpectedToken {
+            expected: "valid SELECT optimizer hint",
+            found: format!("{error:?}"),
+            span: comment_span,
+        })?
+        .into_iter()
+        .map(|mut token| {
+            token.span = Span::new(
+                payload_start + token.span.start(),
+                payload_start + token.span.end(),
+            );
+            token
+        })
+        .collect::<Vec<_>>();
+    let mut parser = StatementParser::new(source, &tokens);
+    parser.skip_trivia();
+    let mut hints = Vec::new();
+    while !parser.is_end() {
+        let name = parser.parse_ident()?;
+        let start = name.span.start();
+        let mut arguments = Vec::new();
+        let end = if parser.consume_if_symbol(Symbol::LParen) {
+            if !parser.current_is_symbol(Symbol::RParen) {
+                loop {
+                    arguments.push(parse_expression_until(
+                        &mut parser,
+                        &[],
+                        &[Symbol::Comma, Symbol::RParen],
+                    )?);
+                    if !parser.consume_if_symbol(Symbol::Comma) {
+                        break;
+                    }
+                }
+            }
+            parser.consume_symbol(Symbol::RParen)?.end()
+        } else {
+            name.span.end()
+        };
+        hints.push(SelectHint {
+            name,
+            arguments,
+            span: Span::new(start, end),
+        });
+    }
+    Ok(hints)
 }
 
 fn parse_named_windows(

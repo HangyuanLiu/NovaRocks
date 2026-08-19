@@ -46,7 +46,7 @@ pub use expr::{
     FunctionQuantifier, InListExpr, InSubqueryExpr, IntervalExpr, IntervalField, IsPredicate,
     IsPredicateExpr, JsonOperator, LambdaExpr, LikeExpr, LikeOperator, MapEntry, MapExpr,
     NestedExpr, NullTreatment, StructExpr, StructExprField, SubqueryExpr, TupleExpr,
-    TypedStringExpr, UnaryExpr, UnaryOperator,
+    TypedStringExpr, UnaryExpr, UnaryOperator, UserVariable,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
@@ -70,8 +70,8 @@ pub use materialized_view::{
 };
 pub use query::{
     Cte, ExplainFormat, ExplainQuery, Fetch, GroupBy, Offset, OffsetRows, OrderByExpr, Query,
-    ReplaceSelectItem, Select, SelectItem, SelectQuantifier, SetExpr, SetOperation, SetOperator,
-    SetQuantifier, Values, WildcardOptions, With,
+    ReplaceSelectItem, Select, SelectHint, SelectItem, SelectQuantifier, SetExpr, SetOperation,
+    SetOperator, SetQuantifier, Values, WildcardOptions, With,
 };
 pub use relation::{
     Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableFunctionSyntax, TableHint,

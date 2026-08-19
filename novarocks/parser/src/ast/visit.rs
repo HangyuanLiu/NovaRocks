@@ -85,6 +85,10 @@ pub trait Visit {
         walk_literal(self, literal);
     }
 
+    fn visit_user_variable(&mut self, variable: &UserVariable) {
+        walk_user_variable(self, variable);
+    }
+
     fn visit_expr(&mut self, expression: &Expr) {
         walk_expr(self, expression);
     }
@@ -186,6 +190,8 @@ pub fn walk_type_name<V: Visit + ?Sized>(visitor: &mut V, type_name: &TypeName) 
 
 pub fn walk_literal<V: Visit + ?Sized>(_: &mut V, _: &Literal) {}
 
+pub fn walk_user_variable<V: Visit + ?Sized>(_: &mut V, _: &UserVariable) {}
+
 pub fn walk_explain_query<V: Visit + ?Sized>(visitor: &mut V, query: &ExplainQuery) {
     visitor.visit_query(&query.query);
 }
@@ -236,6 +242,12 @@ pub fn walk_set_expr<V: Visit + ?Sized>(visitor: &mut V, set_expr: &SetExpr) {
 }
 
 pub fn walk_select<V: Visit + ?Sized>(visitor: &mut V, select: &Select) {
+    for hint in &select.hints {
+        visitor.visit_ident(&hint.name);
+        for argument in &hint.arguments {
+            visitor.visit_expr(argument);
+        }
+    }
     if let SelectQuantifier::Distinct { on, .. } = &select.quantifier {
         for expr in on {
             visitor.visit_expr(expr);
@@ -447,6 +459,7 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
                 visitor.visit_ident(part);
             }
         }
+        Expr::UserVariable(variable) => visitor.visit_user_variable(variable),
         Expr::Literal(literal) => visitor.visit_literal(literal),
         Expr::FunctionCall(call) => visitor.visit_function_call(call),
         Expr::Unary(expression) => visitor.visit_unary_expr(expression),
@@ -656,6 +669,10 @@ pub trait Fold {
         fold_literal(self, literal)
     }
 
+    fn fold_user_variable(&mut self, variable: UserVariable) -> UserVariable {
+        fold_user_variable(self, variable)
+    }
+
     fn fold_expr(&mut self, expression: Expr) -> Expr {
         fold_expr(self, expression)
     }
@@ -796,6 +813,10 @@ pub fn fold_literal<F: Fold + ?Sized>(_: &mut F, literal: Literal) -> Literal {
     literal
 }
 
+pub fn fold_user_variable<F: Fold + ?Sized>(_: &mut F, variable: UserVariable) -> UserVariable {
+    variable
+}
+
 pub fn fold_explain_query<F: Fold + ?Sized>(
     folder: &mut F,
     mut query: ExplainQuery,
@@ -864,6 +885,19 @@ pub fn fold_set_expr<F: Fold + ?Sized>(folder: &mut F, set_expr: SetExpr) -> Set
 }
 
 pub fn fold_select<F: Fold + ?Sized>(folder: &mut F, mut select: Select) -> Select {
+    select.hints = select
+        .hints
+        .into_iter()
+        .map(|mut hint| {
+            hint.name = folder.fold_ident(hint.name);
+            hint.arguments = hint
+                .arguments
+                .into_iter()
+                .map(|argument| folder.fold_expr(argument))
+                .collect();
+            hint
+        })
+        .collect();
     select.quantifier = match select.quantifier {
         SelectQuantifier::Distinct { on, span } => SelectQuantifier::Distinct {
             on: on.into_iter().map(|expr| folder.fold_expr(expr)).collect(),
@@ -1183,6 +1217,7 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
                 .collect();
             Expr::CompoundIdentifier(ident)
         }
+        Expr::UserVariable(variable) => Expr::UserVariable(folder.fold_user_variable(variable)),
         Expr::Literal(literal) => Expr::Literal(folder.fold_literal(literal)),
         Expr::FunctionCall(call) => Expr::FunctionCall(folder.fold_function_call(call)),
         Expr::Unary(expression) => Expr::Unary(folder.fold_unary_expr(expression)),

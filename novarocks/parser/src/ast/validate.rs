@@ -131,6 +131,11 @@ fn validate_values(values: &Values) -> Result<(), ValidateError> {
 }
 
 fn validate_select(select: &Select) -> Result<(), ValidateError> {
+    for hint in &select.hints {
+        for argument in &hint.arguments {
+            validate_expr(argument)?;
+        }
+    }
     if select.projection.is_empty() {
         return Err(ValidateError::invalid_structure(
             StructuralViolation::EmptySelectProjection,
@@ -487,6 +492,7 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
         }
         Expr::Identifier(_)
         | Expr::CompoundIdentifier(_)
+        | Expr::UserVariable(_)
         | Expr::Literal(_)
         | Expr::TypedString(_) => {}
     }

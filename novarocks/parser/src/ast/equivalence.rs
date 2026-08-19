@@ -61,6 +61,12 @@ impl SyntaxEq for Literal {
     }
 }
 
+impl SyntaxEq for UserVariable {
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
 impl SyntaxEq for TypeName {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.name.syntax_eq(&other.name) && syntax_eq_slice(&self.arguments, &other.arguments)
@@ -145,7 +151,8 @@ impl SyntaxEq for Values {
 
 impl SyntaxEq for Select {
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.quantifier.syntax_eq(&other.quantifier)
+        syntax_eq_slice(&self.hints, &other.hints)
+            && self.quantifier.syntax_eq(&other.quantifier)
             && syntax_eq_slice(&self.projection, &other.projection)
             && syntax_eq_slice(&self.from, &other.from)
             && syntax_eq_option(&self.selection, &other.selection)
@@ -153,6 +160,12 @@ impl SyntaxEq for Select {
             && syntax_eq_option(&self.having, &other.having)
             && syntax_eq_option(&self.qualify, &other.qualify)
             && syntax_eq_slice(&self.windows, &other.windows)
+    }
+}
+
+impl SyntaxEq for SelectHint {
+    fn syntax_eq(&self, other: &Self) -> bool {
+        self.name.syntax_eq(&other.name) && syntax_eq_slice(&self.arguments, &other.arguments)
     }
 }
 
@@ -489,6 +502,7 @@ impl SyntaxEq for Expr {
             (Self::CompoundIdentifier(left), Self::CompoundIdentifier(right)) => {
                 syntax_eq_slice(&left.parts, &right.parts)
             }
+            (Self::UserVariable(left), Self::UserVariable(right)) => left.syntax_eq(right),
             (Self::Literal(left), Self::Literal(right)) => left.syntax_eq(right),
             (Self::FunctionCall(left), Self::FunctionCall(right)) => left.syntax_eq(right),
             (Self::Unary(left), Self::Unary(right)) => left.syntax_eq(right),
@@ -859,6 +873,7 @@ mod tests {
                 span: span(start + 6),
             }),
             body: Box::new(SetExpr::Select(Box::new(Select {
+                hints: Vec::new(),
                 quantifier: SelectQuantifier::Distinct {
                     on: vec![sample_expr(start + 7)],
                     span: span(start + 8),

@@ -238,6 +238,16 @@ impl Printer {
 
     fn write_select(&mut self, select: &Select) {
         self.output.push_str("SELECT");
+        for hint in &select.hints {
+            self.output.push_str(" /*+ ");
+            self.write_ident(&hint.name);
+            if !hint.arguments.is_empty() {
+                self.output.push('(');
+                self.write_expr_list(&hint.arguments);
+                self.output.push(')');
+            }
+            self.output.push_str(" */");
+        }
         match &select.quantifier {
             SelectQuantifier::None => {}
             SelectQuantifier::All(_) => self.output.push_str(" ALL"),
@@ -731,6 +741,7 @@ impl Printer {
             Expr::CompoundIdentifier(ident) => {
                 self.write_ident_list_with_separator(&ident.parts, ".")
             }
+            Expr::UserVariable(variable) => self.output.push_str(&variable.value),
             Expr::Literal(literal) => self.write_literal(literal),
             Expr::FunctionCall(call) => self.write_function_call(call),
             Expr::Unary(expression) => self.write_unary_expr(expression),
@@ -1472,6 +1483,7 @@ mod tests {
                 span: span(),
             }),
             body: Box::new(SetExpr::Select(Box::new(Select {
+                hints: Vec::new(),
                 quantifier: SelectQuantifier::Distinct {
                     on: vec![identifier("s")],
                     span: span(),

@@ -54,6 +54,7 @@ fn query_forms_parse_and_print_as_typed_syntax() {
         "SELECT * FROM (((SELECT 1 UNION ALL SELECT 2))) AS source",
         "SELECT * FROM (SELECT 1) catalog",
         "EXPLAIN VERBOSE SELECT k1 FROM __nr_ivm_delta('orders', 0, 0)",
+        "SELECT @@time_zone, @user_name",
         "SELECT l.id FROM left_table l LEFT JOIN right_table r ON l.id = r.id JOIN third_table s ON s.id = l.id",
         "EXPLAIN ANALYZE VALUES (1), (2)",
     ] {
@@ -81,6 +82,17 @@ fn source_significant_query_forms_are_retained_by_the_typed_ast() {
     assert_eq!(
         Printer::new().statements(&statements),
         "SELECT t.id AS value FROM source AS t INNER JOIN LATERAL UNNEST(t.items) AS u(item) ON TRUE LEFT OUTER JOIN target AS r ON r.id = t.id"
+    );
+}
+
+#[test]
+fn select_optimizer_hints_are_typed_and_roundtrip() {
+    let source = "SELECT /*+ SET_VAR(enable_recursive_cte=true, recursive_cte_max_depth=10) */ 1";
+    let statements = parse(source).expect("optimizer hint should parse");
+
+    assert_eq!(
+        Printer::new().statements(&statements),
+        "SELECT /*+ SET_VAR(enable_recursive_cte = TRUE, recursive_cte_max_depth = 10) */ 1"
     );
 }
 

@@ -25,7 +25,7 @@ use crate::{
         Ident, InListExpr, InSubqueryExpr, IsPredicate, IsPredicateExpr, JsonOperator, LambdaExpr,
         LikeExpr, LikeOperator, Literal, LiteralKind, MapEntry, MapExpr, NestedExpr, NullTreatment,
         ObjectName, StructField, SubqueryExpr, TupleExpr, TypeName, TypeNameArgument,
-        TypedStringExpr, UnaryExpr, UnaryOperator, WindowFrame, WindowFrameBound,
+        TypedStringExpr, UnaryExpr, UnaryOperator, UserVariable, WindowFrame, WindowFrameBound,
         WindowFrameExclusion, WindowFrameUnits, WindowSpec,
     },
     error::ParseError,
@@ -682,6 +682,16 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 self.advance();
                 Ok(Expr::Literal(Literal {
                     kind: LiteralKind::String(self.string_value(span)),
+                    span,
+                }))
+            }
+            Some(Token {
+                kind: TokenKind::UserVariable,
+                span,
+            }) => {
+                self.advance();
+                Ok(Expr::UserVariable(UserVariable {
+                    value: self.token_text(span).to_owned(),
                     span,
                 }))
             }
