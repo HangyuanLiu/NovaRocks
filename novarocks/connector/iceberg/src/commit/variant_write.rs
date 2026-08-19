@@ -34,6 +34,7 @@ pub const VARIANT_SHREDDING_PROPERTY_PREFIX: &str = "write.parquet.variant-shred
 #[derive(Clone, Debug, Default)]
 pub struct VariantShreddingConfig {
     specs_by_index: HashMap<usize, VariantShreddingSpec>,
+    variant_indices: Vec<usize>,
 }
 
 impl VariantShreddingConfig {
@@ -43,6 +44,10 @@ impl VariantShreddingConfig {
 
     pub fn spec_for_index(&self, index: usize) -> Option<&VariantShreddingSpec> {
         self.specs_by_index.get(&index)
+    }
+
+    fn is_variant_index(&self, index: usize) -> bool {
+        self.variant_indices.contains(&index)
     }
 }
 
@@ -69,6 +74,19 @@ pub fn parse_variant_shredding_properties(
         columns_by_name.insert(key, (idx, field));
     }
 
+    let variant_indices = iceberg_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, field)| {
+            matches!(
+                field.field_type.as_ref(),
+                Type::Primitive(PrimitiveType::Variant)
+            )
+            .then_some(idx)
+        })
+        .collect();
     let mut specs_by_index = HashMap::new();
     for (key, value) in properties {
         let Some(column_name) = key.strip_prefix(VARIANT_SHREDDING_PROPERTY_PREFIX) else {
@@ -99,7 +117,10 @@ pub fn parse_variant_shredding_properties(
         }
     }
 
-    Ok(VariantShreddingConfig { specs_by_index })
+    Ok(VariantShreddingConfig {
+        specs_by_index,
+        variant_indices,
+    })
 }
 
 pub fn apply_variant_shredding_to_arrow_schema(
@@ -108,24 +129,29 @@ pub fn apply_variant_shredding_to_arrow_schema(
 ) -> Result<arrow::datatypes::SchemaRef, String> {
     use std::sync::Arc;
 
-    if shredding_config.is_empty() {
-        return Ok(Arc::clone(annotated_schema));
-    }
-
-    let fields = annotated_schema
+    let fields: Vec<arrow::datatypes::FieldRef> = annotated_schema
         .fields()
         .iter()
         .enumerate()
         .map(|(idx, field)| {
-            let Some(spec) = shredding_config.spec_for_index(idx) else {
+            let Some(data_type) = shredding_config
+                .spec_for_index(idx)
+                .map(|spec| shredded_variant_data_type(spec.as_type()))
+                .transpose()
+                .map_err(|e| {
+                    format!(
+                        "derive shredded Arrow type for column `{}`: {e}",
+                        field.name()
+                    )
+                })?
+                .or_else(|| {
+                    shredding_config
+                        .is_variant_index(idx)
+                        .then(unshredded_variant_data_type)
+                })
+            else {
                 return Ok(field.clone());
             };
-            let data_type = shredded_variant_data_type(spec.as_type()).map_err(|e| {
-                format!(
-                    "derive shredded Arrow type for column `{}`: {e}",
-                    field.name()
-                )
-            })?;
             Ok(field.as_ref().clone().with_data_type(data_type).into())
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -134,6 +160,44 @@ pub fn apply_variant_shredding_to_arrow_schema(
         fields,
         annotated_schema.metadata().clone(),
     )))
+}
+
+pub fn apply_variant_input_schema_to_arrow_schema(
+    annotated_schema: &arrow::datatypes::SchemaRef,
+    shredding_config: &VariantShreddingConfig,
+) -> arrow::datatypes::SchemaRef {
+    use std::sync::Arc;
+
+    let fields: Vec<arrow::datatypes::FieldRef> = annotated_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            if shredding_config.is_variant_index(idx) {
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(unshredded_variant_data_type())
+                    .into()
+            } else {
+                field.clone()
+            }
+        })
+        .collect();
+
+    Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        annotated_schema.metadata().clone(),
+    ))
+}
+
+fn unshredded_variant_data_type() -> DataType {
+    use arrow::datatypes::{Field, Fields};
+
+    DataType::Struct(Fields::from(vec![
+        Field::new("metadata", DataType::Binary, false),
+        Field::new("value", DataType::Binary, true),
+    ]))
 }
 
 fn shredded_variant_data_type(as_type: &DataType) -> Result<DataType, String> {

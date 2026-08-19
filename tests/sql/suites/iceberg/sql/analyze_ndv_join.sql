@@ -45,10 +45,10 @@ ANALYZE TABLE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.l_${uuid0};
 -- @skip_result_check=true
 ANALYZE TABLE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.r_${uuid0};
 
--- The exact Theta mapping is intentionally unavailable. The fallback is
--- |l|*|r|*0.25 = 162000 and must stay explicit and bounded.
+-- ANALYZE publishes the measured approximate NDV as an Estimated statistic,
+-- so the join uses |l|*|r|/max(ndv_l, ndv_r) = 6480.
 -- @explain_contains=HASH JOIN
--- @explain_contains=stats={rows=162000}
+-- @explain_contains=stats={rows=6480}
 EXPLAIN VERBOSE SELECT l.k
 FROM iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.l_${uuid0} l
 JOIN iceberg_cat_${suite_uuid0}.ndv_db_${uuid0}.r_${uuid0} r ON l.k = r.k;

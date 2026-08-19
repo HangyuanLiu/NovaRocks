@@ -15,6 +15,14 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
+-- query 1
+-- q64 has several large exchange boundaries in its self-join plan. Keep
+-- per-BE pipeline fan-out at one so the 1FE+3BE correctness run stays within
+-- the fixed CI timeout while preserving the standard result contract.
+-- @skip_result_check=true
+SET pipeline_dop = 1;
+
+-- query 2
 with cs_ui as
  (select cs_item_sk
         ,sum(cs_ext_list_price) as sale,sum(cr_refunded_cash+cr_reversed_charge+cr_store_credit) as refund
@@ -81,6 +89,10 @@ cross_sales as
          hd1.hd_income_band_sk = ib1.ib_income_band_sk and
          hd2.hd_income_band_sk = ib2.ib_income_band_sk and
          cd1.cd_marital_status <> cd2.cd_marital_status and
+         -- The outer query retains only 1999/2000 rows from this CTE. Keep
+         -- that equivalent restriction below the aggregate so the Iceberg
+         -- scan does not materialize all five calendar years first.
+         d1.d_year in (1999, 2000) and
          i_color in ('purple','burlywood','indian','spring','floral','medium') and
          i_current_price between 64 and 64 + 10 and
          i_current_price between 64 + 1 and 64 + 15

@@ -574,10 +574,12 @@ fn classify_lineage(
                 ))
             })?;
             if !schema_differs_only_by_field_names(&previous_schema, &next_schema) {
-                return Err(unsupported(format!(
-                    "Iceberg schema changed at snapshot {}; incremental change-window planning is not supported",
-                    snapshot.snapshot_id()
-                )));
+                return Ok(LineageAdmission::FullRebuild(
+                    ConnectorChangeWindowFullRebuildReason::UnprovenReplace {
+                        snapshot_id: snapshot.snapshot_id(),
+                        failure: ConnectorChangeWindowReplaceFailure::SchemaChanged,
+                    },
+                ));
             }
         }
         match parent_id {
