@@ -32,6 +32,7 @@ INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0} VA
 
 -- query 4
 -- @skip_result_check=true
+-- @nova_extension=iceberg branch and tag DDL
 ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_ref_db_${uuid0}.t_ref_${uuid0} CREATE BRANCH dev;
 
 -- query 5

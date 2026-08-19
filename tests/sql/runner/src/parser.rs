@@ -17,6 +17,9 @@
 
 use crate::config::{case_placeholder_variables, parse_bool, substitute_placeholders};
 use crate::engine_error_codes::EngineErrorCode;
+use crate::sql_error_codes::{
+    SQL_ERROR_DESCRIPTORS, SqlErrorDescriptor, SqlErrorPhase, lookup_sql_error_descriptor,
+};
 use crate::types::*;
 use anyhow::{Context, Result, bail};
 use novarocks_failpoint::{
@@ -258,6 +261,14 @@ fn detect_case_sequential(lines: &[String], file_meta_lines: &[String], meta_re:
 }
 
 pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
+    parse_meta_with_sql_error_descriptors(lines, meta_re, SQL_ERROR_DESCRIPTORS)
+}
+
+fn parse_meta_with_sql_error_descriptors(
+    lines: &[String],
+    meta_re: &Regex,
+    sql_error_descriptors: &[SqlErrorDescriptor],
+) -> Result<QueryMeta> {
     let mut meta = QueryMeta::default();
     for line in lines {
         let Some((key, raw_value)) = parse_meta_line(line, meta_re) else {
@@ -287,6 +298,41 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                     bail!("unknown expect_error_code: {}", raw_value);
                 }
                 meta.expect_error_code = Some(raw_value);
+            }
+            "expect_sql_code" => {
+                if lookup_sql_error_descriptor(sql_error_descriptors, &raw_value).is_none() {
+                    bail!("unknown expect_sql_code: {}", raw_value);
+                }
+                meta.expect_sql_code = Some(raw_value);
+            }
+            "expect_sql_phase" => {
+                meta.expect_sql_phase = Some(SqlErrorPhase::parse(&raw_value).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid expect_sql_phase: {raw_value}; expected Lex, Parse, Validate, Analyze, or Admit"
+                    )
+                })?);
+            }
+            "expect_error_at" => {
+                meta.expect_error_at =
+                    Some(SqlErrorLocation::parse(&raw_value).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid expect_error_at: {raw_value}; expected positive <line>:<col>"
+                        )
+                    })?);
+            }
+            "expect_error_tier" => {
+                meta.expect_error_tier =
+                    Some(SqlErrorTier::parse(&raw_value).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid expect_error_tier: {raw_value}; expected drift or target"
+                        )
+                    })?);
+            }
+            "nova_extension" => {
+                if raw_value.is_empty() {
+                    bail!("@nova_extension must not be empty");
+                }
+                meta.nova_extension = Some(raw_value);
             }
             "result_contains" => {
                 meta.result_contains.push(raw_value);
@@ -630,6 +676,32 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
     Ok(meta)
 }
 
+fn validate_sql_error_expectations(
+    meta: &QueryMeta,
+    sql_error_descriptors: &[SqlErrorDescriptor],
+) -> Result<()> {
+    if let Some(code) = meta.expect_sql_code.as_deref()
+        && lookup_sql_error_descriptor(sql_error_descriptors, code).is_none()
+    {
+        bail!("unknown expect_sql_code: {code}");
+    }
+
+    if meta.expect_sql_phase.is_some() && meta.expect_sql_code.is_none() {
+        bail!("@expect_sql_phase requires @expect_sql_code");
+    }
+
+    if meta.sql_error_tier() == SqlErrorTier::Target {
+        if meta.expect_sql_code.is_none() {
+            bail!("@expect_error_tier=target requires @expect_sql_code");
+        }
+        if meta.expect_error_at.is_none() {
+            bail!("@expect_error_tier=target requires @expect_error_at");
+        }
+    }
+
+    Ok(())
+}
+
 fn merge_lifecycle_structured_assertion(
     base: Option<&QueryLifecycleStructuredAssertion>,
     override_meta: Option<&QueryLifecycleStructuredAssertion>,
@@ -671,6 +743,17 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .expect_error_code
             .clone()
             .or_else(|| base.expect_error_code.clone()),
+        expect_sql_code: override_meta
+            .expect_sql_code
+            .clone()
+            .or_else(|| base.expect_sql_code.clone()),
+        expect_sql_phase: override_meta.expect_sql_phase.or(base.expect_sql_phase),
+        expect_error_at: override_meta.expect_error_at.or(base.expect_error_at),
+        expect_error_tier: override_meta.expect_error_tier.or(base.expect_error_tier),
+        nova_extension: override_meta
+            .nova_extension
+            .clone()
+            .or_else(|| base.nova_extension.clone()),
         result_contains: if override_meta.result_contains.is_empty() {
             base.result_contains.clone()
         } else {
@@ -891,6 +974,31 @@ pub fn load_sql_case_from_file(
     marker_re: &Regex,
     variables: &HashMap<String, String>,
 ) -> Result<Option<SqlCase>> {
+    let case_id = sql_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid SQL file name: {}", sql_path.display()))?;
+    let case_variables = case_placeholder_variables(variables, case_id);
+    load_sql_case_from_file_with_variables(sql_path, meta_re, marker_re, &case_variables)
+}
+
+/// Load a case while preserving supplied placeholder tokens. This is used by
+/// read-only source inventories whose output must not contain run-specific IDs.
+pub fn load_sql_case_from_file_preserving_placeholders(
+    sql_path: &Path,
+    meta_re: &Regex,
+    marker_re: &Regex,
+    variables: &HashMap<String, String>,
+) -> Result<Option<SqlCase>> {
+    load_sql_case_from_file_with_variables(sql_path, meta_re, marker_re, variables)
+}
+
+fn load_sql_case_from_file_with_variables(
+    sql_path: &Path,
+    meta_re: &Regex,
+    marker_re: &Regex,
+    case_variables: &HashMap<String, String>,
+) -> Result<Option<SqlCase>> {
     let base_name = sql_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -907,7 +1015,6 @@ pub fn load_sql_case_from_file(
             return Ok(None);
         }
     };
-    let case_variables = case_placeholder_variables(variables, &base_name);
     let case_dbs = detect_case_dbs(&content, &case_variables);
     let content = substitute_placeholders(
         &content,
@@ -1019,6 +1126,15 @@ pub fn load_sql_case_from_file(
         }
 
         let merged_meta = merge_meta(&file_meta, &section_meta);
+        validate_sql_error_expectations(&merged_meta, SQL_ERROR_DESCRIPTORS).with_context(
+            || {
+                format!(
+                    "{} ({}): invalid SQL error expectation",
+                    sql_path.display(),
+                    section_id
+                )
+            },
+        )?;
         steps.push(SqlStep {
             query_number,
             sql,
@@ -1435,6 +1551,151 @@ mod opt5_directive_tests {
             err.to_string()
                 .contains("unknown expect_error_code: NotARealCode"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_sql_error_directives_with_test_only_descriptors() {
+        let re = meta_re();
+        let lines = vec![
+            "-- @expect_sql_code=sql.test.fixture".to_string(),
+            "-- @expect_sql_phase=Parse".to_string(),
+            "-- @expect_error_at=7:11".to_string(),
+            "-- @expect_error_tier=target".to_string(),
+        ];
+
+        let meta = parse_meta_with_sql_error_descriptors(
+            &lines,
+            &re,
+            crate::sql_error_codes::TEST_SQL_ERROR_DESCRIPTORS,
+        )
+        .expect("test descriptor should be accepted");
+        validate_sql_error_expectations(&meta, crate::sql_error_codes::TEST_SQL_ERROR_DESCRIPTORS)
+            .expect("complete target assertion should validate");
+
+        assert_eq!(meta.expect_sql_code.as_deref(), Some("sql.test.fixture"));
+        assert_eq!(meta.expect_sql_phase, Some(SqlErrorPhase::Parse));
+        assert_eq!(
+            meta.expect_error_at,
+            Some(SqlErrorLocation {
+                line: 7,
+                column: 11
+            })
+        );
+        assert_eq!(meta.sql_error_tier(), SqlErrorTier::Target);
+    }
+
+    #[test]
+    fn parse_nova_extension_is_declarative_metadata() {
+        let re = meta_re();
+        let meta = parse_meta(
+            &["-- @nova_extension=iceberg branch and tag DDL".to_string()],
+            &re,
+        )
+        .expect("extension annotation should parse");
+
+        assert_eq!(
+            meta.nova_extension.as_deref(),
+            Some("iceberg branch and tag DDL")
+        );
+        assert!(!meta.has_error_expectation());
+    }
+
+    #[test]
+    fn production_sql_error_registry_is_empty_and_unknown_codes_fail_fast() {
+        let re = meta_re();
+        let error = parse_meta(&["-- @expect_sql_code=sql.test.fixture".to_string()], &re)
+            .expect_err("production registry must not accept fixture code");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown expect_sql_code: sql.test.fixture"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn target_tier_requires_code_and_location_after_meta_merge() {
+        let incomplete = QueryMeta {
+            expect_error_tier: Some(SqlErrorTier::Target),
+            ..QueryMeta::default()
+        };
+        let error = validate_sql_error_expectations(
+            &incomplete,
+            crate::sql_error_codes::TEST_SQL_ERROR_DESCRIPTORS,
+        )
+        .expect_err("target tier without code must fail");
+        assert!(error.to_string().contains("requires @expect_sql_code"));
+
+        let missing_location = QueryMeta {
+            expect_error_tier: Some(SqlErrorTier::Target),
+            expect_sql_code: Some("sql.test.fixture".to_string()),
+            ..QueryMeta::default()
+        };
+        let error = validate_sql_error_expectations(
+            &missing_location,
+            crate::sql_error_codes::TEST_SQL_ERROR_DESCRIPTORS,
+        )
+        .expect_err("target tier without location must fail");
+        assert!(error.to_string().contains("requires @expect_error_at"));
+    }
+
+    #[test]
+    fn sql_phase_requires_sql_code() {
+        let meta = QueryMeta {
+            expect_sql_phase: Some(SqlErrorPhase::Parse),
+            ..QueryMeta::default()
+        };
+        let error = validate_sql_error_expectations(
+            &meta,
+            crate::sql_error_codes::TEST_SQL_ERROR_DESCRIPTORS,
+        )
+        .expect_err("phase must be descriptor-addressable by code");
+        assert!(
+            error
+                .to_string()
+                .contains("@expect_sql_phase requires @expect_sql_code")
+        );
+    }
+
+    #[test]
+    fn merge_meta_preserves_sql_error_assertion_fields() {
+        let base = QueryMeta {
+            expect_sql_code: Some("sql.test.fixture".to_string()),
+            expect_sql_phase: Some(SqlErrorPhase::Parse),
+            expect_error_at: Some(SqlErrorLocation { line: 3, column: 2 }),
+            expect_error_tier: Some(SqlErrorTier::Target),
+            ..QueryMeta::default()
+        };
+        let merged = merge_meta(&base, &QueryMeta::default());
+
+        assert_eq!(merged.expect_sql_code, base.expect_sql_code);
+        assert_eq!(merged.expect_sql_phase, base.expect_sql_phase);
+        assert_eq!(merged.expect_error_at, base.expect_error_at);
+        assert_eq!(merged.expect_error_tier, base.expect_error_tier);
+    }
+
+    #[test]
+    fn merge_meta_preserves_nova_extension_annotation() {
+        let base = QueryMeta {
+            nova_extension: Some("native syntax".to_string()),
+            ..QueryMeta::default()
+        };
+        let override_meta = QueryMeta {
+            nova_extension: Some("more specific syntax".to_string()),
+            ..QueryMeta::default()
+        };
+
+        assert_eq!(
+            merge_meta(&base, &QueryMeta::default())
+                .nova_extension
+                .as_deref(),
+            Some("native syntax")
+        );
+        assert_eq!(
+            merge_meta(&base, &override_meta).nova_extension.as_deref(),
+            Some("more specific syntax")
         );
     }
 
