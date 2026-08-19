@@ -158,6 +158,14 @@ code-anchors:
 - ADR-0025 — SQL compiler 为何以显式 request、immutable snapshots 与 post-compile binding context 形成唯一入口（superseded → ADR-0073）
 - ADR-0042 — sealed DistributedPlan 为何以单一只读契约服务跨 owner encoder（superseded → ADR-0050）
 
+### sql-language
+
+领域哲学：SQL语言事实由自有parser及其source span定义；持久化定义保存用户有效原文与创建时解析上下文，不保存
+normalizer、AST mutation或printer生成的内部表示。运行期可以按请求派生typed/canonical facts，但派生物不能反向成为
+语言或durable authority。
+
+- ADR-0090 — MV/View定义为何持久化用户有效SQL原文与解析上下文，而不是AST Display（active）
+
 ### runtime-role
 
 领域哲学：生产运行时只由 native FE/BE 角色组成。FE 拥有 SQL admission 和
