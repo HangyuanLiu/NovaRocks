@@ -57,7 +57,7 @@ use crate::runner::{
 };
 use crate::session::{MysqlSession, drop_case_database, execute_suite_hook, reset_case_database};
 use crate::sql_error_codes::{
-    SQL_ERROR_DESCRIPTORS, SqlErrorDescriptor, SqlErrorPhase, lookup_sql_error_descriptor,
+    SqlErrorDescriptor, SqlErrorPhase, is_sql_error_code_token, lookup_sql_error_descriptor,
 };
 use crate::suite_manifest::select_suite_names;
 use crate::types::*;
@@ -70,10 +70,51 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+
+const SQL_ERROR_MANIFEST: &str =
+    include_str!("../../../../tools/error-manifest/error-manifest-v1.tsv");
+
+static PRODUCTION_SQL_ERROR_DESCRIPTORS: LazyLock<Vec<SqlErrorDescriptor>> = LazyLock::new(|| {
+    parse_sql_error_manifest(SQL_ERROR_MANIFEST)
+        .expect("checked-in SQL error manifest must be valid")
+});
+
+pub(crate) fn production_sql_error_descriptors() -> &'static [SqlErrorDescriptor] {
+    PRODUCTION_SQL_ERROR_DESCRIPTORS.as_slice()
+}
+
+fn parse_sql_error_manifest(source: &'static str) -> Result<Vec<SqlErrorDescriptor>, String> {
+    let mut lines = source.lines().filter(|line| !line.starts_with('#'));
+    if lines.next() != Some("schema_version=1") {
+        return Err("SQL error manifest has unsupported schema".to_owned());
+    }
+    if lines.next() != Some("code\tphase") {
+        return Err("SQL error manifest has invalid header".to_owned());
+    }
+
+    let mut descriptors = Vec::new();
+    let mut codes = HashSet::new();
+    for line in lines.filter(|line| !line.is_empty()) {
+        let mut fields = line.split('\t');
+        let code = fields.next().unwrap_or_default();
+        let phase = fields.next().unwrap_or_default();
+        if fields.next().is_some() || !is_sql_error_code_token(code) {
+            return Err(format!("invalid SQL error manifest entry: {line}"));
+        }
+        let phase = SqlErrorPhase::parse(phase)
+            .ok_or_else(|| format!("invalid SQL error manifest phase: {phase}"))?;
+        if !codes.insert(code) {
+            return Err(format!("duplicate SQL error manifest code: {code}"));
+        }
+        descriptors.push(SqlErrorDescriptor { code, phase });
+    }
+    Ok(descriptors)
+}
 
 fn resolve_effective_target_port(
     server_port: Option<u16>,
@@ -202,7 +243,7 @@ fn evaluate_expected_error_branch(
         meta,
         ok,
         err_msg,
-        SQL_ERROR_DESCRIPTORS,
+        production_sql_error_descriptors(),
     )
 }
 
@@ -4721,7 +4762,7 @@ mod tests {
     #[test]
     fn sql_error_assertions_match_code_phase_and_location() {
         let meta = QueryMeta {
-            expect_sql_code: Some("sql.test.fixture".to_string()),
+            expect_sql_code: Some("sql.parse.unsupported_statement".to_string()),
             expect_sql_phase: Some(SqlErrorPhase::Parse),
             expect_error_at: Some(SqlErrorLocation {
                 line: 7,
@@ -4730,14 +4771,14 @@ mod tests {
             expect_error_tier: Some(SqlErrorTier::Target),
             ..QueryMeta::default()
         };
-        let error = "ERROR 1064 (42000): [sql.test.fixture] at line 7, column 11: unexpected token";
+        let error = "ERROR 1064 (42000): [sql.parse.unsupported_statement] at line 7, column 11: unsupported statement";
 
         assert_eq!(
             evaluate_expected_error_branch_with_sql_error_descriptors(
                 &meta,
                 false,
                 error,
-                crate::sql_error_codes::TEST_SQL_ERROR_DESCRIPTORS,
+                crate::production_sql_error_descriptors(),
             ),
             Some(Ok(()))
         );

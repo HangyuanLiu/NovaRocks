@@ -55,11 +55,6 @@ pub struct SqlErrorDescriptor {
     pub phase: SqlErrorPhase,
 }
 
-/// SQLP-1 replaces this empty compile-time slice with the generated aggregate
-/// manifest.  Keeping it empty here is intentional: no production suite may
-/// silently start relying on an unregistered SQL error code.
-pub const SQL_ERROR_DESCRIPTORS: &[SqlErrorDescriptor] = &[];
-
 pub fn lookup_sql_error_descriptor<'a>(
     descriptors: &'a [SqlErrorDescriptor],
     code: &str,

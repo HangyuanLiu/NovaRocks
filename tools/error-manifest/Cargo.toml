@@ -1,0 +1,19 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to you under the Apache License, Version 2.0.
+
+[workspace]
+
+[package]
+name = "novarocks-error-manifest"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "novarocks-error-manifest"
+path = "src/main.rs"
+
+[dependencies]
+novarocks-parser = { path = "../../novarocks/parser" }
+novarocks-user-error = { path = "../../novarocks/user-error" }

@@ -3313,6 +3313,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-parser"
+version = "0.1.0"
+dependencies = [
+ "novarocks-user-error",
+]
+
+[[package]]
 name = "novarocks-protocol"
 version = "0.1.0"
 dependencies = [
@@ -3448,6 +3455,10 @@ dependencies = [
  "serde_json",
  "toml",
 ]
+
+[[package]]
+name = "novarocks-user-error"
+version = "0.1.0"
 
 [[package]]
 name = "novarocks-version"
