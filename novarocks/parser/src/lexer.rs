@@ -75,6 +75,11 @@ impl<'source> Lexer<'source> {
             } else if character == '@' {
                 self.consume_user_variable();
                 self.push(TokenKind::UserVariable, start);
+            } else if self.has_string_prefix() {
+                self.advance(); // literal prefix
+                let quote = self.current().expect("prefixed string has a quote");
+                self.consume_string(start, quote)?;
+                self.push(TokenKind::String, start);
             } else if character.is_ascii_digit()
                 || (character == '.' && self.next().is_some_and(|next| next.is_ascii_digit()))
             {
@@ -234,6 +239,11 @@ impl<'source> Lexer<'source> {
         }
     }
 
+    fn has_string_prefix(&self) -> bool {
+        matches!(self.current(), Some('x' | 'X' | 'b' | 'B' | 'n' | 'N'))
+            && matches!(self.next(), Some('\'' | '"'))
+    }
+
     fn consume_number(&mut self) -> TokenKind {
         if self.starts_with("0x") || self.starts_with("0X") {
             self.position += 2;
@@ -242,7 +252,7 @@ impl<'source> Lexer<'source> {
         }
 
         self.consume_while(|character| character.is_ascii_digit());
-        if self.current() == Some('.') {
+        if self.current() == Some('.') && !self.starts_with("..") {
             self.advance();
             self.consume_while(|character| character.is_ascii_digit());
         }
@@ -265,12 +275,36 @@ impl<'source> Lexer<'source> {
     }
 
     fn consume_symbol(&mut self) -> Option<Symbol> {
-        let (prefix, symbol) = if self.starts_with(">=") {
+        let (prefix, symbol) = if self.starts_with("->>") {
+            (3, Symbol::LongArrow)
+        } else if self.starts_with("<=>") {
+            (3, Symbol::NullSafeEq)
+        } else if self.starts_with(">=") {
             (2, Symbol::Gte)
         } else if self.starts_with("<=") {
             (2, Symbol::Lte)
         } else if self.starts_with("<>") || self.starts_with("!=") {
             (2, Symbol::Neq)
+        } else if self.starts_with("<<") {
+            (2, Symbol::ShiftLeft)
+        } else if self.starts_with(">>") {
+            (2, Symbol::ShiftRight)
+        } else if self.starts_with("||") {
+            (2, Symbol::DoublePipe)
+        } else if self.starts_with("&&") {
+            (2, Symbol::DoubleAmpersand)
+        } else if self.starts_with(":=") {
+            (2, Symbol::ColonEq)
+        } else if self.starts_with("::") {
+            (2, Symbol::DoubleColon)
+        } else if self.starts_with("=>") {
+            (2, Symbol::FatArrow)
+        } else if self.starts_with("->") {
+            (2, Symbol::Arrow)
+        } else if self.starts_with("..") {
+            (2, Symbol::DoubleDot)
+        } else if self.starts_with("?&") {
+            (2, Symbol::QuestionAmpersand)
         } else {
             match self.current()? {
                 ',' => (1, Symbol::Comma),
@@ -345,7 +379,7 @@ mod tests {
         let source = "SELECT `odd``name`, @user, @@global$t, t$snapshots, 'e\\\\f', \"x\\\"y\", 1.2e-3, .5, 0xDeAd";
         let tokens = lex(source).expect("source should lex");
         assert_eq!(reconstruct(source), source);
-        assert_eq!(tokens[0].kind, TokenKind::Ident);
+        assert_eq!(tokens[0].kind, TokenKind::Keyword(Keyword::Select));
         assert!(
             tokens
                 .iter()
@@ -392,6 +426,55 @@ mod tests {
                 TokenKind::Keyword(Keyword::False),
                 TokenKind::Trivia(TriviaKind::Whitespace),
                 TokenKind::Ident,
+                TokenKind::End,
+            ]
+        );
+        assert_eq!(reconstruct(source), source);
+    }
+
+    #[test]
+    fn classifies_query_vocabulary_and_preserves_quoted_and_non_reserved_words() {
+        let source = "SeLeCt `select`, window, TRY_CAST(x AS INT) FROM t";
+        assert_eq!(
+            kinds(source),
+            vec![
+                TokenKind::Keyword(Keyword::Select),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::QuotedIdent,
+                TokenKind::Symbol(Symbol::Comma),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Keyword(Keyword::Window),
+                TokenKind::Symbol(Symbol::Comma),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Keyword(Keyword::TryCast),
+                TokenKind::Symbol(Symbol::LParen),
+                TokenKind::Ident,
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Keyword(Keyword::As),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Ident,
+                TokenKind::Symbol(Symbol::RParen),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Keyword(Keyword::From),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Ident,
+                TokenKind::End,
+            ]
+        );
+        assert_eq!(reconstruct(source), source);
+    }
+
+    #[test]
+    fn preserves_prefixed_string_literals_as_single_lossless_tokens() {
+        let source = "X'4D79' b\"0101\" N'local text'";
+        assert_eq!(
+            kinds(source),
+            vec![
+                TokenKind::String,
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::String,
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::String,
                 TokenKind::End,
             ]
         );
@@ -471,6 +554,51 @@ mod tests {
                 TokenKind::Symbol(Symbol::Bang),
                 TokenKind::Symbol(Symbol::Ampersand),
                 TokenKind::Symbol(Symbol::Caret),
+                TokenKind::End,
+            ]
+        );
+        assert_eq!(reconstruct(source), source);
+    }
+
+    #[test]
+    fn prefers_longest_query_operator_matches_and_keeps_number_boundaries() {
+        let source = "<=> <= <> != << >> || && := :: => ->> -> ?& .. 1..2";
+        assert_eq!(
+            kinds(source),
+            vec![
+                TokenKind::Symbol(Symbol::NullSafeEq),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Symbol(Symbol::Lte),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Symbol(Symbol::Neq),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Symbol(Symbol::Neq),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Symbol(Symbol::ShiftLeft),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Symbol(Symbol::ShiftRight),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Symbol(Symbol::DoublePipe),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Symbol(Symbol::DoubleAmpersand),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Symbol(Symbol::ColonEq),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Symbol(Symbol::DoubleColon),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Symbol(Symbol::FatArrow),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Symbol(Symbol::LongArrow),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Symbol(Symbol::Arrow),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Symbol(Symbol::QuestionAmpersand),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Symbol(Symbol::DoubleDot),
+                TokenKind::Trivia(TriviaKind::Whitespace),
+                TokenKind::Number,
+                TokenKind::Symbol(Symbol::DoubleDot),
+                TokenKind::Number,
                 TokenKind::End,
             ]
         );

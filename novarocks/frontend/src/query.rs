@@ -283,6 +283,10 @@ impl CoreCommandRoute for TypedCommandRoute {
                     &connector_context,
                 )
             }
+            ParsedStatement::Query(_) | ParsedStatement::ExplainQuery(_) => Err(
+                "typed query syntax has no frontend execution owner; LegacyFrontier remains authoritative"
+                    .to_string(),
+            ),
             ParsedStatement::RawQuery(_) => {
                 Err("statement was admitted before its command-family owner cut".to_string())
             }

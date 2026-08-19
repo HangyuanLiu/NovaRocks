@@ -28,6 +28,7 @@ mod iceberg;
 mod maintenance;
 mod materialized_view;
 mod pratt;
+mod query;
 mod show_backends;
 mod statistics;
 mod view;
@@ -96,6 +97,7 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
             iceberg::parse,
             maintenance::parse,
             materialized_view::parse,
+            query::parse,
         ] {
             if let Some(statement) = parser(self)? {
                 return Ok(statement);
@@ -421,9 +423,13 @@ mod tests {
 
     #[test]
     fn unsupported_statement_is_typed_and_trailing_token_is_rejected() {
-        let unsupported = parse("SELECT 1").expect_err("SELECT is not owned in SQLP-1");
+        let unsupported =
+            parse("INSERT INTO t VALUES (1)").expect_err("INSERT is not owned in SQLP-4");
         assert_eq!(
-            unsupported.to_user_error("SELECT 1").code().as_str(),
+            unsupported
+                .to_user_error("INSERT INTO t VALUES (1)")
+                .code()
+                .as_str(),
             "sql.parse.unsupported_statement"
         );
 
@@ -459,6 +465,28 @@ mod tests {
         assert_eq!(unquote_string(r"'it''s \\ safe'"), "it's \\ safe");
     }
 
+    #[test]
+    fn query_expression_is_owned_as_typed_syntax_without_execution_admission() {
+        let source = "SELECT a, count(*) AS n FROM db.t AS t WHERE a >= 1 ORDER BY a DESC LIMIT 5";
+        let statements = parse(source).expect("query syntax must parse");
+        assert!(matches!(statements.as_slice(), [Statement::Query(_)]));
+        assert_eq!(
+            crate::printer::Printer::new().statements(&statements),
+            "SELECT a, count(*) AS n FROM db.t t WHERE a >= 1 ORDER BY a DESC LIMIT 5"
+        );
+
+        let statements =
+            parse("EXPLAIN ANALYZE VALUES (1), (2)").expect("explain values must parse");
+        assert!(matches!(
+            statements.as_slice(),
+            [Statement::ExplainQuery(_)]
+        ));
+        assert_eq!(
+            crate::printer::Printer::new().statements(&statements),
+            "EXPLAIN ANALYZE VALUES (1), (2)"
+        );
+    }
+
     fn statement_shapes(statements: &[Statement]) -> Vec<&'static str> {
         statements
             .iter()
@@ -471,6 +499,8 @@ mod tests {
                 Statement::Maintenance(_) => "MAINTENANCE",
                 Statement::MaterializedView(_) => "MATERIALIZED VIEW",
                 Statement::View(_) => "VIEW",
+                Statement::Query(_) => "QUERY",
+                Statement::ExplainQuery(_) => "EXPLAIN QUERY",
                 Statement::RawQuery(_) => "RAW QUERY",
             })
             .collect()

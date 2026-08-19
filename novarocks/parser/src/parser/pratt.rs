@@ -20,10 +20,11 @@
 use crate::{
     Span, Symbol, Token, TokenKind,
     ast::{
-        BinaryExpr, BinaryOperator, Expr, FunctionCall, Ident, Literal, LiteralKind, NestedExpr,
-        UnaryExpr, UnaryOperator,
+        BinaryExpr, BinaryOperator, Expr, FunctionCall, FunctionQuantifier, Ident, Literal,
+        LiteralKind, NestedExpr, ObjectName, UnaryExpr, UnaryOperator,
     },
     error::ParseError,
+    keyword_class,
     token::Keyword,
 };
 
@@ -83,6 +84,11 @@ const INFIX_BINDINGS: &[InfixBinding] = &[
         precedence: COMPARISON_PRECEDENCE,
     },
     InfixBinding {
+        token: TokenPattern::Symbol(Symbol::NullSafeEq),
+        operator: BinaryOperator::NullSafeEqual,
+        precedence: COMPARISON_PRECEDENCE,
+    },
+    InfixBinding {
         token: TokenPattern::Symbol(Symbol::Neq),
         operator: BinaryOperator::NotEqual,
         precedence: COMPARISON_PRECEDENCE,
@@ -127,6 +133,41 @@ const INFIX_BINDINGS: &[InfixBinding] = &[
         operator: BinaryOperator::Divide,
         precedence: MULTIPLICATIVE_PRECEDENCE,
     },
+    InfixBinding {
+        token: TokenPattern::Symbol(Symbol::Percent),
+        operator: BinaryOperator::Modulo,
+        precedence: MULTIPLICATIVE_PRECEDENCE,
+    },
+    InfixBinding {
+        token: TokenPattern::Symbol(Symbol::DoublePipe),
+        operator: BinaryOperator::StringConcat,
+        precedence: ADDITIVE_PRECEDENCE,
+    },
+    InfixBinding {
+        token: TokenPattern::Symbol(Symbol::ShiftLeft),
+        operator: BinaryOperator::ShiftLeft,
+        precedence: ADDITIVE_PRECEDENCE,
+    },
+    InfixBinding {
+        token: TokenPattern::Symbol(Symbol::ShiftRight),
+        operator: BinaryOperator::ShiftRight,
+        precedence: ADDITIVE_PRECEDENCE,
+    },
+    InfixBinding {
+        token: TokenPattern::Symbol(Symbol::Ampersand),
+        operator: BinaryOperator::BitwiseAnd,
+        precedence: ADDITIVE_PRECEDENCE,
+    },
+    InfixBinding {
+        token: TokenPattern::Symbol(Symbol::Caret),
+        operator: BinaryOperator::BitwiseXor,
+        precedence: ADDITIVE_PRECEDENCE,
+    },
+    InfixBinding {
+        token: TokenPattern::Symbol(Symbol::Pipe),
+        operator: BinaryOperator::BitwiseOr,
+        precedence: ADDITIVE_PRECEDENCE,
+    },
 ];
 
 const PREFIX_BINDINGS: &[PrefixBinding] = &[
@@ -143,6 +184,11 @@ const PREFIX_BINDINGS: &[PrefixBinding] = &[
     PrefixBinding {
         token: TokenPattern::Symbol(Symbol::Minus),
         operator: UnaryOperator::Minus,
+        precedence: UNARY_ARITHMETIC_PRECEDENCE,
+    },
+    PrefixBinding {
+        token: TokenPattern::Symbol(Symbol::Tilde),
+        operator: UnaryOperator::BitwiseNot,
         precedence: UNARY_ARITHMETIC_PRECEDENCE,
     },
 ];
@@ -305,6 +351,12 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 span,
             }) => self.parse_identifier_or_function_call(span),
             Some(Token {
+                kind: TokenKind::Keyword(keyword),
+                span,
+            }) if keyword_class(keyword) == crate::KeywordClass::NonReserved => {
+                self.parse_identifier_or_function_call(span)
+            }
+            Some(Token {
                 kind: TokenKind::Symbol(Symbol::LParen),
                 span,
             }) => self.parse_nested_expression(span),
@@ -330,12 +382,41 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }
     }
 
-    /// `function-call ::= identifier "(" [ expression { "," expression } ] ")"`
+    /// `function-call ::= object-name "(" [ expression { "," expression } ] ")"`
     fn parse_identifier_or_function_call(&mut self, span: Span) -> Result<Expr, ParseError> {
-        let identifier = self.parse_identifier(span);
+        let first = self.parse_identifier(span);
+        let mut end = first.span.end();
+        let mut parts = vec![first];
+        while self.current_is_symbol(Symbol::Dot) {
+            self.advance();
+            self.skip_trivia();
+            let Some(token) = self.current().cloned() else {
+                return Err(self.unexpected("identifier after '.'"));
+            };
+            if !matches!(
+                token.kind,
+                TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::Keyword(_)
+            ) {
+                return Err(self.unexpected("identifier after '.'"));
+            }
+            let ident = self.parse_identifier(token.span);
+            end = ident.span.end();
+            parts.push(ident);
+        }
+        let name = ObjectName {
+            parts,
+            span: Span::new(span.start(), end),
+        };
         self.skip_trivia();
         if !self.current_is_symbol(Symbol::LParen) {
-            return Ok(Expr::Identifier(identifier));
+            return Ok(if name.parts.len() == 1 {
+                Expr::Identifier(name.parts.into_iter().next().expect("one identifier"))
+            } else {
+                Expr::CompoundIdentifier(crate::ast::CompoundIdentifier {
+                    span: name.span,
+                    parts: name.parts,
+                })
+            });
         }
 
         self.advance();
@@ -343,7 +424,17 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         self.skip_trivia();
         if !self.current_is_symbol(Symbol::RParen) {
             loop {
-                arguments.push(self.parse_binding_power(0)?);
+                if self.current_is_symbol(Symbol::Star) {
+                    let star = self.current_span();
+                    self.advance();
+                    arguments.push(Expr::Identifier(Ident {
+                        value: "*".to_owned(),
+                        quoted: false,
+                        span: star,
+                    }));
+                } else {
+                    arguments.push(self.parse_binding_power(0)?);
+                }
                 self.skip_trivia();
                 if !self.current_is_symbol(Symbol::Comma) {
                     break;
@@ -363,8 +454,14 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let end = self.current_span().end();
         self.advance();
         Ok(Expr::FunctionCall(FunctionCall {
-            name: identifier,
+            name,
             arguments,
+            quantifier: FunctionQuantifier::None,
+            order_by: Vec::new(),
+            separator: None,
+            filter: None,
+            null_treatment: None,
+            over: None,
             span: Span::new(span.start(), end),
         }))
     }

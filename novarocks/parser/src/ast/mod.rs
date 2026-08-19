@@ -24,9 +24,12 @@ mod expr;
 pub(crate) mod iceberg;
 pub(crate) mod maintenance;
 pub(crate) mod materialized_view;
+mod query;
+mod relation;
 pub(crate) mod statistics;
 pub(crate) mod view;
 mod visit;
+mod window;
 
 pub use backend::{AddBackend, BackendStatement, DropBackend, ShowBackends};
 pub use catalog::{
@@ -35,7 +38,12 @@ pub use catalog::{
 };
 pub use command::{Property, PropertyKeyValue};
 pub use expr::{
-    BinaryExpr, BinaryOperator, Expr, FunctionCall, NestedExpr, UnaryExpr, UnaryOperator,
+    AccessExpr, AccessKind, ArrayExpr, BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr,
+    CastKind, CompoundIdentifier, ExistsExpr, Expr, FunctionCall, FunctionOrderBy,
+    FunctionQuantifier, InListExpr, InSubqueryExpr, IntervalExpr, IntervalField, IsPredicate,
+    IsPredicateExpr, JsonOperator, LambdaExpr, LikeExpr, LikeOperator, MapEntry, MapExpr,
+    NestedExpr, NullTreatment, StructExpr, StructExprField, SubqueryExpr, TupleExpr,
+    TypedStringExpr, UnaryExpr, UnaryOperator,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
@@ -57,6 +65,15 @@ pub use materialized_view::{
     MaterializedViewRefreshPolicy, MaterializedViewStatement, RefreshMaterializedView,
     ShowMaterializedViews,
 };
+pub use query::{
+    Cte, ExplainFormat, ExplainQuery, Fetch, GroupBy, Offset, OffsetRows, OrderByExpr, Query,
+    ReplaceSelectItem, Select, SelectItem, SelectQuantifier, SetExpr, SetOperation, SetOperator,
+    SetQuantifier, Values, WildcardOptions, With,
+};
+pub use relation::{
+    Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableHint, TableVersion,
+    TableVersionKind, TableWithJoins,
+};
 pub use statistics::{
     AnalyzeMode, AnalyzeTable, CancelAnalyze, DropHistogram, DropMultipleColumnsStats, DropStats,
     ShowAnalyzeJobs, ShowBasicStatsMeta, ShowHistogramStatsMeta, ShowTableStats,
@@ -69,6 +86,9 @@ pub use visit::{
     fold_unary_expr, fold_view_statement, walk_binary_expr, walk_expr, walk_function_call,
     walk_ident, walk_literal, walk_nested_expr, walk_object_name, walk_show_backends,
     walk_statement, walk_type_name, walk_unary_expr, walk_view_statement,
+};
+pub use window::{
+    NamedWindow, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
 };
 
 use crate::Span;
@@ -83,6 +103,8 @@ pub enum Statement {
     Maintenance(MaintenanceStatement),
     MaterializedView(MaterializedViewStatement),
     View(ViewStatement),
+    Query(Query),
+    ExplainQuery(ExplainQuery),
     RawQuery(RawQuerySlice),
 }
 
@@ -96,6 +118,8 @@ impl Statement {
             Self::Maintenance(statement) => statement.span(),
             Self::MaterializedView(statement) => statement.span(),
             Self::View(statement) => statement.span(),
+            Self::Query(query) => query.span,
+            Self::ExplainQuery(query) => query.span,
             Self::RawQuery(query) => query.span,
         }
     }
@@ -235,15 +259,24 @@ mod tests {
             })),
             operator: BinaryOperator::Add,
             right: Box::new(Expr::FunctionCall(FunctionCall {
-                name: Ident {
-                    value: "abs".to_owned(),
-                    quoted: false,
+                name: ObjectName {
+                    parts: vec![Ident {
+                        value: "abs".to_owned(),
+                        quoted: false,
+                        span: span(4, 7),
+                    }],
                     span: span(4, 7),
                 },
                 arguments: vec![Expr::Literal(Literal {
                     kind: LiteralKind::Number("1".to_owned()),
                     span: span(8, 9),
                 })],
+                quantifier: FunctionQuantifier::None,
+                order_by: Vec::new(),
+                separator: None,
+                filter: None,
+                null_treatment: None,
+                over: None,
                 span: span(4, 10),
             })),
             span: span(0, 10),
