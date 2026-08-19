@@ -1403,6 +1403,12 @@ fn verify_runtime_filter_structured_assertion(
                     .iter()
                     .any(|transport| transport.sent_count > 0 && transport.acked_count > 0)
             }),
+            RuntimeFilterDetailExpectation::DeliveredConsumer => details.iter().any(|details| {
+                details
+                    .consumers
+                    .iter()
+                    .any(|consumer| consumer.latest_delivered_logical_version.is_some())
+            }),
             RuntimeFilterDetailExpectation::DeliveredAppliedConsumer => details.iter().any(|details| {
                 details.consumers.iter().any(|consumer| {
                     consumer.latest_delivered_logical_version.is_some()
@@ -4589,8 +4595,9 @@ mod tests {
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
     use crate::sql_error_codes::SqlErrorPhase;
     use crate::types::{
-        QueryExecution, QueryMeta, ResultSet, RunnerConfig, SqlCase, SqlErrorLocation,
-        SqlErrorTier, SqlStep,
+        QueryExecution, QueryLifecycleStructuredAssertion, QueryMeta, ResultSet,
+        RunnerConfig, RuntimeFilterDetailExpectation, SqlCase, SqlErrorLocation, SqlErrorTier,
+        SqlStep,
     };
     use crate::{
         AlterJobPollState, Cli, annotate_failure_with_engine_error_code,
@@ -4600,6 +4607,7 @@ mod tests {
         finish_expected_error_step, sql_text_has_query_lifecycle_fault_directive,
         statement_starts_dml_operation, validate_ctas_takeover_preflight,
         validate_dml_cluster_jobs, validate_fault_injection_jobs, validate_selected_suite_cluster,
+        verify_runtime_filter_structured_assertion,
     };
     use clap::Parser;
     use regex::Regex;
@@ -4804,6 +4812,83 @@ mod tests {
         assert!(!sql_text_has_query_lifecycle_fault_directive(
             "-- query-control-heartbeat-loss is only a case name\nSELECT 1;"
         ));
+    }
+
+    #[test]
+    fn delivered_consumer_assertion_does_not_require_apply() {
+        use novarocks_cluster_harness as harness;
+
+        let snapshot = harness::QueryLifecycleStructuredSnapshot {
+            execution_id: Some("1:2:3".to_string()),
+            error_source: None,
+            participant_outcomes: Vec::new(),
+            telemetry_unavailable: Vec::new(),
+            runtime_filter: harness::RuntimeFilterTerminalRollup::Available {
+                participants: vec![harness::RuntimeFilterParticipantTerminalTelemetry {
+                    participant: harness::RuntimeFilterTerminalParticipant {
+                        backend_id: 7,
+                        start_epoch: 11,
+                    },
+                    telemetry: harness::RuntimeFilterParticipantTerminalTelemetryValue::Available(
+                        harness::RuntimeFilterParticipantTerminalDetails {
+                            channels: Vec::new(),
+                            producer_streams: Vec::new(),
+                            transport_routes: Vec::new(),
+                            consumers: vec![harness::RuntimeFilterConsumerTerminalDetail {
+                                channel_binding_id: 1,
+                                channel_id: 2,
+                                consumer_binding_id: 3,
+                                fragment_instance_id: None,
+                                latest_delivered_logical_version: Some(1),
+                                latest_applied_logical_version: None,
+                                subscription_terminal:
+                                    harness::RuntimeFilterSubscriptionTerminal::Completed,
+                                row_evaluations: 0,
+                                input_rows: 0,
+                                output_rows: 0,
+                                scan_evaluated: 0,
+                                scan_kept: 0,
+                                scan_pruned: 0,
+                                scan_not_evaluated: 1,
+                                scan_not_evaluated_reasons:
+                                    harness::RuntimeFilterScanNotEvaluatedCounters {
+                                        unit_facts_missing: 0,
+                                        column_facts_missing: 0,
+                                        data_type_unsupported: 0,
+                                        predicate_capability_unsupported: 0,
+                                        resource_unavailable: 0,
+                                        snapshot_unavailable: 1,
+                                        snapshot_timed_out: 0,
+                                        snapshot_not_published: 0,
+                                    },
+                            }],
+                        },
+                    ),
+                }],
+                totals: harness::RuntimeFilterTerminalTotalsTelemetry::Unavailable(
+                    harness::RuntimeFilterTerminalTotalsUnavailable::ParticipantTelemetryUnavailable,
+                ),
+            },
+            metrics: BTreeMap::new(),
+        };
+        let delivered = QueryLifecycleStructuredAssertion {
+            error_source: None,
+            participant_outcome: None,
+            telemetry_unavailable: Vec::new(),
+            metric_deltas: Vec::new(),
+            runtime_filter_availability: None,
+            runtime_filter_details: vec![RuntimeFilterDetailExpectation::DeliveredConsumer],
+            runtime_filter_totals_at_least: Vec::new(),
+        };
+        assert!(verify_runtime_filter_structured_assertion(&delivered, &snapshot).is_ok());
+
+        let delivered_and_applied = QueryLifecycleStructuredAssertion {
+            runtime_filter_details: vec![RuntimeFilterDetailExpectation::DeliveredAppliedConsumer],
+            ..delivered
+        };
+        assert!(
+            verify_runtime_filter_structured_assertion(&delivered_and_applied, &snapshot).is_err()
+        );
     }
 
     #[test]

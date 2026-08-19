@@ -47,11 +47,23 @@ SELECT generate_series AS id, generate_series % 200 AS k
 FROM TABLE(generate_series(1, 2000));
 
 -- 200 build rows, one per key; only even keys pass the flag = 'Y' predicate,
--- so the runtime filter has real work to prune (~half the probe rows).
+-- so the runtime filter has real work to prune (~half the probe rows). Write
+-- three Iceberg data files so the partitioned build scan has cross-BE producer
+-- work and the native terminal rollup observes a remote transport route.
 INSERT INTO ${case_db}.rf_dist_part_build
 SELECT generate_series % 200 AS k,
        CASE WHEN (generate_series % 200) % 2 = 0 THEN 'Y' ELSE 'N' END AS flag
-FROM TABLE(generate_series(1, 200));
+FROM TABLE(generate_series(1, 67));
+
+INSERT INTO ${case_db}.rf_dist_part_build
+SELECT generate_series % 200 AS k,
+       CASE WHEN (generate_series % 200) % 2 = 0 THEN 'Y' ELSE 'N' END AS flag
+FROM TABLE(generate_series(68, 134));
+
+INSERT INTO ${case_db}.rf_dist_part_build
+SELECT generate_series % 200 AS k,
+       CASE WHEN (generate_series % 200) % 2 = 0 THEN 'Y' ELSE 'N' END AS flag
+FROM TABLE(generate_series(135, 200));
 
 ANALYZE TABLE ${case_db}.rf_dist_part_probe;
 ANALYZE TABLE ${case_db}.rf_dist_part_build;

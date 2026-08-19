@@ -2136,6 +2136,7 @@ mod opt5_directive_tests {
             "-- @expect_runtime_filter_available=available".to_string(),
             "-- @expect_runtime_filter_detail=completed-channel".to_string(),
             "-- @expect_runtime_filter_detail=accepted-producer".to_string(),
+            "-- @expect_runtime_filter_detail=delivered-consumer".to_string(),
             "-- @expect_runtime_filter_total_at_least=transport_acked_count,1".to_string(),
             "-- @expect_runtime_filter_total_at_least=consumer_input_rows,20".to_string(),
         ];
@@ -2153,6 +2154,7 @@ mod opt5_directive_tests {
             vec![
                 RuntimeFilterDetailExpectation::CompletedChannel,
                 RuntimeFilterDetailExpectation::AcceptedProducer,
+                RuntimeFilterDetailExpectation::DeliveredConsumer,
             ]
         );
         assert_eq!(

@@ -109,6 +109,7 @@ pub enum RuntimeFilterDetailExpectation {
     CompletedChannel,
     AcceptedProducer,
     SentAckedTransport,
+    DeliveredConsumer,
     DeliveredAppliedConsumer,
 }
 
@@ -118,6 +119,7 @@ impl RuntimeFilterDetailExpectation {
             "completed-channel" => Some(Self::CompletedChannel),
             "accepted-producer" => Some(Self::AcceptedProducer),
             "sent-acked-transport" => Some(Self::SentAckedTransport),
+            "delivered-consumer" => Some(Self::DeliveredConsumer),
             "delivered-applied-consumer" => Some(Self::DeliveredAppliedConsumer),
             _ => None,
         }
@@ -128,12 +130,13 @@ impl RuntimeFilterDetailExpectation {
             Self::CompletedChannel => "completed-channel",
             Self::AcceptedProducer => "accepted-producer",
             Self::SentAckedTransport => "sent-acked-transport",
+            Self::DeliveredConsumer => "delivered-consumer",
             Self::DeliveredAppliedConsumer => "delivered-applied-consumer",
         }
     }
 
     pub const fn valid_names() -> &'static str {
-        "completed-channel, accepted-producer, sent-acked-transport, delivered-applied-consumer"
+        "completed-channel, accepted-producer, sent-acked-transport, delivered-consumer, delivered-applied-consumer"
     }
 }
 
