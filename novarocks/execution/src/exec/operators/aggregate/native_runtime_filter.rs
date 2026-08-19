@@ -749,7 +749,7 @@ mod tests {
         let state = Arc::new(RecordingState::with_open_actions([]));
         let spec = binding(7, 2);
         let factory = AggregateTopNProducerSessionFactory::from_plan(
-            &[spec.clone()],
+            std::slice::from_ref(&spec),
             recording_session(Arc::clone(&state)),
             2,
         )
@@ -810,7 +810,7 @@ mod tests {
         let state = Arc::new(RecordingState::with_open_actions([]));
         let spec = binding(8, 2);
         let factory = AggregateTopNProducerSessionFactory::from_plan(
-            &[spec.clone()],
+            std::slice::from_ref(&spec),
             recording_session(Arc::clone(&state)),
             1,
         )
@@ -885,7 +885,7 @@ mod tests {
             let state = Arc::new(RecordingState::with_open_actions([action]));
             let spec = binding(10, 1);
             let factory = AggregateTopNProducerSessionFactory::from_plan(
-                &[spec.clone()],
+                std::slice::from_ref(&spec),
                 recording_session(Arc::clone(&state)),
                 1,
             )
@@ -1010,7 +1010,7 @@ mod tests {
             .push_back(SubmitAction::TerminalNoop);
         let spec = binding(15, 1);
         let factory = AggregateTopNProducerSessionFactory::from_plan(
-            &[spec.clone()],
+            std::slice::from_ref(&spec),
             recording_session(Arc::clone(&state)),
             1,
         )
