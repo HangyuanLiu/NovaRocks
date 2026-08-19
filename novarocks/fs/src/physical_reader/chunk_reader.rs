@@ -95,6 +95,21 @@ impl ReaderMetrics {
         self.delayed_materialization_ranges
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    pub(crate) fn record_page_index(&self, fallback: bool, rows_considered: u64, rows_pruned: u64) {
+        saturating_add(&self.page_index_attempts, 1);
+        if fallback {
+            saturating_add(&self.page_index_fallbacks, 1);
+        }
+        saturating_add(&self.page_index_rows_considered, rows_considered);
+        saturating_add(&self.page_index_rows_pruned, rows_pruned);
+    }
+}
+
+fn saturating_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
 }
 
 #[derive(Clone)]

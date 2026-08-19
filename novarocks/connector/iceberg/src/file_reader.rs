@@ -406,4 +406,20 @@ mod tests {
         assert_eq!(retagged.data_type(), &DataType::Binary);
         assert_eq!(retagged.to_data().buffers(), source.to_data().buffers());
     }
+
+    #[test]
+    fn projects_page_index_metrics_without_provider_metadata() {
+        let projected = connector_metrics(novarocks_fs::FileMetricsSnapshot {
+            page_index_attempts: 3,
+            page_index_fallbacks: 1,
+            page_index_rows_considered: 96,
+            page_index_rows_pruned: 64,
+            ..Default::default()
+        });
+
+        assert_eq!(projected.page_index_attempts, 3);
+        assert_eq!(projected.page_index_fallbacks, 1);
+        assert_eq!(projected.page_index_rows_considered, 96);
+        assert_eq!(projected.page_index_rows_pruned, 64);
+    }
 }

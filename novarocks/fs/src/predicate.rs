@@ -123,6 +123,26 @@ impl ScanPredicateDomain {
             }
         }
     }
+
+    /// Returns whether every literal in this domain can be compared to the
+    /// supplied physical bounds. Readers use this to distinguish a definite
+    /// page-index judgement from the conservative "keep" result returned by
+    /// [`Self::may_match_bounds`] for incomparable logical representations.
+    pub fn can_compare_bounds(
+        &self,
+        min: &MinMaxPredicateValue,
+        max: &MinMaxPredicateValue,
+    ) -> bool {
+        let comparable = |value: &MinMaxPredicateValue| {
+            compare(min, value).is_some() && compare(max, value).is_some()
+        };
+        match self {
+            Self::Range { value, .. } => comparable(value),
+            Self::DiscreteSet { values, .. } | Self::Membership { values } => {
+                values.iter().all(comparable)
+            }
+        }
+    }
 }
 
 fn compare(left: &MinMaxPredicateValue, right: &MinMaxPredicateValue) -> Option<Ordering> {

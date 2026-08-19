@@ -199,10 +199,7 @@ fn complete_profile(
             RUNTIME_FILTER_SCAN_UNIT_COUNTER_NAMES,
             "RuntimeFilterScanUnits",
         ),
-        (
-            CONNECTOR_FILE_ROW_GROUP_COUNTER_NAMES,
-            "ConnectorFileMetrics",
-        ),
+        (CONNECTOR_FILE_COUNTER_NAMES, "ConnectorFileMetrics"),
     ] {
         if let Some(counters) =
             crate::query_execution::profile::format_counter_sums_from_profile_trees(
@@ -288,10 +285,14 @@ const RUNTIME_FILTER_SCAN_UNIT_COUNTER_NAMES: &[&str] = &[
     "RuntimeFilterScanUnitsNotEvaluatedSnapshotTimedOut",
     "RuntimeFilterScanUnitsNotEvaluatedSnapshotNotPublished",
 ];
-const CONNECTOR_FILE_ROW_GROUP_COUNTER_NAMES: &[&str] = &[
+const CONNECTOR_FILE_COUNTER_NAMES: &[&str] = &[
     "ConnectorFileRowGroupsRead",
     "ConnectorFileRowGroupsPruned",
     "ConnectorUnitReadersOpened",
+    "ConnectorFilePageIndexAttempts",
+    "ConnectorFilePageIndexFallbacks",
+    "ConnectorFilePageIndexRowsConsidered",
+    "ConnectorFilePageIndexRowsPruned",
 ];
 
 fn format_distributed_profile_summary(
@@ -327,5 +328,24 @@ fn format_explain_analyze_duration(duration: std::time::Duration) -> String {
         format!("{ms:.1}ms")
     } else {
         format!("{:.2}s", duration.as_secs_f64())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn connector_file_summary_includes_page_index_effect_counters() {
+        assert_eq!(
+            super::CONNECTOR_FILE_COUNTER_NAMES,
+            [
+                "ConnectorFileRowGroupsRead",
+                "ConnectorFileRowGroupsPruned",
+                "ConnectorUnitReadersOpened",
+                "ConnectorFilePageIndexAttempts",
+                "ConnectorFilePageIndexFallbacks",
+                "ConnectorFilePageIndexRowsConsidered",
+                "ConnectorFilePageIndexRowsPruned",
+            ]
+        );
     }
 }

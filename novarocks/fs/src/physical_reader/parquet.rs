@@ -29,6 +29,7 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
 use parquet::basic::{SortOrder, Type as ParquetType};
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, RowGroupMetaData};
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::statistics::Statistics;
 
 use super::chunk_reader::{BoundChunkReader, ReaderMetrics};
@@ -247,7 +248,7 @@ pub fn inspect_parquet_metadata(
     );
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
     let metadata = if let Some(metadata) =
-        crate::cache::parquet_cache::metadata_get(cache_enabled, &identity)
+        crate::cache::parquet_cache::metadata_get(cache_enabled, &identity, false)
     {
         metadata
     } else {
@@ -519,15 +520,19 @@ impl ParquetPhysicalReader {
             crate::cache::parquet_cache::page_cache_enabled(cache_enabled),
             Arc::clone(&metrics),
         );
-        let page_index_policy = if request.pruning.pages.is_empty() {
+        let automatic_page_pruning =
+            request.options.enable_parquet_reader_page_index && !request.predicates.is_empty();
+        let page_index_policy = if request.pruning.pages.is_empty() && !automatic_page_pruning {
             PageIndexPolicy::Skip
         } else {
             PageIndexPolicy::Optional
         };
         let options = ArrowReaderOptions::new().with_page_index_policy(page_index_policy);
-        let arrow_metadata = if let Some(metadata) =
-            crate::cache::parquet_cache::metadata_get(cache_enabled, &identity)
-        {
+        let arrow_metadata = if let Some(metadata) = crate::cache::parquet_cache::metadata_get(
+            cache_enabled,
+            &identity,
+            page_index_policy != PageIndexPolicy::Skip,
+        ) {
             metadata
         } else {
             let metadata = ArrowReaderMetadata::load(&chunk_reader, options)
@@ -550,8 +555,22 @@ impl ParquetPhysicalReader {
             &request.predicates,
         );
         metrics.record_row_group_selection(metadata.num_row_groups(), row_groups.len());
-        let (selection, positions) =
-            page_selection(metadata.as_ref(), &row_groups, &request.pruning.pages)?;
+        let automatic_ranges = automatic_page_pruning
+            .then(|| automatic_page_ranges(metadata.as_ref(), &row_groups, &request.predicates))
+            .transpose()?;
+        if let Some(automatic) = automatic_ranges.as_ref() {
+            metrics.record_page_index(
+                automatic.fallback,
+                automatic.rows_considered,
+                automatic.rows_pruned,
+            );
+        }
+        let (selection, positions) = page_selection(
+            metadata.as_ref(),
+            &row_groups,
+            &request.pruning.pages,
+            automatic_ranges.as_ref().map(|ranges| &ranges.by_row_group),
+        )?;
         let selected_rows = positions.iter().map(|span| span.remaining).sum::<usize>();
         let row_group_rows = selected_row_count(metadata.as_ref(), &row_groups)?;
         let delayed = selection.as_ref().and_then(|_| {
@@ -935,8 +954,9 @@ fn page_selection(
     metadata: &ParquetMetaData,
     selected: &[usize],
     pages: &[crate::PhysicalPageSelection],
+    automatic_ranges: Option<&HashMap<usize, Vec<std::ops::Range<usize>>>>,
 ) -> FileResult<(Option<RowSelection>, VecDeque<PositionSpan>)> {
-    if pages.is_empty() {
+    if pages.is_empty() && automatic_ranges.is_none() {
         return Ok((None, row_position_spans(metadata, selected)?));
     }
 
@@ -945,12 +965,6 @@ fn page_selection(
         let entry = pages_by_row_group.entry(page.row_group).or_default();
         entry.extend(page.page_indices.iter().copied());
     }
-    let Some(offset_index) = metadata.offset_index() else {
-        return Err(FileError::unsupported(
-            "explicit Parquet page selection requires an offset index",
-        ));
-    };
-
     let first_rows = row_group_first_rows(metadata)?;
     let mut selected_ranges = Vec::new();
     let mut positions = VecDeque::new();
@@ -968,7 +982,13 @@ fn page_selection(
                 "negative or overflowing Parquet row-group row count",
             )
         })?;
-        let ranges = if let Some(selected_pages) = pages_by_row_group.get(&row_group_index) {
+        let explicit_ranges = if let Some(selected_pages) = pages_by_row_group.get(&row_group_index)
+        {
+            let Some(offset_index) = metadata.offset_index() else {
+                return Err(FileError::unsupported(
+                    "explicit Parquet page selection requires an offset index",
+                ));
+            };
             let page_locations = offset_index
                 .get(row_group_index)
                 .and_then(|columns| columns.first())
@@ -982,6 +1002,10 @@ fn page_selection(
         } else {
             std::iter::once(0..row_count).collect::<Vec<_>>()
         };
+        let ranges = automatic_ranges
+            .and_then(|ranges| ranges.get(&row_group_index))
+            .map(|automatic| intersect_ranges(&explicit_ranges, automatic))
+            .unwrap_or(explicit_ranges);
 
         for range in ranges {
             selected_ranges.push(selection_offset + range.start..selection_offset + range.end);
@@ -1002,6 +1026,352 @@ fn page_selection(
         )),
         positions,
     ))
+}
+
+#[derive(Debug)]
+struct AutomaticPageRanges {
+    by_row_group: HashMap<usize, Vec<std::ops::Range<usize>>>,
+    fallback: bool,
+    rows_considered: u64,
+    rows_pruned: u64,
+}
+
+/// Select row ranges from Parquet page indexes. This is deliberately an
+/// optional optimization: a missing, unsupported, or non-comparable page
+/// index leaves the whole row group selected. The only error path is malformed
+/// structural metadata after the Parquet library has declared a page index
+/// present, because continuing would make the reader's row-position contract
+/// ambiguous.
+fn automatic_page_ranges(
+    metadata: &ParquetMetaData,
+    selected: &[usize],
+    predicates: &[ScanPredicate],
+) -> FileResult<AutomaticPageRanges> {
+    let Some(column_indexes) = metadata.column_index() else {
+        return automatic_page_fallback(metadata, selected);
+    };
+    let Some(offset_indexes) = metadata.offset_index() else {
+        return automatic_page_fallback(metadata, selected);
+    };
+
+    let mut by_row_group = HashMap::new();
+    let mut fallback = false;
+    let mut rows_considered = 0u64;
+    let mut rows_pruned = 0u64;
+    for &row_group_index in selected {
+        let row_group = metadata.row_groups().get(row_group_index).ok_or_else(|| {
+            FileError::invalid(format!(
+                "Parquet row-group selection is out of bounds: {row_group_index}"
+            ))
+        })?;
+        let row_count = usize::try_from(row_group.num_rows()).map_err(|_| {
+            FileError::new(
+                FileErrorKind::Corrupt,
+                format!(
+                    "Parquet row group {row_group_index} has a negative or overflowing row count"
+                ),
+            )
+        })?;
+        rows_considered = rows_considered.saturating_add(row_count as u64);
+        let full = std::iter::once(0..row_count).collect::<Vec<_>>();
+        let mut candidate = full.clone();
+        let mut row_group_fallback = false;
+
+        for predicate in predicates {
+            let Some(column_ordinal) = predicate_column_ordinal(row_group, predicate) else {
+                row_group_fallback = true;
+                break;
+            };
+            let column_index = page_index_cell(
+                column_indexes,
+                row_group_index,
+                column_ordinal,
+                "column index",
+                row_group,
+            )?;
+            let offset_index = page_index_cell(
+                offset_indexes,
+                row_group_index,
+                column_ordinal,
+                "offset index",
+                row_group,
+            )?;
+            let Some(predicate_ranges) = predicate_page_ranges(
+                row_group_index,
+                row_count,
+                column_index,
+                offset_index.page_locations(),
+                predicate,
+                row_group,
+            )?
+            else {
+                row_group_fallback = true;
+                break;
+            };
+            if predicate_ranges.is_empty() {
+                // A file-level page index is advisory. Even when every page
+                // appears disjoint, retain a conservative path for writers
+                // with incomplete page-index coverage.
+                row_group_fallback = true;
+                break;
+            }
+            candidate = intersect_ranges(&candidate, &predicate_ranges);
+            if candidate.is_empty() {
+                row_group_fallback = true;
+                break;
+            }
+        }
+
+        if row_group_fallback {
+            fallback = true;
+            by_row_group.insert(row_group_index, full);
+        } else {
+            let selected_rows = range_len(&candidate);
+            rows_pruned = rows_pruned.saturating_add(
+                u64::try_from(row_count.saturating_sub(selected_rows)).unwrap_or(u64::MAX),
+            );
+            by_row_group.insert(row_group_index, candidate);
+        }
+    }
+    Ok(AutomaticPageRanges {
+        by_row_group,
+        fallback,
+        rows_considered,
+        rows_pruned,
+    })
+}
+
+fn automatic_page_fallback(
+    metadata: &ParquetMetaData,
+    selected: &[usize],
+) -> FileResult<AutomaticPageRanges> {
+    let mut by_row_group = HashMap::new();
+    let mut rows_considered = 0u64;
+    for &row_group_index in selected {
+        let row_group = metadata.row_groups().get(row_group_index).ok_or_else(|| {
+            FileError::invalid(format!(
+                "Parquet row-group selection is out of bounds: {row_group_index}"
+            ))
+        })?;
+        let row_count = usize::try_from(row_group.num_rows()).map_err(|_| {
+            FileError::new(
+                FileErrorKind::Corrupt,
+                format!(
+                    "Parquet row group {row_group_index} has a negative or overflowing row count"
+                ),
+            )
+        })?;
+        rows_considered = rows_considered.saturating_add(row_count as u64);
+        by_row_group.insert(
+            row_group_index,
+            std::iter::once(0..row_count).collect::<Vec<_>>(),
+        );
+    }
+    Ok(AutomaticPageRanges {
+        by_row_group,
+        fallback: true,
+        rows_considered,
+        rows_pruned: 0,
+    })
+}
+
+fn predicate_column_ordinal(
+    row_group: &RowGroupMetaData,
+    predicate: &ScanPredicate,
+) -> Option<usize> {
+    predicate
+        .physical_field_id()
+        .and_then(|field_id| {
+            row_group.columns().iter().position(|column| {
+                let info = column.column_descr().self_type().get_basic_info();
+                info.has_id() && info.id() == field_id
+            })
+        })
+        // File writers occasionally omit a field ID even where a table schema
+        // has one. A full physical path match is still a safe fallback; do not
+        // use a leaf-only or root-only comparison that could bind a nested
+        // column with the same name.
+        .or_else(|| {
+            row_group
+                .columns()
+                .iter()
+                .position(|column| column.column_path().parts().join(".") == predicate.column())
+        })
+}
+
+fn page_index_cell<'a, T>(
+    indexes: &'a [Vec<T>],
+    row_group_index: usize,
+    column_ordinal: usize,
+    kind: &str,
+    row_group: &RowGroupMetaData,
+) -> FileResult<&'a T> {
+    indexes
+        .get(row_group_index)
+        .and_then(|columns| columns.get(column_ordinal))
+        .ok_or_else(|| {
+            let path = row_group
+                .columns()
+                .get(column_ordinal)
+                .map(|column| column.column_path().parts().join("."))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            FileError::new(
+                FileErrorKind::Corrupt,
+                format!(
+                    "Parquet {kind} is structurally incomplete for row group {row_group_index}, column chunk {column_ordinal} ({path})"
+                ),
+            )
+        })
+}
+
+fn predicate_page_ranges(
+    row_group_index: usize,
+    row_count: usize,
+    column_index: &ColumnIndexMetaData,
+    page_locations: &[parquet::file::page_index::offset_index::PageLocation],
+    predicate: &ScanPredicate,
+    row_group: &RowGroupMetaData,
+) -> FileResult<Option<Vec<std::ops::Range<usize>>>> {
+    if matches!(column_index, ColumnIndexMetaData::NONE) {
+        return Ok(None);
+    }
+    let page_count = usize::try_from(column_index.num_pages()).map_err(|_| {
+        FileError::new(
+            FileErrorKind::Corrupt,
+            format!("Parquet page count overflows usize in row group {row_group_index}"),
+        )
+    })?;
+    if page_count != page_locations.len() {
+        return Err(FileError::new(
+            FileErrorKind::Corrupt,
+            format!(
+                "Parquet page-index cardinality mismatch in row group {row_group_index}, column chunk {} ({})",
+                predicate_column_ordinal(row_group, predicate).unwrap_or_default(),
+                predicate.column(),
+            ),
+        ));
+    }
+    let mut ranges = Vec::new();
+    for page_index in 0..page_count {
+        let Some((min, max)) = page_index_bounds(column_index, page_index) else {
+            return Ok(None);
+        };
+        if !predicate.domain().can_compare_bounds(&min, &max) {
+            return Ok(None);
+        }
+        if predicate.domain().may_match_bounds(&min, &max) {
+            ranges.push(page_range(
+                row_group_index,
+                row_count,
+                page_locations,
+                page_index,
+                predicate.column(),
+            )?);
+        }
+    }
+    Ok(Some(merge_ranges(ranges)))
+}
+
+fn page_index_bounds(
+    column_index: &ColumnIndexMetaData,
+    page_index: usize,
+) -> Option<(MinMaxPredicateValue, MinMaxPredicateValue)> {
+    match column_index {
+        ColumnIndexMetaData::BOOLEAN(index) => Some((
+            MinMaxPredicateValue::Boolean(*index.min_value(page_index)?),
+            MinMaxPredicateValue::Boolean(*index.max_value(page_index)?),
+        )),
+        ColumnIndexMetaData::INT32(index) => Some((
+            MinMaxPredicateValue::Int32(*index.min_value(page_index)?),
+            MinMaxPredicateValue::Int32(*index.max_value(page_index)?),
+        )),
+        ColumnIndexMetaData::INT64(index) => Some((
+            MinMaxPredicateValue::Int64(*index.min_value(page_index)?),
+            MinMaxPredicateValue::Int64(*index.max_value(page_index)?),
+        )),
+        _ => None,
+    }
+}
+
+fn page_range(
+    row_group_index: usize,
+    row_count: usize,
+    locations: &[parquet::file::page_index::offset_index::PageLocation],
+    page_index: usize,
+    column: &str,
+) -> FileResult<std::ops::Range<usize>> {
+    let start = usize::try_from(locations[page_index].first_row_index).map_err(|_| {
+        FileError::new(
+            FileErrorKind::Corrupt,
+            format!(
+                "Parquet page first-row index is negative in row group {row_group_index}, column {column}"
+            ),
+        )
+    })?;
+    let end = locations
+        .get(page_index + 1)
+        .map(|location| usize::try_from(location.first_row_index))
+        .transpose()
+        .map_err(|_| {
+            FileError::new(
+                FileErrorKind::Corrupt,
+                format!(
+                    "Parquet page first-row index is negative in row group {row_group_index}, column {column}"
+                ),
+            )
+        })?
+        .unwrap_or(row_count);
+    if start >= end || end > row_count {
+        return Err(FileError::new(
+            FileErrorKind::Corrupt,
+            format!(
+                "Parquet page row range is invalid in row group {row_group_index}, column {column}"
+            ),
+        ));
+    }
+    Ok(start..end)
+}
+
+fn intersect_ranges(
+    left: &[std::ops::Range<usize>],
+    right: &[std::ops::Range<usize>],
+) -> Vec<std::ops::Range<usize>> {
+    let mut result = Vec::new();
+    let (mut left_index, mut right_index) = (0, 0);
+    while left_index < left.len() && right_index < right.len() {
+        let start = left[left_index].start.max(right[right_index].start);
+        let end = left[left_index].end.min(right[right_index].end);
+        if start < end {
+            result.push(start..end);
+        }
+        if left[left_index].end <= right[right_index].end {
+            left_index += 1;
+        } else {
+            right_index += 1;
+        }
+    }
+    result
+}
+
+fn merge_ranges(mut ranges: Vec<std::ops::Range<usize>>) -> Vec<std::ops::Range<usize>> {
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged = Vec::<std::ops::Range<usize>>::new();
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && previous.end >= range.start
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+fn range_len(ranges: &[std::ops::Range<usize>]) -> usize {
+    ranges.iter().fold(0usize, |total, range| {
+        total.saturating_add(range.end.saturating_sub(range.start))
+    })
 }
 
 fn row_group_first_rows(metadata: &ParquetMetaData) -> FileResult<Vec<u64>> {
@@ -1084,17 +1454,8 @@ fn explicit_page_ranges(
 
 fn row_group_may_match(row_group: &RowGroupMetaData, predicates: &[ScanPredicate]) -> bool {
     predicates.iter().all(|predicate| {
-        let column = row_group.columns().iter().find(|column| {
-            if let Some(field_id) = predicate.physical_field_id() {
-                let info = column.column_descr().self_type().get_basic_info();
-                return info.has_id() && info.id() == field_id;
-            }
-            column
-                .column_path()
-                .parts()
-                .first()
-                .is_some_and(|name| name == predicate.column())
-        });
+        let column = predicate_column_ordinal(row_group, predicate)
+            .and_then(|ordinal| row_group.columns().get(ordinal));
         let Some(statistics) = column.and_then(|column| column.statistics()) else {
             return true;
         };

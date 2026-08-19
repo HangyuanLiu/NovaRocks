@@ -311,11 +311,18 @@ impl ConnectorBatchReader for MetricsReader {
                 self.metrics.read_requests = 1;
                 self.metrics.rows_decoded = 1;
                 self.metrics.batches_delivered = 1;
+                self.metrics.page_index_attempts = 1;
+                self.metrics.page_index_rows_considered = 8;
+                self.metrics.page_index_rows_pruned = 4;
                 Ok(Some(batch()))
             }
             2 => {
                 self.metrics.bytes_read = 25;
                 self.metrics.read_requests = 2;
+                self.metrics.page_index_attempts = 2;
+                self.metrics.page_index_fallbacks = 1;
+                self.metrics.page_index_rows_considered = 16;
+                self.metrics.page_index_rows_pruned = 12;
                 Ok(None)
             }
             _ => unreachable!("metrics reader reached terminal state"),
@@ -347,6 +354,101 @@ fn file_read_profile_receives_metrics_deltas_once() {
     assert_eq!(
         profile.counter_value("ConnectorFileBatchesDelivered"),
         Some(1)
+    );
+    assert_eq!(
+        profile.counter_value("ConnectorFilePageIndexAttempts"),
+        Some(2)
+    );
+    assert_eq!(
+        profile.counter_value("ConnectorFilePageIndexFallbacks"),
+        Some(1)
+    );
+    assert_eq!(
+        profile.counter_value("ConnectorFilePageIndexRowsConsidered"),
+        Some(16)
+    );
+    assert_eq!(
+        profile.counter_value("ConnectorFilePageIndexRowsPruned"),
+        Some(12)
+    );
+}
+
+struct ResettingMetricsReader {
+    step: usize,
+    metrics: ConnectorReaderMetricsSnapshot,
+}
+
+impl ConnectorBatchReader for ResettingMetricsReader {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
+        self.step += 1;
+        self.metrics = match self.step {
+            1 => ConnectorReaderMetricsSnapshot {
+                page_index_attempts: 9,
+                page_index_fallbacks: 4,
+                page_index_rows_considered: 90,
+                page_index_rows_pruned: 45,
+                ..Default::default()
+            },
+            // A provider snapshot reset must not make an unsigned counter wrap
+            // or repeat values already reported to the runtime profile.
+            2 => ConnectorReaderMetricsSnapshot {
+                page_index_attempts: 5,
+                page_index_fallbacks: 2,
+                page_index_rows_considered: 50,
+                page_index_rows_pruned: 25,
+                ..Default::default()
+            },
+            3 => ConnectorReaderMetricsSnapshot {
+                page_index_attempts: 7,
+                page_index_fallbacks: 3,
+                page_index_rows_considered: 70,
+                page_index_rows_pruned: 35,
+                ..Default::default()
+            },
+            _ => unreachable!("resetting metrics reader reached terminal state"),
+        };
+        match self.step {
+            1 | 2 => Ok(Some(batch())),
+            3 => Ok(None),
+            _ => unreachable!("terminal state handled above"),
+        }
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
+    fn metrics_snapshot(&self) -> ConnectorReaderMetricsSnapshot {
+        self.metrics
+    }
+}
+
+#[test]
+fn file_read_profile_handles_reset_page_index_snapshots_without_wraparound() {
+    let profile = novarocks_execution::runtime::profile::RuntimeProfile::new("file-read");
+    let reader = ResettingMetricsReader {
+        step: 0,
+        metrics: ConnectorReaderMetricsSnapshot::default(),
+    };
+    ConnectorBatchReaderIter::with_profile(Box::new(reader), chunk_schema(), Some(profile.clone()))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("consume resetting metric reader");
+
+    assert_eq!(
+        profile.counter_value("ConnectorFilePageIndexAttempts"),
+        Some(11)
+    );
+    assert_eq!(
+        profile.counter_value("ConnectorFilePageIndexFallbacks"),
+        Some(5)
+    );
+    assert_eq!(
+        profile.counter_value("ConnectorFilePageIndexRowsConsidered"),
+        Some(110)
+    );
+    assert_eq!(
+        profile.counter_value("ConnectorFilePageIndexRowsPruned"),
+        Some(55)
     );
 }
 

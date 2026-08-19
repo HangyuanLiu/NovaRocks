@@ -394,6 +394,155 @@ fn parquet_honors_explicit_page_selection_and_positions() {
 }
 
 #[test]
+fn parquet_predicate_page_index_prunes_rows_and_records_effect() {
+    let fixture = Fixture::parquet();
+    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    request.options.enable_parquet_reader_page_index = true;
+    request.pruning.row_groups = Some(vec![0]);
+    request.predicates.push(ScanPredicate::new(
+        "id",
+        ScanPredicateDomain::Range {
+            op: MinMaxPredicateOp::Ge,
+            value: MinMaxPredicateValue::Int32(2),
+        },
+        ScanPredicateSource::Static,
+    ));
+
+    let mut reader = open_file_reader(request).expect("open page-index reader");
+    let batches = collect(reader.as_mut()).expect("read pruned pages");
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.batch.num_rows())
+            .sum::<usize>(),
+        2
+    );
+    assert_eq!(
+        batches[0].physical_row_positions.as_ref().unwrap().values(),
+        &[2, 3]
+    );
+    let metrics = reader.metrics_snapshot();
+    assert_eq!(metrics.page_index_attempts, 1);
+    assert_eq!(metrics.page_index_fallbacks, 0);
+    assert_eq!(metrics.page_index_rows_considered, 4);
+    assert_eq!(metrics.page_index_rows_pruned, 2);
+}
+
+#[test]
+fn parquet_predicate_page_index_falls_back_for_incomparable_bounds() {
+    let fixture = Fixture::parquet();
+    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    request.options.enable_parquet_reader_page_index = true;
+    request.pruning.row_groups = Some(vec![0]);
+    request.predicates.push(ScanPredicate::new(
+        "id",
+        ScanPredicateDomain::Range {
+            op: MinMaxPredicateOp::Ge,
+            value: MinMaxPredicateValue::Int64(2),
+        },
+        ScanPredicateSource::Static,
+    ));
+
+    let mut reader = open_file_reader(request).expect("open page-index reader");
+    let batches = collect(reader.as_mut()).expect("read fallback pages");
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.batch.num_rows())
+            .sum::<usize>(),
+        4,
+        "incomparable page bounds must preserve the whole row group"
+    );
+    let metrics = reader.metrics_snapshot();
+    assert_eq!(metrics.page_index_attempts, 1);
+    assert_eq!(metrics.page_index_fallbacks, 1);
+    assert_eq!(metrics.page_index_rows_considered, 4);
+    assert_eq!(metrics.page_index_rows_pruned, 0);
+}
+
+#[test]
+fn parquet_predicate_page_index_uses_name_when_the_requested_field_id_is_missing() {
+    let fixture = Fixture::parquet();
+    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    request.options.enable_parquet_reader_page_index = true;
+    request.pruning.row_groups = Some(vec![0]);
+    request.predicates.push(
+        ScanPredicate::new(
+            "id",
+            ScanPredicateDomain::Range {
+                op: MinMaxPredicateOp::Ge,
+                value: MinMaxPredicateValue::Int32(2),
+            },
+            ScanPredicateSource::Static,
+        )
+        .with_physical_field_id(999),
+    );
+
+    let mut reader = open_file_reader(request).expect("open page-index reader");
+    let batches = collect(reader.as_mut()).expect("read pruned pages");
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.batch.num_rows())
+            .sum::<usize>(),
+        2
+    );
+    assert_eq!(reader.metrics_snapshot().page_index_fallbacks, 0);
+}
+
+#[test]
+fn parquet_page_index_read_does_not_reuse_a_footer_only_metadata_cache_entry() {
+    let _ = DataCacheManager::instance().init_page_cache(DataCachePageCacheOptions {
+        capacity: 1024 * 1024,
+        evict_probability: 100,
+    });
+    let fixture = Fixture::parquet();
+    let cache = DataCacheManager::instance().external_context(CacheOptions {
+        enable_scan_datacache: true,
+        enable_populate_datacache: true,
+        enable_datacache_async_populate_mode: false,
+        enable_datacache_io_adaptor: false,
+        enable_cache_select: false,
+        datacache_evict_probability: 100,
+        datacache_priority: 0,
+        datacache_ttl_seconds: 0,
+        datacache_sharing_work_period: None,
+    });
+    let inspection = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    inspect_parquet_metadata(
+        fixture.file.clone(),
+        Some(cache.clone()),
+        inspection.context,
+    )
+    .expect("populate footer-only metadata cache entry");
+
+    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    request.cache = Some(cache);
+    request.options.enable_parquet_reader_page_index = true;
+    request.pruning.row_groups = Some(vec![0]);
+    request.predicates.push(ScanPredicate::new(
+        "id",
+        ScanPredicateDomain::Range {
+            op: MinMaxPredicateOp::Ge,
+            value: MinMaxPredicateValue::Int32(2),
+        },
+        ScanPredicateSource::Static,
+    ));
+    let mut reader = open_file_reader(request).expect("reload page-index-capable metadata");
+    let batches = collect(reader.as_mut()).expect("read page-index selection");
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.batch.num_rows())
+            .sum::<usize>(),
+        2
+    );
+    let metrics = reader.metrics_snapshot();
+    assert_eq!(metrics.page_index_fallbacks, 0);
+    assert_eq!(metrics.page_index_rows_pruned, 2);
+}
+
+#[test]
 fn parquet_enforces_row_budget() {
     let fixture = Fixture::parquet();
     let mut reader =
