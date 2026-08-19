@@ -814,7 +814,21 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         let over = if self.current_is_keyword(Keyword::Over) {
             self.advance();
             self.skip_trivia();
-            Some(Box::new(self.parse_window_spec()?))
+            if matches!(
+                self.current().map(|token| &token.kind),
+                Some(TokenKind::Ident | TokenKind::QuotedIdent)
+            ) {
+                let name = self.parse_identifier(self.current_span());
+                Some(Box::new(WindowSpec {
+                    span: name.span,
+                    existing_window_name: Some(name),
+                    partition_by: Vec::new(),
+                    order_by: Vec::new(),
+                    window_frame: None,
+                }))
+            } else {
+                Some(Box::new(self.parse_window_spec()?))
+            }
         } else {
             None
         };
@@ -1119,6 +1133,20 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             .and_then(|text| text.strip_suffix(quote))
             .unwrap_or(text);
         unescape_string(body, quote)
+    }
+}
+
+/// Parses exactly one parenthesized window specification from a query-clause
+/// token slice. Named `WINDOW name AS (...)` definitions and function `OVER
+/// (...)` deliberately share the same syntax production.
+pub(super) fn parse_window_spec(source: &str, tokens: &[Token]) -> Result<WindowSpec, ParseError> {
+    let mut parser = PrattParser::new(source, tokens);
+    let specification = parser.parse_window_spec()?;
+    parser.skip_trivia();
+    if parser.is_end() {
+        Ok(specification)
+    } else {
+        Err(parser.unexpected("end of window specification"))
     }
 }
 

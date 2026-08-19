@@ -21,14 +21,17 @@ use crate::{
     Span, Token, TokenKind,
     ast::{
         Cte, ExplainFormat, ExplainQuery, Expr, Fetch, GroupBy, Join, JoinConstraint, JoinOperator,
-        Offset, OffsetRows, OrderByExpr, Query, Select, SelectItem, SelectQuantifier, SetExpr,
-        SetOperation, SetOperator, SetQuantifier, Statement, TableFactor, TableWithJoins, Values,
-        WildcardOptions, With,
+        NamedWindow, Offset, OffsetRows, OrderByExpr, Query, Select, SelectItem, SelectQuantifier,
+        SetExpr, SetOperation, SetOperator, SetQuantifier, Statement, TableFactor, TableWithJoins,
+        Values, WildcardOptions, With,
     },
     token::{Keyword, Symbol},
 };
 
-use super::{StatementParser, pratt::PrattParser};
+use super::{
+    StatementParser,
+    pratt::{PrattParser, parse_window_spec},
+};
 
 pub(super) fn parse(
     parser: &mut StatementParser<'_, '_>,
@@ -282,15 +285,25 @@ fn parse_select(parser: &mut StatementParser<'_, '_>) -> Result<Select, crate::P
     } else {
         None
     };
+    let windows = if parser.consume_if_word("WINDOW") {
+        parse_named_windows(parser)?
+    } else {
+        Vec::new()
+    };
     let end = qualify
         .as_ref()
         .or(having.as_ref())
         .or(selection.as_ref())
         .map_or_else(
             || {
-                from.last().map_or_else(
-                    || projection.last().map_or(start, |item| item.span().end()),
-                    |relation| relation.span.end(),
+                windows.last().map_or_else(
+                    || {
+                        from.last().map_or_else(
+                            || projection.last().map_or(start, |item| item.span().end()),
+                            |relation| relation.span.end(),
+                        )
+                    },
+                    |window| window.span.end(),
                 )
             },
             |expr| expr.span().end(),
@@ -303,9 +316,70 @@ fn parse_select(parser: &mut StatementParser<'_, '_>) -> Result<Select, crate::P
         group_by,
         having,
         qualify,
-        windows: Vec::new(),
+        windows,
         span: Span::new(start, end),
     })
+}
+
+fn parse_named_windows(
+    parser: &mut StatementParser<'_, '_>,
+) -> Result<Vec<NamedWindow>, crate::ParseError> {
+    let mut windows = Vec::new();
+    loop {
+        let name = parser.parse_ident()?;
+        let start = name.span.start();
+        parser.consume_word("AS")?;
+        let specification = parse_window_spec_until(parser)?;
+        let span = Span::new(start, specification.span.end());
+        windows.push(NamedWindow {
+            name,
+            specification,
+            span,
+        });
+        if !parser.consume_if_symbol(Symbol::Comma) {
+            break;
+        }
+    }
+    Ok(windows)
+}
+
+fn parse_window_spec_until(
+    parser: &mut StatementParser<'_, '_>,
+) -> Result<crate::ast::WindowSpec, crate::ParseError> {
+    if !parser.current_is_symbol(Symbol::LParen) {
+        return Err(parser.unexpected("'(' after WINDOW name AS"));
+    }
+    let begin = parser.position;
+    let mut end = begin;
+    let mut nesting = 0usize;
+    while let Some(token) = parser.tokens.get(end) {
+        match token.kind {
+            TokenKind::Symbol(Symbol::LParen) => nesting += 1,
+            TokenKind::Symbol(Symbol::RParen) => {
+                nesting = nesting.saturating_sub(1);
+                if nesting == 0 {
+                    end += 1;
+                    break;
+                }
+            }
+            TokenKind::End => return Err(parser.unexpected("')' after WINDOW specification")),
+            _ => {}
+        }
+        end += 1;
+    }
+    if nesting != 0 {
+        return Err(parser.unexpected("')' after WINDOW specification"));
+    }
+    let boundary = parser
+        .tokens
+        .get(end)
+        .map_or_else(|| parser.current_span(), |token| token.span);
+    let mut tokens = parser.tokens[begin..end].to_vec();
+    tokens.push(Token::new(TokenKind::End, boundary));
+    let specification = parse_window_spec(parser.source, &tokens)?;
+    parser.position = end;
+    parser.skip_trivia();
+    Ok(specification)
 }
 
 fn parse_projection(
@@ -769,6 +843,7 @@ fn query_clause_words() -> &'static [&'static str] {
         "GROUP",
         "HAVING",
         "QUALIFY",
+        "WINDOW",
         "ORDER",
         "LIMIT",
         "OFFSET",
@@ -790,6 +865,7 @@ fn join_or_query_clause_words() -> &'static [&'static str] {
         "GROUP",
         "HAVING",
         "QUALIFY",
+        "WINDOW",
         "ORDER",
         "LIMIT",
         "OFFSET",

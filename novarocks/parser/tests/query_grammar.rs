@@ -25,6 +25,7 @@ fn query_forms_parse_and_print_as_typed_syntax() {
         "SELECT a, count(*) AS n FROM db.t AS t WHERE a >= 1 GROUP BY a HAVING count(*) > 0 ORDER BY a DESC LIMIT 5 OFFSET 2 ROWS FETCH FIRST 1 ROW ONLY",
         "SELECT CASE WHEN a IS NULL THEN CAST(0 AS INT) ELSE CAST(a AS INT) END AS normalized FROM t WHERE a NOT BETWEEN 1 AND 3",
         "SELECT sum(v) OVER (PARTITION BY k ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        "SELECT sum(v) OVER w FROM t WINDOW w AS (PARTITION BY k ORDER BY ts ROWS 1 PRECEDING)",
         "SELECT k, sum(v) FROM t GROUP BY GROUPING SETS ((), (k)) ORDER BY k",
         "SELECT k, sum(v) FROM t GROUP BY ROLLUP(k) UNION ALL SELECT k, sum(v) FROM t GROUP BY CUBE(k)",
         "SELECT u.x FROM t CROSS JOIN LATERAL UNNEST(t.arr) AS u(x)",
