@@ -59,6 +59,7 @@ static EXECUTION_CONSTANT_EVALUATOR: ExecutionConstantEvaluator = ExecutionConst
 /// execution kernels, so it owns this adapter. Every compile request built here
 /// passes it, which is what lets the optimizer fold constants with exactly the
 /// semantics the runtime would have produced.
+// Design: ADR-0090 (docs/adr/ADR-0090-constant-folding-reuses-execution-kernels-through-an-injected-port.md)
 pub(crate) fn constant_evaluator() -> &'static dyn SqlConstantEvaluator {
     &EXECUTION_CONSTANT_EVALUATOR
 }

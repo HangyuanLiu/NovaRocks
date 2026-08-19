@@ -245,6 +245,7 @@ pub struct FoldRequest {
 /// - `Err(_)` — evaluation failed. Callers keep the original expression and
 ///   must never surface this as a planning error, because the runtime is
 ///   still allowed to produce a value or its own error for that expression.
+// Design: ADR-0090 (docs/adr/ADR-0090-constant-folding-reuses-execution-kernels-through-an-injected-port.md)
 pub trait SqlConstantEvaluator: Send + Sync {
     fn eval_scalar(&self, request: &FoldRequest) -> Result<Option<LiteralValue>, String>;
 }

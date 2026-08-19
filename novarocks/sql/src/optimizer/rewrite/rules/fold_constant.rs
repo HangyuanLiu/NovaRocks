@@ -163,6 +163,7 @@ fn is_wire_encodable_literal_type(data_type: &DataType) -> bool {
     ) || novarocks_types::largeint::is_largeint_data_type(data_type)
 }
 
+// Design: ADR-0090 (docs/adr/ADR-0090-constant-folding-reuses-execution-kernels-through-an-injected-port.md)
 pub(crate) struct FoldConstant;
 
 impl LogicalRewriteRule for FoldConstant {
