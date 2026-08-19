@@ -22,6 +22,7 @@ use crate::optimizer::rewrite::rule::LogicalRewriteRule;
 pub(crate) mod aggregate_pushdown;
 pub(crate) mod column_pruning;
 pub(crate) mod derive_join_not_null;
+pub(crate) mod fold_constant;
 pub(crate) mod predicate_pushdown;
 pub(crate) mod ranking_window_predicate_pushdown;
 pub(crate) mod subquery;
@@ -56,6 +57,13 @@ pub(crate) fn variant_path_pushdown_rules() -> Vec<Box<dyn LogicalRewriteRule>> 
     vec![Box::new(variant_path_pushdown::VariantPathPushdownRule)]
 }
 
+/// Constant folding. Runs in `LogicalNormalize` before any structural
+/// rewrite so a `Cast(Literal)` has already collapsed into a bare literal by
+/// the time predicate pushdown extracts static predicates.
+pub(crate) fn fold_constant_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
+    vec![Box::new(fold_constant::FoldConstant)]
+}
+
 pub(crate) fn union_distinct_normalize_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     vec![Box::new(
         union_distinct_to_aggregate::UnionDistinctToAggregate,
@@ -68,6 +76,7 @@ pub(crate) fn union_distinct_normalize_rules() -> Vec<Box<dyn LogicalRewriteRule
 pub(crate) fn all_query_rewrite_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     let mut all = Vec::new();
     all.extend(union_distinct_normalize_rules());
+    all.extend(fold_constant_rules());
     all.extend(predicate_pushdown_rules());
     all.extend(predicate_move_around_rules());
     all.extend(column_pruning_rules());
@@ -87,8 +96,8 @@ mod tests {
         // 16 v2 pruning rules + 2 ukfk + 1 VariantPathPushdown
         // + 1 AggregatePushdown + 5 predicate pushdown rules
         // + 1 predicate move-around rule + 1 DeriveJoinNotNullPredicate
-        // + 1 UnionDistinctToAggregate = 28
-        assert_eq!(rules.len(), 28);
+        // + 1 UnionDistinctToAggregate + 1 FoldConstant = 29
+        assert_eq!(rules.len(), 29);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();
         assert_eq!(
@@ -97,6 +106,7 @@ mod tests {
                 "AggregatePushdown",
                 "DeriveJoinNotNullPredicate",
                 "EliminateUniqueAggregate",
+                "FoldConstant",
                 "JoinPredicateMoveAround",
                 "PruneAggregateColumns",
                 "PruneCTEAnchorColumns",

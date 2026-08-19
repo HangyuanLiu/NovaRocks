@@ -35,6 +35,14 @@ pub(crate) fn query_rewrite_pipeline() -> RewritePipeline {
             RewritePhase::LogicalNormalize,
             rules::union_distinct_normalize_rules(),
         ),
+        // Constant folding must precede every structural rewrite: predicate
+        // pushdown's static-predicate extraction only sees a bare literal if
+        // `Cast(Literal)` has already collapsed by then.
+        RewriteStage::new(
+            "ConstantFold",
+            RewritePhase::LogicalNormalize,
+            rules::fold_constant_rules(),
+        ),
         RewriteStage::new(
             "SubqueryRewrite",
             RewritePhase::StructuralRewrite,
@@ -137,6 +145,7 @@ mod tests {
             pipeline.stage_names(),
             vec![
                 "UnionDistinctNormalize",
+                "ConstantFold",
                 "SubqueryRewrite",
                 "PredicatePushdownPreJoin",
                 "PredicatePushdownPostJoin",
@@ -162,6 +171,7 @@ mod tests {
                 "DeriveJoinNotNullPredicate",
                 "EliminateUniqueAggregate",
                 "ExistentialApplyToJoin",
+                "FoldConstant",
                 "JoinPredicateMoveAround",
                 "PruneAggregateColumns",
                 "PruneCTEAnchorColumns",
@@ -253,6 +263,8 @@ mod tests {
         // Ranking window predicate pushdown skeleton (Tasks 4.1+4.2).
         assert!(is_known_rewrite_rule_name("RankingWindowPredicatePushdown"));
         assert!(is_known_rewrite_rule_name("UnionDistinctToAggregate"));
+        // Constant folding (LogicalNormalize, before any structural rewrite).
+        assert!(is_known_rewrite_rule_name("FoldConstant"));
     }
 
     fn assert_default_phase_trace(ctx: &RewriteContext) {

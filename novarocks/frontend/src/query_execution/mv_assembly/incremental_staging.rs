@@ -302,7 +302,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                     },
                     catalog: &catalog,
                     functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
-                    constant_evaluator: novarocks_sql::compiler::noop_constant_evaluator(),
+                    constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
                     control: novarocks_sql::compiler::SqlCompileControl::new(
                         execution.deadline(),
                         crate::query_execution::planning::sql_cancellation_observation(
@@ -404,7 +404,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                     },
                     catalog: &catalog,
                     functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
-                    constant_evaluator: novarocks_sql::compiler::noop_constant_evaluator(),
+                    constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
                     control: novarocks_sql::compiler::SqlCompileControl::new(
                         execution.deadline(),
                         crate::query_execution::planning::sql_cancellation_observation(
