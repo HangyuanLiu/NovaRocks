@@ -24,6 +24,7 @@ mod fault_injection;
 mod fenced_catalog;
 mod iceberg_orphan_fixture;
 mod parser;
+mod query_parser_differential;
 mod results;
 mod runner;
 mod session;
@@ -389,6 +390,12 @@ struct Cli {
     /// Print the deterministic manifest derived from @nova_extension annotations and exit.
     #[arg(long, action = ArgAction::SetTrue)]
     list_extensions: bool,
+
+    /// Compare parser-owned Query syntax with the current production raw SQL AST.
+    /// This mode reads SQL cases only and exits before any runtime prerequisite,
+    /// fixture, cluster, or MySQL connection is created.
+    #[arg(long, action = ArgAction::SetTrue)]
+    query_parser_differential: bool,
 
     #[arg(long)]
     config: Option<String>,
@@ -3630,8 +3637,6 @@ fn run() -> Result<i32> {
     let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
     let mut runner_config = load_runner_config(config_path.as_deref())?;
 
-    ensure_iceberg_object_store_prereqs(&runner_config)?;
-
     let suite_names = match select_suite_names(
         cli.suite
             .as_deref()
@@ -3644,6 +3649,25 @@ fn run() -> Result<i32> {
             return Ok(1);
         }
     };
+    if cli.query_parser_differential {
+        let summary = query_parser_differential::run(
+            &base_dir,
+            &runner_config,
+            &suite_names,
+            &suite_configs,
+            query_parser_differential::Options {
+                sql_dir: cli.sql_dir.as_deref(),
+                sql_glob: cli.sql_glob.as_deref(),
+                only: cli.only.as_deref(),
+                skip: cli.skip.as_deref(),
+                limit: cli.limit,
+            },
+        )?;
+        summary.print();
+        return Ok(summary.exit_code());
+    }
+
+    ensure_iceberg_object_store_prereqs(&runner_config)?;
     let selected_cluster_mode = cli.cluster_mode;
     let selected_cluster_size = cli.cluster_size.unwrap_or(1);
     if let Err(error) = validate_cluster_args(selected_cluster_mode, selected_cluster_size) {
