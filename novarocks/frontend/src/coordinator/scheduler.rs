@@ -327,6 +327,7 @@ fn bind_query_lifecycle_fault_scopes(
             QueryLifecycleFaultKind::TerminalProofStreamDrop,
             QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
             QueryLifecycleFaultKind::TerminalOutcomeSuppress,
+            QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
         ] {
             if let Some(scope) = bind_armed_fault(
                 &root,
@@ -394,6 +395,7 @@ fn query_lifecycle_fault_preferred_live_index(
         QueryLifecycleFaultKind::TerminalProofStreamDrop,
         QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
         QueryLifecycleFaultKind::TerminalOutcomeSuppress,
+        QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
     ];
     let armed = backends
         .entries

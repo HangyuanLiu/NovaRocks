@@ -52,10 +52,11 @@ pub enum QueryLifecycleFaultKind {
     TerminalProofStreamDrop,
     TerminalAttestationStreamDrop,
     TerminalOutcomeSuppress,
+    RuntimeFilterContributionAckDrop,
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::InitAckDrop,
         Self::StageAckDrop,
         Self::StartAckDrop,
@@ -76,6 +77,7 @@ impl QueryLifecycleFaultKind {
         Self::TerminalProofStreamDrop,
         Self::TerminalAttestationStreamDrop,
         Self::TerminalOutcomeSuppress,
+        Self::RuntimeFilterContributionAckDrop,
     ];
 
     pub const fn file_stem(self) -> &'static str {
@@ -100,6 +102,7 @@ impl QueryLifecycleFaultKind {
             Self::TerminalProofStreamDrop => "terminal-proof-stream-drop",
             Self::TerminalAttestationStreamDrop => "terminal-attestation-stream-drop",
             Self::TerminalOutcomeSuppress => "terminal-outcome-suppress",
+            Self::RuntimeFilterContributionAckDrop => "runtime-filter-contribution-ack-drop",
         }
     }
 
@@ -112,9 +115,10 @@ impl QueryLifecycleFaultKind {
     }
 }
 
-/// The runner can request only the RFO-8R2 characterization subset, never a
-/// generic lifecycle hook.  This is intentionally a separate parsing surface.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 10] = [
+/// The runner can request only the explicitly allowlisted closeout fault
+/// subset, never a generic lifecycle hook. This is intentionally a separate
+/// parsing surface.
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 11] = [
     QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
     QueryLifecycleFaultKind::ObservationP2BudgetPressure,
     QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
@@ -125,6 +129,7 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 10] = [
     QueryLifecycleFaultKind::TerminalProofStreamDrop,
     QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
     QueryLifecycleFaultKind::TerminalOutcomeSuppress,
+    QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
 ];
 
 pub fn parse_runner_rfo_kind(value: &str) -> Option<QueryLifecycleFaultKind> {
@@ -487,17 +492,21 @@ mod tests {
     use super::*;
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
-        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 20);
+        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 21);
         for kind in QueryLifecycleFaultKind::ALL {
             assert_eq!(QueryLifecycleFaultKind::parse(kind.file_stem()), Some(kind));
         }
     }
     #[test]
     fn runner_parser_rejects_non_rfo_kinds() {
-        assert_eq!(RUNNER_RFO_KINDS.len(), 10);
+        assert_eq!(RUNNER_RFO_KINDS.len(), 11);
         assert_eq!(
             parse_runner_rfo_kind("terminal-outcome-suppress"),
             Some(QueryLifecycleFaultKind::TerminalOutcomeSuppress)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("runtime-filter-contribution-ack-drop"),
+            Some(QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop)
         );
         assert_eq!(parse_runner_rfo_kind("init-ack-drop"), None);
     }
