@@ -17,9 +17,8 @@
 
 use crate::config::{case_placeholder_variables, parse_bool, substitute_placeholders};
 use crate::engine_error_codes::EngineErrorCode;
-use crate::sql_error_codes::{
-    SQL_ERROR_DESCRIPTORS, SqlErrorDescriptor, SqlErrorPhase, lookup_sql_error_descriptor,
-};
+use crate::production_sql_error_descriptors;
+use crate::sql_error_codes::{SqlErrorDescriptor, SqlErrorPhase, lookup_sql_error_descriptor};
 use crate::types::*;
 use anyhow::{Context, Result, bail};
 use novarocks_failpoint::{
@@ -261,7 +260,7 @@ fn detect_case_sequential(lines: &[String], file_meta_lines: &[String], meta_re:
 }
 
 pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
-    parse_meta_with_sql_error_descriptors(lines, meta_re, SQL_ERROR_DESCRIPTORS)
+    parse_meta_with_sql_error_descriptors(lines, meta_re, production_sql_error_descriptors())
 }
 
 fn parse_meta_with_sql_error_descriptors(
@@ -1126,15 +1125,14 @@ fn load_sql_case_from_file_with_variables(
         }
 
         let merged_meta = merge_meta(&file_meta, &section_meta);
-        validate_sql_error_expectations(&merged_meta, SQL_ERROR_DESCRIPTORS).with_context(
-            || {
+        validate_sql_error_expectations(&merged_meta, production_sql_error_descriptors())
+            .with_context(|| {
                 format!(
                     "{} ({}): invalid SQL error expectation",
                     sql_path.display(),
                     section_id
                 )
-            },
-        )?;
+            })?;
         steps.push(SqlStep {
             query_number,
             sql,
@@ -1602,10 +1600,20 @@ mod opt5_directive_tests {
     }
 
     #[test]
-    fn production_sql_error_registry_is_empty_and_unknown_codes_fail_fast() {
+    fn production_sql_error_manifest_accepts_parser_codes_and_rejects_unknown_codes() {
         let re = meta_re();
+        let meta = parse_meta(
+            &[
+                "-- @expect_sql_code=sql.parse.unsupported_statement".to_string(),
+                "-- @expect_sql_phase=Parse".to_string(),
+            ],
+            &re,
+        )
+        .expect("generated manifest must expose parser descriptors");
+        assert_eq!(meta.expect_sql_phase, Some(SqlErrorPhase::Parse));
+
         let error = parse_meta(&["-- @expect_sql_code=sql.test.fixture".to_string()], &re)
-            .expect_err("production registry must not accept fixture code");
+            .expect_err("unknown production code must fail fast");
 
         assert!(
             error
