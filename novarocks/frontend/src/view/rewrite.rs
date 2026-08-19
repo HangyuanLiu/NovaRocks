@@ -130,7 +130,17 @@ fn expand_session_table_factor(
                 return;
             };
             let mut expanded = stored.query.as_ref().clone();
-            expand_session_query(&mut expanded, registry, &key.database, &HashSet::new());
+            qualify_view_body_names(
+                &mut expanded,
+                &stored.definition.resolution.default_catalog,
+                &stored.definition.resolution.default_database,
+            );
+            expand_session_query(
+                &mut expanded,
+                registry,
+                &stored.definition.resolution.default_database,
+                &HashSet::new(),
+            );
             let alias = alias.take().unwrap_or_else(|| sqlast::TableAlias {
                 name: sqlast::Ident::new(parts.last().cloned().unwrap_or_else(|| key.view.clone())),
                 columns: Vec::new(),
@@ -302,14 +312,18 @@ fn expand_external_table_factor(
                 ));
             }
             let mut body = parse_external_view_sql(&view, &key)?;
-            qualify_view_body_names(&mut body, &target.catalog, &view.default_database);
+            qualify_view_body_names(
+                &mut body,
+                &view.definition.resolution.default_catalog,
+                &view.definition.resolution.default_database,
+            );
             stack.push(key);
             expand_external_query(
                 engine,
                 &mut body,
                 ViewRequestContext {
-                    current_catalog: Some(&target.catalog),
-                    current_database: &view.default_database,
+                    current_catalog: Some(&view.definition.resolution.default_catalog),
+                    current_database: &view.definition.resolution.default_database,
                     connector_context: Some(connector_context),
                 },
                 &HashSet::new(),
@@ -373,11 +387,13 @@ fn parse_external_view_sql(
     key: &ExternalViewKey,
 ) -> Result<sqlast::Query, String> {
     let mut parser = Parser::new(&ViewSqlDialect)
-        .try_with_sql(&view.sql)
-        .map_err(|error| external_view_parse_error(key, &view.dialect, &error.to_string()))?;
+        .try_with_sql(&novarocks_sql::syntax::normalize_for_raw_parse(
+            &view.definition.raw_query_source,
+        )?)
+        .map_err(|error| external_view_parse_error(key, "starrocks", &error.to_string()))?;
     let statement = parser
         .parse_statement()
-        .map_err(|error| external_view_parse_error(key, &view.dialect, &error.to_string()))?;
+        .map_err(|error| external_view_parse_error(key, "starrocks", &error.to_string()))?;
     let sqlast::Statement::Query(query) = statement else {
         return Err(format!(
             "iceberg view {}.{}.{} body is not a SELECT query",

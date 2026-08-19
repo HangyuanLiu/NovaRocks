@@ -15,33 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::common::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use crate::view::{
-    CreateExternalViewRequest, ViewEngine, ViewRequestContext, ViewSqlDialect, ViewStatementResult,
-    ViewTarget,
+    CreateExternalViewRequest, ViewEngine, ViewRequestContext, ViewStatementResult, ViewTarget,
 };
 use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_parser::ast::{CreateView, ObjectName};
 use novarocks_spi::connector::DropPolicy;
-use sqlparser::ast::{CreateView, ObjectName, ObjectNamePart};
-use sqlparser::keywords::Keyword;
-use sqlparser::parser::Parser;
 
 use super::{DEFAULT_CATALOG, build_query_result};
-
-pub(super) fn resolve_external_target(
-    engine: &dyn ViewEngine,
-    name: &ObjectName,
-    context: ViewRequestContext<'_>,
-) -> Result<Option<ViewTarget>, String> {
-    let parts = name
-        .0
-        .iter()
-        .filter_map(|part| match part {
-            ObjectNamePart::Identifier(identifier) => Some(identifier.value.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    resolve_external_target_parts(engine, &parts, context)
-}
 
 pub(super) fn resolve_external_target_parts(
     _engine: &dyn ViewEngine,
@@ -83,32 +65,34 @@ pub(super) fn resolve_external_target_parts(
 pub(super) fn create_external_view(
     engine: &dyn ViewEngine,
     target: ViewTarget,
-    statement: CreateView,
+    statement: &CreateView,
     context: ViewRequestContext<'_>,
 ) -> Result<ViewStatementResult, String> {
-    if statement.materialized {
-        return Err(
-            "CREATE MATERIALIZED VIEW must go through the materialized-view DDL path".to_string(),
-        );
-    }
     let connector_context = context
         .connector_context
         .ok_or_else(|| "external view mutation requires connector request context".to_string())?;
 
-    let view_sql = statement.query.to_string();
-    let mut analyzed_query = statement.query.as_ref().clone();
+    let definition = PersistedQueryDefinition::new(
+        statement.query.text.clone(),
+        PersistedQueryDialect::StarRocks,
+        context.current_catalog.unwrap_or(DEFAULT_CATALOG),
+        context.current_database,
+    )?;
+    let mut analyzed_query = super::parse_query(&definition.raw_query_source)?
+        .as_ref()
+        .clone();
     super::rewrite::expand_external_views(
         engine,
         &mut analyzed_query,
         ViewRequestContext {
-            current_catalog: Some(&target.catalog),
-            current_database: &target.database,
+            current_catalog: Some(&definition.resolution.default_catalog),
+            current_database: &definition.resolution.default_database,
             connector_context: Some(connector_context),
         },
     )?;
     let mut columns = engine.analyze_external_view(
-        &target.catalog,
-        &target.database,
+        &definition.resolution.default_catalog,
+        &definition.resolution.default_database,
         &analyzed_query,
         connector_context,
     )?;
@@ -124,15 +108,15 @@ pub(super) fn create_external_view(
     }
     if !statement.columns.is_empty() {
         for (column, alias) in columns.iter_mut().zip(&statement.columns) {
-            column.name = alias.name.value.clone();
+            column.name = alias.value.clone();
         }
     }
     engine.create_external_view(
         CreateExternalViewRequest {
             target,
             columns,
-            sql: view_sql,
-            comment: statement.comment,
+            definition,
+            comment: statement.comment.as_ref().map(literal_to_string),
             or_replace: statement.or_replace,
             if_not_exists: statement.if_not_exists,
             properties: Vec::new(),
@@ -140,6 +124,16 @@ pub(super) fn create_external_view(
         connector_context,
     )?;
     Ok(ViewStatementResult::Ok)
+}
+
+fn literal_to_string(literal: &novarocks_parser::ast::Literal) -> String {
+    match &literal.kind {
+        novarocks_parser::ast::LiteralKind::String(value)
+        | novarocks_parser::ast::LiteralKind::HexString(value)
+        | novarocks_parser::ast::LiteralKind::Number(value) => value.clone(),
+        novarocks_parser::ast::LiteralKind::Null => "NULL".to_string(),
+        novarocks_parser::ast::LiteralKind::Boolean(value) => value.to_string(),
+    }
 }
 
 pub(super) fn drop_external_view(
@@ -164,11 +158,15 @@ pub(super) fn drop_external_view(
 
 pub(super) fn show_create_view(
     engine: &dyn ViewEngine,
-    sql: &str,
+    name: &ObjectName,
     context: ViewRequestContext<'_>,
 ) -> Result<ViewStatementResult, String> {
-    let name = parse_show_create_view(sql)?;
-    let Some(target) = resolve_external_target(engine, &name, context)? else {
+    let parts = name
+        .parts
+        .iter()
+        .map(|part| part.value.clone())
+        .collect::<Vec<_>>();
+    let Some(target) = resolve_external_target_parts(engine, &parts, context)? else {
         return Err("SHOW CREATE VIEW only supports views in iceberg catalogs".to_string());
     };
     let connector_context = context
@@ -195,53 +193,9 @@ pub(super) fn show_create_view(
     if let Some(comment) = &view.comment {
         ddl.push_str(&format!("\nCOMMENT \"{}\"", comment.replace('"', "\\\"")));
     }
-    ddl.push_str(&format!("\nAS {};", view.sql));
+    ddl.push_str(&format!("\nAS {};", view.definition.raw_query_source));
     Ok(ViewStatementResult::Query(build_query_result(vec![
         ("View".to_string(), vec![target.view]),
         ("Create View".to_string(), vec![ddl]),
     ])?))
-}
-
-fn parse_show_create_view(sql: &str) -> Result<ObjectName, String> {
-    let mut parser = Parser::new(&ViewSqlDialect)
-        .try_with_sql(sql)
-        .map_err(|error| format!("parse SHOW CREATE VIEW: {error}"))?;
-    parser
-        .expect_keyword(Keyword::SHOW)
-        .map_err(|error| format!("parse SHOW CREATE VIEW: {error}"))?;
-    parser
-        .expect_keyword(Keyword::CREATE)
-        .map_err(|error| format!("parse SHOW CREATE VIEW: {error}"))?;
-    parser
-        .expect_keyword(Keyword::VIEW)
-        .map_err(|error| format!("parse SHOW CREATE VIEW: {error}"))?;
-    parser
-        .parse_object_name(false)
-        .map_err(|error| format!("parse SHOW CREATE VIEW view name: {error}"))
-}
-
-pub(super) fn parse_show_views(sql: &str) -> Result<Option<String>, String> {
-    let mut parser = Parser::new(&ViewSqlDialect)
-        .try_with_sql(sql)
-        .map_err(|error| format!("parse SHOW VIEWS: {error}"))?;
-    parser
-        .expect_keyword(Keyword::SHOW)
-        .map_err(|error| format!("parse SHOW VIEWS: {error}"))?;
-    parser
-        .expect_keyword(Keyword::VIEWS)
-        .map_err(|error| format!("parse SHOW VIEWS: {error}"))?;
-    let database = if parser.parse_keyword(Keyword::FROM) {
-        Some(
-            parser
-                .parse_identifier()
-                .map_err(|error| format!("parse SHOW VIEWS database after FROM: {error}"))?
-                .value,
-        )
-    } else {
-        None
-    };
-    if parser.parse_keyword(Keyword::LIKE) || parser.parse_keyword(Keyword::WHERE) {
-        return Err("SHOW VIEWS LIKE/WHERE is not supported".to_string());
-    }
-    Ok(database)
 }

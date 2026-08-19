@@ -20,7 +20,7 @@ use novarocks_frontend::dml::{DmlErrorKind, DmlOperationId};
 use novarocks_frontend::view::repository::database_key;
 use novarocks_frontend::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
-    ViewEngine, ViewRequestContext, ViewSqlDialect, ViewTarget,
+    ViewEngine, ViewRequestContext, ViewService, ViewSqlDialect, ViewStatementResult, ViewTarget,
 };
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
@@ -140,6 +140,19 @@ fn view_context() -> ViewRequestContext<'static> {
         current_database: "db",
         connector_context: None,
     }
+}
+
+fn execute_view_statement(
+    service: &dyn ViewService,
+    engine: &dyn ViewEngine,
+    sql: &str,
+    context: ViewRequestContext<'_>,
+) -> Result<ViewStatementResult, String> {
+    let statements = parse_typed_statement(sql).map_err(|error| error.to_string())?;
+    let [novarocks_parser::ast::Statement::View(statement)] = statements.as_slice() else {
+        return Err("expected typed View statement".to_string());
+    };
+    service.execute_statement(engine, statement, context)
 }
 
 fn parse_query(sql: &str) -> Box<Query> {
@@ -277,13 +290,13 @@ async fn absent_config_opens_disabled_host() {
     let _backend_activity = host.backend_query_activity();
     let _backend_event_sink = host.backend_query_event_sink();
     assert!(
-        host.view_service()
-            .try_handle_statement(
-                &SessionViewEngine,
-                "CREATE VIEW memory_view AS SELECT 1",
-                view_context(),
-            )
-            .is_ok()
+        execute_view_statement(
+            host.view_service().as_ref(),
+            &SessionViewEngine,
+            "CREATE VIEW memory_view AS SELECT 1",
+            view_context(),
+        )
+        .is_ok()
     );
     host.shutdown()
         .await
@@ -468,13 +481,13 @@ async fn configured_host_restores_views_through_its_service_after_reopen() {
     let host = open_host(Some(config.clone()))
         .await
         .expect("configured host must open");
-    host.view_service()
-        .try_handle_statement(
-            &SessionViewEngine,
-            "CREATE VIEW durable_view AS SELECT 42 AS answer",
-            view_context(),
-        )
-        .expect("host view service must persist the view");
+    execute_view_statement(
+        host.view_service().as_ref(),
+        &SessionViewEngine,
+        "CREATE VIEW durable_view AS SELECT 42 AS answer",
+        view_context(),
+    )
+    .expect("host view service must persist the view");
     host.shutdown().await.expect("first host shutdown");
 
     let reopened = open_host(Some(config))

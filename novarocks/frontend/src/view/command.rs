@@ -32,31 +32,28 @@ impl ViewCommandExecutor {
         Self { kernel }
     }
 
-    /// Execute only statements recognized by the installed view service.
-    pub(crate) fn try_execute(
+    /// Execute a View command already admitted by `novarocks-parser`.
+    pub(crate) fn execute(
         &self,
-        sql: &str,
+        statement: &novarocks_parser::ast::ViewStatement,
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &ConnectorRequestContext,
-    ) -> Result<Option<StatementResult>, String> {
-        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
+    ) -> Result<StatementResult, String> {
         self.kernel
             .view_service()
-            .try_handle_statement(
+            .execute_statement(
                 &self.kernel,
-                &normalized,
+                statement,
                 ViewRequestContext {
                     current_catalog,
                     current_database,
                     connector_context: Some(connector_context),
                 },
             )
-            .map(|result| {
-                result.map(|result| match result {
-                    ViewStatementResult::Ok => StatementResult::Ok,
-                    ViewStatementResult::Query(result) => StatementResult::Query(result),
-                })
+            .map(|result| match result {
+                ViewStatementResult::Ok => StatementResult::Ok,
+                ViewStatementResult::Query(result) => StatementResult::Query(result),
             })
     }
 

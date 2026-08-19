@@ -233,9 +233,9 @@ pub use mutation::{
     ConnectorPropertyChange, ConnectorRefAction, ConnectorRefKind,
     ConnectorRefreshPublicationGuard, ConnectorSchemaChange, ConnectorStructField,
     ConnectorTableKey, ConnectorTableKeyKind, ConnectorViewDefinition, ConnectorViewDialect,
-    ConnectorViewIdentity, CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    ConnectorViewIdentity, ConnectorViewSourceFormat, CreateOrReplacePolicy, CreatePolicy,
+    DropPolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 pub use mv_attempt_discovery::{
     CONNECTOR_MV_ATTEMPT_DISCOVERY_CONTRACT_VERSION, ConnectorMvAttemptContinuation,

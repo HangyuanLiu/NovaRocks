@@ -39,7 +39,6 @@ pub struct ConnectorListViewsRequest {
 pub struct ConnectorViewMetadataValue {
     pub identity: ConnectorViewIdentity,
     pub definition: ConnectorViewDefinition,
-    pub default_namespace: Arc<str>,
     pub column_names: Vec<Arc<str>>,
     pub comment: Option<Arc<str>>,
     pub properties: Vec<(Arc<str>, Arc<str>)>,
@@ -49,16 +48,28 @@ impl ConnectorViewMetadataValue {
     pub fn try_new(
         identity: ConnectorViewIdentity,
         definition: ConnectorViewDefinition,
-        default_namespace: Arc<str>,
         column_names: Vec<Arc<str>>,
         comment: Option<Arc<str>>,
         mut properties: Vec<(Arc<str>, Arc<str>)>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
-        if default_namespace.is_empty() || column_names.iter().any(|name| name.is_empty()) {
+        if definition.raw_sql.is_empty()
+            || definition.default_namespace.is_empty()
+            || definition
+                .default_catalog
+                .as_ref()
+                .is_some_and(|catalog| catalog.is_empty())
+            || column_names.iter().any(|name| name.is_empty())
+        {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
-                "connector view metadata contains an empty namespace or column name",
+                "connector view metadata contains an empty source field or column name",
+            ));
+        }
+        if definition.source_format.is_some() && definition.default_catalog.is_none() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "versioned connector view source is missing its default catalog",
             ));
         }
         properties.sort_by(|left, right| left.0.cmp(&right.0));
@@ -73,8 +84,12 @@ impl ConnectorViewMetadataValue {
         }
         let bytes = identity.namespace.len()
             + identity.view.len()
-            + definition.sql.len()
-            + default_namespace.len()
+            + definition.raw_sql.len()
+            + definition
+                .default_catalog
+                .as_ref()
+                .map_or(0, |value| value.len())
+            + definition.default_namespace.len()
             + column_names.iter().map(|name| name.len()).sum::<usize>()
             + comment.as_ref().map_or(0, |value| value.len())
             + properties
@@ -90,7 +105,6 @@ impl ConnectorViewMetadataValue {
         Ok(Self {
             identity,
             definition,
-            default_namespace,
             column_names,
             comment,
             properties,
@@ -138,6 +152,7 @@ mod tests {
     use super::*;
     use crate::connector::{
         ConnectorCancellation, ConnectorInstanceId, ConnectorProviderId, ConnectorViewDialect,
+        ConnectorViewSourceFormat,
     };
 
     struct NeverCancelled;
@@ -212,7 +227,10 @@ mod tests {
     fn definition() -> ConnectorViewDefinition {
         ConnectorViewDefinition {
             dialect: ConnectorViewDialect::StarRocks,
-            sql: Arc::from("SELECT 1"),
+            raw_sql: Arc::from("SELECT 1"),
+            default_catalog: Some(Arc::from("catalog")),
+            default_namespace: Arc::from("db"),
+            source_format: Some(ConnectorViewSourceFormat::EffectiveUserSourceV1),
         }
     }
 
@@ -221,7 +239,6 @@ mod tests {
         let value = ConnectorViewMetadataValue::try_new(
             identity(),
             definition(),
-            Arc::from("db"),
             vec![Arc::from("c")],
             Some(Arc::from("comment")),
             vec![
@@ -241,7 +258,6 @@ mod tests {
         let error = ConnectorViewMetadataValue::try_new(
             identity(),
             definition(),
-            Arc::from("db"),
             Vec::new(),
             None,
             vec![
@@ -251,6 +267,23 @@ mod tests {
             &context(),
         )
         .expect_err("duplicate properties are corrupt provider data");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn spi5b_view_metadata_rejects_versioned_source_without_catalog() {
+        let mut definition = definition();
+        definition.default_catalog = None;
+        let error = ConnectorViewMetadataValue::try_new(
+            identity(),
+            definition,
+            Vec::new(),
+            None,
+            Vec::new(),
+            &context(),
+        )
+        .expect_err("versioned source requires a frozen catalog");
 
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
     }

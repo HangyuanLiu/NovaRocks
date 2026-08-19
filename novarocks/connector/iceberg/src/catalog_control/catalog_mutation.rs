@@ -339,13 +339,10 @@ fn execute_operation(
                 &view.namespace,
                 &view.view,
                 columns,
-                &definition.sql,
+                definition,
                 comment.as_deref(),
                 exists && *policy == CreateOrReplacePolicy::ReplaceIfExists,
-                &properties
-                    .iter()
-                    .map(|(key, value)| (key.to_string(), value.to_string()))
-                    .collect::<Vec<_>>(),
+                &view_properties(properties)?,
             )
             .map_err(map_view_error)?;
             Ok(ExternalMutationEffect::Applied)
@@ -419,6 +416,26 @@ fn execute_operation(
             "bootstrap operation bypassed its exact commit path",
         )),
     }
+}
+
+fn view_properties(
+    properties: &[(Arc<str>, Arc<str>)],
+) -> Result<Vec<(String, String)>, ConnectorError> {
+    let mut validated = BTreeMap::new();
+    for (key, value) in properties {
+        if key.as_ref() == "engine-name" || reserved_property(key).is_some() {
+            return Err(invalid(format!(
+                "Iceberg view property `{key}` is reserved for provider or engine provenance"
+            )));
+        }
+        if validated
+            .insert(key.to_string(), value.to_string())
+            .is_some()
+        {
+            return Err(invalid("duplicate Iceberg view property"));
+        }
+    }
+    Ok(validated.into_iter().collect())
 }
 
 fn create_table(
@@ -2654,6 +2671,12 @@ fn map_view_error(error: String) -> ConnectorError {
         not_found(error)
     } else if error.contains("require a REST") {
         ConnectorError::new(ConnectorErrorKind::Unsupported, error)
+    } else if error.starts_with("unsupported SQL dialect for NovaRocks Iceberg view") {
+        ConnectorError::new(ConnectorErrorKind::Unsupported, error)
+    } else if error.starts_with("NovaRocks Iceberg view source")
+        || error.starts_with("NovaRocks Iceberg view creation requires")
+    {
+        invalid(error)
     } else {
         unavailable(error)
     }
@@ -3320,6 +3343,29 @@ mod tests {
         assert_eq!(reserved_property(COLLECT_ON_WRITE_PROPERTY), None);
         assert!(reserved_property("novarocks.statistics.future").is_some());
         assert_eq!(reserved_property("write.parquet.compression-codec"), None);
+    }
+
+    #[test]
+    fn view_properties_reject_engine_provenance_and_duplicates() {
+        let reserved = view_properties(&[(Arc::from("engine-name"), Arc::from("spoofed"))])
+            .expect_err("user properties cannot impersonate view provenance");
+        assert_eq!(reserved.kind(), ConnectorErrorKind::InvalidRequest);
+
+        let duplicate = view_properties(&[
+            (Arc::from("comment"), Arc::from("one")),
+            (Arc::from("comment"), Arc::from("two")),
+        ])
+        .expect_err("duplicate view property must not be silently collapsed");
+        assert_eq!(duplicate.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn view_error_mapping_rejects_incomplete_novarocks_source_contract() {
+        let error = map_view_error(
+            "NovaRocks Iceberg view creation requires effective-user-source-v1 provenance"
+                .to_string(),
+        );
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
 
     #[test]

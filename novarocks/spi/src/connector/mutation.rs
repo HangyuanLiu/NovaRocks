@@ -237,10 +237,31 @@ pub enum ConnectorViewDialect {
     StarRocks,
 }
 
+/// The durable source contract used by an engine-created connector view.
+///
+/// `None` is reserved for third-party provider metadata. It is not a legacy
+/// NovaRocks representation: a NovaRocks writer must always supply the exact
+/// format it wrote.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorViewSourceFormat {
+    EffectiveUserSourceV1,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorViewDefinition {
     pub dialect: ConnectorViewDialect,
-    pub sql: Arc<str>,
+    /// Exact user query source, after admission substitutions and before any
+    /// normalization, qualification, or printing.
+    pub raw_sql: Arc<str>,
+    /// The catalog used to resolve unqualified names when the definition was
+    /// created. Third-party metadata may omit this provider-specific fact.
+    pub default_catalog: Option<Arc<str>>,
+    /// The namespace used to resolve unqualified names when the definition was
+    /// created.
+    pub default_namespace: Arc<str>,
+    /// NovaRocks-owned source provenance. Third-party provider metadata has no
+    /// obligation to supply a NovaRocks format.
+    pub source_format: Option<ConnectorViewSourceFormat>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

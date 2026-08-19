@@ -23,10 +23,14 @@ use std::time::{Duration, Instant};
 use arrow::array::{Array, StringArray};
 use bytes::Bytes;
 use novarocks_frontend::FrontendViewService;
+use novarocks_frontend::common::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
+};
 use novarocks_frontend::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
     ViewEngine, ViewRequestContext, ViewService, ViewSqlDialect, ViewStatementResult, ViewTarget,
 };
+use novarocks_parser::ast::Statement as ParsedStatement;
 use novarocks_spi::{
     connector::{ConnectorCancellation, ConnectorRequestContext},
     state_store::{FeDeploymentView, StateStore},
@@ -59,12 +63,17 @@ impl FakeViewEngine {
     }
 
     fn insert_view(&self, target: ViewTarget, sql: &str, default_database: &str) {
+        let definition = PersistedQueryDefinition::new(
+            sql,
+            PersistedQueryDialect::StarRocks,
+            &target.catalog,
+            default_database,
+        )
+        .unwrap();
         self.views.lock().unwrap().insert(
             target,
             ResolvedExternalView {
-                sql: sql.to_string(),
-                dialect: "starrocks".to_string(),
-                default_database: default_database.to_string(),
+                definition,
                 column_names: vec!["a".to_string()],
                 comment: None,
                 properties: HashMap::new(),
@@ -119,9 +128,7 @@ impl ViewEngine for FakeViewEngine {
         views.insert(
             request.target.clone(),
             ResolvedExternalView {
-                sql: request.sql.clone(),
-                dialect: "starrocks".to_string(),
-                default_database: request.target.database.clone(),
+                definition: request.definition.clone(),
                 column_names: request
                     .columns
                     .iter()
@@ -229,6 +236,30 @@ fn context<'a>(catalog: Option<&'a str>, database: &'a str) -> ViewRequestContex
         current_catalog: catalog,
         current_database: database,
         connector_context: Some(connector_context()),
+    }
+}
+
+trait ViewServiceTestExt {
+    fn try_handle_statement(
+        &self,
+        engine: &dyn ViewEngine,
+        sql: &str,
+        context: ViewRequestContext<'_>,
+    ) -> Result<Option<ViewStatementResult>, String>;
+}
+
+impl ViewServiceTestExt for FrontendViewService {
+    fn try_handle_statement(
+        &self,
+        engine: &dyn ViewEngine,
+        sql: &str,
+        context: ViewRequestContext<'_>,
+    ) -> Result<Option<ViewStatementResult>, String> {
+        let statements = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
+        let [ParsedStatement::View(statement)] = statements.as_slice() else {
+            return Ok(None);
+        };
+        self.execute_statement(engine, statement, context).map(Some)
     }
 }
 
@@ -410,6 +441,31 @@ async fn default_catalog_one_two_and_three_part_names_share_session_registry() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn session_view_rewrite_uses_its_frozen_creation_database() {
+    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
+        .await
+        .unwrap();
+    let engine = FakeViewEngine::default();
+
+    service
+        .try_handle_statement(
+            &engine,
+            "CREATE VIEW default_catalog.creation.v AS SELECT * FROM base",
+            context(None, "caller"),
+        )
+        .unwrap();
+
+    let mut query = parse_query("SELECT * FROM creation.v");
+    service
+        .rewrite_query(&engine, &mut query, context(None, "other"))
+        .unwrap();
+    assert_eq!(
+        query.to_string(),
+        "SELECT * FROM (SELECT * FROM default_catalog.caller.base) v"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
     let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
         .await
@@ -436,13 +492,21 @@ async fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
     service
         .try_handle_statement(
             &engine,
-            "CREATE VIEW db.v (left_col, right_col) AS SELECT 1, 2",
+            "CREATE VIEW db.v (left_col, right_col) AS SELECT /* preserve */ 1,\n  2",
             context(Some("ice"), "ignored"),
         )
         .unwrap();
     let created = engine.created.lock().unwrap();
     assert_eq!(created[0].target.catalog, "ice");
     assert_eq!(created[0].target.database, "db");
+    assert_eq!(
+        created[0].definition.raw_query_source,
+        "SELECT /* preserve */ 1,\n  2"
+    );
+    assert_eq!(
+        created[0].definition.resolution.default_catalog, "ice",
+        "external view must freeze its creation catalog"
+    );
     assert_eq!(
         created[0]
             .columns
@@ -492,9 +556,13 @@ async fn iceberg_show_create_escapes_comment_and_show_views_is_sorted() {
     engine.views.lock().unwrap().insert(
         target,
         ResolvedExternalView {
-            sql: "SELECT 1 AS a".to_string(),
-            dialect: "starrocks".to_string(),
-            default_database: "db".to_string(),
+            definition: PersistedQueryDefinition::new(
+                "SELECT /* raw body */\n 1 AS a",
+                PersistedQueryDialect::StarRocks,
+                "ice",
+                "db",
+            )
+            .unwrap(),
             column_names: vec!["a".to_string()],
             comment: Some("say \"hello\"".to_string()),
             properties: HashMap::new(),
@@ -520,7 +588,9 @@ async fn iceberg_show_create_escapes_comment_and_show_views_is_sorted() {
     assert_eq!(query_rows_at(&show_create, 0), vec!["v"]);
     assert_eq!(
         query_rows_at(&show_create, 1),
-        vec!["CREATE VIEW `ice`.`db`.`v` (`a`)\nCOMMENT \"say \\\"hello\\\"\"\nAS SELECT 1 AS a;"]
+        vec![
+            "CREATE VIEW `ice`.`db`.`v` (`a`)\nCOMMENT \"say \\\"hello\\\"\"\nAS SELECT /* raw body */\n 1 AS a;"
+        ]
     );
 
     let show = query_result(
