@@ -617,6 +617,12 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
     /// `primary-expression ::= literal | identifier [ function-call ] | "(" expression ")"`
     fn parse_primary_expression(&mut self) -> Result<Expr, ParseError> {
         self.skip_trivia();
+        if self.current_is_word("MAP") && self.peek_nontrivia_is_symbol(1, Symbol::LBrace) {
+            let start = self.current_span().start();
+            self.advance();
+            self.skip_trivia();
+            return self.parse_map_expression(start);
+        }
         if self.current_is_word("EXTRACT") && self.peek_nontrivia_is_symbol(1, Symbol::LParen) {
             return self.parse_extract_expression();
         }
@@ -697,7 +703,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             Some(Token {
                 kind: TokenKind::Keyword(Keyword::Date | Keyword::Time | Keyword::Timestamp),
                 ..
-            }) => self.parse_typed_string_expression(),
+            }) if self.peek_nontrivia_is_string(1) => self.parse_typed_string_expression(),
             Some(Token {
                 kind: TokenKind::Keyword(Keyword::Exists),
                 span,
@@ -1100,12 +1106,6 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             span: Span::new(span.start(), end),
         };
         self.skip_trivia();
-        if name.parts.len() == 1
-            && name.parts[0].value.eq_ignore_ascii_case("MAP")
-            && self.current_is_symbol(Symbol::LBrace)
-        {
-            return self.parse_map_expression(name.span.start());
-        }
         if !self.current_is_symbol(Symbol::LParen) {
             return Ok(if name.parts.len() == 1 {
                 Expr::Identifier(name.parts.into_iter().next().expect("one identifier"))
@@ -1749,4 +1749,28 @@ fn unescape_string(text: &str, quote: char) -> String {
         }
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{lex, parser::parse_expression, printer::Printer};
+
+    #[test]
+    fn map_brace_literal_is_a_primary_expression_and_round_trips_in_a_query() {
+        let expression_source = "map{1:[2,3], NULL:map{4:5}}";
+        let tokens = lex(expression_source).expect("map literal should lex");
+        let expression =
+            parse_expression(expression_source, &tokens).expect("map literal should parse");
+        let canonical_expression = Printer::new().expression(&expression);
+        assert_eq!(canonical_expression, "MAP{1: [2, 3], NULL: MAP{4: 5}}");
+
+        let source = format!("SELECT {canonical_expression} AS value_map");
+        let statements = crate::parse(&source).expect("map literal should parse in SELECT");
+        let canonical_query = Printer::new().statements(&statements);
+        assert_eq!(
+            canonical_query,
+            "SELECT MAP{1: [2, 3], NULL: MAP{4: 5}} AS value_map"
+        );
+        crate::parse(&canonical_query).expect("canonical map query should reparse");
+    }
 }
