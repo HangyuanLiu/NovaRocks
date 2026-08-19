@@ -512,7 +512,7 @@ mod tests {
         assert!(matches!(statements.as_slice(), [Statement::Query(_)]));
         assert_eq!(
             crate::printer::Printer::new().statements(&statements),
-            "SELECT a, count(*) AS n FROM db.t t WHERE a >= 1 ORDER BY a DESC LIMIT 5"
+            "SELECT a, count(*) AS n FROM db.t AS t WHERE a >= 1 ORDER BY a DESC LIMIT 5"
         );
 
         let statements =
