@@ -374,9 +374,9 @@ fn bind_query_lifecycle_fault_scopes(
     Ok(())
 }
 
-/// A runner arm names one exact BE. Pin single-instance fragments to that BE
-/// so the owner-local fault is actually reachable; without this, a valid arm
-/// can remain unclaimed merely because hash placement chose another live BE.
+/// A runner arm normally names one exact BE. Pin single-instance fragments to
+/// that BE so owner-local faults are reachable; contribution ACK loss is
+/// receiver-agnostic because remote materialization may accept it elsewhere.
 #[cfg(debug_assertions)]
 fn query_lifecycle_fault_preferred_live_index(
     backends: &FrontendBackendSnapshot,
@@ -395,7 +395,6 @@ fn query_lifecycle_fault_preferred_live_index(
         QueryLifecycleFaultKind::TerminalProofStreamDrop,
         QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
         QueryLifecycleFaultKind::TerminalOutcomeSuppress,
-        QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
     ];
     let armed = backends
         .entries

@@ -360,6 +360,45 @@ mod typed {
         Ok(Some(scope))
     }
 
+    /// Claims an arm-bound token from the first receiver that has accepted a
+    /// matching runtime-filter Contribution. The arm's backend identity
+    /// remains part of the stored scope for provenance, but is intentionally
+    /// not an eligibility condition: remote materialization can accept the
+    /// contribution on a different BE than the producer placement.
+    pub fn claim_matching_receiver_agnostic_fault(
+        root: &Path,
+        kind: QueryLifecycleFaultKind,
+        execution_id: QueryExecutionId,
+    ) -> Result<Option<QueryLifecycleFaultScope>, String> {
+        let suffix = format!(".{}.trigger", kind.file_stem());
+        let entries =
+            fs::read_dir(root).map_err(|error| format!("read {}: {error}", root.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("read {} entry: {error}", root.display()))?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("be-") || !name.ends_with(&suffix) {
+                continue;
+            }
+            let contents = match fs::read_to_string(&path) {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("read {}: {error}", path.display())),
+            };
+            let scope = parse_scope(&contents)?;
+            if scope.execution_id != execution_id {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => return Ok(Some(scope)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("consume {}: {error}", path.display())),
+            }
+        }
+        Ok(None)
+    }
+
     pub fn observe_matching_fault(
         root: &Path,
         kind: QueryLifecycleFaultKind,
@@ -571,6 +610,51 @@ mod tests {
             claim_matching_fault(&root, kind, execution_id, 1, 17, 23)
                 .expect("claim")
                 .is_some()
+        );
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[cfg(feature = "typed")]
+    #[test]
+    fn receiver_agnostic_contribution_fault_claims_once_for_the_exact_execution() {
+        use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
+
+        let root = unique_temp_root("receiver-agnostic");
+        std::fs::create_dir_all(&root).expect("create root");
+        let kind = QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop;
+        std::fs::write(
+            arm_path(&root, 1, kind),
+            "token=ack-drop\nbackend_index=1\n",
+        )
+        .expect("write arm");
+        let execution_id = QueryExecutionId::new(
+            novarocks_types::QueryId::new(7, 9),
+            AttemptId::new(1).expect("attempt"),
+        )
+        .expect("execution id");
+        let other_execution_id = QueryExecutionId::new(
+            novarocks_types::QueryId::new(7, 10),
+            AttemptId::new(1).expect("attempt"),
+        )
+        .expect("other execution id");
+        bind_armed_fault(&root, kind, execution_id, 1, 17, 23)
+            .expect("bind")
+            .expect("armed");
+
+        assert!(
+            claim_matching_receiver_agnostic_fault(&root, kind, other_execution_id)
+                .expect("different query cannot claim")
+                .is_none()
+        );
+        let claimed = claim_matching_receiver_agnostic_fault(&root, kind, execution_id)
+            .expect("matching accepted receiver can claim")
+            .expect("matching execution claims");
+        assert_eq!(claimed.backend_index, 1);
+        assert_eq!(claimed.backend_id, 17);
+        assert!(
+            claim_matching_receiver_agnostic_fault(&root, kind, execution_id)
+                .expect("second receiver observes consumed token")
+                .is_none()
         );
         std::fs::remove_dir_all(root).expect("remove root");
     }

@@ -513,24 +513,10 @@ fn drop_accepted_contribution_response(
         return Ok(false);
     };
     let execution_id = runtime_filter_fault_execution_id(query_id, deployment_epoch)?;
-    let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
-        .map_err(|_| tonic::Status::failed_precondition("lifecycle fault backend index is unset"))?
-        .parse::<usize>()
-        .map_err(|error| {
-            tonic::Status::failed_precondition(format!(
-                "invalid lifecycle fault backend index: {error}"
-            ))
-        })?;
-    let backend_id = crate::runtime::backend_id::backend_id()
-        .and_then(|id| u64::try_from(id).ok())
-        .ok_or_else(|| tonic::Status::failed_precondition("backend identity is not bound"))?;
-    let scope = novarocks_failpoint::claim_matching_fault(
+    let scope = novarocks_failpoint::claim_matching_receiver_agnostic_fault(
         &root,
         novarocks_failpoint::QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
         execution_id,
-        backend_index,
-        backend_id,
-        crate::runtime::start_epoch::start_epoch(),
     )
     .map_err(tonic::Status::failed_precondition)?;
     Ok(scope.is_some())
