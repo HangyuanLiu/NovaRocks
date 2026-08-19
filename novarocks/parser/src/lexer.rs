@@ -40,10 +40,7 @@ impl<'source> Lexer<'source> {
             if character.is_whitespace() {
                 self.consume_while(char::is_whitespace);
                 self.push(TokenKind::Trivia(TriviaKind::Whitespace), start);
-            } else if self.starts_with("--") && self.mysql_dash_comment() {
-                self.consume_line_comment();
-                self.push(TokenKind::Trivia(TriviaKind::LineComment), start);
-            } else if character == '#' {
+            } else if (self.starts_with("--") && self.mysql_dash_comment()) || character == '#' {
                 self.consume_line_comment();
                 self.push(TokenKind::Trivia(TriviaKind::LineComment), start);
             } else if self.starts_with("/*") {
