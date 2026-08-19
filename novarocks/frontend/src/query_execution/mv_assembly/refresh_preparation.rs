@@ -715,6 +715,21 @@ fn prepare_frontend_first_refresh_write(
         ),
         &definition.query_definition.resolution.default_database,
     );
+    // The persisted source definition owns name resolution. The execution
+    // artifact is transient and may be canonicalized, but it must never fall
+    // back to the session which happens to issue REFRESH.
+    let source_catalog = Some(
+        definition
+            .query_definition
+            .resolution
+            .default_catalog
+            .clone(),
+    );
+    let source_database = definition
+        .query_definition
+        .resolution
+        .default_database
+        .clone();
     let expected_target_snapshot_id = match &contract.state_baseline {
         RefreshStateBaseline::SnapshotBacked {
             target_snapshot_id, ..
@@ -810,12 +825,12 @@ fn prepare_frontend_first_refresh_write(
         let aggregate_layout_sql = if schema_contract.branch.is_some() {
             aggregate_query.to_string()
         } else {
-            refresh_query_source.clone()
+            query.to_string()
         };
         let aggregate_layout = build_aggregate_layout_for_refresh_select_sql(
             source,
-            current_catalog,
-            current_database,
+            source_catalog.as_deref(),
+            &source_database,
             &aggregate_layout_sql,
             &connector_context,
         )?;
@@ -850,10 +865,10 @@ fn prepare_frontend_first_refresh_write(
     };
     let physical_sql =
         novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifactBuilder::try_new(
-            refresh_query_source.clone(),
+            query.to_string(),
             sql_pin,
-            current_catalog.map(str::to_string),
-            current_database.to_string(),
+            source_catalog,
+            source_database,
             target_contract,
             shape,
         )?

@@ -17,8 +17,10 @@
 
 -- @order_sensitive=true
 -- Validate Iceberg MV target catalog semantics against REST catalog:
--- - target is created as a normal Iceberg table in the current catalog/database
+-- - target is created as a normal Iceberg table in an explicitly selected namespace
 -- - CREATE does not write data; REFRESH populates the target
+-- - refresh resolves an unqualified raw source with the frozen creation database,
+--   not the target namespace
 -- - SHOW/REFRESH/DROP use NovaRocks relationship metadata
 -- - existing target and non-Iceberg current catalog fail fast
 
@@ -36,25 +38,25 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0} (
 INSERT INTO iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0}
 VALUES (1, 'a'), (2, 'b');
 SET CATALOG iceberg_rest_${suite_uuid0};
-USE analytics_${uuid0};
+USE sales_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
-CREATE MATERIALIZED VIEW mv_orders_${uuid0}
+CREATE MATERIALIZED VIEW analytics_${uuid0}.mv_orders_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES('storage_engine' = 'iceberg')
-AS SELECT id, name
-FROM iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0};
+AS SELECT /* effective raw source */ id, name
+FROM orders_${uuid0};
 
 -- query 3
-SELECT COUNT(*) AS n FROM mv_orders_${uuid0};
+SELECT COUNT(*) AS n FROM analytics_${uuid0}.mv_orders_${uuid0};
 
 -- query 4
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW mv_orders_${uuid0};
+REFRESH MATERIALIZED VIEW analytics_${uuid0}.mv_orders_${uuid0};
 
 -- query 5
-SELECT id, name FROM mv_orders_${uuid0} ORDER BY id;
+SELECT id, name FROM analytics_${uuid0}.mv_orders_${uuid0} ORDER BY id;
 
 -- query 6
 -- @result_contains=mv_orders_
@@ -63,16 +65,15 @@ SHOW MATERIALIZED VIEWS;
 
 -- query 7
 -- @expect_error=Iceberg MV target table iceberg_rest_${suite_uuid0}.analytics_${uuid0}.mv_conflict_${uuid0} already exists
-CREATE TABLE mv_conflict_${uuid0} (id INT);
-CREATE MATERIALIZED VIEW mv_conflict_${uuid0}
+CREATE TABLE analytics_${uuid0}.mv_conflict_${uuid0} (id INT);
+CREATE MATERIALIZED VIEW analytics_${uuid0}.mv_conflict_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES('storage_engine' = 'iceberg')
-AS SELECT id
-FROM iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0};
+AS SELECT id FROM orders_${uuid0};
 
 -- query 8
 -- @skip_result_check=true
-DROP TABLE mv_conflict_${uuid0};
+DROP TABLE analytics_${uuid0}.mv_conflict_${uuid0};
 
 -- query 9
 -- @expect_error=requires current catalog to be an Iceberg catalog
@@ -87,12 +88,12 @@ FROM iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0};
 -- query 10
 -- @skip_result_check=true
 SET CATALOG iceberg_rest_${suite_uuid0};
-USE analytics_${uuid0};
-DROP MATERIALIZED VIEW mv_orders_${uuid0};
+USE sales_${uuid0};
+DROP MATERIALIZED VIEW analytics_${uuid0}.mv_orders_${uuid0};
 
 -- query 11
 -- @expect_error=unknown table
-SELECT COUNT(*) FROM mv_orders_${uuid0};
+SELECT COUNT(*) FROM analytics_${uuid0}.mv_orders_${uuid0};
 
 -- query 12
 -- @skip_result_check=true
