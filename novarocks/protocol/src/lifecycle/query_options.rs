@@ -76,7 +76,7 @@ mod tests {
             ..Default::default()
         };
 
-        let parsed = QueryOptions::parse(raw.clone()).expect("valid wire options");
+        let parsed = QueryOptions::parse(raw).expect("valid wire options");
 
         assert_eq!(parsed.as_proto(), &raw);
         assert_eq!(
@@ -144,7 +144,7 @@ mod tests {
             ..Default::default()
         };
 
-        let parsed = QueryOptions::parse(raw.clone())
+        let parsed = QueryOptions::parse(raw)
             .expect("disabled spilling preserves the existing ignored-field semantics");
         assert_eq!(parsed.as_proto(), &raw);
     }

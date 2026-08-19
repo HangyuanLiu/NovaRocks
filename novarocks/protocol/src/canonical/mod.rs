@@ -241,18 +241,20 @@ mod tests {
 
     #[test]
     fn sorts_maps_but_preserves_repeated_order() {
-        let mut first = novarocks::InstanceParams::default();
-        first.per_exch_num_senders = HashMap::from([(3, 30), (9, 90)]);
-        first.destinations = vec![
-            novarocks::Destination {
-                endpoint: "be-a:9020".into(),
-                ..Default::default()
-            },
-            novarocks::Destination {
-                endpoint: "be-b:9020".into(),
-                ..Default::default()
-            },
-        ];
+        let first = novarocks::InstanceParams {
+            per_exch_num_senders: HashMap::from([(3, 30), (9, 90)]),
+            destinations: vec![
+                novarocks::Destination {
+                    endpoint: "be-a:9020".into(),
+                    ..Default::default()
+                },
+                novarocks::Destination {
+                    endpoint: "be-b:9020".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
         let mut second = first.clone();
         second.per_exch_num_senders = HashMap::from([(9, 90), (3, 30)]);
         assert_eq!(
