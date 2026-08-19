@@ -21,7 +21,6 @@
 //! not own RPC encoding.  The native adapter is responsible for translating a
 //! validated [`BackendRuntimeFilterEnvelope`] to the unchanged wire DTO.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -33,6 +32,11 @@ use novarocks_types::UniqueId;
 use super::{
     BackendChannelIdentity, BackendProducerStreamIdentity, BackendRouteEdgeId,
     BackendTransportSequence,
+};
+use crate::runtime_filter::reliable_transport::{
+    ReliableTransportAckOutcome, ReliableTransportFailOpenReason, ReliableTransportPolicy,
+    ReliableTransportResourceLimit, ReliableTransportSendOutcome, ReliableTransportState,
+    ReliableTransportStateError,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -447,6 +451,28 @@ impl BackendRetryPolicy {
     }
 }
 
+impl ReliableTransportPolicy for BackendRetryPolicy {
+    fn retry_interval(self) -> Duration {
+        self.retry_interval
+    }
+
+    fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
+
+    fn deadline(self) -> Duration {
+        self.deadline
+    }
+
+    fn max_pending_entries(self) -> usize {
+        self.max_pending_entries
+    }
+
+    fn max_pending_bytes(self) -> usize {
+        self.max_pending_bytes
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BackendTransportResourceLimit {
     PendingEntries,
@@ -472,6 +498,7 @@ pub(crate) enum BackendAckOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BackendTransportFailOpenReason {
     Deadline,
+    AttemptsExhausted,
     ContractRejected,
 }
 
@@ -491,31 +518,20 @@ impl BackendRetryTick {
     }
 }
 
-struct PendingEnvelope {
-    frame: Arc<BackendTransportEnvelope>,
-    first_sent_at: Instant,
-    last_sent_at: Instant,
-    attempts: u32,
-}
-
 /// Bounded sender-side retry state. It is deliberately driven by the Service's
 /// query tick; this type starts no background task and does not perform I/O.
 pub(crate) struct BackendReliableTransport {
-    policy: BackendRetryPolicy,
-    pending: BTreeMap<BackendRouteIdentity, PendingEnvelope>,
-    completed: BTreeMap<BackendRouteIdentity, Arc<BackendTransportEnvelope>>,
-    pending_bytes: usize,
-    shutdown: bool,
+    state: ReliableTransportState<
+        BackendRouteIdentity,
+        Arc<BackendTransportEnvelope>,
+        BackendRetryPolicy,
+    >,
 }
 
 impl BackendReliableTransport {
     pub(crate) fn new(policy: BackendRetryPolicy) -> Self {
         Self {
-            policy,
-            pending: BTreeMap::new(),
-            completed: BTreeMap::new(),
-            pending_bytes: 0,
-            shutdown: false,
+            state: ReliableTransportState::new(policy),
         }
     }
 
@@ -524,51 +540,29 @@ impl BackendReliableTransport {
         frame: Arc<BackendTransportEnvelope>,
         now: Instant,
     ) -> Result<BackendRetrySendOutcome, BackendTransportError> {
-        if self.shutdown {
-            return Ok(BackendRetrySendOutcome::Shutdown);
-        }
         let key = frame.envelope().route_identity();
-        if let Some(existing) = self.pending.get(&key).map(|entry| &entry.frame) {
-            return if existing == &frame {
-                Ok(BackendRetrySendOutcome::Duplicate)
-            } else {
-                Err(BackendTransportError::IdentityConflict)
-            };
-        }
-        if let Some(existing) = self.completed.get(&key) {
-            return if existing == &frame {
-                Ok(BackendRetrySendOutcome::Duplicate)
-            } else {
-                Err(BackendTransportError::RetiredIdentity)
-            };
-        }
-        if self.pending.len() >= self.policy.max_pending_entries {
-            return Ok(BackendRetrySendOutcome::ResourceLimit(
-                BackendTransportResourceLimit::PendingEntries,
-            ));
-        }
         let bytes = frame.envelope().retained_bytes();
-        let Some(next_pending_bytes) = self.pending_bytes.checked_add(bytes) else {
-            return Ok(BackendRetrySendOutcome::ResourceLimit(
+        match self.state.send(key, frame, bytes, now) {
+            Ok(ReliableTransportSendOutcome::Buffered) => Ok(BackendRetrySendOutcome::Buffered),
+            Ok(ReliableTransportSendOutcome::ResourceLimit(
+                ReliableTransportResourceLimit::PendingEntries,
+            )) => Ok(BackendRetrySendOutcome::ResourceLimit(
+                BackendTransportResourceLimit::PendingEntries,
+            )),
+            Ok(ReliableTransportSendOutcome::ResourceLimit(
+                ReliableTransportResourceLimit::PendingBytes,
+            )) => Ok(BackendRetrySendOutcome::ResourceLimit(
                 BackendTransportResourceLimit::PendingBytes,
-            ));
-        };
-        if next_pending_bytes > self.policy.max_pending_bytes {
-            return Ok(BackendRetrySendOutcome::ResourceLimit(
-                BackendTransportResourceLimit::PendingBytes,
-            ));
+            )),
+            Ok(ReliableTransportSendOutcome::Duplicate) => Ok(BackendRetrySendOutcome::Duplicate),
+            Ok(ReliableTransportSendOutcome::Shutdown) => Ok(BackendRetrySendOutcome::Shutdown),
+            Err(ReliableTransportStateError::IdentityConflict) => {
+                Err(BackendTransportError::IdentityConflict)
+            }
+            Err(ReliableTransportStateError::RetiredIdentity) => {
+                Err(BackendTransportError::RetiredIdentity)
+            }
         }
-        self.pending_bytes = next_pending_bytes;
-        self.pending.insert(
-            key,
-            PendingEnvelope {
-                frame,
-                first_sent_at: now,
-                last_sent_at: now,
-                attempts: 1,
-            },
-        );
-        Ok(BackendRetrySendOutcome::Buffered)
     }
 
     pub(crate) fn acknowledge(
@@ -576,42 +570,42 @@ impl BackendReliableTransport {
         key: BackendRouteIdentity,
         status: BackendAcceptStatus,
     ) -> BackendAckOutcome {
-        let Some(entry) = self.pending.remove(&key) else {
-            return BackendAckOutcome::Unknown;
-        };
-        self.pending_bytes = self
-            .pending_bytes
-            .saturating_sub(entry.frame.envelope().retained_bytes());
-        self.completed.insert(key, entry.frame);
-        match status {
-            BackendAcceptStatus::Accepted => BackendAckOutcome::Released,
-            BackendAcceptStatus::Duplicate => BackendAckOutcome::ReleasedOnDuplicate,
-            BackendAcceptStatus::Rejected => BackendAckOutcome::Rejected,
+        match self.state.acknowledge(key) {
+            ReliableTransportAckOutcome::Unknown => BackendAckOutcome::Unknown,
+            ReliableTransportAckOutcome::Released(_) => match status {
+                BackendAcceptStatus::Accepted => BackendAckOutcome::Released,
+                BackendAcceptStatus::Duplicate => BackendAckOutcome::ReleasedOnDuplicate,
+                BackendAcceptStatus::Rejected => BackendAckOutcome::Rejected,
+            },
         }
     }
 
     pub(crate) fn drive(&mut self, now: Instant) -> BackendRetryTick {
-        let mut retried = Vec::new();
-        let mut failed_open = Vec::new();
-        let policy = self.policy;
-        self.pending.retain(|key, entry| {
-            if now.saturating_duration_since(entry.first_sent_at) >= policy.deadline {
-                self.pending_bytes = self
-                    .pending_bytes
-                    .saturating_sub(entry.frame.envelope().retained_bytes());
-                failed_open.push((*key, BackendTransportFailOpenReason::Deadline));
-                self.completed.insert(*key, Arc::clone(&entry.frame));
-                return false;
-            }
-            if entry.attempts < policy.max_attempts
-                && now.saturating_duration_since(entry.last_sent_at) >= policy.retry_interval
-            {
-                entry.attempts += 1;
-                entry.last_sent_at = now;
-                retried.push(Arc::clone(&entry.frame));
-            }
-            true
-        });
+        // The legacy domain owner has no per-attempt I/O callback. Its query
+        // tick therefore treats every unacknowledged frame as retry-eligible;
+        // native callers instead mark only observed transport failures.
+        self.state.schedule_all_pending_retries();
+        let tick = self.state.drive(now);
+        let retried = tick
+            .retried()
+            .iter()
+            .map(|(_, frame)| Arc::clone(frame))
+            .collect();
+        let failed_open = tick
+            .failed_open()
+            .iter()
+            .map(|(key, reason)| {
+                let reason = match reason {
+                    ReliableTransportFailOpenReason::Deadline => {
+                        BackendTransportFailOpenReason::Deadline
+                    }
+                    ReliableTransportFailOpenReason::AttemptsExhausted => {
+                        BackendTransportFailOpenReason::AttemptsExhausted
+                    }
+                };
+                (*key, reason)
+            })
+            .collect();
         BackendRetryTick {
             retried,
             failed_open,
@@ -619,9 +613,7 @@ impl BackendReliableTransport {
     }
 
     pub(crate) fn shutdown(&mut self) {
-        self.shutdown = true;
-        self.pending.clear();
-        self.pending_bytes = 0;
+        self.state.shutdown();
     }
 }
 
@@ -857,7 +849,7 @@ mod tests {
         )
         .unwrap();
         let mut transport = BackendReliableTransport::new(policy);
-        transport.pending_bytes = usize::MAX;
+        transport.state.set_pending_bytes_for_test(usize::MAX);
 
         assert_eq!(
             transport.send(delivery_frame(1), Instant::now()).unwrap(),

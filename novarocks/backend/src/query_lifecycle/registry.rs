@@ -543,7 +543,7 @@ fn terminal_profile_contribution(
 
 // Design: ADR-0078 (docs/adr/ADR-0078-runtime-filter-terminal-observation-without-lifecycle-veto.md)
 fn capture_terminal_profile_contribution(
-    participant: Option<&Arc<RuntimeFilterParticipant>>,
+    snapshot: Option<RuntimeFilterObservationSnapshot>,
     runtime_filter_installed: bool,
 ) -> novarocks_protocol::novarocks::QueryTerminalProfileContributionTelemetry {
     use novarocks_protocol::novarocks as wire;
@@ -554,7 +554,7 @@ fn capture_terminal_profile_contribution(
             code: code.to_owned(),
         })),
     };
-    let Some(participant) = participant else {
+    let Some(snapshot) = snapshot else {
         if runtime_filter_installed {
             return unavailable("PARTICIPANT_RELEASED");
         }
@@ -565,7 +565,6 @@ fn capture_terminal_profile_contribution(
             })),
         };
     };
-    let snapshot = participant.capture_runtime_filter_observation();
     match terminal_profile_contribution(snapshot) {
         Ok(contribution) => wire::QueryTerminalProfileContributionTelemetry {
             telemetry: Some(Telemetry::Available(contribution.as_proto().clone())),
@@ -2890,12 +2889,15 @@ impl QueryLifecycleRegistry {
         // The entry lock only freezes terminal facts. Canonical encoding and
         // digest construction can be expensive and must not block control,
         // fragment completion, or ACK handling.
-        if let Some(participant) = participant.as_ref() {
-            participant.prepare_terminal_capture(termination_reason);
-        }
+        // Freeze the participant contribution before optional P2 telemetry
+        // assembly/fault handling. A P2 fault may make the projection
+        // unavailable, but must never bypass terminal observation sealing.
+        let runtime_filter_snapshot = participant
+            .as_ref()
+            .map(|participant| participant.prepare_terminal_capture(termination_reason));
         let contribution = self.capture_terminal_profile_contribution(
             execution_id,
-            participant.as_ref(),
+            runtime_filter_snapshot,
             runtime_filter_installed,
         );
         let (snapshot, outcome) = match terminal_outcome_from_snapshot(
@@ -3085,14 +3087,16 @@ impl QueryLifecycleRegistry {
             QueryTerminationReason::CoordinatorFinalize,
             "query finalized after local drain",
         );
-        if let Some(participant) = participant.as_ref() {
-            participant.prepare_terminal_capture(QueryTerminationReason::CoordinatorFinalize);
-        }
+        // As on failure, terminal observation must be sealed before an
+        // optional P2 fault can decide whether it is projected.
+        let runtime_filter_snapshot = participant.as_ref().map(|participant| {
+            participant.prepare_terminal_capture(QueryTerminationReason::CoordinatorFinalize)
+        });
         // Finish the immutable record outside the lifecycle entry lock. The
         // local-drained gate makes the cloned fact set stable.
         let contribution = self.capture_terminal_profile_contribution(
             execution_id,
-            participant.as_ref(),
+            runtime_filter_snapshot,
             runtime_filter_installed,
         );
         let (snapshot, outcome) = terminal_outcome_from_snapshot(
@@ -3185,7 +3189,7 @@ impl QueryLifecycleRegistry {
     fn capture_terminal_profile_contribution(
         &self,
         execution_id: QueryExecutionId,
-        participant: Option<&Arc<RuntimeFilterParticipant>>,
+        snapshot: Option<RuntimeFilterObservationSnapshot>,
         runtime_filter_installed: bool,
     ) -> novarocks_protocol::novarocks::QueryTerminalProfileContributionTelemetry {
         for (kind, code) in [
@@ -3217,7 +3221,7 @@ impl QueryLifecycleRegistry {
                 }
             }
         }
-        capture_terminal_profile_contribution(participant, runtime_filter_installed)
+        capture_terminal_profile_contribution(snapshot, runtime_filter_installed)
     }
 
     fn fail_if_terminal_p1_retention_fault(

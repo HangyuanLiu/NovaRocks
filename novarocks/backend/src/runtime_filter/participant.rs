@@ -25,7 +25,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime_filter::{
@@ -60,8 +59,9 @@ use crate::native::runtime_filter_adapter::{
 use crate::native::runtime_filter_install::DecodedRuntimeFilterContribution;
 use crate::native::runtime_filter_sender::{
     BackendNativeRuntimeFilterTransportEnvelope, BackendRuntimeFilterEnvelopeSink,
-    BackendRuntimeFilterSinkCompletion, BackendRuntimeFilterSinkSubmitOutcome,
-    BackendRuntimeFilterUnaryError, GrpcRuntimeFilterEnvelopeSink,
+    BackendRuntimeFilterRetryPolicy, BackendRuntimeFilterSinkCompletion,
+    BackendRuntimeFilterSinkSubmitOutcome, BackendRuntimeFilterTransportFailureReason,
+    GrpcRuntimeFilterEnvelopeSink,
 };
 use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use crate::runtime_filter::artifact_query::BackendRuntimeFilterArtifactQuery;
@@ -163,11 +163,24 @@ impl RuntimeFilterParticipantFactory for BackendRuntimeFilterParticipantFactory 
             query_id.low(),
             execution_id.attempt_id().get()
         ));
+        let transport_policy = BackendRuntimeFilterRetryPolicy::new(
+            lifecycle.transport_retry_interval,
+            lifecycle.transport_max_attempts,
+            lifecycle.transport_deadline,
+            lifecycle.transport_max_pending_entries,
+            lifecycle.transport_max_pending_bytes,
+        )
+        .map_err(|error| {
+            QueryLifecycleError::new(
+                QueryLifecycleErrorCode::InvalidManifest,
+                format!("invalid runtime filter transport policy: {error:?}"),
+            )
+        })?;
         RuntimeFilterParticipant::from_installed(
             execution_id,
             install,
             observation,
-            lifecycle.transport_deadline,
+            transport_policy,
             producers,
             consumers,
             memory,
@@ -208,7 +221,7 @@ impl RuntimeFilterParticipant {
         execution_id: QueryExecutionId,
         install: BackendParticipantInstall,
         observation: Arc<RuntimeFilterObservationEmitter>,
-        transport_deadline: Duration,
+        transport_policy: BackendRuntimeFilterRetryPolicy,
         producer_sessions: BTreeMap<
             novarocks_execution::runtime_filter::RuntimeFilterBindingId,
             Arc<BackendRuntimeFilterSession>,
@@ -222,7 +235,7 @@ impl RuntimeFilterParticipant {
     ) -> Result<Arc<Self>, QueryLifecycleError> {
         let outbound = Arc::new(BackendParticipantOutbound::new(
             install.clone(),
-            transport_deadline,
+            transport_policy,
             transport_sink,
             Arc::clone(&observation),
         ));
@@ -676,23 +689,29 @@ impl RuntimeFilterParticipant {
         self.observation.capture()
     }
 
-    pub(crate) fn prepare_terminal_capture(&self, reason: QueryTerminationReason) {
+    /// Drains sender-side completions, records the required terminal facts, and
+    /// freezes the only runtime-filter observation snapshot eligible for query
+    /// terminalization. Repeated calls intentionally return that same proof.
+    pub(crate) fn prepare_terminal_capture(
+        &self,
+        reason: QueryTerminationReason,
+    ) -> RuntimeFilterObservationSnapshot {
         self.outbound.drain_transport_completions();
-        if reason == QueryTerminationReason::QueryTerminationCoordinatorFinalize {
-            return;
-        }
-        for channel in self.install.channels().values() {
-            for binding_id in channel.producers().keys().chain(channel.consumers().keys()) {
-                self.observation
-                    .record(BackendRuntimeFilterEvent::ChannelCancelled {
-                        channel: BackendChannelIdentity::new(
-                            self.install.participant(),
-                            *binding_id,
-                            channel.channel_id(),
-                        ),
-                    });
+        if reason != QueryTerminationReason::QueryTerminationCoordinatorFinalize {
+            for channel in self.install.channels().values() {
+                for binding_id in channel.producers().keys().chain(channel.consumers().keys()) {
+                    self.observation
+                        .record(BackendRuntimeFilterEvent::ChannelCancelled {
+                            channel: BackendChannelIdentity::new(
+                                self.install.participant(),
+                                *binding_id,
+                                channel.channel_id(),
+                            ),
+                        });
+                }
             }
         }
+        self.observation.seal()
     }
 
     pub(crate) fn record_row_effect(
@@ -912,7 +931,7 @@ impl RuntimeFilterProducer for BackendParticipantRuntimeFilterProducer {
 
 struct BackendParticipantOutbound {
     install: BackendParticipantInstall,
-    transport_deadline: Duration,
+    transport_policy: BackendRuntimeFilterRetryPolicy,
     transport_sink: Arc<dyn BackendRuntimeFilterEnvelopeSink>,
     next_delivery_sequence: AtomicU64,
     observation: Arc<RuntimeFilterObservationEmitter>,
@@ -924,13 +943,13 @@ struct BackendParticipantOutbound {
 impl BackendParticipantOutbound {
     fn new(
         install: BackendParticipantInstall,
-        transport_deadline: Duration,
+        transport_policy: BackendRuntimeFilterRetryPolicy,
         transport_sink: Arc<dyn BackendRuntimeFilterEnvelopeSink>,
         observation: Arc<RuntimeFilterObservationEmitter>,
     ) -> Self {
         Self {
             install,
-            transport_deadline,
+            transport_policy,
             transport_sink,
             next_delivery_sequence: AtomicU64::new(1),
             observation,
@@ -1145,7 +1164,7 @@ impl BackendParticipantOutbound {
         let route_identity = *envelope.route_identity();
         let Ok(envelope) = BackendNativeRuntimeFilterTransportEnvelope::new(
             Arc::new(envelope),
-            self.transport_deadline,
+            self.transport_policy,
         ) else {
             self.record_transport(
                 identity,
@@ -1206,22 +1225,31 @@ impl BackendParticipantOutbound {
 
     fn drain_transport_completions(&self) {
         while let Some(completion) = self.transport_sink.try_recv_completion() {
-            let (route_identity, kind) = match completion {
-                BackendRuntimeFilterSinkCompletion::Ack(route_identity, status) => {
-                    (route_identity, BackendTransportEventKind::Acked(status))
+            let (route_identity, kind, terminal) = match completion {
+                BackendRuntimeFilterSinkCompletion::Ack(route_identity, status) => (
+                    route_identity,
+                    BackendTransportEventKind::Acked(status),
+                    true,
+                ),
+                BackendRuntimeFilterSinkCompletion::Retried(route_identity) => {
+                    (route_identity, BackendTransportEventKind::Retried, false)
                 }
-                BackendRuntimeFilterSinkCompletion::TransportFailure(route_identity, error) => {
-                    let reason = match error {
-                        BackendRuntimeFilterUnaryError::Contract(_) => {
-                            BackendTransportFailOpenReason::ContractRejected
-                        }
-                        BackendRuntimeFilterUnaryError::Transport(_) => {
+                BackendRuntimeFilterSinkCompletion::TransportFailure(route_identity, _, reason) => {
+                    let reason = match reason {
+                        BackendRuntimeFilterTransportFailureReason::Deadline => {
                             BackendTransportFailOpenReason::Deadline
+                        }
+                        BackendRuntimeFilterTransportFailureReason::AttemptsExhausted => {
+                            BackendTransportFailOpenReason::AttemptsExhausted
+                        }
+                        BackendRuntimeFilterTransportFailureReason::ContractRejected => {
+                            BackendTransportFailOpenReason::ContractRejected
                         }
                     };
                     (
                         route_identity,
                         BackendTransportEventKind::FailedOpen(reason),
+                        true,
                     )
                 }
             };
@@ -1232,6 +1260,14 @@ impl BackendParticipantOutbound {
             let Some(queue) = pending.get_mut(&route_identity) else {
                 continue;
             };
+            if !terminal {
+                let Some((identity, bytes)) = queue.front().copied() else {
+                    pending.remove(&route_identity);
+                    continue;
+                };
+                self.record_transport(identity, kind, bytes);
+                continue;
+            }
             let Some((identity, bytes)) = queue.pop_front() else {
                 pending.remove(&route_identity);
                 continue;
@@ -1706,6 +1742,17 @@ mod tests {
         .expect("valid execution id")
     }
 
+    fn transport_policy() -> BackendRuntimeFilterRetryPolicy {
+        BackendRuntimeFilterRetryPolicy::new(
+            Duration::from_millis(1),
+            3,
+            Duration::from_secs(1),
+            64,
+            64 * 1024,
+        )
+        .expect("test transport policy")
+    }
+
     fn endpoint(port: i32) -> RuntimeEndpoint {
         RuntimeEndpoint::new("127.0.0.1", port).expect("valid endpoint")
     }
@@ -1782,7 +1829,7 @@ mod tests {
             execution_id(),
             install,
             observation,
-            Duration::from_secs(1),
+            transport_policy(),
             BTreeMap::from([(producer.binding_id(), session)]),
             BTreeMap::new(),
             MemTracker::new_root("runtime_filter_final_domain_completion_test"),
@@ -1915,6 +1962,38 @@ mod tests {
                 .channels()
                 .iter()
                 .all(|channel| channel.completed() == 0)
+        );
+    }
+
+    #[test]
+    fn terminal_prepare_seals_one_idempotent_observation_proof() {
+        let (participant, producer, _) = final_domain_participant(1024);
+        let first = participant.prepare_terminal_capture(QueryTerminationReason::LocalFailure);
+        assert!(
+            first
+                .channels()
+                .iter()
+                .all(|channel| channel.cancelled() == 1),
+            "local failure must record cancellation before sealing"
+        );
+
+        let late_channel = BackendChannelIdentity::new(
+            participant.install.participant(),
+            producer.binding_id(),
+            producer.channel_id(),
+        );
+        participant
+            .observation
+            .record(BackendRuntimeFilterEvent::ChannelCancelled {
+                channel: late_channel,
+            });
+
+        let second = participant.prepare_terminal_capture(QueryTerminationReason::LocalFailure);
+        assert_eq!(second, first, "terminal proof is frozen exactly once");
+        assert_eq!(
+            participant.capture_runtime_filter_observation(),
+            first,
+            "late writes cannot alter the retained terminal proof"
         );
     }
 
@@ -2192,7 +2271,7 @@ mod tests {
             execution_id(),
             target_install,
             target_observation,
-            Duration::from_secs(1),
+            transport_policy(),
             BTreeMap::new(),
             BTreeMap::from([(consumer_contract.binding_id(), target_session)]),
             MemTracker::new_root("runtime_filter_remote_consumer_test"),
@@ -2213,7 +2292,7 @@ mod tests {
             execution_id(),
             source_install,
             source_observation,
-            Duration::from_secs(1),
+            transport_policy(),
             BTreeMap::from([(producer.binding_id(), source_session)]),
             BTreeMap::new(),
             MemTracker::new_root("runtime_filter_remote_source_test"),
@@ -2387,7 +2466,7 @@ mod tests {
             execution_id(),
             target_install,
             target_observation,
-            Duration::from_secs(1),
+            transport_policy(),
             BTreeMap::new(),
             BTreeMap::from([(consumer_contract.binding_id(), target_session)]),
             MemTracker::new_root("runtime_filter_remote_unavailable_test"),
