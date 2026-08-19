@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 
 use novarocks_catalog::identifier::normalize_identifier;
-use novarocks_spi::connector::ConnectorColumnDefinition;
+use novarocks_spi::connector::{
+    ConnectorColumnDefinition, ConnectorViewDefinition, ConnectorViewSourceFormat,
+};
 
 use crate::catalog_config::IcebergCatalogKind;
 use crate::control_runtime::IcebergControlRuntime;
@@ -31,12 +33,17 @@ use crate::iceberg::{
 };
 
 pub(crate) const VIEW_DIALECT_STARROCKS: &str = "starrocks";
+const NOVAROCKS_ENGINE_NAME: &str = "novarocks";
+const NOVAROCKS_SOURCE_FORMAT_KEY: &str = "novarocks.source-format";
+const EFFECTIVE_USER_SOURCE_V1: &str = "effective-user-source-v1";
 
 #[derive(Clone, Debug)]
 pub(crate) struct LoadedIcebergView {
-    pub sql: String,
+    pub raw_sql: String,
     pub dialect: String,
+    pub default_catalog: Option<String>,
     pub default_namespace: String,
+    pub source_format: Option<ConnectorViewSourceFormat>,
     pub column_names: Vec<String>,
     pub comment: Option<String>,
     pub properties: HashMap<String, String>,
@@ -67,29 +74,94 @@ fn build_view_schema(columns: &[ConnectorColumnDefinition]) -> Result<Schema, St
         .map_err(|error| format!("build Iceberg view schema: {error}"))
 }
 
+fn novarocks_source_context(
+    definition: &ConnectorViewDefinition,
+) -> Result<(String, NamespaceIdent, &'static str), String> {
+    if definition.dialect != ConnectorViewDialect::StarRocks {
+        return Err("unsupported SQL dialect for NovaRocks Iceberg view creation".to_string());
+    }
+    if definition.raw_sql.is_empty() {
+        return Err("NovaRocks Iceberg view source SQL is empty".to_string());
+    }
+    let source_catalog = definition
+        .default_catalog
+        .as_ref()
+        .ok_or_else(|| "NovaRocks Iceberg view source is missing default catalog".to_string())?;
+    let source_catalog = normalize_identifier(source_catalog)
+        .map_err(|error| format!("normalize NovaRocks view source catalog: {error}"))?;
+    let source_namespace = normalize_identifier(&definition.default_namespace)
+        .map_err(|error| format!("normalize NovaRocks view source namespace: {error}"))?;
+    let source_format = match definition.source_format {
+        Some(ConnectorViewSourceFormat::EffectiveUserSourceV1) => EFFECTIVE_USER_SOURCE_V1,
+        None => {
+            return Err(
+                "NovaRocks Iceberg view creation requires effective-user-source-v1 provenance"
+                    .to_string(),
+            );
+        }
+    };
+    Ok((
+        source_catalog,
+        NamespaceIdent::new(source_namespace),
+        source_format,
+    ))
+}
+
+fn source_format_from_summary(
+    ident: &TableIdent,
+    summary: &HashMap<String, String>,
+) -> Result<Option<ConnectorViewSourceFormat>, String> {
+    if summary.get("engine-name").map(String::as_str) != Some(NOVAROCKS_ENGINE_NAME) {
+        return Ok(None);
+    }
+    match summary.get(NOVAROCKS_SOURCE_FORMAT_KEY).map(String::as_str) {
+        Some(EFFECTIVE_USER_SOURCE_V1) => {
+            Ok(Some(ConnectorViewSourceFormat::EffectiveUserSourceV1))
+        }
+        None => Err(format!(
+            "corrupt NovaRocks Iceberg view {ident}: missing {NOVAROCKS_SOURCE_FORMAT_KEY}"
+        )),
+        Some(value) => Err(format!(
+            "unsupported NovaRocks Iceberg view {ident}: unknown {NOVAROCKS_SOURCE_FORMAT_KEY} `{value}`"
+        )),
+    }
+}
+
 pub(crate) fn create_view(
     runtime: &IcebergControlRuntime,
     namespace: &str,
     view: &str,
     columns: &[ConnectorColumnDefinition],
-    sql: &str,
+    definition: &ConnectorViewDefinition,
     comment: Option<&str>,
     replace: bool,
     extra_properties: &[(String, String)],
 ) -> Result<(), String> {
     ensure_rest(runtime)?;
+    let (source_catalog, source_namespace, source_format) = novarocks_source_context(definition)?;
     let (namespace_ident, ident) = view_ident(namespace, view)?;
     let schema = build_view_schema(columns)?;
     let representations =
         ViewRepresentations::new(vec![ViewRepresentation::Sql(SqlViewRepresentation {
-            sql: sql.to_string(),
+            sql: definition.raw_sql.to_string(),
             dialect: VIEW_DIALECT_STARROCKS.to_string(),
         })]);
     let mut properties = extra_properties.iter().cloned().collect::<HashMap<_, _>>();
     if let Some(comment) = comment {
-        properties.insert("comment".to_string(), comment.to_string());
+        if properties
+            .insert("comment".to_string(), comment.to_string())
+            .is_some()
+        {
+            return Err("duplicate Iceberg view comment property".to_string());
+        }
     }
-    let summary = HashMap::from([("engine-name".to_string(), "novarocks".to_string())]);
+    let summary = HashMap::from([
+        ("engine-name".to_string(), NOVAROCKS_ENGINE_NAME.to_string()),
+        (
+            NOVAROCKS_SOURCE_FORMAT_KEY.to_string(),
+            source_format.to_string(),
+        ),
+    ]);
     let catalog = runtime.catalog().clone();
 
     if replace {
@@ -111,6 +183,8 @@ pub(crate) fn create_view(
             representations,
             properties,
             summary,
+            source_catalog,
+            source_namespace,
         );
     }
 
@@ -120,8 +194,8 @@ pub(crate) fn create_view(
         .representations(representations)
         .schema(schema)
         .properties(properties)
-        .default_namespace(namespace_ident.clone())
-        .default_catalog(None)
+        .default_namespace(source_namespace)
+        .default_catalog(Some(source_catalog))
         .summary(summary)
         .build();
     runtime
@@ -142,6 +216,8 @@ fn replace_view(
     representations: ViewRepresentations,
     properties: HashMap<String, String>,
     summary: HashMap<String, String>,
+    source_catalog: String,
+    source_namespace: NamespaceIdent,
 ) -> Result<(), String> {
     let uuid = current.uuid();
     let timestamp_ms = std::time::SystemTime::now()
@@ -154,8 +230,8 @@ fn replace_view(
         .with_timestamp_ms(timestamp_ms)
         .with_summary(summary)
         .with_representations(representations)
-        .with_default_catalog(None)
-        .with_default_namespace(ident.namespace.clone())
+        .with_default_catalog(Some(source_catalog))
+        .with_default_namespace(source_namespace)
         .build();
     let mut builder = current.into_builder();
     if !properties.is_empty() {
@@ -297,10 +373,13 @@ fn loaded_view_from_metadata(
         .collect::<Vec<_>>()
         .join(".");
     let properties = metadata.properties().clone();
+    let source_format = source_format_from_summary(ident, version.summary())?;
     Ok(LoadedIcebergView {
-        sql: selected.sql.clone(),
+        raw_sql: selected.sql.clone(),
         dialect: selected.dialect.clone(),
+        default_catalog: version.default_catalog().cloned(),
         default_namespace,
+        source_format,
         column_names: metadata
             .current_schema()
             .as_struct()
@@ -316,8 +395,8 @@ fn loaded_view_from_metadata(
 use crate::control_provider::IcebergControlProvider;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
-    ConnectorListViewsRequest, ConnectorViewDefinition, ConnectorViewDialect,
-    ConnectorViewIdentity, ConnectorViewMetadata, ConnectorViewMetadataValue, ConnectorViewRequest,
+    ConnectorListViewsRequest, ConnectorViewDialect, ConnectorViewIdentity, ConnectorViewMetadata,
+    ConnectorViewMetadataValue, ConnectorViewRequest,
 };
 
 impl ConnectorViewMetadata for IcebergControlProvider {
@@ -355,9 +434,11 @@ impl ConnectorViewMetadata for IcebergControlProvider {
             request.view,
             ConnectorViewDefinition {
                 dialect: ConnectorViewDialect::StarRocks,
-                sql: loaded.sql.into(),
+                raw_sql: loaded.raw_sql.into(),
+                default_catalog: loaded.default_catalog.map(Into::into),
+                default_namespace: loaded.default_namespace.into(),
+                source_format: loaded.source_format,
             },
-            loaded.default_namespace.into(),
             loaded.column_names.into_iter().map(Into::into).collect(),
             loaded.comment.map(Into::into),
             loaded
@@ -417,7 +498,12 @@ fn ensure_request(
 fn unavailable(error: String) -> ConnectorError {
     let kind = if error.starts_with("unknown view:") {
         ConnectorErrorKind::NotFound
-    } else if error.contains("require a REST") || error.contains("unsupported SQL dialect") {
+    } else if error.starts_with("corrupt NovaRocks Iceberg view") {
+        ConnectorErrorKind::CorruptData
+    } else if error.contains("require a REST")
+        || error.contains("unsupported SQL dialect")
+        || error.starts_with("unsupported NovaRocks Iceberg view")
+    {
         ConnectorErrorKind::Unsupported
     } else {
         ConnectorErrorKind::Unavailable
@@ -433,6 +519,16 @@ mod tests {
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::resources::IcebergControlResources;
+
+    fn novarocks_definition(raw_sql: &str) -> ConnectorViewDefinition {
+        ConnectorViewDefinition {
+            dialect: ConnectorViewDialect::StarRocks,
+            raw_sql: raw_sql.into(),
+            default_catalog: Some("source_catalog".into()),
+            default_namespace: "source_namespace".into(),
+            source_format: Some(ConnectorViewSourceFormat::EffectiveUserSourceV1),
+        }
+    }
 
     fn hadoop_runtime() -> (
         tokio::runtime::Runtime,
@@ -480,7 +576,7 @@ mod tests {
             "db",
             "v",
             &[],
-            "select 1",
+            &novarocks_definition("select 1"),
             None,
             false,
             &[],
@@ -510,8 +606,62 @@ mod tests {
             ConnectorErrorKind::NotFound
         );
         assert_eq!(
+            unavailable("corrupt NovaRocks Iceberg view db.v: missing format".to_string()).kind(),
+            ConnectorErrorKind::CorruptData
+        );
+        assert_eq!(
+            unavailable("unsupported NovaRocks Iceberg view db.v: unknown format".to_string())
+                .kind(),
+            ConnectorErrorKind::Unsupported
+        );
+        assert_eq!(
             unavailable("REST response lost".to_string()).kind(),
             ConnectorErrorKind::Unavailable
+        );
+    }
+
+    #[test]
+    fn novarocks_view_source_context_is_frozen_independently_of_target() {
+        let definition = novarocks_definition("SELECT  /* preserve */ 1");
+        let (catalog, namespace, format) =
+            novarocks_source_context(&definition).expect("valid NovaRocks source context");
+
+        assert_eq!(catalog, "source_catalog");
+        assert_eq!(namespace.to_string(), "source_namespace");
+        assert_eq!(format, EFFECTIVE_USER_SOURCE_V1);
+        assert_eq!(definition.raw_sql.as_ref(), "SELECT  /* preserve */ 1");
+    }
+
+    #[test]
+    fn provenance_validation_rejects_old_novarocks_and_accepts_third_party_views() {
+        let ident = TableIdent::from_strs(["db", "v"]).expect("view ident");
+        let third_party = HashMap::new();
+        assert_eq!(
+            source_format_from_summary(&ident, &third_party).expect("third-party view"),
+            None
+        );
+
+        let old_novarocks =
+            HashMap::from([("engine-name".to_string(), NOVAROCKS_ENGINE_NAME.to_string())]);
+        let error = source_format_from_summary(&ident, &old_novarocks)
+            .expect_err("NovaRocks provenance without format is corrupt");
+        assert!(
+            error.starts_with("corrupt NovaRocks Iceberg view"),
+            "{error}"
+        );
+
+        let unknown_novarocks = HashMap::from([
+            ("engine-name".to_string(), NOVAROCKS_ENGINE_NAME.to_string()),
+            (
+                NOVAROCKS_SOURCE_FORMAT_KEY.to_string(),
+                "future-v2".to_string(),
+            ),
+        ]);
+        let error = source_format_from_summary(&ident, &unknown_novarocks)
+            .expect_err("unknown NovaRocks format is unsupported");
+        assert!(
+            error.starts_with("unsupported NovaRocks Iceberg view"),
+            "{error}"
         );
     }
 }

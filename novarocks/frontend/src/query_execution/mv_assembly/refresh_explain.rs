@@ -48,9 +48,15 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
 
     let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
     let canonical_select_query = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&mv_definition.select_sql)?,
-        current_catalog,
-        current_database,
+        &parse_mv_select_query(&mv_definition.query_definition.raw_query_source)?,
+        Some(
+            mv_definition
+                .query_definition
+                .resolution
+                .default_catalog
+                .as_str(),
+        ),
+        &mv_definition.query_definition.resolution.default_database,
     );
     let dispatch_schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
         format!(

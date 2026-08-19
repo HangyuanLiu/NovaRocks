@@ -17,6 +17,9 @@
 
 use std::collections::HashMap;
 
+use novarocks_frontend::common::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
+};
 use novarocks_frontend::view::{
     CreateExternalViewRequest, ResolvedExternalView, ViewColumnDefinition, ViewEngine,
     ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
@@ -36,16 +39,20 @@ fn frontend_facing_view_ports_and_dtos_are_publicly_nameable() {
             data_type: sqlparser::ast::DataType::BigInt(None),
             nullable: false,
         }],
-        sql: "SELECT COUNT(*) AS sale_count FROM sales".to_string(),
+        definition: PersistedQueryDefinition::new(
+            "SELECT COUNT(*) AS sale_count FROM sales",
+            PersistedQueryDialect::StarRocks,
+            "rest",
+            "analytics",
+        )
+        .unwrap(),
         comment: Some("Daily sales".to_string()),
         or_replace: false,
         if_not_exists: false,
         properties: vec![],
     };
     let resolved = ResolvedExternalView {
-        sql: request.sql.clone(),
-        dialect: "starrocks".to_string(),
-        default_database: target.database.clone(),
+        definition: request.definition.clone(),
         column_names: vec!["sale_count".to_string()],
         comment: request.comment.clone(),
         properties: HashMap::new(),

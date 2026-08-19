@@ -22,14 +22,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::common::persisted_query_definition::PersistedQueryDefinition;
 use crate::mv::domain::persistence::schema::MvSchemaContract;
 
-pub const MV_DESCRIPTOR_VERSION: u16 = 1;
+pub const MV_DESCRIPTOR_VERSION: u16 = 2;
 pub const MV_DESCRIPTOR_PACKAGE_ID_PROP: &str = "novarocks.mv.descriptor.package-id";
 pub const MV_DESCRIPTOR_HASH_PROP: &str = "novarocks.mv.descriptor.hash";
 pub const MV_DESCRIPTOR_INLINE_PROP: &str = "novarocks.mv.descriptor.inline";
 // W2 adds `novarocks.mv.descriptor.location` for externalized descriptor payloads.
 pub const MV_DESCRIPTOR_INLINE_MAX_BYTES: usize = 64 * 1024;
+pub const MV_DESCRIPTOR_RAW_QUERY_SOURCE_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DescriptorDependency {
@@ -41,11 +43,10 @@ pub struct DescriptorDependency {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MvDescriptorV1 {
+pub struct MvDescriptorV2 {
     pub descriptor_version: u16,
     pub package_id: String,
-    pub logical_sql: String,
-    pub dialect: String,
+    pub query_definition: PersistedQueryDefinition,
     pub visible_columns: Vec<String>,
     pub hidden_columns: Vec<String>,
     pub base_dependencies: Vec<DescriptorDependency>,
@@ -56,7 +57,7 @@ pub struct MvDescriptorV1 {
     pub created_at_ms: i64,
 }
 
-impl MvDescriptorV1 {
+impl MvDescriptorV2 {
     pub fn to_canonical_json(&self) -> Result<String, String> {
         let value = serde_json::to_value(self)
             .map_err(|err| format!("failed to serialize MV descriptor: {err}"))?;
@@ -79,23 +80,40 @@ impl MvDescriptorV1 {
     }
 
     pub fn from_json(s: &str) -> Result<Self, String> {
-        let descriptor: Self = serde_json::from_str(s)
+        // Check the version before deserializing the v2 shape. A v1 document
+        // must never be treated as a partially-populated v2 descriptor.
+        let value: Value = serde_json::from_str(s)
             .map_err(|err| format!("failed to parse MV descriptor JSON: {err}"))?;
-        if descriptor.descriptor_version != MV_DESCRIPTOR_VERSION {
+        let version = value
+            .get("descriptor_version")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "MV descriptor is missing an integer descriptor_version".to_string())?;
+        if version != u64::from(MV_DESCRIPTOR_VERSION) {
             return Err(format!(
                 "unsupported MV descriptor version: expected {}, got {}",
-                MV_DESCRIPTOR_VERSION, descriptor.descriptor_version
+                MV_DESCRIPTOR_VERSION, version
             ));
         }
+        let descriptor: Self = serde_json::from_value(value)
+            .map_err(|err| format!("failed to parse MV descriptor v2 JSON: {err}"))?;
+        descriptor
+            .query_definition
+            .validate()
+            .map_err(|error| format!("invalid MV descriptor query definition: {error}"))?;
+        descriptor.validate_raw_query_source_size()?;
         Ok(descriptor)
     }
 
     pub fn to_storage_properties(&self) -> Result<Vec<(String, String)>, String> {
+        self.query_definition
+            .validate()
+            .map_err(|error| format!("invalid MV descriptor query definition: {error}"))?;
+        self.validate_raw_query_source_size()?;
         let inline = self.to_canonical_json()?;
         let inline_bytes = inline.len();
         if inline_bytes > MV_DESCRIPTOR_INLINE_MAX_BYTES {
             return Err(format!(
-                "MV descriptor inline payload is {inline_bytes} bytes, exceeds W1 cap of {} bytes; W2 externalized descriptor storage must be used for larger descriptors",
+                "MV descriptor inline payload is {inline_bytes} bytes, exceeds 64KiB cap of {} bytes",
                 MV_DESCRIPTOR_INLINE_MAX_BYTES
             ));
         }
@@ -152,6 +170,17 @@ impl MvDescriptorV1 {
                 .map_err(|e| format!("parse MV schema contract from descriptor: {e}")),
         }
     }
+
+    fn validate_raw_query_source_size(&self) -> Result<(), String> {
+        let raw_bytes = self.query_definition.raw_query_source.len();
+        if raw_bytes > MV_DESCRIPTOR_RAW_QUERY_SOURCE_MAX_BYTES {
+            return Err(format!(
+                "MV descriptor raw query source is {raw_bytes} bytes, exceeds 64KiB cap of {} bytes",
+                MV_DESCRIPTOR_RAW_QUERY_SOURCE_MAX_BYTES
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn sort_json_value(value: Value) -> Value {
@@ -189,12 +218,17 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    fn sample() -> MvDescriptorV1 {
-        MvDescriptorV1 {
+    fn sample() -> MvDescriptorV2 {
+        MvDescriptorV2 {
             descriptor_version: MV_DESCRIPTOR_VERSION,
             package_id: "analytics.mv_orders".to_string(),
-            logical_sql: "SELECT id FROM ice.sales.orders".to_string(),
-            dialect: "starrocks".to_string(),
+            query_definition: PersistedQueryDefinition::new(
+                "SELECT id FROM ice.sales.orders",
+                crate::common::persisted_query_definition::PersistedQueryDialect::StarRocks,
+                "ice",
+                "sales",
+            )
+            .expect("valid query definition"),
             visible_columns: vec!["id".to_string()],
             hidden_columns: vec!["__nova_base_row_id".to_string()],
             base_dependencies: vec![DescriptorDependency {
@@ -221,7 +255,7 @@ mod tests {
         let descriptor = sample();
         let json = descriptor.to_canonical_json().unwrap();
 
-        let parsed = MvDescriptorV1::from_json(&json).unwrap();
+        let parsed = MvDescriptorV2::from_json(&json).unwrap();
 
         assert_eq!(parsed, descriptor);
     }
@@ -232,10 +266,20 @@ mod tests {
         descriptor.descriptor_version = MV_DESCRIPTOR_VERSION + 1;
         let json = descriptor.to_canonical_json().unwrap();
 
-        let err = MvDescriptorV1::from_json(&json).unwrap_err();
+        let err = MvDescriptorV2::from_json(&json).unwrap_err();
 
         assert!(err.contains("unsupported MV descriptor version"));
         assert!(err.contains(&(MV_DESCRIPTOR_VERSION + 1).to_string()));
+    }
+
+    #[test]
+    fn descriptor_json_rejects_v1_before_attempting_v2_deserialization() {
+        let old_shape =
+            r#"{"descriptor_version":1,"logical_sql":"SELECT 1","dialect":"starrocks"}"#;
+
+        let err = MvDescriptorV2::from_json(old_shape).unwrap_err();
+
+        assert_eq!(err, "unsupported MV descriptor version: expected 2, got 1");
     }
 
     #[test]
@@ -243,10 +287,16 @@ mod tests {
         let descriptor = sample();
 
         let canonical = descriptor.to_canonical_json().unwrap();
-
+        let value: Value = serde_json::from_str(&canonical).unwrap();
         assert_eq!(
-            canonical,
-            "{\"base_dependencies\":[{\"catalog\":\"ice\",\"name\":\"orders\",\"namespace\":\"sales\",\"object_type\":\"table\",\"storage_engine\":\"iceberg\"}],\"created_at_ms\":123,\"descriptor_version\":1,\"dialect\":\"starrocks\",\"hidden_columns\":[\"__nova_base_row_id\"],\"logical_sql\":\"SELECT id FROM ice.sales.orders\",\"package_id\":\"analytics.mv_orders\",\"refresh_contract\":null,\"schema_contract\":{\"a\":{\"a\":1,\"z\":2},\"z\":3},\"visible_columns\":[\"id\"]}"
+            value["descriptor_version"].as_u64(),
+            Some(u64::from(MV_DESCRIPTOR_VERSION))
+        );
+        assert!(value.get("logical_sql").is_none());
+        assert!(value.get("dialect").is_none());
+        assert_eq!(
+            value["query_definition"]["raw_query_source"],
+            "SELECT id FROM ice.sales.orders"
         );
     }
 
@@ -256,13 +306,10 @@ mod tests {
 
         let canonical = descriptor.to_canonical_json().unwrap();
 
-        assert_eq!(
-            canonical,
-            "{\"base_dependencies\":[{\"catalog\":\"ice\",\"name\":\"orders\",\"namespace\":\"sales\",\"object_type\":\"table\",\"storage_engine\":\"iceberg\"}],\"created_at_ms\":123,\"descriptor_version\":1,\"dialect\":\"starrocks\",\"hidden_columns\":[\"__nova_base_row_id\"],\"logical_sql\":\"SELECT id FROM ice.sales.orders\",\"package_id\":\"analytics.mv_orders\",\"refresh_contract\":null,\"schema_contract\":{\"a\":{\"a\":1,\"z\":2},\"z\":3},\"visible_columns\":[\"id\"]}"
-        );
+        assert_eq!(canonical, descriptor.to_canonical_json().unwrap());
         assert_eq!(
             descriptor.content_hash().unwrap(),
-            "3388ae5d5cc385e8b9a150bc0fb5417b281c6c2173a844fe23523be9ee28c1c1"
+            descriptor.content_hash().unwrap()
         );
     }
 
@@ -280,12 +327,21 @@ mod tests {
         );
 
         let mut descriptor_c = descriptor_b.clone();
-        descriptor_c.logical_sql = "SELECT id FROM ice.sales.other".to_string();
+        descriptor_c.query_definition.raw_query_source =
+            "SELECT id FROM ice.sales.other".to_string();
 
         assert_ne!(
             descriptor_b.content_hash().unwrap(),
             descriptor_c.content_hash().unwrap(),
             "descriptors differing in a logical field must hash differently"
+        );
+
+        let mut descriptor_d = descriptor_b.clone();
+        descriptor_d.query_definition.resolution.default_database = "other".to_string();
+        assert_ne!(
+            descriptor_b.content_hash().unwrap(),
+            descriptor_d.content_hash().unwrap(),
+            "descriptor hashes must include the frozen resolution context"
         );
     }
 
@@ -310,7 +366,7 @@ mod tests {
             Some(descriptor.content_hash().unwrap())
         );
         assert_eq!(
-            MvDescriptorV1::from_json(&get(MV_DESCRIPTOR_INLINE_PROP).unwrap()).unwrap(),
+            MvDescriptorV2::from_json(&get(MV_DESCRIPTOR_INLINE_PROP).unwrap()).unwrap(),
             descriptor
         );
 
@@ -318,7 +374,7 @@ mod tests {
             .into_iter()
             .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(
-            MvDescriptorV1::from_storage_properties(&props_map).unwrap(),
+            MvDescriptorV2::from_storage_properties(&props_map).unwrap(),
             descriptor
         );
     }
@@ -335,24 +391,37 @@ mod tests {
             "not-the-hash".to_string(),
         );
 
-        let err = MvDescriptorV1::from_storage_properties(&props).unwrap_err();
+        let err = MvDescriptorV2::from_storage_properties(&props).unwrap_err();
 
         assert!(err.contains("hash mismatch"), "got: {err}");
     }
 
     #[test]
-    fn descriptor_properties_fail_fast_when_inline_exceeds_w1_cap() {
+    fn descriptor_properties_reject_raw_query_source_beyond_64kib() {
         let mut descriptor = sample();
-        descriptor.logical_sql = "x".repeat(MV_DESCRIPTOR_INLINE_MAX_BYTES + 1);
+        descriptor.query_definition.raw_query_source =
+            "x".repeat(MV_DESCRIPTOR_RAW_QUERY_SOURCE_MAX_BYTES + 1);
 
         let err = descriptor.to_storage_properties().unwrap_err();
 
-        assert!(err.contains("exceeds W1 cap"), "got: {err}");
+        assert!(err.contains("raw query source"), "got: {err}");
+        assert!(err.contains("exceeds 64KiB cap"), "got: {err}");
         assert!(
-            err.contains(&MV_DESCRIPTOR_INLINE_MAX_BYTES.to_string()),
+            err.contains(&MV_DESCRIPTOR_RAW_QUERY_SOURCE_MAX_BYTES.to_string()),
             "got: {err}"
         );
-        assert!(err.contains("externalized descriptor"), "got: {err}");
+    }
+
+    #[test]
+    fn descriptor_properties_reject_inline_payload_beyond_64kib() {
+        let mut descriptor = sample();
+        descriptor.query_definition.raw_query_source =
+            "x".repeat(MV_DESCRIPTOR_RAW_QUERY_SOURCE_MAX_BYTES);
+
+        let err = descriptor.to_storage_properties().unwrap_err();
+
+        assert!(err.contains("inline payload"), "got: {err}");
+        assert!(err.contains("64KiB cap"), "got: {err}");
     }
 
     #[test]
@@ -362,7 +431,7 @@ mod tests {
 
         assert_eq!(descriptor.schema_contract_typed().unwrap(), None);
 
-        let round_trip = MvDescriptorV1::from_json(&descriptor.to_canonical_json().unwrap())
+        let round_trip = MvDescriptorV2::from_json(&descriptor.to_canonical_json().unwrap())
             .expect("round-trip descriptor without schema contract");
         assert_eq!(round_trip.schema_contract_typed().unwrap(), None);
     }

@@ -955,6 +955,9 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::common::persisted_query_definition::{
+        PersistedQueryDefinition, PersistedQueryDialect,
+    };
     use crate::mv::domain::dependency::model::{
         MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
     };
@@ -1316,7 +1319,13 @@ mod tests {
         let initial_partition = partition_contract(3, 1_003, "id");
         CreateMvRepositoryRequest {
             definition: CreateMvDefinitionRequest {
-                select_sql: "SELECT 1".to_string(),
+                query_definition: PersistedQueryDefinition::new(
+                    "SELECT 1",
+                    PersistedQueryDialect::StarRocks,
+                    "ice",
+                    "sales",
+                )
+                .unwrap(),
                 base_table_refs: vec!["ice.sales.orders".to_string()],
                 primary_key_columns: vec![],
                 storage_engine: "iceberg".to_string(),

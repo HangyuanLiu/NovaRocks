@@ -64,17 +64,9 @@ fn is_legacy_frontier(source: &str) -> bool {
                     && words.get(2).map(String::as_str) == Some("TABLE"))
                 || (words.get(1).map(String::as_str) == Some("EXTERNAL")
                     && words.get(2).map(String::as_str) == Some("TABLE"))
-                || words.get(1).map(String::as_str) == Some("VIEW")
-                || (words.get(1).map(String::as_str) == Some("OR")
-                    && words.get(2).map(String::as_str) == Some("REPLACE")
-                    && words.get(3).map(String::as_str) == Some("VIEW"))
         }
-        Some("DROP" | "ALTER") => matches!(words.get(1).map(String::as_str), Some("VIEW")),
-        Some("SHOW") => {
-            words.get(1).map(String::as_str) == Some("VIEWS")
-                || (words.get(1).map(String::as_str) == Some("CREATE")
-                    && words.get(2).map(String::as_str) == Some("VIEW"))
-        }
+        Some("DROP" | "ALTER") => false,
+        Some("SHOW") => false,
         _ => false,
     }
 }
@@ -167,11 +159,7 @@ mod tests {
             "WITH c AS (SELECT 1) SELECT * FROM c",
             "CREATE TABLE t (k INT)",
             "CREATE TEMPORARY TABLE t (k INT)",
-            "CREATE VIEW v AS SELECT 1",
-            "CREATE OR REPLACE VIEW v AS SELECT 1",
             "INSERT INTO t VALUES (1)",
-            "DROP VIEW v",
-            "SHOW VIEWS",
             "SET query_timeout = 1",
             "KILL QUERY 1",
             "EXPLAIN VERBOSE SELECT 1",
@@ -241,6 +229,28 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn view_family_is_admitted_and_malformed_view_does_not_fall_back() {
+        for source in [
+            "CREATE VIEW v AS SELECT 1",
+            "DROP VIEW v",
+            "SHOW VIEWS",
+            "SHOW CREATE VIEW v",
+        ] {
+            assert_eq!(
+                admit_statement(source)
+                    .expect("View command should parse")
+                    .0,
+                StatementAdmission::Parsed,
+                "{source}"
+            );
+        }
+
+        let error = admit_statement("CREATE VIEW v AS")
+            .expect_err("malformed typed View command must not reach the legacy frontier");
+        assert_eq!(error.code().as_str(), "sql.parse.unexpected_token");
     }
 
     #[test]

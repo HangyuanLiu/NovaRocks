@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
+use crate::common::persisted_query_definition::PersistedQueryDefinition;
 use crate::view::ViewSqlDialect;
 use bytes::Bytes;
 use novarocks_catalog::identifier::normalize_identifier;
@@ -37,21 +38,27 @@ use uuid::Uuid;
 
 use crate::durable::{DurableRecord, DurableRecordStore};
 
-const SCHEMA_VERSION: u8 = 1;
-const VIEW_PREFIX: &[u8] = b"novarocks/frontend/views/v1/";
+const SCHEMA_VERSION: u8 = 2;
+const VIEW_PREFIX: &[u8] = b"novarocks/frontend/views/v2/";
+const LEGACY_VIEW_PREFIX: &[u8] = b"novarocks/frontend/views/v1/";
 const VIEW_RECORD_ENCODED_LIMIT: usize = 60 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StoredDatabaseViewsV1 {
+pub struct StoredDatabaseViewsV2 {
     pub schema_version: u8,
     pub catalog: String,
     pub database: String,
     pub last_operation_id: Uuid,
     #[serde(deserialize_with = "deserialize_views")]
-    pub views: BTreeMap<String, String>,
+    pub views: BTreeMap<String, StoredViewDefinitionV2>,
 }
 
-impl DurableRecord for StoredDatabaseViewsV1 {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredViewDefinitionV2 {
+    pub definition: PersistedQueryDefinition,
+}
+
+impl DurableRecord for StoredDatabaseViewsV2 {
     const RECORD_KIND: &'static str = "frontend-view-database";
     const SCHEMA_VERSION: u8 = SCHEMA_VERSION;
     // View SQL and names are variable-length, so the full encoded candidate is
@@ -64,7 +71,7 @@ impl DurableRecord for StoredDatabaseViewsV1 {
 pub enum DatabaseMutation {
     Create {
         view: String,
-        sql: String,
+        definition: PersistedQueryDefinition,
         or_replace: bool,
     },
     DropView {
@@ -107,7 +114,38 @@ impl ViewRepository {
         &self.runtime
     }
 
-    pub async fn load_all(&self) -> Result<Vec<StoredDatabaseViewsV1>, String> {
+    async fn reject_legacy_records(&self) -> Result<(), String> {
+        let prefix = Key::try_from(Bytes::from_static(LEGACY_VIEW_PREFIX))
+            .map_err(|error| format!("build legacy frontend view range failed: {error}"))?;
+        let range = KeyRange::for_prefix(prefix)
+            .map_err(|error| format!("build legacy frontend view range failed: {error}"))?;
+        let mut transaction = self
+            .store
+            .begin_read()
+            .await
+            .map_err(|error| format!("begin legacy frontend view scan failed: {error}"))?;
+        let page = transaction
+            .range(&RangeRequest {
+                range,
+                direction: Direction::Forward,
+                page_size: 1,
+                continuation: None,
+            })
+            .await
+            .map_err(|error| format!("scan legacy frontend view records failed: {error}"))?;
+        transaction
+            .abort()
+            .await
+            .map_err(|error| format!("finish legacy frontend view scan failed: {error}"))?;
+        if page.records.is_empty() {
+            Ok(())
+        } else {
+            Err("unsupported frontend view durable version v1; delete the development fixture and recreate the view".to_string())
+        }
+    }
+
+    pub async fn load_all(&self) -> Result<Vec<StoredDatabaseViewsV2>, String> {
+        self.reject_legacy_records().await?;
         let prefix = Key::try_from(Bytes::from_static(VIEW_PREFIX))
             .map_err(|error| format!("build frontend view database range failed: {error}"))?;
         let range = KeyRange::for_prefix(prefix)
@@ -160,7 +198,7 @@ impl ViewRepository {
         catalog: &str,
         database: &str,
         mutation: DatabaseMutation,
-    ) -> Result<StoredDatabaseViewsV1, String> {
+    ) -> Result<StoredDatabaseViewsV2, String> {
         let catalog = normalize_identity("catalog", catalog)?;
         let database = normalize_identity("database", database)?;
         let mutation = prepare_mutation(mutation)?;
@@ -212,7 +250,7 @@ impl ViewRepository {
         }
     }
 
-    async fn load_database(&self, key: &Key) -> Result<Option<StoredDatabaseViewsV1>, String> {
+    async fn load_database(&self, key: &Key) -> Result<Option<StoredDatabaseViewsV2>, String> {
         let mut transaction = self.store.begin_read().await.map_err(|error| {
             format!("begin authoritative frontend view database read failed: {error}")
         })?;
@@ -239,7 +277,7 @@ pub fn database_key(catalog: &str, database: &str) -> Result<Key, String> {
         .map_err(|error| format!("encode frontend view database key failed: {error}"))
 }
 
-pub fn encode_record(record: StoredDatabaseViewsV1) -> Result<Value, String> {
+pub fn encode_record(record: StoredDatabaseViewsV2) -> Result<Value, String> {
     validate_record(&record)?;
     DurableRecordStore::with_limits(StateStoreLimits::default())
         .encode_compat_value(&record)
@@ -251,9 +289,9 @@ pub fn encode_record(record: StoredDatabaseViewsV1) -> Result<Value, String> {
         })
 }
 
-pub fn decode_record(key: Key, value: Value) -> Result<StoredDatabaseViewsV1, String> {
+pub fn decode_record(key: Key, value: Value) -> Result<StoredDatabaseViewsV2, String> {
     let (key_catalog, key_database) = decode_database_key(&key)?;
-    let record: StoredDatabaseViewsV1 =
+    let record: StoredDatabaseViewsV2 =
         serde_json::from_slice(value.as_bytes()).map_err(|error| {
             format!(
                 "decode frontend view database {}.{} failed: {error}",
@@ -301,14 +339,16 @@ fn decode_key_part(encoded: &[u8], identity: &str) -> Result<String, String> {
         .map_err(|_| format!("frontend view database key has non-UTF-8 {identity}"))
 }
 
-fn deserialize_views<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+fn deserialize_views<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, StoredViewDefinitionV2>, D::Error>
 where
     D: Deserializer<'de>,
 {
     struct ViewsVisitor;
 
     impl<'de> Visitor<'de> for ViewsVisitor {
-        type Value = BTreeMap<String, String>;
+        type Value = BTreeMap<String, StoredViewDefinitionV2>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str("a map of normalized frontend view names to query SQL")
@@ -320,14 +360,16 @@ where
         {
             let mut views = BTreeMap::new();
             let mut normalized_names = BTreeSet::new();
-            while let Some((view, sql)) = access.next_entry::<String, String>()? {
+            while let Some((view, definition)) =
+                access.next_entry::<String, StoredViewDefinitionV2>()?
+            {
                 let normalized = normalize_identifier(&view).unwrap_or_else(|_| view.clone());
                 if !normalized_names.insert(normalized.clone()) {
                     return Err(serde::de::Error::custom(format!(
                         "duplicate normalized frontend view name `{normalized}`"
                     )));
                 }
-                views.insert(view, sql);
+                views.insert(view, definition);
             }
             Ok(views)
         }
@@ -336,7 +378,7 @@ where
     deserializer.deserialize_map(ViewsVisitor)
 }
 
-fn validate_record(record: &StoredDatabaseViewsV1) -> Result<(), String> {
+fn validate_record(record: &StoredDatabaseViewsV2) -> Result<(), String> {
     if record.schema_version != SCHEMA_VERSION {
         return Err(format!(
             "unsupported frontend view database schema version: {}",
@@ -345,9 +387,10 @@ fn validate_record(record: &StoredDatabaseViewsV1) -> Result<(), String> {
     }
     validate_normalized_identity("catalog", &record.catalog)?;
     validate_normalized_identity("database", &record.database)?;
-    for (view, sql) in &record.views {
+    for (view, stored) in &record.views {
         validate_normalized_identity("view", view)?;
-        parse_query(sql).map_err(|error| {
+        stored.definition.validate()?;
+        parse_query(&stored.definition.raw_query_source).map_err(|error| {
             format!(
                 "invalid frontend view definition {}.{}.{}: {error}",
                 record.catalog, record.database, view
@@ -371,14 +414,11 @@ fn normalize_identity(kind: &str, value: &str) -> Result<String, String> {
 }
 
 fn parse_query(sql: &str) -> Result<(), String> {
-    canonical_query(sql).map(|_| ())
-}
-
-fn canonical_query(sql: &str) -> Result<String, String> {
-    let statements = Parser::parse_sql(&ViewSqlDialect, sql)
+    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
+    let statements = Parser::parse_sql(&ViewSqlDialect, &normalized)
         .map_err(|error| format!("query parse failed: {error}"))?;
     match statements.as_slice() {
-        [Statement::Query(query)] => Ok(query.to_string()),
+        [Statement::Query(_)] => Ok(()),
         _ => Err("view SQL must contain exactly one query statement".to_string()),
     }
 }
@@ -387,11 +427,15 @@ fn prepare_mutation(mutation: DatabaseMutation) -> Result<DatabaseMutation, Stri
     match mutation {
         DatabaseMutation::Create {
             view,
-            sql,
+            definition,
             or_replace,
         } => Ok(DatabaseMutation::Create {
             view: normalize_identity("view", &view)?,
-            sql: canonical_query(&sql)?,
+            definition: {
+                definition.validate()?;
+                parse_query(&definition.raw_query_source)?;
+                definition
+            },
             or_replace,
         }),
         DatabaseMutation::DropView { view } => Ok(DatabaseMutation::DropView {
@@ -409,7 +453,7 @@ async fn apply_mutation(
     catalog: &str,
     database: &str,
     mutation: &DatabaseMutation,
-) -> Result<Result<StoredDatabaseViewsV1, String>, novarocks_spi::state_store::StateStoreError> {
+) -> Result<Result<StoredDatabaseViewsV2, String>, novarocks_spi::state_store::StateStoreError> {
     let existing = transaction.get(key).await?;
     let (mut record, precondition) = match existing {
         Some(StateRecord {
@@ -424,7 +468,7 @@ async fn apply_mutation(
             (record, Precondition::Version(version))
         }
         None => (
-            StoredDatabaseViewsV1 {
+            StoredDatabaseViewsV2 {
                 schema_version: SCHEMA_VERSION,
                 catalog: catalog.to_string(),
                 database: database.to_string(),
@@ -438,13 +482,18 @@ async fn apply_mutation(
     match mutation {
         DatabaseMutation::Create {
             view,
-            sql,
+            definition,
             or_replace,
         } => {
             if record.views.contains_key(view) && !or_replace {
                 return Ok(Err(format!("view already exists: {database}.{view}")));
             }
-            record.views.insert(view.clone(), sql.clone());
+            record.views.insert(
+                view.clone(),
+                StoredViewDefinitionV2 {
+                    definition: definition.clone(),
+                },
+            );
         }
         DatabaseMutation::DropView { view } => {
             record.views.remove(view);

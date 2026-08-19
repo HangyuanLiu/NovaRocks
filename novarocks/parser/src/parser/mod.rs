@@ -30,6 +30,7 @@ mod materialized_view;
 mod pratt;
 mod show_backends;
 mod statistics;
+mod view;
 
 use crate::{
     ParseError, ParserError, Span, Token, TokenKind,
@@ -88,7 +89,8 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
     /// immediate typed error from that parser.
     fn parse_statement(&mut self) -> Result<Statement, ParserError> {
         for parser in [
-            backend::parse as FamilyParser,
+            view::parse as FamilyParser,
+            backend::parse,
             statistics::parse,
             catalog::parse,
             iceberg::parse,
@@ -249,6 +251,39 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
 
     pub(super) fn source_slice(&self, span: Span) -> &str {
         &self.source[span.start()..span.end()]
+    }
+
+    /// Captures an embedded query through its final non-trivia token.
+    ///
+    /// Command-family parsers call this after consuming their `AS` delimiter.
+    /// It leaves the trailing semicolon for the statement-sequence parser and
+    /// excludes whitespace/comments that follow the query while preserving all
+    /// bytes between query tokens exactly.
+    pub(super) fn parse_raw_query_slice(
+        &mut self,
+    ) -> Result<crate::ast::RawQuerySlice, ParseError> {
+        let start = self.current_span().start();
+        let mut end = None;
+        while let Some(token) = self.current() {
+            if matches!(
+                token.kind,
+                TokenKind::End | TokenKind::Symbol(Symbol::Semicolon)
+            ) {
+                break;
+            }
+            if !matches!(token.kind, TokenKind::Trivia(_)) {
+                end = Some(token.span.end());
+            }
+            self.advance();
+        }
+        let Some(end) = end else {
+            return Err(self.unexpected("query"));
+        };
+        let span = Span::new(start, end);
+        Ok(crate::ast::RawQuerySlice {
+            text: self.source_slice(span).to_owned(),
+            span,
+        })
     }
 
     pub(super) fn current_is_symbol(&self, symbol: Symbol) -> bool {
@@ -435,6 +470,7 @@ mod tests {
                 Statement::Iceberg(_) => "ICEBERG",
                 Statement::Maintenance(_) => "MAINTENANCE",
                 Statement::MaterializedView(_) => "MATERIALIZED VIEW",
+                Statement::View(_) => "VIEW",
                 Statement::RawQuery(_) => "RAW QUERY",
             })
             .collect()

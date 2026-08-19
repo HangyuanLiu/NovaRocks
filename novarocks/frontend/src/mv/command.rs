@@ -350,7 +350,7 @@ fn lower_typed_create(
                 .as_ref()
                 .unwrap_or(&TypedRefreshPolicy::Manual { deferred: false }),
         )?,
-        select_sql: select_query.to_string(),
+        select_sql: statement.query.text.clone(),
         select_query,
         properties: lower_typed_properties(&statement.properties)?,
         primary_key,

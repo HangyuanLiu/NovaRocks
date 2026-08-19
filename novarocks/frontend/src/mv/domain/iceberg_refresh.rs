@@ -33,7 +33,6 @@ use crate::catalog_application::query_bindings::{
 };
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::common::engine_error::EngineError;
-use crate::mv::domain::analysis::rebind::rewrite_select_sql_for_rebind;
 use crate::mv::domain::analysis::refresh_property::{
     RefreshFragmentProperty, TargetIdentity, derive_fragment_property, derive_imv_refresh_contract,
 };
@@ -61,7 +60,7 @@ use crate::mv::domain::persistence::definition::CreateMvDefinitionRequest;
 use crate::mv::domain::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::persistence::descriptor::{
-    DescriptorDependency, MV_DESCRIPTOR_VERSION, MvDescriptorV1,
+    DescriptorDependency, MV_DESCRIPTOR_VERSION, MvDescriptorV2,
 };
 use crate::mv::domain::persistence::schema as mv_schema;
 use crate::mv::domain::persistence::schema::{
@@ -356,7 +355,14 @@ impl MvEngine for StandaloneMvEngine {
         };
         let repository_request = CreateMvRepositoryRequest {
             definition: CreateMvDefinitionRequest {
-                select_sql: prepared.canonical_select_query.to_string(),
+                query_definition:
+                    crate::common::persisted_query_definition::PersistedQueryDefinition::new(
+                        request.statement.select_sql.clone(),
+                        crate::common::persisted_query_definition::PersistedQueryDialect::StarRocks,
+                        request.context.current_catalog.unwrap_or("default_catalog"),
+                        request.context.current_database,
+                    )
+                    .map_err(engine_prepare_error)?,
                 base_table_refs: prepared.base_refs.iter().map(TableIdentity::fqn).collect(),
                 primary_key_columns: request.statement.primary_key.clone().unwrap_or_default(),
                 storage_engine: MvStorageEngine::Iceberg.as_sql_str().to_string(),
@@ -1031,11 +1037,15 @@ fn prepare_iceberg_mv_create_with_ports(
         descriptor_hidden_columns.push(BRANCH_ID_COLUMN_NAME.to_string());
     }
     descriptor_hidden_columns.extend(aggregate_state_hidden_columns.iter().cloned());
-    let descriptor = MvDescriptorV1 {
+    let descriptor = MvDescriptorV2 {
         descriptor_version: MV_DESCRIPTOR_VERSION,
         package_id: format!("{}.{}", target.namespace, target.table),
-        logical_sql: canonical_select_query.to_string(),
-        dialect: "starrocks".to_string(),
+        query_definition: crate::common::persisted_query_definition::PersistedQueryDefinition::new(
+            stmt.select_sql.clone(),
+            crate::common::persisted_query_definition::PersistedQueryDialect::StarRocks,
+            current_catalog,
+            current_database,
+        )?,
         visible_columns: analysis
             .output_columns
             .iter()
@@ -3776,6 +3786,7 @@ fn log_planned_iceberg_mv_affected_partitions(
 #[derive(Serialize)]
 struct RefreshDefinitionFingerprint<'a> {
     mv_id: i64,
+    query_definition: &'a crate::common::persisted_query_definition::PersistedQueryDefinition,
     canonical_select_sql: String,
     canonical_base_refs: BTreeSet<String>,
     storage_engine: &'a str,
@@ -3792,9 +3803,15 @@ fn refresh_execution_definition_fingerprint(
     current_database: &str,
 ) -> Result<String, String> {
     let canonical_select_sql = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&mv_definition.select_sql)?,
-        current_catalog,
-        current_database,
+        &parse_mv_select_query(&mv_definition.query_definition.raw_query_source)?,
+        Some(
+            mv_definition
+                .query_definition
+                .resolution
+                .default_catalog
+                .as_str(),
+        ),
+        &mv_definition.query_definition.resolution.default_database,
     )
     .to_string();
     let canonical_base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?
@@ -3803,6 +3820,7 @@ fn refresh_execution_definition_fingerprint(
         .collect::<BTreeSet<_>>();
     let input = RefreshDefinitionFingerprint {
         mv_id: mv_definition.mv_id,
+        query_definition: &mv_definition.query_definition,
         canonical_select_sql,
         canonical_base_refs,
         storage_engine: &mv_definition.storage_engine,
@@ -3881,7 +3899,7 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
 
     let base_refs =
         parse_iceberg_table_refs(&mv_definition.base_table_refs).map_err(RefreshError::user)?;
-    let mv_definition = rebind_mv_definition_before_refresh_derivation(
+    let (mv_definition, refresh_query_source) = rebind_mv_definition_before_refresh_derivation(
         source.connector_control(),
         source.storage_observation(),
         &mv_definition,
@@ -3905,9 +3923,15 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
     )
     .map_err(RefreshError::user)?;
     let canonical_select_query = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&mv_definition.select_sql).map_err(RefreshError::user)?,
-        current_catalog,
-        current_database,
+        &parse_mv_select_query(&refresh_query_source).map_err(RefreshError::user)?,
+        Some(
+            mv_definition
+                .query_definition
+                .resolution
+                .default_catalog
+                .as_str(),
+        ),
+        &mv_definition.query_definition.resolution.default_database,
     );
     // Driver dispatch (Phase 3 / B2): plan-side dispatch is capability-driven,
     // matching the execute path.
@@ -5213,22 +5237,6 @@ pub fn join_base_refs_for_schema_contract<'a>(
         .find(|base| base.fqn().eq_ignore_ascii_case(right_name))
         .ok_or_else(|| format!("join MV right base {right_name} was not resolved"))?;
     Ok((left, right))
-}
-
-fn apply_join_schema_contract_decision(
-    decision: JoinContractDecision,
-    mv_definition: &StoredMvDefinition,
-) -> Result<StoredMvDefinition, String> {
-    match decision {
-        JoinContractDecision::CompatibleSafe => Ok(mv_definition.clone()),
-        JoinContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
-            let rewritten_sql =
-                rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
-            let mut definition = mv_definition.clone();
-            definition.select_sql = rewritten_sql;
-            Ok(definition)
-        }
-    }
 }
 
 fn rewrite_snapshot_table_factor(

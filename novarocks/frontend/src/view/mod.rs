@@ -21,12 +21,14 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::common::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
+use novarocks_parser::ast::{CreateView, ViewStatement};
 use novarocks_spi::state_store::StateStore;
 use novarocks_types::SlotId;
 use sqlparser::ast::{ObjectName, ObjectNamePart, Query, Statement};
@@ -45,7 +47,7 @@ pub use engine::{
     ViewStatementResult, ViewTarget,
 };
 
-use repository::{DatabaseMutation, StoredDatabaseViewsV1, ViewRepository};
+use repository::{DatabaseMutation, StoredDatabaseViewsV2, ViewRepository};
 
 const DEFAULT_CATALOG: &str = "default_catalog";
 
@@ -58,6 +60,7 @@ struct SessionViewKey {
 
 #[derive(Clone, Debug)]
 struct StoredView {
+    definition: PersistedQueryDefinition,
     query: Box<Query>,
 }
 
@@ -88,7 +91,7 @@ impl FrontendViewService {
         Ok(service)
     }
 
-    fn replace_all_records(&self, records: Vec<StoredDatabaseViewsV1>) -> Result<(), String> {
+    fn replace_all_records(&self, records: Vec<StoredDatabaseViewsV2>) -> Result<(), String> {
         let mut replacement = HashMap::new();
         for record in records {
             append_record_views(&mut replacement, &record)?;
@@ -100,7 +103,7 @@ impl FrontendViewService {
         Ok(())
     }
 
-    fn replace_database_record(&self, record: &StoredDatabaseViewsV1) -> Result<(), String> {
+    fn replace_database_record(&self, record: &StoredDatabaseViewsV2) -> Result<(), String> {
         let mut parsed = HashMap::new();
         append_record_views(&mut parsed, record)?;
         let mut registry = self
@@ -131,6 +134,7 @@ impl FrontendViewService {
     fn create_session_view(
         &self,
         key: SessionViewKey,
+        definition: PersistedQueryDefinition,
         query: Box<Query>,
         or_replace: bool,
     ) -> Result<(), String> {
@@ -141,7 +145,7 @@ impl FrontendViewService {
         if let Some(repository) = &self.repository {
             let mutation = DatabaseMutation::Create {
                 view: key.view.clone(),
-                sql: query.to_string(),
+                definition: definition.clone(),
                 or_replace,
             };
             match self.block_on(repository.mutate_database(&key.catalog, &key.database, mutation)) {
@@ -167,7 +171,7 @@ impl FrontendViewService {
                     key.database, key.view
                 ));
             }
-            registry.insert(key, StoredView { query });
+            registry.insert(key, StoredView { definition, query });
             Ok(())
         }
     }
@@ -208,54 +212,38 @@ impl FrontendViewService {
     fn handle_create(
         &self,
         engine: &dyn ViewEngine,
-        sql: &str,
+        create_view: &CreateView,
         context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, String> {
-        let mut parser = Parser::new(&ViewSqlDialect)
-            .try_with_sql(sql)
-            .map_err(|error| format!("CREATE VIEW parse error: {error}"))?;
-        let statement = parser
-            .parse_statement()
-            .map_err(|error| format!("CREATE VIEW parse error: {error}"))?;
-        let Statement::CreateView(create_view) = statement else {
-            return Err("CREATE VIEW: failed to parse statement".to_string());
-        };
-        if let Some(target) = iceberg::resolve_external_target(engine, &create_view.name, context)?
-        {
+        let parts = view_object_name_parts(&create_view.name);
+        if let Some(target) = iceberg::resolve_external_target_parts(engine, &parts, context)? {
             return iceberg::create_external_view(engine, target, create_view, context);
         }
         let key = session_view_key(&create_view.name, context.current_database)?;
-        self.create_session_view(key, create_view.query, create_view.or_replace)?;
+        let definition = query_definition(&create_view.query.text, context)?;
+        self.create_session_view(
+            key,
+            definition.clone(),
+            parse_query(&definition.raw_query_source)?,
+            create_view.or_replace,
+        )?;
         Ok(ViewStatementResult::Ok)
     }
 
     fn handle_drop(
         &self,
         engine: &dyn ViewEngine,
-        sql: &str,
+        drop_view: &novarocks_parser::ast::DropView,
         context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, String> {
-        let mut parser = Parser::new(&ViewSqlDialect)
-            .try_with_sql(sql)
-            .map_err(|error| format!("DROP VIEW parse error: {error}"))?;
-        let statement = parser
-            .parse_statement()
-            .map_err(|error| format!("DROP VIEW parse error: {error}"))?;
-        let Statement::Drop {
-            object_type: sqlparser::ast::ObjectType::View,
-            names,
-            if_exists,
-            ..
-        } = statement
-        else {
-            return Err("DROP VIEW: failed to parse statement".to_string());
-        };
-        for name in names {
-            if let Some(target) = iceberg::resolve_external_target(engine, &name, context)? {
-                iceberg::drop_external_view(engine, &target, if_exists, context)?;
-            } else {
-                self.drop_session_view(&session_view_key(&name, context.current_database)?)?;
-            }
+        let parts = view_object_name_parts(&drop_view.name);
+        if let Some(target) = iceberg::resolve_external_target_parts(engine, &parts, context)? {
+            iceberg::drop_external_view(engine, &target, drop_view.if_exists, context)?;
+        } else {
+            self.drop_session_view(&session_view_key(
+                &drop_view.name,
+                context.current_database,
+            )?)?;
         }
         Ok(ViewStatementResult::Ok)
     }
@@ -263,11 +251,14 @@ impl FrontendViewService {
     fn handle_show_views(
         &self,
         engine: &dyn ViewEngine,
-        sql: &str,
+        show_views: &novarocks_parser::ast::ShowViews,
         context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, String> {
-        let database =
-            iceberg::parse_show_views(sql)?.unwrap_or_else(|| context.current_database.to_string());
+        let database = show_views
+            .database
+            .as_ref()
+            .and_then(|database| view_object_name_parts(database).last().cloned())
+            .unwrap_or_else(|| context.current_database.to_string());
         let normalized_database = normalize_identifier(&database)?;
         let active_external_catalog = context
             .current_catalog
@@ -306,29 +297,20 @@ impl FrontendViewService {
 }
 
 impl ViewService for FrontendViewService {
-    fn try_handle_statement(
+    fn execute_statement(
         &self,
         engine: &dyn ViewEngine,
-        sql: &str,
+        statement: &ViewStatement,
         context: ViewRequestContext<'_>,
-    ) -> Result<Option<ViewStatementResult>, String> {
-        let trimmed = sql.trim().trim_end_matches(';').trim();
-        let normalized = trimmed.to_ascii_lowercase();
-        if normalized.starts_with("create view ")
-            || normalized.starts_with("create or replace view ")
-        {
-            return self.handle_create(engine, trimmed, context).map(Some);
+    ) -> Result<ViewStatementResult, String> {
+        match statement {
+            ViewStatement::Create(create_view) => self.handle_create(engine, create_view, context),
+            ViewStatement::Drop(drop_view) => self.handle_drop(engine, drop_view, context),
+            ViewStatement::Show(show_views) => self.handle_show_views(engine, show_views, context),
+            ViewStatement::ShowCreate(show_create) => {
+                iceberg::show_create_view(engine, &show_create.name, context)
+            }
         }
-        if normalized.starts_with("drop view ") {
-            return self.handle_drop(engine, trimmed, context).map(Some);
-        }
-        if has_keyword_prefix(&normalized, &["show", "create", "view"]) {
-            return iceberg::show_create_view(engine, trimmed, context).map(Some);
-        }
-        if has_keyword_prefix(&normalized, &["show", "views"]) {
-            return self.handle_show_views(engine, trimmed, context).map(Some);
-        }
-        Ok(None)
     }
 
     fn rewrite_query(
@@ -381,9 +363,10 @@ impl ViewService for FrontendViewService {
 
 fn append_record_views(
     registry: &mut HashMap<SessionViewKey, StoredView>,
-    record: &StoredDatabaseViewsV1,
+    record: &StoredDatabaseViewsV2,
 ) -> Result<(), String> {
-    for (view, sql) in &record.views {
+    for (view, stored) in &record.views {
+        stored.definition.validate()?;
         registry.insert(
             SessionViewKey {
                 catalog: record.catalog.clone(),
@@ -391,7 +374,8 @@ fn append_record_views(
                 view: view.clone(),
             },
             StoredView {
-                query: parse_query(sql)?,
+                definition: stored.definition.clone(),
+                query: parse_query(&stored.definition.raw_query_source)?,
             },
         );
     }
@@ -399,7 +383,8 @@ fn append_record_views(
 }
 
 fn parse_query(sql: &str) -> Result<Box<Query>, String> {
-    let statements = Parser::parse_sql(&ViewSqlDialect, sql)
+    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
+    let statements = Parser::parse_sql(&ViewSqlDialect, &normalized)
         .map_err(|error| format!("query parse failed: {error}"))?;
     match statements.as_slice() {
         [Statement::Query(query)] => Ok(query.clone()),
@@ -407,18 +392,15 @@ fn parse_query(sql: &str) -> Result<Box<Query>, String> {
     }
 }
 
-fn object_name_parts(name: &ObjectName) -> Vec<String> {
-    name.0
-        .iter()
-        .filter_map(|part| match part {
-            ObjectNamePart::Identifier(identifier) => Some(identifier.value.clone()),
-            _ => None,
-        })
-        .collect()
+fn view_object_name_parts(name: &novarocks_parser::ast::ObjectName) -> Vec<String> {
+    name.parts.iter().map(|part| part.value.clone()).collect()
 }
 
-fn session_view_key(name: &ObjectName, current_database: &str) -> Result<SessionViewKey, String> {
-    let parts = object_name_parts(name);
+fn session_view_key(
+    name: &novarocks_parser::ast::ObjectName,
+    current_database: &str,
+) -> Result<SessionViewKey, String> {
+    let parts = view_object_name_parts(name);
     let (catalog, database, view) = match parts.as_slice() {
         [view] => (
             DEFAULT_CATALOG.to_string(),
@@ -427,7 +409,7 @@ fn session_view_key(name: &ObjectName, current_database: &str) -> Result<Session
         ),
         [database, view] => (DEFAULT_CATALOG.to_string(), database.clone(), view.clone()),
         [catalog, database, view] => (catalog.clone(), database.clone(), view.clone()),
-        _ => return Err(format!("invalid view name: {name}")),
+        _ => return Err(format!("invalid view name: {}", parts.join("."))),
     };
     let catalog = normalize_identifier(&catalog)?;
     if catalog != DEFAULT_CATALOG {
@@ -440,15 +422,20 @@ fn session_view_key(name: &ObjectName, current_database: &str) -> Result<Session
     })
 }
 
-fn build_string_result(column_name: &str, rows: Vec<String>) -> Result<QueryResult, String> {
-    build_query_result(vec![(column_name.to_string(), rows)])
+fn query_definition(
+    raw_query_source: &str,
+    context: ViewRequestContext<'_>,
+) -> Result<PersistedQueryDefinition, String> {
+    PersistedQueryDefinition::new(
+        raw_query_source,
+        PersistedQueryDialect::StarRocks,
+        context.current_catalog.unwrap_or(DEFAULT_CATALOG),
+        context.current_database,
+    )
 }
 
-fn has_keyword_prefix(sql: &str, expected: &[&str]) -> bool {
-    sql.split_ascii_whitespace()
-        .zip(expected)
-        .all(|(actual, expected)| actual == *expected)
-        && sql.split_ascii_whitespace().count() >= expected.len()
+fn build_string_result(column_name: &str, rows: Vec<String>) -> Result<QueryResult, String> {
+    build_query_result(vec![(column_name.to_string(), rows)])
 }
 
 fn build_query_result(columns: Vec<(String, Vec<String>)>) -> Result<QueryResult, String> {

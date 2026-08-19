@@ -161,12 +161,16 @@ pub(crate) fn reject_drop_column_mv_dependencies_with_repository(
             .iter()
             .any(|base| base.eq_ignore_ascii_case(&target_key))
             || definition
-                .select_sql
+                .query_definition
+                .raw_query_source
                 .to_ascii_lowercase()
                 .contains(&target_key_lower);
         if references_target
-            && (sql_mentions_identifier(&definition.select_sql, &leaf)
-                || sql_projects_target_wildcard(&definition.select_sql, &target))
+            && (sql_mentions_identifier(&definition.query_definition.raw_query_source, &leaf)
+                || sql_projects_target_wildcard(
+                    &definition.query_definition.raw_query_source,
+                    &target,
+                ))
         {
             return Err(format!(
                 "DROP COLUMN `{}` is blocked because a StarRocks materialized view references it",

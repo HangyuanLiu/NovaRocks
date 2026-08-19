@@ -3124,7 +3124,7 @@ impl MvRepository for StateStoreMvRepository {
 fn definition_from_request(mv_id: i64, request: &CreateMvRepositoryRequest) -> StoredMvDefinition {
     StoredMvDefinition {
         mv_id,
-        select_sql: request.definition.select_sql.clone(),
+        query_definition: request.definition.query_definition.clone(),
         base_table_refs: request.definition.base_table_refs.clone(),
         primary_key_columns: request.definition.primary_key_columns.clone(),
         storage_engine: request.definition.storage_engine.clone(),
@@ -3156,7 +3156,7 @@ fn definition_matches_request(
     definition: &StoredMvDefinition,
     request: &CreateMvRepositoryRequest,
 ) -> bool {
-    definition.select_sql == request.definition.select_sql
+    definition.query_definition == request.definition.query_definition
         && definition.base_table_refs == request.definition.base_table_refs
         && definition.primary_key_columns == request.definition.primary_key_columns
         && definition.storage_engine == request.definition.storage_engine
@@ -3174,6 +3174,11 @@ fn definition_matches_request(
 }
 
 fn validate_create_request(request: &CreateMvRepositoryRequest) -> Result<(), MvRepositoryError> {
+    request
+        .definition
+        .query_definition
+        .validate()
+        .map_err(|error| invalid(format!("invalid persisted MV query definition: {error}")))?;
     let target_fields = [
         &request.definition.target_catalog,
         &request.definition.target_namespace,

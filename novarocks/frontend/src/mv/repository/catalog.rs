@@ -153,8 +153,8 @@ fn schema_sources() -> &'static [SchemaSource] {
     &[
         SchemaSource {
             subject: "mv.definition",
-            id: 3,
-            raw_schema: include_str!("schemas/mv.definition/0003.avsc"),
+            id: 4,
+            raw_schema: include_str!("schemas/mv.definition/0004.avsc"),
         },
         SchemaSource {
             subject: "mv.target_lookup",
@@ -187,4 +187,21 @@ fn schema_sources() -> &'static [SchemaSource] {
             raw_schema: include_str!("schemas/mv.sequence/0002.avsc"),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::schema_catalog;
+
+    #[test]
+    fn mv_definition_hard_cut_registers_only_schema_v4() {
+        let catalog = schema_catalog().expect("schema catalog");
+
+        assert_eq!(catalog.latest("mv.definition").unwrap().id(), 4);
+        let error = catalog.entry("mv.definition", 3).unwrap_err();
+        assert!(
+            error.contains("unknown MV Avro schema entry for subject `mv.definition` id 3"),
+            "unexpected error: {error}"
+        );
+    }
 }

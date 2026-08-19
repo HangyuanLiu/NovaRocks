@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use novarocks_frontend::common::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
+};
 use novarocks_frontend::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
@@ -74,7 +77,13 @@ pub(crate) fn repository() -> (
 pub(crate) fn create_request(table: &str) -> CreateMvRepositoryRequest {
     CreateMvRepositoryRequest {
         definition: CreateMvDefinitionRequest {
-            select_sql: "SELECT 1".to_string(),
+            query_definition: PersistedQueryDefinition::new(
+                "SELECT 1",
+                PersistedQueryDialect::StarRocks,
+                "ice",
+                "sales",
+            )
+            .unwrap(),
             base_table_refs: vec!["ice.sales.orders".to_string()],
             primary_key_columns: vec![],
             storage_engine: "iceberg".to_string(),

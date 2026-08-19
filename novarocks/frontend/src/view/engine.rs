@@ -26,12 +26,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::catalog_application::query_catalog::CatalogServiceSource;
+use crate::common::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use crate::query_execution::kernels::ViewExecutionKernel;
 use crate::runtime::query_result::QueryResult;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
-    ConnectorViewRequest, CreateOrReplacePolicy, DropPolicy,
+    ConnectorViewRequest, ConnectorViewSourceFormat, CreateOrReplacePolicy, DropPolicy,
 };
 /// Shared StarRocks SQL syntax contract for view DDL, storage, and rewrite.
 pub use novarocks_sql::syntax::StarRocksDialect as ViewSqlDialect;
@@ -68,7 +69,7 @@ pub struct ViewColumnDefinition {
 pub struct CreateExternalViewRequest {
     pub target: ViewTarget,
     pub columns: Vec<ViewColumnDefinition>,
-    pub sql: String,
+    pub definition: PersistedQueryDefinition,
     pub comment: Option<String>,
     pub or_replace: bool,
     pub if_not_exists: bool,
@@ -77,9 +78,7 @@ pub struct CreateExternalViewRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedExternalView {
-    pub sql: String,
-    pub dialect: String,
-    pub default_database: String,
+    pub definition: PersistedQueryDefinition,
     pub column_names: Vec<String>,
     pub comment: Option<String>,
     pub properties: HashMap<String, String>,
@@ -93,12 +92,12 @@ pub enum ExternalViewResolution {
 }
 
 pub trait ViewService: Send + Sync {
-    fn try_handle_statement(
+    fn execute_statement(
         &self,
         engine: &dyn ViewEngine,
-        sql: &str,
+        statement: &novarocks_parser::ast::ViewStatement,
         context: ViewRequestContext<'_>,
-    ) -> Result<Option<ViewStatementResult>, String>;
+    ) -> Result<ViewStatementResult, String>;
 
     fn rewrite_query(
         &self,
@@ -154,23 +153,13 @@ pub trait ViewEngine: Send + Sync {
 pub struct EmptyViewService;
 
 impl ViewService for EmptyViewService {
-    fn try_handle_statement(
+    fn execute_statement(
         &self,
         _engine: &dyn ViewEngine,
-        sql: &str,
+        _statement: &novarocks_parser::ast::ViewStatement,
         _context: ViewRequestContext<'_>,
-    ) -> Result<Option<ViewStatementResult>, String> {
-        let normalized = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
-        if normalized.starts_with("create view ")
-            || normalized.starts_with("create or replace view ")
-            || normalized.starts_with("drop view ")
-            || normalized.starts_with("show create view ")
-            || normalized == "show views"
-            || normalized.starts_with("show views ")
-        {
-            return Err("view service is not injected".to_string());
-        }
-        Ok(None)
+    ) -> Result<ViewStatementResult, String> {
+        Err("view service is not injected".to_string())
     }
 
     fn rewrite_query(
@@ -247,7 +236,9 @@ where
             },
             context: context.clone(),
         }) {
-            Ok(view) => Ok(ExternalViewResolution::View(resolved_external_view(view))),
+            Ok(view) => Ok(ExternalViewResolution::View(resolved_external_view(
+                target, view,
+            )?)),
             // A catalog that cannot host views has none, so resolution treats
             // that exactly like an absent view and the name falls through to
             // the ordinary unknown-relation error. Creating a view still fails
@@ -297,7 +288,10 @@ where
                 columns,
                 definition: ConnectorViewDefinition {
                     dialect: ConnectorViewDialect::StarRocks,
-                    sql: Arc::from(request.sql),
+                    raw_sql: Arc::from(request.definition.raw_query_source),
+                    default_catalog: Some(Arc::from(request.definition.resolution.default_catalog)),
+                    default_namespace: Arc::from(request.definition.resolution.default_database),
+                    source_format: Some(ConnectorViewSourceFormat::EffectiveUserSourceV1),
                 },
                 comment: request.comment.map(Arc::from),
                 properties: request
@@ -368,7 +362,7 @@ where
             },
             context: context.clone(),
         }) {
-            Ok(view) => Ok(Some(resolved_external_view(view))),
+            Ok(view) => Ok(Some(resolved_external_view(target, view)?)),
             // See `resolve_external_view`: a catalog without view support has
             // no view to find.
             Err(error)
@@ -457,14 +451,24 @@ where
 }
 
 fn resolved_external_view(
+    target: &ViewTarget,
     view: novarocks_spi::connector::ConnectorViewMetadataValue,
-) -> ResolvedExternalView {
-    ResolvedExternalView {
-        sql: view.definition.sql.to_string(),
-        dialect: match view.definition.dialect {
-            ConnectorViewDialect::StarRocks => "starrocks".to_string(),
+) -> Result<ResolvedExternalView, String> {
+    let default_catalog = view
+        .definition
+        .default_catalog
+        .as_deref()
+        .unwrap_or(target.catalog.as_str());
+    let definition = PersistedQueryDefinition::new(
+        view.definition.raw_sql.to_string(),
+        match view.definition.dialect {
+            ConnectorViewDialect::StarRocks => PersistedQueryDialect::StarRocks,
         },
-        default_database: view.default_namespace.to_string(),
+        default_catalog,
+        &view.definition.default_namespace,
+    )?;
+    Ok(ResolvedExternalView {
+        definition,
         column_names: view
             .column_names
             .into_iter()
@@ -476,7 +480,7 @@ fn resolved_external_view(
             .into_iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect(),
-    }
+    })
 }
 
 fn view_sqlparser_data_type(
@@ -624,9 +628,13 @@ mod tests {
             current_database: "db",
             connector_context: None,
         };
+        let statements = novarocks_parser::parse("CREATE VIEW v AS SELECT 1").expect("parse");
+        let [novarocks_parser::ast::Statement::View(statement)] = statements.as_slice() else {
+            panic!("expected view statement");
+        };
         assert!(
             service
-                .try_handle_statement(&engine, "CREATE VIEW v AS SELECT 1", ctx)
+                .execute_statement(&engine, statement, ctx)
                 .unwrap_err()
                 .contains("view service is not injected")
         );

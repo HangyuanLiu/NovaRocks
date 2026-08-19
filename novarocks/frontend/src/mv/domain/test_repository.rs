@@ -245,7 +245,7 @@ fn definition_from_request(
 ) -> StoredMvDefinition {
     StoredMvDefinition {
         mv_id,
-        select_sql: request.select_sql,
+        query_definition: request.query_definition,
         base_table_refs: request.base_table_refs,
         primary_key_columns: request.primary_key_columns,
         storage_engine: request.storage_engine,

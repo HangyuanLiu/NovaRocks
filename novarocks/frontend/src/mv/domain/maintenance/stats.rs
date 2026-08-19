@@ -194,6 +194,9 @@ pub fn collect_table_stats_with_ports(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::persisted_query_definition::{
+        PersistedQueryDefinition, PersistedQueryDialect,
+    };
     use crate::mv::domain::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
     use std::collections::BTreeMap;
 
@@ -202,7 +205,13 @@ mod tests {
         last_refresh_snapshots.insert(fqn.to_string(), snapshot_id);
         StoredMvDefinition {
             mv_id: 1,
-            select_sql: "SELECT 1".to_string(),
+            query_definition: PersistedQueryDefinition::new(
+                "SELECT 1",
+                PersistedQueryDialect::StarRocks,
+                "ice",
+                "analytics",
+            )
+            .unwrap(),
             base_table_refs: vec![fqn.to_string()],
             primary_key_columns: vec![],
             storage_engine: "iceberg".to_string(),

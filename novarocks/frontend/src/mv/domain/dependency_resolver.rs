@@ -202,6 +202,9 @@ fn stored_definition_dependency_ref_for_iceberg(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::persisted_query_definition::{
+        PersistedQueryDefinition, PersistedQueryDialect,
+    };
     use crate::mv::domain::dependency::model::iceberg_mv_dependency_ref;
     use crate::mv::domain::dependency::scope as dependency_scope;
 
@@ -213,7 +216,13 @@ mod tests {
     ) -> StoredMvDefinition {
         StoredMvDefinition {
             mv_id: 1,
-            select_sql: "select 1".to_string(),
+            query_definition: PersistedQueryDefinition::new(
+                "select 1",
+                PersistedQueryDialect::StarRocks,
+                "ice",
+                target_namespace.unwrap_or("db"),
+            )
+            .unwrap(),
             base_table_refs: Vec::new(),
             primary_key_columns: Vec::new(),
             storage_engine: storage_engine.to_string(),

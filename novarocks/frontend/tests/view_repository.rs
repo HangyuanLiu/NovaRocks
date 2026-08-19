@@ -23,9 +23,12 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use novarocks_frontend::common::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
+};
 use novarocks_frontend::view::repository::{
-    DatabaseMutation, StoredDatabaseViewsV1, ViewRepository, database_key, decode_record,
-    encode_record,
+    DatabaseMutation, StoredDatabaseViewsV2, StoredViewDefinitionV2, ViewRepository, database_key,
+    decode_record, encode_record,
 };
 use novarocks_spi::state_store::{
     ChangePage, ChangePollRequest, CommitOutcome, CommitResolution, FeDeploymentView, Key,
@@ -40,9 +43,19 @@ use novarocks_state_store::{
 use tempfile::TempDir;
 use uuid::Uuid;
 
-fn record(catalog: &str, database: &str) -> StoredDatabaseViewsV1 {
-    StoredDatabaseViewsV1 {
-        schema_version: 1,
+fn definition(sql: &str) -> PersistedQueryDefinition {
+    PersistedQueryDefinition::new(
+        sql,
+        PersistedQueryDialect::StarRocks,
+        "default_catalog",
+        "db",
+    )
+    .expect("test query definition")
+}
+
+fn record(catalog: &str, database: &str) -> StoredDatabaseViewsV2 {
+    StoredDatabaseViewsV2 {
+        schema_version: 2,
         catalog: catalog.to_string(),
         database: database.to_string(),
         last_operation_id: Uuid::now_v7(),
@@ -55,7 +68,7 @@ fn database_record_key_is_versioned_and_unambiguous() {
     let key = database_key("default_catalog", "db/a").unwrap();
     assert_eq!(
         key.as_bytes(),
-        b"novarocks/frontend/views/v1/64656661756c745f636174616c6f67/64622f61"
+        b"novarocks/frontend/views/v2/64656661756c745f636174616c6f67/64622f61"
     );
 }
 
@@ -73,7 +86,7 @@ fn decode_rejects_key_value_identity_mismatch() {
 fn decode_rejects_duplicate_normalized_view_keys() {
     let operation_id = Uuid::now_v7();
     let json = format!(
-        r#"{{"schema_version":1,"catalog":"default_catalog","database":"db","last_operation_id":"{operation_id}","views":{{"v":"SELECT 1","v":"SELECT 2"}}}}"#
+        r#"{{"schema_version":2,"catalog":"default_catalog","database":"db","last_operation_id":"{operation_id}","views":{{"v":{{"definition":{{"format_version":1,"raw_query_source":"SELECT 1","dialect":"starrocks","resolution":{{"default_catalog":"default_catalog","default_database":"db"}}}}}},"v":{{"definition":{{"format_version":1,"raw_query_source":"SELECT 2","dialect":"starrocks","resolution":{{"default_catalog":"default_catalog","default_database":"db"}}}}}}}}}}"#
     );
     let error = decode_record(
         database_key("default_catalog", "db").unwrap(),
@@ -86,7 +99,7 @@ fn decode_rejects_duplicate_normalized_view_keys() {
 #[test]
 fn decode_rejects_non_canonical_hex_key_encoding() {
     let key = Key::try_from(Bytes::from_static(
-        b"novarocks/frontend/views/v1/64656661756C745F636174616C6F67/6462",
+        b"novarocks/frontend/views/v2/64656661756C745F636174616C6F67/6462",
     ))
     .unwrap();
     let error =
@@ -97,7 +110,7 @@ fn decode_rejects_non_canonical_hex_key_encoding() {
 #[test]
 fn codec_rejects_unknown_schema_non_normalized_names_non_queries_and_oversized_values() {
     let mut unknown_schema = record("default_catalog", "db");
-    unknown_schema.schema_version = 2;
+    unknown_schema.schema_version = 3;
     assert!(
         encode_record(unknown_schema)
             .unwrap_err()
@@ -105,7 +118,12 @@ fn codec_rejects_unknown_schema_non_normalized_names_non_queries_and_oversized_v
     );
 
     let mut non_normalized = record("default_catalog", "DB");
-    non_normalized.views.insert("v".into(), "SELECT 1".into());
+    non_normalized.views.insert(
+        "v".into(),
+        StoredViewDefinitionV2 {
+            definition: definition("SELECT 1"),
+        },
+    );
     assert!(
         encode_record(non_normalized)
             .unwrap_err()
@@ -113,7 +131,12 @@ fn codec_rejects_unknown_schema_non_normalized_names_non_queries_and_oversized_v
     );
 
     let mut non_query = record("default_catalog", "db");
-    non_query.views.insert("v".into(), "DROP TABLE t".into());
+    non_query.views.insert(
+        "v".into(),
+        StoredViewDefinitionV2 {
+            definition: definition("DROP TABLE t"),
+        },
+    );
     assert!(
         encode_record(non_query)
             .unwrap_err()
@@ -121,9 +144,12 @@ fn codec_rejects_unknown_schema_non_normalized_names_non_queries_and_oversized_v
     );
 
     let mut oversized = record("default_catalog", "db");
-    oversized
-        .views
-        .insert("v".into(), format!("SELECT '{}'", "x".repeat(70 * 1024)));
+    oversized.views.insert(
+        "v".into(),
+        StoredViewDefinitionV2 {
+            definition: definition(&format!("SELECT '{}'", "x".repeat(70 * 1024))),
+        },
+    );
     assert!(
         encode_record(oversized)
             .unwrap_err()
@@ -171,7 +197,7 @@ async fn open_sqlite(path: &Path) -> (StateStoreHost, Arc<dyn StateStore>) {
 fn create(view: &str, sql: &str, or_replace: bool) -> DatabaseMutation {
     DatabaseMutation::Create {
         view: view.to_string(),
-        sql: sql.to_string(),
+        definition: definition(sql),
         or_replace,
     }
 }
@@ -188,7 +214,13 @@ async fn repository_mutations_are_atomic_and_catalog_isolated() {
         .mutate_database("default_catalog", "db", create("v", "select 1", false))
         .await
         .unwrap();
-    assert_eq!(created.views.get("v").map(String::as_str), Some("SELECT 1"));
+    assert_eq!(
+        created
+            .views
+            .get("v")
+            .map(|view| view.definition.raw_query_source.as_str()),
+        Some("select 1")
+    );
 
     let duplicate = repository
         .mutate_database("default_catalog", "db", create("v", "SELECT 2", false))
@@ -199,8 +231,8 @@ async fn repository_mutations_are_atomic_and_catalog_isolated() {
         repository.load_all().await.unwrap()[0]
             .views
             .get("v")
-            .map(String::as_str),
-        Some("SELECT 1")
+            .map(|view| view.definition.raw_query_source.as_str()),
+        Some("select 1")
     );
 
     repository
@@ -245,7 +277,7 @@ async fn repository_mutations_are_atomic_and_catalog_isolated() {
             .unwrap()
             .views
             .get("v")
-            .map(String::as_str),
+            .map(|view| view.definition.raw_query_source.as_str()),
         Some("SELECT 3")
     );
 }
@@ -274,8 +306,46 @@ async fn repository_reopens_from_durable_records() {
     let loaded = reopened.load_all().await.unwrap();
     assert_eq!(loaded.len(), 1);
     assert_eq!(
-        loaded[0].views.get("v").map(String::as_str),
+        loaded[0]
+            .views
+            .get("v")
+            .map(|view| view.definition.raw_query_source.as_str()),
         Some("SELECT 42")
+    );
+}
+
+#[tokio::test]
+async fn repository_preserves_raw_source_and_frozen_resolution_context() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store) = open_sqlite(&temp.path().join("state.sqlite")).await;
+    let repository = ViewRepository::open(store, tokio::runtime::Handle::current())
+        .await
+        .unwrap();
+    let raw = "SELECT /* retain */\n  * FROM base";
+    let definition = PersistedQueryDefinition::new(
+        raw,
+        PersistedQueryDialect::StarRocks,
+        "default_catalog",
+        "creation_db",
+    )
+    .unwrap();
+    let record = repository
+        .mutate_database(
+            "default_catalog",
+            "view_db",
+            DatabaseMutation::Create {
+                view: "v".to_string(),
+                definition,
+                or_replace: false,
+            },
+        )
+        .await
+        .unwrap();
+    let stored = record.views.get("v").unwrap();
+    assert_eq!(stored.definition.raw_query_source, raw);
+    assert_eq!(
+        stored.definition.resolution.default_database, "creation_db",
+        "the target view namespace must not replace source resolution"
     );
 }
 
@@ -355,9 +425,12 @@ impl ReadTransaction for DuplicateRangeTransaction {
         Ok((key == &self.record.key).then(|| self.record.clone()))
     }
 
-    async fn range(&mut self, _request: &RangeRequest) -> Result<RangePage, StateStoreError> {
+    async fn range(&mut self, request: &RangeRequest) -> Result<RangePage, StateStoreError> {
         Ok(RangePage {
-            records: vec![self.record.clone(), self.record.clone()],
+            records: (request.range.start <= self.record.key
+                && self.record.key < request.range.end)
+                .then(|| vec![self.record.clone(), self.record.clone()])
+                .unwrap_or_default(),
             continuation: None,
         })
     }
@@ -505,7 +578,13 @@ async fn repository_resolves_commit_unknown_only_from_authoritative_operation_id
         .mutate_database("default_catalog", "db", create("v", "SELECT 7", false))
         .await
         .unwrap();
-    assert_eq!(record.views.get("v").map(String::as_str), Some("SELECT 7"));
+    assert_eq!(
+        record
+            .views
+            .get("v")
+            .map(|view| view.definition.raw_query_source.as_str()),
+        Some("SELECT 7")
+    );
 
     let unresolved_temp = TempDir::new().unwrap();
     let (_unresolved_host, unresolved_inner) =
@@ -540,4 +619,26 @@ async fn repository_open_fails_fast_on_corrupt_records() {
         .await
         .unwrap_err();
     assert!(error.contains("decode frontend view database default_catalog.db failed"));
+}
+
+#[tokio::test]
+async fn repository_open_rejects_v1_fixture_without_decoding_or_migrating_it() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store) = open_sqlite(&temp.path().join("state.sqlite")).await;
+    let legacy_key = Key::try_from(Bytes::from_static(
+        b"novarocks/frontend/views/v1/64656661756c745f636174616c6f67/6462",
+    ))
+    .unwrap();
+    write_raw(
+        store.as_ref(),
+        legacy_key,
+        Value::try_from(Bytes::from_static(b"intentionally-not-a-v1-record")).unwrap(),
+    )
+    .await;
+
+    let error = ViewRepository::open(store, tokio::runtime::Handle::current())
+        .await
+        .unwrap_err();
+    assert!(error.contains("unsupported frontend view durable version v1"));
+    assert!(error.contains("delete the development fixture and recreate the view"));
 }
