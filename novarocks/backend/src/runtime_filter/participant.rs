@@ -589,6 +589,12 @@ impl RuntimeFilterParticipant {
         );
         match envelope.kind() {
             BackendEnvelopeKind::Contribution => {
+                let partition = novarocks_execution::runtime_filter::PartitionId::new(
+                    identity.partition_id().get(),
+                );
+                let sequence = novarocks_execution::runtime_filter::ProducerSequence::new(
+                    identity.sequence().get(),
+                );
                 let contribution =
                     novarocks_execution::runtime_filter::RuntimeFilterContribution::new(
                         contribution_kind(install.contract().kind()),
@@ -598,13 +604,32 @@ impl RuntimeFilterParticipant {
                 match session.submit(
                     binding_id,
                     identity.fragment_instance_id(),
-                    novarocks_execution::runtime_filter::PartitionId::new(identity.partition_id().get()),
-                    novarocks_execution::runtime_filter::ProducerSequence::new(identity.sequence().get()),
+                    partition,
+                    sequence,
                     contribution,
                 ) {
-                    Ok(submission) if matches!(submission.outcome(), novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome::Duplicate | novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome::Stale) => BackendIngressResult::duplicate(),
-                    Ok(_) => BackendIngressResult::accepted(),
-                    Err(_) => rejected("runtime filter ingress rejected [contribution]: contribution violates the installed execution contract"),
+                    Ok(submission) => {
+                        self.record_contribution_outcome(
+                            binding_id,
+                            channel_id,
+                            identity.fragment_instance_id(),
+                            partition,
+                            sequence,
+                            submission.outcome(),
+                        );
+                        if matches!(
+                            submission.outcome(),
+                            novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome::Duplicate
+                                | novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome::Stale
+                        ) {
+                            BackendIngressResult::duplicate()
+                        } else {
+                            BackendIngressResult::accepted()
+                        }
+                    }
+                    Err(_) => rejected(
+                        "runtime filter ingress rejected [contribution]: contribution violates the installed execution contract",
+                    ),
                 }
             }
             BackendEnvelopeKind::ProducerClosed => match session.close_partition(
@@ -627,6 +652,41 @@ impl RuntimeFilterParticipant {
             },
             _ => unreachable!("caller selects producer envelope kinds"),
         }
+    }
+
+    fn record_contribution_outcome(
+        &self,
+        binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
+        channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
+        fragment_instance_id: UniqueId,
+        partition: novarocks_execution::runtime_filter::PartitionId,
+        sequence: novarocks_execution::runtime_filter::ProducerSequence,
+        outcome: novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome,
+    ) {
+        let stream = BackendProducerStreamIdentity::new(
+            BackendChannelIdentity::new(self.install.participant(), binding_id, channel_id),
+            fragment_instance_id,
+            partition,
+        );
+        let event = match outcome {
+            novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome::Duplicate => {
+                BackendRuntimeFilterEvent::ContributionDuplicateIgnored {
+                    stream,
+                    sequence: sequence.get(),
+                }
+            }
+            novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome::Stale => {
+                BackendRuntimeFilterEvent::ContributionStaleIgnored {
+                    stream,
+                    sequence: sequence.get(),
+                }
+            }
+            _ => BackendRuntimeFilterEvent::ContributionAccepted {
+                stream,
+                sequence: sequence.get(),
+            },
+        };
+        self.observation.record(event);
     }
 
     fn dispatch_producer_failure(
@@ -1669,9 +1729,10 @@ mod tests {
     use crate::runtime_filter::domain::{
         BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall, BackendCoverage,
         BackendMaterializationOwner, BackendMaterializationPolicy,
-        BackendOutboundMaterializationGroup, BackendParticipantIdentity, BackendRemoteRoute,
-        BackendRouteEdgeId, BackendRouteEndpoint, BackendRoutePeer, BackendRouteRole,
-        BackendRoutingChannel, BackendRoutingEdge, BackendRoutingShard,
+        BackendOutboundMaterializationGroup, BackendParticipantIdentity,
+        BackendProducerOpenMetadata, BackendRemoteRoute, BackendRouteEdgeId, BackendRouteEndpoint,
+        BackendRoutePeer, BackendRouteRole, BackendRoutingChannel, BackendRoutingEdge,
+        BackendRoutingShard,
     };
     use crate::runtime_filter::test_support::BackendRuntimeFilterFixture;
 
@@ -2375,6 +2436,131 @@ mod tests {
                     Some(super::super::observation::RuntimeFilterConsumerOutcome::Acquired)
                 )
         }));
+    }
+
+    #[test]
+    fn inbound_contribution_retry_is_folded_as_the_same_producer_stream_duplicate() {
+        let fixture = BackendRuntimeFilterFixture::membership();
+        let identity = fixture.identity();
+        let producer = fixture.producer_contract();
+        let source_instance = UniqueId::new(101, 102);
+        let witness = super::super::domain::BackendCoverageWitnessId::new(29);
+        let source_endpoint =
+            BackendRouteEndpoint::new(1, BackendRouteRole::Producer(producer.binding_id()))
+                .expect("source endpoint");
+        let target_endpoint =
+            BackendRouteEndpoint::new(2, BackendRouteRole::Aggregator).expect("target endpoint");
+        let edge_id = BackendRouteEdgeId::new(501);
+        let inbound_edge = BackendRoutingEdge::new(
+            edge_id,
+            source_endpoint,
+            target_endpoint,
+            BackendRoutePeer::Remote {
+                participant_id: 1,
+                endpoint: endpoint(9071),
+            },
+            [BackendEnvelopeKind::Contribution],
+        )
+        .expect("inbound contribution route");
+        let channel = BackendChannelInstall::new(
+            producer.channel_id(),
+            producer.contract().clone(),
+            BackendChannelLifecycle::CompleteOnce,
+            BackendCoverage::witness(witness),
+            BackendCoverage::witness(witness),
+            BackendMaterializationPolicy::new(8, 3, 5, 1, 4096, 4096, 1)
+                .expect("materialization policy"),
+            4096,
+            4096,
+            [super::super::domain::BackendProducerInstall::new(
+                producer.clone(),
+                witness,
+                [source_instance],
+                4096,
+            )
+            .expect("producer install")],
+            [],
+            [],
+        )
+        .expect("aggregator channel");
+        let routing = BackendRoutingShard::new(
+            identity,
+            2,
+            [BackendRoutingChannel::new(
+                producer.channel_id(),
+                [BackendRouteRole::Aggregator],
+                [inbound_edge],
+                [],
+                [((producer.binding_id(), source_instance), 1)],
+            )
+            .expect("aggregator routing channel")],
+        )
+        .expect("aggregator routing");
+        let install = BackendParticipantInstall::new(identity, 2, [channel], routing)
+            .expect("aggregator install");
+        let observation = RuntimeFilterObservationEmitter::from_install(&install, None);
+        let session = Arc::new(
+            BackendRuntimeFilterSession::from_channel_install(
+                identity,
+                install.channels()[&producer.channel_id()].clone(),
+                observation.clone(),
+            )
+            .expect("aggregator session"),
+        );
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(identity.query_id().high(), identity.query_id().low()),
+            AttemptId::new(identity.deployment_epoch()).expect("deployment epoch"),
+        )
+        .expect("execution id");
+        let participant = RuntimeFilterParticipant::from_installed(
+            execution_id,
+            install,
+            observation,
+            transport_policy(),
+            BTreeMap::from([(producer.binding_id(), session)]),
+            BTreeMap::new(),
+            MemTracker::new_root("runtime_filter_inbound_contribution_retry_test"),
+            Arc::new(DiscardSink),
+        )
+        .expect("aggregator participant");
+        let contribution = fixture.membership_contribution();
+        let envelope = || {
+            BackendNativeRuntimeFilterEnvelope::new(
+                BackendEnvelopeKind::Contribution,
+                identity,
+                producer.channel_id(),
+                BackendNativeRouteIdentity::contribution(
+                    BackendNativeContributionRouteIdentity::new(
+                        producer.binding_id(),
+                        source_instance,
+                        novarocks_execution::runtime_filter::PartitionId::new(0),
+                        super::super::domain::BackendTransportSequence::new(0),
+                    ),
+                ),
+                Some(BackendProducerOpenMetadata::try_new(1).expect("producer open")),
+                None,
+                contribution.contract_digest(),
+                contribution.canonical_bytes().clone(),
+            )
+            .expect("contribution envelope")
+        };
+
+        assert_eq!(
+            participant.dispatch_envelope(envelope()).status(),
+            super::super::domain::BackendAcceptStatus::Accepted
+        );
+        assert_eq!(
+            participant.dispatch_envelope(envelope()).status(),
+            super::super::domain::BackendAcceptStatus::Duplicate
+        );
+
+        let snapshot = participant.capture_runtime_filter_observation();
+        assert_eq!(snapshot.producer_streams().len(), 1);
+        let stream = &snapshot.producer_streams()[0];
+        assert_eq!(stream.identity().fragment_instance_id(), source_instance);
+        assert_eq!(stream.latest_accepted_sequence(), Some(0));
+        assert_eq!(stream.accepted(), 1);
+        assert_eq!(stream.duplicate(), 1);
     }
 
     #[test]
