@@ -1832,15 +1832,17 @@ impl ConnectorHistoricalCtasObservation {
             locator.try_to_wire_v1()?;
         }
         let digest = connector_historical_ctas_observation_digest(
-            &inspection_binding,
-            descriptor.digest,
-            descriptor.fence.digest,
-            descriptor.fence.operation_id,
-            disposition,
-            locator.as_ref(),
-            proof.as_ref().map(ConnectorCtasPublicationProof::digest),
-            conflict_kind,
-            failure.as_ref(),
+            ConnectorHistoricalCtasObservationDigestInput {
+                inspection_binding: &inspection_binding,
+                descriptor_digest: descriptor.digest,
+                fence_digest: descriptor.fence.digest,
+                operation_id: descriptor.fence.operation_id,
+                disposition,
+                locator: locator.as_ref(),
+                proof_digest: proof.as_ref().map(ConnectorCtasPublicationProof::digest),
+                conflict_kind,
+                failure: failure.as_ref(),
+            },
         );
         Ok(Self {
             inspection_binding,
@@ -2862,17 +2864,33 @@ pub fn connector_historical_ctas_descriptor_digest(
     hasher.finalize().into()
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ConnectorHistoricalCtasObservationDigestInput<'a> {
+    pub inspection_binding: &'a ConnectorExecutionBindingKey,
+    pub descriptor_digest: [u8; 32],
+    pub fence_digest: [u8; 32],
+    pub operation_id: ConnectorCtasOperationId,
+    pub disposition: ConnectorHistoricalCtasDisposition,
+    pub locator: Option<&'a ConnectorCtasStagedLocator>,
+    pub proof_digest: Option<[u8; 32]>,
+    pub conflict_kind: Option<ConnectorCtasConflictKind>,
+    pub failure: Option<&'a ConnectorMutationFailure>,
+}
+
 pub fn connector_historical_ctas_observation_digest(
-    inspection_binding: &ConnectorExecutionBindingKey,
-    descriptor_digest: [u8; 32],
-    fence_digest: [u8; 32],
-    operation_id: ConnectorCtasOperationId,
-    disposition: ConnectorHistoricalCtasDisposition,
-    locator: Option<&ConnectorCtasStagedLocator>,
-    proof_digest: Option<[u8; 32]>,
-    conflict_kind: Option<ConnectorCtasConflictKind>,
-    failure: Option<&ConnectorMutationFailure>,
+    input: ConnectorHistoricalCtasObservationDigestInput<'_>,
 ) -> [u8; 32] {
+    let ConnectorHistoricalCtasObservationDigestInput {
+        inspection_binding,
+        descriptor_digest,
+        fence_digest,
+        operation_id,
+        disposition,
+        locator,
+        proof_digest,
+        conflict_kind,
+        failure,
+    } = input;
     let mut hasher = Sha256::new();
     hasher.update(OBSERVATION_DOMAIN);
     hash_bytes(
