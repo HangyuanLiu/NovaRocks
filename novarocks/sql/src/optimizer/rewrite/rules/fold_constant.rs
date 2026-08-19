@@ -98,6 +98,35 @@ const ENVIRONMENT_SENSITIVE_FUNCTIONS: &[&str] = &[
     "get_variant_time",
 ];
 
+/// Functions whose string values carry raw bytes rather than text.
+///
+/// NovaRocks represents binary payloads inside `Utf8` values for this family,
+/// and the byte convention is not preserved by the literal representation: a
+/// folded `aes_encrypt(..)` re-materializes as an ordinary string literal, and
+/// downstream consumers such as `to_base64` then read different bytes than the
+/// runtime produced. Excluding the family keeps folded output bit-identical to
+/// runtime output; the cost is only a missed optimization.
+const BYTE_CARRYING_STRING_FUNCTIONS: &[&str] = &[
+    "aes_encrypt",
+    "aes_decrypt",
+    "from_base64",
+    "from_binary",
+    "base64_decode_binary",
+    "base64_decode_string",
+    "encode_fingerprint_sha256",
+    "encode_row_id",
+    "encode_sort_key",
+    "sm3",
+    "unhex",
+];
+
+fn is_byte_carrying_string_function(name: &str) -> bool {
+    let lowered = name.to_ascii_lowercase();
+    BYTE_CARRYING_STRING_FUNCTIONS
+        .iter()
+        .any(|denied| *denied == lowered)
+}
+
 fn is_environment_sensitive_function(name: &str) -> bool {
     let lowered = name.to_ascii_lowercase();
     ENVIRONMENT_SENSITIVE_FUNCTIONS
@@ -596,7 +625,7 @@ fn try_fold_node(
             if *distinct || *volatility != FunctionVolatility::Immutable {
                 return None;
             }
-            if is_environment_sensitive_function(name) {
+            if is_environment_sensitive_function(name) || is_byte_carrying_string_function(name) {
                 return None;
             }
             FoldNodeKind::Function { name: name.clone() }
@@ -1037,6 +1066,34 @@ mod tests {
                     volatility: FunctionVolatility::Immutable,
                 },
                 DataType::Int64,
+                false,
+            );
+            let plan = project(call);
+
+            assert!(
+                matches!(fixture.apply(plan), RewriteResult::Unchanged),
+                "{name} must not be folded"
+            );
+            assert_eq!(fixture.calls(), 0, "{name} must not reach the port");
+        }
+    }
+
+    #[test]
+    fn does_not_fold_byte_carrying_string_function() {
+        // These carry raw bytes inside a Utf8 value. Folding one turns it into
+        // an ordinary string literal, after which a consumer such as
+        // `to_base64` reads different bytes than the runtime produced.
+        for name in ["aes_encrypt", "AES_ENCRYPT", "from_base64", "unhex"] {
+            let mut fixture = Fixture::with_mode(FakeMode::Fold);
+            let one = fixture.int_literal(1);
+            let call = fixture.intern(
+                ScalarNode::FunctionCall {
+                    name: name.to_string(),
+                    args: vec![one],
+                    distinct: false,
+                    volatility: FunctionVolatility::Immutable,
+                },
+                DataType::Utf8,
                 false,
             );
             let plan = project(call);

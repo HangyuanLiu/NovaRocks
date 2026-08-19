@@ -34,7 +34,7 @@ use arrow::array::{
     Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchOptions, StringArray,
 };
 use arrow::compute::kernels::cast_utils::parse_decimal;
-use arrow::datatypes::{DataType, Decimal128Type, Decimal256Type};
+use arrow::datatypes::{DataType, Decimal128Type, Decimal256Type, DecimalType};
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
 use novarocks_execution::exec::expr::function::lookup_function;
 use novarocks_execution::exec::expr::{
@@ -284,11 +284,24 @@ fn read_back_row0(
             SqlLiteralValue::Float(f64::from(downcast::<Float32Array>(output)?.value(0)))
         }
         DataType::Float64 => SqlLiteralValue::Float(downcast::<Float64Array>(output)?.value(0)),
+        // `StringArray::value` converts without revalidating, so a kernel is
+        // able to hand back bytes that are not valid UTF-8. The plan encodes a
+        // literal string as a protobuf string field, which would re-encode
+        // those bytes, so decline rather than fold something the runtime would
+        // not reproduce. (Byte-carrying string families such as `aes_encrypt`
+        // are valid UTF-8 and are excluded by the SQL-side foldable list.)
         DataType::Utf8 => {
-            SqlLiteralValue::String(downcast::<StringArray>(output)?.value(0).to_string())
+            let Some(text) = utf8_round_trippable(downcast::<StringArray>(output)?.value(0)) else {
+                return Ok(None);
+            };
+            SqlLiteralValue::String(text)
         }
         DataType::LargeUtf8 => {
-            SqlLiteralValue::String(downcast::<LargeStringArray>(output)?.value(0).to_string())
+            let Some(text) = utf8_round_trippable(downcast::<LargeStringArray>(output)?.value(0))
+            else {
+                return Ok(None);
+            };
+            SqlLiteralValue::String(text)
         }
         DataType::Binary => {
             SqlLiteralValue::Binary(downcast::<BinaryArray>(output)?.value(0).to_vec())
@@ -297,17 +310,43 @@ fn read_back_row0(
             SqlLiteralValue::Binary(downcast::<LargeBinaryArray>(output)?.value(0).to_vec())
         }
         // Arrow renders the unscaled value exactly at the column's scale, so
-        // the folded text matches what the runtime would have printed.
-        DataType::Decimal128(_, _) => {
-            SqlLiteralValue::Decimal(downcast::<Decimal128Array>(output)?.value_as_string(0))
+        // the folded text matches what the runtime would have printed — but
+        // only while the value still fits the declared precision. A decimal
+        // kernel is allowed to return a result wider than its own declared
+        // precision (an overflowed multiply or a rounding cast such as
+        // `CAST(99999.999 AS DECIMAL(7,2))` -> 100000.00), and rendering that
+        // through the declared precision drops the leading digit. Decline the
+        // fold instead, so the runtime keeps producing whatever it produces
+        // today for out-of-range decimals.
+        DataType::Decimal128(precision, _) => {
+            let array = downcast::<Decimal128Array>(output)?;
+            if !Decimal128Type::is_valid_decimal_precision(array.value(0), *precision) {
+                return Ok(None);
+            }
+            SqlLiteralValue::Decimal(array.value_as_string(0))
         }
-        DataType::Decimal256(_, _) => {
-            SqlLiteralValue::Decimal(downcast::<Decimal256Array>(output)?.value_as_string(0))
+        DataType::Decimal256(precision, _) => {
+            let array = downcast::<Decimal256Array>(output)?;
+            if !Decimal256Type::is_valid_decimal_precision(array.value(0), *precision) {
+                return Ok(None);
+            }
+            SqlLiteralValue::Decimal(array.value_as_string(0))
         }
         // `is_readable_output_type` already filtered everything else.
         _ => return Ok(None),
     };
     Ok(Some(literal))
+}
+
+/// Returns the string only when its bytes really are valid UTF-8.
+///
+/// `StringArray::value` converts without revalidating, so a kernel that stores
+/// raw bytes in a Utf8 array yields a `&str` whose bytes would change the first
+/// time they are re-encoded.
+fn utf8_round_trippable(value: &str) -> Option<String> {
+    std::str::from_utf8(value.as_bytes())
+        .ok()
+        .map(str::to_string)
 }
 
 /// Output types with an exact SQL literal representation.
@@ -445,6 +484,41 @@ mod tests {
         assert_eq!(
             folded,
             Ok(Some(SqlLiteralValue::Decimal("5.0000".to_string())))
+        );
+    }
+
+    #[test]
+    fn declines_decimal_result_wider_than_its_declared_precision() {
+        // `CAST(99999.999 AS DECIMAL(7,2))` rounds to 100000.00, which needs
+        // precision 8. The kernel still returns it, but rendering that through
+        // the declared precision 7 drops the leading digit and the fold would
+        // read 10000.00 — ten times smaller than what the runtime produces.
+        let folded = fold(
+            FoldNodeKind::Cast,
+            vec![arg(
+                SqlLiteralValue::Decimal("99999.999".to_string()),
+                DataType::Decimal128(8, 3),
+            )],
+            DataType::Decimal128(7, 2),
+        );
+        assert_eq!(folded, Ok(None));
+    }
+
+    #[test]
+    fn folds_decimal_cast_that_still_fits_its_precision() {
+        // Same rounding shape as above, one digit of headroom: the guard must
+        // not reject a result the declared precision can hold.
+        let folded = fold(
+            FoldNodeKind::Cast,
+            vec![arg(
+                SqlLiteralValue::Decimal("99999.999".to_string()),
+                DataType::Decimal128(8, 3),
+            )],
+            DataType::Decimal128(8, 2),
+        );
+        assert_eq!(
+            folded,
+            Ok(Some(SqlLiteralValue::Decimal("100000.00".to_string())))
         );
     }
 

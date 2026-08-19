@@ -17,81 +17,92 @@
 
 -- @tags=optimizer,constant_folding
 -- Test Objective:
--- 1. The FoldConstant rewrite rule evaluates constant scalar sub-trees during
---    LogicalNormalize, before predicate pushdown, so the plan carries literals
---    instead of arithmetic / cast / function nodes.
--- 2. A string literal compared against a DATE column folds to the same plan a
---    typed DATE literal produces, which is what makes the predicate eligible
---    for connector static-predicate pushdown (partition / row-group pruning).
--- 3. Volatile functions are never folded.
+-- 1. FoldConstant evaluates constant scalar sub-trees during LogicalNormalize,
+--    so the plan carries literals instead of arithmetic / cast / function nodes.
+-- 2. A string literal compared against a DATE column folds to the same scan
+--    predicate the typed DATE literal produces. That equality is the point of
+--    the rule: static-predicate lowering only accepts a bare literal, so the
+--    unfolded CAST shape never reached partition / row-group / page pruning.
+-- 3. Volatile builtins and environment-sensitive builtins are never folded.
 -- 4. SET disable_optimizer_rules = 'FoldConstant' restores the unfolded plan
---    without changing results.
--- 5. Expressions whose evaluation fails stay in the plan and keep their
---    runtime behaviour (fail-open).
-
+--    while the results stay identical.
+--
+-- Note on labels: the output column label is rendered from the parsed
+-- statement, so it still shows the original expression text after folding.
+-- The assertions below therefore target the projection *expression* position
+-- (`[<expr> AS <label>]`), not the label.
 DROP TABLE IF EXISTS ${case_db}.t_fold_dates;
 CREATE TABLE ${case_db}.t_fold_dates (id INT, dt DATE);
 INSERT INTO ${case_db}.t_fold_dates VALUES
-    (1, DATE '2019-12-31'),
-    (2, DATE '2020-01-01'),
-    (3, DATE '2020-01-02');
+    (1, '2019-12-31'),
+    (2, '2020-01-01'),
+    (3, '2020-01-02');
 
 -- ---------------------------------------------------------------------------
--- 1. Projection: constant arithmetic collapses to one literal.
---    The output column label still renders the original expression text
---    (labels come from the parsed statement, not from the folded plan).
+-- 1. Constant arithmetic collapses to one literal.
 -- ---------------------------------------------------------------------------
--- @explain_contains=42096
--- @explain_not_contains=40000 + 2000
+-- @explain_contains=[42096 AS
+-- @explain_not_contains=[40000 + 2000 + 96 AS
 SELECT 40000 + 2000 + 96;
 
 -- ---------------------------------------------------------------------------
--- 2. Projection: a constant function call collapses to its result literal.
+-- 2. A constant function call collapses to its result literal. The string
+--    argument binds to the DATE overload, so the intermediate cast folds to a
+--    Date32 literal first and the whole call folds afterwards.
 -- ---------------------------------------------------------------------------
--- @explain_contains='2020-01'
--- @explain_not_contains=date_format(
-SELECT date_format(DATE '2020-01-01', '%Y-%m');
+-- @explain_contains=['2020-01' AS
+-- @explain_not_contains=[date_format(
+SELECT date_format('2020-01-01', '%Y-%m');
 
 -- ---------------------------------------------------------------------------
--- 3. Predicate: a string literal against a DATE column folds to the same
---    Date32 literal the typed DATE form produces. Both plans must show the
---    folded epoch-day literal and neither may keep a CAST node, which is the
---    precondition for static-predicate lowering.
+-- 3. A string literal against a DATE column folds to the epoch-day literal,
+--    with no CAST left in the scan predicate.
 -- ---------------------------------------------------------------------------
--- @explain_contains=18262
--- @explain_not_contains=CAST
+-- @explain_contains=predicates: dt = 18262
+-- @explain_not_contains=CAST(
 SELECT id FROM ${case_db}.t_fold_dates WHERE dt = '2020-01-01';
 
--- @explain_contains=18262
--- @explain_not_contains=CAST
+-- ---------------------------------------------------------------------------
+-- 4. The typed DATE literal must produce exactly the same scan predicate.
+-- ---------------------------------------------------------------------------
+-- @explain_contains=predicates: dt = 18262
+-- @explain_not_contains=CAST(
 SELECT id FROM ${case_db}.t_fold_dates WHERE dt = DATE '2020-01-01';
 
 -- ---------------------------------------------------------------------------
--- 4. Volatile builtins are never folded: the call must survive in the plan.
+-- 5. Volatile builtins survive in the plan.
 -- ---------------------------------------------------------------------------
 -- @skip_result_check=true
--- @result_contains=rand
+-- @result_contains=[rand()]
 EXPLAIN VERBOSE SELECT rand();
 
 -- @skip_result_check=true
--- @result_contains=now
+-- @result_contains=[now()]
 EXPLAIN VERBOSE SELECT now();
 
 -- ---------------------------------------------------------------------------
--- 5. Disabling the rule restores the unfolded plan and keeps the same result.
+-- 6. Environment-sensitive builtins are immutable but read the process
+--    timezone, so folding them on the frontend would move that read off the
+--    backend. They must survive in the plan too.
+-- ---------------------------------------------------------------------------
+-- @skip_result_check=true
+-- @result_contains=[from_unixtime(1577836800)]
+EXPLAIN VERBOSE SELECT from_unixtime(1577836800);
+
+-- ---------------------------------------------------------------------------
+-- 7. Division by zero is a value, not an error, in this engine: folding
+--    reproduces the runtime NULL instead of failing planning.
+-- ---------------------------------------------------------------------------
+-- @explain_contains=[NULL AS 1 / 0]
+SELECT 1 / 0;
+
+-- ---------------------------------------------------------------------------
+-- 8. Disabling the rule restores the unfolded plan; results are unchanged.
 -- ---------------------------------------------------------------------------
 SET disable_optimizer_rules = 'FoldConstant';
 
--- @explain_contains=40000 + 2000
+-- @explain_contains=[40000 + 2000 + 96 AS
 SELECT 40000 + 2000 + 96;
 
--- @explain_contains=CAST
+-- @explain_contains=predicates: dt = CAST('2020-01-01' AS Date32)
 SELECT id FROM ${case_db}.t_fold_dates WHERE dt = '2020-01-01';
-
-SET disable_optimizer_rules = '';
-
--- ---------------------------------------------------------------------------
--- 6. Fail-open: an expression the evaluator cannot evaluate keeps its runtime
---    behaviour instead of becoming a planning error.
--- ---------------------------------------------------------------------------
-SELECT 1 / 0;
