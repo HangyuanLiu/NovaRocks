@@ -42,6 +42,7 @@ struct LifecycleConvergenceWireSnapshot {
     error_source: Option<String>,
     participant_outcomes: Vec<LifecycleParticipantOutcomeWire>,
     telemetry_unavailable: Vec<LifecycleTelemetryUnavailableWire>,
+    runtime_filter: RuntimeFilterTerminalRollupWire,
     metrics: BTreeMap<String, i64>,
 }
 
@@ -58,6 +59,183 @@ struct LifecycleTelemetryUnavailableWire {
     scope: String,
     stage: String,
     code: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum RuntimeFilterTerminalRollupWire {
+    Available {
+        participants: Vec<RuntimeFilterParticipantTerminalWire>,
+        totals: RuntimeFilterTerminalTotalsWire,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeFilterParticipantTerminalWire {
+    participant: RuntimeFilterParticipantWire,
+    telemetry: RuntimeFilterParticipantTelemetryWire,
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeFilterParticipantWire {
+    backend_id: u64,
+    start_epoch: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum RuntimeFilterParticipantTelemetryWire {
+    Available {
+        channels: Vec<RuntimeFilterChannelWire>,
+        producer_streams: Vec<RuntimeFilterProducerStreamWire>,
+        transport_routes: Vec<RuntimeFilterTransportRouteWire>,
+        consumers: Vec<RuntimeFilterConsumerWire>,
+    },
+    Unavailable {
+        stage: String,
+        code: String,
+    },
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeFilterChannelWire {
+    channel_binding_id: u32,
+    channel_id: u32,
+    install_state: String,
+    terminal_state: String,
+    latest_published_logical_version: Option<u64>,
+    published_count: u64,
+    completed_count: u64,
+    unavailable_count: u64,
+    cancelled_count: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeFilterProducerStreamWire {
+    channel_binding_id: u32,
+    channel_id: u32,
+    producer_fragment_instance_id: Option<RuntimeFilterUniqueIdWire>,
+    partition_id: u32,
+    latest_accepted_sequence: Option<u64>,
+    accepted_count: u64,
+    duplicate_count: u64,
+    stale_count: u64,
+    conflict_count: u64,
+    resource_limit_count: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeFilterTransportRouteWire {
+    channel_binding_id: u32,
+    channel_id: u32,
+    route_edge_id: u64,
+    sent_count: u64,
+    sent_bytes: u64,
+    retried_count: u64,
+    retried_bytes: u64,
+    acked_count: u64,
+    acked_bytes: u64,
+    fail_open_count: u64,
+    fail_open_bytes: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeFilterConsumerWire {
+    channel_binding_id: u32,
+    channel_id: u32,
+    consumer_binding_id: u32,
+    fragment_instance_id: Option<RuntimeFilterUniqueIdWire>,
+    latest_delivered_logical_version: Option<u64>,
+    latest_applied_logical_version: Option<u64>,
+    subscription_terminal: String,
+    row_evaluations: u64,
+    input_rows: u64,
+    output_rows: u64,
+    scan_evaluated: u64,
+    scan_kept: u64,
+    scan_pruned: u64,
+    scan_not_evaluated: u64,
+    scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedWire,
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeFilterUniqueIdWire {
+    high: i64,
+    low: i64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum RuntimeFilterTerminalTotalsWire {
+    Available {
+        channels: RuntimeFilterChannelTotalsWire,
+        producer_streams: RuntimeFilterProducerStreamTotalsWire,
+        transport_routes: RuntimeFilterTransportRouteTotalsWire,
+        consumers: RuntimeFilterConsumerTotalsWire,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeFilterChannelTotalsWire {
+    count: u64,
+    published_count: u64,
+    completed_count: u64,
+    unavailable_count: u64,
+    cancelled_count: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeFilterProducerStreamTotalsWire {
+    count: u64,
+    accepted_count: u64,
+    duplicate_count: u64,
+    stale_count: u64,
+    conflict_count: u64,
+    resource_limit_count: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeFilterTransportRouteTotalsWire {
+    count: u64,
+    sent_count: u64,
+    sent_bytes: u64,
+    retried_count: u64,
+    retried_bytes: u64,
+    acked_count: u64,
+    acked_bytes: u64,
+    fail_open_count: u64,
+    fail_open_bytes: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeFilterConsumerTotalsWire {
+    count: u64,
+    row_evaluations: u64,
+    input_rows: u64,
+    output_rows: u64,
+    scan_evaluated: u64,
+    scan_kept: u64,
+    scan_pruned: u64,
+    scan_not_evaluated: u64,
+    scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedWire,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+struct RuntimeFilterScanNotEvaluatedWire {
+    unit_facts_missing: u64,
+    column_facts_missing: u64,
+    data_type_unsupported: u64,
+    predicate_capability_unsupported: u64,
+    resource_unavailable: u64,
+    snapshot_unavailable: u64,
+    snapshot_timed_out: u64,
+    snapshot_not_published: u64,
 }
 
 fn query_lifecycle_structured_snapshot_from_fe(
@@ -87,6 +265,12 @@ fn query_lifecycle_structured_snapshot_from_fe(
     let wire: LifecycleConvergenceWireSnapshot = response
         .json()
         .context("decode FE lifecycle snapshot JSON")?;
+    decode_query_lifecycle_structured_snapshot(wire)
+}
+
+fn decode_query_lifecycle_structured_snapshot(
+    wire: LifecycleConvergenceWireSnapshot,
+) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
     let error_source = match wire.error_source.as_deref() {
         None => None,
         Some("backend-attestation") => Some(QueryLifecycleErrorSource::BackendAttestation),
@@ -119,6 +303,7 @@ fn query_lifecycle_structured_snapshot_from_fe(
         error_source,
         participant_outcomes,
         telemetry_unavailable,
+        runtime_filter: decode_runtime_filter_terminal_rollup(wire.runtime_filter)?,
         metrics: wire.metrics,
     }))
 }
@@ -226,7 +411,523 @@ pub struct QueryLifecycleStructuredSnapshot {
     pub error_source: Option<QueryLifecycleErrorSource>,
     pub participant_outcomes: Vec<ParticipantTerminalOutcomeKind>,
     pub telemetry_unavailable: Vec<QueryLifecycleTelemetryUnavailable>,
+    /// The FE-normalized Runtime Filter terminal read model. This is a
+    /// query-scoped immutable projection, never a process counter or log
+    /// rendering.
+    pub runtime_filter: RuntimeFilterTerminalRollup,
     pub metrics: BTreeMap<String, i64>,
+}
+
+/// Runtime Filter telemetry availability for a completed query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeFilterTerminalRollup {
+    Available {
+        participants: Vec<RuntimeFilterParticipantTerminalTelemetry>,
+        totals: RuntimeFilterTerminalTotalsTelemetry,
+    },
+    Unavailable {
+        reason: RuntimeFilterTerminalRollupUnavailable,
+    },
+}
+
+/// A query-level reason that terminal Runtime Filter facts are unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeFilterTerminalRollupUnavailable {
+    TerminalOutcomesIncomplete,
+    NegativeAttestation,
+}
+
+/// One participant identity prefixes every detail in its terminal telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RuntimeFilterTerminalParticipant {
+    pub backend_id: u64,
+    pub start_epoch: u64,
+}
+
+/// One participant's complete Runtime Filter terminal telemetry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeFilterParticipantTerminalTelemetry {
+    pub participant: RuntimeFilterTerminalParticipant,
+    pub telemetry: RuntimeFilterParticipantTerminalTelemetryValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeFilterParticipantTerminalTelemetryValue {
+    Available(RuntimeFilterParticipantTerminalDetails),
+    Unavailable(RuntimeFilterTerminalUnavailable),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeFilterTerminalUnavailable {
+    pub stage: String,
+    pub code: String,
+}
+
+/// The four owner-local detail sections retained for one participant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeFilterParticipantTerminalDetails {
+    pub channels: Vec<RuntimeFilterChannelTerminalDetail>,
+    pub producer_streams: Vec<RuntimeFilterProducerStreamTerminalDetail>,
+    pub transport_routes: Vec<RuntimeFilterTransportRouteTerminalDetail>,
+    pub consumers: Vec<RuntimeFilterConsumerTerminalDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeFilterChannelTerminalDetail {
+    pub channel_binding_id: u32,
+    pub channel_id: u32,
+    pub install_state: RuntimeFilterChannelInstallState,
+    pub terminal_state: RuntimeFilterChannelTerminalState,
+    pub latest_published_logical_version: Option<u64>,
+    pub published_count: u64,
+    pub completed_count: u64,
+    pub unavailable_count: u64,
+    pub cancelled_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeFilterChannelInstallState {
+    Installed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeFilterChannelTerminalState {
+    Open,
+    Completed,
+    Unavailable,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeFilterProducerStreamTerminalDetail {
+    pub channel_binding_id: u32,
+    pub channel_id: u32,
+    pub producer_fragment_instance_id: Option<RuntimeFilterUniqueId>,
+    pub partition_id: u32,
+    pub latest_accepted_sequence: Option<u64>,
+    pub accepted_count: u64,
+    pub duplicate_count: u64,
+    pub stale_count: u64,
+    pub conflict_count: u64,
+    pub resource_limit_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeFilterTransportRouteTerminalDetail {
+    pub channel_binding_id: u32,
+    pub channel_id: u32,
+    pub route_edge_id: u64,
+    pub sent_count: u64,
+    pub sent_bytes: u64,
+    pub retried_count: u64,
+    pub retried_bytes: u64,
+    pub acked_count: u64,
+    pub acked_bytes: u64,
+    pub fail_open_count: u64,
+    pub fail_open_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeFilterConsumerTerminalDetail {
+    pub channel_binding_id: u32,
+    pub channel_id: u32,
+    pub consumer_binding_id: u32,
+    pub fragment_instance_id: Option<RuntimeFilterUniqueId>,
+    pub latest_delivered_logical_version: Option<u64>,
+    pub latest_applied_logical_version: Option<u64>,
+    pub subscription_terminal: RuntimeFilterSubscriptionTerminal,
+    pub row_evaluations: u64,
+    pub input_rows: u64,
+    pub output_rows: u64,
+    pub scan_evaluated: u64,
+    pub scan_kept: u64,
+    pub scan_pruned: u64,
+    pub scan_not_evaluated: u64,
+    pub scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedCounters,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeFilterSubscriptionTerminal {
+    Pending,
+    Acquired,
+    TimedOut,
+    Unavailable,
+    Unsupported,
+    Cancelled,
+    Completed,
+    CompletedWithoutArtifact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeFilterUniqueId {
+    pub high: i64,
+    pub low: i64,
+}
+
+/// Checked totals from the FE read model. A caller must explicitly match
+/// `Unavailable`; a partial sum is never exposed as a query total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeFilterTerminalTotalsTelemetry {
+    Available(RuntimeFilterTerminalTotals),
+    Unavailable(RuntimeFilterTerminalTotalsUnavailable),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeFilterTerminalTotalsUnavailable {
+    ParticipantTelemetryUnavailable,
+    CounterOverflow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeFilterTerminalTotals {
+    pub channels: RuntimeFilterChannelTotals,
+    pub producer_streams: RuntimeFilterProducerStreamTotals,
+    pub transport_routes: RuntimeFilterTransportRouteTotals,
+    pub consumers: RuntimeFilterConsumerTotals,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeFilterChannelTotals {
+    pub count: u64,
+    pub published_count: u64,
+    pub completed_count: u64,
+    pub unavailable_count: u64,
+    pub cancelled_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeFilterProducerStreamTotals {
+    pub count: u64,
+    pub accepted_count: u64,
+    pub duplicate_count: u64,
+    pub stale_count: u64,
+    pub conflict_count: u64,
+    pub resource_limit_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeFilterTransportRouteTotals {
+    pub count: u64,
+    pub sent_count: u64,
+    pub sent_bytes: u64,
+    pub retried_count: u64,
+    pub retried_bytes: u64,
+    pub acked_count: u64,
+    pub acked_bytes: u64,
+    pub fail_open_count: u64,
+    pub fail_open_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeFilterConsumerTotals {
+    pub count: u64,
+    pub row_evaluations: u64,
+    pub input_rows: u64,
+    pub output_rows: u64,
+    pub scan_evaluated: u64,
+    pub scan_kept: u64,
+    pub scan_pruned: u64,
+    pub scan_not_evaluated: u64,
+    pub scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedCounters,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeFilterScanNotEvaluatedCounters {
+    pub unit_facts_missing: u64,
+    pub column_facts_missing: u64,
+    pub data_type_unsupported: u64,
+    pub predicate_capability_unsupported: u64,
+    pub resource_unavailable: u64,
+    pub snapshot_unavailable: u64,
+    pub snapshot_timed_out: u64,
+    pub snapshot_not_published: u64,
+}
+
+fn decode_runtime_filter_terminal_rollup(
+    wire: RuntimeFilterTerminalRollupWire,
+) -> Result<RuntimeFilterTerminalRollup> {
+    match wire {
+        RuntimeFilterTerminalRollupWire::Available {
+            participants,
+            totals,
+        } => Ok(RuntimeFilterTerminalRollup::Available {
+            participants: participants
+                .into_iter()
+                .map(decode_runtime_filter_participant)
+                .collect::<Result<Vec<_>>>()?,
+            totals: decode_runtime_filter_totals(totals)?,
+        }),
+        RuntimeFilterTerminalRollupWire::Unavailable { reason } => {
+            let reason = match reason.as_str() {
+                "terminal-outcomes-incomplete" => {
+                    RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete
+                }
+                "negative-attestation" => {
+                    RuntimeFilterTerminalRollupUnavailable::NegativeAttestation
+                }
+                _ => bail!("unknown runtime-filter rollup unavailable reason {reason:?}"),
+            };
+            Ok(RuntimeFilterTerminalRollup::Unavailable { reason })
+        }
+    }
+}
+
+fn decode_runtime_filter_participant(
+    wire: RuntimeFilterParticipantTerminalWire,
+) -> Result<RuntimeFilterParticipantTerminalTelemetry> {
+    let participant = RuntimeFilterTerminalParticipant {
+        backend_id: wire.participant.backend_id,
+        start_epoch: wire.participant.start_epoch,
+    };
+    let telemetry = match wire.telemetry {
+        RuntimeFilterParticipantTelemetryWire::Available {
+            channels,
+            producer_streams,
+            transport_routes,
+            consumers,
+        } => RuntimeFilterParticipantTerminalTelemetryValue::Available(
+            RuntimeFilterParticipantTerminalDetails {
+                channels: channels
+                    .into_iter()
+                    .map(decode_runtime_filter_channel)
+                    .collect::<Result<Vec<_>>>()?,
+                producer_streams: producer_streams
+                    .into_iter()
+                    .map(|stream| {
+                        Ok(RuntimeFilterProducerStreamTerminalDetail {
+                            channel_binding_id: stream.channel_binding_id,
+                            channel_id: stream.channel_id,
+                            producer_fragment_instance_id: stream
+                                .producer_fragment_instance_id
+                                .map(runtime_filter_unique_id)
+                                .transpose()?,
+                            partition_id: stream.partition_id,
+                            latest_accepted_sequence: stream.latest_accepted_sequence,
+                            accepted_count: stream.accepted_count,
+                            duplicate_count: stream.duplicate_count,
+                            stale_count: stream.stale_count,
+                            conflict_count: stream.conflict_count,
+                            resource_limit_count: stream.resource_limit_count,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                transport_routes: transport_routes
+                    .into_iter()
+                    .map(|route| RuntimeFilterTransportRouteTerminalDetail {
+                        channel_binding_id: route.channel_binding_id,
+                        channel_id: route.channel_id,
+                        route_edge_id: route.route_edge_id,
+                        sent_count: route.sent_count,
+                        sent_bytes: route.sent_bytes,
+                        retried_count: route.retried_count,
+                        retried_bytes: route.retried_bytes,
+                        acked_count: route.acked_count,
+                        acked_bytes: route.acked_bytes,
+                        fail_open_count: route.fail_open_count,
+                        fail_open_bytes: route.fail_open_bytes,
+                    })
+                    .collect(),
+                consumers: consumers
+                    .into_iter()
+                    .map(decode_runtime_filter_consumer)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+        ),
+        RuntimeFilterParticipantTelemetryWire::Unavailable { stage, code } => {
+            RuntimeFilterParticipantTerminalTelemetryValue::Unavailable(
+                RuntimeFilterTerminalUnavailable { stage, code },
+            )
+        }
+    };
+    Ok(RuntimeFilterParticipantTerminalTelemetry {
+        participant,
+        telemetry,
+    })
+}
+
+fn decode_runtime_filter_channel(
+    wire: RuntimeFilterChannelWire,
+) -> Result<RuntimeFilterChannelTerminalDetail> {
+    Ok(RuntimeFilterChannelTerminalDetail {
+        channel_binding_id: wire.channel_binding_id,
+        channel_id: wire.channel_id,
+        install_state: match wire.install_state.as_str() {
+            "QUERY_TERMINAL_RUNTIME_FILTER_CHANNEL_INSTALL_STATE_V1_INSTALLED" => {
+                RuntimeFilterChannelInstallState::Installed
+            }
+            _ => bail!(
+                "unknown runtime-filter channel install state {:?}",
+                wire.install_state
+            ),
+        },
+        terminal_state: match wire.terminal_state.as_str() {
+            "QUERY_TERMINAL_RUNTIME_FILTER_CHANNEL_TERMINAL_STATE_V1_OPEN" => {
+                RuntimeFilterChannelTerminalState::Open
+            }
+            "QUERY_TERMINAL_RUNTIME_FILTER_CHANNEL_TERMINAL_STATE_V1_COMPLETED" => {
+                RuntimeFilterChannelTerminalState::Completed
+            }
+            "QUERY_TERMINAL_RUNTIME_FILTER_CHANNEL_TERMINAL_STATE_V1_UNAVAILABLE" => {
+                RuntimeFilterChannelTerminalState::Unavailable
+            }
+            "QUERY_TERMINAL_RUNTIME_FILTER_CHANNEL_TERMINAL_STATE_V1_CANCELLED" => {
+                RuntimeFilterChannelTerminalState::Cancelled
+            }
+            _ => bail!(
+                "unknown runtime-filter channel terminal state {:?}",
+                wire.terminal_state
+            ),
+        },
+        latest_published_logical_version: wire.latest_published_logical_version,
+        published_count: wire.published_count,
+        completed_count: wire.completed_count,
+        unavailable_count: wire.unavailable_count,
+        cancelled_count: wire.cancelled_count,
+    })
+}
+
+fn decode_runtime_filter_consumer(
+    wire: RuntimeFilterConsumerWire,
+) -> Result<RuntimeFilterConsumerTerminalDetail> {
+    let subscription_terminal = match wire.subscription_terminal.as_str() {
+        "QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_PENDING" => {
+            RuntimeFilterSubscriptionTerminal::Pending
+        }
+        "QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_ACQUIRED" => {
+            RuntimeFilterSubscriptionTerminal::Acquired
+        }
+        "QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_TIMED_OUT" => {
+            RuntimeFilterSubscriptionTerminal::TimedOut
+        }
+        "QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_UNAVAILABLE" => {
+            RuntimeFilterSubscriptionTerminal::Unavailable
+        }
+        "QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_UNSUPPORTED" => {
+            RuntimeFilterSubscriptionTerminal::Unsupported
+        }
+        "QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_CANCELLED" => {
+            RuntimeFilterSubscriptionTerminal::Cancelled
+        }
+        "QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_COMPLETED" => {
+            RuntimeFilterSubscriptionTerminal::Completed
+        }
+        "QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_COMPLETED_WITHOUT_ARTIFACT" => {
+            RuntimeFilterSubscriptionTerminal::CompletedWithoutArtifact
+        }
+        _ => bail!(
+            "unknown runtime-filter subscription terminal state {:?}",
+            wire.subscription_terminal
+        ),
+    };
+    Ok(RuntimeFilterConsumerTerminalDetail {
+        channel_binding_id: wire.channel_binding_id,
+        channel_id: wire.channel_id,
+        consumer_binding_id: wire.consumer_binding_id,
+        fragment_instance_id: wire
+            .fragment_instance_id
+            .map(runtime_filter_unique_id)
+            .transpose()?,
+        latest_delivered_logical_version: wire.latest_delivered_logical_version,
+        latest_applied_logical_version: wire.latest_applied_logical_version,
+        subscription_terminal,
+        row_evaluations: wire.row_evaluations,
+        input_rows: wire.input_rows,
+        output_rows: wire.output_rows,
+        scan_evaluated: wire.scan_evaluated,
+        scan_kept: wire.scan_kept,
+        scan_pruned: wire.scan_pruned,
+        scan_not_evaluated: wire.scan_not_evaluated,
+        scan_not_evaluated_reasons: runtime_filter_scan_not_evaluated(
+            wire.scan_not_evaluated_reasons,
+        ),
+    })
+}
+
+fn runtime_filter_unique_id(wire: RuntimeFilterUniqueIdWire) -> Result<RuntimeFilterUniqueId> {
+    Ok(RuntimeFilterUniqueId {
+        high: wire.high,
+        low: wire.low,
+    })
+}
+
+fn decode_runtime_filter_totals(
+    wire: RuntimeFilterTerminalTotalsWire,
+) -> Result<RuntimeFilterTerminalTotalsTelemetry> {
+    match wire {
+        RuntimeFilterTerminalTotalsWire::Available {
+            channels,
+            producer_streams,
+            transport_routes,
+            consumers,
+        } => Ok(RuntimeFilterTerminalTotalsTelemetry::Available(
+            RuntimeFilterTerminalTotals {
+                channels: RuntimeFilterChannelTotals {
+                    count: channels.count,
+                    published_count: channels.published_count,
+                    completed_count: channels.completed_count,
+                    unavailable_count: channels.unavailable_count,
+                    cancelled_count: channels.cancelled_count,
+                },
+                producer_streams: RuntimeFilterProducerStreamTotals {
+                    count: producer_streams.count,
+                    accepted_count: producer_streams.accepted_count,
+                    duplicate_count: producer_streams.duplicate_count,
+                    stale_count: producer_streams.stale_count,
+                    conflict_count: producer_streams.conflict_count,
+                    resource_limit_count: producer_streams.resource_limit_count,
+                },
+                transport_routes: RuntimeFilterTransportRouteTotals {
+                    count: transport_routes.count,
+                    sent_count: transport_routes.sent_count,
+                    sent_bytes: transport_routes.sent_bytes,
+                    retried_count: transport_routes.retried_count,
+                    retried_bytes: transport_routes.retried_bytes,
+                    acked_count: transport_routes.acked_count,
+                    acked_bytes: transport_routes.acked_bytes,
+                    fail_open_count: transport_routes.fail_open_count,
+                    fail_open_bytes: transport_routes.fail_open_bytes,
+                },
+                consumers: RuntimeFilterConsumerTotals {
+                    count: consumers.count,
+                    row_evaluations: consumers.row_evaluations,
+                    input_rows: consumers.input_rows,
+                    output_rows: consumers.output_rows,
+                    scan_evaluated: consumers.scan_evaluated,
+                    scan_kept: consumers.scan_kept,
+                    scan_pruned: consumers.scan_pruned,
+                    scan_not_evaluated: consumers.scan_not_evaluated,
+                    scan_not_evaluated_reasons: runtime_filter_scan_not_evaluated(
+                        consumers.scan_not_evaluated_reasons,
+                    ),
+                },
+            },
+        )),
+        RuntimeFilterTerminalTotalsWire::Unavailable { reason } => {
+            let reason = match reason.as_str() {
+                "participant-telemetry-unavailable" => {
+                    RuntimeFilterTerminalTotalsUnavailable::ParticipantTelemetryUnavailable
+                }
+                "counter-overflow" => RuntimeFilterTerminalTotalsUnavailable::CounterOverflow,
+                _ => bail!("unknown runtime-filter totals unavailable reason {reason:?}"),
+            };
+            Ok(RuntimeFilterTerminalTotalsTelemetry::Unavailable(reason))
+        }
+    }
+}
+
+fn runtime_filter_scan_not_evaluated(
+    wire: RuntimeFilterScanNotEvaluatedWire,
+) -> RuntimeFilterScanNotEvaluatedCounters {
+    RuntimeFilterScanNotEvaluatedCounters {
+        unit_facts_missing: wire.unit_facts_missing,
+        column_facts_missing: wire.column_facts_missing,
+        data_type_unsupported: wire.data_type_unsupported,
+        predicate_capability_unsupported: wire.predicate_capability_unsupported,
+        resource_unavailable: wire.resource_unavailable,
+        snapshot_unavailable: wire.snapshot_unavailable,
+        snapshot_timed_out: wire.snapshot_timed_out,
+        snapshot_not_published: wire.snapshot_not_published,
+    }
 }
 
 impl QueryLifecyclePhase {
@@ -328,6 +1029,7 @@ const BACKEND_TOPOLOGY_TIMEOUT_CAP: Duration = Duration::from_secs(120);
 const TOPOLOGY_MYSQL_IO_TIMEOUT_CAP: Duration = Duration::from_secs(2);
 const TOPOLOGY_MYSQL_IO_TIMEOUT_MIN: Duration = Duration::from_millis(1);
 const RESOURCE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const LIFECYCLE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const QUERY_EXECUTION_RESOURCE_METRIC: &str = "novarocks_backend_query_execution_resources";
 const QUERY_LIFECYCLE_TERMINAL_METRIC: &str = "novarocks_backend_query_lifecycle_terminal_total";
 
@@ -702,6 +1404,41 @@ fn prometheus_labeled_gauge(
     }
 }
 
+fn await_query_lifecycle_structured_snapshot_after<F>(
+    before_execution_id: Option<&str>,
+    deadline: Instant,
+    mut snapshot: F,
+) -> Result<QueryLifecycleStructuredSnapshot>
+where
+    F: FnMut() -> Result<Option<QueryLifecycleStructuredSnapshot>>,
+{
+    let mut latest_execution_id = None;
+    let mut latest_error = None;
+    loop {
+        match snapshot() {
+            Ok(Some(candidate)) => {
+                let execution_id = candidate.execution_id.as_deref();
+                latest_execution_id = candidate.execution_id.clone();
+                if execution_id.is_some() && execution_id != before_execution_id {
+                    return Ok(candidate);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => latest_error = Some(format!("{error:#}")),
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for a query lifecycle snapshot newer than {before_execution_id:?}; latest_execution_id={latest_execution_id:?}; latest_error={latest_error:?}"
+            );
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(LIFECYCLE_CONVERGENCE_POLL_INTERVAL),
+        );
+    }
+}
+
 pub trait ServerHandle: Send {
     fn target_host(&self) -> Option<&str>;
     fn target_port(&self) -> Option<u16>;
@@ -820,6 +1557,19 @@ pub trait ServerHandle: Send {
         &mut self,
     ) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
         Ok(None)
+    }
+    /// Wait for the retained terminal record created by the query that started
+    /// after `before_execution_id`. The debug endpoint intentionally exposes
+    /// only `latest`, so accepting the pre-query identity would associate a
+    /// test with a different query's terminal facts.
+    fn await_query_lifecycle_structured_snapshot_after(
+        &mut self,
+        before_execution_id: Option<&str>,
+        deadline: Instant,
+    ) -> Result<QueryLifecycleStructuredSnapshot> {
+        await_query_lifecycle_structured_snapshot_after(before_execution_id, deadline, || {
+            self.query_lifecycle_structured_snapshot()
+        })
     }
     fn release_query_lifecycle_phase_fault(
         &mut self,
@@ -3092,7 +3842,250 @@ fn table_mut<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::fs;
+
+    fn lifecycle_debug_json(execution_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "execution_id": execution_id,
+            "error_source": null,
+            "participant_outcomes": [],
+            "telemetry_unavailable": [],
+            "runtime_filter": {
+                "kind": "available",
+                "participants": [{
+                    "participant": { "backend_id": 7, "start_epoch": 11 },
+                    "telemetry": {
+                        "kind": "available",
+                        "channels": [{
+                            "channel_binding_id": 1,
+                            "channel_id": 2,
+                            "install_state": "QUERY_TERMINAL_RUNTIME_FILTER_CHANNEL_INSTALL_STATE_V1_INSTALLED",
+                            "terminal_state": "QUERY_TERMINAL_RUNTIME_FILTER_CHANNEL_TERMINAL_STATE_V1_COMPLETED",
+                            "latest_published_logical_version": 3,
+                            "published_count": 4,
+                            "completed_count": 1,
+                            "unavailable_count": 0,
+                            "cancelled_count": 0
+                        }],
+                        "producer_streams": [{
+                            "channel_binding_id": 1,
+                            "channel_id": 2,
+                            "producer_fragment_instance_id": { "high": 9, "low": 10 },
+                            "partition_id": 3,
+                            "latest_accepted_sequence": 0,
+                            "accepted_count": 1,
+                            "duplicate_count": 2,
+                            "stale_count": 0,
+                            "conflict_count": 0,
+                            "resource_limit_count": 0
+                        }],
+                        "transport_routes": [{
+                            "channel_binding_id": 1,
+                            "channel_id": 2,
+                            "route_edge_id": 13,
+                            "sent_count": 1,
+                            "sent_bytes": 17,
+                            "retried_count": 1,
+                            "retried_bytes": 17,
+                            "acked_count": 1,
+                            "acked_bytes": 17,
+                            "fail_open_count": 0,
+                            "fail_open_bytes": 0
+                        }],
+                        "consumers": [{
+                            "channel_binding_id": 1,
+                            "channel_id": 2,
+                            "consumer_binding_id": 5,
+                            "fragment_instance_id": { "high": 19, "low": 20 },
+                            "latest_delivered_logical_version": 3,
+                            "latest_applied_logical_version": 3,
+                            "subscription_terminal": "QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_COMPLETED",
+                            "row_evaluations": 100,
+                            "input_rows": 100,
+                            "output_rows": 20,
+                            "scan_evaluated": 10,
+                            "scan_kept": 4,
+                            "scan_pruned": 6,
+                            "scan_not_evaluated": 0,
+                            "scan_not_evaluated_reasons": {
+                                "unit_facts_missing": 0,
+                                "column_facts_missing": 0,
+                                "data_type_unsupported": 0,
+                                "predicate_capability_unsupported": 0,
+                                "resource_unavailable": 0,
+                                "snapshot_unavailable": 0,
+                                "snapshot_timed_out": 0,
+                                "snapshot_not_published": 0
+                            }
+                        }]
+                    }
+                }],
+                "totals": {
+                    "kind": "available",
+                    "channels": { "count": 1, "published_count": 4, "completed_count": 1, "unavailable_count": 0, "cancelled_count": 0 },
+                    "producer_streams": { "count": 1, "accepted_count": 1, "duplicate_count": 2, "stale_count": 0, "conflict_count": 0, "resource_limit_count": 0 },
+                    "transport_routes": { "count": 1, "sent_count": 1, "sent_bytes": 17, "retried_count": 1, "retried_bytes": 17, "acked_count": 1, "acked_bytes": 17, "fail_open_count": 0, "fail_open_bytes": 0 },
+                    "consumers": {
+                        "count": 1, "row_evaluations": 100, "input_rows": 100, "output_rows": 20, "scan_evaluated": 10, "scan_kept": 4, "scan_pruned": 6, "scan_not_evaluated": 0,
+                        "scan_not_evaluated_reasons": {
+                            "unit_facts_missing": 0, "column_facts_missing": 0, "data_type_unsupported": 0, "predicate_capability_unsupported": 0,
+                            "resource_unavailable": 0, "snapshot_unavailable": 0, "snapshot_timed_out": 0, "snapshot_not_published": 0
+                        }
+                    }
+                }
+            },
+            "metrics": {}
+        })
+    }
+
+    fn decode_lifecycle_debug_json(value: serde_json::Value) -> QueryLifecycleStructuredSnapshot {
+        let wire = serde_json::from_value(value).expect("decode lifecycle debug wire");
+        decode_query_lifecycle_structured_snapshot(wire)
+            .expect("decode lifecycle debug snapshot")
+            .expect("debug endpoint returns a snapshot")
+    }
+
+    #[test]
+    fn lifecycle_debug_decode_preserves_prefixed_runtime_filter_details_and_totals() {
+        let snapshot = decode_lifecycle_debug_json(lifecycle_debug_json("11:12:13"));
+        let RuntimeFilterTerminalRollup::Available {
+            participants,
+            totals,
+        } = snapshot.runtime_filter
+        else {
+            panic!("runtime-filter fixture must be available");
+        };
+        assert_eq!(snapshot.execution_id.as_deref(), Some("11:12:13"));
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0].participant.backend_id, 7);
+        assert_eq!(participants[0].participant.start_epoch, 11);
+        let RuntimeFilterParticipantTerminalTelemetryValue::Available(details) =
+            &participants[0].telemetry
+        else {
+            panic!("participant telemetry must be available");
+        };
+        assert_eq!(
+            details.channels[0].terminal_state,
+            RuntimeFilterChannelTerminalState::Completed
+        );
+        assert_eq!(
+            details.producer_streams[0].latest_accepted_sequence,
+            Some(0)
+        );
+        assert_eq!(details.transport_routes[0].retried_count, 1);
+        assert_eq!(
+            details.consumers[0].subscription_terminal,
+            RuntimeFilterSubscriptionTerminal::Completed
+        );
+        let RuntimeFilterTerminalTotalsTelemetry::Available(totals) = totals else {
+            panic!("fixture totals must be available");
+        };
+        assert_eq!(totals.channels.completed_count, 1);
+        assert_eq!(totals.producer_streams.duplicate_count, 2);
+        assert_eq!(totals.transport_routes.acked_count, 1);
+        assert_eq!(totals.consumers.scan_pruned, 6);
+    }
+
+    #[test]
+    fn lifecycle_debug_decode_preserves_explicit_runtime_filter_unavailable_categories() {
+        let mut value = lifecycle_debug_json("11:12:13");
+        value["runtime_filter"] = serde_json::json!({
+            "kind": "unavailable",
+            "reason": "negative-attestation"
+        });
+        let snapshot = decode_lifecycle_debug_json(value);
+        assert_eq!(
+            snapshot.runtime_filter,
+            RuntimeFilterTerminalRollup::Unavailable {
+                reason: RuntimeFilterTerminalRollupUnavailable::NegativeAttestation
+            }
+        );
+
+        let mut value = lifecycle_debug_json("11:12:13");
+        value["runtime_filter"]["participants"][0]["telemetry"] = serde_json::json!({
+            "kind": "unavailable",
+            "stage": "terminal_capture",
+            "code": "BUDGET_EXHAUSTED"
+        });
+        value["runtime_filter"]["totals"] = serde_json::json!({
+            "kind": "unavailable",
+            "reason": "participant-telemetry-unavailable"
+        });
+        let snapshot = decode_lifecycle_debug_json(value);
+        let RuntimeFilterTerminalRollup::Available {
+            participants,
+            totals,
+        } = snapshot.runtime_filter
+        else {
+            panic!("rollup remains available when participant truth is retained");
+        };
+        assert!(matches!(
+            participants[0].telemetry,
+            RuntimeFilterParticipantTerminalTelemetryValue::Unavailable(RuntimeFilterTerminalUnavailable { ref stage, ref code })
+                if stage == "terminal_capture" && code == "BUDGET_EXHAUSTED"
+        ));
+        assert_eq!(
+            totals,
+            RuntimeFilterTerminalTotalsTelemetry::Unavailable(
+                RuntimeFilterTerminalTotalsUnavailable::ParticipantTelemetryUnavailable
+            )
+        );
+    }
+
+    #[test]
+    fn lifecycle_debug_decode_rejects_unknown_runtime_filter_categories() {
+        let mut unknown_rollup = lifecycle_debug_json("11:12:13");
+        unknown_rollup["runtime_filter"]["kind"] = serde_json::json!("future-category");
+        let wire = match serde_json::from_value::<LifecycleConvergenceWireSnapshot>(unknown_rollup)
+        {
+            Ok(_) => panic!("unknown tagged rollup category must fail wire decode"),
+            Err(error) => error,
+        };
+        assert!(wire.to_string().contains("future-category"), "{wire}");
+
+        let mut unknown_state = lifecycle_debug_json("11:12:13");
+        unknown_state["runtime_filter"]["participants"][0]["telemetry"]["channels"][0]["terminal_state"] =
+            serde_json::json!("future-terminal-state");
+        let wire = serde_json::from_value(unknown_state).expect("known wire envelope");
+        let error = decode_query_lifecycle_structured_snapshot(wire)
+            .expect_err("unknown terminal state must fail typed decoding");
+        assert!(
+            format!("{error:#}").contains("future-terminal-state"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_snapshot_wait_rejects_old_identity_until_a_new_query_arrives() {
+        let mut snapshots = VecDeque::from([
+            Ok(Some(decode_lifecycle_debug_json(lifecycle_debug_json(
+                "old",
+            )))),
+            Ok(None),
+            Ok(Some(decode_lifecycle_debug_json(lifecycle_debug_json(
+                "new",
+            )))),
+        ]);
+        let snapshot = await_query_lifecycle_structured_snapshot_after(
+            Some("old"),
+            Instant::now() + Duration::from_secs(1),
+            || snapshots.pop_front().expect("fixture snapshot"),
+        )
+        .expect("new execution identity must be returned");
+        assert_eq!(snapshot.execution_id.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn lifecycle_snapshot_wait_timeout_names_the_latest_stale_identity() {
+        let snapshot = decode_lifecycle_debug_json(lifecycle_debug_json("old"));
+        let error =
+            await_query_lifecycle_structured_snapshot_after(Some("old"), Instant::now(), || {
+                Ok(Some(snapshot.clone()))
+            })
+            .expect_err("the pre-query execution identity must not satisfy the wait");
+        assert!(format!("{error:#}").contains("latest_execution_id=Some(\"old\")"));
+    }
 
     fn backend_row(grpc_port: u16, state: &str, alive: bool) -> BackendTopologyRow {
         BackendTopologyRow {
