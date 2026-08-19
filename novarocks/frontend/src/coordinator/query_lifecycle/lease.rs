@@ -42,7 +42,8 @@ use super::{
 use crate::coordinator::query_registry::ActiveQueryAttemptBinding;
 use crate::coordinator::query_registry::{
     ActiveQueryAttemptControl, FrontendQueryRegistry, QueryLifecycleConvergenceErrorSource,
-    QueryLifecycleConvergenceSnapshot,
+    QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
+    RuntimeFilterTerminalRollupUnavailable,
 };
 
 const ACTIVE: u8 = 0;
@@ -1772,6 +1773,23 @@ impl ActiveQueryAttemptControl for AttemptControl {
         if outcomes.is_empty() && self.state.load(Ordering::Acquire) == ACTIVE {
             return None;
         }
+        let runtime_filter = match self.terminal_set() {
+            Ok(terminal_set) => RuntimeFilterTerminalRollupSnapshot::Available(
+                terminal_set.runtime_filter_terminal_rollup(),
+            ),
+            Err(_)
+                if outcomes
+                    .iter()
+                    .any(|outcome| outcome.negative_attestation().is_some()) =>
+            {
+                RuntimeFilterTerminalRollupSnapshot::Unavailable(
+                    RuntimeFilterTerminalRollupUnavailable::NegativeAttestation,
+                )
+            }
+            Err(_) => RuntimeFilterTerminalRollupSnapshot::Unavailable(
+                RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
+            ),
+        };
         Some(QueryLifecycleConvergenceSnapshot {
             execution_id: self.execution_id,
             error_source: *self
@@ -1784,6 +1802,7 @@ impl ActiveQueryAttemptControl for AttemptControl {
                 .expect("query lifecycle primary error")
                 .clone(),
             participant_outcomes: outcomes,
+            runtime_filter,
             metrics: self.metrics.snapshot(),
         })
     }

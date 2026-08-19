@@ -28,7 +28,13 @@ use tonic::server::NamedService;
 
 use crate::coordinator::{
     QueryLifecycleConvergenceErrorSource, QueryLifecycleConvergenceReader,
-    QueryLifecycleConvergenceSnapshot,
+    QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
+    RuntimeFilterTerminalRollupUnavailable,
+};
+use crate::query_execution::runtime_filter_terminal_rollup::{
+    RuntimeFilterParticipantTerminalDetails, RuntimeFilterParticipantTerminalTelemetry,
+    RuntimeFilterParticipantTerminalTelemetryValue, RuntimeFilterTerminalTotals,
+    RuntimeFilterTerminalTotalsTelemetry, RuntimeFilterTerminalTotalsUnavailable,
 };
 
 use super::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
@@ -48,6 +54,7 @@ struct LifecycleConvergenceDebugSnapshot {
     error_source: Option<&'static str>,
     participant_outcomes: Vec<LifecycleParticipantOutcomeDebug>,
     telemetry_unavailable: Vec<LifecycleTelemetryUnavailableDebug>,
+    runtime_filter: RuntimeFilterTerminalRollupDebug,
     /// This endpoint intentionally exposes only query-scoped immutable
     /// terminal evidence. Process metrics are not an acceptable substitute.
     metrics: BTreeMap<String, i64>,
@@ -66,6 +73,183 @@ struct LifecycleTelemetryUnavailableDebug {
     scope: &'static str,
     stage: String,
     code: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum RuntimeFilterTerminalRollupDebug {
+    Available {
+        participants: Vec<RuntimeFilterParticipantTerminalDebug>,
+        totals: RuntimeFilterTerminalTotalsDebug,
+    },
+    Unavailable {
+        reason: &'static str,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeFilterParticipantTerminalDebug {
+    participant: RuntimeFilterParticipantDebug,
+    telemetry: RuntimeFilterParticipantTelemetryDebug,
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeFilterParticipantDebug {
+    backend_id: u64,
+    start_epoch: u64,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum RuntimeFilterParticipantTelemetryDebug {
+    Available {
+        channels: Vec<RuntimeFilterChannelDebug>,
+        producer_streams: Vec<RuntimeFilterProducerStreamDebug>,
+        transport_routes: Vec<RuntimeFilterTransportRouteDebug>,
+        consumers: Vec<RuntimeFilterConsumerDebug>,
+    },
+    Unavailable {
+        stage: String,
+        code: String,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeFilterChannelDebug {
+    channel_binding_id: u32,
+    channel_id: u32,
+    install_state: String,
+    terminal_state: String,
+    latest_published_logical_version: Option<u64>,
+    published_count: u64,
+    completed_count: u64,
+    unavailable_count: u64,
+    cancelled_count: u64,
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeFilterProducerStreamDebug {
+    channel_binding_id: u32,
+    channel_id: u32,
+    producer_fragment_instance_id: Option<RuntimeFilterUniqueIdDebug>,
+    partition_id: u32,
+    latest_accepted_sequence: Option<u64>,
+    accepted_count: u64,
+    duplicate_count: u64,
+    stale_count: u64,
+    conflict_count: u64,
+    resource_limit_count: u64,
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeFilterTransportRouteDebug {
+    channel_binding_id: u32,
+    channel_id: u32,
+    route_edge_id: u64,
+    sent_count: u64,
+    sent_bytes: u64,
+    retried_count: u64,
+    retried_bytes: u64,
+    acked_count: u64,
+    acked_bytes: u64,
+    fail_open_count: u64,
+    fail_open_bytes: u64,
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeFilterConsumerDebug {
+    channel_binding_id: u32,
+    channel_id: u32,
+    consumer_binding_id: u32,
+    fragment_instance_id: Option<RuntimeFilterUniqueIdDebug>,
+    latest_delivered_logical_version: Option<u64>,
+    latest_applied_logical_version: Option<u64>,
+    subscription_terminal: String,
+    row_evaluations: u64,
+    input_rows: u64,
+    output_rows: u64,
+    scan_evaluated: u64,
+    scan_kept: u64,
+    scan_pruned: u64,
+    scan_not_evaluated: u64,
+    scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedDebug,
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeFilterUniqueIdDebug {
+    high: i64,
+    low: i64,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum RuntimeFilterTerminalTotalsDebug {
+    Available {
+        channels: RuntimeFilterChannelTotalsDebug,
+        producer_streams: RuntimeFilterProducerStreamTotalsDebug,
+        transport_routes: RuntimeFilterTransportRouteTotalsDebug,
+        consumers: RuntimeFilterConsumerTotalsDebug,
+    },
+    Unavailable {
+        reason: &'static str,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeFilterChannelTotalsDebug {
+    count: u64,
+    published_count: u64,
+    completed_count: u64,
+    unavailable_count: u64,
+    cancelled_count: u64,
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeFilterProducerStreamTotalsDebug {
+    count: u64,
+    accepted_count: u64,
+    duplicate_count: u64,
+    stale_count: u64,
+    conflict_count: u64,
+    resource_limit_count: u64,
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeFilterTransportRouteTotalsDebug {
+    count: u64,
+    sent_count: u64,
+    sent_bytes: u64,
+    retried_count: u64,
+    retried_bytes: u64,
+    acked_count: u64,
+    acked_bytes: u64,
+    fail_open_count: u64,
+    fail_open_bytes: u64,
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeFilterConsumerTotalsDebug {
+    count: u64,
+    row_evaluations: u64,
+    input_rows: u64,
+    output_rows: u64,
+    scan_evaluated: u64,
+    scan_kept: u64,
+    scan_pruned: u64,
+    scan_not_evaluated: u64,
+    scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedDebug,
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeFilterScanNotEvaluatedDebug {
+    unit_facts_missing: u64,
+    column_facts_missing: u64,
+    data_type_unsupported: u64,
+    predicate_capability_unsupported: u64,
+    resource_unavailable: u64,
+    snapshot_unavailable: u64,
+    snapshot_timed_out: u64,
+    snapshot_not_published: u64,
 }
 
 async fn latest_lifecycle_convergence_snapshot(
@@ -145,7 +329,286 @@ fn lifecycle_convergence_debug_snapshot(
         error_source,
         participant_outcomes,
         telemetry_unavailable,
+        runtime_filter: runtime_filter_terminal_rollup_debug(snapshot.runtime_filter),
         metrics: lifecycle_metric_map(snapshot.metrics),
+    }
+}
+
+fn runtime_filter_terminal_rollup_debug(
+    snapshot: RuntimeFilterTerminalRollupSnapshot,
+) -> RuntimeFilterTerminalRollupDebug {
+    match snapshot {
+        RuntimeFilterTerminalRollupSnapshot::Available(rollup) => {
+            RuntimeFilterTerminalRollupDebug::Available {
+                participants: rollup
+                    .participants
+                    .into_iter()
+                    .map(runtime_filter_participant_debug)
+                    .collect(),
+                totals: runtime_filter_totals_debug(rollup.totals),
+            }
+        }
+        RuntimeFilterTerminalRollupSnapshot::Unavailable(reason) => {
+            RuntimeFilterTerminalRollupDebug::Unavailable {
+                reason: runtime_filter_rollup_unavailable_reason(reason),
+            }
+        }
+    }
+}
+
+fn runtime_filter_rollup_unavailable_reason(
+    reason: RuntimeFilterTerminalRollupUnavailable,
+) -> &'static str {
+    match reason {
+        RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete => {
+            "terminal-outcomes-incomplete"
+        }
+        RuntimeFilterTerminalRollupUnavailable::NegativeAttestation => "negative-attestation",
+    }
+}
+
+fn runtime_filter_participant_debug(
+    participant: RuntimeFilterParticipantTerminalTelemetry,
+) -> RuntimeFilterParticipantTerminalDebug {
+    let participant_identity = RuntimeFilterParticipantDebug {
+        backend_id: participant.participant.backend_id,
+        start_epoch: participant.participant.start_epoch,
+    };
+    let telemetry = match participant.telemetry {
+        RuntimeFilterParticipantTerminalTelemetryValue::Available(details) => {
+            runtime_filter_participant_available_debug(details)
+        }
+        RuntimeFilterParticipantTerminalTelemetryValue::Unavailable(unavailable) => {
+            RuntimeFilterParticipantTelemetryDebug::Unavailable {
+                stage: unavailable.stage,
+                code: unavailable.code,
+            }
+        }
+    };
+    RuntimeFilterParticipantTerminalDebug {
+        participant: participant_identity,
+        telemetry,
+    }
+}
+
+fn runtime_filter_participant_available_debug(
+    details: RuntimeFilterParticipantTerminalDetails,
+) -> RuntimeFilterParticipantTelemetryDebug {
+    RuntimeFilterParticipantTelemetryDebug::Available {
+        channels: details
+            .channels
+            .into_iter()
+            .map(|channel| RuntimeFilterChannelDebug {
+                channel_binding_id: channel.channel_binding_id,
+                channel_id: channel.channel_id,
+                install_state: proto::QueryTerminalRuntimeFilterChannelInstallStateV1::try_from(
+                    channel.install_state,
+                )
+                .expect("validated runtime-filter channel install state")
+                .as_str_name()
+                .to_owned(),
+                terminal_state: proto::QueryTerminalRuntimeFilterChannelTerminalStateV1::try_from(
+                    channel.terminal_state,
+                )
+                .expect("validated runtime-filter channel terminal state")
+                .as_str_name()
+                .to_owned(),
+                latest_published_logical_version: channel.latest_published_logical_version,
+                published_count: channel.published_count,
+                completed_count: channel.completed_count,
+                unavailable_count: channel.unavailable_count,
+                cancelled_count: channel.cancelled_count,
+            })
+            .collect(),
+        producer_streams: details
+            .producer_streams
+            .into_iter()
+            .map(|stream| RuntimeFilterProducerStreamDebug {
+                channel_binding_id: stream.channel_binding_id,
+                channel_id: stream.channel_id,
+                producer_fragment_instance_id: stream
+                    .producer_fragment_instance_id
+                    .map(runtime_filter_unique_id_debug),
+                partition_id: stream.partition_id,
+                latest_accepted_sequence: stream.latest_accepted_sequence,
+                accepted_count: stream.accepted_count,
+                duplicate_count: stream.duplicate_count,
+                stale_count: stream.stale_count,
+                conflict_count: stream.conflict_count,
+                resource_limit_count: stream.resource_limit_count,
+            })
+            .collect(),
+        transport_routes: details
+            .transport_routes
+            .into_iter()
+            .map(|route| RuntimeFilterTransportRouteDebug {
+                channel_binding_id: route.channel_binding_id,
+                channel_id: route.channel_id,
+                route_edge_id: route.route_edge_id,
+                sent_count: route.sent_count,
+                sent_bytes: route.sent_bytes,
+                retried_count: route.retried_count,
+                retried_bytes: route.retried_bytes,
+                acked_count: route.acked_count,
+                acked_bytes: route.acked_bytes,
+                fail_open_count: route.fail_open_count,
+                fail_open_bytes: route.fail_open_bytes,
+            })
+            .collect(),
+        consumers: details
+            .consumers
+            .into_iter()
+            .map(|consumer| RuntimeFilterConsumerDebug {
+                channel_binding_id: consumer.channel_binding_id,
+                channel_id: consumer.channel_id,
+                consumer_binding_id: consumer.consumer_binding_id,
+                fragment_instance_id: consumer
+                    .fragment_instance_id
+                    .map(runtime_filter_unique_id_debug),
+                latest_delivered_logical_version: consumer.latest_delivered_logical_version,
+                latest_applied_logical_version: consumer.latest_applied_logical_version,
+                subscription_terminal:
+                    proto::QueryTerminalRuntimeFilterSubscriptionTerminalV1::try_from(
+                        consumer.subscription_terminal,
+                    )
+                    .expect("validated runtime-filter subscription terminal state")
+                    .as_str_name()
+                    .to_owned(),
+                row_evaluations: consumer.row_evaluations,
+                input_rows: consumer.input_rows,
+                output_rows: consumer.output_rows,
+                scan_evaluated: consumer.scan_evaluated,
+                scan_kept: consumer.scan_kept,
+                scan_pruned: consumer.scan_pruned,
+                scan_not_evaluated: consumer.scan_not_evaluated,
+                scan_not_evaluated_reasons: runtime_filter_scan_not_evaluated_debug(
+                    consumer
+                        .scan_not_evaluated_reasons
+                        .expect("validated runtime-filter consumer scan reasons"),
+                ),
+            })
+            .collect(),
+    }
+}
+
+fn runtime_filter_unique_id_debug(
+    id: novarocks_protocol::common::UniqueId,
+) -> RuntimeFilterUniqueIdDebug {
+    RuntimeFilterUniqueIdDebug {
+        high: id.hi,
+        low: id.lo,
+    }
+}
+
+fn runtime_filter_scan_not_evaluated_debug(
+    reasons: proto::QueryTerminalRuntimeFilterScanNotEvaluatedV1,
+) -> RuntimeFilterScanNotEvaluatedDebug {
+    RuntimeFilterScanNotEvaluatedDebug {
+        unit_facts_missing: reasons.unit_facts_missing,
+        column_facts_missing: reasons.column_facts_missing,
+        data_type_unsupported: reasons.data_type_unsupported,
+        predicate_capability_unsupported: reasons.predicate_capability_unsupported,
+        resource_unavailable: reasons.resource_unavailable,
+        snapshot_unavailable: reasons.snapshot_unavailable,
+        snapshot_timed_out: reasons.snapshot_timed_out,
+        snapshot_not_published: reasons.snapshot_not_published,
+    }
+}
+
+fn runtime_filter_totals_debug(
+    totals: RuntimeFilterTerminalTotalsTelemetry,
+) -> RuntimeFilterTerminalTotalsDebug {
+    match totals {
+        RuntimeFilterTerminalTotalsTelemetry::Available(totals) => {
+            runtime_filter_available_totals_debug(totals)
+        }
+        RuntimeFilterTerminalTotalsTelemetry::Unavailable(reason) => {
+            RuntimeFilterTerminalTotalsDebug::Unavailable {
+                reason: match reason {
+                    RuntimeFilterTerminalTotalsUnavailable::ParticipantTelemetryUnavailable => {
+                        "participant-telemetry-unavailable"
+                    }
+                    RuntimeFilterTerminalTotalsUnavailable::CounterOverflow => "counter-overflow",
+                },
+            }
+        }
+    }
+}
+
+fn runtime_filter_available_totals_debug(
+    totals: RuntimeFilterTerminalTotals,
+) -> RuntimeFilterTerminalTotalsDebug {
+    RuntimeFilterTerminalTotalsDebug::Available {
+        channels: RuntimeFilterChannelTotalsDebug {
+            count: totals.channels.count,
+            published_count: totals.channels.published_count,
+            completed_count: totals.channels.completed_count,
+            unavailable_count: totals.channels.unavailable_count,
+            cancelled_count: totals.channels.cancelled_count,
+        },
+        producer_streams: RuntimeFilterProducerStreamTotalsDebug {
+            count: totals.producer_streams.count,
+            accepted_count: totals.producer_streams.accepted_count,
+            duplicate_count: totals.producer_streams.duplicate_count,
+            stale_count: totals.producer_streams.stale_count,
+            conflict_count: totals.producer_streams.conflict_count,
+            resource_limit_count: totals.producer_streams.resource_limit_count,
+        },
+        transport_routes: RuntimeFilterTransportRouteTotalsDebug {
+            count: totals.transport_routes.count,
+            sent_count: totals.transport_routes.sent_count,
+            sent_bytes: totals.transport_routes.sent_bytes,
+            retried_count: totals.transport_routes.retried_count,
+            retried_bytes: totals.transport_routes.retried_bytes,
+            acked_count: totals.transport_routes.acked_count,
+            acked_bytes: totals.transport_routes.acked_bytes,
+            fail_open_count: totals.transport_routes.fail_open_count,
+            fail_open_bytes: totals.transport_routes.fail_open_bytes,
+        },
+        consumers: RuntimeFilterConsumerTotalsDebug {
+            count: totals.consumers.count,
+            row_evaluations: totals.consumers.row_evaluations,
+            input_rows: totals.consumers.input_rows,
+            output_rows: totals.consumers.output_rows,
+            scan_evaluated: totals.consumers.scan_evaluated,
+            scan_kept: totals.consumers.scan_kept,
+            scan_pruned: totals.consumers.scan_pruned,
+            scan_not_evaluated: totals.consumers.scan_not_evaluated,
+            scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedDebug {
+                unit_facts_missing: totals
+                    .consumers
+                    .scan_not_evaluated_reasons
+                    .unit_facts_missing,
+                column_facts_missing: totals
+                    .consumers
+                    .scan_not_evaluated_reasons
+                    .column_facts_missing,
+                data_type_unsupported: totals
+                    .consumers
+                    .scan_not_evaluated_reasons
+                    .data_type_unsupported,
+                predicate_capability_unsupported: totals
+                    .consumers
+                    .scan_not_evaluated_reasons
+                    .predicate_capability_unsupported,
+                resource_unavailable: totals
+                    .consumers
+                    .scan_not_evaluated_reasons
+                    .resource_unavailable,
+                snapshot_unavailable: totals
+                    .consumers
+                    .scan_not_evaluated_reasons
+                    .snapshot_unavailable,
+                snapshot_timed_out: totals
+                    .consumers
+                    .scan_not_evaluated_reasons
+                    .snapshot_timed_out,
+                snapshot_not_published: totals
+                    .consumers
+                    .scan_not_evaluated_reasons
+                    .snapshot_not_published,
+            },
+        },
     }
 }
 
@@ -368,8 +831,20 @@ mod tests {
     use std::time::Duration;
 
     use super::super::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
-    use super::{FrontendReportServerHandle, report_response_from_ack};
-    use crate::coordinator::{QueryLifecycleConvergenceReader, QueryTerminalIngress};
+    use super::{
+        FrontendReportServerHandle, lifecycle_convergence_debug_snapshot, report_response_from_ack,
+    };
+    use crate::coordinator::{
+        QueryLifecycleConvergenceReader, QueryTerminalIngress, RuntimeFilterTerminalRollupSnapshot,
+        RuntimeFilterTerminalRollupUnavailable,
+    };
+    use crate::metrics::FrontendQueryLifecycleMetricsSnapshot;
+    use crate::query_execution::runtime_filter_terminal_rollup::{
+        RuntimeFilterParticipantTerminalDetails, RuntimeFilterParticipantTerminalTelemetry,
+        RuntimeFilterParticipantTerminalTelemetryValue, RuntimeFilterTerminalParticipant,
+        RuntimeFilterTerminalRollup, RuntimeFilterTerminalTotals,
+        RuntimeFilterTerminalTotalsTelemetry, RuntimeFilterTerminalTotalsUnavailable,
+    };
     use novarocks_protocol::lifecycle::{
         AttemptId, NegativeAttestation, ParticipantBackendIdentity, ParticipantTerminalOutcome,
         QueryExecutionId, QueryTerminalReportAck, QueryTerminalReportOutcome,
@@ -434,6 +909,183 @@ mod tests {
             ),
         })
         .expect("participant terminal outcome")
+    }
+
+    fn debug_snapshot_with_runtime_filter(
+        runtime_filter: RuntimeFilterTerminalRollupSnapshot,
+    ) -> crate::coordinator::QueryLifecycleConvergenceSnapshot {
+        crate::coordinator::QueryLifecycleConvergenceSnapshot {
+            execution_id: QueryExecutionId::new(
+                QueryId::new(51, 52),
+                AttemptId::new(1).expect("nonzero attempt"),
+            )
+            .expect("execution id"),
+            error_source: None,
+            primary_error: None,
+            participant_outcomes: Vec::new(),
+            runtime_filter,
+            metrics: FrontendQueryLifecycleMetricsSnapshot::default(),
+        }
+    }
+
+    fn available_runtime_filter_rollup(
+        totals: RuntimeFilterTerminalTotalsTelemetry,
+    ) -> RuntimeFilterTerminalRollup {
+        RuntimeFilterTerminalRollup {
+            participants: vec![RuntimeFilterParticipantTerminalTelemetry {
+                participant: RuntimeFilterTerminalParticipant {
+                    backend_id: 7,
+                    start_epoch: 11,
+                },
+                telemetry: RuntimeFilterParticipantTerminalTelemetryValue::Available(
+                    RuntimeFilterParticipantTerminalDetails {
+                        channels: vec![proto::QueryTerminalRuntimeFilterChannelV1 {
+                            channel_binding_id: 3,
+                            channel_id: 5,
+                            install_state:
+                                proto::QueryTerminalRuntimeFilterChannelInstallStateV1::Installed
+                                    as i32,
+                            terminal_state:
+                                proto::QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed
+                                    as i32,
+                            latest_published_logical_version: Some(4),
+                            published_count: 2,
+                            completed_count: 1,
+                            unavailable_count: 0,
+                            cancelled_count: 0,
+                        }],
+                        producer_streams: vec![proto::QueryTerminalRuntimeFilterProducerStreamV1 {
+                            channel_binding_id: 3,
+                            channel_id: 5,
+                            producer_fragment_instance_id: Some(
+                                novarocks_protocol::common::UniqueId { hi: 9, lo: 10 },
+                            ),
+                            partition_id: 0,
+                            latest_accepted_sequence: Some(0),
+                            accepted_count: 1,
+                            duplicate_count: 1,
+                            stale_count: 0,
+                            conflict_count: 0,
+                            resource_limit_count: 0,
+                        }],
+                        transport_routes: vec![proto::QueryTerminalRuntimeFilterTransportRouteV1 {
+                            channel_binding_id: 3,
+                            channel_id: 5,
+                            route_edge_id: 13,
+                            sent_count: 1,
+                            sent_bytes: 64,
+                            retried_count: 1,
+                            retried_bytes: 64,
+                            acked_count: 1,
+                            acked_bytes: 64,
+                            fail_open_count: 0,
+                            fail_open_bytes: 0,
+                        }],
+                        consumers: vec![proto::QueryTerminalRuntimeFilterConsumerV1 {
+                            channel_binding_id: 3,
+                            channel_id: 5,
+                            consumer_binding_id: 8,
+                            fragment_instance_id: Some(novarocks_protocol::common::UniqueId {
+                                hi: 12,
+                                lo: 14,
+                            }),
+                            latest_delivered_logical_version: Some(4),
+                            latest_applied_logical_version: Some(4),
+                            subscription_terminal:
+                                proto::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Completed
+                                    as i32,
+                            row_evaluations: 9,
+                            input_rows: 8,
+                            output_rows: 7,
+                            scan_evaluated: 6,
+                            scan_kept: 4,
+                            scan_pruned: 2,
+                            scan_not_evaluated: 0,
+                            scan_not_evaluated_reasons: Some(Default::default()),
+                        }],
+                    },
+                ),
+            }],
+            totals,
+        }
+    }
+
+    #[test]
+    fn query_lifecycle_convergence_debug_exposes_runtime_filter_details_and_totals() {
+        let mut totals = RuntimeFilterTerminalTotals::default();
+        totals.channels.count = 1;
+        totals.channels.published_count = 2;
+        totals.producer_streams.duplicate_count = 1;
+        totals.transport_routes.retried_count = 1;
+        totals.consumers.output_rows = 7;
+        let value = serde_json::to_value(lifecycle_convergence_debug_snapshot(
+            debug_snapshot_with_runtime_filter(RuntimeFilterTerminalRollupSnapshot::Available(
+                available_runtime_filter_rollup(RuntimeFilterTerminalTotalsTelemetry::Available(
+                    totals,
+                )),
+            )),
+        ))
+        .expect("serialize debug snapshot");
+
+        assert_eq!(value["execution_id"], "51:52:1");
+        assert_eq!(value["runtime_filter"]["kind"], "available");
+        assert_eq!(
+            value["runtime_filter"]["participants"][0]["participant"]["backend_id"],
+            7
+        );
+        assert_eq!(
+            value["runtime_filter"]["participants"][0]["telemetry"]["channels"][0]["terminal_state"],
+            "QUERY_TERMINAL_RUNTIME_FILTER_CHANNEL_TERMINAL_STATE_V1_COMPLETED"
+        );
+        assert_eq!(
+            value["runtime_filter"]["participants"][0]["telemetry"]["transport_routes"][0]["retried_count"],
+            1
+        );
+        assert_eq!(
+            value["runtime_filter"]["totals"]["transport_routes"]["retried_count"],
+            1
+        );
+        assert_eq!(
+            value["runtime_filter"]["totals"]["consumers"]["output_rows"],
+            7
+        );
+        assert_eq!(value["metrics"]["active_attempts"], 0);
+    }
+
+    #[test]
+    fn query_lifecycle_convergence_debug_marks_incomplete_terminal_rollup_unavailable() {
+        let value = serde_json::to_value(lifecycle_convergence_debug_snapshot(
+            debug_snapshot_with_runtime_filter(RuntimeFilterTerminalRollupSnapshot::Unavailable(
+                RuntimeFilterTerminalRollupUnavailable::NegativeAttestation,
+            )),
+        ))
+        .expect("serialize debug snapshot");
+
+        assert_eq!(value["runtime_filter"]["kind"], "unavailable");
+        assert_eq!(value["runtime_filter"]["reason"], "negative-attestation");
+    }
+
+    #[test]
+    fn query_lifecycle_convergence_debug_keeps_participant_truth_when_totals_overflow() {
+        let value = serde_json::to_value(lifecycle_convergence_debug_snapshot(
+            debug_snapshot_with_runtime_filter(RuntimeFilterTerminalRollupSnapshot::Available(
+                available_runtime_filter_rollup(RuntimeFilterTerminalTotalsTelemetry::Unavailable(
+                    RuntimeFilterTerminalTotalsUnavailable::CounterOverflow,
+                )),
+            )),
+        ))
+        .expect("serialize debug snapshot");
+
+        assert_eq!(value["runtime_filter"]["kind"], "available");
+        assert_eq!(
+            value["runtime_filter"]["participants"][0]["telemetry"]["producer_streams"][0]["duplicate_count"],
+            1
+        );
+        assert_eq!(value["runtime_filter"]["totals"]["kind"], "unavailable");
+        assert_eq!(
+            value["runtime_filter"]["totals"]["reason"],
+            "counter-overflow"
+        );
     }
 
     #[test]
