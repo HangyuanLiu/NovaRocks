@@ -2933,7 +2933,7 @@ mod tests {
         let ready_path = temp.path().join("ready.txt");
         fs::write(&ready_path, "existing prefix\n").expect("write file baseline");
         let command = shell_with_arg(
-            "sleep 0.05; printf 'FILE_READY\n' >> \"$1\"; sleep 30",
+            "sleep 0.05; printf 'FILE_READY\n' >> \"$1\"; exec sleep 30",
             &ready_path,
         );
 

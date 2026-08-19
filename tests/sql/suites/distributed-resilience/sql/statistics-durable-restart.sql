@@ -18,9 +18,9 @@
 -- The canonical STAT-1 acceptance uses the runner-owned native 1FE+3BE
 -- topology. Three independent writes produce multiple Iceberg scan tasks;
 -- the BE marker below proves all three collection participants emitted a
--- non-empty internal partial. The FE is restarted after the durable JobRecord
--- is committed, so the recovered worker (not the client session) owns the
--- eventual collection and publication.
+-- non-empty internal partial. ANALYZE is synchronous, so the FE restart is
+-- performed after the durable terminal job state is written; the following
+-- observation proves that state remains visible across the restart.
 -- @sequential=true
 
 -- query 1
@@ -45,6 +45,11 @@ INSERT INTO ${case_db}.statistics_recovery VALUES (3, 30);
 
 -- query 5
 -- @restart_fe_after_step=true
+-- The synchronous ANALYZE statement returns only after all three BE-local
+-- partials have been collected. Assert those fresh markers on this step; the
+-- following step intentionally starts after the FE restart and observes the
+-- durable terminal job state instead of looking for already-emitted markers.
+-- @be_log_be_count_at_least=NOVAROCKS_STATISTICS_FRAGMENT_COLLECTED,3
 -- @skip_result_check=true
 ANALYZE TABLE ${case_db}.statistics_recovery;
 
@@ -54,7 +59,6 @@ ANALYZE TABLE ${case_db}.statistics_recovery;
 -- @retry_count=60
 -- @retry_interval_ms=1000
 -- @result_contains=SUCCEEDED
--- @be_log_be_count_at_least=NOVAROCKS_STATISTICS_FRAGMENT_COLLECTED,3
 -- @skip_result_check=true
 SHOW ANALYZE JOBS;
 

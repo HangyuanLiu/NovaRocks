@@ -921,7 +921,7 @@ fn validate_partition_transform(
         .ok_or_else(|| format!("partition source field ID {source_id} is missing"))?;
     let data_type = source.field_type.as_ref();
     if matches!(data_type, Type::Primitive(PrimitiveType::Variant)) {
-        return Err("Variant columns cannot appear in an Iceberg partition spec".to_string());
+        return Err("variant columns cannot appear in the partition spec".to_string());
     }
     match field {
         ConnectorPartitionTransform::Year { .. }

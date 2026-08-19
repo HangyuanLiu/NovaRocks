@@ -32,6 +32,11 @@ use novarocks_spi::connector::{
 
 use crate::iceberg::spec::{SnapshotRetention, TableMetadata};
 
+fn is_provider_private_ref(name: &str) -> bool {
+    crate::commit::write_fence::is_fence_ref(name)
+        || name == crate::commit::mv_publication_fence::MV_PUBLICATION_FENCE_REF
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum MetadataTableType {
     Files,
@@ -798,6 +803,7 @@ fn load_ref_rows(cfg: &MetadataBatchReaderConfig) -> Result<Vec<RefMetadataRow>,
     let refs = metadata.refs();
     let mut rows: Vec<RefMetadataRow> = refs
         .iter()
+        .filter(|(name, _)| !is_provider_private_ref(name))
         .map(|(name, reference)| {
             let (type_, max_reference_age_in_ms, min_snapshots_to_keep, max_snapshot_age_in_ms) =
                 match &reference.retention {

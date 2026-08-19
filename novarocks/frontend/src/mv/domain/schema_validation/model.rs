@@ -89,7 +89,7 @@ impl std::fmt::Display for SchemaEvolutionError {
         match self {
             Self::BaseTableIdentityChanged => write!(
                 f,
-                "iceberg MV refresh blocked: base table physical identity changed; run REFRESH FULL or recreate the MV"
+                "iceberg MV refresh blocked: base table identity changed (physical identity changed); run REFRESH FULL or recreate the MV"
             ),
             Self::BaseRowLineageContractBroken { reason } => write!(
                 f,

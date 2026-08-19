@@ -43,8 +43,9 @@ use parquet::file::properties::WriterProperties;
 
 use novarocks_connector_iceberg::commit::report as iceberg_report;
 use novarocks_connector_iceberg::commit::variant_write::{
-    VariantShreddingConfig, apply_variant_shredding_to_arrow_schema,
-    parse_variant_shredding_properties, transform_variant_columns_for_write, variant_field_indices,
+    VariantShreddingConfig, apply_variant_input_schema_to_arrow_schema,
+    apply_variant_shredding_to_arrow_schema, parse_variant_shredding_properties,
+    transform_variant_columns_for_write, variant_field_indices,
 };
 use novarocks_connector_iceberg::delete_file::IcebergFileContent;
 use novarocks_connector_iceberg::theta_sketch::{
@@ -179,12 +180,14 @@ impl StagedWriteContext {
             parse_variant_shredding_properties(metadata.properties(), &writer_schema)?;
         let writer_arrow_schema =
             apply_variant_shredding_to_arrow_schema(&annotated_schema, &variant_shredding)?;
+        let variant_input_schema =
+            apply_variant_input_schema_to_arrow_schema(&annotated_schema, &variant_shredding);
         Ok(Self {
             metadata,
             file_io,
             writer_schema,
             annotated_schema: writer_arrow_schema,
-            variant_input_schema: annotated_schema,
+            variant_input_schema,
             variant_shredding,
             partition_spec_id,
         })

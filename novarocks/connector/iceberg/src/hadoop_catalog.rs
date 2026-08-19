@@ -660,9 +660,31 @@ fn hex_digest(bytes: &[u8]) -> String {
 impl Catalog for HadoopFileSystemCatalog {
     async fn list_namespaces(
         &self,
-        _parent: Option<&NamespaceIdent>,
+        parent: Option<&NamespaceIdent>,
     ) -> Result<Vec<NamespaceIdent>> {
-        Ok(vec![])
+        let location = parent
+            .map(|namespace| self.namespace_location(namespace))
+            .unwrap_or_else(|| self.warehouse_location.clone());
+        let mut namespaces = Vec::new();
+        for child in self.file_io.list_directories(&location).await? {
+            if child.starts_with('.') {
+                continue;
+            }
+            let namespace = match parent {
+                Some(parent) => {
+                    let mut components = parent.as_ref().to_vec();
+                    components.push(child);
+                    NamespaceIdent::from_vec(components)?
+                }
+                None => NamespaceIdent::new(child),
+            };
+            if self.namespace_exists(&namespace).await? {
+                namespaces.push(namespace);
+            }
+        }
+        namespaces.sort();
+        namespaces.dedup();
+        Ok(namespaces)
     }
 
     async fn create_namespace(
@@ -790,7 +812,11 @@ impl Catalog for HadoopFileSystemCatalog {
         // The table location follows the Hadoop catalog convention:
         //   <warehouse>/<namespace>/<table>
         let table_location = self.table_location(table);
-        if let Err(e) = self.file_io.delete_prefix(&table_location).await {
+        // Object-store prefix deletion is lexical: deleting `.../dim` would
+        // also delete the sibling table `.../dim2`. Keep the separator in the
+        // prefix so DROP TABLE only removes this table's directory.
+        let table_prefix = format!("{}/", table_location.trim_end_matches('/'));
+        if let Err(e) = self.file_io.delete_prefix(&table_prefix).await {
             // Log but do not propagate — the in-memory and SQLite state has
             // already been removed, so the drop must be considered successful
             // even if the filesystem cleanup fails (e.g. table files were never
@@ -973,12 +999,20 @@ mod tests {
             .await
             .unwrap();
         assert!(catalog.namespace_exists(&namespace).await.unwrap());
+        assert_eq!(
+            catalog.list_namespaces(None).await.unwrap(),
+            vec![namespace.clone()]
+        );
 
         let restored = HadoopFileSystemCatalog::new(
             crate::fs_io::build_file_io_for_location(&location, None),
             location,
         );
         assert!(restored.namespace_exists(&namespace).await.unwrap());
+        assert_eq!(
+            restored.list_namespaces(None).await.unwrap(),
+            vec![namespace.clone()]
+        );
         restored.drop_namespace(&namespace).await.unwrap();
         assert!(!restored.namespace_exists(&namespace).await.unwrap());
     }
@@ -1002,6 +1036,10 @@ mod tests {
             location,
         );
         assert!(catalog.namespace_exists(&namespace).await.unwrap());
+        assert_eq!(
+            catalog.list_namespaces(None).await.unwrap(),
+            vec![namespace.clone()]
+        );
         assert_eq!(
             catalog.list_tables(&namespace).await.unwrap(),
             vec![TableIdent::new(namespace, "orders".to_string())]

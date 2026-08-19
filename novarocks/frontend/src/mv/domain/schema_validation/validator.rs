@@ -829,7 +829,7 @@ mod tests {
         let cases = vec![
             (
                 SchemaEvolutionError::BaseTableIdentityChanged,
-                "iceberg MV refresh blocked: base table physical identity changed; run REFRESH FULL or recreate the MV",
+                "iceberg MV refresh blocked: base table identity changed (physical identity changed); run REFRESH FULL or recreate the MV",
             ),
             (
                 SchemaEvolutionError::BaseRowLineageContractBroken {
