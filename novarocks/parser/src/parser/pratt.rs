@@ -20,12 +20,12 @@
 use crate::{
     Span, Symbol, Token, TokenKind,
     ast::{
-        ArrayExpr, BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr, CastKind,
-        ExistsExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier, Ident, InListExpr,
-        InSubqueryExpr, IsPredicate, IsPredicateExpr, LikeExpr, LikeOperator, Literal, LiteralKind,
-        NestedExpr, NullTreatment, ObjectName, SubqueryExpr, TupleExpr, TypeName, TypeNameArgument,
-        UnaryExpr, UnaryOperator, WindowFrame, WindowFrameBound, WindowFrameExclusion,
-        WindowFrameUnits, WindowSpec,
+        AccessExpr, AccessKind, ArrayExpr, BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr,
+        CastExpr, CastKind, ExistsExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier,
+        Ident, InListExpr, InSubqueryExpr, IsPredicate, IsPredicateExpr, JsonOperator, LambdaExpr,
+        LikeExpr, LikeOperator, Literal, LiteralKind, NestedExpr, NullTreatment, ObjectName,
+        SubqueryExpr, TupleExpr, TypeName, TypeNameArgument, UnaryExpr, UnaryOperator, WindowFrame,
+        WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
     },
     error::ParseError,
     keyword_class,
@@ -245,6 +245,28 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
 
         loop {
             self.skip_trivia();
+            if self.current_is_symbol(Symbol::Arrow) && self.arrow_starts_lambda(&left) {
+                let parameters = Self::lambda_parameters(&left)
+                    .expect("arrow_starts_lambda only accepts identifier parameters");
+                let start = left.span().start();
+                self.advance();
+                self.skip_trivia();
+                let body = self.parse_binding_power(0)?;
+                let span = Span::new(start, body.span().end());
+                left = Expr::Lambda(LambdaExpr {
+                    parameters,
+                    body: Box::new(body),
+                    span,
+                });
+                continue;
+            }
+            if self.current_is_symbol(Symbol::LBracket)
+                || self.current_is_symbol(Symbol::Arrow)
+                || self.current_is_symbol(Symbol::LongArrow)
+            {
+                left = self.parse_postfix_access(left)?;
+                continue;
+            }
             if minimum_precedence <= COMPARISON_PRECEDENCE && self.starts_comparison_special() {
                 left = self.parse_comparison_special(left)?;
                 continue;
@@ -271,6 +293,72 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }
 
         Ok(left)
+    }
+
+    fn parse_postfix_access(&mut self, expr: Expr) -> Result<Expr, ParseError> {
+        let start = expr.span().start();
+        let kind = if self.current_is_symbol(Symbol::LBracket) {
+            self.advance();
+            self.skip_trivia();
+            let index = self.parse_binding_power(0)?;
+            self.skip_trivia();
+            if !self.current_is_symbol(Symbol::RBracket) {
+                return Err(self.unexpected("']' after subscript expression"));
+            }
+            let end = self.current_span().end();
+            self.advance();
+            self.skip_trivia();
+            return Ok(Expr::Access(AccessExpr {
+                expr: Box::new(expr),
+                kind: AccessKind::Subscript(Box::new(index)),
+                span: Span::new(start, end),
+            }));
+        } else if self.current_is_symbol(Symbol::Arrow) {
+            JsonOperator::Arrow
+        } else {
+            JsonOperator::ArrowText
+        };
+        self.advance();
+        self.skip_trivia();
+        let path = self.parse_binding_power(UNARY_ARITHMETIC_PRECEDENCE + 1)?;
+        let end = path.span().end();
+        Ok(Expr::Access(AccessExpr {
+            expr: Box::new(expr),
+            kind: AccessKind::Json {
+                operator: kind,
+                path: Box::new(path),
+            },
+            span: Span::new(start, end),
+        }))
+    }
+
+    fn arrow_starts_lambda(&self, left: &Expr) -> bool {
+        Self::lambda_parameters(left).is_some() && !self.peek_nontrivia_is_string(1)
+    }
+
+    fn lambda_parameters(expression: &Expr) -> Option<Vec<Ident>> {
+        match expression {
+            Expr::Identifier(ident) => Some(vec![ident.clone()]),
+            Expr::Nested(nested) => Self::lambda_parameters(&nested.expression),
+            Expr::Tuple(tuple) => tuple
+                .expressions
+                .iter()
+                .map(|expression| match expression {
+                    Expr::Identifier(ident) => Some(ident.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        }
+    }
+
+    fn peek_nontrivia_is_string(&self, offset: usize) -> bool {
+        self.tokens
+            .iter()
+            .skip(self.position)
+            .filter(|token| !matches!(token.kind, TokenKind::Trivia(_)))
+            .nth(offset)
+            .is_some_and(|token| matches!(token.kind, TokenKind::String))
     }
 
     fn starts_comparison_special(&self) -> bool {

@@ -173,6 +173,12 @@ mod tests {
         assert!(matches!(parse("(SELECT 1) + 2"), Expr::Binary(_)));
         assert!(matches!(parse("[1, 2, 3]"), Expr::Array(_)));
         assert!(matches!(parse("(a, b)"), Expr::Tuple(_)));
+        assert!(matches!(parse("items[1]"), Expr::Access(_)));
+        assert!(matches!(parse("payload->>'$.name'"), Expr::Access(_)));
+        let Expr::FunctionCall(call) = parse("array_map((x, y) -> x + y, input)") else {
+            panic!("expected lambda function argument");
+        };
+        assert!(matches!(call.arguments[0], Expr::Lambda(_)));
         let Expr::FunctionCall(call) = parse(
             "group_concat(DISTINCT a ORDER BY b DESC SEPARATOR ',') FILTER (WHERE a IS NOT NULL)",
         ) else {

@@ -514,18 +514,21 @@ fn debug_ast(statement: &LegacyStatement) -> String {
     format!("{statement:#?}")
 }
 
-/// `sqlparser` derives `PartialEq` for source spans together with the SQL
-/// structure. A canonical printer necessarily relocates those spans, so raw
-/// `PartialEq` is not semantic equality. The crate's visitor API has no hook
-/// that can rewrite every `Span`; normalize its deterministic structural
-/// debug tree instead. This keeps every AST field and value while removing
-/// only fields whose type is explicitly `Span` (source coordinates).
+/// `sqlparser` derives `PartialEq` for source spans and concrete keyword
+/// tokens together with SQL structure. A canonical printer necessarily
+/// relocates spans, case-normalizes keywords, and canonicalizes StarRocks'
+/// equivalent single- and double-quoted string spellings. The crate's visitor
+/// API has no hook that can rewrite every such carrier; normalize its
+/// deterministic structural debug tree instead while retaining every semantic
+/// AST field and value.
 fn legacy_semantically_eq(left: &LegacyStatement, right: &LegacyStatement) -> bool {
     normalized_legacy_ast(left) == normalized_legacy_ast(right)
 }
 
 fn normalized_legacy_ast(statement: &LegacyStatement) -> String {
-    strip_debug_spans(&debug_ast(statement))
+    let without_spans = strip_debug_spans(&debug_ast(statement));
+    let without_tokens = strip_debug_blocks(&without_spans, "TokenWithSpan {");
+    without_tokens.replace("DoubleQuotedString(", "SingleQuotedString(")
 }
 
 /// Removes only a `span: Span(...)` field from the debug tree. `Span`'s
@@ -557,6 +560,34 @@ fn strip_debug_spans(debug: &str) -> String {
                 index += 1;
             }
         }
+        cursor = index;
+    }
+    normalized.push_str(&debug[cursor..]);
+    normalized
+}
+
+/// Removes `TokenWithSpan` source carriers such as `select_token` and
+/// `with_token`. Their keyword spelling and coordinates are lexical metadata;
+/// the corresponding typed AST fields retain the statement's meaning.
+fn strip_debug_blocks(debug: &str, marker: &str) -> String {
+    let mut normalized = String::with_capacity(debug.len());
+    let mut cursor = 0;
+    while let Some(relative_start) = debug[cursor..].find(marker) {
+        let start = cursor + relative_start;
+        normalized.push_str(&debug[cursor..start]);
+
+        let mut index = start + marker.len();
+        let mut depth = 1usize;
+        while depth > 0 {
+            match debug.as_bytes().get(index) {
+                Some(b'{') => depth += 1,
+                Some(b'}') => depth -= 1,
+                Some(_) => {}
+                None => unreachable!("sqlparser TokenWithSpan debug rendering must close its braces"),
+            }
+            index += 1;
+        }
+        normalized.push_str("<token>");
         cursor = index;
     }
     normalized.push_str(&debug[cursor..]);
@@ -701,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_semantic_equality_ignores_only_source_spans() {
+    fn legacy_semantic_equality_ignores_source_carriers_but_not_sql_values() {
         let compact = novarocks_sql::syntax::parse_sql_raw("SELECT value FROM source")
             .expect("compact legacy AST");
         let spaced = novarocks_sql::syntax::parse_sql_raw("SELECT\n  value\nFROM source")
@@ -717,6 +748,36 @@ mod tests {
         );
         assert!(legacy_semantically_eq(&compact, &spaced));
         assert!(!legacy_semantically_eq(&compact, &different));
+
+        let lowercase = novarocks_sql::syntax::parse_sql_raw("with cte as (SELECT 1) SELECT * FROM cte")
+            .expect("lowercase keyword legacy AST");
+        let uppercase = novarocks_sql::syntax::parse_sql_raw("WITH cte AS (SELECT 1) SELECT * FROM cte")
+            .expect("uppercase keyword legacy AST");
+        assert!(legacy_semantically_eq(&lowercase, &uppercase));
+
+        let double_quoted = novarocks_sql::syntax::parse_sql_raw("SELECT \"value\"")
+            .expect("double-quoted string legacy AST");
+        let single_quoted = novarocks_sql::syntax::parse_sql_raw("SELECT 'value'")
+            .expect("single-quoted string legacy AST");
+        let different_quoted = novarocks_sql::syntax::parse_sql_raw("SELECT 'other'")
+            .expect("different string legacy AST");
+        assert!(legacy_semantically_eq(&double_quoted, &single_quoted));
+        assert!(!legacy_semantically_eq(&double_quoted, &different_quoted));
+
+        let ignore_first = novarocks_sql::syntax::parse_sql_raw(
+            "SELECT LEAD(value IGNORE NULLS, 1) OVER (ORDER BY key) FROM source",
+        )
+        .expect("inner null treatment legacy AST");
+        let ignore_last = novarocks_sql::syntax::parse_sql_raw(
+            "SELECT LEAD(value, 1 IGNORE NULLS) OVER (ORDER BY key) FROM source",
+        )
+        .expect("canonical null treatment legacy AST");
+        let respect = novarocks_sql::syntax::parse_sql_raw(
+            "SELECT LEAD(value, 1 RESPECT NULLS) OVER (ORDER BY key) FROM source",
+        )
+        .expect("different null treatment legacy AST");
+        assert!(legacy_semantically_eq(&ignore_first, &ignore_last));
+        assert!(!legacy_semantically_eq(&ignore_first, &respect));
     }
 
     #[test]

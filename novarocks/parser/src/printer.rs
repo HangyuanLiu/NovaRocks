@@ -727,6 +727,15 @@ impl Printer {
             FunctionQuantifier::All => self.output.push_str("ALL "),
         }
         self.write_expr_list(&call.arguments);
+        if let Some(null_treatment) = call.null_treatment {
+            if !call.arguments.is_empty() {
+                self.output.push(' ');
+            }
+            self.output.push_str(match null_treatment {
+                NullTreatment::IgnoreNulls => "IGNORE NULLS",
+                NullTreatment::RespectNulls => "RESPECT NULLS",
+            });
+        }
         if !call.order_by.is_empty() {
             if !call.arguments.is_empty() {
                 self.output.push(' ');
@@ -749,12 +758,6 @@ impl Printer {
             self.write_expr(separator);
         }
         self.output.push(')');
-        if let Some(null_treatment) = call.null_treatment {
-            self.output.push_str(match null_treatment {
-                NullTreatment::IgnoreNulls => " IGNORE NULLS",
-                NullTreatment::RespectNulls => " RESPECT NULLS",
-            });
-        }
         if let Some(filter) = &call.filter {
             self.output.push_str(" FILTER (WHERE ");
             self.write_expr(filter);
@@ -1037,9 +1040,14 @@ impl Printer {
     }
 
     fn write_lambda_expr(&mut self, expression: &LambdaExpr) {
-        self.output.push('(');
-        self.write_ident_list(&expression.parameters);
-        self.output.push_str(") -> ");
+        if expression.parameters.len() == 1 {
+            self.write_ident(&expression.parameters[0]);
+        } else {
+            self.output.push('(');
+            self.write_ident_list(&expression.parameters);
+            self.output.push(')');
+        }
+        self.output.push_str(" -> ");
         self.write_expr(&expression.body);
     }
     fn write_access_expr(&mut self, expression: &AccessExpr) {
@@ -1242,7 +1250,7 @@ mod tests {
         });
         assert_eq!(
             print_expr(&function),
-            "Coalesce(DISTINCT a, 1) IGNORE NULLS FILTER (WHERE b IS NOT NULL) OVER (PARTITION BY partition_key)"
+            "Coalesce(DISTINCT a, 1 IGNORE NULLS) FILTER (WHERE b IS NOT NULL) OVER (PARTITION BY partition_key)"
         );
 
         let between = Expr::Between(BetweenExpr {
@@ -1270,6 +1278,14 @@ mod tests {
                 span: span(),
             })),
             "payload ->> 'name'"
+        );
+        assert_eq!(
+            print_expr(&Expr::Lambda(LambdaExpr {
+                parameters: vec![ident("value")],
+                body: Box::new(identifier("value")),
+                span: span(),
+            })),
+            "value -> value"
         );
     }
 
