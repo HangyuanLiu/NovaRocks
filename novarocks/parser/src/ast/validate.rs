@@ -132,8 +132,14 @@ fn validate_values(values: &Values) -> Result<(), ValidateError> {
 
 fn validate_select(select: &Select) -> Result<(), ValidateError> {
     for hint in &select.hints {
-        for argument in &hint.arguments {
-            validate_expr(argument)?;
+        match &hint.value {
+            super::SelectHintValue::Bare => {}
+            super::SelectHintValue::Call { arguments } => {
+                for argument in arguments {
+                    validate_expr(argument)?;
+                }
+            }
+            super::SelectHintValue::Assignment { value } => validate_expr(value)?,
         }
     }
     if select.projection.is_empty() {

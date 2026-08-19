@@ -128,8 +128,20 @@ pub struct Select {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectHint {
     pub name: Ident,
-    pub arguments: Vec<Expr>,
+    pub value: SelectHintValue,
     pub span: Span,
+}
+
+/// The typed payload shape of a [`SelectHint`].
+///
+/// Keep assignment-style directives distinct from function-style directives:
+/// `new_planner_agg_stage = 3` is not a function call and must not be
+/// reconstructed from opaque comment text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SelectHintValue {
+    Bare,
+    Call { arguments: Vec<Expr> },
+    Assignment { value: Expr },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

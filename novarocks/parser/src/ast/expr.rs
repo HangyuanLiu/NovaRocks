@@ -263,11 +263,15 @@ pub struct IntervalExpr {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntervalField {
     Year,
+    Quarter,
     Month,
+    Week,
     Day,
     Hour,
     Minute,
     Second,
+    Millisecond,
+    Microsecond,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

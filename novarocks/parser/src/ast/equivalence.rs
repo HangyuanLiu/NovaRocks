@@ -169,7 +169,22 @@ impl SyntaxEq for Select {
 
 impl SyntaxEq for SelectHint {
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.name.syntax_eq(&other.name) && syntax_eq_slice(&self.arguments, &other.arguments)
+        self.name.syntax_eq(&other.name) && self.value.syntax_eq(&other.value)
+    }
+}
+
+impl SyntaxEq for SelectHintValue {
+    fn syntax_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Bare, Self::Bare) => true,
+            (Self::Call { arguments: left }, Self::Call { arguments: right }) => {
+                syntax_eq_slice(left, right)
+            }
+            (Self::Assignment { value: left }, Self::Assignment { value: right }) => {
+                left.syntax_eq(right)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -436,6 +451,7 @@ impl SyntaxEq for TableHint {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.name.syntax_eq(&other.name)
             && syntax_eq_slice(&self.arguments, &other.arguments)
+            && self.attached_to_relation == other.attached_to_relation
             && match (&self.target, &other.target) {
                 (Some(left), Some(right)) => left.syntax_eq(right),
                 (None, None) => true,

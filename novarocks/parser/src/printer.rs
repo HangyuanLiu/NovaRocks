@@ -241,10 +241,17 @@ impl Printer {
         for hint in &select.hints {
             self.output.push_str(" /*+ ");
             self.write_ident(&hint.name);
-            if !hint.arguments.is_empty() {
-                self.output.push('(');
-                self.write_expr_list(&hint.arguments);
-                self.output.push(')');
+            match &hint.value {
+                SelectHintValue::Bare => {}
+                SelectHintValue::Call { arguments } => {
+                    self.output.push('(');
+                    self.write_expr_list(arguments);
+                    self.output.push(')');
+                }
+                SelectHintValue::Assignment { value } => {
+                    self.output.push_str(" = ");
+                    self.write_expr(value);
+                }
             }
             self.output.push_str(" */");
         }
@@ -441,7 +448,9 @@ impl Printer {
                     self.write_table_version(version);
                 }
                 for hint in hints {
-                    self.output.push(' ');
+                    if !hint.attached_to_relation {
+                        self.output.push(' ');
+                    }
                     self.write_table_hint(hint);
                 }
                 if let Some(alias) = alias {
@@ -608,6 +617,36 @@ impl Printer {
 
     fn write_join_relation(&mut self, relation: &TableFactor) {
         match relation {
+            TableFactor::Table {
+                name,
+                alias,
+                version,
+                hints,
+                ..
+            } if hints.iter().any(|hint| hint.attached_to_relation) => {
+                let first_postfix = hints
+                    .iter()
+                    .position(|hint| hint.attached_to_relation)
+                    .expect("matched attached table hint");
+                for hint in &hints[..first_postfix] {
+                    self.write_table_hint(hint);
+                    self.output.push(' ');
+                }
+                self.write_object_name(name);
+                if let Some(version) = version {
+                    self.write_table_version(version);
+                }
+                for hint in &hints[first_postfix..] {
+                    if !hint.attached_to_relation {
+                        self.output.push(' ');
+                    }
+                    self.write_table_hint(hint);
+                }
+                if let Some(alias) = alias {
+                    self.output.push(' ');
+                    self.write_table_alias(alias);
+                }
+            }
             TableFactor::Table {
                 name,
                 alias,
@@ -838,6 +877,14 @@ impl Printer {
         self.output.push('\'');
         for character in value.chars() {
             match character {
+                '\0' => self.output.push_str("\\0"),
+                '\u{0008}' => self.output.push_str("\\b"),
+                '\n' => self.output.push_str("\\n"),
+                '\r' => self.output.push_str("\\r"),
+                '\t' => self.output.push_str("\\t"),
+                '\u{000b}' => self.output.push_str("\\v"),
+                '\u{000c}' => self.output.push_str("\\f"),
+                '\u{001a}' => self.output.push_str("\\Z"),
                 '\\' => self.output.push_str("\\\\"),
                 '\'' => self.output.push_str("''"),
                 _ => self.output.push(character),
@@ -1160,11 +1207,15 @@ impl Printer {
     fn write_interval_field(&mut self, field: IntervalField) {
         self.output.push_str(match field {
             IntervalField::Year => "YEAR",
+            IntervalField::Quarter => "QUARTER",
             IntervalField::Month => "MONTH",
+            IntervalField::Week => "WEEK",
             IntervalField::Day => "DAY",
             IntervalField::Hour => "HOUR",
             IntervalField::Minute => "MINUTE",
             IntervalField::Second => "SECOND",
+            IntervalField::Millisecond => "MILLISECOND",
+            IntervalField::Microsecond => "MICROSECOND",
         });
     }
     fn write_subquery_expr(&mut self, expression: &SubqueryExpr) {

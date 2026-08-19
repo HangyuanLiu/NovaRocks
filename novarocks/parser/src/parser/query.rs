@@ -21,8 +21,8 @@ use crate::{
     Span, Token, TokenKind,
     ast::{
         Cte, ExplainFormat, ExplainQuery, Expr, Fetch, GroupBy, Join, JoinConstraint, JoinOperator,
-        NamedWindow, Offset, OffsetRows, OrderByExpr, Query, Select, SelectHint, SelectItem,
-        SelectQuantifier, SetExpr, SetOperation, SetOperator, SetQuantifier, Statement,
+        NamedWindow, Offset, OffsetRows, OrderByExpr, Query, Select, SelectHint, SelectHintValue,
+        SelectItem, SelectQuantifier, SetExpr, SetOperation, SetOperator, SetQuantifier, Statement,
         TableFactor, TableHint, TableVersion, TableVersionKind, TableWithJoins, Values,
         WildcardOptions, With,
     },
@@ -413,8 +413,8 @@ fn parse_select_hint_payload(
     while !parser.is_end() {
         let name = parser.parse_ident()?;
         let start = name.span.start();
-        let mut arguments = Vec::new();
-        let end = if parser.consume_if_symbol(Symbol::LParen) {
+        let (value, end) = if parser.consume_if_symbol(Symbol::LParen) {
+            let mut arguments = Vec::new();
             if !parser.current_is_symbol(Symbol::RParen) {
                 loop {
                     arguments.push(parse_expression_until(
@@ -427,13 +427,20 @@ fn parse_select_hint_payload(
                     }
                 }
             }
-            parser.consume_symbol(Symbol::RParen)?.end()
+            (
+                SelectHintValue::Call { arguments },
+                parser.consume_symbol(Symbol::RParen)?.end(),
+            )
+        } else if parser.consume_if_symbol(Symbol::Eq) {
+            let value = parse_expression_until(&mut parser, &[], &[])?;
+            let end = value.span().end();
+            (SelectHintValue::Assignment { value }, end)
         } else {
-            name.span.end()
+            (SelectHintValue::Bare, name.span.end())
         };
         hints.push(SelectHint {
             name,
-            arguments,
+            value,
             span: Span::new(start, end),
         });
     }
@@ -829,7 +836,14 @@ fn parse_table_factor(
         });
     }
     let version = parse_table_version(parser)?;
+    let relation_end = version
+        .as_ref()
+        .map_or(name.span.end(), |version| version.span.end());
+    let postfix_hint_start = hints.len();
     hints.extend(parse_table_hints(parser)?);
+    if let Some(hint) = hints.get_mut(postfix_hint_start) {
+        hint.attached_to_relation = hint.span.start() == relation_end;
+    }
     let alias = parse_optional_table_alias(parser)?;
     let end = alias
         .as_ref()
@@ -954,6 +968,7 @@ fn parse_table_hints(
             name,
             arguments,
             target,
+            attached_to_relation: false,
             span: Span::new(start, end),
         });
     }

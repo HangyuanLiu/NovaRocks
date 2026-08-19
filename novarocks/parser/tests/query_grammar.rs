@@ -17,7 +17,11 @@
 //! Query grammar vertical-slice contracts. These cases prove that parser-owned
 //! syntax can round-trip without making it a frontend execution route.
 
-use novarocks_parser::{ast::Statement, parse, printer::Printer};
+use novarocks_parser::{
+    ast::{SelectHintValue, SetExpr, Statement, SyntaxEq, TableFactor},
+    parse,
+    printer::Printer,
+};
 
 #[test]
 fn query_forms_parse_and_print_as_typed_syntax() {
@@ -99,11 +103,79 @@ fn select_optimizer_hints_are_typed_and_roundtrip() {
 }
 
 #[test]
+fn select_optimizer_assignment_hint_is_typed_and_roundtrips() {
+    let source = "SELECT /*+ new_planner_agg_stage = 3 */ 1";
+    let statements = parse(source).expect("assignment-style optimizer hint should parse");
+
+    let Statement::Query(query) = statements.first().expect("one query statement") else {
+        panic!("assignment-style optimizer hint must remain a typed query");
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("assignment-style optimizer hint must remain attached to SELECT");
+    };
+    assert!(matches!(
+        select.hints.as_slice(),
+        [hint] if matches!(hint.value, SelectHintValue::Assignment { .. })
+    ));
+
+    let canonical = Printer::new().statements(&statements);
+    assert_eq!(canonical, "SELECT /*+ new_planner_agg_stage = 3 */ 1");
+
+    let reparsed = parse(&canonical).expect("canonical assignment-style hint should parse");
+    assert_eq!(Printer::new().statements(&reparsed), canonical);
+}
+
+#[test]
 fn comma_limit_syntax_is_retained_by_the_typed_ast() {
     let statements = parse("SELECT * FROM t LIMIT 2, 10").expect("comma LIMIT should parse");
 
     assert_eq!(
         Printer::new().statements(&statements),
         "SELECT * FROM t LIMIT 2, 10"
+    );
+}
+
+#[test]
+fn table_metadata_postfix_adjacency_is_retained() {
+    let source = "SELECT count(*) FROM t0[_META_]";
+    let statements = parse(source).expect("metadata postfix should parse");
+    let Statement::Query(query) = &statements[0] else {
+        panic!("expected query");
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("expected SELECT");
+    };
+    let TableFactor::Table { hints, .. } = &select.from[0].relation else {
+        panic!("expected table relation");
+    };
+    assert!(hints[0].attached_to_relation);
+
+    let canonical = Printer::new().statements(&statements);
+    assert_eq!(canonical, source);
+    let reparsed = parse(&canonical).expect("canonical metadata postfix should parse");
+    assert_eq!(Printer::new().statements(&reparsed), canonical);
+    let Statement::Query(reparsed_query) = &reparsed[0] else {
+        panic!("expected reparsed query");
+    };
+    assert!(query.syntax_eq(reparsed_query));
+
+    let spaced = parse("SELECT count(*) FROM t0 [_META_]").expect("spaced hint should parse");
+    assert_eq!(
+        Printer::new().statements(&spaced),
+        "SELECT count(*) FROM t0 [_META_]"
+    );
+
+    let join_hint = parse("SELECT * FROM t1 JOIN [broadcast] t2 ON t1.id = t2.id")
+        .expect("join hint should parse");
+    assert_eq!(
+        Printer::new().statements(&join_hint),
+        "SELECT * FROM t1 JOIN [broadcast] t2 ON t1.id = t2.id"
+    );
+
+    let join_metadata = parse("SELECT * FROM t1 JOIN t2[_META_] ON t1.id = t2.id")
+        .expect("joined metadata postfix should parse");
+    assert_eq!(
+        Printer::new().statements(&join_metadata),
+        "SELECT * FROM t1 JOIN t2[_META_] ON t1.id = t2.id"
     );
 }

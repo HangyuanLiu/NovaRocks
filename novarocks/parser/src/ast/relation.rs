@@ -102,6 +102,9 @@ pub struct TableHint {
     pub arguments: Vec<Expr>,
     /// The expression selected by a pipe-style hint such as `[skew|key(1, 2)]`.
     pub target: Option<Expr>,
+    /// Whether this postfix hint was written directly after its relation with
+    /// no intervening trivia, as in `table[_META_]`.
+    pub attached_to_relation: bool,
     pub span: Span,
 }
 

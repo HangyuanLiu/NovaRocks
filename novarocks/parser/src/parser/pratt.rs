@@ -22,11 +22,12 @@ use crate::{
     ast::{
         AccessExpr, AccessKind, ArrayExpr, BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr,
         CastExpr, CastKind, ExistsExpr, Expr, FunctionCall, FunctionOrderBy, FunctionQuantifier,
-        Ident, InListExpr, InSubqueryExpr, IsPredicate, IsPredicateExpr, JsonOperator, LambdaExpr,
-        LikeExpr, LikeOperator, Literal, LiteralKind, MapEntry, MapExpr, NestedExpr, NullTreatment,
-        ObjectName, StructField, SubqueryExpr, TupleExpr, TypeName, TypeNameArgument,
-        TypedStringExpr, UnaryExpr, UnaryOperator, UserVariable, WindowFrame, WindowFrameBound,
-        WindowFrameExclusion, WindowFrameUnits, WindowSpec,
+        Ident, InListExpr, InSubqueryExpr, IntervalExpr, IntervalField, IsPredicate,
+        IsPredicateExpr, JsonOperator, LambdaExpr, LikeExpr, LikeOperator, Literal, LiteralKind,
+        MapEntry, MapExpr, NestedExpr, NullTreatment, ObjectName, StructField, SubqueryExpr,
+        TupleExpr, TypeName, TypeNameArgument, TypedStringExpr, UnaryExpr, UnaryOperator,
+        UserVariable, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits,
+        WindowSpec,
     },
     error::ParseError,
     keyword_class,
@@ -656,6 +657,9 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         if self.current_is_word("EXTRACT") && self.peek_nontrivia_is_symbol(1, Symbol::LParen) {
             return self.parse_extract_expression();
         }
+        if self.current_is_word("DATETIME") && self.peek_nontrivia_is_string(1) {
+            return self.parse_typed_string_expression();
+        }
         let token = self.current().cloned();
         match token {
             Some(Token {
@@ -741,6 +745,10 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 ..
             }) => self.parse_cast_expression(CastKind::TryCast),
             Some(Token {
+                kind: TokenKind::Keyword(Keyword::Interval),
+                ..
+            }) => self.parse_interval_expression(),
+            Some(Token {
                 kind: TokenKind::Keyword(Keyword::Date | Keyword::Time | Keyword::Timestamp),
                 ..
             }) if self.peek_nontrivia_is_string(1) => self.parse_typed_string_expression(),
@@ -778,6 +786,52 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }) => self.parse_array_expression(span),
             _ => Err(self.unexpected("expression")),
         }
+    }
+
+    fn parse_interval_expression(&mut self) -> Result<Expr, ParseError> {
+        let start = self.current_span().start();
+        self.advance();
+        self.skip_trivia();
+        let value = self.parse_binding_power(0)?;
+        self.skip_trivia();
+        let (leading_field, field_span) = self.parse_interval_field()?;
+        Ok(Expr::Interval(IntervalExpr {
+            value: Box::new(value),
+            leading_field,
+            leading_precision: None,
+            last_field: None,
+            fractional_seconds_precision: None,
+            span: Span::new(start, field_span.end()),
+        }))
+    }
+
+    fn parse_interval_field(&mut self) -> Result<(IntervalField, Span), ParseError> {
+        let field = if self.current_is_word("YEAR") {
+            IntervalField::Year
+        } else if self.current_is_word("QUARTER") {
+            IntervalField::Quarter
+        } else if self.current_is_word("MONTH") {
+            IntervalField::Month
+        } else if self.current_is_word("WEEK") {
+            IntervalField::Week
+        } else if self.current_is_word("DAY") {
+            IntervalField::Day
+        } else if self.current_is_word("HOUR") {
+            IntervalField::Hour
+        } else if self.current_is_word("MINUTE") {
+            IntervalField::Minute
+        } else if self.current_is_word("SECOND") {
+            IntervalField::Second
+        } else if self.current_is_word("MILLISECOND") {
+            IntervalField::Millisecond
+        } else if self.current_is_word("MICROSECOND") {
+            IntervalField::Microsecond
+        } else {
+            return Err(self.unexpected("interval field"));
+        };
+        let span = self.current_span();
+        self.advance();
+        Ok((field, span))
     }
 
     fn parse_exists_expression(&mut self, start: usize, negated: bool) -> Result<Expr, ParseError> {
@@ -1875,7 +1929,17 @@ fn unescape_string(text: &str, quote: char) -> String {
     while let Some(character) = characters.next() {
         if character == '\\' {
             if let Some(escaped) = characters.next() {
-                value.push(escaped);
+                value.push(match escaped {
+                    '0' => '\0',
+                    'b' => '\u{0008}',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    'v' => '\u{000b}',
+                    'f' => '\u{000c}',
+                    'Z' => '\u{001a}',
+                    other => other,
+                });
             } else {
                 value.push(character);
             }
@@ -1942,5 +2006,67 @@ mod tests {
             assert_eq!(Printer::new().statements(&statements), query, "{source}");
             crate::parse(&query).expect("canonical substring query should reparse");
         }
+    }
+
+    #[test]
+    fn interval_primary_expression_round_trips_in_time_slice_and_array_generate() {
+        let interval_units = [
+            "year",
+            "quarter",
+            "month",
+            "week",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+        ];
+        for unit in interval_units {
+            let source =
+                format!("SELECT time_slice('2023-10-31 23:59:59', interval 5 {unit}, ceil)");
+            let statements = crate::parse(&source).expect("time_slice interval query should parse");
+            let canonical = Printer::new().statements(&statements);
+            assert_eq!(
+                canonical,
+                format!(
+                    "SELECT time_slice('2023-10-31 23:59:59', INTERVAL 5 {}, ceil)",
+                    unit.to_ascii_uppercase()
+                )
+            );
+            let reparsed =
+                crate::parse(&canonical).expect("canonical time_slice query should reparse");
+            assert_eq!(Printer::new().statements(&reparsed), canonical);
+        }
+
+        let source = "SELECT time_slice('2023-10-31 23:59:59', INTERVAL idx * 370 DAY)";
+        let statements =
+            crate::parse(source).expect("computed time_slice interval query should parse");
+        let canonical = Printer::new().statements(&statements);
+        assert_eq!(canonical, source);
+        let reparsed =
+            crate::parse(&canonical).expect("canonical computed time_slice query should reparse");
+        assert_eq!(Printer::new().statements(&reparsed), canonical);
+
+        let source = "SELECT array_generate(DATE '2024-01-05', DATE '2024-01-01', INTERVAL -1 DAY)";
+        let statements = crate::parse(source).expect("array_generate interval query should parse");
+        let canonical = Printer::new().statements(&statements);
+        assert_eq!(canonical, source);
+        let reparsed =
+            crate::parse(&canonical).expect("canonical array_generate query should reparse");
+        assert_eq!(Printer::new().statements(&reparsed), canonical);
+    }
+
+    #[test]
+    fn typed_datetime_strings_and_mysql_escapes_round_trip() {
+        let source = "SELECT array_generate(DATETIME\"2025-10-01\", DATETIME\"2025-10-05\", INTERVAL 1 DAY), '\\n\\t\\v\\f\\r'";
+        let statements = crate::parse(source).expect("typed DATETIME and escaped strings parse");
+        let canonical = Printer::new().statements(&statements);
+        assert_eq!(
+            canonical,
+            "SELECT array_generate(DATETIME '2025-10-01', DATETIME '2025-10-05', INTERVAL 1 DAY), '\\n\\t\\v\\f\\r'"
+        );
+        let reparsed = crate::parse(&canonical).expect("canonical SQL should reparse");
+        assert_eq!(Printer::new().statements(&reparsed), canonical);
     }
 }

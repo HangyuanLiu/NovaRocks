@@ -70,8 +70,8 @@ pub use materialized_view::{
 };
 pub use query::{
     Cte, ExplainFormat, ExplainQuery, Fetch, GroupBy, Offset, OffsetRows, OrderByExpr, Query,
-    ReplaceSelectItem, Select, SelectHint, SelectItem, SelectQuantifier, SetExpr, SetOperation,
-    SetOperator, SetQuantifier, Values, WildcardOptions, With,
+    ReplaceSelectItem, Select, SelectHint, SelectHintValue, SelectItem, SelectQuantifier, SetExpr,
+    SetOperation, SetOperator, SetQuantifier, Values, WildcardOptions, With,
 };
 pub use relation::{
     Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableFunctionSyntax, TableHint,

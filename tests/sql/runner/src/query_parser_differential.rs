@@ -24,6 +24,7 @@ use crate::{
     config::{list_sql_files, placeholder_variables, resolve_path},
     parser::load_sql_case_from_file,
     runner::parse_selector_list,
+    shell::is_shell_step,
     suite_manifest::select_suite_names,
     types::{RunnerConfig, SqlCase, SqlStep, SuiteConfig},
 };
@@ -54,7 +55,9 @@ pub struct Options<'a> {
 #[derive(Debug, Default)]
 pub struct Summary {
     pub scanned: usize,
+    pub statement_payloads: usize,
     pub accept_query: usize,
+    pub typed_only_explain: usize,
     pub reject_excluded: usize,
     pub non_query: usize,
     pub mismatches: Vec<Mismatch>,
@@ -70,9 +73,11 @@ impl Summary {
             eprintln!("{mismatch}");
         }
         println!(
-            "SQLP-4 query parser differential: scanned={} accept-query={} reject-excluded={} non-query={} mismatches={}",
+            "SQLP-4 query parser differential: scanned={} statement-payloads={} accept-query={} typed-only-explain={} reject-excluded={} non-query={} mismatches={}",
             self.scanned,
+            self.statement_payloads,
             self.accept_query,
+            self.typed_only_explain,
             self.reject_excluded,
             self.non_query,
             self.mismatches.len(),
@@ -89,6 +94,7 @@ pub struct Mismatch {
     source_file: String,
     case_id: String,
     step: usize,
+    payload: usize,
     reason: String,
     original_sql: String,
     canonical_sql: Option<String>,
@@ -107,6 +113,7 @@ impl std::fmt::Display for Mismatch {
         writeln!(formatter, "  file: {}", self.source_file)?;
         writeln!(formatter, "  case: {}", self.case_id)?;
         writeln!(formatter, "  step: {}", self.step)?;
+        writeln!(formatter, "  payload: {}", self.payload)?;
         writeln!(formatter, "  reason: {}", self.reason)?;
         writeln!(formatter, "  original SQL:\n{}", self.original_sql)?;
         writeln!(
@@ -254,144 +261,296 @@ fn inspect_case(suite: &str, case: &SqlCase, summary: &mut Summary) {
             summary.reject_excluded += 1;
             continue;
         }
-
-        let legacy_original = match novarocks_sql::syntax::parse_sql_raw(&step.sql) {
-            Ok(statement) => statement,
-            Err(error) => {
-                if query_candidate_after_legacy_rejection(&step.sql) {
-                    summary.mismatches.push(mismatch(
-                        suite,
-                        case,
-                        step,
-                        format!("legacy parser rejected a query-shaped accept step: {error}"),
-                        None,
-                        None,
-                        None,
-                        None,
-                    ));
-                } else {
-                    summary.non_query += 1;
-                }
-                continue;
-            }
-        };
-        let Some(expected_class) = classify_legacy_query(&legacy_original) else {
+        if is_shell_step(&step.sql) {
             summary.non_query += 1;
             continue;
-        };
-        summary.accept_query += 1;
+        }
 
-        let typed_original = match parse_typed(&step.sql) {
-            Ok(statements) => statements,
+        let payloads = match split_statement_payloads(step) {
+            Ok(payloads) => payloads,
             Err(error) => {
                 summary.mismatches.push(mismatch(
                     suite,
                     case,
                     step,
-                    format!("typed parser rejected legacy-accepted query: {error}"),
+                    0,
+                    format!("could not lexically split an accept runner step: {error}"),
                     None,
-                    Some(&legacy_original),
+                    None,
                     None,
                     None,
                 ));
                 continue;
             }
         };
-        if !matches_typed_class(&typed_original, expected_class) {
-            summary.mismatches.push(mismatch(
-                suite,
-                case,
-                step,
-                format!(
-                    "typed parser did not produce exactly one matching {:?} statement",
-                    expected_class
-                ),
-                None,
-                Some(&legacy_original),
-                None,
-                Some(&typed_original),
-            ));
-            continue;
+        for (payload_index, payload) in payloads.iter().enumerate() {
+            summary.statement_payloads += 1;
+            inspect_payload(suite, case, payload, payload_index + 1, summary);
         }
+    }
+}
 
-        let canonical_sql = print_statements(&typed_original);
-        let typed_canonical = match parse_typed(&canonical_sql) {
-            Ok(statements) => statements,
-            Err(error) => {
+fn inspect_payload(
+    suite: &str,
+    case: &SqlCase,
+    step: &SqlStep,
+    payload_index: usize,
+    summary: &mut Summary,
+) {
+    let legacy_original = match novarocks_sql::syntax::parse_sql_raw(&step.sql) {
+        Ok(statement) => statement,
+        Err(error) if is_typed_only_explain(&step.sql) => {
+            inspect_typed_only_explain(suite, case, step, payload_index, summary);
+            return;
+        }
+        Err(error) => {
+            if query_candidate_after_legacy_rejection(&step.sql) {
                 summary.mismatches.push(mismatch(
                     suite,
                     case,
                     step,
-                    format!("canonical typed SQL did not reparse: {error}"),
-                    Some(canonical_sql),
-                    Some(&legacy_original),
+                    payload_index,
+                    format!("legacy parser rejected a query-shaped accept payload: {error}"),
                     None,
-                    Some(&typed_original),
+                    None,
+                    None,
+                    None,
                 ));
-                continue;
+            } else {
+                summary.non_query += 1;
             }
-        };
-        if !typed_statements_syntax_eq(&typed_original, &typed_canonical) {
-            let mut diagnostic = mismatch(
+            return;
+        }
+    };
+    let Some(expected_class) = classify_legacy_query(&legacy_original) else {
+        summary.non_query += 1;
+        return;
+    };
+    summary.accept_query += 1;
+
+    let typed_original = match parse_typed(&step.sql) {
+        Ok(statements) => statements,
+        Err(error) => {
+            summary.mismatches.push(mismatch(
                 suite,
                 case,
                 step,
-                "typed parse-print-parse is not span-insensitively equivalent".to_owned(),
+                payload_index,
+                format!("typed parser rejected legacy-accepted query: {error}"),
+                None,
+                Some(&legacy_original),
+                None,
+                None,
+            ));
+            return;
+        }
+    };
+    if !matches_typed_class(&typed_original, expected_class) {
+        summary.mismatches.push(mismatch(
+            suite,
+            case,
+            step,
+            payload_index,
+            format!(
+                "typed parser did not produce exactly one matching {:?} statement",
+                expected_class
+            ),
+            None,
+            Some(&legacy_original),
+            None,
+            Some(&typed_original),
+        ));
+        return;
+    }
+
+    let canonical_sql = print_statements(&typed_original);
+    let typed_canonical = match parse_typed(&canonical_sql) {
+        Ok(statements) => statements,
+        Err(error) => {
+            summary.mismatches.push(mismatch(
+                suite,
+                case,
+                step,
+                payload_index,
+                format!("canonical typed SQL did not reparse: {error}"),
                 Some(canonical_sql),
                 Some(&legacy_original),
                 None,
                 Some(&typed_original),
-            );
-            diagnostic.typed_canonical = Some(debug_typed_ast(&typed_canonical));
-            diagnostic.first_typed_difference = first_debug_difference(
-                diagnostic.typed_original.as_deref(),
-                diagnostic.typed_canonical.as_deref(),
-            );
-            summary.mismatches.push(diagnostic);
-            continue;
+            ));
+            return;
         }
+    };
+    if !typed_statements_syntax_eq(&typed_original, &typed_canonical) {
+        let mut diagnostic = mismatch(
+            suite,
+            case,
+            step,
+            payload_index,
+            "typed parse-print-parse is not span-insensitively equivalent".to_owned(),
+            Some(canonical_sql),
+            Some(&legacy_original),
+            None,
+            Some(&typed_original),
+        );
+        diagnostic.typed_canonical = Some(debug_typed_ast(&typed_canonical));
+        diagnostic.first_typed_difference = first_debug_difference(
+            diagnostic.typed_original.as_deref(),
+            diagnostic.typed_canonical.as_deref(),
+        );
+        summary.mismatches.push(diagnostic);
+        return;
+    }
 
-        let legacy_canonical = match novarocks_sql::syntax::parse_sql_raw(&canonical_sql) {
-            Ok(statement) => statement,
-            Err(error) => {
-                summary.mismatches.push(mismatch(
-                    suite,
-                    case,
-                    step,
-                    format!("legacy parser rejected canonical typed SQL: {error}"),
-                    Some(canonical_sql),
-                    Some(&legacy_original),
-                    None,
-                    Some(&typed_original),
-                ));
-                continue;
-            }
-        };
-        if classify_legacy_query(&legacy_canonical) != Some(expected_class) {
+    let legacy_canonical = match novarocks_sql::syntax::parse_sql_raw(&canonical_sql) {
+        Ok(statement) => statement,
+        Err(error) => {
             summary.mismatches.push(mismatch(
                 suite,
                 case,
                 step,
-                "canonical typed SQL changed the legacy query classification".to_owned(),
+                payload_index,
+                format!("legacy parser rejected canonical typed SQL: {error}"),
                 Some(canonical_sql),
                 Some(&legacy_original),
-                Some(&legacy_canonical),
+                None,
                 Some(&typed_original),
             ));
+            return;
+        }
+    };
+    if classify_legacy_query(&legacy_canonical) != Some(expected_class) {
+        summary.mismatches.push(mismatch(
+            suite,
+            case,
+            step,
+            payload_index,
+            "canonical typed SQL changed the legacy query classification".to_owned(),
+            Some(canonical_sql),
+            Some(&legacy_original),
+            Some(&legacy_canonical),
+            Some(&typed_original),
+        ));
+        return;
+    }
+    if !legacy_semantically_eq(&legacy_original, &legacy_canonical) {
+        summary.mismatches.push(mismatch(
+            suite,
+            case,
+            step,
+            payload_index,
+            "legacy AST semantic equality differs after canonical typed SQL".to_owned(),
+            Some(canonical_sql),
+            Some(&legacy_original),
+            Some(&legacy_canonical),
+            Some(&typed_original),
+        ));
+    }
+}
+
+fn inspect_typed_only_explain(
+    suite: &str,
+    case: &SqlCase,
+    step: &SqlStep,
+    payload_index: usize,
+    summary: &mut Summary,
+) {
+    let typed_original = match parse_typed(&step.sql) {
+        Ok(statements) => statements,
+        Err(error) => {
+            summary.mismatches.push(mismatch(
+                suite,
+                case,
+                step,
+                payload_index,
+                format!("typed-only EXPLAIN payload did not parse: {error}"),
+                None,
+                None,
+                None,
+                None,
+            ));
+            return;
+        }
+    };
+    if !matches_typed_only_explain(&typed_original) {
+        summary.mismatches.push(mismatch(
+            suite,
+            case,
+            step,
+            payload_index,
+            "raw-rejected EXPLAIN payload did not produce typed COSTS or LOGICAL Query EXPLAIN"
+                .to_owned(),
+            None,
+            None,
+            None,
+            Some(&typed_original),
+        ));
+        return;
+    }
+    summary.typed_only_explain += 1;
+
+    let canonical_sql = print_statements(&typed_original);
+    let typed_canonical = match parse_typed(&canonical_sql) {
+        Ok(statements) => statements,
+        Err(error) => {
+            summary.mismatches.push(mismatch(
+                suite,
+                case,
+                step,
+                payload_index,
+                format!("canonical typed-only EXPLAIN SQL did not reparse: {error}"),
+                Some(canonical_sql),
+                None,
+                None,
+                Some(&typed_original),
+            ));
+            return;
+        }
+    };
+    if !typed_statements_syntax_eq(&typed_original, &typed_canonical) {
+        let mut diagnostic = mismatch(
+            suite,
+            case,
+            step,
+            payload_index,
+            "typed-only EXPLAIN parse-print-parse is not span-insensitively equivalent".to_owned(),
+            Some(canonical_sql),
+            None,
+            None,
+            Some(&typed_original),
+        );
+        diagnostic.typed_canonical = Some(debug_typed_ast(&typed_canonical));
+        diagnostic.first_typed_difference = first_debug_difference(
+            diagnostic.typed_original.as_deref(),
+            diagnostic.typed_canonical.as_deref(),
+        );
+        summary.mismatches.push(diagnostic);
+    }
+}
+
+fn split_statement_payloads(step: &SqlStep) -> Result<Vec<SqlStep>, String> {
+    let tokens = lex(&step.sql).map_err(|error| format!("{error:?}"))?;
+    let mut payloads = Vec::new();
+    let mut start = 0;
+    for token in tokens {
+        if !matches!(token.kind, TokenKind::Symbol(Symbol::Semicolon)) {
             continue;
         }
-        if !legacy_semantically_eq(&legacy_original, &legacy_canonical) {
-            summary.mismatches.push(mismatch(
-                suite,
-                case,
-                step,
-                "legacy AST semantic equality differs after canonical typed SQL".to_owned(),
-                Some(canonical_sql),
-                Some(&legacy_original),
-                Some(&legacy_canonical),
-                Some(&typed_original),
-            ));
-        }
+        push_payload(step, start, token.span.start(), &mut payloads);
+        start = token.span.end();
+    }
+    push_payload(step, start, step.sql.len(), &mut payloads);
+    Ok(payloads)
+}
+
+fn push_payload(step: &SqlStep, start: usize, end: usize, payloads: &mut Vec<SqlStep>) {
+    let sql = &step.sql[start..end];
+    if !sql.trim().is_empty() {
+        payloads.push(SqlStep {
+            query_number: step.query_number,
+            sql: sql.to_owned(),
+            meta: step.meta.clone(),
+        });
     }
 }
 
@@ -456,11 +615,43 @@ fn is_query_start(kind: &&TokenKind) -> bool {
     )
 }
 
+fn is_typed_only_explain(sql: &str) -> bool {
+    let Ok(tokens) = lex(sql) else {
+        return false;
+    };
+    let significant: Vec<&TokenKind> = tokens
+        .iter()
+        .map(|token| &token.kind)
+        .filter(|kind| !matches!(kind, TokenKind::Trivia(_) | TokenKind::End))
+        .collect();
+    matches!(
+        significant.as_slice(),
+        [
+            TokenKind::Keyword(Keyword::Explain),
+            TokenKind::Keyword(Keyword::Costs | Keyword::Logical),
+            query_start,
+            ..
+        ] if is_query_start(query_start)
+    )
+}
+
 fn matches_typed_class(statements: &[TypedStatement], expected: QueryClass) -> bool {
     matches!(
         (expected, statements),
         (QueryClass::Query, [TypedStatement::Query(_)])
             | (QueryClass::ExplainQuery, [TypedStatement::ExplainQuery(_)])
+    )
+}
+
+fn matches_typed_only_explain(statements: &[TypedStatement]) -> bool {
+    matches!(
+        statements,
+        [TypedStatement::ExplainQuery(explain)]
+            if matches!(
+                explain.format,
+                novarocks_parser::ast::ExplainFormat::Costs
+                    | novarocks_parser::ast::ExplainFormat::Logical
+            )
     )
 }
 
@@ -478,6 +669,7 @@ fn mismatch(
     suite: &str,
     case: &SqlCase,
     step: &SqlStep,
+    payload: usize,
     reason: String,
     canonical_sql: Option<String>,
     legacy_original: Option<&LegacyStatement>,
@@ -498,6 +690,7 @@ fn mismatch(
         source_file: case.source_file.display().to_string(),
         case_id: case.case_id.clone(),
         step: step.query_number,
+        payload,
         reason,
         original_sql: step.sql.clone(),
         canonical_sql,
@@ -583,7 +776,9 @@ fn strip_debug_blocks(debug: &str, marker: &str) -> String {
                 Some(b'{') => depth += 1,
                 Some(b'}') => depth -= 1,
                 Some(_) => {}
-                None => unreachable!("sqlparser TokenWithSpan debug rendering must close its braces"),
+                None => {
+                    unreachable!("sqlparser TokenWithSpan debug rendering must close its braces")
+                }
             }
             index += 1;
         }
@@ -684,6 +879,28 @@ mod tests {
     }
 
     #[test]
+    fn splits_accept_steps_lexically_and_counts_typed_only_explain() {
+        let summary = run_fixture(
+            "-- query 1\nSELECT ';' AS value; SET query_timeout = 1; EXPLAIN COSTS SELECT 2;",
+        );
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.statement_payloads, 3);
+        assert_eq!(summary.accept_query, 1);
+        assert_eq!(summary.typed_only_explain, 1);
+        assert_eq!(summary.non_query, 1);
+        assert!(summary.mismatches.is_empty(), "{summary:#?}");
+    }
+
+    #[test]
+    fn classifies_shell_steps_without_lexing_them_as_sql() {
+        let summary = run_fixture("shell: printf 'a;b'\n");
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.statement_payloads, 0);
+        assert_eq!(summary.non_query, 1);
+        assert!(summary.mismatches.is_empty(), "{summary:#?}");
+    }
+
+    #[test]
     fn legacy_query_classifier_accepts_only_query_and_query_explain() {
         let query = novarocks_sql::syntax::parse_sql_raw("SELECT 1").expect("legacy query");
         let explain =
@@ -718,6 +935,7 @@ mod tests {
             "fixture",
             &case,
             &step,
+            1,
             "semantic mismatch".to_owned(),
             Some("SELECT 2".to_owned()),
             Some(&original),
@@ -728,6 +946,7 @@ mod tests {
         assert!(diagnostic.contains("suite: fixture"));
         assert!(diagnostic.contains("case: fixture"));
         assert!(diagnostic.contains("step: 7"));
+        assert!(diagnostic.contains("payload: 1"));
         assert!(diagnostic.contains("first legacy AST difference"));
     }
 
@@ -749,10 +968,12 @@ mod tests {
         assert!(legacy_semantically_eq(&compact, &spaced));
         assert!(!legacy_semantically_eq(&compact, &different));
 
-        let lowercase = novarocks_sql::syntax::parse_sql_raw("with cte as (SELECT 1) SELECT * FROM cte")
-            .expect("lowercase keyword legacy AST");
-        let uppercase = novarocks_sql::syntax::parse_sql_raw("WITH cte AS (SELECT 1) SELECT * FROM cte")
-            .expect("uppercase keyword legacy AST");
+        let lowercase =
+            novarocks_sql::syntax::parse_sql_raw("with cte as (SELECT 1) SELECT * FROM cte")
+                .expect("lowercase keyword legacy AST");
+        let uppercase =
+            novarocks_sql::syntax::parse_sql_raw("WITH cte AS (SELECT 1) SELECT * FROM cte")
+                .expect("uppercase keyword legacy AST");
         assert!(legacy_semantically_eq(&lowercase, &uppercase));
 
         let double_quoted = novarocks_sql::syntax::parse_sql_raw("SELECT \"value\"")

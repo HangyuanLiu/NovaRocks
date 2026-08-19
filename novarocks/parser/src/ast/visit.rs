@@ -244,8 +244,14 @@ pub fn walk_set_expr<V: Visit + ?Sized>(visitor: &mut V, set_expr: &SetExpr) {
 pub fn walk_select<V: Visit + ?Sized>(visitor: &mut V, select: &Select) {
     for hint in &select.hints {
         visitor.visit_ident(&hint.name);
-        for argument in &hint.arguments {
-            visitor.visit_expr(argument);
+        match &hint.value {
+            SelectHintValue::Bare => {}
+            SelectHintValue::Call { arguments } => {
+                for argument in arguments {
+                    visitor.visit_expr(argument);
+                }
+            }
+            SelectHintValue::Assignment { value } => visitor.visit_expr(value),
         }
     }
     if let SelectQuantifier::Distinct { on, .. } = &select.quantifier {
@@ -894,11 +900,18 @@ pub fn fold_select<F: Fold + ?Sized>(folder: &mut F, mut select: Select) -> Sele
         .into_iter()
         .map(|mut hint| {
             hint.name = folder.fold_ident(hint.name);
-            hint.arguments = hint
-                .arguments
-                .into_iter()
-                .map(|argument| folder.fold_expr(argument))
-                .collect();
+            hint.value = match hint.value {
+                SelectHintValue::Bare => SelectHintValue::Bare,
+                SelectHintValue::Call { arguments } => SelectHintValue::Call {
+                    arguments: arguments
+                        .into_iter()
+                        .map(|argument| folder.fold_expr(argument))
+                        .collect(),
+                },
+                SelectHintValue::Assignment { value } => SelectHintValue::Assignment {
+                    value: folder.fold_expr(value),
+                },
+            };
             hint
         })
         .collect();
