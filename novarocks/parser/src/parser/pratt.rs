@@ -397,6 +397,25 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             .is_some_and(|token| matches!(token.kind, TokenKind::Symbol(found) if found == symbol))
     }
 
+    fn substring_special_form_follows(&self) -> bool {
+        let mut depth = 0;
+        for token in self
+            .tokens
+            .iter()
+            .skip(self.position)
+            .filter(|token| !matches!(token.kind, TokenKind::Trivia(_)))
+        {
+            match token.kind {
+                TokenKind::Symbol(Symbol::LParen) => depth += 1,
+                TokenKind::Symbol(Symbol::RParen) if depth == 1 => return false,
+                TokenKind::Symbol(Symbol::RParen) => depth -= 1,
+                TokenKind::Keyword(Keyword::From) if depth == 1 => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn starts_comparison_special(&self) -> bool {
         self.current_is_keyword(Keyword::Between)
             || self.current_is_keyword(Keyword::In)
@@ -627,6 +646,9 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             self.advance();
             self.skip_trivia();
             return self.parse_map_expression(start);
+        }
+        if self.current_is_word("SUBSTRING") && self.substring_special_form_follows() {
+            return self.parse_substring_expression();
         }
         if self.current_is_word("EXTRACT") && self.peek_nontrivia_is_symbol(1, Symbol::LParen) {
             return self.parse_extract_expression();
@@ -963,6 +985,63 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         }))
     }
 
+    fn parse_substring_expression(&mut self) -> Result<Expr, ParseError> {
+        let start = self.current_span().start();
+        let name_span = self.current_span();
+        self.advance();
+        self.skip_trivia();
+        if !self.current_is_symbol(Symbol::LParen) {
+            return Err(self.unexpected("'(' after SUBSTRING"));
+        }
+        self.advance();
+        self.skip_trivia();
+        let value = self.parse_binding_power(0)?;
+        self.skip_trivia();
+        if !self.current_is_keyword(Keyword::From) {
+            return Err(self.unexpected("FROM in SUBSTRING"));
+        }
+        self.advance();
+        self.skip_trivia();
+        let start_position = self.parse_binding_power(0)?;
+        self.skip_trivia();
+        let length = if self.current_is_keyword(Keyword::For) {
+            self.advance();
+            self.skip_trivia();
+            Some(self.parse_binding_power(0)?)
+        } else {
+            None
+        };
+        self.skip_trivia();
+        if !self.current_is_symbol(Symbol::RParen) {
+            return Err(self.unexpected("')' after SUBSTRING"));
+        }
+        let end = self.current_span().end();
+        self.advance();
+
+        let mut arguments = vec![value, start_position];
+        if let Some(length) = length {
+            arguments.push(length);
+        }
+        Ok(Expr::FunctionCall(FunctionCall {
+            name: ObjectName {
+                parts: vec![Ident {
+                    value: self.token_text(name_span).to_owned(),
+                    quoted: false,
+                    span: name_span,
+                }],
+                span: name_span,
+            },
+            arguments,
+            quantifier: FunctionQuantifier::None,
+            order_by: Vec::new(),
+            separator: None,
+            filter: None,
+            null_treatment: None,
+            over: None,
+            span: Span::new(start, end),
+        }))
+    }
+
     fn parse_type_name(&mut self) -> Result<TypeName, ParseError> {
         let start = self.current_span().start();
         let Some(token) = self.current().cloned() else {
@@ -1196,10 +1275,28 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 } else {
                     None
                 };
+                let nulls_first = if self.current_is_keyword(Keyword::Nulls) {
+                    self.advance();
+                    self.skip_trivia();
+                    if self.current_is_keyword(Keyword::First) {
+                        self.advance();
+                        self.skip_trivia();
+                        Some(true)
+                    } else if self.current_is_keyword(Keyword::Last) {
+                        self.advance();
+                        self.skip_trivia();
+                        Some(false)
+                    } else {
+                        return Err(self.unexpected("FIRST or LAST after NULLS"));
+                    }
+                } else {
+                    None
+                };
                 order_by.push(FunctionOrderBy {
                     span: Span::new(expr.span().start(), self.current_span().start()),
                     expr,
                     asc,
+                    nulls_first,
                 });
                 if !self.current_is_symbol(Symbol::Comma) {
                     break;
@@ -1783,5 +1880,34 @@ mod tests {
             "SELECT MAP{1: [2, 3], NULL: MAP{4: 5}} AS value_map"
         );
         crate::parse(&canonical_query).expect("canonical map query should reparse");
+    }
+
+    #[test]
+    fn substring_from_for_form_canonicalizes_to_function_arguments_and_reparses() {
+        for (source, canonical) in [
+            (
+                "SUBSTRING('STARROCKS' FROM 2 FOR 3)",
+                "SUBSTRING('STARROCKS', 2, 3)",
+            ),
+            ("SUBSTRING('STARROCKS' FROM 5)", "SUBSTRING('STARROCKS', 5)"),
+            (
+                "SUBSTRING('STARROCKS', 2, 3)",
+                "SUBSTRING('STARROCKS', 2, 3)",
+            ),
+        ] {
+            let tokens = lex(source).expect("substring source should lex");
+            let expression =
+                parse_expression(source, &tokens).expect("substring source should parse");
+            assert_eq!(
+                Printer::new().expression(&expression),
+                canonical,
+                "{source}"
+            );
+
+            let query = format!("SELECT {canonical} AS fragment");
+            let statements = crate::parse(&query).expect("substring query should parse");
+            assert_eq!(Printer::new().statements(&statements), query, "{source}");
+            crate::parse(&query).expect("canonical substring query should reparse");
+        }
     }
 }

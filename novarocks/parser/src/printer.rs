@@ -865,6 +865,11 @@ impl Printer {
                     Some(false) => self.output.push_str(" DESC"),
                     None => {}
                 }
+                match order.nulls_first {
+                    Some(true) => self.output.push_str(" NULLS FIRST"),
+                    Some(false) => self.output.push_str(" NULLS LAST"),
+                    None => {}
+                }
             }
         }
         if let Some(separator) = &call.separator {

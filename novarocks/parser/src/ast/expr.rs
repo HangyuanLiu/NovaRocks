@@ -111,6 +111,7 @@ pub enum FunctionQuantifier {
 pub struct FunctionOrderBy {
     pub expr: Expr,
     pub asc: Option<bool>,
+    pub nulls_first: Option<bool>,
     pub span: Span,
 }
 

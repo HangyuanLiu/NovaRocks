@@ -45,6 +45,8 @@ fn query_forms_parse_and_print_as_typed_syntax() {
         "SELECT * FROM t ORDER BY id DESC NULLS LAST",
         "SELECT count(*) AS \"order count\" FROM t",
         "SELECT db.t.*, w.* FROM db.t AS w",
+        "WITH a AS (SELECT ARRAY_AGG(`t`.`a`) AS x FROM t AS t) SELECT * FROM a",
+        "SELECT ARRAY_AGG(a ORDER BY a ASC NULLS LAST) FROM t",
         "SELECT greatest(date('2026-01-11'), timestamp('2026-01-14 00:00:00'))",
         "SELECT * FROM TABLE(generate_series(end => 5, start => 2))",
         "SELECT * FROM left_table l JOIN right_table r ON l.id = r.id WHERE r.id IS NOT NULL",

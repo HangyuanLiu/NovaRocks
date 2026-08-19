@@ -528,7 +528,9 @@ impl SyntaxEq for FunctionCall {
 
 impl SyntaxEq for FunctionOrderBy {
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.expr.syntax_eq(&other.expr) && self.asc == other.asc
+        self.expr.syntax_eq(&other.expr)
+            && self.asc == other.asc
+            && self.nulls_first == other.nulls_first
     }
 }
 
@@ -788,6 +790,7 @@ mod tests {
             order_by: vec![FunctionOrderBy {
                 expr: number("1", start + 8),
                 asc: Some(false),
+                nulls_first: Some(false),
                 span: span(start + 9),
             }],
             separator: Some(Box::new(Expr::Literal(Literal {
