@@ -181,6 +181,7 @@ mod tests {
         assert!(matches!(parse("items[1]"), Expr::Access(_)));
         assert!(matches!(parse("items[1].field"), Expr::Access(_)));
         assert!(matches!(parse("left('value', 2)"), Expr::FunctionCall(_)));
+        assert!(matches!(parse("right('value', 2)"), Expr::FunctionCall(_)));
         assert!(matches!(parse("DATE '2024-01-10'"), Expr::TypedString(_)));
         assert!(matches!(
             parse("EXTRACT(YEAR FROM created_at)"),

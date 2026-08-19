@@ -83,7 +83,6 @@ pub const fn class(keyword: Keyword) -> KeywordClass {
         | Keyword::Or
         | Keyword::Order
         | Keyword::Outer
-        | Keyword::Right
         | Keyword::Select
         | Keyword::Show
         | Keyword::Then

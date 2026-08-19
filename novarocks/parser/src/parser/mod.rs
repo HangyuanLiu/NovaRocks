@@ -206,10 +206,15 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
             .current()
             .ok_or_else(|| self.unexpected("identifier"))?;
         match token.kind {
-            TokenKind::Ident | TokenKind::QuotedIdent => {
+            TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::String
+                if matches!(token.kind, TokenKind::Ident | TokenKind::QuotedIdent)
+                    || self.source[token.span.start()..token.span.end()].starts_with('"') =>
+            {
                 let source = &self.source[token.span.start()..token.span.end()];
                 let (value, quoted) = if matches!(token.kind, TokenKind::QuotedIdent) {
                     (source[1..source.len() - 1].replace("``", "`"), true)
+                } else if matches!(token.kind, TokenKind::String) {
+                    (source[1..source.len() - 1].replace("\"\"", "\""), true)
                 } else {
                     (source.to_owned(), false)
                 };

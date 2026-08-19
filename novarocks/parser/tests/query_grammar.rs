@@ -41,6 +41,7 @@ fn query_forms_parse_and_print_as_typed_syntax() {
         "WITH c AS (SELECT 1 AS a) SELECT a FROM c UNION ALL SELECT 2 ORDER BY a LIMIT 3",
         "SELECT * FROM t ORDER BY id LIMIT 5, 10",
         "SELECT * FROM t ORDER BY id DESC NULLS LAST",
+        "SELECT count(*) AS \"order count\" FROM t",
         "SELECT * FROM left_table l JOIN right_table r ON l.id = r.id WHERE r.id IS NOT NULL",
         "((SELECT 1 UNION ALL SELECT 2)) ORDER BY 1",
         "SELECT * FROM (((SELECT 1 UNION ALL SELECT 2))) AS source",
