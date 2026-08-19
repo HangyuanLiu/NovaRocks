@@ -32,7 +32,9 @@ use std::thread;
 use std::time::Duration;
 
 const REQUIRED_BACKENDS: usize = 3;
+const ACK_DROP_TARGET_BACKEND: usize = 1;
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const RUNTIME_FILTER_SERVICE_RESOURCE: &str = "native_runtime_filter_services";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -52,21 +54,37 @@ impl Scenario for AcceptedAfterAckDrop {
         require_three_backends(context)?;
         let mut control = connect_control(context, "connect retry scenario control session")?;
         let tables = create_runtime_filter_tables(context, &mut control, "retry")?;
-        configure_broadcast_runtime_filter(&mut control)?;
-        let before_execution_id = latest_execution_id(context)?;
+        configure_partitioned_runtime_filter(&mut control)?;
+        let before_candidate_execution_id = latest_execution_id(context)?;
 
-        arm_every_backend(context, "runtime-filter-contribution-ack-drop")?;
-        context
-            .action("armed Accepted-after-ACK-drop Runtime Filter faults for every native backend");
+        let candidate_rows: Vec<i64> = control
+            .query(runtime_filter_count_query(&tables))
+            .context("execute native partitioned Runtime Filter candidate query")?;
+        ensure!(
+            candidate_rows == [30],
+            "Runtime Filter candidate query returned unexpected rows: {candidate_rows:?}"
+        );
+        let candidate_snapshot =
+            await_terminal_snapshot(context, before_candidate_execution_id.as_deref())?;
+        assert_remote_contribution_candidate(&candidate_snapshot)?;
+        context.action(
+            "typed terminal oracle verified a multi-backend Runtime Filter contribution candidate",
+        );
+        let before_execution_id = candidate_snapshot.execution_id.clone();
+
+        arm_target_backend(context, "runtime-filter-contribution-ack-drop")?;
+        context.action(
+            "armed an Accepted-after-ACK-drop Runtime Filter fault for the targeted native backend",
+        );
 
         let rows: Vec<i64> = control
             .query(runtime_filter_count_query(&tables))
-            .context("execute native broadcast Runtime Filter query with ACK-drop fault")?;
+            .context("execute native partitioned Runtime Filter query with ACK-drop fault")?;
         ensure!(
-            rows == [20],
+            rows == [30],
             "Runtime Filter retry query returned unexpected rows: {rows:?}"
         );
-        context.action("completed the broadcast Runtime Filter query with expected row count");
+        context.action("completed the partitioned Runtime Filter query with expected row count");
 
         let snapshot = await_terminal_snapshot(context, before_execution_id.as_deref())?;
         assert_retry_duplicate_conformance(&snapshot)?;
@@ -97,13 +115,11 @@ impl Scenario for CancelWithTerminalAckReplay {
         let baseline = resource_snapshot(context)?;
         let before_execution_id = latest_execution_id(context)?;
 
-        for index in 0..context.handle().be_count() {
-            context
-                .handle()
-                .arm_terminal_ack_drop(index)
-                .with_context(|| format!("arm terminal ACK drop for BE[{index}]"))?;
-        }
-        context.action("armed terminal ACK-drop replay faults for every native backend");
+        context
+            .handle()
+            .arm_terminal_ack_drop(0)
+            .context("arm terminal ACK drop for the targeted backend")?;
+        context.action("armed a terminal ACK-drop replay fault for the targeted native backend");
 
         let target = start_blocking_runtime_filter_query(
             context.mysql_user(),
@@ -115,8 +131,10 @@ impl Scenario for CancelWithTerminalAckReplay {
             .recv_timeout(context.remaining("receive Runtime Filter query connection id")?)
             .context("Runtime Filter query terminated before publishing its connection id")?;
         context.action("started an in-flight native Runtime Filter query through public MySQL");
-        await_resource_activity(context, &baseline)?;
-        context.action("observed the in-flight native query through the typed resource oracle");
+        await_runtime_filter_activity(context, &baseline)?;
+        context.action(
+            "observed active native Runtime Filter services through the typed resource oracle",
+        );
 
         control
             .query_drop(format!("KILL QUERY {connection_id}"))
@@ -218,12 +236,14 @@ fn create_runtime_filter_tables(
             tables.catalog, tables.database, tables.probe
         ))
         .context("write Runtime Filter probe rows")?;
-    control
-        .query_drop(format!(
-            "INSERT INTO {}.{}.{} SELECT generate_series % 600, CASE WHEN generate_series % 600 IN (11, 29) THEN 'Y' ELSE 'N' END FROM TABLE(generate_series(1, 600))",
-            tables.catalog, tables.database, tables.build
-        ))
-        .context("write Runtime Filter build rows")?;
+    for partition in 0..REQUIRED_BACKENDS {
+        control
+            .query_drop(format!(
+                "INSERT INTO {}.{}.{} SELECT (generate_series * 3 + {partition}) % 600, CASE WHEN generate_series = 1 THEN 'Y' ELSE 'N' END FROM TABLE(generate_series(1, 200))",
+                tables.catalog, tables.database, tables.build
+            ))
+            .with_context(|| format!("write Runtime Filter build partition {partition}"))?;
+    }
     control
         .query_drop(format!(
             "ANALYZE TABLE {}.{}.{}",
@@ -250,10 +270,21 @@ fn create_hadoop_catalog(control: &mut mysql::Conn, catalog: &str, warehouse: &P
 }
 
 fn configure_broadcast_runtime_filter(control: &mut mysql::Conn) -> Result<()> {
+    configure_runtime_filter(
+        control,
+        "SET cbo_broadcast_node_mem_budget_bytes = 10737418240",
+    )
+}
+
+fn configure_partitioned_runtime_filter(control: &mut mysql::Conn) -> Result<()> {
+    configure_runtime_filter(control, "SET cbo_broadcast_node_mem_budget_bytes = 0")
+}
+
+fn configure_runtime_filter(control: &mut mysql::Conn, join_distribution: &str) -> Result<()> {
     for setting in [
         "SET global_runtime_filter_build_max_size = 10737418240",
         "SET global_runtime_filter_probe_min_selectivity = 0.0",
-        "SET cbo_broadcast_node_mem_budget_bytes = 10737418240",
+        join_distribution,
         "SET disable_optimizer_rules = ''",
     ] {
         control
@@ -275,7 +306,7 @@ fn runtime_filter_count_query(tables: &RuntimeFilterTables) -> String {
 
 fn runtime_filter_blocking_query(tables: &RuntimeFilterTables) -> String {
     format!(
-        "SELECT sleep(10) FROM ({join}) filtered CROSS JOIN TABLE(generate_series(1, 1000000000)) series",
+        "SELECT sleep(10) FROM (SELECT COUNT(*) AS matched_rows FROM ({join}) filtered) completed_join CROSS JOIN TABLE(generate_series(1, 1000000000)) series WHERE completed_join.matched_rows > 0",
         join = runtime_filter_counting_join(tables),
     )
 }
@@ -297,14 +328,11 @@ fn latest_execution_id(context: &mut ScenarioContext) -> Result<Option<String>> 
         .and_then(|snapshot| snapshot.execution_id))
 }
 
-fn arm_every_backend(context: &mut ScenarioContext, kind: &'static str) -> Result<()> {
-    for index in 0..context.handle().be_count() {
-        context
-            .handle()
-            .arm_query_lifecycle_fault(index, kind)
-            .with_context(|| format!("arm {kind} fault for BE[{index}]"))?;
-    }
-    Ok(())
+fn arm_target_backend(context: &mut ScenarioContext, kind: &'static str) -> Result<()> {
+    context
+        .handle()
+        .arm_query_lifecycle_fault(ACK_DROP_TARGET_BACKEND, kind)
+        .with_context(|| format!("arm {kind} fault for BE[{ACK_DROP_TARGET_BACKEND}]"))
 }
 
 fn await_terminal_snapshot(
@@ -325,15 +353,33 @@ fn resource_snapshot(context: &mut ScenarioContext) -> Result<QueryExecutionReso
         .context("cross-process Runtime Filter scenario requires resource oracle")
 }
 
-fn await_resource_activity(
+fn await_runtime_filter_activity(
     context: &mut ScenarioContext,
     baseline: &QueryExecutionResourceSnapshot,
 ) -> Result<()> {
     loop {
-        if resource_snapshot(context)? != *baseline {
+        let current = resource_snapshot(context)?;
+        let runtime_filter_active =
+            current
+                .backends
+                .iter()
+                .zip(&baseline.backends)
+                .any(|(current, baseline)| {
+                    current
+                        .resources
+                        .get(RUNTIME_FILTER_SERVICE_RESOURCE)
+                        .copied()
+                        .unwrap_or_default()
+                        > baseline
+                            .resources
+                            .get(RUNTIME_FILTER_SERVICE_RESOURCE)
+                            .copied()
+                            .unwrap_or_default()
+                });
+        if runtime_filter_active {
             return Ok(());
         }
-        let remaining = context.remaining("observe active Runtime Filter query")?;
+        let remaining = context.remaining("observe active Runtime Filter services")?;
         thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
     }
 }
@@ -410,6 +456,27 @@ fn assert_retry_duplicate_conformance(snapshot: &QueryLifecycleStructuredSnapsho
     ensure!(
         retried_and_acked,
         "ACK-drop retry terminal facts contained no sender route with sent, retried, and ACKed counts: {snapshot:?}"
+    );
+    Ok(())
+}
+
+fn assert_remote_contribution_candidate(snapshot: &QueryLifecycleStructuredSnapshot) -> Result<()> {
+    let (participants, totals) = available_rollup(snapshot)?;
+    assert_complete_nonduplicated_rollup(participants, totals)?;
+    let producer_backends = participants
+        .iter()
+        .filter(|participant| {
+            available_details(participant)
+                .is_some_and(|details| !details.producer_streams.is_empty())
+        })
+        .count();
+    ensure!(
+        producer_backends >= 2,
+        "partitioned Runtime Filter candidate did not place producers on multiple backends: {snapshot:?}"
+    );
+    ensure!(
+        totals.transport_routes.sent_count >= 1,
+        "partitioned Runtime Filter candidate retained no Runtime Filter transport route: {snapshot:?}"
     );
     Ok(())
 }
