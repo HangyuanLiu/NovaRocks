@@ -21,6 +21,11 @@ const LEX_UNTERMINATED_STRING: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Lex,
     status: ErrorCodeStatus::Active,
 };
+const LEX_UNTERMINATED_QUOTED_IDENTIFIER: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.lex.unterminated_quoted_identifier"),
+    phase: ErrorPhase::Lex,
+    status: ErrorCodeStatus::Active,
+};
 const LEX_UNTERMINATED_COMMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.lex.unterminated_comment"),
     phase: ErrorPhase::Lex,
@@ -47,6 +52,7 @@ const VALIDATE_INVALID_STRUCTURE: ErrorCodeDescriptor = ErrorCodeDescriptor {
 pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     LEX_UNEXPECTED_CHARACTER,
     LEX_UNTERMINATED_STRING,
+    LEX_UNTERMINATED_QUOTED_IDENTIFIER,
     LEX_UNTERMINATED_COMMENT,
     PARSE_UNEXPECTED_TOKEN,
     PARSE_UNSUPPORTED_STATEMENT,
@@ -58,6 +64,7 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
 pub enum LexError {
     UnexpectedCharacter { character: char, span: Span },
     UnterminatedString { span: Span },
+    UnterminatedQuotedIdentifier { span: Span },
     UnterminatedComment { span: Span },
 }
 
@@ -111,6 +118,11 @@ impl ParserError {
             Self::Lex(LexError::UnterminatedString { span }) => (
                 LEX_UNTERMINATED_STRING,
                 messages::unterminated("string literal"),
+                *span,
+            ),
+            Self::Lex(LexError::UnterminatedQuotedIdentifier { span }) => (
+                LEX_UNTERMINATED_QUOTED_IDENTIFIER,
+                messages::unterminated("quoted identifier"),
                 *span,
             ),
             Self::Lex(LexError::UnterminatedComment { span }) => (
@@ -173,6 +185,9 @@ impl fmt::Display for ParserError {
             }
             Self::Lex(LexError::UnterminatedString { .. }) => {
                 messages::unterminated("string literal")
+            }
+            Self::Lex(LexError::UnterminatedQuotedIdentifier { .. }) => {
+                messages::unterminated("quoted identifier")
             }
             Self::Lex(LexError::UnterminatedComment { .. }) => {
                 messages::unterminated("block comment")
