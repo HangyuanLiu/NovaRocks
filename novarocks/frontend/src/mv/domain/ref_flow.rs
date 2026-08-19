@@ -23,13 +23,14 @@
 use std::sync::Arc;
 
 use crate::runtime::statement_result::StatementResult;
+use novarocks_parser::ast::{
+    AlterIcebergTable, IcebergReferenceAction, IcebergReferenceKind, IcebergTableAction,
+    ObjectName, ReferenceAnchor,
+};
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorInstanceId, ConnectorRefAction, ConnectorRefKind,
     ConnectorTableIdentity, ConnectorTableResolution, CreateOrReplacePolicy, DropPolicy,
     ExternalMutationFinalization,
-};
-use novarocks_sql::syntax::{
-    AlterIcebergRefAction, AlterIcebergRefStmt, ObjectName, SnapshotAnchor,
 };
 
 /// Execute an Iceberg ref mutation using only the explicit connector-control
@@ -38,11 +39,14 @@ pub(crate) fn execute_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     _current_database: &str,
-    stmt: &AlterIcebergRefStmt,
+    stmt: &AlterIcebergTable,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
     // 1. Resolve qualified name — must be 3-part (catalog.namespace.table).
+    let IcebergTableAction::Reference(action) = &stmt.action else {
+        return Err("Iceberg ref executor received a non-reference action".to_string());
+    };
     let (catalog_name, namespace, table_name) = resolve_table_parts(&stmt.table)?;
 
     // Retain one exact generation across MV admission and the ref mutation.
@@ -98,7 +102,7 @@ pub(crate) fn execute_with_ports(
                 namespace: Arc::from(namespace.as_str()),
                 table: Arc::from(table_name.as_str()),
             },
-            action: connector_ref_action(&stmt.action)?,
+            action: connector_ref_action(action)?,
         },
         connector_context.clone(),
     );
@@ -135,7 +139,7 @@ pub(crate) fn execute_with_ports(
     Ok(StatementResult::Ok)
 }
 
-fn connector_ref_action(action: &AlterIcebergRefAction) -> Result<ConnectorRefAction, String> {
+fn connector_ref_action(action: &IcebergReferenceAction) -> Result<ConnectorRefAction, String> {
     let policy = |replace: bool, if_not_exists: bool| {
         if replace {
             CreateOrReplacePolicy::ReplaceIfExists
@@ -145,47 +149,37 @@ fn connector_ref_action(action: &AlterIcebergRefAction) -> Result<ConnectorRefAc
             CreateOrReplacePolicy::FailIfExists
         }
     };
-    let snapshot_anchor = |anchor: &SnapshotAnchor| match anchor {
-        SnapshotAnchor::SnapshotId(snapshot_id) => Some(*snapshot_id),
-        SnapshotAnchor::CurrentMain => None,
+    let snapshot_anchor = |anchor: &ReferenceAnchor| match anchor {
+        ReferenceAnchor::Version(literal) => match &literal.kind {
+            novarocks_parser::ast::LiteralKind::Number(value) => value
+                .parse::<i64>()
+                .map(Some)
+                .map_err(|_| "Iceberg reference version must fit i64".to_string()),
+            _ => Err("Iceberg reference version must be a numeric literal".to_string()),
+        },
+        ReferenceAnchor::CurrentMain => Ok(None),
     };
     Ok(match action {
-        AlterIcebergRefAction::CreateBranch {
+        IcebergReferenceAction::Create {
+            kind,
             name,
             anchor,
             if_not_exists,
-            replace,
+            or_replace,
             ..
         } => ConnectorRefAction::Create {
-            kind: ConnectorRefKind::Branch,
-            name: Arc::from(name.as_str()),
-            snapshot_id: snapshot_anchor(anchor),
-            policy: policy(*replace, *if_not_exists),
+            kind: connector_ref_kind(*kind),
+            name: Arc::from(name.value.as_str()),
+            snapshot_id: snapshot_anchor(anchor)?,
+            policy: policy(*or_replace, *if_not_exists),
         },
-        AlterIcebergRefAction::CreateTag {
+        IcebergReferenceAction::Drop {
+            kind,
             name,
-            anchor,
-            if_not_exists,
-            replace,
-            ..
-        } => ConnectorRefAction::Create {
-            kind: ConnectorRefKind::Tag,
-            name: Arc::from(name.as_str()),
-            snapshot_id: snapshot_anchor(anchor),
-            policy: policy(*replace, *if_not_exists),
-        },
-        AlterIcebergRefAction::DropBranch { name, if_exists } => ConnectorRefAction::Drop {
-            kind: ConnectorRefKind::Branch,
-            name: Arc::from(name.as_str()),
-            policy: if *if_exists {
-                DropPolicy::NoOpIfMissing
-            } else {
-                DropPolicy::FailIfMissing
-            },
-        },
-        AlterIcebergRefAction::DropTag { name, if_exists } => ConnectorRefAction::Drop {
-            kind: ConnectorRefKind::Tag,
-            name: Arc::from(name.as_str()),
+            if_exists,
+        } => ConnectorRefAction::Drop {
+            kind: connector_ref_kind(*kind),
+            name: Arc::from(name.value.as_str()),
             policy: if *if_exists {
                 DropPolicy::NoOpIfMissing
             } else {
@@ -195,17 +189,28 @@ fn connector_ref_action(action: &AlterIcebergRefAction) -> Result<ConnectorRefAc
     })
 }
 
+const fn connector_ref_kind(kind: IcebergReferenceKind) -> ConnectorRefKind {
+    match kind {
+        IcebergReferenceKind::Branch => ConnectorRefKind::Branch,
+        IcebergReferenceKind::Tag => ConnectorRefKind::Tag,
+    }
+}
+
 fn resolve_table_parts(name: &ObjectName) -> Result<(String, String, String), String> {
     let parts = &name.parts;
     match parts.len() {
-        3 => Ok((parts[0].clone(), parts[1].clone(), parts[2].clone())),
+        3 => Ok((
+            parts[0].value.clone(),
+            parts[1].value.clone(),
+            parts[2].value.clone(),
+        )),
         2 => Err(format!(
             "iceberg ref: qualify table with catalog (got '{}.{}')",
-            parts[0], parts[1]
+            parts[0].value, parts[1].value
         )),
         1 => Err(format!(
             "iceberg ref: qualify table with catalog and namespace (got '{}')",
-            parts[0]
+            parts[0].value
         )),
         _ => Err(format!(
             "iceberg ref: invalid table name (parts: {})",

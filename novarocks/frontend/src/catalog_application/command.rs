@@ -153,6 +153,62 @@ impl CatalogCommandExecutor {
         }
     }
 
+    /// Executes an admitted Iceberg `ALTER TABLE` syntax node without a SQL
+    /// text round-trip. Reference mutations belong to their dedicated owner;
+    /// ADD FILES belongs to the DML lifecycle owner.
+    pub fn execute_iceberg_typed(
+        &self,
+        statement: &novarocks_parser::ast::AlterIcebergTable,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<StatementResult, String> {
+        use novarocks_parser::ast::IcebergTableAction;
+
+        match &statement.action {
+            IcebergTableAction::Schema(change) => execute_alter_iceberg_schema(
+                self,
+                crate::catalog_application::statement::AlterIcebergSchemaStmt {
+                    table: typed_object_name(&statement.table),
+                    change: crate::catalog_application::statement::lower_typed_iceberg_schema_change(
+                        change,
+                    )?,
+                },
+                current_catalog,
+                current_database,
+                connector_context,
+            ),
+            IcebergTableAction::Properties(action) => execute_alter_iceberg_properties(
+                self,
+                crate::catalog_application::statement::AlterIcebergPropertiesStmt {
+                    table: typed_object_name(&statement.table),
+                    op: crate::catalog_application::statement::lower_typed_iceberg_properties_action(
+                        action,
+                    )?,
+                },
+                current_catalog,
+                current_database,
+                connector_context,
+            ),
+            IcebergTableAction::Partition(change) => execute_alter_partition_spec(
+                self,
+                typed_object_name(&statement.table),
+                crate::catalog_application::statement::lower_typed_iceberg_partition_change(
+                    change,
+                )?,
+                current_catalog,
+                current_database,
+                connector_context,
+            ),
+            IcebergTableAction::Reference(_) => Err(
+                "Iceberg reference command belongs to the ref command executor".to_string(),
+            ),
+            IcebergTableAction::AddFiles(_) => {
+                Err("ADD FILES belongs to the DML lifecycle executor".to_string())
+            }
+        }
+    }
+
     /// Execute exactly one catalog-DDL statement.
     ///
     /// CTAS belongs to the frontend DML service and is rejected here.  A
@@ -184,38 +240,6 @@ impl CatalogCommandExecutor {
             return execute_show_create_table(
                 self,
                 &normalized,
-                current_catalog,
-                current_database,
-                connector_context,
-            )
-            .map(Some);
-        }
-        if crate::catalog_application::statement::looks_like_alter_iceberg_properties(&normalized) {
-            return execute_alter_iceberg_properties(
-                self,
-                &normalized,
-                current_catalog,
-                current_database,
-                connector_context,
-            )
-            .map(Some);
-        }
-        if crate::catalog_application::statement::looks_like_alter_iceberg_schema(&normalized) {
-            return execute_alter_iceberg_schema(
-                self,
-                &normalized,
-                current_catalog,
-                current_database,
-                connector_context,
-            )
-            .map(Some);
-        }
-        if crate::catalog_application::statement::looks_like_alter_partition_column(&normalized) {
-            return execute_alter_partition_spec(
-                self,
-                crate::catalog_application::statement::parse_alter_partition_column_sql(
-                    &normalized,
-                )?,
                 current_catalog,
                 current_database,
                 connector_context,
@@ -296,12 +320,11 @@ fn lower_create_catalog(
 
 fn execute_alter_iceberg_properties(
     executor: &CatalogCommandExecutor,
-    sql: &str,
+    statement: crate::catalog_application::statement::AlterIcebergPropertiesStmt,
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    let statement = crate::catalog_application::statement::parse_alter_iceberg_properties_sql(sql)?;
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
         executor,
         &statement.table,
@@ -362,12 +385,11 @@ fn execute_alter_iceberg_properties(
 
 fn execute_alter_iceberg_schema(
     executor: &CatalogCommandExecutor,
-    sql: &str,
+    statement: crate::catalog_application::statement::AlterIcebergSchemaStmt,
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    let statement = crate::catalog_application::statement::parse_alter_iceberg_schema_sql(sql)?;
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
         executor,
         &statement.table,
@@ -481,22 +503,15 @@ fn execute_alter_iceberg_schema(
 
 fn execute_alter_partition_spec(
     executor: &CatalogCommandExecutor,
-    statement: novarocks_sql::syntax::AlterIcebergPartitionSpecStmt,
+    table_name: novarocks_sql::syntax::ObjectName,
+    statement: crate::catalog_application::statement::IcebergPartitionSpecChange,
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    let table_name = match &statement {
-        novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
-            table, ..
-        }
-        | novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
-            table, ..
-        } => table,
-    };
     let target = crate::catalog_application::resolver::resolve_table_target(
         executor,
-        table_name,
+        &table_name,
         current_catalog,
         current_database,
     )?;
@@ -512,20 +527,14 @@ fn execute_alter_partition_spec(
         &target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::AlterTable,
     )?;
-    let adding = matches!(
-        &statement,
-        novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::AddPartitionColumn { .. }
-    );
-    let partition_field = match &statement {
-        novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
-            field, ..
+    let (adding, transform) = match statement {
+        crate::catalog_application::statement::IcebergPartitionSpecChange::Add(transform) => {
+            (true, transform)
         }
-        | novarocks_sql::syntax::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
-            field, ..
-        } => field,
+        crate::catalog_application::statement::IcebergPartitionSpecChange::Drop(transform) => {
+            (false, transform)
+        }
     };
-    let transform =
-        crate::catalog_application::statement::connector_partition_transform(partition_field);
     let instance_id =
         ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
     crate::connector::mutation::execute_catalog_mutation(

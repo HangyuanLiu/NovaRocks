@@ -74,7 +74,9 @@ fn is_deferred_family(source: &str) -> bool {
     let first = words.first().map(String::as_str);
     match first {
         Some("CALL") => true,
-        Some("ALTER") => words.get(1).map(String::as_str) == Some("TABLE"),
+        Some("ALTER") if words.get(1).map(String::as_str) == Some("TABLE") => {
+            !is_admitted_iceberg_alter(&words)
+        }
         Some("CREATE" | "DROP" | "REFRESH") => {
             words.get(1).map(String::as_str) == Some("MATERIALIZED")
         }
@@ -88,6 +90,26 @@ fn is_deferred_family(source: &str) -> bool {
         Some("EXPLAIN") => words.iter().any(|word| word == "REFRESH"),
         _ => false,
     }
+}
+
+/// The Iceberg owner cut is intentionally narrower than the `ALTER TABLE`
+/// head: maintenance remains on its legacy route until T9. This deterministic
+/// lexical gate chooses the already-owned structural forms before parsing;
+/// malformed forms within that owned shape still surface parser errors.
+fn is_admitted_iceberg_alter(words: &[String]) -> bool {
+    words.windows(2).any(|pair| {
+        matches!(
+            (pair[0].as_str(), pair[1].as_str()),
+            ("ADD", "COLUMN" | "PARTITION" | "FILES")
+                | ("DROP", "COLUMN" | "PARTITION" | "BRANCH" | "TAG")
+                | ("RENAME", "COLUMN")
+                | ("MODIFY", "COLUMN")
+                | ("ALTER", "COLUMN")
+                | ("SET", "TBLPROPERTIES")
+                | ("UNSET", "TBLPROPERTIES")
+                | ("CREATE", "BRANCH" | "TAG")
+        )
+    }) || words.iter().skip(2).any(|word| word == "COMMENT")
 }
 
 fn explain_targets_query(words: &[String]) -> bool {
@@ -106,7 +128,6 @@ fn significant_words(source: &str) -> Vec<String> {
     tokens
         .iter()
         .filter(|token| matches!(token.kind, TokenKind::Ident | TokenKind::Keyword(_)))
-        .take(4)
         .map(|token| source[token.span.start()..token.span.end()].to_ascii_uppercase())
         .collect()
 }
@@ -168,7 +189,7 @@ mod tests {
     #[test]
     fn later_command_families_are_deferred_without_parsing() {
         for source in [
-            "ALTER TABLE ice.db.t ADD COLUMN c INT",
+            "ALTER TABLE ice.db.t OPTIMIZE",
             "CALL ice.system.rewrite_manifests()",
             "CREATE MATERIALIZED VIEW mv DISTRIBUTED BY HASH(k) BUCKETS 1 AS SELECT k FROM t",
             "SHOW CREATE TABLE ice.db.t",
@@ -178,6 +199,24 @@ mod tests {
                     .expect("later family must remain deferred")
                     .0,
                 StatementAdmission::DeferredFamily,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn iceberg_alter_table_family_is_admitted_after_its_owner_cut() {
+        for source in [
+            "ALTER TABLE ice.db.t ADD COLUMN c INT",
+            "ALTER TABLE ice.db.t SET TBLPROPERTIES ('format' = 'parquet')",
+            "ALTER TABLE ice.db.t CREATE BRANCH dev",
+            "ALTER TABLE ice.db.t ADD FILES FROM 's3://warehouse/staged'",
+        ] {
+            assert_eq!(
+                admit_statement(source)
+                    .expect("Iceberg command should parse")
+                    .0,
+                StatementAdmission::Parsed,
                 "{source}"
             );
         }

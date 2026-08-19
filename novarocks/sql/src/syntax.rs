@@ -15,7 +15,6 @@ pub use crate::parser::ast::{
     RefreshMaterializedViewStmt, ShowMaterializedViewsStmt, TableColumnDef, TableKeyDesc,
     TableKeyKind, UpdateAssignment, UpdateStmt,
 };
-pub use crate::parser::ast::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
 pub use crate::parser::dialect::StarRocksDialect;
 pub use crate::parser::procedure::{
     CallProcedureStmt, ProcedureArg, ProcedureArgMode, ProcedureArgValue,
@@ -270,17 +269,6 @@ pub fn parse_partition_field_expr(
     parser: &mut Parser<'_>,
 ) -> Result<IcebergPartitionFieldExpr, String> {
     crate::parser::dialect::create_table::parse_partition_field_expr(parser)
-}
-
-pub fn parse_alter_iceberg_ref(sql: &str) -> Result<Option<AlterIcebergRefStmt>, String> {
-    let mut statements = crate::parser::parse_sql(sql)?;
-    if statements.len() != 1 {
-        return Err("Iceberg ref command accepts exactly one statement".to_string());
-    }
-    match statements.pop().expect("one checked statement") {
-        crate::parser::ast::Statement::AlterIcebergRef(statement) => Ok(Some(statement)),
-        _ => Ok(None),
-    }
 }
 
 #[cfg(test)]

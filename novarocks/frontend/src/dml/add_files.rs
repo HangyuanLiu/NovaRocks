@@ -51,20 +51,15 @@ use crate::dml::service::DmlService;
 const ADD_FILES_ARTIFACT_CODEC_VERSION: u16 = 1;
 
 impl DmlService {
-    /// Recognize and execute one ADD FILES statement through the frontend
-    /// application owner.  `Ok(None)` means this is not ADD FILES; all errors
-    /// after classification are terminal for the SQL router.
-    pub fn try_execute_add_files(
+    /// Execute one parser-admitted ADD FILES command through the frontend
+    /// application owner.
+    pub fn execute_add_files(
         &self,
         engine: &dyn AddFilesEngine,
-        sql: &str,
+        command: AddFilesCommand,
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
-    ) -> Result<Option<u32>, DmlError> {
-        let Some(command) = engine.classify_add_files(sql).map_err(DmlError::executor)? else {
-            return Ok(None);
-        };
-
+    ) -> Result<u32, DmlError> {
         if !is_secret_free_source_location(&command.location) {
             return Err(DmlError::executor(
                 "ADD FILES source location must not contain credentials or query parameters",
@@ -121,7 +116,7 @@ impl DmlService {
             &mut active,
         );
         let _ = active.release();
-        result.map(Some)
+        result
     }
 }
 
@@ -1061,7 +1056,6 @@ mod tests {
     struct FakeEngine {
         execute_behavior: Behavior,
         reconcile_behavior: Behavior,
-        classify_calls: AtomicUsize,
         plan_calls: AtomicUsize,
         execute_calls: AtomicUsize,
         reconcile_calls: AtomicUsize,
@@ -1075,7 +1069,6 @@ mod tests {
             Self {
                 execute_behavior,
                 reconcile_behavior,
-                classify_calls: AtomicUsize::new(0),
                 plan_calls: AtomicUsize::new(0),
                 execute_calls: AtomicUsize::new(0),
                 reconcile_calls: AtomicUsize::new(0),
@@ -1085,9 +1078,8 @@ mod tests {
             }
         }
 
-        fn counts(&self) -> (usize, usize, usize, usize) {
+        fn counts(&self) -> (usize, usize, usize) {
             (
-                self.classify_calls.load(Ordering::SeqCst),
                 self.plan_calls.load(Ordering::SeqCst),
                 self.execute_calls.load(Ordering::SeqCst),
                 self.reconcile_calls.load(Ordering::SeqCst),
@@ -1112,14 +1104,6 @@ mod tests {
                 &fence,
                 Bytes::from_static(b"add-files-fence-marker"),
             )
-        }
-
-        fn classify_add_files(&self, sql: &str) -> Result<Option<AddFilesCommand>, String> {
-            self.classify_calls.fetch_add(1, Ordering::SeqCst);
-            Ok((sql == "ADD").then(|| AddFilesCommand {
-                table_parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()],
-                location: "s3://bucket/source".to_string(),
-            }))
         }
 
         fn plan_add_files(
@@ -1598,18 +1582,11 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn non_add_files_returns_none_without_journal_or_engine_side_effects() {
-        let mut engine = FakeEngine::new(Behavior::Committed, Behavior::Committed);
-        let (service, journal) = harness(&mut engine);
-        assert_eq!(
-            service
-                .try_execute_add_files(&engine, "SELECT 1", &context(), None)
-                .unwrap(),
-            None
-        );
-        assert_eq!(engine.counts(), (1, 0, 0, 0));
-        assert!(journal.history.lock().unwrap().is_empty());
+    fn command() -> AddFilesCommand {
+        AddFilesCommand {
+            table_parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()],
+            location: "s3://bucket/source".to_string(),
+        }
     }
 
     #[test]
@@ -1618,11 +1595,11 @@ mod tests {
         let (service, journal) = harness(&mut engine);
         assert_eq!(
             service
-                .try_execute_add_files(&engine, "ADD", &context(), None)
+                .execute_add_files(&engine, command(), &context(), None)
                 .unwrap(),
-            Some(3)
+            3
         );
-        assert_eq!(engine.counts(), (1, 1, 1, 0));
+        assert_eq!(engine.counts(), (1, 1, 0));
         assert_eq!(journal.preflight_calls.load(Ordering::SeqCst), 1);
         let operation = journal.only_operation();
         let OperationPayload::AddFilesLifecycle(record) = operation.payload else {
@@ -1651,11 +1628,11 @@ mod tests {
         let (service, journal) = harness(&mut engine);
         assert_eq!(
             service
-                .try_execute_add_files(&engine, "ADD", &context(), None)
+                .execute_add_files(&engine, command(), &context(), None)
                 .unwrap(),
-            Some(3)
+            3
         );
-        assert_eq!(engine.counts(), (1, 1, 1, 1));
+        assert_eq!(engine.counts(), (1, 1, 1));
         let operation = journal.only_operation();
         let OperationPayload::AddFilesLifecycle(record) = operation.payload else {
             panic!("ADD FILES payload")
@@ -1670,13 +1647,13 @@ mod tests {
         let mut engine = FakeEngine::new(Behavior::Unknown, Behavior::Unknown);
         let (service, journal) = harness(&mut engine);
         let error = service
-            .try_execute_add_files(&engine, "ADD", &context(), None)
+            .execute_add_files(&engine, command(), &context(), None)
             .unwrap_err();
         assert_eq!(
             error.next_action(),
             Some(StatementNextAction::ManualInspect)
         );
-        assert_eq!(engine.counts(), (1, 1, 1, 1));
+        assert_eq!(engine.counts(), (1, 1, 1));
         let operation = journal.only_operation();
         let OperationPayload::AddFilesLifecycle(record) = operation.payload else {
             panic!("ADD FILES payload")
@@ -1691,13 +1668,13 @@ mod tests {
         let mut engine = FakeEngine::new(Behavior::PossiblyDispatched, Behavior::Committed);
         let (service, journal) = harness(&mut engine);
         let error = service
-            .try_execute_add_files(&engine, "ADD", &context(), None)
+            .execute_add_files(&engine, command(), &context(), None)
             .unwrap_err();
         assert_eq!(
             error.next_action(),
             Some(StatementNextAction::ManualInspect)
         );
-        assert_eq!(engine.counts(), (1, 1, 1, 0));
+        assert_eq!(engine.counts(), (1, 1, 0));
         let operation = journal.only_operation();
         let OperationPayload::AddFilesLifecycle(record) = operation.payload else {
             panic!("ADD FILES payload")
@@ -1711,10 +1688,10 @@ mod tests {
         let mut engine = FakeEngine::new(Behavior::KnownUncommitted, Behavior::Committed);
         let (service, journal) = harness(&mut engine);
         let error = service
-            .try_execute_add_files(&engine, "ADD", &context(), None)
+            .execute_add_files(&engine, command(), &context(), None)
             .unwrap_err();
         assert_eq!(error.next_action(), Some(StatementNextAction::None));
-        assert_eq!(engine.counts(), (1, 1, 1, 0));
+        assert_eq!(engine.counts(), (1, 1, 0));
         let operation = journal.only_operation();
         let OperationPayload::AddFilesLifecycle(record) = operation.payload else {
             panic!("ADD FILES payload")

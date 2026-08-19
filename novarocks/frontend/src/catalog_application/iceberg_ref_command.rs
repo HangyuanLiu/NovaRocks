@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Closed capability for `ALTER ICEBERG REF`.
+//! Closed capability for typed Iceberg branch and tag mutations.
 
 use std::sync::Arc;
 
@@ -41,26 +41,18 @@ impl IcebergRefCommandExecutor {
         }
     }
 
-    pub fn try_execute(
+    pub fn execute(
         &self,
-        sql: &str,
+        statement: &novarocks_parser::ast::AlterIcebergTable,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<Option<StatementResult>, String> {
-        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
-        let Some(statement) = (match novarocks_sql::syntax::parse_alter_iceberg_ref(&normalized) {
-            Ok(statement) => statement,
-            Err(_) => return Ok(None),
-        }) else {
-            return Ok(None);
-        };
+    ) -> Result<StatementResult, String> {
         crate::mv::domain::ref_flow::execute_with_ports(
             self.connector_control.as_ref(),
             self.storage_observation.as_ref(),
             current_database,
-            &statement,
+            statement,
             connector_context,
         )
-        .map(Some)
     }
 }

@@ -39,10 +39,45 @@ use crate::connector::data_mutation::{
 };
 use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_protocol::lifecycle::QueryOptions;
-use novarocks_sql::planning::dml::classify_add_files;
 use novarocks_sql::syntax::ObjectName;
 
-pub use novarocks_sql::planning::dml::AddFilesCommand;
+/// Lowered, parser-owned `ALTER TABLE ... ADD FILES FROM ...` syntax.
+///
+/// Table resolution remains a frontend concern; this command deliberately
+/// carries no parser-private AST or raw SQL source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddFilesCommand {
+    pub table_parts: Vec<String>,
+    pub location: String,
+}
+
+/// Lowers the typed Iceberg command into the ADD FILES mutation input.
+pub fn command_from_typed_statement(
+    statement: &novarocks_parser::ast::AlterIcebergTable,
+) -> Result<AddFilesCommand, String> {
+    let novarocks_parser::ast::IcebergTableAction::AddFiles(add_files) = &statement.action else {
+        return Err("typed Iceberg statement is not ADD FILES".to_string());
+    };
+    let table_parts = statement
+        .table
+        .parts
+        .iter()
+        .map(|part| part.value.clone())
+        .collect::<Vec<_>>();
+    if !(1..=3).contains(&table_parts.len()) {
+        return Err("ADD FILES table name must have one to three parts".to_string());
+    }
+    let novarocks_parser::ast::LiteralKind::String(location) = &add_files.location.kind else {
+        return Err("ADD FILES requires a quoted non-empty location".to_string());
+    };
+    if location.is_empty() {
+        return Err("ADD FILES requires a quoted non-empty location".to_string());
+    }
+    Ok(AddFilesCommand {
+        table_parts,
+        location: location.clone(),
+    })
+}
 
 pub struct PlanAddFilesRequest {
     pub command: AddFilesCommand,
@@ -190,8 +225,6 @@ pub enum AddFilesOutcome {
 /// One-to-one core capability used only by the frontend ADD FILES owner.
 /// It is deliberately statement-specific rather than a generic DML SPI.
 pub trait AddFilesEngine: Send + Sync {
-    fn classify_add_files(&self, sql: &str) -> Result<Option<AddFilesCommand>, String>;
-
     fn plan_add_files(
         &self,
         request: PlanAddFilesRequest,
@@ -256,10 +289,6 @@ impl AddFilesEngine for DmlExecutionKernel {
             ))
         })?;
         session.establish_external_fence(fence)
-    }
-
-    fn classify_add_files(&self, sql: &str) -> Result<Option<AddFilesCommand>, String> {
-        classify_add_files(sql)
     }
 
     fn plan_add_files(
@@ -631,8 +660,41 @@ mod tests {
     }
 
     #[test]
-    fn classifier_has_no_engine_side_effects() {
-        assert_eq!(classify_add_files("SELECT 1").unwrap(), None);
+    fn typed_add_files_lowering_preserves_only_lifecycle_inputs() {
+        let statement = novarocks_parser::parse(
+            "ALTER TABLE ice.db.orders ADD FILES FROM 's3://bucket/source'",
+        )
+        .expect("parse")
+        .pop()
+        .expect("statement");
+        let novarocks_parser::ast::Statement::Iceberg(
+            novarocks_parser::ast::IcebergStatement::AlterTable(statement),
+        ) = statement
+        else {
+            panic!("typed Iceberg ADD FILES");
+        };
+        assert_eq!(
+            command_from_typed_statement(&statement).expect("lower"),
+            AddFilesCommand {
+                table_parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()],
+                location: "s3://bucket/source".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn typed_add_files_lowering_rejects_empty_source() {
+        let statement = novarocks_parser::parse("ALTER TABLE t ADD FILES FROM ''")
+            .expect("parse")
+            .pop()
+            .expect("statement");
+        let novarocks_parser::ast::Statement::Iceberg(
+            novarocks_parser::ast::IcebergStatement::AlterTable(statement),
+        ) = statement
+        else {
+            panic!("typed Iceberg ADD FILES");
+        };
+        assert!(command_from_typed_statement(&statement).is_err());
     }
 
     #[test]

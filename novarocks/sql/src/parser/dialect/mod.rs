@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod add_files;
-pub(crate) mod alter_iceberg_ref;
 pub(crate) mod create_table;
 pub(crate) mod materialized_view;
 

@@ -147,7 +147,7 @@ fn parse_add_column(
             if default.is_some() {
                 return Err(parser.unexpected("one DEFAULT clause"));
             }
-            default = Some(parser.parse_literal()?);
+            default = Some(parse_default_literal(parser)?);
         } else if parser.consume_if_word("FIRST") {
             if !matches!(position, ColumnPosition::Default) {
                 return Err(parser.unexpected("one column position clause"));
@@ -175,6 +175,25 @@ fn parse_add_column(
         default,
         position,
     })
+}
+
+fn parse_default_literal(parser: &mut StatementParser<'_, '_>) -> Result<Literal, ParseError> {
+    if parser.current_is_symbol(Symbol::Minus) {
+        let start = parser.current_span().start();
+        parser.consume_symbol(Symbol::Minus)?;
+        let mut literal = parser.parse_literal()?;
+        let LiteralKind::Number(value) = &mut literal.kind else {
+            return Err(ParseError::UnexpectedToken {
+                expected: "numeric literal after `-` in DEFAULT",
+                found: "non-numeric literal".to_string(),
+                span: literal.span,
+            });
+        };
+        value.insert(0, '-');
+        literal.span = Span::new(start, literal.span.end());
+        return Ok(literal);
+    }
+    parser.parse_literal()
 }
 
 fn parse_alter_column_action(
@@ -282,6 +301,13 @@ fn parse_partition_field(
         });
     }
     let column = parse_column_path(parser)?;
+    if transform.value.eq_ignore_ascii_case("identity") {
+        parser.consume_symbol(Symbol::RParen)?;
+        return Ok(IcebergPartitionField::Identity {
+            column,
+            span: Span::new(start, parser.current_offset()),
+        });
+    }
     if transform.value.eq_ignore_ascii_case("year") {
         parser.consume_symbol(Symbol::RParen)?;
         return Ok(IcebergPartitionField::Year {

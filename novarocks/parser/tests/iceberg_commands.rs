@@ -29,12 +29,25 @@ fn parses_schema_properties_partition_references_and_add_files() {
     let partition = statement("ALTER TABLE ice.db.orders ADD PARTITION COLUMN bucket(user_id, 32)");
     assert!(matches!(partition, Statement::Iceberg(_)));
 
+    let identity_partition =
+        statement("ALTER TABLE ice.db.orders ADD PARTITION COLUMN identity(user_id)");
+    assert!(matches!(identity_partition, Statement::Iceberg(_)));
+
     let reference =
         statement("ALTER TABLE ice.db.orders CREATE OR REPLACE BRANCH dev AS OF VERSION 42");
     assert!(matches!(reference, Statement::Iceberg(_)));
 
     let files = statement("ALTER TABLE ice.db.orders ADD FILES FROM 's3://warehouse/staged'");
     assert!(matches!(files, Statement::Iceberg(_)));
+}
+
+#[test]
+fn schema_default_preserves_negative_numeric_literal() {
+    let parsed = statement("ALTER TABLE ice.db.orders ADD COLUMN offset INT DEFAULT -7");
+    assert_eq!(
+        print_statement(&parsed),
+        "ALTER TABLE ice.db.orders ADD COLUMN offset INT DEFAULT -7"
+    );
 }
 
 #[test]

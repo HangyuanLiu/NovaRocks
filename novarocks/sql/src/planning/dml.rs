@@ -23,7 +23,6 @@
 //! facts.  Its module hook is installed by the SQL facade integration wave.
 
 pub use crate::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
-pub use crate::parser::dialect::add_files::{AddFilesCommand, classify_add_files};
 
 const ICEBERG_FILE_PATH_COLUMN: &str = "_file";
 const ICEBERG_ROW_POSITION_COLUMN: &str = "_pos";
