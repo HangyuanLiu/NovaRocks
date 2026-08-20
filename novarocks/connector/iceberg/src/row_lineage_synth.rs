@@ -47,6 +47,7 @@ pub fn is_iceberg_last_updated_sequence_number(name: &str) -> bool {
 
 /// Indices of stored row-lineage columns (`_row_id`, `_last_updated_seq`) in a
 /// batch schema, if present.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct StoredRowLineageIndices {
     pub(crate) row_id: Option<usize>,
@@ -54,6 +55,7 @@ pub(crate) struct StoredRowLineageIndices {
 }
 
 /// Locate stored row-lineage columns by their reserved Iceberg field IDs.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn stored_row_lineage_indices(schema: &Schema) -> StoredRowLineageIndices {
     let mut out = StoredRowLineageIndices::default();
     for (idx, field) in schema.fields().iter().enumerate() {
@@ -75,6 +77,7 @@ pub(crate) fn stored_row_lineage_indices(schema: &Schema) -> StoredRowLineageInd
 }
 
 /// Synthesize `_row_id` values for rows in `columns`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn synthesize_row_id(
     schema: &Schema,
     columns: &[ArrayRef],
@@ -134,6 +137,7 @@ pub(crate) fn synthesize_row_id(
 }
 
 /// Synthesize `_last_updated_sequence_number` values for rows in `columns`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn synthesize_last_updated_sequence_number(
     schema: &Schema,
     columns: &[ArrayRef],

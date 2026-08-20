@@ -399,6 +399,10 @@ pub(super) fn debug_assert_single_unmarked_row_bearing_data_manifest(
 /// Write a manifest list (avro) to `out_path` containing the supplied entries.
 /// Caller is responsible for `abort_handle.record_manifest(out_path)` before
 /// invoking this function so that a later failure can clean up.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Manifest construction keeps its existing explicit commit inputs to avoid an ambiguous context object."
+)]
 pub async fn write_manifest_list(
     file_io: &FileIO,
     out_path: &str,

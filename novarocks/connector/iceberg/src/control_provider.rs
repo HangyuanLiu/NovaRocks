@@ -452,22 +452,22 @@ impl ConnectorMetadata for IcebergControlProvider {
                 serialized_metadata_rows: None,
             };
         let mut prepared_files = Vec::new();
-        if matches!(metadata_table_type, Some(MetadataTableType::Partitions)) {
-            if let Some(snapshot_id) = metadata.current_snapshot_id() {
-                let table = loaded.table.clone();
-                prepared_files = self
-                    .runtime
-                    .resources()
-                    .catalog_runtime()
-                    .block_on(
-                        async move { extract_data_files_with_stats_at(&table, snapshot_id).await },
-                    )
-                    .map_err(unavailable)?
-                    .map_err(unavailable)?
-                    .into_iter()
-                    .map(data_file_with_stats_to_iceberg_data_file_info)
-                    .collect();
-            }
+        if matches!(metadata_table_type, Some(MetadataTableType::Partitions))
+            && let Some(snapshot_id) = metadata.current_snapshot_id()
+        {
+            let table = loaded.table.clone();
+            prepared_files = self
+                .runtime
+                .resources()
+                .catalog_runtime()
+                .block_on(
+                    async move { extract_data_files_with_stats_at(&table, snapshot_id).await },
+                )
+                .map_err(unavailable)?
+                .map_err(unavailable)?
+                .into_iter()
+                .map(data_file_with_stats_to_iceberg_data_file_info)
+                .collect();
         }
         if matches!(
             metadata_table_type,
@@ -684,7 +684,9 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 purpose: request.purpose.into(),
                 fact_columns,
                 physical_predicates: Vec::new(),
-                mode: IcebergScanModeV1::ChangeWindow { delta },
+                mode: IcebergScanModeV1::ChangeWindow {
+                    delta: Box::new(delta),
+                },
                 rewrite_position: None,
             };
             return ConnectorScan::try_new_change_window(
@@ -784,7 +786,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
             return self.plan_metadata_splits(scan, request);
         }
         if let IcebergScanModeV1::ChangeWindow { delta } = &scan.mode {
-            return self.plan_change_window_splits(&scan, delta.as_ref(), request);
+            return self.plan_change_window_splits(&scan, delta.as_ref().as_ref(), request);
         }
         let files = self.scan_files(&scan)?;
         if let Some(rewrite_position) = scan.rewrite_position.clone() {
@@ -1921,7 +1923,7 @@ struct IcebergFrozenRewritePositionScanV1 {
 enum IcebergScanModeV1 {
     Snapshot,
     ChangeWindow {
-        delta: Option<crate::change_planning::IcebergDeltaScanPlan>,
+        delta: Box<Option<crate::change_planning::IcebergDeltaScanPlan>>,
     },
 }
 

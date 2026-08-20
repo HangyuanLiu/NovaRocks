@@ -121,6 +121,10 @@ fn metadata_dir(table: &crate::iceberg::table::Table) -> String {
     format!("{}/metadata", table.metadata().location())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Manifest-list rewriting keeps its existing explicit commit inputs to preserve lifecycle ownership."
+)]
 async fn write_manifest_list(
     file_io: &FileIO,
     out_path: &str,

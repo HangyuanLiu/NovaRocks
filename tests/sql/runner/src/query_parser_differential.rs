@@ -20,12 +20,13 @@
 //! session, or MySQL dependency: it consumes the runner's authoritative SQL
 //! case loader and exits before the execution runner starts those owners.
 
+#[cfg(test)]
+use crate::suite_manifest::select_suite_names;
 use crate::{
     config::{list_sql_files, placeholder_variables, resolve_path},
     parser::load_sql_case_from_file,
     runner::parse_selector_list,
     shell::is_shell_step,
-    suite_manifest::select_suite_names,
     types::{RunnerConfig, SqlCase, SqlStep, SuiteConfig},
 };
 use anyhow::{Context, Result, bail};
@@ -104,6 +105,27 @@ pub struct Mismatch {
     typed_original: Option<String>,
     typed_canonical: Option<String>,
     first_typed_difference: Option<String>,
+}
+
+struct MismatchLocation<'a> {
+    suite: &'a str,
+    case: &'a SqlCase,
+    step: &'a SqlStep,
+    payload: usize,
+}
+
+macro_rules! mismatch {
+    ($suite:expr, $case:expr, $step:expr, $payload:expr, $($argument:expr),+ $(,)?) => {
+        build_mismatch(
+            MismatchLocation {
+                suite: $suite,
+                case: $case,
+                step: $step,
+                payload: $payload,
+            },
+            $($argument),+
+        )
+    };
 }
 
 impl std::fmt::Display for Mismatch {
@@ -269,7 +291,7 @@ fn inspect_case(suite: &str, case: &SqlCase, summary: &mut Summary) {
         let payloads = match split_statement_payloads(step) {
             Ok(payloads) => payloads,
             Err(error) => {
-                summary.mismatches.push(mismatch(
+                summary.mismatches.push(mismatch!(
                     suite,
                     case,
                     step,
@@ -305,7 +327,7 @@ fn inspect_payload(
         }
         Err(error) => {
             if query_candidate_after_legacy_rejection(&step.sql) {
-                summary.mismatches.push(mismatch(
+                summary.mismatches.push(mismatch!(
                     suite,
                     case,
                     step,
@@ -331,7 +353,7 @@ fn inspect_payload(
     let typed_original = match parse_typed(&step.sql) {
         Ok(statements) => statements,
         Err(error) => {
-            summary.mismatches.push(mismatch(
+            summary.mismatches.push(mismatch!(
                 suite,
                 case,
                 step,
@@ -346,7 +368,7 @@ fn inspect_payload(
         }
     };
     if !matches_typed_class(&typed_original, expected_class) {
-        summary.mismatches.push(mismatch(
+        summary.mismatches.push(mismatch!(
             suite,
             case,
             step,
@@ -367,7 +389,7 @@ fn inspect_payload(
     let typed_canonical = match parse_typed(&canonical_sql) {
         Ok(statements) => statements,
         Err(error) => {
-            summary.mismatches.push(mismatch(
+            summary.mismatches.push(mismatch!(
                 suite,
                 case,
                 step,
@@ -382,7 +404,7 @@ fn inspect_payload(
         }
     };
     if !typed_statements_syntax_eq(&typed_original, &typed_canonical) {
-        let mut diagnostic = mismatch(
+        let mut diagnostic = mismatch!(
             suite,
             case,
             step,
@@ -405,7 +427,7 @@ fn inspect_payload(
     let legacy_canonical = match novarocks_sql::syntax::parse_sql_raw(&canonical_sql) {
         Ok(statement) => statement,
         Err(error) => {
-            summary.mismatches.push(mismatch(
+            summary.mismatches.push(mismatch!(
                 suite,
                 case,
                 step,
@@ -420,7 +442,7 @@ fn inspect_payload(
         }
     };
     if classify_legacy_query(&legacy_canonical) != Some(expected_class) {
-        summary.mismatches.push(mismatch(
+        summary.mismatches.push(mismatch!(
             suite,
             case,
             step,
@@ -434,7 +456,7 @@ fn inspect_payload(
         return;
     }
     if !legacy_semantically_eq(&legacy_original, &legacy_canonical) {
-        summary.mismatches.push(mismatch(
+        summary.mismatches.push(mismatch!(
             suite,
             case,
             step,
@@ -458,7 +480,7 @@ fn inspect_typed_only_explain(
     let typed_original = match parse_typed(&step.sql) {
         Ok(statements) => statements,
         Err(error) => {
-            summary.mismatches.push(mismatch(
+            summary.mismatches.push(mismatch!(
                 suite,
                 case,
                 step,
@@ -473,7 +495,7 @@ fn inspect_typed_only_explain(
         }
     };
     if !matches_typed_only_explain(&typed_original) {
-        summary.mismatches.push(mismatch(
+        summary.mismatches.push(mismatch!(
             suite,
             case,
             step,
@@ -493,7 +515,7 @@ fn inspect_typed_only_explain(
     let typed_canonical = match parse_typed(&canonical_sql) {
         Ok(statements) => statements,
         Err(error) => {
-            summary.mismatches.push(mismatch(
+            summary.mismatches.push(mismatch!(
                 suite,
                 case,
                 step,
@@ -508,7 +530,7 @@ fn inspect_typed_only_explain(
         }
     };
     if !typed_statements_syntax_eq(&typed_original, &typed_canonical) {
-        let mut diagnostic = mismatch(
+        let mut diagnostic = mismatch!(
             suite,
             case,
             step,
@@ -665,11 +687,8 @@ fn typed_statements_syntax_eq(left: &[TypedStatement], right: &[TypedStatement])
     }
 }
 
-fn mismatch(
-    suite: &str,
-    case: &SqlCase,
-    step: &SqlStep,
-    payload: usize,
+fn build_mismatch(
+    location: MismatchLocation<'_>,
     reason: String,
     canonical_sql: Option<String>,
     legacy_original: Option<&LegacyStatement>,
@@ -686,13 +705,13 @@ fn mismatch(
         normalized_legacy_canonical.as_deref(),
     );
     Mismatch {
-        suite: suite.to_owned(),
-        source_file: case.source_file.display().to_string(),
-        case_id: case.case_id.clone(),
-        step: step.query_number,
-        payload,
+        suite: location.suite.to_owned(),
+        source_file: location.case.source_file.display().to_string(),
+        case_id: location.case.case_id.clone(),
+        step: location.step.query_number,
+        payload: location.payload,
         reason,
-        original_sql: step.sql.clone(),
+        original_sql: location.step.sql.clone(),
         canonical_sql,
         legacy_original,
         legacy_canonical,
@@ -931,7 +950,7 @@ mod tests {
             sql: "SELECT 1".to_owned(),
             meta: Default::default(),
         };
-        let diagnostic = mismatch(
+        let diagnostic = mismatch!(
             "fixture",
             &case,
             &step,

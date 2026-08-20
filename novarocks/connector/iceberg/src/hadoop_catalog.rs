@@ -368,6 +368,10 @@ impl HadoopFileSystemCatalog {
         Ok(Some(metadata_location))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Create-attempt errors are propagated unchanged to preserve the catalog error contract."
+    )]
     pub(crate) fn prepare_create_attempt(
         &self,
         namespace: &NamespaceIdent,
@@ -518,12 +522,12 @@ impl HadoopFileSystemCatalog {
         };
 
         let mut finalization_failure = None;
-        if disposition == HadoopCreateDisposition::Created {
-            if let Err(error) = self.write_version_hint(&attempt.table_location, 1).await {
-                finalization_failure = Some(format!(
-                    "publish Hadoop catalog version hint after committed v1 metadata: {error}"
-                ));
-            }
+        if disposition == HadoopCreateDisposition::Created
+            && let Err(error) = self.write_version_hint(&attempt.table_location, 1).await
+        {
+            finalization_failure = Some(format!(
+                "publish Hadoop catalog version hint after committed v1 metadata: {error}"
+            ));
         }
 
         let key = Self::table_key(&attempt.ident);

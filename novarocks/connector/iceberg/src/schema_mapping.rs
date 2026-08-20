@@ -20,6 +20,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+type ListFieldWrapper = Box<dyn FnOnce(Arc<Field>) -> DataType>;
+
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 pub use novarocks_types::value::variant::is_variant_struct_data_type;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -106,8 +108,7 @@ fn sql_read_data_type(
             Ok(DataType::Struct(fields.into()))
         }
         Type::List(iceberg_list) => {
-            let (field, wrap): (&Field, Box<dyn FnOnce(Arc<Field>) -> DataType>) = match arrow_type
-            {
+            let (field, wrap): (&Field, ListFieldWrapper) = match arrow_type {
                 DataType::List(field) => (field.as_ref(), Box::new(DataType::List)),
                 DataType::LargeList(field) => (field.as_ref(), Box::new(DataType::LargeList)),
                 DataType::FixedSizeList(field, size) => {

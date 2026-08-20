@@ -150,9 +150,13 @@ impl OperationTable {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Operation state remains by-value so state transitions do not add allocation or indirection."
+)]
 #[derive(Clone)]
 enum OperationState {
-    Active(ActiveOperation),
+    Active(Box<ActiveOperation>),
     Committing(CommittingOperation),
     KnownUncommitted(KnownUncommittedOperation),
     KnownCommitted(KnownCommittedOperation),
@@ -555,35 +559,34 @@ impl IcebergWriteControl {
         if matches!(
             request.intent,
             ConnectorWriteActivationIntent::ManagedPublication(_)
-        ) {
-            if let ConnectorWriteActivationSource::RowMutation(plan) = &request.source {
-                if plan.copy_on_write().is_some() {
-                    return Err(invalid(
-                        "managed Iceberg publication does not support copy-on-write routing",
-                    ));
-                }
-                let mut route_payloads = plan
-                    .routes()
-                    .iter()
-                    .map(|route| {
-                        cohorts
-                            .get(&route.cohort_id())
-                            .map(|cohort| (route.cohort_id(), cohort.writer_payload.clone()))
-                            .ok_or_else(|| {
-                                corrupt(
-                                    "managed Iceberg row-mutation route omitted its activated cohort",
-                                )
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                route_payloads.sort_by_key(|(cohort_id, _)| *cohort_id);
-                let route_payloads = route_payloads
-                    .into_iter()
-                    .map(|(_, payload)| payload)
-                    .collect::<Vec<_>>();
-                for cohort in cohorts.values_mut() {
-                    cohort.routed_writer_payloads = Some(route_payloads.clone());
-                }
+        ) && let ConnectorWriteActivationSource::RowMutation(plan) = &request.source
+        {
+            if plan.copy_on_write().is_some() {
+                return Err(invalid(
+                    "managed Iceberg publication does not support copy-on-write routing",
+                ));
+            }
+            let mut route_payloads = plan
+                .routes()
+                .iter()
+                .map(|route| {
+                    cohorts
+                        .get(&route.cohort_id())
+                        .map(|cohort| (route.cohort_id(), cohort.writer_payload.clone()))
+                        .ok_or_else(|| {
+                            corrupt(
+                                "managed Iceberg row-mutation route omitted its activated cohort",
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            route_payloads.sort_by_key(|(cohort_id, _)| *cohort_id);
+            let route_payloads = route_payloads
+                .into_iter()
+                .map(|(_, payload)| payload)
+                .collect::<Vec<_>>();
+            for cohort in cohorts.values_mut() {
+                cohort.routed_writer_payloads = Some(route_payloads.clone());
             }
         }
         Ok(ActiveOperation {
@@ -698,7 +701,7 @@ impl IcebergWriteControl {
                 ))
             }
             None => {
-                operations.insert(operation_id, OperationState::Active(active));
+                operations.insert(operation_id, OperationState::Active(Box::new(active)));
                 Ok(activation)
             }
         }
@@ -797,6 +800,10 @@ impl IcebergWriteControl {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Writer payload construction preserves the established explicit control-plane inputs."
+    )]
     fn writer_payload(
         &self,
         input: &ConnectorWriteInputShape,
@@ -1233,6 +1240,10 @@ impl IcebergWriteControl {
         Ok(decoded)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Commit-service errors are propagated unchanged across the existing public error boundary."
+    )]
     fn execute_commit(
         &self,
         request: &ConnectorWriteCommitRequest,
@@ -1440,6 +1451,10 @@ impl IcebergWriteControl {
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Commit-service errors are propagated unchanged across the existing public error boundary."
+    )]
     fn snapshot_properties(
         &self,
         request: &ConnectorWriteCommitRequest,
@@ -1596,10 +1611,10 @@ impl IcebergWriteControl {
                     let Some(name) = entry.path().rsplit('/').next() else {
                         continue;
                     };
-                    if operation_manifest_name_owned(name, &token) {
-                        if let Err(error) = operator.delete(entry.path()).await {
-                            errors.push(format!("{}: {error}", entry.path()));
-                        }
+                    if operation_manifest_name_owned(name, &token)
+                        && let Err(error) = operator.delete(entry.path()).await
+                    {
+                        errors.push(format!("{}: {error}", entry.path()));
                     }
                 }
                 Ok(errors)
@@ -1832,7 +1847,10 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 ))
             }
             None => {
-                operations.insert(request.operation_id, OperationState::Active(active));
+                operations.insert(
+                    request.operation_id,
+                    OperationState::Active(Box::new(active)),
+                );
                 Ok(activation)
             }
         }
@@ -2146,7 +2164,7 @@ impl ConnectorWriteControl for IcebergWriteControl {
                     cohort_set_digest: request.sealed().digest(),
                     aggregate_digest: request.aggregate_digest(),
                     outcome: outcome.clone(),
-                    active: active.clone(),
+                    active: *active.clone(),
                     request: request.clone(),
                 })
             }
@@ -2692,6 +2710,10 @@ fn replaces_every_live_row(cohorts: &[DecodedCohort]) -> bool {
         })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Commit-service errors are propagated unchanged across the existing public error boundary."
+)]
 fn commit_shape(
     active: &ActiveOperation,
     cohorts: &[DecodedCohort],
@@ -2760,6 +2782,10 @@ fn commit_shape(
 /// arm has to agree with what its action accepts, and a mismatch does not fail
 /// as a shape error but as an ambiguous commit that reconciles to "marker is
 /// absent" — a diagnosis that says nothing about the real cause.
+#[expect(
+    clippy::result_large_err,
+    reason = "Commit-service errors are propagated unchanged across the existing public error boundary."
+)]
 fn commit_shape_for_intents(cohorts: &[DecodedCohort]) -> Result<CommitOpKind, CommitServiceError> {
     let intents = cohorts
         .iter()
@@ -3052,6 +3078,10 @@ fn managed_partition_field_name(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Commit-service errors are propagated unchanged across the existing public error boundary."
+)]
 fn managed_snapshot_properties(
     intent: &ConnectorWriteActivationIntent,
     rows: u64,
@@ -3345,6 +3375,10 @@ fn find_operation_marker_snapshot<'a>(
 /// target ref was activated against and the honest row count is that snapshot's
 /// own. `None` when the ref has no snapshot at all: there is no version to
 /// report, so the caller keeps failing closed rather than inventing one.
+#[expect(
+    clippy::result_large_err,
+    reason = "Commit-service errors are propagated unchanged across the existing public error boundary."
+)]
 fn unchanged_version_no_op(
     metadata: &crate::iceberg::spec::TableMetadata,
     target: &ActiveTarget,
@@ -3370,6 +3404,10 @@ fn unchanged_version_no_op(
 /// Unlike `table_snapshot_row_count` this reloads nothing and never claims a
 /// commit happened, so it is the reader for paths that report an unchanged
 /// version rather than a newly written one.
+#[expect(
+    clippy::result_large_err,
+    reason = "Commit-service errors are propagated unchanged across the existing public error boundary."
+)]
 fn snapshot_total_records(
     metadata: &crate::iceberg::spec::TableMetadata,
     snapshot_id: i64,
@@ -3387,6 +3425,10 @@ fn snapshot_total_records(
         .map_err(|error| CommitServiceError::invalid_input(error.to_string()))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Commit-service errors are propagated unchanged across the existing public error boundary."
+)]
 fn table_snapshot_row_count(
     runtime: &Arc<IcebergControlRuntime>,
     target: &ActiveTarget,
@@ -4858,7 +4900,7 @@ mod tests {
         .expect("prior observation");
         let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
             operation_id,
-            prior.clone(),
+            prior,
             vec![
                 ConnectorManagedPartitionField::try_new(
                     1,
@@ -5202,7 +5244,7 @@ mod tests {
                 cohort_set_digest,
                 aggregate_digest,
                 outcome,
-                active,
+                active: *active,
                 request,
             }),
         );

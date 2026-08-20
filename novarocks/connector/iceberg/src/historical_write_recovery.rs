@@ -111,7 +111,6 @@ const ICEBERG_HISTORICAL_WRITE_EVIDENCE_VERSION: u16 = 1;
 /// whose `version` is anything else is reported as ambiguous rather than
 /// reinterpreted, so a future producer layout degrades to "unresolved" instead
 /// of to a wrong classification.
-
 /// Upper bound on the snapshot ancestry this facet will walk. A lineage that
 /// does not end within the bound is reported as unproven, never as absence.
 const MAX_TARGET_LINEAGE_WALK: usize = 50_000;

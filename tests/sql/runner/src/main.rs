@@ -293,10 +293,10 @@ fn evaluate_expected_error_branch_with_sql_error_descriptors(
         )));
     }
 
-    if let Some(expected_code) = meta.expect_error_code.as_deref() {
-        if let Err(error) = expected_engine_error_code_result(err_msg, expected_code) {
-            return Some(Err(error));
-        }
+    if let Some(expected_code) = meta.expect_error_code.as_deref()
+        && let Err(error) = expected_engine_error_code_result(err_msg, expected_code)
+    {
+        return Some(Err(error));
     }
     if let Some(expected_code) = meta.expect_sql_code.as_deref()
         && let Err(error) = expected_sql_error_code_result(err_msg, expected_code)

@@ -557,11 +557,13 @@ impl TransactionAction for OverwritePartitionsTxnAction {
 /// Write a Data manifest in which every entry is EXISTING (status=Existing).
 /// Used by `OverwritePartitionsCommit` to emit surviving data files (those in
 /// non-touched partitions) into the new snapshot's manifest list.
+type SurvivingDataFile = (DataFile, i64, i64, Option<i64>, Option<i64>, i32);
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn write_existing_data_manifest(
     file_io: &FileIO,
     out_path: &str,
-    surviving: &[(DataFile, i64, i64, Option<i64>, Option<i64>, i32)],
+    surviving: &[SurvivingDataFile],
     assigned_manifest_first_row_id: Option<u64>,
     partition_spec: PartitionSpecRef,
     schema: SchemaRef,

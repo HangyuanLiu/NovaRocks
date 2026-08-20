@@ -222,12 +222,11 @@ impl IcebergCleanupMaintenanceAdapter {
             .map_err(|_| internal("Iceberg cleanup plan cache lock poisoned"))?
             .get(&plan.operation_id())
             .cloned()
+            && cached.plan.plan_digest() != plan.plan_digest()
         {
-            if cached.plan.plan_digest() != plan.plan_digest() {
-                return Err(invalid(
-                    "Iceberg cleanup operation conflicts with its generation-local plan",
-                ));
-            }
+            return Err(invalid(
+                "Iceberg cleanup operation conflicts with its generation-local plan",
+            ));
         }
         let payload: PlanPayload = decode_canonical(plan.provider_payload(), "cleanup plan")?;
         if payload.version != ARTIFACT_VERSION
@@ -1156,7 +1155,7 @@ fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
 }
 
 fn hex_decode(value: &str) -> Option<Vec<u8>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return None;
     }
     value

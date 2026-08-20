@@ -297,8 +297,8 @@ pub fn materialize_local_scan_units(
         let total = unit
             .estimated_bytes
             .ok_or_else(|| corrupt("Iceberg Parquet split unit must carry a known frozen cost"))?;
-        let costs = distribute_unit_cost(total, &layout)?;
-        for (group, estimated_bytes) in layout.into_iter().zip(costs) {
+        let costs = distribute_unit_cost(total, layout)?;
+        for (group, estimated_bytes) in layout.iter().zip(costs) {
             result.push(IcebergFrozenScanUnitPayload {
                 data_file: unit.data_file.clone(),
                 row_groups: Some(vec![group.ordinal as usize]),

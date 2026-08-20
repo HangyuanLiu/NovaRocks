@@ -127,6 +127,10 @@ fn source_format_from_summary(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The control-plane view operation preserves its established explicit input contract."
+)]
 pub(crate) fn create_view(
     runtime: &IcebergControlRuntime,
     namespace: &str,
@@ -147,13 +151,12 @@ pub(crate) fn create_view(
             dialect: VIEW_DIALECT_STARROCKS.to_string(),
         })]);
     let mut properties = extra_properties.iter().cloned().collect::<HashMap<_, _>>();
-    if let Some(comment) = comment {
-        if properties
+    if let Some(comment) = comment
+        && properties
             .insert("comment".to_string(), comment.to_string())
             .is_some()
-        {
-            return Err("duplicate Iceberg view comment property".to_string());
-        }
+    {
+        return Err("duplicate Iceberg view comment property".to_string());
     }
     let summary = HashMap::from([
         ("engine-name".to_string(), NOVAROCKS_ENGINE_NAME.to_string()),

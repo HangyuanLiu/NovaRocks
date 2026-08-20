@@ -448,7 +448,6 @@ pub struct LiveDataFileCompactionStats {
     pub max_compactable_data_files: i64,
 }
 
-#[cfg_attr(test, allow(dead_code))]
 #[allow(dead_code)]
 pub(crate) async fn count_current_live_files(
     table: &Table,

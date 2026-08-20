@@ -783,7 +783,7 @@ impl IcebergWriterReportV1 {
                 referenced_data_file: file.referenced_data_file.clone(),
                 first_row_id: file.first_row_id,
                 equality_ids: file.equality_ids.clone(),
-                key_metadata_base64: file.key_metadata.as_ref().map(|value| base64_encode(value)),
+                key_metadata_base64: file.key_metadata.as_ref().map(base64_encode),
                 content_offset: file.content_offset,
                 content_size_in_bytes: file.content_size_in_bytes,
                 cardinality: file.cardinality,

@@ -1242,40 +1242,44 @@ where
     }
 }
 
+struct LiveBackendTopologyWait<'a> {
+    mysql_user: &'a str,
+    runtime: &'a CrossProcessRuntime,
+    expected_ports: &'a [u16],
+    fe_config_path: &'a Path,
+    be_config_paths: &'a [PathBuf],
+    timeout: Duration,
+}
+
 fn wait_for_live_backend_topology(
-    mysql_user: &str,
-    runtime: &CrossProcessRuntime,
-    expected_ports: &[u16],
-    fe_config_path: &Path,
-    be_config_paths: &[PathBuf],
+    wait: LiveBackendTopologyWait<'_>,
     fe_process: &mut ManagedProcess,
     be_processes: &mut [ManagedProcess],
-    timeout: Duration,
 ) -> Result<()> {
-    let expected = expected_ports.len();
+    let expected = wait.expected_ports.len();
     let host = "127.0.0.1";
-    let port = runtime.fe_mysql_port;
+    let port = wait.runtime.fe_mysql_port;
     let rows = wait_for_live_backend_topology_with(
-        &expected_ports,
-        timeout,
+        wait.expected_ports,
+        wait.timeout,
         || {
             process_runtime_diagnostics(
                 fe_process,
                 be_processes,
-                fe_config_path,
-                be_config_paths,
-                runtime,
+                wait.fe_config_path,
+                wait.be_config_paths,
+                wait.runtime,
             )
         },
-        |io_timeout| query_frontend_backend_topology(mysql_user, host, port, io_timeout),
+        |io_timeout| query_frontend_backend_topology(wait.mysql_user, host, port, io_timeout),
         thread::sleep,
     )?;
     let diagnostics = process_runtime_diagnostics(
         fe_process,
         be_processes,
-        fe_config_path,
-        be_config_paths,
-        runtime,
+        wait.fe_config_path,
+        wait.be_config_paths,
+        wait.runtime,
     )?;
     println!(
         "cross-process topology barrier PASS: SHOW BACKENDS {}/{} Live; {}",
@@ -1813,17 +1817,30 @@ pub fn render_cross_process_config(
     toml::to_string(&value).context("serialize cross-process standalone config")
 }
 
-fn render_cross_process_launch_config(
-    base_config: &str,
+struct CrossProcessLaunchConfig<'a> {
+    base_config: &'a str,
     role: ClusterProcessRole,
     be_index: usize,
-    runtime: &CrossProcessRuntime,
-    runtime_dir: &Path,
+    runtime: &'a CrossProcessRuntime,
+    runtime_dir: &'a Path,
     query_lifecycle_faults_enabled: bool,
     cleanup_faults_enabled: bool,
-    overlay: Option<&str>,
-    initial_backend_seeds: &[usize],
-) -> Result<String> {
+    overlay: Option<&'a str>,
+    initial_backend_seeds: &'a [usize],
+}
+
+fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> Result<String> {
+    let CrossProcessLaunchConfig {
+        base_config,
+        role,
+        be_index,
+        runtime,
+        runtime_dir,
+        query_lifecycle_faults_enabled,
+        cleanup_faults_enabled,
+        overlay,
+        initial_backend_seeds,
+    } = config;
     let rendered = render_cross_process_config(base_config, role, be_index, runtime)?;
     let mut value = rendered
         .parse::<Value>()
@@ -2330,20 +2347,20 @@ impl CrossProcessServerHandle {
             .unwrap_or_else(|| "root".to_string());
 
         let render = |role: ClusterProcessRole, be_index: usize| -> Result<String> {
-            render_cross_process_launch_config(
-                &base_config,
+            render_cross_process_launch_config(CrossProcessLaunchConfig {
+                base_config: &base_config,
                 role,
                 be_index,
-                &runtime,
-                runtime_dir.path(),
+                runtime: &runtime,
+                runtime_dir: runtime_dir.path(),
                 query_lifecycle_faults_enabled,
                 cleanup_faults_enabled,
-                match role {
+                overlay: match role {
                     ClusterProcessRole::Fe => config_overlay.fe.as_deref(),
                     ClusterProcessRole::Be => config_overlay.be.as_deref(),
                 },
-                &initial_backend_seeds,
-            )
+                initial_backend_seeds: &initial_backend_seeds,
+            })
         };
 
         // Write per-BE configs.
@@ -2424,14 +2441,16 @@ impl CrossProcessServerHandle {
             fe_config_path.display()
         );
         wait_for_live_backend_topology(
-            &mysql_user,
-            &runtime,
-            &initial_backend_seed_ports,
-            &fe_config_path,
-            &be_config_paths,
+            LiveBackendTopologyWait {
+                mysql_user: &mysql_user,
+                runtime: &runtime,
+                expected_ports: &initial_backend_seed_ports,
+                fe_config_path: &fe_config_path,
+                be_config_paths: &be_config_paths,
+                timeout: startup_timeout,
+            },
             &mut fe_process,
             &mut be_processes,
-            startup_timeout,
         )
         .context("cross-process backend topology barrier")?;
         assert_role_scoped_metrics(&runtime)
@@ -2501,15 +2520,14 @@ impl CrossProcessServerHandle {
                 failures.push(format!("stop cross-process BE[{index}]: {error:#}"));
             }
         }
-        if !self.retain_runtime_artifacts {
-            if let Err(error) = fs::remove_dir_all(&self.runtime_dir) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    failures.push(format!(
-                        "remove cross-process runtime {}: {error}",
-                        self.runtime_dir.display()
-                    ));
-                }
-            }
+        if !self.retain_runtime_artifacts
+            && let Err(error) = fs::remove_dir_all(&self.runtime_dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            failures.push(format!(
+                "remove cross-process runtime {}: {error}",
+                self.runtime_dir.display()
+            ));
         }
         if failures.is_empty() {
             Ok(())
@@ -3285,15 +3303,18 @@ impl ServerHandle for CrossProcessServerHandle {
             be_process.pid(),
             config_path.display()
         );
+        let expected_ports = self.runtime.be.iter().map(|be| be.grpc).collect::<Vec<_>>();
         wait_for_live_backend_topology(
-            &self.mysql_user,
-            &self.runtime,
-            &self.runtime.be.iter().map(|be| be.grpc).collect::<Vec<_>>(),
-            &self.fe_config_path,
-            &self.be_config_paths,
+            LiveBackendTopologyWait {
+                mysql_user: &self.mysql_user,
+                runtime: &self.runtime,
+                expected_ports: &expected_ports,
+                fe_config_path: &self.fe_config_path,
+                be_config_paths: &self.be_config_paths,
+                timeout: remaining_until(deadline, "BE topology barrier")?,
+            },
             &mut self.fe_process,
             &mut self.be_processes,
-            remaining_until(deadline, "BE topology barrier")?,
         )
         .context("cross-process backend topology barrier after BE restart")?;
         loop {
@@ -3387,15 +3408,18 @@ impl ServerHandle for CrossProcessServerHandle {
             self.fe_process.pid(),
             self.fe_config_path.display()
         );
+        let expected_ports = self.runtime.be.iter().map(|be| be.grpc).collect::<Vec<_>>();
         wait_for_live_backend_topology(
-            &self.mysql_user,
-            &self.runtime,
-            &self.runtime.be.iter().map(|be| be.grpc).collect::<Vec<_>>(),
-            &self.fe_config_path,
-            &self.be_config_paths,
+            LiveBackendTopologyWait {
+                mysql_user: &self.mysql_user,
+                runtime: &self.runtime,
+                expected_ports: &expected_ports,
+                fe_config_path: &self.fe_config_path,
+                be_config_paths: &self.be_config_paths,
+                timeout: remaining_until(deadline, "FE topology barrier")?,
+            },
             &mut self.fe_process,
             &mut self.be_processes,
-            remaining_until(deadline, "FE topology barrier")?,
         )
         .context("cross-process backend topology barrier after FE restart")?;
         Ok(())
@@ -4643,31 +4667,31 @@ enable_path_style_access = true
         let first_runtime = Path::new("/tmp/novarocks-cross-process-run-a");
         let second_runtime = Path::new("/tmp/novarocks-cross-process-run-b");
 
-        let first = render_cross_process_launch_config(
-            BASE_CONFIG,
-            ClusterProcessRole::Fe,
-            0,
-            &runtime,
-            first_runtime,
-            false,
-            false,
-            None,
-            &[0],
-        )
+        let first = render_cross_process_launch_config(CrossProcessLaunchConfig {
+            base_config: BASE_CONFIG,
+            role: ClusterProcessRole::Fe,
+            be_index: 0,
+            runtime: &runtime,
+            runtime_dir: first_runtime,
+            query_lifecycle_faults_enabled: false,
+            cleanup_faults_enabled: false,
+            overlay: None,
+            initial_backend_seeds: &[0],
+        })
         .unwrap()
         .parse::<Value>()
         .unwrap();
-        let second = render_cross_process_launch_config(
-            BASE_CONFIG,
-            ClusterProcessRole::Fe,
-            0,
-            &runtime,
-            second_runtime,
-            false,
-            false,
-            None,
-            &[0],
-        )
+        let second = render_cross_process_launch_config(CrossProcessLaunchConfig {
+            base_config: BASE_CONFIG,
+            role: ClusterProcessRole::Fe,
+            be_index: 0,
+            runtime: &runtime,
+            runtime_dir: second_runtime,
+            query_lifecycle_faults_enabled: false,
+            cleanup_faults_enabled: false,
+            overlay: None,
+            initial_backend_seeds: &[0],
+        })
         .unwrap()
         .parse::<Value>()
         .unwrap();

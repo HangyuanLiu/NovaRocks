@@ -1080,10 +1080,10 @@ fn load_sql_case_from_file_with_variables(
             return Ok(None);
         }
     };
-    let case_dbs = detect_case_dbs(&content, &case_variables);
+    let case_dbs = detect_case_dbs(&content, case_variables);
     let content = substitute_placeholders(
         &content,
-        &case_variables,
+        case_variables,
         &format!("{}: placeholder substitution", sql_path.display()),
     )?;
 

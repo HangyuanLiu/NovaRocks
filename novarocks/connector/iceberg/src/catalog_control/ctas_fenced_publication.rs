@@ -214,7 +214,7 @@ impl IcebergCtasFencedPublication {
         let creation = TableCreation::builder()
             .name(table_name)
             .schema(schema)
-            .properties(properties.into_iter())
+            .properties(properties)
             .format_version(format_version);
         let creation = if let Some(spec) = partition_spec {
             creation.partition_spec(spec).build()

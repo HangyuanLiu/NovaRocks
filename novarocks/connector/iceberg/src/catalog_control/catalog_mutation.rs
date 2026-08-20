@@ -529,7 +529,7 @@ fn prepare_table_creation(
     let creation = TableCreation::builder()
         .name(table_name)
         .schema(schema)
-        .properties(properties.into_iter())
+        .properties(properties)
         .format_version(format_version);
     let creation = if let Some(spec) = spec {
         creation.partition_spec(spec).build()
@@ -1377,7 +1377,7 @@ fn rebuild_composite(
             }
             Ok(Type::Struct(StructType::new(children)))
         }
-        Type::List(list_type) => {
+        Type::List(_) => {
             let [element] = children.as_slice() else {
                 return Err(invalid(
                     "Iceberg LIST element cannot be added or dropped".to_string(),
@@ -1385,10 +1385,9 @@ fn rebuild_composite(
             };
             Ok(Type::List(crate::iceberg::spec::ListType {
                 element_field: element.clone(),
-                ..list_type.clone()
             }))
         }
-        Type::Map(map_type) => {
+        Type::Map(_) => {
             let [key, value] = children.as_slice() else {
                 return Err(invalid(
                     "Iceberg MAP key or value cannot be added or dropped".to_string(),
@@ -1397,7 +1396,6 @@ fn rebuild_composite(
             Ok(Type::Map(crate::iceberg::spec::MapType {
                 key_field: key.clone(),
                 value_field: value.clone(),
-                ..map_type.clone()
             }))
         }
         _ => Err(ConnectorError::new(
@@ -2669,9 +2667,9 @@ fn map_iceberg_message(action: &str, error: crate::iceberg::Error) -> ConnectorE
 fn map_view_error(error: String) -> ConnectorError {
     if error.starts_with("unknown view:") {
         not_found(error)
-    } else if error.contains("require a REST") {
-        ConnectorError::new(ConnectorErrorKind::Unsupported, error)
-    } else if error.starts_with("unsupported SQL dialect for NovaRocks Iceberg view") {
+    } else if error.contains("require a REST")
+        || error.starts_with("unsupported SQL dialect for NovaRocks Iceberg view")
+    {
         ConnectorError::new(ConnectorErrorKind::Unsupported, error)
     } else if error.starts_with("NovaRocks Iceberg view source")
         || error.starts_with("NovaRocks Iceberg view creation requires")
