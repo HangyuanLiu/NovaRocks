@@ -91,6 +91,10 @@ impl Printer {
                 crate::ast::materialized_view::write_sql(statement, &mut self.output)
             }
             Statement::View(statement) => crate::ast::view::write_sql(statement, &mut self.output),
+            Statement::Table(statement) => {
+                crate::ast::table::write_sql(statement, &mut self.output)
+            }
+            Statement::Dml(statement) => crate::ast::dml::write_sql(statement, &mut self.output),
             Statement::Query(query) => self.write_query(query),
             Statement::ExplainQuery(explain) => self.write_explain_query(explain),
             Statement::RawQuery(query) => self.write_raw_query(query),

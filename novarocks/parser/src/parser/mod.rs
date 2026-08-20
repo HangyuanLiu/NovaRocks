@@ -23,6 +23,7 @@
 mod backend;
 mod catalog;
 mod command;
+mod dml;
 mod expr;
 mod iceberg;
 mod maintenance;
@@ -31,6 +32,7 @@ mod pratt;
 mod query;
 mod show_backends;
 mod statistics;
+mod table;
 mod view;
 
 use crate::{
@@ -98,6 +100,8 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
             backend::parse,
             statistics::parse,
             catalog::parse,
+            table::parse,
+            dml::parse,
             iceberg::parse,
             maintenance::parse,
             materialized_view::parse,
@@ -561,6 +565,8 @@ mod tests {
                 Statement::Maintenance(_) => "MAINTENANCE",
                 Statement::MaterializedView(_) => "MATERIALIZED VIEW",
                 Statement::View(_) => "VIEW",
+                Statement::Table(_) => "TABLE",
+                Statement::Dml(_) => "DML",
                 Statement::Query(_) => "QUERY",
                 Statement::ExplainQuery(_) => "EXPLAIN QUERY",
                 Statement::RawQuery(_) => "RAW QUERY",

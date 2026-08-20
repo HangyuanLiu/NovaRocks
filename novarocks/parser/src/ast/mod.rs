@@ -20,6 +20,7 @@
 pub(crate) mod backend;
 pub(crate) mod catalog;
 pub(crate) mod command;
+pub(crate) mod dml;
 mod equivalence;
 mod expr;
 pub(crate) mod iceberg;
@@ -28,6 +29,7 @@ pub(crate) mod materialized_view;
 mod query;
 mod relation;
 pub(crate) mod statistics;
+pub(crate) mod table;
 mod validate;
 pub(crate) mod view;
 mod visit;
@@ -39,6 +41,11 @@ pub use catalog::{
     DropTable, ShowCreateTable, TruncateTable,
 };
 pub use command::{Property, PropertyKeyValue};
+pub use dml::{
+    AddEqualityDelete, Assignment, CreateTableAsSelect, Delete, DmlStatement, Insert,
+    InsertPartitionEntry, InsertPartitions, Merge, MergeClause, MergeMatchedAction,
+    MergeNotMatchedAction, MutationSource, Update,
+};
 pub use equivalence::{SyntaxEq, syntax_eq_explain_query, syntax_eq_expr, syntax_eq_query};
 pub use expr::{
     AccessExpr, AccessKind, ArrayExpr, BetweenExpr, BinaryExpr, BinaryOperator, CaseExpr, CastExpr,
@@ -82,6 +89,11 @@ pub use statistics::{
     ShowAnalyzeJobs, ShowBasicStatsMeta, ShowHistogramStatsMeta, ShowTableStats,
     StatisticsStatement,
 };
+pub use table::{
+    ColumnDefinition, CreateTable, LegacyRangePartition, LegacyRangePartitionDefinition,
+    PartitionTransform, TableDistribution, TableKey, TableKeyKind, TablePartition,
+    TablePartitionTransform, TableProperty, TableStatement,
+};
 pub use validate::{validate_statement, validate_statements};
 pub use view::{CreateView, DropView, ShowCreateView, ShowViews, ViewStatement};
 pub use visit::{
@@ -111,6 +123,8 @@ pub enum Statement {
     Maintenance(MaintenanceStatement),
     MaterializedView(MaterializedViewStatement),
     View(ViewStatement),
+    Table(TableStatement),
+    Dml(DmlStatement),
     Query(Query),
     ExplainQuery(ExplainQuery),
     RawQuery(RawQuerySlice),
@@ -126,6 +140,8 @@ impl Statement {
             Self::Maintenance(statement) => statement.span(),
             Self::MaterializedView(statement) => statement.span(),
             Self::View(statement) => statement.span(),
+            Self::Table(statement) => statement.span(),
+            Self::Dml(statement) => statement.span(),
             Self::Query(query) => query.span,
             Self::ExplainQuery(query) => query.span,
             Self::RawQuery(query) => query.span,

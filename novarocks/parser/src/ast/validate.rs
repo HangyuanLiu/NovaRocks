@@ -50,6 +50,8 @@ pub fn validate_statement(statement: &Statement) -> Result<(), ValidateError> {
         | Statement::Maintenance(_)
         | Statement::MaterializedView(_)
         | Statement::View(_)
+        | Statement::Table(_)
+        | Statement::Dml(_)
         | Statement::RawQuery(_) => Ok(()),
     }
 }

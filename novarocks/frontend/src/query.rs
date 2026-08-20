@@ -283,6 +283,10 @@ impl CoreCommandRoute for TypedCommandRoute {
                     &connector_context,
                 )
             }
+            ParsedStatement::Table(_) | ParsedStatement::Dml(_) => Err(
+                "typed DDL/DML syntax has no frontend execution owner; SQLP-5 cut is in progress"
+                    .to_string(),
+            ),
             ParsedStatement::Query(_) | ParsedStatement::ExplainQuery(_) => Err(
                 "typed query syntax has no frontend execution owner; LegacyFrontier remains authoritative"
                     .to_string(),
