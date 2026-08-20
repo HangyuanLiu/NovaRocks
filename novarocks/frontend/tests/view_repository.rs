@@ -36,7 +36,9 @@ use novarocks_spi::state_store::{
     StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
     StoreIdentity, TransactionId, Value, VersionToken, WriteTransaction,
 };
-use novarocks_state_store::{
+mod common;
+use common::state_store_fixture as state_store_test;
+use state_store_test::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
@@ -159,7 +161,7 @@ fn codec_rejects_unknown_schema_non_normalized_names_non_queries_and_oversized_v
 
 fn sqlite_config(path: &Path) -> StateStoreConfig {
     StateStoreConfig {
-        cluster_id: "view-repository-test".to_string(),
+        cluster_id: format!("view-repository-test-{}", path.display()),
         limits: StateStoreLimitOverrides {
             max_page_size: Some(1),
             ..StateStoreLimitOverrides::default()

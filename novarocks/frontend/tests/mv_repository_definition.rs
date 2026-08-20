@@ -25,7 +25,10 @@ use novarocks_spi::state_store::{
     StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
     StoreIdentity, TransactionId, Value, WriteTransaction,
 };
-use novarocks_state_store::{
+#[path = "common/mod.rs"]
+mod common;
+use common::state_store_fixture as state_store_test;
+use state_store_test::{
     OperationId, StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
     derive_transaction_id,
@@ -38,6 +41,7 @@ pub(crate) fn repository() -> (
     Arc<StateStoreMvRepository>,
 ) {
     let temp = tempfile::tempdir().expect("temporary StateStore directory");
+    let cluster_id = format!("mv-repository-test-{}", temp.path().display());
     let runtime = tokio::runtime::Runtime::new().expect("repository runtime");
     let registry = builtin_state_store_provider_registry().expect("built-in StateStore providers");
     let host = runtime
@@ -46,7 +50,7 @@ pub(crate) fn repository() -> (
             StateStoreHostConfig {
                 state_store: StateStoreAppConfig {
                     store: StateStoreConfig {
-                        cluster_id: "mv-repository-test".to_string(),
+                        cluster_id,
                         limits: StateStoreLimitOverrides::default(),
                         provider: StateStoreProviderConfig::Sqlite {
                             path: temp.path().join("state-store.sqlite"),
@@ -542,7 +546,7 @@ fn sqlite_state_store_reopen_preserves_mv_records() {
             StateStoreHostConfig {
                 state_store: StateStoreAppConfig {
                     store: StateStoreConfig {
-                        cluster_id: "mv-repository-test".to_string(),
+                        cluster_id: format!("mv-repository-test-{}", temp.path().display()),
                         limits: StateStoreLimitOverrides::default(),
                         provider: StateStoreProviderConfig::Sqlite {
                             path: temp.path().join("state-store.sqlite"),

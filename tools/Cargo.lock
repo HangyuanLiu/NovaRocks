@@ -2901,6 +2901,7 @@ dependencies = [
 name = "novarocks-frontend"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "apache-avro",
  "arrow",
  "arrow-buffer",
@@ -2917,11 +2918,12 @@ dependencies = [
  "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-fs",
+ "novarocks-parser",
  "novarocks-protocol",
  "novarocks-spi",
  "novarocks-sql",
- "novarocks-state-store",
  "novarocks-types",
+ "novarocks-user-error",
  "novarocks-version",
  "once_cell",
  "opensrv-mysql",
@@ -2960,6 +2962,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-parser"
+version = "0.1.0"
+dependencies = [
+ "novarocks-user-error",
+]
+
+[[package]]
 name = "novarocks-protocol"
 version = "0.1.0"
 dependencies = [
@@ -2988,7 +2997,7 @@ dependencies = [
  "novarocks-frontend",
  "novarocks-fs",
  "novarocks-spi",
- "novarocks-state-store",
+ "novarocks-state-store-sqlite",
  "novarocks-types",
  "serde",
  "tokio",
@@ -3032,23 +3041,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-state-store"
+name = "novarocks-state-store-sqlite"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "bytes",
  "fs2",
- "futures",
- "hex",
- "libc",
  "novarocks-spi",
  "rusqlite",
- "serde",
- "serde_json",
- "sha2",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -3080,6 +3081,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "novarocks-user-error"
+version = "0.1.0"
 
 [[package]]
 name = "novarocks-version"

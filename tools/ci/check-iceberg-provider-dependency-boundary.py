@@ -42,7 +42,7 @@ FORBIDDEN_PROVIDER_CLOSURE = {
     "novarocks-frontend",
     "novarocks-backend",
     "novarocks-protocol",
-    "novarocks-state-store",
+    "novarocks-state-store-sqlite",
     "novarocks-connector-starrocks",
 }
 ALLOWED_PROVIDER_INTERNAL = {
@@ -136,7 +136,7 @@ def verify_roles(metadata):
 
     server = package(metadata, SERVER)
     direct = dependency_names(server, {None})
-    missing = sorted({PROVIDER, "novarocks-state-store"} - direct)
+    missing = sorted({PROVIDER, "novarocks-state-store-sqlite"} - direct)
     if missing:
         fail("server composition root is missing direct dependencies: " + ", ".join(missing))
 

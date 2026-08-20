@@ -30,6 +30,7 @@ use crate::query_execution::maintenance::{
     MaintenanceAttemptCancellationSource, MaintenanceRequestContext, MaintenanceStatementResult,
     MaintenanceTargetRebind, OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
 };
+use crate::state_store::coordination::WriteAdmission;
 use novarocks_failpoint::{
     CleanupFaultKind, claim_configured_cleanup_fault as claim_cleanup_fault,
 };
@@ -47,7 +48,6 @@ use novarocks_spi::connector::{
     ConnectorHistoricalMaintenanceOutcome,
 };
 use novarocks_spi::state_store::StateStore;
-use novarocks_state_store::coordination::WriteAdmission;
 use tokio::runtime::Handle;
 
 pub(crate) use self::admission::{

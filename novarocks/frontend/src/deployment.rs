@@ -21,7 +21,6 @@ use std::num::NonZeroUsize;
 use async_trait::async_trait;
 use bytes::Bytes;
 use novarocks_spi::state_store::FeDeploymentView;
-use novarocks_state_store::{StateStoreConfig, StateStoreProviderConfig};
 use sha2::{Digest, Sha256};
 
 const REVISION_DOMAIN: &[u8] = b"novarocks/fe-deployment-view/v1";
@@ -68,33 +67,27 @@ pub struct SqliteSingleFeDeploymentViewSource {
 }
 
 impl SqliteSingleFeDeploymentViewSource {
-    pub fn try_from_state_store_config(
-        config: &StateStoreConfig,
+    pub fn new(
+        cluster_id: &str,
+        deployment_owner: &str,
     ) -> Result<Self, FeDeploymentViewSourceError> {
-        let StateStoreProviderConfig::Sqlite {
-            deployment_owner, ..
-        } = &config.provider
-        else {
+        if cluster_id.trim().is_empty() || deployment_owner.trim().is_empty() {
             return Err(FeDeploymentViewSourceError::new(
-                FeDeploymentViewSourceErrorKind::UnsupportedProvider,
-                "SQLite single-FE deployment source requires the SQLite state store provider",
-            ));
-        };
-
-        config.validate().map_err(|_| {
-            FeDeploymentViewSourceError::new(
                 FeDeploymentViewSourceErrorKind::InvalidConfiguration,
-                "SQLite state store configuration is invalid",
-            )
-        })?;
-
-        let topology_revision = derive_topology_revision(&config.cluster_id, deployment_owner)?;
+                "SQLite deployment identity fields must not be empty",
+            ));
+        }
+        let topology_revision = derive_topology_revision(cluster_id, deployment_owner)?;
         Ok(Self {
             snapshot: FeDeploymentView {
                 active_fe_count: SQLITE_SINGLE_FE_COUNT,
                 topology_revision,
             },
         })
+    }
+
+    pub fn snapshot_value(&self) -> FeDeploymentView {
+        self.snapshot.clone()
     }
 }
 

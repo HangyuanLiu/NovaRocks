@@ -25,6 +25,9 @@ mod range;
 #[cfg(feature = "state-store-conformance")]
 pub mod conformance;
 
+#[cfg(feature = "state-store-conformance")]
+pub mod testing;
+
 pub use contract::{
     ChangeHint, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Key,
     Precondition, RangePage, ReadTransaction, StateRecord, StateStore, StoreIdentity,
@@ -36,12 +39,12 @@ pub use limits::{
     MAX_TRANSACTION_BYTES, MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
 };
 pub use metrics::{
-    STATE_STORE_OPERATION_COUNT, STATE_STORE_OUTCOME_COUNT, StateStoreMetricsSnapshot,
-    StateStoreOperation, StateStoreOutcome,
+    STATE_STORE_OPERATION_COUNT, STATE_STORE_OUTCOME_COUNT, StateStoreMetrics,
+    StateStoreMetricsSnapshot, StateStoreOperation, StateStoreOutcome,
 };
 pub use provider::{
-    FeDeploymentView, StateStoreOpenRequest, StateStoreProviderDescriptor,
-    StateStoreProviderFactory, StateStoreProviderId, StateStoreProviderIdError,
-    StateStoreProviderInstance, StateStoreProviderLifecycle,
+    FeDeploymentView, StateStoreOpenRequest, StateStoreProviderAccessMode,
+    StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderId,
+    StateStoreProviderIdError, StateStoreProviderInstance, StateStoreProviderLifecycle,
 };
 pub use range::{ChangeCursor, ContinuationToken, Direction, KeyRange, RangeRequest};

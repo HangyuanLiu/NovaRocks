@@ -978,6 +978,10 @@ mod tests {
         BeginFrontendMvRefreshIntentRequest, CreateMvRepositoryRequest,
         InitialMvRefreshConfiguration, MvRepository,
     };
+    use crate::state_store::testing::{
+        StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+        StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
+    };
     use novarocks_spi::connector::{
         ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,
         ConnectorCommittedVersion, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
@@ -988,10 +992,6 @@ mod tests {
     };
     use novarocks_spi::state_store::FeDeploymentView;
     use novarocks_sql::planning::mv::ApplyKeySource;
-    use novarocks_state_store::{
-        StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
-        StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
-    };
 
     use super::*;
     use crate::connector::ConnectorControlHost;

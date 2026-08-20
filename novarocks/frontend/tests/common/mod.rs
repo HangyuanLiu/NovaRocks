@@ -17,5 +17,8 @@
 
 //! Shared fixtures for the frontend integration tests.
 
+#![allow(clippy::duplicate_mod)]
+
 pub mod coordination_fixture;
 pub mod fence_fixture;
+pub mod state_store_fixture;

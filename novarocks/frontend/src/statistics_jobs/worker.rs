@@ -27,14 +27,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
-use novarocks_spi::connector::ExternalMutationEvidence;
-use novarocks_spi::state_store::StateStore;
-use novarocks_state_store::OperationId;
-use novarocks_state_store::coordination::{
+use crate::state_store::OperationId;
+use crate::state_store::coordination::{
     AcquireOutcome, AttemptId, CoordinationError, CoordinationErrorKind, LeaseFence, LeaseManager,
     ResourceKey,
 };
+use bytes::Bytes;
+use novarocks_spi::connector::ExternalMutationEvidence;
+use novarocks_spi::state_store::StateStore;
 use uuid::Uuid;
 
 use super::model::{StatisticsJob, StatisticsJobError, StatisticsJobErrorKind, StatisticsJobState};
@@ -305,7 +305,7 @@ async fn run_worker(
 }
 
 async fn release_worker_lease(
-    guard: &mut novarocks_state_store::coordination::LeaseGuard,
+    guard: &mut crate::state_store::coordination::LeaseGuard,
 ) -> Result<(), CoordinationError> {
     for attempt in 1..=STATISTICS_LEASE_RELEASE_MAX_ATTEMPTS {
         let operation_id = OperationId::new_v7();
@@ -400,7 +400,7 @@ async fn process_cancellation_requests(
 async fn reconcile_publishing(
     repository: &StatisticsJobRepository,
     executor: &Weak<dyn StatisticsAttemptExecutor>,
-    guard: &mut novarocks_state_store::coordination::LeaseGuard,
+    guard: &mut crate::state_store::coordination::LeaseGuard,
     current_fence: &crate::coordination::CurrentLeaseFence,
     fence: &FenceValidator,
     stop: &AtomicBool,
@@ -481,7 +481,7 @@ async fn reconcile_publishing(
 async fn process_submitted(
     repository: &StatisticsJobRepository,
     executor: &Weak<dyn StatisticsAttemptExecutor>,
-    guard: &mut novarocks_state_store::coordination::LeaseGuard,
+    guard: &mut crate::state_store::coordination::LeaseGuard,
     current_fence: &crate::coordination::CurrentLeaseFence,
     claim_fence: &FenceValidator,
     fence: &FenceValidator,
@@ -731,7 +731,7 @@ fn retry_backoff(attempt: u32) -> Duration {
 }
 
 async fn run_with_lease_renewal<T, F>(
-    guard: &mut novarocks_state_store::coordination::LeaseGuard,
+    guard: &mut crate::state_store::coordination::LeaseGuard,
     current_fence: &crate::coordination::CurrentLeaseFence,
     work: F,
 ) -> Result<T, StatisticsAttemptError>

@@ -39,6 +39,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use crate::state_store::OperationId;
+use crate::state_store::coordination::{
+    AcquireOutcome, AttemptId, CoordinationError, CoordinationErrorKind, LeaseGuard, LeaseManager,
+    ResourceKey, WriteAdmission,
+};
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorControlBinding, ConnectorError, ConnectorErrorKind,
@@ -47,11 +52,6 @@ use novarocks_spi::connector::{
     ConnectorTableResolution,
 };
 use novarocks_spi::state_store::StateStore;
-use novarocks_state_store::OperationId;
-use novarocks_state_store::coordination::{
-    AcquireOutcome, AttemptId, CoordinationError, CoordinationErrorKind, LeaseGuard, LeaseManager,
-    ResourceKey, WriteAdmission,
-};
 use uuid::Uuid;
 
 use crate::coordination::{CurrentLeaseFence, FenceValidator, FrontendCoordinationRuntime};
@@ -645,7 +645,7 @@ const RENEW_CONFLICT_RETRIES: u8 = 3;
 /// nothing to recover and a fresh ID may simply try again.
 async fn renew_once(
     guard: &tokio::sync::Mutex<LeaseGuard>,
-) -> Result<novarocks_state_store::coordination::LeaseFence, CoordinationError> {
+) -> Result<crate::state_store::coordination::LeaseFence, CoordinationError> {
     let mut remaining = RENEW_CONFLICT_RETRIES;
     loop {
         let operation_id = OperationId::new_v7();
@@ -924,16 +924,16 @@ mod tests {
         armed: &Arc<std::sync::atomic::AtomicUsize>,
         uncertain: &Arc<std::sync::atomic::AtomicUsize>,
     ) -> MvRefreshCoordination {
-        let registry = novarocks_state_store::builtin_state_store_provider_registry()
+        let registry = crate::state_store::testing::builtin_state_store_provider_registry()
             .expect("built-in provider registry");
-        let inner = novarocks_state_store::StateStoreHost::open(
+        let inner = crate::state_store::testing::StateStoreHost::open(
             &registry,
-            novarocks_state_store::StateStoreHostConfig {
-                state_store: novarocks_state_store::StateStoreAppConfig {
-                    store: novarocks_state_store::StateStoreConfig {
+            crate::state_store::testing::StateStoreHostConfig {
+                state_store: crate::state_store::testing::StateStoreAppConfig {
+                    store: crate::state_store::testing::StateStoreConfig {
                         cluster_id: "mv-refresh-lease-conflict".to_string(),
-                        limits: novarocks_state_store::StateStoreLimitOverrides::default(),
-                        provider: novarocks_state_store::StateStoreProviderConfig::Sqlite {
+                        limits: crate::state_store::testing::StateStoreLimitOverrides::default(),
+                        provider: crate::state_store::testing::StateStoreProviderConfig::Sqlite {
                             path: path.to_path_buf(),
                             deployment_owner: "mv-refresh-lease-conflict-fe".to_string(),
                         },

@@ -40,10 +40,12 @@ use novarocks_frontend::table_maintenance::repository::{
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_spi::state_store::{FeDeploymentView, StateStore};
-use novarocks_state_store::coordination::{
+mod common;
+use common::state_store_fixture as state_store_test;
+use state_store_test::coordination::{
     ClockHealth, CoordinationError, IncarnationGate, LeaseClock, LeaseManager, LeaseSettings,
 };
-use novarocks_state_store::{
+use state_store_test::{
     OperationId, StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
@@ -88,7 +90,7 @@ impl LeaseClock for ManualClock {
 
 fn sqlite_config(path: &Path) -> StateStoreConfig {
     StateStoreConfig {
-        cluster_id: "table-maintenance-coordination-test".to_string(),
+        cluster_id: format!("table-maintenance-coordination-test-{}", path.display()),
         limits: StateStoreLimitOverrides::default(),
         provider: StateStoreProviderConfig::Sqlite {
             path: path.to_path_buf(),

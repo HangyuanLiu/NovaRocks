@@ -40,10 +40,12 @@ use novarocks_spi::state_store::{
     StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
     StoreIdentity, TransactionId, Value, WriteTransaction,
 };
-use novarocks_state_store::coordination::{
+mod common;
+use common::state_store_fixture as state_store_test;
+use state_store_test::coordination::{
     ControlPlaneIncarnation, CoordinationError, FencingToken, IncarnationGate, ResourceEpoch,
 };
-use novarocks_state_store::{
+use state_store_test::{
     OperationId, StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
@@ -55,7 +57,7 @@ const PREFIX: &str = "novarocks/frontend/table-maintenance/v1/";
 
 fn sqlite_config(path: &Path) -> StateStoreConfig {
     StateStoreConfig {
-        cluster_id: "table-maintenance-repository-test".to_string(),
+        cluster_id: format!("table-maintenance-repository-test-{}", path.display()),
         limits: StateStoreLimitOverrides {
             max_page_size: Some(1),
             ..StateStoreLimitOverrides::default()

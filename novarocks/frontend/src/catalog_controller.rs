@@ -295,6 +295,11 @@ mod tests {
         CatalogApplicationPort, CatalogCreateCommand, CatalogDropCommand,
         CatalogRuntimeObservation, CatalogRuntimePublisherSink,
     };
+    use crate::state_store::testing::{
+        StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+        StateStoreLimitOverrides, StateStoreProviderConfig, TEST_STATE_STORE_PROVIDER_ID,
+        builtin_state_store_provider_registry,
+    };
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorControlCreation, ConnectorControlFactory, ConnectorControlFactoryRequest,
@@ -305,11 +310,6 @@ mod tests {
         StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits,
         StateStoreMetricsSnapshot, StoreIdentity, TransactionId, WriteTransaction,
         conformance::FaultInjectingStateStore,
-    };
-    use novarocks_state_store::{
-        SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHost,
-        StateStoreHostConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
-        builtin_state_store_provider_registry,
     };
 
     use super::*;
@@ -722,7 +722,7 @@ mod tests {
         )
         .await
         .expect("open SQLite StateStore");
-        assert_eq!(host.provider_id(), SQLITE_STATE_STORE_PROVIDER_ID);
+        assert_eq!(host.provider_id(), TEST_STATE_STORE_PROVIDER_ID);
         let store = host.state_store().expect("ready StateStore");
         (directory, host, store)
     }

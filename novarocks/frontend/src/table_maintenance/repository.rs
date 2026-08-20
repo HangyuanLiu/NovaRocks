@@ -21,6 +21,9 @@ use std::sync::Arc;
 
 use crate::maintenance::MaintenanceTarget;
 use crate::query_execution::maintenance::OptimizeJobState;
+use crate::state_store::coordination::WriteAdmission;
+use crate::state_store::metrics::StateStoreMetrics;
+use crate::state_store::{OperationId, RunFailure, run_side_effect_free};
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteAttemptCheckpoint as SpiRewriteCheckpoint,
@@ -32,9 +35,6 @@ use novarocks_spi::state_store::{
     StateStore, StateStoreError, StateStoreErrorKind, TransactionId, Value, VersionToken,
     WriteTransaction,
 };
-use novarocks_state_store::coordination::WriteAdmission;
-use novarocks_state_store::metrics::StateStoreMetrics;
-use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -998,7 +998,7 @@ impl OptimizeJobRepository {
 
     async fn resolve_unit_mutation(
         &self,
-        result: Result<novarocks_state_store::RunSuccess<RepositoryResult<()>>, RunFailure>,
+        result: Result<crate::state_store::RunSuccess<RepositoryResult<()>>, RunFailure>,
         operation_id: OperationId,
         action: StoredOptimizeOperationActionV1,
         job_id: i64,
@@ -3415,7 +3415,7 @@ impl MetadataMaintenanceOperationRepository {
     async fn resolve_metadata_result(
         &self,
         result: Result<
-            novarocks_state_store::RunSuccess<RepositoryResult<MetadataMaintenanceOperation>>,
+            crate::state_store::RunSuccess<RepositoryResult<MetadataMaintenanceOperation>>,
             RunFailure,
         >,
         transaction_operation_id: OperationId,
@@ -5809,7 +5809,7 @@ impl DistributedRewriteOperationRepository {
     async fn resolve_rewrite_result(
         &self,
         result: Result<
-            novarocks_state_store::RunSuccess<RepositoryResult<DistributedRewriteOperation>>,
+            crate::state_store::RunSuccess<RepositoryResult<DistributedRewriteOperation>>,
             RunFailure,
         >,
         _transaction_operation_id: OperationId,

@@ -1,0 +1,39 @@
+[package]
+name = "novarocks-state-store-mysql"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "state-store-mysql-helper"
+path = "tests/support/state_store_mysql_helper.rs"
+required-features = ["state-store-test-hooks"]
+test = false
+bench = false
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+hex = "0.4"
+mysql_async = { version = "=0.37.0", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12"] }
+novarocks-spi = { path = "../../spi" }
+rustls = { version = "0.23", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+
+[dev-dependencies]
+novarocks-spi = { path = "../../spi", features = ["state-store-conformance"] }
+tempfile = "3"
+
+[features]
+default = ["mysql-state-store-provider"]
+mysql-state-store-provider = []
+state-store-test-hooks = []

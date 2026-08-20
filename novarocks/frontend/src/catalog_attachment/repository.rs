@@ -19,13 +19,13 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::state_store::metrics::StateStoreMetrics;
+use crate::state_store::{OperationId, RunFailure, run_side_effect_free};
 use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
 use novarocks_spi::state_store::{
     CommitResolution, Direction, KeyRange, Precondition, RangeRequest, StateRecord, StateStore,
     StateStoreError, StateStoreErrorKind, VersionToken,
 };
-use novarocks_state_store::metrics::StateStoreMetrics;
-use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
 use uuid::Uuid;
 
 use crate::durable::{DurableRecordError, DurableRecordStore};
@@ -672,15 +672,15 @@ mod tests {
     use crate::mv::domain::dependency::model::{
         MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
     };
+    use crate::state_store::testing::{
+        StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+        StateStoreLimitOverrides, StateStoreProviderConfig, TEST_STATE_STORE_PROVIDER_ID,
+        builtin_state_store_provider_registry,
+    };
     use bytes::Bytes;
     use novarocks_spi::state_store::{
         CommitOutcome, FeDeploymentView, Precondition, StateStore, TransactionId,
         conformance::{FaultGate, FaultInjectingStateStore},
-    };
-    use novarocks_state_store::{
-        SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHost,
-        StateStoreHostConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
-        builtin_state_store_provider_registry,
     };
 
     use super::*;
@@ -743,7 +743,7 @@ mod tests {
         )
         .await
         .expect("open SQLite StateStore");
-        assert_eq!(host.provider_id(), SQLITE_STATE_STORE_PROVIDER_ID);
+        assert_eq!(host.provider_id(), TEST_STATE_STORE_PROVIDER_ID);
         let store = host.state_store().expect("ready StateStore");
         let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
             .await

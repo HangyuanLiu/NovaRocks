@@ -34,11 +34,13 @@ use novarocks_spi::connector::{
     ConnectorMvRefreshResourceIdentity, ConnectorProviderId, ConnectorTableObjectId,
 };
 use novarocks_spi::state_store::FeDeploymentView;
-use novarocks_state_store::{
+mod common;
+use common::state_store_fixture as state_store_test;
+use sha2::{Digest, Sha256};
+use state_store_test::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
-use sha2::{Digest, Sha256};
 
 #[path = "mv_repository_definition.rs"]
 mod definition_support;
@@ -54,6 +56,7 @@ fn repository() -> (
     Arc<StateStoreMvRepository>,
 ) {
     let temp = tempfile::tempdir().expect("temporary StateStore directory");
+    let cluster_id = format!("mv-refresh-test-{}", temp.path().display());
     let runtime = tokio::runtime::Runtime::new().expect("repository runtime");
     let registry = builtin_state_store_provider_registry().expect("built-in StateStore providers");
     let host = runtime
@@ -62,7 +65,7 @@ fn repository() -> (
             StateStoreHostConfig {
                 state_store: StateStoreAppConfig {
                     store: StateStoreConfig {
-                        cluster_id: "mv-refresh-test".to_string(),
+                        cluster_id,
                         limits: StateStoreLimitOverrides::default(),
                         provider: StateStoreProviderConfig::Sqlite {
                             path: temp.path().join("state-store.sqlite"),
@@ -96,6 +99,7 @@ fn limited_repository() -> (
     Arc<StateStoreMvRepository>,
 ) {
     let temp = tempfile::tempdir().expect("temporary StateStore directory");
+    let cluster_id = format!("mv-refresh-limit-test-{}", temp.path().display());
     let runtime = tokio::runtime::Runtime::new().expect("repository runtime");
     let registry = builtin_state_store_provider_registry().expect("built-in StateStore providers");
     let host = runtime
@@ -104,7 +108,7 @@ fn limited_repository() -> (
             StateStoreHostConfig {
                 state_store: StateStoreAppConfig {
                     store: StateStoreConfig {
-                        cluster_id: "mv-refresh-limit-test".to_string(),
+                        cluster_id,
                         limits: StateStoreLimitOverrides {
                             max_page_size: Some(2),
                             ..StateStoreLimitOverrides::default()
@@ -1051,6 +1055,7 @@ fn fenced_repository(
     Arc<StateStoreMvRepository>,
 ) {
     let temp = tempfile::tempdir().expect("temporary StateStore directory");
+    let cluster_id = format!("mv-refresh-fence-test-{}", temp.path().display());
     let runtime = tokio::runtime::Runtime::new().expect("repository runtime");
     let registry = builtin_state_store_provider_registry().expect("built-in StateStore providers");
     let host = runtime
@@ -1059,7 +1064,7 @@ fn fenced_repository(
             StateStoreHostConfig {
                 state_store: StateStoreAppConfig {
                     store: StateStoreConfig {
-                        cluster_id: "mv-refresh-fence-test".to_string(),
+                        cluster_id,
                         limits: StateStoreLimitOverrides::default(),
                         provider: StateStoreProviderConfig::Sqlite {
                             path: temp.path().join("state-store.sqlite"),
@@ -1271,6 +1276,7 @@ fn installing_a_fence_source_without_registration_stops_every_refresh() {
 #[test]
 fn two_frontends_competing_for_one_target_yield_a_single_owner() {
     let temp = tempfile::tempdir().expect("temporary StateStore directory");
+    let cluster_id = format!("mv-ownership-race-{}", temp.path().display());
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let registry = builtin_state_store_provider_registry().expect("providers");
     let host = runtime
@@ -1279,7 +1285,7 @@ fn two_frontends_competing_for_one_target_yield_a_single_owner() {
             StateStoreHostConfig {
                 state_store: StateStoreAppConfig {
                     store: StateStoreConfig {
-                        cluster_id: "mv-ownership-race".to_string(),
+                        cluster_id,
                         limits: StateStoreLimitOverrides::default(),
                         provider: StateStoreProviderConfig::Sqlite {
                             path: temp.path().join("state-store.sqlite"),

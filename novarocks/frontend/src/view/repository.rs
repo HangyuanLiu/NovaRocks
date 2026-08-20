@@ -20,6 +20,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::common::persisted_query_definition::PersistedQueryDefinition;
+use crate::state_store::metrics::StateStoreMetrics;
+use crate::state_store::{OperationId, RunFailure, run_side_effect_free};
 use crate::view::ViewSqlDialect;
 use bytes::Bytes;
 use novarocks_catalog::identifier::normalize_identifier;
@@ -27,8 +29,6 @@ use novarocks_spi::state_store::{
     Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore,
     StateStoreLimits, Value, WriteTransaction,
 };
-use novarocks_state_store::metrics::StateStoreMetrics;
-use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use sqlparser::ast::Statement;

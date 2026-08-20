@@ -18,12 +18,12 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::state_store::coordination::FencingToken;
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorWriteReceipt,
     ExternalMutationEvidence,
 };
-use novarocks_state_store::coordination::FencingToken;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 

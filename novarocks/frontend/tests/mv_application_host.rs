@@ -23,29 +23,14 @@ use novarocks_frontend::{
     FrontendExecutionConfig,
 };
 use novarocks_spi::state_store::{CommitOutcome, Precondition, TransactionId, Value};
-use novarocks_state_store::{
-    StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig, StateStoreLimitOverrides,
-    StateStoreProviderConfig,
-};
+mod common;
+use common::state_store_fixture;
 use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 
-fn sqlite_config(temp: &TempDir) -> StateStoreHostConfig {
-    StateStoreHostConfig {
-        state_store: StateStoreAppConfig {
-            store: StateStoreConfig {
-                cluster_id: "frontend-mv-host".to_owned(),
-                limits: StateStoreLimitOverrides::default(),
-                provider: StateStoreProviderConfig::Sqlite {
-                    path: temp.path().join("state-store.sqlite"),
-                    deployment_owner: "frontend-fe".to_owned(),
-                },
-            },
-            mysql_client: None,
-        },
-        foundationdb_client: None,
-    }
+fn state_store_input(temp: &TempDir) -> novarocks_frontend::StateStoreHostInput {
+    state_store_fixture::input(format!("frontend-mv-host-{}", temp.path().display()))
 }
 
 fn execution_config() -> FrontendExecutionConfig {
@@ -53,12 +38,15 @@ fn execution_config() -> FrontendExecutionConfig {
 }
 
 async fn open_host(
-    config: Option<StateStoreHostConfig>,
+    input: Option<novarocks_frontend::StateStoreHostInput>,
 ) -> Result<FrontendApplicationHost, novarocks_frontend::FrontendApplicationError> {
-    FrontendApplicationHost::open(
-        config,
+    let registry = state_store_fixture::registry();
+    FrontendApplicationHost::open_with_factories_and_state_store_registry(
+        input,
+        &registry,
         execution_config(),
         backend_config(),
+        Vec::new(),
         tokio::runtime::Handle::current(),
     )
     .await
@@ -78,7 +66,7 @@ fn backend_config() -> ClusterBackendOpenConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn configured_sqlite_opens_and_reopens_mv_repository() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
-    let config = sqlite_config(&temp);
+    let config = state_store_input(&temp);
 
     let host = open_host(Some(config.clone()))
         .await
@@ -109,7 +97,7 @@ async fn absent_state_store_keeps_host_available_but_mv_unavailable() {
 #[tokio::test]
 async fn current_thread_runtime_rejects_sync_mv_repository_calls_without_panicking() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
-    let host = open_host(Some(sqlite_config(&temp)))
+    let host = open_host(Some(state_store_input(&temp)))
         .await
         .expect("configured host");
     let repository = host.mv_repository();
@@ -130,7 +118,7 @@ async fn current_thread_runtime_rejects_sync_mv_repository_calls_without_panicki
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrupt_mv_record_fails_open_and_releases_provider_for_retry() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
-    let config = sqlite_config(&temp);
+    let config = state_store_input(&temp);
     let host = open_host(Some(config.clone()))
         .await
         .expect("configured host");

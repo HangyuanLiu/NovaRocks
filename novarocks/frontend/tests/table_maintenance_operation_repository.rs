@@ -41,8 +41,10 @@ use novarocks_frontend::table_maintenance::repository::{
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_spi::state_store::{FeDeploymentView, StateStore};
-use novarocks_state_store::coordination::{ControlPlaneIncarnation, FencingToken, ResourceEpoch};
-use novarocks_state_store::{
+mod common;
+use common::state_store_fixture as state_store_test;
+use state_store_test::coordination::{ControlPlaneIncarnation, FencingToken, ResourceEpoch};
+use state_store_test::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
@@ -51,7 +53,10 @@ use uuid::Uuid;
 
 fn sqlite_config(path: &Path) -> StateStoreConfig {
     StateStoreConfig {
-        cluster_id: "table-maintenance-operation-repository-test".to_string(),
+        cluster_id: format!(
+            "table-maintenance-operation-repository-test-{}",
+            path.display()
+        ),
         limits: StateStoreLimitOverrides::default(),
         provider: StateStoreProviderConfig::Sqlite {
             path: path.to_path_buf(),

@@ -16,7 +16,6 @@
 // under the License.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -66,20 +65,19 @@ use novarocks_frontend::dml::{
     TruncateLifecycleRecord,
 };
 use novarocks_spi::state_store::{
-    ChangePage, ChangePollRequest, CommitOutcome as StateStoreCommitOutcome, CommitResolution,
-    FeDeploymentView, Key, Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord,
-    StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
+    ChangePage, ChangePollRequest, CommitOutcome as StateStoreCommitOutcome, CommitResolution, Key,
+    Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord, StateStore,
+    StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
     StoreIdentity, TransactionId, Value, WriteTransaction,
 };
-use novarocks_state_store::OperationId;
-use novarocks_state_store::coordination::{
+mod common;
+use common::state_store_fixture;
+use novarocks_frontend::OperationId;
+use novarocks_frontend::StateStoreHost;
+use novarocks_frontend::state_store::coordination::{
     AcquireOutcome, AttemptId, ClockHealth, ControlPlaneIncarnation, CoordinationError,
     CoordinationErrorKind, FencingToken, HolderId, IncarnationGate, LeaseClock, LeaseFence,
     LeaseGuard, LeaseManager, LeaseSettings, ResourceEpoch, WriteAdmission,
-};
-use novarocks_state_store::{
-    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
-    StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -95,31 +93,12 @@ const CTAS_RECOVERY_PREFIX: &str = "novarocks/frontend/dml/v1/ctas-recoveries/";
     dead_code,
     reason = "Retained for state-store journal fixture construction."
 )]
-fn config(path: &std::path::Path) -> StateStoreHostConfig {
-    config_with_max_value_bytes(path, None)
-}
-
-fn config_with_max_value_bytes(
-    path: &std::path::Path,
-    max_value_bytes: Option<usize>,
-) -> StateStoreHostConfig {
-    StateStoreHostConfig {
-        state_store: StateStoreAppConfig {
-            store: StateStoreConfig {
-                cluster_id: "dml-journal-test".to_string(),
-                limits: StateStoreLimitOverrides {
-                    max_value_bytes,
-                    ..StateStoreLimitOverrides::default()
-                },
-                provider: StateStoreProviderConfig::Sqlite {
-                    path: path.to_path_buf(),
-                    deployment_owner: "dml-journal-fe".to_string(),
-                },
-            },
-            mysql_client: None,
-        },
-        foundationdb_client: None,
+fn limits_with_max_value_bytes(max_value_bytes: Option<usize>) -> StateStoreLimits {
+    let mut limits = StateStoreLimits::default();
+    if let Some(max_value_bytes) = max_value_bytes {
+        limits.max_value_bytes = max_value_bytes;
     }
+    limits
 }
 
 async fn open_store(
@@ -140,18 +119,12 @@ async fn open_store_with_max_value_bytes(
     Arc<dyn StateStore>,
     StateStoreOperationJournal,
 ) {
-    let registry = builtin_state_store_provider_registry().expect("provider registry");
-    let host = StateStoreHost::open(
-        &registry,
-        config_with_max_value_bytes(path, max_value_bytes),
-        FeDeploymentView {
-            active_fe_count: NonZeroUsize::new(1).unwrap(),
-            topology_revision: Bytes::from_static(b"dml-journal-topology"),
-        },
-        Instant::now() + Duration::from_secs(5),
-    )
-    .await
-    .expect("open SQLite StateStore");
+    let cluster_id = format!("dml-journal-test-{}", path.display());
+    let host = state_store_fixture::open_with_input(state_store_fixture::input_with_limits(
+        cluster_id,
+        limits_with_max_value_bytes(max_value_bytes),
+    ))
+    .await;
     let store = host.state_store().expect("StateStore exposure");
     let journal =
         StateStoreOperationJournal::open(Arc::clone(&store), tokio::runtime::Handle::current())

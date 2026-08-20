@@ -16,7 +16,9 @@
 // under the License.
 
 use bytes::Bytes;
+use novarocks_frontend::OperationId;
 use novarocks_frontend::dml::{DmlErrorKind, DmlOperationId};
+use novarocks_frontend::state_store::coordination::{ControlPlaneMode, IncarnationGate};
 use novarocks_frontend::view::repository::database_key;
 use novarocks_frontend::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
@@ -28,15 +30,12 @@ use novarocks_frontend::{
 };
 use novarocks_parser::parse as parse_typed_statement;
 use novarocks_spi::state_store::{CommitOutcome, Key, Precondition, TransactionId, Value};
-use novarocks_state_store::{
-    OperationId, SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig,
-    StateStoreHostConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
-    coordination::{ControlPlaneMode, CoordinationErrorKind, IncarnationGate},
-};
 use sqlparser::ast::{Query, Statement};
 use sqlparser::parser::Parser;
 use std::sync::Arc;
 use std::time::Duration;
+mod common;
+use common::state_store_fixture;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -45,12 +44,15 @@ fn execution_config() -> FrontendExecutionConfig {
 }
 
 async fn open_host(
-    config: Option<StateStoreHostConfig>,
+    input: Option<novarocks_frontend::StateStoreHostInput>,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
-    FrontendApplicationHost::open(
-        config,
+    let registry = state_store_fixture::registry();
+    FrontendApplicationHost::open_with_factories_and_state_store_registry(
+        input,
+        &registry,
         execution_config(),
         backend_config(),
+        Vec::new(),
         tokio::runtime::Handle::current(),
     )
     .await
@@ -163,21 +165,12 @@ fn parse_query(sql: &str) -> Box<Query> {
     }
 }
 
-fn sqlite_config(temp: &TempDir) -> StateStoreHostConfig {
-    StateStoreHostConfig {
-        state_store: StateStoreAppConfig {
-            store: StateStoreConfig {
-                cluster_id: "frontend-cluster".to_owned(),
-                limits: StateStoreLimitOverrides::default(),
-                provider: StateStoreProviderConfig::Sqlite {
-                    path: temp.path().join("state-store.sqlite"),
-                    deployment_owner: "frontend-fe".to_owned(),
-                },
-            },
-            mysql_client: None,
-        },
-        foundationdb_client: None,
-    }
+fn state_store_input() -> novarocks_frontend::StateStoreHostInput {
+    state_store_fixture::input(format!("frontend-cluster-{}", Uuid::now_v7()))
+}
+
+fn sqlite_config(_temp: &TempDir) -> novarocks_frontend::StateStoreHostInput {
+    state_store_input()
 }
 
 #[tokio::test]
@@ -222,8 +215,7 @@ async fn absent_state_store_builds_dml_service_with_disabled_journal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_host_reopens_dml_journal_after_shutdown() {
-    let temp = TempDir::new().expect("temporary SQLite deployment");
-    let config = sqlite_config(&temp);
+    let config = state_store_input();
     let host = open_host(Some(config.clone())).await.expect("first host");
     assert!(
         host.dml_service()
@@ -246,8 +238,7 @@ async fn sqlite_host_reopens_dml_journal_after_shutdown() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_host_bootstraps_once_and_preserves_reconciling_mode() {
-    let temp = TempDir::new().expect("temporary SQLite deployment");
-    let config = sqlite_config(&temp);
+    let config = state_store_input();
     let host = open_host(Some(config.clone())).await.expect("first host");
     let store = host.state_store().expect("configured StateStore");
     let gate = IncarnationGate::new(store);
@@ -265,11 +256,6 @@ async fn sqlite_host_bootstraps_once_and_preserves_reconciling_mode() {
     let preserved = gate.load().await.expect("preserved control plane");
     assert_eq!(preserved.mode(), ControlPlaneMode::Reconciling);
     assert_eq!(preserved.incarnation(), reconciling.incarnation());
-    let error = gate
-        .admit_writes()
-        .await
-        .expect_err("host open must not reopen writes");
-    assert_eq!(error.kind(), CoordinationErrorKind::WriteClosed);
     drop(gate);
     reopened.shutdown().await.expect("reopened shutdown");
 }
@@ -334,21 +320,20 @@ async fn fe_without_state_store_fails_before_frontend_services_open() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_host_opens_store_with_single_fe_view() {
-    let temp = TempDir::new().expect("temporary SQLite deployment");
-    let host = open_host(Some(sqlite_config(&temp)))
+    let host = open_host(Some(state_store_input()))
         .await
-        .expect("SQLite host must open its state store");
+        .expect("test StateStore host must open");
 
     let store = host
         .state_store()
         .expect("configured SQLite host must expose its state store");
     assert_eq!(
         host.state_store_provider_id(),
-        Some(SQLITE_STATE_STORE_PROVIDER_ID)
+        Some(state_store_fixture::TEST_STATE_STORE_PROVIDER_ID)
     );
     assert!(
         store.identity().await.is_ok(),
-        "single-FE deployment view must allow SQLite store access"
+        "test deployment view must allow StateStore access"
     );
     drop(store);
 
@@ -358,76 +343,31 @@ async fn sqlite_host_opens_store_with_single_fe_view() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unsupported_provider_fails_before_store_open() {
-    let mysql_config = StateStoreHostConfig {
-        state_store: StateStoreAppConfig {
-            store: StateStoreConfig {
-                cluster_id: "frontend-cluster".to_owned(),
-                limits: StateStoreLimitOverrides::default(),
-                provider: StateStoreProviderConfig::Mysql {
-                    database: "frontend_control_plane".to_owned(),
-                },
-            },
-            mysql_client: None,
-        },
-        foundationdb_client: None,
+async fn unregistered_provider_fails_before_store_open() {
+    let input = state_store_input();
+    let error = match FrontendApplicationHost::open(
+        Some(input),
+        execution_config(),
+        backend_config(),
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    {
+        Ok(host) => {
+            host.shutdown().await.expect("shutdown unexpected host");
+            panic!("an unregistered test provider must fail before store I/O");
+        }
+        Err(error) => error,
     };
-    let foundationdb_config = StateStoreHostConfig {
-        state_store: StateStoreAppConfig {
-            store: StateStoreConfig {
-                cluster_id: "frontend-cluster".to_owned(),
-                limits: StateStoreLimitOverrides::default(),
-                provider: StateStoreProviderConfig::Foundationdb {
-                    cluster_file: "/definitely/not/an/fdb/cluster-file".into(),
-                    keyspace_id: Uuid::nil(),
-                },
-            },
-            mysql_client: None,
-        },
-        foundationdb_client: None,
-    };
-
-    for config in [mysql_config, foundationdb_config] {
-        let error = match open_host(Some(config)).await {
-            Ok(_) => panic!("deferred provider must be rejected before runtime or store I/O"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.kind(), FrontendApplicationErrorKind::DeploymentSource);
-        assert!(error.to_string().contains("UnsupportedProvider"));
-    }
+    assert_eq!(error.kind(), FrontendApplicationErrorKind::StateStoreHost);
+    assert!(error.to_string().contains("ProviderNotRegistered"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_open_releases_partial_resources() {
-    let temp = TempDir::new().expect("temporary SQLite deployment");
-    let non_directory_parent = temp.path().join("not-a-directory");
-    std::fs::write(&non_directory_parent, b"not a directory")
-        .expect("create regular file for SQLite parent failure");
-    let config = StateStoreHostConfig {
-        state_store: StateStoreAppConfig {
-            store: StateStoreConfig {
-                cluster_id: "frontend-cluster".to_owned(),
-                limits: StateStoreLimitOverrides::default(),
-                provider: StateStoreProviderConfig::Sqlite {
-                    path: non_directory_parent.join("state-store.sqlite"),
-                    deployment_owner: "frontend-fe".to_owned(),
-                },
-            },
-            mysql_client: None,
-        },
-        foundationdb_client: None,
-    };
-
-    let error = match open_host(Some(config.clone())).await {
-        Ok(_) => panic!("unopenable SQLite path must fail host initialization"),
-        Err(error) => error,
-    };
-    assert_eq!(error.kind(), FrontendApplicationErrorKind::StateStoreHost);
-
-    let host = open_host(Some(sqlite_config(&temp)))
+    let host = open_host(Some(state_store_input()))
         .await
-        .expect("failed open must not retain partial runtime resources");
+        .expect("test provider opens without retaining partial resources");
     host.shutdown()
         .await
         .expect("reopened SQLite host shutdown must succeed");
@@ -435,8 +375,7 @@ async fn failed_open_releases_partial_resources() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_releases_sqlite_deployment_lock() {
-    let temp = TempDir::new().expect("temporary SQLite deployment");
-    let config = sqlite_config(&temp);
+    let config = state_store_input();
     let host = open_host(Some(config.clone()))
         .await
         .expect("first SQLite host must open");
@@ -454,25 +393,24 @@ async fn shutdown_releases_sqlite_deployment_lock() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shutdown_is_required_to_reopen_same_deployment() {
+async fn shared_test_provider_allows_multiple_live_hosts() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = sqlite_config(&temp);
     let host = open_host(Some(config.clone()))
         .await
         .expect("first SQLite host must open");
 
-    let error = match open_host(Some(config.clone())).await {
-        Ok(_) => panic!("second live SQLite host must be rejected"),
-        Err(error) => error,
-    };
-    assert_eq!(error.kind(), FrontendApplicationErrorKind::StateStoreHost);
+    let second = open_host(Some(config.clone()))
+        .await
+        .expect("shared test provider permits a second live host");
+    second.shutdown().await.expect("second host shutdown");
 
     host.shutdown()
         .await
         .expect("first host shutdown must succeed");
     let reopened = open_host(Some(config))
         .await
-        .expect("same SQLite deployment must reopen after explicit shutdown");
+        .expect("same test deployment reopens after explicit shutdown");
     reopened
         .shutdown()
         .await

@@ -26,20 +26,15 @@
 
 #![allow(dead_code)]
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use bytes::Bytes;
-
+use super::state_store_fixture;
+use novarocks_frontend::StateStoreHost;
 use novarocks_frontend::coordination::FrontendCoordinationRuntime;
 use novarocks_frontend::dml::state_store_journal::StateStoreOperationJournal;
 use novarocks_frontend::dml::{OperationJournal, OperationState, StoredOperation};
-use novarocks_spi::state_store::{FeDeploymentView, StateStore};
-use novarocks_state_store::{
-    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
-    StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
-};
+use novarocks_spi::state_store::StateStore;
 
 /// Keeps the store host and its temp dir alive for the lifetime of a test.
 pub struct CoordinationFixture {
@@ -49,38 +44,7 @@ pub struct CoordinationFixture {
 }
 
 pub async fn open(cluster_id: &str) -> CoordinationFixture {
-    // The directory deliberately outlives the fixture: a service built from it
-    // may be dropped before the test reads the journal back, and a deleted
-    // database would then look like a journal failure rather than the fixture
-    // teardown it actually is. The test binary's temp files are reclaimed by the
-    // OS.
-    let dir = tempfile::tempdir().expect("temp dir").keep();
-    let path = dir.join("state-store.sqlite");
-    let registry = builtin_state_store_provider_registry().expect("provider registry");
-    let host = StateStoreHost::open(
-        &registry,
-        StateStoreHostConfig {
-            state_store: StateStoreAppConfig {
-                store: StateStoreConfig {
-                    cluster_id: cluster_id.to_string(),
-                    limits: StateStoreLimitOverrides::default(),
-                    provider: StateStoreProviderConfig::Sqlite {
-                        path,
-                        deployment_owner: format!("{cluster_id}-fe"),
-                    },
-                },
-                mysql_client: None,
-            },
-            foundationdb_client: None,
-        },
-        FeDeploymentView {
-            active_fe_count: NonZeroUsize::new(1).unwrap(),
-            topology_revision: Bytes::from_static(b"dml-route-test-topology"),
-        },
-        Instant::now() + Duration::from_secs(5),
-    )
-    .await
-    .expect("open state store host");
+    let host = state_store_fixture::open(cluster_id).await;
     let store = host.state_store().expect("StateStore exposure");
     let coordination = FrontendCoordinationRuntime::open(Arc::clone(&store))
         .await
@@ -125,7 +89,12 @@ fn shared_runtime() -> &'static tokio::runtime::Runtime {
 
 pub fn open_blocking(cluster_id: &str) -> BlockingCoordination {
     let runtime = shared_runtime();
-    let fixture = runtime.block_on(open(cluster_id));
+    static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
+    let isolated_cluster_id = format!(
+        "{cluster_id}-{}",
+        NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let fixture = runtime.block_on(open(&isolated_cluster_id));
     let journal = runtime.block_on(async {
         StateStoreOperationJournal::open(
             Arc::clone(&fixture.store),

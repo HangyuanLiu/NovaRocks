@@ -16,12 +16,12 @@
 // under the License.
 
 use crate::mv::domain::repository::{MvRepositoryError, MvRepositoryErrorKind};
+use crate::state_store::metrics::StateStoreMetrics;
+use crate::state_store::{OperationId, RunFailure, derive_transaction_id, run_side_effect_free};
 use novarocks_spi::state_store::{
     CommitOutcome, CommitResolution, StateStore, StateStoreError, StateStoreErrorKind,
     TransactionId,
 };
-use novarocks_state_store::metrics::StateStoreMetrics;
-use novarocks_state_store::{OperationId, RunFailure, derive_transaction_id, run_side_effect_free};
 
 pub(crate) fn state_store_error(error: StateStoreError) -> MvRepositoryError {
     let kind = match error.kind() {

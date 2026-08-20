@@ -50,8 +50,10 @@ use novarocks_spi::state_store::{
     CommitOutcome, Direction, FeDeploymentView, Key, KeyRange, Precondition, RangeRequest,
     StateStore, TransactionId, Value,
 };
-use novarocks_state_store::coordination::IncarnationGate;
-use novarocks_state_store::{
+mod common;
+use common::state_store_fixture as state_store_test;
+use state_store_test::coordination::IncarnationGate;
+use state_store_test::{
     OperationId, StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
@@ -78,7 +80,7 @@ fn publication_evidence(
 
 fn sqlite_config_with_value_limit(path: &Path, max_value_bytes: Option<usize>) -> StateStoreConfig {
     StateStoreConfig {
-        cluster_id: "statistics-repository-test".to_string(),
+        cluster_id: format!("statistics-repository-test-{}", path.display()),
         limits: StateStoreLimitOverrides {
             max_value_bytes,
             ..StateStoreLimitOverrides::default()

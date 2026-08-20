@@ -25,13 +25,13 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
-use novarocks_spi::state_store::{StateStore, WriteTransaction};
-use novarocks_state_store::OperationId;
-use novarocks_state_store::coordination::{
+use crate::state_store::OperationId;
+use crate::state_store::coordination::{
     ClockHealth, CoordinationError, CoordinationErrorKind, HolderId, IncarnationGate, LeaseClock,
     LeaseFence, LeaseManager, LeaseSettings, WriteAdmission,
 };
+use bytes::Bytes;
+use novarocks_spi::state_store::{StateStore, WriteTransaction};
 use uuid::Uuid;
 
 /// Closure a fenced owner hands to a repository so the exact lease fence is
