@@ -193,3 +193,16 @@ fn mv_drift_corpus_rejections_remain_parser_domain_failures() {
         );
     }
 }
+
+#[test]
+fn empty_primary_key_keeps_the_command_specific_diagnostic() {
+    let source = "CREATE MATERIALIZED VIEW reject_mv DISTRIBUTED BY HASH (k1) BUCKETS 1 PRIMARY KEY () AS SELECT k1 FROM source_table";
+    let error = parse(source)
+        .expect_err("empty PRIMARY KEY must fail")
+        .to_user_error(source)
+        .to_string();
+    assert!(
+        error.contains("PRIMARY KEY clause requires at least one column"),
+        "{error}"
+    );
+}

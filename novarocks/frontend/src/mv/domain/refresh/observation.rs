@@ -17,9 +17,12 @@
 
 //! Refresh-time schema and base-state observations over explicit Core ports.
 
-use crate::mv::domain::analysis::rebind::rewrite_select_sql_for_rebind;
+use crate::mv::domain::analysis::{
+    canonicalize_iceberg_mv_select_query, rebind::rewrite_select_sql_for_rebind,
+};
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::refresh::capabilities::RefreshCapabilities;
+use crate::mv::domain::refresh::definition::parse_mv_select_query;
 use crate::mv::domain::refresh::snapshot::BaseSnapshotPolicy;
 use crate::mv::domain::refresh::target::IcebergMvTarget;
 use crate::mv::domain::schema_validation::{
@@ -35,6 +38,18 @@ use novarocks_spi::connector::{
     ConnectorTableObjectCaptureRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
 };
 use std::sync::Arc;
+
+fn derive_rebind_query_source(
+    query_definition: &crate::common::persisted_query_definition::PersistedQueryDefinition,
+) -> Result<String, String> {
+    let query = parse_mv_select_query(&query_definition.raw_query_source)?;
+    Ok(canonicalize_iceberg_mv_select_query(
+        &query,
+        Some(query_definition.resolution.default_catalog.as_str()),
+        &query_definition.resolution.default_database,
+    )
+    .to_string())
+}
 
 /// Loads the current schema facts used to validate a persisted MV contract.
 pub(crate) fn observe_schema_validation_for_table(
@@ -162,7 +177,7 @@ pub(crate) fn rebind_mv_definition_before_refresh_derivation(
                 ContractDecision::CompatibleSafeWithRebind { rebound_columns } => Ok((
                     mv_definition.clone(),
                     rewrite_select_sql_for_rebind(
-                        &mv_definition.query_definition.raw_query_source,
+                        &derive_rebind_query_source(&mv_definition.query_definition)?,
                         &rebound_columns,
                     )?,
                 )),
@@ -216,7 +231,7 @@ pub(crate) fn rebind_mv_definition_before_refresh_derivation(
                 JoinContractDecision::CompatibleSafeWithRebind { rebound_columns } => Ok((
                     mv_definition.clone(),
                     rewrite_select_sql_for_rebind(
-                        &mv_definition.query_definition.raw_query_source,
+                        &derive_rebind_query_source(&mv_definition.query_definition)?,
                         &rebound_columns,
                     )?,
                 )),
@@ -226,5 +241,48 @@ pub(crate) fn rebind_mv_definition_before_refresh_derivation(
             mv_definition.clone(),
             mv_definition.query_definition.raw_query_source.clone(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::persisted_query_definition::{
+        PersistedQueryDefinition, PersistedQueryDialect,
+    };
+    use crate::mv::domain::analysis::rebind::RebindColumn;
+
+    #[test]
+    fn rebind_source_uses_frozen_context_without_rewriting_raw_definition() {
+        let raw = "SELECT d.region, SUM(f.amount) AS total FROM fact AS f JOIN dim AS d ON f.dim_id = d.id GROUP BY d.region";
+        let definition =
+            PersistedQueryDefinition::new(raw, PersistedQueryDialect::StarRocks, "ice", "sales")
+                .expect("definition should be valid");
+
+        let derived = derive_rebind_query_source(&definition).expect("derive rebind source");
+        assert!(derived.contains("ice.sales.fact AS f"), "{derived}");
+        assert!(derived.contains("ice.sales.dim AS d"), "{derived}");
+        assert_eq!(definition.raw_query_source, raw);
+
+        let rewritten = rewrite_select_sql_for_rebind(
+            &derived,
+            &[
+                RebindColumn {
+                    base_table_fqn: "ice.sales.fact".to_string(),
+                    field_id: 2,
+                    name_at_create: "dim_id".to_string(),
+                    current_name: "new_dim_id".to_string(),
+                },
+                RebindColumn {
+                    base_table_fqn: "ice.sales.dim".to_string(),
+                    field_id: 3,
+                    name_at_create: "region".to_string(),
+                    current_name: "area".to_string(),
+                },
+            ],
+        )
+        .expect("qualified derived source should rebind");
+        assert!(rewritten.contains("f.new_dim_id"), "{rewritten}");
+        assert!(rewritten.contains("d.area AS region"), "{rewritten}");
     }
 }

@@ -36,6 +36,13 @@ fn parse_error_code(source: &str) -> String {
     error.to_user_error(source).code().as_str().to_owned()
 }
 
+fn parse_error_message(source: &str) -> String {
+    parse(source)
+        .expect_err("owned malformed maintenance input must fail")
+        .to_user_error(source)
+        .to_string()
+}
+
 #[test]
 fn generic_call_retains_named_args_maps_and_timestamp_literals() {
     let source = "call `ice`.system.rewrite_manifests(\
@@ -120,5 +127,34 @@ fn malformed_owned_forms_have_stable_typed_parse_errors() {
             "sql.parse.unexpected_token",
             "{source}"
         );
+    }
+}
+
+#[test]
+fn malformed_maintenance_forms_keep_command_specific_diagnostics() {
+    for (source, expected) in [
+        (
+            "ALTER TABLE ice.db.orders EXPIRE SNAPSHOTS",
+            "EXPIRE SNAPSHOTS requires at least",
+        ),
+        (
+            "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES",
+            "REMOVE ORPHAN FILES requires OLDER THAN",
+        ),
+        (
+            "ALTER TABLE ice.db.orders REWRITE MANIFESTS WHERE size_in_bytes < 100",
+            "REWRITE MANIFESTS without unsupported trailing clauses",
+        ),
+        (
+            "ALTER TABLE ice.db.orders EXPIRE SNAPSHOTS OLDER THAN 1 OLDER THAN 2",
+            "duplicate OLDER THAN clause",
+        ),
+        (
+            "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES OLDER THAN 1 WHERE size_in_bytes < 100",
+            "REMOVE ORPHAN FILES without unsupported trailing clauses",
+        ),
+    ] {
+        let error = parse_error_message(source);
+        assert!(error.contains(expected), "{source}: {error}");
     }
 }

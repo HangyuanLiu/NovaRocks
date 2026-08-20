@@ -393,7 +393,7 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
             .nth(offset)
     }
 
-    fn is_end(&self) -> bool {
+    pub(super) fn is_end(&self) -> bool {
         self.current()
             .is_none_or(|token| token.kind == TokenKind::End)
     }
