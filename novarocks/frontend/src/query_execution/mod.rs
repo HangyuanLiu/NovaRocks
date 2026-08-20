@@ -68,6 +68,7 @@ pub mod prepared_write;
 pub(crate) mod profile;
 pub mod read_session;
 pub(crate) mod row_mutation;
+pub(crate) mod runtime_filter_terminal_rollup;
 pub(crate) mod schedule;
 pub mod service;
 pub(crate) mod statement_admission;

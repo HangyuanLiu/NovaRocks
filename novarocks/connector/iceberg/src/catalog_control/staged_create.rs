@@ -150,7 +150,7 @@ pub(crate) fn prepare_rest_staged_table(
     let creation = TableCreation::builder()
         .name(table_name)
         .schema(schema)
-        .properties(properties.into_iter())
+        .properties(properties)
         .format_version(format_version);
     let creation = if let Some(spec) = partition_spec {
         creation.partition_spec(spec).build()
@@ -249,6 +249,8 @@ struct UnknownOperation {
     evidence_digest: [u8; 32],
     prepared: Option<PreparedOperation>,
 }
+
+type StagedCreateAction = (Vec<TableUpdate>, Option<i64>, Arc<AbortLog>);
 
 pub(crate) struct IcebergFencedCleanupAction {
     pub(crate) data_prefixes: Vec<String>,
@@ -403,7 +405,7 @@ impl IcebergStagedCreateAdapter {
         &self,
         prepared: &PreparedOperation,
         completion: &ConnectorWriteOperationCompletion,
-    ) -> Result<(Vec<TableUpdate>, Option<i64>, Arc<AbortLog>), ConnectorError> {
+    ) -> Result<StagedCreateAction, ConnectorError> {
         if completion.owner() != &self.owner() {
             return Err(invalid(
                 "staged-create writer completion has a foreign owner",

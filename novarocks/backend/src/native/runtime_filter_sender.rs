@@ -23,9 +23,11 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc};
+
+use prost::Message;
 
 use novarocks_protocol::filter::RuntimeFilterEnvelopeResponse;
 
@@ -36,6 +38,10 @@ use crate::native::runtime_filter_adapter::{
     decode_runtime_filter_envelope_response, encode_runtime_filter_envelope,
 };
 use crate::runtime_filter::domain::{BackendAcceptStatus, BackendRemoteRoute};
+use crate::runtime_filter::reliable_transport::{
+    ReliableTransportFailOpenReason, ReliableTransportFailureOutcome, ReliableTransportPolicy,
+    ReliableTransportSendOutcome, ReliableTransportState,
+};
 
 const LIVE_REQUEST_CAPACITY: usize = 1024;
 const LIVE_COMPLETION_CAPACITY: usize = 1024;
@@ -79,27 +85,87 @@ impl BackendRuntimeFilterUnaryError {
     }
 }
 
+/// Frozen per-query policy for native runtime-filter unary delivery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackendRuntimeFilterRetryPolicy {
+    retry_interval: Duration,
+    max_attempts: u32,
+    deadline: Duration,
+    max_pending_entries: usize,
+    max_pending_bytes: usize,
+}
+
+impl BackendRuntimeFilterRetryPolicy {
+    pub(crate) fn new(
+        retry_interval: Duration,
+        max_attempts: u32,
+        deadline: Duration,
+        max_pending_entries: usize,
+        max_pending_bytes: usize,
+    ) -> Result<Self, BackendRuntimeFilterUnaryError> {
+        if retry_interval.is_zero()
+            || max_attempts == 0
+            || deadline.is_zero()
+            || max_pending_entries == 0
+            || max_pending_bytes == 0
+        {
+            return Err(BackendRuntimeFilterUnaryError::contract(
+                "runtime filter retry policy values must be non-zero",
+            ));
+        }
+        Ok(Self {
+            retry_interval,
+            max_attempts,
+            deadline,
+            max_pending_entries,
+            max_pending_bytes,
+        })
+    }
+}
+
+impl ReliableTransportPolicy for BackendRuntimeFilterRetryPolicy {
+    fn retry_interval(self) -> Duration {
+        self.retry_interval
+    }
+
+    fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
+
+    fn deadline(self) -> Duration {
+        self.deadline
+    }
+
+    fn max_pending_entries(self) -> usize {
+        self.max_pending_entries
+    }
+
+    fn max_pending_bytes(self) -> usize {
+        self.max_pending_bytes
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct BackendNativeRuntimeFilterTransportEnvelope {
     envelope: Arc<BackendNativeRuntimeFilterEnvelope>,
-    deadline: Duration,
+    policy: BackendRuntimeFilterRetryPolicy,
 }
 
 impl BackendNativeRuntimeFilterTransportEnvelope {
     pub(crate) fn new(
         envelope: Arc<BackendNativeRuntimeFilterEnvelope>,
-        deadline: Duration,
+        policy: BackendRuntimeFilterRetryPolicy,
     ) -> Result<Self, BackendRuntimeFilterUnaryError> {
-        if deadline.is_zero() {
-            return Err(BackendRuntimeFilterUnaryError::contract(
-                "runtime filter unary deadline must be non-zero",
-            ));
-        }
-        Ok(Self { envelope, deadline })
+        Ok(Self { envelope, policy })
     }
 
-    pub(crate) fn into_parts(self) -> (Arc<BackendNativeRuntimeFilterEnvelope>, Duration) {
-        (self.envelope, self.deadline)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Arc<BackendNativeRuntimeFilterEnvelope>,
+        BackendRuntimeFilterRetryPolicy,
+    ) {
+        (self.envelope, self.policy)
     }
 }
 
@@ -113,7 +179,19 @@ pub(crate) enum BackendRuntimeFilterSinkSubmitOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BackendRuntimeFilterSinkCompletion {
     Ack(BackendNativeRouteIdentity, BackendAcceptStatus),
-    TransportFailure(BackendNativeRouteIdentity, BackendRuntimeFilterUnaryError),
+    Retried(BackendNativeRouteIdentity),
+    TransportFailure(
+        BackendNativeRouteIdentity,
+        BackendRuntimeFilterUnaryError,
+        BackendRuntimeFilterTransportFailureReason,
+    ),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackendRuntimeFilterTransportFailureReason {
+    Deadline,
+    AttemptsExhausted,
+    ContractRejected,
 }
 
 /// Backend-native sink contract. It deliberately does not expose the old Core
@@ -317,27 +395,10 @@ async fn run_worker(
                 None => break,
             },
         };
-        let (envelope, deadline) = request.envelope.into_parts();
-        let requested_identity = *envelope.route_identity();
-        let result = tokio::select! {
-            biased;
-            _ = shutdown_notify.notified() => break,
-            result = client.transmit(request.route, envelope, deadline) => result,
-        };
-        let completion = match result {
-            Ok(ack) if ack.identity() == requested_identity => {
-                BackendRuntimeFilterSinkCompletion::Ack(ack.identity(), ack.status())
-            }
-            Ok(ack) => BackendRuntimeFilterSinkCompletion::TransportFailure(
-                requested_identity,
-                BackendRuntimeFilterUnaryError::contract(format!(
-                    "runtime filter ACK identity mismatch: requested={requested_identity:?} acked={:?}",
-                    ack.identity(),
-                )),
-            ),
-            Err(error) => {
-                BackendRuntimeFilterSinkCompletion::TransportFailure(requested_identity, error)
-            }
+        let Some(completion) =
+            process_request(request, Arc::clone(&client), &completions, &shutdown_notify).await
+        else {
+            break;
         };
         tokio::select! {
             biased;
@@ -347,6 +408,158 @@ async fn run_worker(
                     break;
                 }
             }
+        }
+    }
+}
+
+async fn process_request(
+    request: SinkRequest,
+    client: Arc<dyn BackendRuntimeFilterEnvelopeUnaryClient>,
+    completions: &mpsc::Sender<BackendRuntimeFilterSinkCompletion>,
+    shutdown_notify: &Notify,
+) -> Option<BackendRuntimeFilterSinkCompletion> {
+    let (envelope, policy) = request.envelope.into_parts();
+    let identity = *envelope.route_identity();
+    let started = Instant::now();
+    let retained_bytes = encode_runtime_filter_envelope(envelope.as_ref()).encoded_len();
+    let mut state = ReliableTransportState::new(policy);
+    match state.send(identity, Arc::clone(&envelope), retained_bytes, started) {
+        Ok(ReliableTransportSendOutcome::Buffered) => {}
+        Ok(outcome) => {
+            return Some(BackendRuntimeFilterSinkCompletion::TransportFailure(
+                identity,
+                BackendRuntimeFilterUnaryError::contract(format!(
+                    "runtime filter transport admission failed: {outcome:?}"
+                )),
+                BackendRuntimeFilterTransportFailureReason::ContractRejected,
+            ));
+        }
+        Err(error) => {
+            return Some(BackendRuntimeFilterSinkCompletion::TransportFailure(
+                identity,
+                BackendRuntimeFilterUnaryError::contract(format!(
+                    "runtime filter transport identity conflict: {error:?}"
+                )),
+                BackendRuntimeFilterTransportFailureReason::ContractRejected,
+            ));
+        }
+    }
+    let mut frame = envelope;
+    loop {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(started);
+        let Some(remaining) = policy.deadline().checked_sub(elapsed) else {
+            return Some(fail_open_completion(
+                &mut state,
+                identity,
+                ReliableTransportFailOpenReason::Deadline,
+            ));
+        };
+        let result = tokio::select! {
+            biased;
+            _ = shutdown_notify.notified() => return None,
+            result = client.transmit(request.route.clone(), Arc::clone(&frame), remaining) => result,
+        };
+        match result {
+            Ok(ack) if ack.identity() == identity => {
+                let _ = state.acknowledge(identity);
+                return Some(BackendRuntimeFilterSinkCompletion::Ack(
+                    ack.identity(),
+                    ack.status(),
+                ));
+            }
+            Ok(ack) => {
+                let _ = state.acknowledge(identity);
+                return Some(BackendRuntimeFilterSinkCompletion::TransportFailure(
+                    identity,
+                    BackendRuntimeFilterUnaryError::contract(format!(
+                        "runtime filter ACK identity mismatch: requested={identity:?} acked={:?}",
+                        ack.identity(),
+                    )),
+                    BackendRuntimeFilterTransportFailureReason::ContractRejected,
+                ));
+            }
+            Err(BackendRuntimeFilterUnaryError::Contract(error)) => {
+                let _ = state.acknowledge(identity);
+                return Some(BackendRuntimeFilterSinkCompletion::TransportFailure(
+                    identity,
+                    BackendRuntimeFilterUnaryError::Contract(error),
+                    BackendRuntimeFilterTransportFailureReason::ContractRejected,
+                ));
+            }
+            Err(error @ BackendRuntimeFilterUnaryError::Transport(_)) => {
+                match state.transport_failed(identity, Instant::now()) {
+                    ReliableTransportFailureOutcome::RetryScheduled => {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_notify.notified() => return None,
+                            _ = tokio::time::sleep(policy.retry_interval()) => {}
+                        }
+                        let tick = state.drive(Instant::now());
+                        if let Some((_, retried)) = tick.retried().first() {
+                            if completions
+                                .send(BackendRuntimeFilterSinkCompletion::Retried(identity))
+                                .await
+                                .is_err()
+                            {
+                                return None;
+                            }
+                            frame = Arc::clone(retried);
+                            continue;
+                        }
+                        let reason = tick
+                            .failed_open()
+                            .first()
+                            .map(|(_, reason)| *reason)
+                            .unwrap_or(ReliableTransportFailOpenReason::Deadline);
+                        return Some(fail_open_completion(&mut state, identity, reason));
+                    }
+                    ReliableTransportFailureOutcome::FailedOpen(_, reason) => {
+                        return Some(BackendRuntimeFilterSinkCompletion::TransportFailure(
+                            identity,
+                            error,
+                            failure_reason(reason),
+                        ));
+                    }
+                    ReliableTransportFailureOutcome::Unknown => {
+                        return Some(BackendRuntimeFilterSinkCompletion::TransportFailure(
+                            identity,
+                            error,
+                            BackendRuntimeFilterTransportFailureReason::ContractRejected,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn fail_open_completion(
+    state: &mut ReliableTransportState<
+        BackendNativeRouteIdentity,
+        Arc<BackendNativeRuntimeFilterEnvelope>,
+        BackendRuntimeFilterRetryPolicy,
+    >,
+    identity: BackendNativeRouteIdentity,
+    reason: ReliableTransportFailOpenReason,
+) -> BackendRuntimeFilterSinkCompletion {
+    let _ = state.transport_failed(identity, Instant::now());
+    BackendRuntimeFilterSinkCompletion::TransportFailure(
+        identity,
+        BackendRuntimeFilterUnaryError::transport("runtime filter retry budget exhausted"),
+        failure_reason(reason),
+    )
+}
+
+const fn failure_reason(
+    reason: ReliableTransportFailOpenReason,
+) -> BackendRuntimeFilterTransportFailureReason {
+    match reason {
+        ReliableTransportFailOpenReason::Deadline => {
+            BackendRuntimeFilterTransportFailureReason::Deadline
+        }
+        ReliableTransportFailOpenReason::AttemptsExhausted => {
+            BackendRuntimeFilterTransportFailureReason::AttemptsExhausted
         }
     }
 }

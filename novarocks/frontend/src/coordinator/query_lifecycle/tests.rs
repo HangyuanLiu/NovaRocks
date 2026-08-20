@@ -61,6 +61,7 @@ use super::{
 };
 use crate::coordinator::query_registry::{
     ActiveQueryAttemptControl, FrontendQueryRegistry, QueryLifecycleConvergenceErrorSource,
+    RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
 };
 
 fn terminal_outcome(
@@ -1154,11 +1155,17 @@ fn frontend_negative_attestation_is_deduplicated_and_surfaces_as_terminal_input(
             .reason(),
         proto::NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted,
     );
+    let snapshot = ActiveQueryAttemptControl::convergence_snapshot(control.as_ref())
+        .expect("stored terminal outcome retains convergence evidence");
     assert_eq!(
-        ActiveQueryAttemptControl::convergence_snapshot(control.as_ref())
-            .expect("stored terminal outcome retains convergence evidence")
-            .error_source,
+        snapshot.error_source,
         Some(QueryLifecycleConvergenceErrorSource::BackendAttestation)
+    );
+    assert_eq!(
+        snapshot.runtime_filter,
+        RuntimeFilterTerminalRollupSnapshot::Unavailable(
+            RuntimeFilterTerminalRollupUnavailable::NegativeAttestation,
+        )
     );
 }
 

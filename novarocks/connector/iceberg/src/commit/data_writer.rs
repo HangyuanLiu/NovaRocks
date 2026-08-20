@@ -1023,15 +1023,14 @@ fn annotate_batch_by_identity(
     let mut source_by_field_id: HashMap<String, usize> = HashMap::new();
     let mut source_by_name: HashMap<String, usize> = HashMap::new();
     for (idx, field) in source_schema.fields().iter().enumerate() {
-        if let Some(field_id) = iceberg_field_id(field) {
-            if source_by_field_id
+        if let Some(field_id) = iceberg_field_id(field)
+            && source_by_field_id
                 .insert(field_id.to_string(), idx)
                 .is_some()
-            {
-                return Err(format!(
-                    "annotate_batch duplicate iceberg field id {field_id} in source batch"
-                ));
-            }
+        {
+            return Err(format!(
+                "annotate_batch duplicate iceberg field id {field_id} in source batch"
+            ));
         }
         let name_key = field.name().to_ascii_lowercase();
         if source_by_name.insert(name_key.clone(), idx).is_some() {
@@ -1436,7 +1435,7 @@ mod tests {
         .expect("write");
         let path = staged[0].data_file.file_path().to_string();
         assert!(ctx.file_io().exists(&path).await.expect("exists before"));
-        cleanup_staged_files(&ctx, &[path.clone()])
+        cleanup_staged_files(&ctx, std::slice::from_ref(&path))
             .await
             .expect("cleanup");
         assert!(

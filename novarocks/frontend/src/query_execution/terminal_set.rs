@@ -27,6 +27,8 @@ use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_protocol::lifecycle::QueryTerminalSnapshot;
 use novarocks_protocol::novarocks;
 
+use super::runtime_filter_terminal_rollup::RuntimeFilterTerminalRollup;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryTerminalSet {
     snapshots: Vec<QueryTerminalSnapshot>,
@@ -81,5 +83,11 @@ impl QueryTerminalSet {
                 fragment.outcome() == novarocks::QueryTerminalFragmentOutcome::Succeeded
             })
         })
+    }
+
+    /// Builds the Frontend-private Runtime Filter diagnostic projection from
+    /// this already de-duplicated, immutable terminal set.
+    pub(crate) fn runtime_filter_terminal_rollup(&self) -> RuntimeFilterTerminalRollup {
+        super::runtime_filter_terminal_rollup::rollup(self)
     }
 }

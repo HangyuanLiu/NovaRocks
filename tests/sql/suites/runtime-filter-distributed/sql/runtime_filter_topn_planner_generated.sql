@@ -41,6 +41,23 @@ SET disable_optimizer_rules = '';
 -- @explain_contains=domain = OrderedBound(key=Int32 ASC NULLS LAST, inclusive=true)
 -- @explain_contains=target = AggregateTopNKey(group_key_ordinal=0, limit=2)
 -- @explain_contains=activation = NonBlockingLive(Batch)
+-- @expect_runtime_filter_available=available
+-- @expect_runtime_filter_detail=completed-channel
+-- @expect_runtime_filter_detail=accepted-producer
+-- @expect_runtime_filter_detail=delivered-consumer
+-- @expect_runtime_filter_total_at_least=channel_completed_count,1
+-- @expect_runtime_filter_total_at_least=producer_accepted_count,1
+SELECT k, SUM(v) AS total
+FROM ${case_db}.rf_topn_source
+GROUP BY k
+ORDER BY k ASC NULLS LAST
+LIMIT 2;
+
+-- @skip_result_check=true
+-- @normalize_explain_timing=true
+-- @result_contains=Profile: fragments=
+-- @result_contains=AggregateTopNKey
+EXPLAIN ANALYZE
 SELECT k, SUM(v) AS total
 FROM ${case_db}.rf_topn_source
 GROUP BY k

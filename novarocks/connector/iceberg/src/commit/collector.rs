@@ -444,8 +444,8 @@ impl IcebergCommitCollector {
             IcebergFileContent::EqualityDeletes => DataContentType::EqualityDeletes,
         };
         validate_puffin_dv_descriptor(
-            format.clone(),
-            content.clone(),
+            format,
+            content,
             file.referenced_data_file.as_deref(),
             file.content_offset,
             file.content_size_in_bytes,

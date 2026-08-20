@@ -21,10 +21,14 @@ use novarocks_execution::runtime_filter::{
     PartitionId, RuntimeFilterBindingId, RuntimeFilterChannelId,
 };
 use novarocks_protocol as proto;
+#[cfg(debug_assertions)]
+use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
+#[cfg(debug_assertions)]
+use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 
 use crate::runtime_filter::domain::{
-    BackendAcceptStatus, BackendIngressResult, BackendParticipantIdentity,
+    BackendAcceptStatus, BackendEnvelopeKind, BackendIngressResult, BackendParticipantIdentity,
     BackendProducerOpenMetadata, BackendRouteEdgeId, BackendTransportSequence,
 };
 
@@ -460,6 +464,11 @@ pub(crate) fn handle_runtime_filter_envelope(
 
     let acked_route_identity = Some(route_identity.clone());
     let result = ingress.accept(envelope);
+    if drop_accepted_contribution_response(&result, kind, query_id, deployment_epoch)? {
+        return Err(tonic::Status::deadline_exceeded(
+            "runner-owned runtime-filter contribution response dropped after Accepted",
+        ));
+    }
     let (accept_status, rejection_reason) = match result.status() {
         BackendAcceptStatus::Accepted => (
             proto::filter::RuntimeFilterAcceptStatus::Accepted,
@@ -483,6 +492,64 @@ pub(crate) fn handle_runtime_filter_envelope(
         accept_status: accept_status as i32,
         rejection_reason,
     })
+}
+
+/// The test fault is deliberately claimed only after the domain owner has
+/// admitted a Contribution.  The token is consumed before the error is
+/// returned, so the exact retry reaches the ordinary domain dedupe owner and
+/// receives its Duplicate acknowledgement.
+#[cfg(debug_assertions)]
+fn drop_accepted_contribution_response(
+    result: &BackendIngressResult,
+    kind: BackendEnvelopeKind,
+    query_id: UniqueId,
+    deployment_epoch: u64,
+) -> Result<bool, tonic::Status> {
+    if kind != BackendEnvelopeKind::Contribution || result.status() != BackendAcceptStatus::Accepted
+    {
+        return Ok(false);
+    }
+    let Some(root) = novarocks_failpoint::configured_root() else {
+        return Ok(false);
+    };
+    let execution_id = runtime_filter_fault_execution_id(query_id, deployment_epoch)?;
+    let scope = novarocks_failpoint::claim_matching_receiver_agnostic_fault(
+        &root,
+        novarocks_failpoint::QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
+        execution_id,
+    )
+    .map_err(tonic::Status::failed_precondition)?;
+    Ok(scope.is_some())
+}
+
+#[cfg(debug_assertions)]
+fn runtime_filter_fault_execution_id(
+    query_id: UniqueId,
+    deployment_epoch: u64,
+) -> Result<QueryExecutionId, tonic::Status> {
+    QueryExecutionId::new(
+        QueryId::new(query_id.high(), query_id.low()),
+        AttemptId::new(deployment_epoch).map_err(|error| {
+            tonic::Status::failed_precondition(format!(
+                "runtime filter fault deployment epoch is not a valid attempt: {error}"
+            ))
+        })?,
+    )
+    .map_err(|error| {
+        tonic::Status::failed_precondition(format!(
+            "runtime filter fault execution identity is invalid: {error}"
+        ))
+    })
+}
+
+#[cfg(not(debug_assertions))]
+fn drop_accepted_contribution_response(
+    _result: &BackendIngressResult,
+    _kind: BackendEnvelopeKind,
+    _query_id: UniqueId,
+    _deployment_epoch: u64,
+) -> Result<bool, tonic::Status> {
+    Ok(false)
 }
 
 fn decode_kind(
@@ -698,12 +765,14 @@ mod tests {
         BackendTransportSequence as ProducerSequence,
     };
 
+    #[cfg(debug_assertions)]
+    use super::runtime_filter_fault_execution_id;
     use super::{
         BackendNativeContributionRouteIdentity, BackendNativeRouteIdentity,
         BackendNativeRuntimeFilterEnvelope as RuntimeFilterEnvelope,
         BackendRuntimeFilterEnvelopeIngress as RuntimeFilterEnvelopeIngress,
-        decode_runtime_filter_envelope_response, encode_runtime_filter_envelope,
-        handle_runtime_filter_envelope,
+        decode_runtime_filter_envelope_response, drop_accepted_contribution_response,
+        encode_runtime_filter_envelope, handle_runtime_filter_envelope,
     };
 
     #[derive(Debug)]
@@ -1178,6 +1247,42 @@ mod tests {
             assert_eq!(response.acked_route_identity, expected_route);
             assert_eq!(ingress.take().len(), 1);
         }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn contribution_ack_drop_fault_never_claims_non_accepted_or_non_contribution_results() {
+        let query_id = UniqueId::new(11, 12);
+        for (result, kind) in [
+            (
+                RuntimeFilterIngressResult::duplicate(),
+                RuntimeFilterEnvelopeKind::Contribution,
+            ),
+            (
+                RuntimeFilterIngressResult::rejected("rejected").unwrap(),
+                RuntimeFilterEnvelopeKind::Contribution,
+            ),
+            (
+                RuntimeFilterIngressResult::accepted(),
+                RuntimeFilterEnvelopeKind::Artifact,
+            ),
+        ] {
+            assert!(
+                !drop_accepted_contribution_response(&result, kind, query_id, 14)
+                    .expect("ineligible runtime-filter response cannot claim a fault"),
+                "only accepted Contribution responses may consume the fault token"
+            );
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn contribution_ack_drop_fault_uses_the_native_query_and_attempt_identity() {
+        let execution_id = runtime_filter_fault_execution_id(UniqueId::new(11, 12), 14)
+            .expect("positive deployment epoch is an attempt id");
+        assert_eq!(execution_id.query_id().high(), 11);
+        assert_eq!(execution_id.query_id().low(), 12);
+        assert_eq!(execution_id.attempt_id().get(), 14);
     }
 
     #[test]

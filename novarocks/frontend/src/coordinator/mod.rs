@@ -29,7 +29,8 @@ pub use backend_events::BackendQueryActivity;
 pub use execution::FrontendDistributedQueryCoordinator;
 pub(crate) use query_registry::{
     QueryLifecycleConvergenceErrorSource, QueryLifecycleConvergenceReader,
-    QueryLifecycleConvergenceSnapshot,
+    QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
+    RuntimeFilterTerminalRollupUnavailable,
 };
 pub use report::{FrontendCoordinatorTerminalIngress, QueryTerminalIngress};
 pub use scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};

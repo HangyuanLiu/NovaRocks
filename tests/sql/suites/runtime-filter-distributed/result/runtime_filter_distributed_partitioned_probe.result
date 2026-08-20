@@ -1,7 +1,7 @@
--- query 11
+-- query 13
 scenario	row_count	id_sum
 partitioned_probe	1000	1001000
 
--- query 14
+-- query 16
 scenario	row_count	id_sum
 partitioned_probe	1000	1001000

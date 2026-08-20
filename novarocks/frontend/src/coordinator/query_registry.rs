@@ -24,6 +24,7 @@ use crate::metrics::FrontendQueryLifecycleMetricsSnapshot;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
+use crate::query_execution::runtime_filter_terminal_rollup::RuntimeFilterTerminalRollup;
 use novarocks_protocol::lifecycle::{ParticipantTerminalOutcome, QueryExecutionId};
 use novarocks_types::QueryId;
 
@@ -46,7 +47,23 @@ pub(crate) struct QueryLifecycleConvergenceSnapshot {
     pub(crate) error_source: Option<QueryLifecycleConvergenceErrorSource>,
     pub(crate) primary_error: Option<String>,
     pub(crate) participant_outcomes: Vec<ParticipantTerminalOutcome>,
+    /// Runtime Filter terminal facts are normalized only from a complete,
+    /// canonical `QueryTerminalSet`.  The unavailable variant records why no
+    /// such set existed for this retained lifecycle snapshot.
+    pub(crate) runtime_filter: RuntimeFilterTerminalRollupSnapshot,
     pub(crate) metrics: FrontendQueryLifecycleMetricsSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum RuntimeFilterTerminalRollupSnapshot {
+    Available(RuntimeFilterTerminalRollup),
+    Unavailable(RuntimeFilterTerminalRollupUnavailable),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeFilterTerminalRollupUnavailable {
+    TerminalOutcomesIncomplete,
+    NegativeAttestation,
 }
 
 /// Read-only diagnostic seam for the immutable terminal evidence retained by
@@ -802,6 +819,9 @@ mod tests {
                 error_source: None,
                 primary_error: Some("stable test failure".to_string()),
                 participant_outcomes: Vec::new(),
+                runtime_filter: RuntimeFilterTerminalRollupSnapshot::Unavailable(
+                    RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
+                ),
                 metrics: FrontendQueryLifecycleMetricsSnapshot::default(),
             })
         }

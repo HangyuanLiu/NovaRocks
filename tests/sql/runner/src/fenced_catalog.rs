@@ -1082,19 +1082,18 @@ async fn handle_stage(state: &AppState, request: StageRequest) -> Response {
 async fn handle_inspect(state: &AppState, request: InspectRequest) -> Response {
     let _guard = operation_guard(state, &request).await;
     let key = operation_key(&request.operation);
-    if take_fault(state, &request.operation.operation_id, Fault::RecordMissing) {
-        if let Ok(connection) = Connection::open(&state.sqlite_path) {
-            let _ =
-                connection.execute("DELETE FROM ctas_operations WHERE operation_key=?1", [&key]);
-        }
+    if take_fault(state, &request.operation.operation_id, Fault::RecordMissing)
+        && let Ok(connection) = Connection::open(&state.sqlite_path)
+    {
+        let _ = connection.execute("DELETE FROM ctas_operations WHERE operation_key=?1", [&key]);
     }
-    if take_fault(state, &request.operation.operation_id, Fault::RecordCorrupt) {
-        if let Ok(connection) = Connection::open(&state.sqlite_path) {
-            let _ = connection.execute(
-                "UPDATE ctas_operations SET record_json='{' WHERE operation_key=?1",
-                [&key],
-            );
-        }
+    if take_fault(state, &request.operation.operation_id, Fault::RecordCorrupt)
+        && let Ok(connection) = Connection::open(&state.sqlite_path)
+    {
+        let _ = connection.execute(
+            "UPDATE ctas_operations SET record_json='{' WHERE operation_key=?1",
+            [&key],
+        );
     }
     let record = match load_record(state, &key) {
         Ok(Some(record)) => record,
@@ -1440,10 +1439,10 @@ async fn handle_publish(state: &AppState, request: PublishRequest) -> Response {
                 "durable publish intent changed before terminal persistence",
             ));
         }
-        if let Some(existing) = &current.terminal {
-            if existing != &terminal {
-                return Err(terminal_conflict(existing));
-            }
+        if let Some(existing) = &current.terminal
+            && existing != &terminal
+        {
+            return Err(terminal_conflict(existing));
         }
         let mut next = current.clone();
         next.in_flight = None;
@@ -1678,10 +1677,10 @@ async fn handle_abort(state: &AppState, request: AbortRequest) -> Response {
             next.cleanup = cleanup.clone();
             next.staged = None;
         } else {
-            if let Some(existing) = &current.terminal {
-                if Some(existing) != terminal.as_ref() {
-                    return Err(terminal_conflict(existing));
-                }
+            if let Some(existing) = &current.terminal
+                && Some(existing) != terminal.as_ref()
+            {
+                return Err(terminal_conflict(existing));
             }
             next.terminal = terminal.clone();
         }
@@ -1880,6 +1879,10 @@ fn staged_target_identity(staged_table: &Value) -> std::result::Result<String, S
     Ok(identity.to_string())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The fixture must propagate an Axum response unchanged to preserve its status and JSON body."
+)]
 fn parse_publish_action(
     payload: &str,
     durable: &CleanupDescriptor,
@@ -1932,6 +1935,10 @@ fn cleanup_payload(descriptor: &CleanupDescriptor) -> String {
     .to_string()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The fixture must propagate an Axum response unchanged to preserve its status and JSON body."
+)]
 fn resolve_abort_payload(
     payload: &str,
     durable: &CleanupDescriptor,
@@ -2085,6 +2092,10 @@ fn cleanup_operator(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The fixture must propagate an Axum response unchanged to preserve its status and JSON body."
+)]
 fn validate_staged<'a>(
     record: &'a Record,
     locator: &str,
@@ -2117,6 +2128,10 @@ fn validate_staged<'a>(
     Ok(staged)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The fixture must propagate an Axum response unchanged to preserve its status and JSON body."
+)]
 fn load_current_for_action(
     state: &AppState,
     key: &str,
@@ -2135,6 +2150,10 @@ fn load_current_for_action(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The fixture must propagate an Axum response unchanged to preserve its status and JSON body."
+)]
 fn clear_in_flight(
     state: &AppState,
     key: &str,
@@ -2171,6 +2190,10 @@ fn clear_or_ambiguous(
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The fixture must propagate an Axum response unchanged to preserve its status and JSON body."
+)]
 fn require_current<'a>(
     record: Option<&'a Record>,
     action: &Action,
@@ -2196,6 +2219,10 @@ fn require_current<'a>(
     Ok(record)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The fixture must propagate an Axum response unchanged to preserve its status and JSON body."
+)]
 fn transact(
     state: &AppState,
     key: &str,

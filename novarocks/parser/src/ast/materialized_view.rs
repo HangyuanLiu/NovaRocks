@@ -25,6 +25,10 @@ use crate::{
 use super::{Fold, Ident, Literal, ObjectName, RawQuerySlice, Visit};
 
 /// Materialized-view commands owned by SQLP-3.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the public AST keeps command payloads by value; boxing CREATE would break every parser and visitor consumer"
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaterializedViewStatement {
     Create(CreateMaterializedView),

@@ -92,7 +92,7 @@ pub fn writer_report_from_written_file(
             )
         })?;
     let (partition_path, null_fingerprint) =
-        partition_path_from_struct(&file.partition_values, &partition_spec)?;
+        partition_path_from_struct(&file.partition_values, partition_spec)?;
     let content = match file.content {
         crate::iceberg::spec::DataContentType::Data => IcebergFileContent::Data,
         crate::iceberg::spec::DataContentType::PositionDeletes => {

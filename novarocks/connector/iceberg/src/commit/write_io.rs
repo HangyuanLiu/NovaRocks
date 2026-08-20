@@ -102,7 +102,7 @@ pub fn write_parquet_file(
             ));
         };
         runtime
-            .block_on(access.operator().write(*relative_path, data))
+            .block_on(access.operator().write(relative_path, data))
             .map_err(|error| {
                 format!("run object-store write on execution runtime failed: {error}")
             })?

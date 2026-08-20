@@ -216,10 +216,10 @@ pub fn walk_query<V: Visit + ?Sized>(visitor: &mut V, query: &Query) {
     if let Some(offset) = &query.offset {
         visitor.visit_expr(&offset.value);
     }
-    if let Some(fetch) = &query.fetch {
-        if let Some(quantity) = &fetch.quantity {
-            visitor.visit_expr(quantity);
-        }
+    if let Some(fetch) = &query.fetch
+        && let Some(quantity) = &fetch.quantity
+    {
+        visitor.visit_expr(quantity);
     }
 }
 

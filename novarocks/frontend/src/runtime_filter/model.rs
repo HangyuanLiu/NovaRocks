@@ -48,7 +48,7 @@ impl FrontendRuntimeFilterLifecycle {
             delivery_expire_ms,
             query_expire_ms,
             TRANSPORT_RETRY_INTERVAL_MS,
-            1,
+            3,
             query_expire_ms,
             MAX_PENDING_ENTRIES,
             MAX_PENDING_BYTES,
@@ -502,7 +502,17 @@ impl std::error::Error for RuntimeFilterDeploymentError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{FrontendRuntimeFilterDeploymentPolicy, RuntimeFilterChannelPolicy};
+    use super::{
+        FrontendRuntimeFilterDeploymentPolicy, FrontendRuntimeFilterLifecycle,
+        RuntimeFilterChannelPolicy,
+    };
+
+    #[test]
+    fn query_lifecycle_uses_three_total_transport_attempts() {
+        let lifecycle =
+            FrontendRuntimeFilterLifecycle::for_query(600, 900).expect("valid lifecycle");
+        assert_eq!(lifecycle.to_wire().transport_max_attempts, 3);
+    }
 
     #[test]
     fn derives_policy_from_frozen_channel_limits() {

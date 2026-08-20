@@ -305,7 +305,7 @@ impl IcebergDataBatchWriter {
                     )
                 })?;
             let (partition_path, null_fingerprint) =
-                partition_path_from_struct(staged_file.data_file.partition(), &partition_spec)
+                partition_path_from_struct(staged_file.data_file.partition(), partition_spec)
                     .map_err(|message| error(ConnectorErrorKind::CorruptData, message))?;
             let (mut report, _) = staged_data_file_to_writer_report(
                 &staged_file,
@@ -450,7 +450,7 @@ impl ConnectorBatchWriter for IcebergDataBatchWriter {
         staged_report_from_iceberg_reports(
             self.writer.clone(),
             ConnectorWriterTerminalState::Staged,
-            self.summary.clone(),
+            self.summary,
             &self.reports,
             self.context.metadata(),
         )
@@ -470,7 +470,7 @@ impl ConnectorBatchWriter for IcebergDataBatchWriter {
     }
 
     fn summary(&self) -> ConnectorStagedReportSummary {
-        self.summary.clone()
+        self.summary
     }
 }
 
@@ -741,7 +741,7 @@ impl ConnectorBatchWriter for IcebergPositionDeleteBatchWriter {
         staged_report_from_position_delete_files(
             self.writer.clone(),
             ConnectorWriterTerminalState::Staged,
-            self.summary.clone(),
+            self.summary,
             &files,
         )
         .map_err(|message| error(ConnectorErrorKind::Internal, message))
@@ -754,7 +754,7 @@ impl ConnectorBatchWriter for IcebergPositionDeleteBatchWriter {
     }
 
     fn summary(&self) -> ConnectorStagedReportSummary {
-        self.summary.clone()
+        self.summary
     }
 }
 
@@ -1012,7 +1012,7 @@ impl ConnectorBatchWriter for IcebergDeletionVectorBatchWriter {
         staged_report_from_position_delete_files(
             self.writer.clone(),
             ConnectorWriterTerminalState::Staged,
-            self.summary.clone(),
+            self.summary,
             &files,
         )
         .map_err(|message| error(ConnectorErrorKind::Internal, message))
@@ -1024,7 +1024,7 @@ impl ConnectorBatchWriter for IcebergDeletionVectorBatchWriter {
         Ok(())
     }
     fn summary(&self) -> ConnectorStagedReportSummary {
-        self.summary.clone()
+        self.summary
     }
 }
 
@@ -1111,7 +1111,7 @@ impl ConnectorBatchWriter for IcebergEqualityDeleteBatchWriter {
         staged_report_from_unpartitioned_equality_delete_reports(
             self.writer.clone(),
             ConnectorWriterTerminalState::Staged,
-            self.summary.clone(),
+            self.summary,
             &self.reports,
         )
         .map_err(|message| error(ConnectorErrorKind::Internal, message))
@@ -1124,7 +1124,7 @@ impl ConnectorBatchWriter for IcebergEqualityDeleteBatchWriter {
     }
 
     fn summary(&self) -> ConnectorStagedReportSummary {
-        self.summary.clone()
+        self.summary
     }
 }
 

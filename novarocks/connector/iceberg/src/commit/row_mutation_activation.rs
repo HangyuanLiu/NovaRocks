@@ -733,16 +733,15 @@ struct IcebergFrozenCowBase {
     files: BTreeMap<String, DataFileWithStats>,
 }
 
+type IcebergCowSelectionGroups = (
+    BTreeMap<String, Vec<IcebergCowMatchedRow>>,
+    Vec<ConnectorRowMutationSelectionOrdinal>,
+);
+
 fn iceberg_cow_selection_groups(
     preparation: &ConnectorRowMutationPreparation,
     selection: &ConnectorRowMutationSelection,
-) -> Result<
-    (
-        BTreeMap<String, Vec<IcebergCowMatchedRow>>,
-        Vec<ConnectorRowMutationSelectionOrdinal>,
-    ),
-    ConnectorError,
-> {
+) -> Result<IcebergCowSelectionGroups, ConnectorError> {
     let contract = preparation.match_contract();
     let file_ordinal = contract
         .identity_fields()

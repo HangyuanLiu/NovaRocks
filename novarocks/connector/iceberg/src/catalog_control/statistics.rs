@@ -784,7 +784,7 @@ fn manifest_metric(
             let Some(data_type) = data_types.get(&column.to_ascii_lowercase()) else {
                 return missing_column(column);
             };
-            let values = files.iter().map(|file| {
+            let mut values = files.iter().map(|file| {
                 let stats = column_stats(file, column)?;
                 let bytes = if lower {
                     stats.lower_bound.as_deref()?
@@ -793,9 +793,9 @@ fn manifest_metric(
                 };
                 decode_bound_to_f64(bytes, data_type).filter(|value| value.is_finite())
             });
-            let reduced = values.fold(Some(None), |state, value| match (state, value) {
-                (Some(None), Some(value)) => Some(Some(value)),
-                (Some(Some(current)), Some(value)) => Some(Some(if lower {
+            let reduced = values.try_fold(None, |state: Option<f64>, value| match (state, value) {
+                (None, Some(value)) => Some(Some(value)),
+                (Some(current), Some(value)) => Some(Some(if lower {
                     current.min(value)
                 } else {
                     current.max(value)
@@ -1220,8 +1220,6 @@ mod tests {
     ) -> Option<StatisticsNumericNature> {
         let files = vec![manifest_file(Some(4), "k", has_deletes)];
         let data_types = HashMap::from([("k".to_string(), DataType::Int32)]);
-        let field_ids = HashMap::from([("k".to_string(), 1_i32)]);
-        let ndv = HashMap::from([(1_i32, 3.0_f64)]);
         let basis =
             StatisticsDataVersion::try_new(Bytes::from_static(b"table-v1")).expect("data version");
         match manifest_metric(metric, &files, &data_types, has_deletes, &basis) {
@@ -1396,7 +1394,7 @@ mod tests {
         // Coverage answers "did the measurement account for every visible row",
         // which a full manifest read does whether or not deletes exist. The
         // delete-file effect belongs to numeric nature, not to coverage.
-        let files = vec![manifest_file(Some(4), "k", true)];
+        let files = [manifest_file(Some(4), "k", true)];
         assert!(
             files.iter().all(|file| file.record_count.is_some()),
             "the coverage predicate must not consult delete files"
