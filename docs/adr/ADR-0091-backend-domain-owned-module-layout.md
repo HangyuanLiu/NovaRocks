@@ -8,7 +8,7 @@ superseded-by: null
 date: 2026-08-20
 provenance:
   - "discussion: 2026-08-20 Backend domain-first module ownership"
-  - "PR: pending — Backend module ownership migration"
+  - "PR: #945 — Backend module ownership migration"
 code-anchors:
   - "novarocks/backend/src/lib.rs (module ownership boundary)"
 ---
