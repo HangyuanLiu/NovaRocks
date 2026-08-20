@@ -21,6 +21,10 @@ pub struct TableWithJoins {
 pub enum TableFactor {
     Table {
         name: ObjectName,
+        /// A parser-owned `$metadata` suffix on the final unquoted table-name
+        /// part. The parser preserves the spelling but does not decide whether
+        /// the suffix is supported by the resolved catalog or provider.
+        metadata: Option<Ident>,
         alias: Option<TableAlias>,
         version: Option<TableVersion>,
         hints: Vec<TableHint>,

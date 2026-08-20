@@ -442,12 +442,13 @@ impl Printer {
         match factor {
             TableFactor::Table {
                 name,
+                metadata,
                 alias,
                 version,
                 hints,
                 ..
             } => {
-                self.write_object_name(name);
+                self.write_table_name(name, metadata.as_ref());
                 if let Some(version) = version {
                     self.write_table_version(version);
                 }
@@ -623,6 +624,7 @@ impl Printer {
         match relation {
             TableFactor::Table {
                 name,
+                metadata,
                 alias,
                 version,
                 hints,
@@ -636,7 +638,7 @@ impl Printer {
                     self.write_table_hint(hint);
                     self.output.push(' ');
                 }
-                self.write_object_name(name);
+                self.write_table_name(name, metadata.as_ref());
                 if let Some(version) = version {
                     self.write_table_version(version);
                 }
@@ -653,6 +655,7 @@ impl Printer {
             }
             TableFactor::Table {
                 name,
+                metadata,
                 alias,
                 version,
                 hints,
@@ -662,7 +665,7 @@ impl Printer {
                     self.write_table_hint(hint);
                     self.output.push(' ');
                 }
-                self.write_object_name(name);
+                self.write_table_name(name, metadata.as_ref());
                 if let Some(version) = version {
                     self.write_table_version(version);
                 }
@@ -825,6 +828,14 @@ impl Printer {
 
     fn write_object_name(&mut self, name: &ObjectName) {
         self.write_ident_list_with_separator(&name.parts, ".");
+    }
+
+    fn write_table_name(&mut self, name: &ObjectName, metadata: Option<&Ident>) {
+        self.write_object_name(name);
+        if let Some(metadata) = metadata {
+            self.output.push('$');
+            self.write_ident(metadata);
+        }
     }
 
     fn write_type_name(&mut self, type_name: &TypeName) {
@@ -1562,6 +1573,7 @@ mod tests {
                 from: vec![TableWithJoins {
                     relation: TableFactor::Table {
                         name: object_name("source"),
+                        metadata: None,
                         alias: Some(TableAlias {
                             name: ident("s"),
                             columns: Vec::new(),

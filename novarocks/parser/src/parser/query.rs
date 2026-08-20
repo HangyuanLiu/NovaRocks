@@ -835,10 +835,16 @@ fn parse_table_factor(
             span: Span::new(start, span_end),
         });
     }
+    let (name, metadata) = split_metadata_table_suffix(name);
     let version = parse_table_version(parser)?;
-    let relation_end = version
-        .as_ref()
-        .map_or(name.span.end(), |version| version.span.end());
+    let relation_end = version.as_ref().map_or_else(
+        || {
+            metadata
+                .as_ref()
+                .map_or(name.span.end(), |metadata| metadata.span.end())
+        },
+        |version| version.span.end(),
+    );
     let postfix_hint_start = hints.len();
     hints.extend(parse_table_hints(parser)?);
     if let Some(hint) = hints.get_mut(postfix_hint_start) {
@@ -847,14 +853,53 @@ fn parse_table_factor(
     let alias = parse_optional_table_alias(parser)?;
     let end = alias
         .as_ref()
-        .map_or(name.span.end(), |alias| alias.span.end());
+        .map_or(relation_end, |alias| alias.span.end());
     Ok(TableFactor::Table {
         name,
+        metadata,
         alias,
         version,
         hints,
         span: Span::new(start, end),
     })
+}
+
+/// Splits the final unquoted object-name part at its first `$` into the base
+/// table name and a parser-owned metadata suffix. The split deliberately
+/// accepts every non-empty suffix; catalog/provider capability is an analyze
+/// or admission concern, not a grammar restriction.
+fn split_metadata_table_suffix(
+    mut name: crate::ast::ObjectName,
+) -> (crate::ast::ObjectName, Option<crate::ast::Ident>) {
+    let Some(last) = name.parts.last_mut() else {
+        return (name, None);
+    };
+    if last.quoted {
+        return (name, None);
+    }
+    let Some((base, metadata_type)) = last.value.split_once('$') else {
+        return (name, None);
+    };
+    if base.is_empty() || metadata_type.is_empty() {
+        return (name, None);
+    }
+
+    let suffix_start = last.span.start() + base.len();
+    let base = base.to_owned();
+    let metadata_type = metadata_type.to_owned();
+    let suffix_end = last.span.end();
+    last.value = base;
+    last.span = Span::new(last.span.start(), suffix_start);
+    name.span = Span::new(name.span.start(), suffix_start);
+    (
+        name,
+        Some(crate::ast::Ident {
+            value: metadata_type,
+            quoted: false,
+            quote_style: None,
+            span: Span::new(suffix_start + 1, suffix_end),
+        }),
+    )
 }
 
 fn table_function_end(parser: &StatementParser<'_, '_>) -> Result<usize, crate::ParseError> {

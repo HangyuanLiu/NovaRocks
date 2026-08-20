@@ -354,12 +354,16 @@ pub fn walk_table_factor<V: Visit + ?Sized>(visitor: &mut V, factor: &TableFacto
     match factor {
         TableFactor::Table {
             name,
+            metadata,
             alias,
             version,
             hints,
             ..
         } => {
             visitor.visit_object_name(name);
+            if let Some(metadata) = metadata {
+                visitor.visit_ident(metadata);
+            }
             if let Some(alias) = alias {
                 walk_table_alias(visitor, alias);
             }
@@ -1101,12 +1105,14 @@ pub fn fold_table_factor<F: Fold + ?Sized>(folder: &mut F, factor: TableFactor) 
     match factor {
         TableFactor::Table {
             name,
+            metadata,
             alias,
             version,
             hints,
             span,
         } => TableFactor::Table {
             name: folder.fold_object_name(name),
+            metadata: metadata.map(|metadata| folder.fold_ident(metadata)),
             alias: alias.map(|alias| fold_table_alias(folder, alias)),
             version: version.map(|mut version| {
                 version.value = folder.fold_expr(version.value);

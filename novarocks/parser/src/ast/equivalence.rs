@@ -327,6 +327,7 @@ impl SyntaxEq for TableFactor {
             (
                 Self::Table {
                     name: left_name,
+                    metadata: left_metadata,
                     alias: left_alias,
                     version: left_version,
                     hints: left_hints,
@@ -334,6 +335,7 @@ impl SyntaxEq for TableFactor {
                 },
                 Self::Table {
                     name: right_name,
+                    metadata: right_metadata,
                     alias: right_alias,
                     version: right_version,
                     hints: right_hints,
@@ -341,6 +343,7 @@ impl SyntaxEq for TableFactor {
                 },
             ) => {
                 left_name.syntax_eq(right_name)
+                    && syntax_eq_option(left_metadata, right_metadata)
                     && syntax_eq_option(left_alias, right_alias)
                     && syntax_eq_option(left_version, right_version)
                     && syntax_eq_slice(left_hints, right_hints)

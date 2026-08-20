@@ -1012,13 +1012,7 @@ impl TestQueryCompiler {
         let current_database = request_context.session().current_database();
         let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
         let (parse_sql, forced_explain_level, force_logical_explain) =
-            if let Some((rewritten, level)) = split_explain_logical_sql(&normalized) {
-                (rewritten, Some(level), true)
-            } else if let Some((rewritten, level)) = split_explain_costs_sql(&normalized) {
-                (rewritten, Some(level), false)
-            } else {
-                (normalized.clone(), None, false)
-            };
+            crate::query::compiler::classify_explain_sql(normalized);
         let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&parse_sql)
             .map_err(|error| format_parser_error(&error.to_string()))?;
         match stmt {
@@ -1322,23 +1316,6 @@ fn standalone_now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for named-partition overwrite SQL normalization coverage."
-)]
-fn rewrite_named_partition_insert_overwrite(sql: &str) -> Result<String, String> {
-    let re = regex::Regex::new(
-        r#"(?is)^\s*insert\s+overwrite\s+(?:table\s+)?(?P<table>(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)){0,2})\s+partition\s*\([^)]*\)\s+(?P<rest>.*)$"#,
-    )
-    .map_err(|e| format!("compile INSERT OVERWRITE partition rewrite regex failed: {e}"))?;
-    let Some(captures) = re.captures(sql) else {
-        return Ok(sql.to_string());
-    };
-    let table = captures.name("table").expect("table capture").as_str();
-    let rest = captures.name("rest").expect("rest capture").as_str();
-    Ok(format!("INSERT OVERWRITE PARTITIONS {table} {rest}"))
 }
 
 #[allow(
@@ -2654,51 +2631,6 @@ fn format_parser_error(raw: &str) -> String {
     out
 }
 
-#[cfg(test)]
-fn consume_leading_keyword<'a>(sql: &'a str, keyword: &str) -> Option<&'a str> {
-    let trimmed = sql.trim_start();
-    let head = trimmed.as_bytes().get(..keyword.len())?;
-    if !head.eq_ignore_ascii_case(keyword.as_bytes()) {
-        return None;
-    }
-    let rest = &trimmed[keyword.len()..];
-    if rest
-        .chars()
-        .next()
-        .is_some_and(|character| !character.is_ascii_whitespace())
-    {
-        return None;
-    }
-    Some(rest)
-}
-
-#[cfg(test)]
-fn split_explain_costs_sql(sql: &str) -> Option<(String, novarocks_sql::compiler::ExplainLevel)> {
-    let body = consume_leading_keyword(consume_leading_keyword(sql, "EXPLAIN")?, "COSTS")?;
-    Some((
-        format!("EXPLAIN {}", body.trim_start()),
-        novarocks_sql::compiler::ExplainLevel::Costs,
-    ))
-}
-
-#[cfg(test)]
-fn split_explain_logical_sql(sql: &str) -> Option<(String, novarocks_sql::compiler::ExplainLevel)> {
-    let mut body = consume_leading_keyword(consume_leading_keyword(sql, "EXPLAIN")?, "LOGICAL")?;
-    let mut level = novarocks_sql::compiler::ExplainLevel::Normal;
-    for (keyword, candidate) in [
-        ("VERBOSE", novarocks_sql::compiler::ExplainLevel::Verbose),
-        ("COSTS", novarocks_sql::compiler::ExplainLevel::Costs),
-    ] {
-        if let Some(rest) = consume_leading_keyword(body, keyword) {
-            level = candidate;
-            body = rest;
-            break;
-        }
-    }
-
-    Some((format!("EXPLAIN {}", body.trim_start()), level))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2747,23 +2679,25 @@ mod tests {
     }
 
     #[test]
-    fn split_explain_logical_sql_rewrites_to_plain_explain() {
-        let (rewritten, level) =
-            super::split_explain_logical_sql(" EXPLAIN LOGICAL SELECT * FROM t")
-                .expect("recognized");
+    fn test_compiler_reuses_production_explain_classification() {
+        let (rewritten, level, logical) =
+            crate::query::compiler::classify_explain_sql(" EXPLAIN LOGICAL SELECT * FROM t".into());
         assert_eq!(rewritten, "EXPLAIN SELECT * FROM t");
-        assert_eq!(level, novarocks_sql::compiler::ExplainLevel::Normal);
+        assert_eq!(level, Some(novarocks_sql::compiler::ExplainLevel::Normal));
+        assert!(logical);
 
-        let (rewritten, level) =
-            super::split_explain_logical_sql("explain logical verbose select k from t")
-                .expect("recognized");
+        let (rewritten, level, logical) = crate::query::compiler::classify_explain_sql(
+            "explain logical verbose select k from t".into(),
+        );
         assert_eq!(rewritten, "EXPLAIN select k from t");
-        assert_eq!(level, novarocks_sql::compiler::ExplainLevel::Verbose);
+        assert_eq!(level, Some(novarocks_sql::compiler::ExplainLevel::Verbose));
+        assert!(logical);
 
-        let (rewritten, level) =
-            super::split_explain_logical_sql("EXPLAIN\nLOGICAL\nSELECT k FROM t")
-                .expect("recognized");
+        let (rewritten, level, logical) = crate::query::compiler::classify_explain_sql(
+            "EXPLAIN\nLOGICAL\nSELECT k FROM t".into(),
+        );
         assert_eq!(rewritten, "EXPLAIN SELECT k FROM t");
-        assert_eq!(level, novarocks_sql::compiler::ExplainLevel::Normal);
+        assert_eq!(level, Some(novarocks_sql::compiler::ExplainLevel::Normal));
+        assert!(logical);
     }
 }

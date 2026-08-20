@@ -3391,6 +3391,7 @@ dependencies = [
  "hex",
  "md-5",
  "novarocks-catalog",
+ "novarocks-parser",
  "novarocks-spi",
  "novarocks-types",
  "serde",

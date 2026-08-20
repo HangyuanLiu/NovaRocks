@@ -25,6 +25,11 @@ mod helpers;
 mod literal_coercion;
 #[cfg(test)]
 mod load_op_column;
+#[allow(
+    dead_code,
+    reason = "The T4 typed-query contract flip wires this staged pre-analysis module."
+)]
+pub(crate) mod query_prepass;
 mod resolve_expr;
 mod resolve_from;
 mod scope;

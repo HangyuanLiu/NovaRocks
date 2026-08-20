@@ -98,10 +98,10 @@ pub use validate::{validate_statement, validate_statements};
 pub use view::{CreateView, DropView, ShowCreateView, ShowViews, ViewStatement};
 pub use visit::{
     Fold, Visit, fold_binary_expr, fold_expr, fold_function_call, fold_ident, fold_literal,
-    fold_nested_expr, fold_object_name, fold_show_backends, fold_statement, fold_type_name,
-    fold_unary_expr, fold_view_statement, walk_binary_expr, walk_expr, walk_function_call,
-    walk_ident, walk_literal, walk_nested_expr, walk_object_name, walk_show_backends,
-    walk_statement, walk_type_name, walk_unary_expr, walk_view_statement,
+    fold_nested_expr, fold_object_name, fold_query, fold_show_backends, fold_statement,
+    fold_type_name, fold_unary_expr, fold_view_statement, walk_binary_expr, walk_expr,
+    walk_function_call, walk_ident, walk_literal, walk_nested_expr, walk_object_name,
+    walk_show_backends, walk_statement, walk_type_name, walk_unary_expr, walk_view_statement,
 };
 pub use window::{
     NamedWindow, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,

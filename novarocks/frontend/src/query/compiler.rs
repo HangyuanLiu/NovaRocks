@@ -95,13 +95,7 @@ impl FrontendQueryCompiler {
         let current_database = context.session().current_database();
         let normalized = normalize_for_raw_parse(sql)?;
         let (parse_sql, forced_explain_level, force_logical_explain) =
-            if let Some((rewritten, level)) = split_explain_logical_sql(&normalized) {
-                (rewritten, Some(level), true)
-            } else if let Some((rewritten, level)) = split_explain_costs_sql(&normalized) {
-                (rewritten, Some(level), false)
-            } else {
-                (normalized.clone(), None, false)
-            };
+            classify_explain_sql(normalized);
         let statement = parse_normalized_sql_raw(&parse_sql)
             .map_err(|error| format_parser_error(&error.to_string()))?;
 
@@ -459,6 +453,16 @@ fn split_explain_costs_sql(sql: &str) -> Option<(String, ExplainLevel)> {
         format!("EXPLAIN {}", body.trim_start()),
         ExplainLevel::Costs,
     ))
+}
+
+pub(crate) fn classify_explain_sql(sql: String) -> (String, Option<ExplainLevel>, bool) {
+    if let Some((rewritten, level)) = split_explain_logical_sql(&sql) {
+        (rewritten, Some(level), true)
+    } else if let Some((rewritten, level)) = split_explain_costs_sql(&sql) {
+        (rewritten, Some(level), false)
+    } else {
+        (sql, None, false)
+    }
 }
 
 fn split_explain_logical_sql(sql: &str) -> Option<(String, ExplainLevel)> {
