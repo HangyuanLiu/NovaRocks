@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_catalog::partition::LegacyRangePartition;
+pub mod iceberg_ref;
+pub use iceberg_ref::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
 use novarocks_catalog::schema::SqlType;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateTableStmt {
     pub name: ObjectName,
     pub kind: CreateTableKind,
-    pub legacy_range_partitions: Vec<LegacyRangePartition>,
     /// Set to `true` when the SQL was `CREATE TABLE IF NOT EXISTS ...`.
     /// For CTAS, the engine skips table creation and data write when the
     /// target table already exists.

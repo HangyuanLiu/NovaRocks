@@ -17,27 +17,11 @@
 
 use crate::catalog::{IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable};
 use crate::planner::table::TableDef;
-use novarocks_catalog::identifier::TableIdentity;
-use novarocks_catalog::memory::{MemoryCatalog, MemoryCatalogEntry};
-use novarocks_catalog::table::CatalogTable;
+use novarocks_catalog::memory::MemoryCatalog;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
 
 pub(crate) type PlannerMemoryCatalog = MemoryCatalog<TableDef>;
-
-impl MemoryCatalogEntry for TableDef {
-    fn table_name(&self) -> &str {
-        &self.name
-    }
-
-    fn to_catalog_table(&self, _catalog: &str, database: &str) -> CatalogTable {
-        CatalogTable {
-            identity: TableIdentity::new(DEFAULT_CATALOG, database, &self.name),
-            columns: self.columns.clone(),
-            hidden_columns: self.iceberg_row_lineage_metadata_columns.clone(),
-        }
-    }
-}
 
 impl PlannerTableProvider for PlannerMemoryCatalog {
     fn resolve_table_for_analysis(
@@ -85,9 +69,7 @@ mod tests {
     use crate::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
     };
-    use novarocks_catalog::identifier::TableIdentity;
     use novarocks_catalog::memory::DEFAULT_DATABASE;
-    use novarocks_catalog::provider::CatalogProvider;
     use novarocks_catalog::schema::ColumnDef;
     use std::num::{NonZeroU32, NonZeroU64};
 
@@ -184,32 +166,6 @@ mod tests {
             .resolve_table_for_analysis(None, DEFAULT_DATABASE, "connector_tbl")
             .expect("SQL-owned test binding should remain analyzable");
         assert_eq!(table.planner.name, "connector_tbl");
-    }
-
-    #[test]
-    fn neutral_lookup_uses_default_catalog_and_preserves_schema() {
-        let mut catalog = PlannerMemoryCatalog::default();
-        let mut table = test_table("connector_tbl");
-        table.iceberg_row_lineage_metadata_columns =
-            vec![column("_row_id", DataType::Int64, false)];
-        catalog
-            .register(DEFAULT_DATABASE, table)
-            .expect("register table");
-
-        let table = CatalogProvider::get_table_in_catalog(
-            &catalog,
-            Some("ignored_override"),
-            DEFAULT_DATABASE,
-            "connector_tbl",
-        )
-        .expect("resolve neutral table");
-
-        assert_eq!(
-            table.identity,
-            TableIdentity::new("default_catalog", DEFAULT_DATABASE, "connector_tbl")
-        );
-        assert_eq!(table.columns[0].name, "id");
-        assert_eq!(table.hidden_columns[0].name, "_row_id");
     }
 
     #[test]

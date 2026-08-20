@@ -589,7 +589,6 @@ fn execute_create_table_like(
                 partition_fields: Vec::new(),
                 properties: Vec::new(),
             },
-            legacy_range_partitions: Vec::new(),
             if_not_exists,
         },
         current_catalog,

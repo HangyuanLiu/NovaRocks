@@ -111,7 +111,6 @@ pub(crate) fn execute_create_table_statement(
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    let legacy_range_partitions = stmt.legacy_range_partitions.clone();
     match stmt.kind {
         CreateTableKind::Iceberg {
             columns,
@@ -212,7 +211,6 @@ pub(crate) fn execute_create_table_statement(
                 },
                 connector_context.clone(),
             )?;
-            let _ = legacy_range_partitions;
             Ok(StatementResult::Ok)
         }
     }
@@ -314,7 +312,6 @@ pub(crate) fn execute_typed_create_table_statement(
                 partition_fields,
                 properties,
             },
-            legacy_range_partitions: Vec::new(),
             if_not_exists: statement.if_not_exists,
         },
         current_catalog,

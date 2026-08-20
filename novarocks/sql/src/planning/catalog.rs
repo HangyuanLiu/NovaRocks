@@ -24,7 +24,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::planner::table::TableDef;
+use novarocks_catalog::identifier::TableIdentity;
 use novarocks_catalog::memory::MemoryCatalogEntry;
+use novarocks_catalog::table::CatalogTable;
 use novarocks_parser::ast::{Query, TableVersion};
 #[cfg(test)]
 use novarocks_parser::ast::{SetExpr, Statement, TableFactor};
@@ -658,6 +660,20 @@ pub fn frozen_input_snapshot_id(
 /// Opaque local-catalog entry.  Only SQL may inspect the enclosed planner
 /// definition; application code can hold the catalog and request neutral facts
 /// through this module.
+impl MemoryCatalogEntry for TableDef {
+    fn table_name(&self) -> &str {
+        &self.name
+    }
+
+    fn to_catalog_table(&self, _catalog: &str, database: &str) -> CatalogTable {
+        CatalogTable {
+            identity: TableIdentity::new("default_catalog", database, &self.name),
+            columns: self.columns.clone(),
+            hidden_columns: self.iceberg_row_lineage_metadata_columns.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SqlLocalCatalogEntry(TableDef);
 

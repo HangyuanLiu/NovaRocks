@@ -20,6 +20,7 @@ use crate::planning::catalog::MetadataTableKind;
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_catalog::table::CatalogTable;
 
+#[cfg(test)]
 pub(crate) mod local;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

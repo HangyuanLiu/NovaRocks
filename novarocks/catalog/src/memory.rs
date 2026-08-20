@@ -18,12 +18,9 @@
 use std::collections::HashMap;
 
 use crate::identifier::normalize_identifier;
-use crate::partition::LegacyRangePartition;
-use crate::provider::CatalogProvider;
 use crate::table::CatalogTable;
 
 pub const DEFAULT_DATABASE: &str = "default";
-const DEFAULT_CATALOG: &str = "default_catalog";
 
 pub trait MemoryCatalogEntry: Clone {
     fn table_name(&self) -> &str;
@@ -38,7 +35,6 @@ struct DatabaseDef<T> {
 #[derive(Clone, Debug)]
 pub struct MemoryCatalog<T: MemoryCatalogEntry> {
     databases: HashMap<String, DatabaseDef<T>>,
-    legacy_range_partitions: HashMap<(String, String), Vec<LegacyRangePartition>>,
 }
 
 impl<T: MemoryCatalogEntry> Default for MemoryCatalog<T> {
@@ -50,10 +46,7 @@ impl<T: MemoryCatalogEntry> Default for MemoryCatalog<T> {
                 tables: HashMap::new(),
             },
         );
-        Self {
-            databases,
-            legacy_range_partitions: HashMap::new(),
-        }
+        Self { databases }
     }
 }
 
@@ -113,7 +106,6 @@ impl<T: MemoryCatalogEntry> MemoryCatalog<T> {
             .tables
             .remove(&table_key)
             .ok_or_else(|| format!("unknown table: {table_name}"))?;
-        self.legacy_range_partitions.remove(&(db_key, table_key));
         Ok(())
     }
 
@@ -139,99 +131,12 @@ impl<T: MemoryCatalogEntry> MemoryCatalog<T> {
             .cloned()
             .ok_or_else(|| format!("unknown table: {table_name}"))
     }
-
-    pub fn set_legacy_range_partitions(
-        &mut self,
-        database_name: &str,
-        table_name: &str,
-        partitions: Vec<LegacyRangePartition>,
-    ) -> Result<(), String> {
-        let db_key = normalize_identifier(database_name)?;
-        let table_key = normalize_identifier(table_name)?;
-        if partitions.is_empty() {
-            self.legacy_range_partitions.remove(&(db_key, table_key));
-        } else {
-            self.legacy_range_partitions
-                .insert((db_key, table_key), partitions);
-        }
-        Ok(())
-    }
-
-    pub fn add_legacy_range_partition(
-        &mut self,
-        database_name: &str,
-        table_name: &str,
-        partition: LegacyRangePartition,
-    ) -> Result<(), String> {
-        let db_key = normalize_identifier(database_name)?;
-        let table_key = normalize_identifier(table_name)?;
-        let partition_key = normalize_identifier(&partition.name)?;
-        let entries = self
-            .legacy_range_partitions
-            .entry((db_key, table_key))
-            .or_default();
-        entries.retain(|existing| {
-            normalize_identifier(&existing.name).ok().as_deref() != Some(&partition_key)
-        });
-        entries.push(partition);
-        Ok(())
-    }
-
-    pub fn get_legacy_range_partition(
-        &self,
-        database: &str,
-        table: &str,
-        partition: &str,
-    ) -> Result<Option<LegacyRangePartition>, String> {
-        let db_key = normalize_identifier(database)?;
-        let table_key = normalize_identifier(table)?;
-        let partition_key = normalize_identifier(partition)?;
-        Ok(self
-            .legacy_range_partitions
-            .get(&(db_key, table_key))
-            .and_then(|partitions| {
-                partitions
-                    .iter()
-                    .find(|entry| {
-                        normalize_identifier(&entry.name).ok().as_deref() == Some(&partition_key)
-                    })
-                    .cloned()
-            }))
-    }
-}
-
-impl<T: MemoryCatalogEntry> CatalogProvider for MemoryCatalog<T> {
-    fn get_table(&self, database: &str, table: &str) -> Result<CatalogTable, String> {
-        self.get(database, table)
-            .map(|entry| entry.to_catalog_table(DEFAULT_CATALOG, database))
-    }
-
-    fn get_table_in_catalog(
-        &self,
-        catalog: Option<&str>,
-        database: &str,
-        table: &str,
-    ) -> Result<CatalogTable, String> {
-        self.get(database, table)
-            .map(|entry| entry.to_catalog_table(catalog.unwrap_or(DEFAULT_CATALOG), database))
-    }
-
-    fn get_legacy_range_partition(
-        &self,
-        database: &str,
-        table: &str,
-        partition: &str,
-    ) -> Result<Option<LegacyRangePartition>, String> {
-        MemoryCatalog::get_legacy_range_partition(self, database, table, partition)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_DATABASE, MemoryCatalog, MemoryCatalogEntry};
     use crate::identifier::TableIdentity;
-    use crate::partition::LegacyRangePartition;
-    use crate::provider::CatalogProvider;
     use crate::table::CatalogTable;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,15 +165,6 @@ mod tests {
                 columns: vec![],
                 hidden_columns: vec![],
             }
-        }
-    }
-
-    fn partition(name: &str, column: &str, lower: &str, upper: &str) -> LegacyRangePartition {
-        LegacyRangePartition {
-            name: name.to_string(),
-            column: column.to_string(),
-            lower_sql: lower.to_string(),
-            upper_sql: upper.to_string(),
         }
     }
 
@@ -371,95 +267,5 @@ mod tests {
         );
         assert!(catalog.table_names_in_database("missing").is_empty());
         assert!(catalog.table_names_in_database("bad-name").is_empty());
-    }
-
-    #[test]
-    fn neutral_provider_uses_requested_or_default_catalog_identity() {
-        let mut catalog = MemoryCatalog::<TestEntry>::default();
-        catalog
-            .register(DEFAULT_DATABASE, TestEntry::new("Orders", 1))
-            .expect("register table");
-
-        let local = CatalogProvider::get_table(&catalog, "DEFAULT", "orders")
-            .expect("default catalog lookup");
-        assert_eq!(
-            local.identity,
-            TableIdentity::new("default_catalog", "DEFAULT", "Orders")
-        );
-
-        let named =
-            CatalogProvider::get_table_in_catalog(&catalog, Some("analytics"), "default", "ORDERS")
-                .expect("named catalog lookup");
-        assert_eq!(
-            named.identity,
-            TableIdentity::new("analytics", "default", "Orders")
-        );
-    }
-
-    #[test]
-    fn stores_replaces_and_removes_legacy_range_partitions_case_insensitively() {
-        let mut catalog = MemoryCatalog::<TestEntry>::default();
-        catalog
-            .set_legacy_range_partitions(
-                "Default",
-                "Orders",
-                vec![partition("P0", "order_id", "0", "10")],
-            )
-            .expect("set partitions");
-
-        assert_eq!(
-            catalog
-                .get_legacy_range_partition("DEFAULT", "orders", "p0")
-                .expect("lookup partition"),
-            Some(partition("P0", "order_id", "0", "10"))
-        );
-
-        catalog
-            .add_legacy_range_partition(
-                "default",
-                "ORDERS",
-                partition("p0", "order_id", "10", "20"),
-            )
-            .expect("replace partition");
-        assert_eq!(
-            CatalogProvider::get_legacy_range_partition(&catalog, "default", "orders", "P0")
-                .expect("provider lookup"),
-            Some(partition("p0", "order_id", "10", "20"))
-        );
-
-        catalog
-            .set_legacy_range_partitions("default", "orders", vec![])
-            .expect("clear partitions");
-        assert_eq!(
-            catalog
-                .get_legacy_range_partition("default", "orders", "p0")
-                .expect("cleared lookup"),
-            None
-        );
-    }
-
-    #[test]
-    fn dropping_table_removes_legacy_range_partitions() {
-        let mut catalog = MemoryCatalog::<TestEntry>::default();
-        catalog
-            .register(DEFAULT_DATABASE, TestEntry::new("orders", 1))
-            .expect("register table");
-        catalog
-            .add_legacy_range_partition(
-                DEFAULT_DATABASE,
-                "orders",
-                partition("p0", "order_id", "0", "10"),
-            )
-            .expect("add partition");
-
-        catalog
-            .drop_table(DEFAULT_DATABASE, "orders")
-            .expect("drop table");
-        assert_eq!(
-            catalog
-                .get_legacy_range_partition(DEFAULT_DATABASE, "orders", "p0")
-                .expect("lookup after drop"),
-            None
-        );
     }
 }

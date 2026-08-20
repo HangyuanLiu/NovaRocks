@@ -17,8 +17,6 @@
 
 pub mod identifier;
 pub mod memory;
-pub mod partition;
-pub mod provider;
 pub mod registry;
 pub mod schema;
 pub mod schema_cache;
