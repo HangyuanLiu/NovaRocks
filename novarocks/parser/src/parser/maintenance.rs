@@ -230,6 +230,9 @@ fn parse_alter_table(
     }
     if parser.consume_if_word("REWRITE") {
         let end = parser.consume_word("MANIFESTS")?.end();
+        if !parser.current_is_symbol(Symbol::Semicolon) && !parser.is_end() {
+            return Err(parser.unexpected("REWRITE MANIFESTS without unsupported trailing clauses"));
+        }
         return Ok(MaintenanceStatement::RewriteManifests(RewriteManifests {
             table,
             span: Span::new(start, end),
@@ -242,9 +245,17 @@ fn parse_alter_table(
     if parser.consume_if_word("REMOVE") {
         parser.consume_word("ORPHAN")?;
         parser.consume_word("FILES")?;
+        if !parser.current_is_word("OLDER") {
+            return Err(parser.unexpected("REMOVE ORPHAN FILES requires OLDER THAN"));
+        }
         parser.consume_word("OLDER")?;
         parser.consume_word("THAN")?;
         let older_than = parse_value(parser)?;
+        if !parser.current_is_symbol(Symbol::Semicolon) && !parser.is_end() {
+            return Err(
+                parser.unexpected("REMOVE ORPHAN FILES without unsupported trailing clauses")
+            );
+        }
         return Ok(MaintenanceStatement::RemoveOrphanFiles(RemoveOrphanFiles {
             table,
             span: Span::new(start, older_than.span().end()),
@@ -265,7 +276,7 @@ fn parse_expire_snapshots(
     while parser.current_is_word("OLDER") || parser.current_is_word("RETAIN") {
         if parser.current_is_word("OLDER") {
             if older_than {
-                return Err(parser.unexpected("one OLDER THAN clause"));
+                return Err(parser.unexpected("duplicate OLDER THAN clause"));
             }
             let option_start = parser.consume_word("OLDER")?.start();
             parser.consume_word("THAN")?;
@@ -277,7 +288,7 @@ fn parse_expire_snapshots(
             older_than = true;
         } else {
             if retain_last {
-                return Err(parser.unexpected("one RETAIN LAST clause"));
+                return Err(parser.unexpected("duplicate RETAIN LAST clause"));
             }
             let option_start = parser.consume_word("RETAIN")?.start();
             parser.consume_word("LAST")?;
@@ -290,7 +301,12 @@ fn parse_expire_snapshots(
         }
     }
     if options.is_empty() {
-        return Err(parser.unexpected("OLDER THAN or RETAIN LAST"));
+        return Err(parser.unexpected(
+            "EXPIRE SNAPSHOTS requires at least one OLDER THAN or RETAIN LAST clause",
+        ));
+    }
+    if !parser.current_is_symbol(Symbol::Semicolon) && !parser.is_end() {
+        return Err(parser.unexpected("EXPIRE SNAPSHOTS without unsupported trailing clauses"));
     }
     let end = options.last().expect("non-empty options").span().end();
     Ok(MaintenanceStatement::ExpireSnapshots(ExpireSnapshots {

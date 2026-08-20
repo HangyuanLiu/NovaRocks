@@ -214,6 +214,8 @@ mod tests {
             "ALTER TABLE ice.db.t SET ('format' = 'parquet')",
             "ALTER TABLE ice.db.t SET TBLPROPERTIES ('format' = 'parquet')",
             "ALTER TABLE ice.db.t CREATE BRANCH dev",
+            "ALTER TABLE ice.db.t CREATE OR REPLACE BRANCH dev",
+            "ALTER TABLE ice.db.t CREATE OR REPLACE TAG release",
             "ALTER TABLE ice.db.t ADD FILES FROM 's3://warehouse/staged'",
         ] {
             assert_eq!(

@@ -386,6 +386,9 @@ fn parse_partition_argument(
 
 fn parse_ident_list(parser: &mut StatementParser<'_, '_>) -> Result<Vec<Ident>, ParseError> {
     parser.consume_symbol(Symbol::LParen)?;
+    if parser.current_is_symbol(Symbol::RParen) {
+        return Err(parser.unexpected("PRIMARY KEY clause requires at least one column"));
+    }
     let mut idents = Vec::new();
     loop {
         idents.push(parser.parse_ident()?);
