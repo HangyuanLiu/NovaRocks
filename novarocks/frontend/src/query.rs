@@ -284,7 +284,7 @@ impl CoreCommandRoute for TypedCommandRoute {
                 )
             }
             ParsedStatement::Table(_) | ParsedStatement::Dml(_) => Err(
-                "typed DDL/DML syntax has no frontend execution owner; SQLP-5 cut is in progress"
+                "typed DDL/DML admission is enabled, but execution routing remains intentionally unconnected until SQLP-5 T10"
                     .to_string(),
             ),
             ParsedStatement::Query(_) | ParsedStatement::ExplainQuery(_) => Err(
@@ -742,10 +742,7 @@ impl FrontendQuerySession {
                 };
                 Some(statement.clone())
             }
-            crate::query_execution::statement_admission::StatementAdmission::LegacyFrontier
-            | crate::query_execution::statement_admission::StatementAdmission::DeferredFamily => {
-                None
-            }
+            crate::query_execution::statement_admission::StatementAdmission::LegacyFrontier => None,
         };
         let token = self.token()?;
         let mut active = self

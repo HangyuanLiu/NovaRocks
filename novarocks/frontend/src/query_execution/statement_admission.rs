@@ -28,7 +28,6 @@ use novarocks_user_error::UserError;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StatementAdmission {
     LegacyFrontier,
-    DeferredFamily,
     Parsed,
 }
 
@@ -38,9 +37,6 @@ pub(crate) fn admit_statement(
 ) -> Result<(StatementAdmission, Vec<Statement>), UserError> {
     if is_legacy_frontier(source) {
         return Ok((StatementAdmission::LegacyFrontier, Vec::new()));
-    }
-    if is_deferred_family(source) {
-        return Ok((StatementAdmission::DeferredFamily, Vec::new()));
     }
     parse(source)
         .map(|statements| (StatementAdmission::Parsed, statements))
@@ -55,79 +51,13 @@ fn is_legacy_frontier(source: &str) -> bool {
     let words = significant_words(source);
     let first = words.first().map(String::as_str);
     match first {
-        Some(
-            "SELECT" | "WITH" | "VALUES" | "INSERT" | "DELETE" | "UPDATE" | "MERGE" | "SET" | "USE",
-        ) => true,
+        Some("SELECT" | "WITH" | "VALUES" | "SET" | "USE") => true,
         Some("KILL") => words.get(1).map(String::as_str) != Some("ANALYZE"),
         Some("EXPLAIN") => explain_targets_query(&words),
-        Some("CREATE") => {
-            words.get(1).map(String::as_str) == Some("TABLE")
-                || (words.get(1).map(String::as_str) == Some("TEMPORARY")
-                    && words.get(2).map(String::as_str) == Some("TABLE"))
-                || (words.get(1).map(String::as_str) == Some("EXTERNAL")
-                    && words.get(2).map(String::as_str) == Some("TABLE"))
-        }
         Some("DROP" | "ALTER") => false,
         Some("SHOW") => false,
         _ => false,
     }
-}
-
-/// Holds later SQLP-3 families on their existing route until their own atomic
-/// owner cut. This is a deterministic head gate, never a parse-error fallback.
-fn is_deferred_family(source: &str) -> bool {
-    let words = significant_words(source);
-    let first = words.first().map(String::as_str);
-    match first {
-        Some("CALL") => false,
-        Some("ALTER") if words.get(1).map(String::as_str) == Some("TABLE") => {
-            !is_admitted_iceberg_alter(&words) && !is_admitted_maintenance_alter(&words)
-        }
-        Some("SHOW") => {
-            (words.get(1).map(String::as_str) == Some("ALTER")
-                && !matches!(
-                    (
-                        words.get(2).map(String::as_str),
-                        words.get(3).map(String::as_str)
-                    ),
-                    (Some("TABLE"), Some("OPTIMIZE"))
-                ))
-                || (words.get(1).map(String::as_str) == Some("CREATE")
-                    && words.get(2).map(String::as_str) == Some("TABLE"))
-        }
-        _ => false,
-    }
-}
-
-fn is_admitted_maintenance_alter(words: &[String]) -> bool {
-    words.windows(2).any(|pair| {
-        matches!(
-            (pair[0].as_str(), pair[1].as_str()),
-            ("REWRITE", "MANIFESTS") | ("EXPIRE", "SNAPSHOTS") | ("REMOVE", "ORPHAN")
-        )
-    }) || words.iter().any(|word| word == "OPTIMIZE")
-}
-
-/// The Iceberg owner cut is intentionally narrower than the `ALTER TABLE`
-/// head: maintenance remains on its legacy route until T9. This deterministic
-/// lexical gate chooses the already-owned structural forms before parsing;
-/// malformed forms within that owned shape still surface parser errors.
-fn is_admitted_iceberg_alter(words: &[String]) -> bool {
-    words.windows(2).any(|pair| {
-        matches!(
-            (pair[0].as_str(), pair[1].as_str()),
-            ("ADD", "COLUMN" | "PARTITION" | "FILES")
-                | ("DROP", "COLUMN" | "PARTITION" | "BRANCH" | "TAG")
-                | ("RENAME", "COLUMN")
-                | ("MODIFY", "COLUMN")
-                | ("ALTER", "COLUMN")
-                | ("UNSET", "TBLPROPERTIES")
-                | ("CREATE", "BRANCH" | "TAG")
-        )
-    }) || words
-        .iter()
-        .skip(2)
-        .any(|word| word == "COMMENT" || word == "SET")
 }
 
 fn explain_targets_query(words: &[String]) -> bool {
@@ -160,9 +90,6 @@ mod tests {
             "SELECT 1",
             "WITH c AS (SELECT 1) SELECT * FROM c",
             "VALUES (1)",
-            "CREATE TABLE t (k INT)",
-            "CREATE TEMPORARY TABLE t (k INT)",
-            "INSERT INTO t VALUES (1)",
             "SET query_timeout = 1",
             "KILL QUERY 1",
             "EXPLAIN VERBOSE SELECT 1",
@@ -173,6 +100,27 @@ mod tests {
                     .expect("legacy frontier must not parse")
                     .0,
                 StatementAdmission::LegacyFrontier,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlp5_ddl_dml_is_admitted_through_the_typed_parser() {
+        for source in [
+            "CREATE TABLE t (k INT)",
+            "CREATE TEMPORARY TABLE t (k INT)",
+            "INSERT INTO t VALUES (1)",
+            "DELETE FROM t WHERE k = 1",
+            "UPDATE t SET k = 2 WHERE k = 1",
+            "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE",
+            "ALTER TABLE t ADD EQUALITY DELETE (k) VALUES (1)",
+        ] {
+            assert_eq!(
+                admit_statement(source)
+                    .expect("SQLP-5 statement must parse once through typed admission")
+                    .0,
+                StatementAdmission::Parsed,
                 "{source}"
             );
         }
@@ -200,22 +148,6 @@ mod tests {
         assert!(!is_legacy_frontier(
             "EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW mv"
         ));
-    }
-
-    #[test]
-    fn later_command_families_are_deferred_without_parsing() {
-        for source in [
-            "ALTER TABLE ice.db.t ADD EQUALITY DELETE (id) VALUES (1)",
-            "SHOW CREATE TABLE ice.db.t",
-        ] {
-            assert_eq!(
-                admit_statement(source)
-                    .expect("later family must remain deferred")
-                    .0,
-                StatementAdmission::DeferredFamily,
-                "{source}"
-            );
-        }
     }
 
     #[test]
