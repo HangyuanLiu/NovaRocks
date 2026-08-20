@@ -420,6 +420,7 @@ fn compile_dml_change_stream_write(
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog,
         novarocks_sql::compiler::builtin_sql_function_catalog(),
+        crate::query_execution::constant_eval::constant_evaluator(),
         None,
         novarocks_sql::compiler::SqlCompileControl::new(
             execution.deadline(),
@@ -2888,6 +2889,7 @@ fn execute_exact_cow_match_query(
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog,
         novarocks_sql::compiler::builtin_sql_function_catalog(),
+        crate::query_execution::constant_eval::constant_evaluator(),
         None,
         novarocks_sql::compiler::SqlCompileControl::new(
             execution.deadline(),

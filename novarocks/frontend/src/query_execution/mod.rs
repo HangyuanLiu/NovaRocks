@@ -23,6 +23,7 @@ pub mod backend_command;
 pub mod completion;
 mod connector_binding;
 pub(crate) mod connector_write_transaction;
+pub mod constant_eval;
 pub mod contract;
 pub mod control;
 mod core_bindings;

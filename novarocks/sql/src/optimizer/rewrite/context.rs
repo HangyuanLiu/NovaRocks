@@ -70,6 +70,10 @@ pub(crate) struct RewriteContext {
     /// rewrite phase (mirrors `column_ref_factory`); rules that inspect or
     /// build scalars go through this. Unwrapped into `Memo.scalars` at convert.
     scalar_arena: Option<Rc<RefCell<ScalarArena>>>,
+    /// Process-lifetime constant evaluator injected at the compiler boundary.
+    /// `None` means the compile path has no execution capability attached, and
+    /// constant folding degrades to a no-op.
+    constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
 }
 
 impl RewriteContext {
@@ -88,6 +92,7 @@ impl RewriteContext {
             deadline: None,
             column_ref_factory: None,
             scalar_arena: None,
+            constant_evaluator: None,
         }
     }
 
@@ -177,6 +182,19 @@ impl RewriteContext {
 
     pub(crate) fn column_ref_factory(&self) -> Option<&Rc<RefCell<ColumnRefFactory>>> {
         self.column_ref_factory.as_ref()
+    }
+
+    pub(crate) fn set_constant_evaluator(
+        &mut self,
+        evaluator: &'static dyn crate::compiler::SqlConstantEvaluator,
+    ) {
+        self.constant_evaluator = Some(evaluator);
+    }
+
+    pub(crate) fn constant_evaluator(
+        &self,
+    ) -> Option<&'static dyn crate::compiler::SqlConstantEvaluator> {
+        self.constant_evaluator
     }
 
     pub(crate) fn set_scalar_arena(&mut self, arena: Rc<RefCell<ScalarArena>>) {

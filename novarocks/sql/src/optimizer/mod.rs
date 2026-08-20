@@ -91,6 +91,7 @@ pub(crate) fn optimize(
     factory: ColumnRefFactory,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
     settings: &options::SessionOptimizerSettings,
+    constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
 ) -> Result<OptimizedOperatorNode, String> {
     validate_query_stats_bound(&plan_expr)?;
     let stats_input = OptimizerStatsInput::from_query_stats(query_stats);
@@ -102,6 +103,7 @@ pub(crate) fn optimize(
         mv_candidates,
         PhysicalPropertySet::gather(),
         settings,
+        constant_evaluator,
     )
 }
 
@@ -112,6 +114,7 @@ pub(crate) fn optimize_with_root_distribution(
     factory: ColumnRefFactory,
     root_distribution: DistributionSpec,
     settings: &options::SessionOptimizerSettings,
+    constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
 ) -> Result<OptimizedOperatorNode, String> {
     validate_query_stats_bound(&plan_expr)?;
     let root_required = PhysicalPropertySet {
@@ -127,6 +130,7 @@ pub(crate) fn optimize_with_root_distribution(
         Vec::new(),
         root_required,
         settings,
+        constant_evaluator,
     )
 }
 
@@ -151,6 +155,7 @@ pub(crate) fn optimize_with_test_table_statistics(
         mv_candidates,
         PhysicalPropertySet::gather(),
         settings,
+        None,
     )
 }
 
@@ -177,6 +182,7 @@ pub(crate) fn optimize_with_root_distribution_and_test_table_statistics(
         Vec::new(),
         root_required,
         settings,
+        None,
     )
 }
 
@@ -188,6 +194,7 @@ fn optimize_with_root_property(
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
     root_required: PhysicalPropertySet,
     session_settings: &options::SessionOptimizerSettings,
+    constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
 ) -> Result<OptimizedOperatorNode, String> {
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
 
@@ -207,6 +214,9 @@ fn optimize_with_root_property(
     rewrite_ctx.set_query_stats_input(stats_input.clone());
     rewrite_ctx.set_deadline(deadline);
     rewrite_ctx.set_column_ref_factory(Rc::clone(&factory));
+    if let Some(evaluator) = constant_evaluator {
+        rewrite_ctx.set_constant_evaluator(evaluator);
+    }
     let arena = Rc::new(RefCell::new(scalar_arena));
     rewrite_ctx.set_scalar_arena(Rc::clone(&arena));
     let rewritten_expr =
@@ -1333,6 +1343,7 @@ mod is_known_rule_name_tests {
             ColumnRefFactory::new(),
             vec![candidate],
             &crate::optimizer::options::SessionOptimizerSettings::default(),
+            None,
         )
         .expect("optimize");
 

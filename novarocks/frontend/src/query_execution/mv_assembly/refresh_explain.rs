@@ -133,6 +133,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
             environment: novarocks_sql::compiler::SqlPlanningEnvironment::NotApplicable,
             catalog: &catalog,
             functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
+            constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
             control: novarocks_sql::compiler::SqlCompileControl::new(
                 Some(connector_context.deadline()),
                 Arc::new(MvRefreshConnectorCancellationObservation {

@@ -313,6 +313,7 @@ impl FrontendQueryCompiler {
             SqlPlanningEnvironment::Distributed { backend_count },
             materializer,
             builtin_sql_function_catalog(),
+            crate::query_execution::constant_eval::constant_evaluator(),
             mv_definitions,
             SqlCompileControl::new(
                 execution.deadline(),
