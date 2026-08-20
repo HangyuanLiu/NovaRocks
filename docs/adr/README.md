@@ -139,6 +139,7 @@ code-anchors:
 - ADR-0047 — catalog/read admission 为何以 exact Connector generation 与中立 native carrier 封存（active）
 - ADR-0078 — Runtime Filter terminal observation 为何只作观测，且以 P0/P1/P2 查询终止契约交付（active）
 - ADR-0079 — IDL/proto 为何是 FE/BE 中立 query lifecycle 契约的规范形式、Protocol 如何同时拥有 schema 与已验证值（active）
+- ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
 - ADR-0085 — native DTO 的字段路径与验证错误为何由 Protocol 独占、而不保留 Core family 门面（active）
 
 #### 历史

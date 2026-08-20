@@ -36,7 +36,7 @@ use novarocks_protocol::lifecycle::{
     QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminalSnapshot, QueryTerminationAck,
     QueryTerminationReason, StageDigest, StageDigestVersion,
 };
-use novarocks_types::UniqueId;
+use novarocks_types::{LocalQuerySequence, QueryIdAttribution, QueryProcessNamespace, UniqueId};
 use prost::Message;
 use tracing::{info, warn};
 
@@ -1509,9 +1509,13 @@ impl QueryLifecycleRegistry {
                     self.enforce_tombstone_capacity_locked(&mut state);
                 }
                 drop(state);
+                let diagnostic = QueryExecutionDiagnostic::from(execution_id);
                 info!(
                     target: "novarocks::query_lifecycle",
                     query_id = ?execution_id.query_id(),
+                    query_process_namespace = %diagnostic.process_namespace(),
+                    query_local_sequence = %diagnostic.local_sequence(),
+                    query_attempt_id = diagnostic.attempt_id(),
                     attempt_id = execution_id.attempt_id().get(),
                     backend_id = ?self.local_backend_id(),
                     start_epoch = self.local_start_epoch,
@@ -1685,9 +1689,13 @@ impl QueryLifecycleRegistry {
                 format!("publish ControlReady failed: {error}"),
             ));
         }
+        let diagnostic = QueryExecutionDiagnostic::from(execution_id);
         info!(
             target: "novarocks::query_lifecycle",
             query_id = ?execution_id.query_id(),
+            query_process_namespace = %diagnostic.process_namespace(),
+            query_local_sequence = %diagnostic.local_sequence(),
+            query_attempt_id = diagnostic.attempt_id(),
             attempt_id = execution_id.attempt_id().get(),
             backend_id = ?self.local_backend_id(),
             start_epoch = self.local_start_epoch,
@@ -1698,10 +1706,11 @@ impl QueryLifecycleRegistry {
         );
         if query_lifecycle_test_markers_enabled() {
             eprintln!(
-                "NOVAROCKS_QUERY_CONTROL_READY execution_id={} backend_id={} expected_fragments={}",
+                "NOVAROCKS_QUERY_CONTROL_READY execution_id={} backend_id={} expected_fragments={} {}",
                 format_execution_id(execution_id),
                 self.local_backend_id().unwrap_or_default(),
-                entry.expected_fragment_instance_ids.len()
+                entry.expected_fragment_instance_ids.len(),
+                QueryExecutionDiagnostic::from(execution_id),
             );
         }
         self.publish_metrics();
@@ -2122,9 +2131,13 @@ impl QueryLifecycleRegistry {
     ) -> QueryLifecycleError {
         let execution_id = validated(attach.execution_id());
         let digest = validated(attach.digest());
+        let diagnostic = QueryExecutionDiagnostic::from(execution_id);
         warn!(
             target: "novarocks::query_lifecycle",
             query_id = ?execution_id.query_id(),
+            query_process_namespace = %diagnostic.process_namespace(),
+            query_local_sequence = %diagnostic.local_sequence(),
+            query_attempt_id = diagnostic.attempt_id(),
             attempt_id = execution_id.attempt_id().get(),
             backend_id = ?self.local_backend_id(),
             start_epoch = self.local_start_epoch,
@@ -2361,9 +2374,13 @@ impl QueryLifecycleRegistry {
                 .map(|entry| format_digest(entry.digest))
                 .unwrap_or_else(|| "unknown".to_string())
         };
+        let diagnostic = QueryExecutionDiagnostic::from(execution_id);
         warn!(
             target: "novarocks::query_lifecycle",
             query_id = ?execution_id.query_id(),
+            query_process_namespace = %diagnostic.process_namespace(),
+            query_local_sequence = %diagnostic.local_sequence(),
+            query_attempt_id = diagnostic.attempt_id(),
             attempt_id = execution_id.attempt_id().get(),
             backend_id = ?self.local_backend_id(),
             start_epoch = self.local_start_epoch,
@@ -2590,11 +2607,12 @@ impl QueryLifecycleRegistry {
         );
         if query_lifecycle_test_markers_enabled() {
             eprintln!(
-                "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={} backend_id={} reason={} expected_fragments={}",
+                "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={} backend_id={} reason={} expected_fragments={} {}",
                 format_execution_id(execution_id),
                 self.local_backend_id().unwrap_or_default(),
                 termination_reason_name(requested_reason),
-                expected_instances.len()
+                expected_instances.len(),
+                QueryExecutionDiagnostic::from(execution_id),
             );
         }
         if requested_reason == QueryTerminationReason::CoordinatorHeartbeatTimeout {
@@ -3682,11 +3700,12 @@ impl QueryLifecycleRegistry {
         if query_lifecycle_test_markers_enabled() {
             let query_id = execution_id.query_id();
             eprintln!(
-                "NOVAROCKS_QUERY_TERMINAL_ACK query_hi={} query_lo={} attempt={} backend_id={}",
+                "NOVAROCKS_QUERY_TERMINAL_ACK query_hi={} query_lo={} attempt={} backend_id={} {}",
                 query_id.high(),
                 query_id.low(),
                 execution_id.attempt_id().get(),
                 self.local_backend_id().unwrap_or_default(),
+                QueryExecutionDiagnostic::from(execution_id),
             );
         }
         let reason = state
@@ -3807,9 +3826,13 @@ impl QueryLifecycleRegistry {
         self.clean_tombstones_locked(&mut state, self.clock.now(), 64);
         self.enforce_tombstone_capacity_locked(&mut state);
         drop(state);
+        let diagnostic = QueryExecutionDiagnostic::from(execution_id);
         info!(
             target: "novarocks::query_lifecycle",
             query_id = ?execution_id.query_id(),
+            query_process_namespace = %diagnostic.process_namespace(),
+            query_local_sequence = %diagnostic.local_sequence(),
+            query_attempt_id = diagnostic.attempt_id(),
             attempt_id = execution_id.attempt_id().get(),
             backend_id = ?self.local_backend_id(),
             start_epoch = self.local_start_epoch,
@@ -3821,9 +3844,10 @@ impl QueryLifecycleRegistry {
         self.publish_metrics();
         if query_lifecycle_test_markers_enabled() {
             eprintln!(
-                "NOVAROCKS_QUERY_LIFECYCLE_CLEANUP execution_id={} backend_id={} active=false tombstone=true reason={reason:?}",
+                "NOVAROCKS_QUERY_LIFECYCLE_CLEANUP execution_id={} backend_id={} active=false tombstone=true reason={reason:?} {}",
                 format_execution_id(execution_id),
-                self.local_backend_id().unwrap_or_default()
+                self.local_backend_id().unwrap_or_default(),
+                QueryExecutionDiagnostic::from(execution_id),
             );
         }
     }
@@ -3947,9 +3971,13 @@ impl QueryLifecycleRegistry {
             QueryTerminationReason::CoordinatorStreamLost
                 | QueryTerminationReason::CoordinatorHeartbeatTimeout
         ) {
+            let diagnostic = QueryExecutionDiagnostic::from(execution_id);
             warn!(
                 target: "novarocks::query_lifecycle",
                 query_id = ?execution_id.query_id(),
+                query_process_namespace = %diagnostic.process_namespace(),
+                query_local_sequence = %diagnostic.local_sequence(),
+                query_attempt_id = diagnostic.attempt_id(),
                 attempt_id = execution_id.attempt_id().get(),
                 backend_id = ?self.local_backend_id(),
                 start_epoch = self.local_start_epoch,
@@ -4096,9 +4124,13 @@ impl QueryLifecycleRegistry {
         let execution_id = validated(ack.execution_id());
         let digest = validated(ack.digest());
         let outcome = validated(ack.outcome());
+        let diagnostic = QueryExecutionDiagnostic::from(execution_id);
         info!(
             target: "novarocks::query_lifecycle",
             query_id = ?execution_id.query_id(),
+            query_process_namespace = %diagnostic.process_namespace(),
+            query_local_sequence = %diagnostic.local_sequence(),
+            query_attempt_id = diagnostic.attempt_id(),
             attempt_id = execution_id.attempt_id().get(),
             backend_id = ?self.local_backend_id(),
             start_epoch = self.local_start_epoch,
@@ -4127,9 +4159,10 @@ impl QueryLifecycleRegistry {
                 "NOVAROCKS_QUERY_INIT_IDEMPOTENT"
             };
             eprintln!(
-                "{marker} execution_id={} backend_id={} expected_fragments={expected_fragments}",
+                "{marker} execution_id={} backend_id={} expected_fragments={expected_fragments} {}",
                 format_execution_id(execution_id),
-                self.local_backend_id().unwrap_or_default()
+                self.local_backend_id().unwrap_or_default(),
+                QueryExecutionDiagnostic::from(execution_id),
             );
         }
     }
@@ -4380,13 +4413,14 @@ impl FragmentAdmissionPermit {
         self.committed = true;
         if query_lifecycle_test_markers_enabled() {
             eprintln!(
-                "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id={} backend_id={} finst_id={}",
+                "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id={} backend_id={} finst_id={} {}",
                 format_execution_id(self.execution_id),
                 self.registry
                     .upgrade()
                     .and_then(|registry| registry.local_backend_id())
                     .unwrap_or_default(),
-                self.fragment_instance_id
+                self.fragment_instance_id,
+                QueryExecutionDiagnostic::from(self.execution_id),
             );
         }
         Ok(())
@@ -4455,9 +4489,10 @@ impl BackendQueryControl for RegistryQueryControl {
                 .and_then(|registry| registry.local_backend_id())
                 .unwrap_or_default();
             eprintln!(
-                "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST execution_id={} backend_id={} reason={reason:?}",
+                "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST execution_id={} backend_id={} reason={reason:?} {}",
                 format_execution_id(self.execution_id),
-                backend_id
+                backend_id,
+                QueryExecutionDiagnostic::from(self.execution_id),
             );
         }
         self.registry
@@ -4474,6 +4509,62 @@ fn format_execution_id(execution_id: QueryExecutionId) -> String {
         execution_id.query_id().low(),
         execution_id.attempt_id().get()
     )
+}
+
+/// Diagnostic-only view of the process attribution carried by a received
+/// lifecycle identity.  The backend does not allocate, classify, or retain
+/// ownership of this namespace; it only renders the immutable wire value.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct QueryExecutionDiagnostic {
+    attribution: Option<QueryIdAttribution>,
+    attempt_id: u64,
+}
+
+impl From<QueryExecutionId> for QueryExecutionDiagnostic {
+    fn from(execution_id: QueryExecutionId) -> Self {
+        Self {
+            attribution: execution_id.query_id().process_attribution(),
+            attempt_id: execution_id.attempt_id().get(),
+        }
+    }
+}
+
+impl QueryExecutionDiagnostic {
+    fn process_namespace(self) -> QueryDiagnosticValue<QueryProcessNamespace> {
+        QueryDiagnosticValue(self.attribution.map(QueryIdAttribution::namespace))
+    }
+
+    fn local_sequence(self) -> QueryDiagnosticValue<LocalQuerySequence> {
+        QueryDiagnosticValue(self.attribution.map(QueryIdAttribution::sequence))
+    }
+
+    const fn attempt_id(self) -> u64 {
+        self.attempt_id
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct QueryDiagnosticValue<T>(Option<T>);
+
+impl<T: Copy + fmt::Display> fmt::Display for QueryDiagnosticValue<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(value) => value.fmt(f),
+            None => f.write_str("unattributed"),
+        }
+    }
+}
+
+impl fmt::Display for QueryExecutionDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "query_process_namespace={} query_local_sequence={} query_attempt_id={}",
+            self.process_namespace(),
+            self.local_sequence(),
+            self.attempt_id(),
+        )
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -4617,4 +4708,51 @@ fn format_digest(digest: ParticipantManifestDigest) -> String {
 #[allow(dead_code)]
 fn internal_error(detail: impl Into<String>) -> QueryLifecycleError {
     QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, detail)
+}
+
+#[cfg(test)]
+mod query_execution_diagnostic_tests {
+    use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
+    use novarocks_types::QueryId;
+
+    use super::QueryExecutionDiagnostic;
+
+    fn execution_id(namespace: u64, sequence: i64, attempt: u64) -> QueryExecutionId {
+        QueryExecutionId::new(
+            QueryId::new(namespace as i64, sequence),
+            AttemptId::new(attempt).expect("nonzero attempt"),
+        )
+        .expect("nonzero query id")
+    }
+
+    #[test]
+    fn diagnostic_uses_received_identity_for_tombstone_stable_attribution() {
+        let execution_id = execution_id(0xfeed_face_cafe_beef, 42, 3);
+        let before_tombstone = QueryExecutionDiagnostic::from(execution_id).to_string();
+        let after_tombstone = QueryExecutionDiagnostic::from(execution_id).to_string();
+
+        assert_eq!(before_tombstone, after_tombstone);
+        assert_eq!(
+            after_tombstone,
+            "query_process_namespace=0xfeedfacecafebeef query_local_sequence=42 query_attempt_id=3"
+        );
+    }
+
+    #[test]
+    fn diagnostic_distinguishes_received_process_namespaces() {
+        let first = QueryExecutionDiagnostic::from(execution_id(0x10, 7, 1)).to_string();
+        let second = QueryExecutionDiagnostic::from(execution_id(0x20, 7, 1)).to_string();
+
+        assert_ne!(first, second);
+        assert!(first.contains("query_process_namespace=0x0000000000000010"));
+        assert!(second.contains("query_process_namespace=0x0000000000000020"));
+    }
+
+    #[test]
+    fn diagnostic_refuses_to_guess_non_local_sequences() {
+        assert_eq!(
+            QueryExecutionDiagnostic::from(execution_id(0x20, 0, 1)).to_string(),
+            "query_process_namespace=unattributed query_local_sequence=unattributed query_attempt_id=1"
+        );
+    }
 }

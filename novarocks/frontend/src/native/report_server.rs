@@ -51,6 +51,9 @@ fn lifecycle_convergence_debug_enabled() -> bool {
 #[derive(serde::Serialize)]
 struct LifecycleConvergenceDebugSnapshot {
     execution_id: String,
+    query_process_namespace: String,
+    query_local_sequence: u64,
+    query_attempt_id: u64,
     error_source: Option<&'static str>,
     participant_outcomes: Vec<LifecycleParticipantOutcomeDebug>,
     telemetry_unavailable: Vec<LifecycleTelemetryUnavailableDebug>,
@@ -272,6 +275,11 @@ async fn latest_lifecycle_convergence_snapshot(
 fn lifecycle_convergence_debug_snapshot(
     snapshot: QueryLifecycleConvergenceSnapshot,
 ) -> LifecycleConvergenceDebugSnapshot {
+    let attribution = snapshot
+        .execution_id
+        .query_id()
+        .process_attribution()
+        .expect("frontend query allocator always emits a positive local sequence");
     let mut telemetry_unavailable = Vec::new();
     let mut participant_outcomes = snapshot
         .participant_outcomes
@@ -334,6 +342,9 @@ fn lifecycle_convergence_debug_snapshot(
             snapshot.execution_id.query_id().low(),
             snapshot.execution_id.attempt_id().get()
         ),
+        query_process_namespace: attribution.namespace().to_string(),
+        query_local_sequence: attribution.sequence().get(),
+        query_attempt_id: snapshot.execution_id.attempt_id().get(),
         error_source,
         participant_outcomes,
         telemetry_unavailable,
@@ -1040,6 +1051,9 @@ mod tests {
         .expect("serialize debug snapshot");
 
         assert_eq!(value["execution_id"], "51:52:1");
+        assert_eq!(value["query_process_namespace"], "0x0000000000000033");
+        assert_eq!(value["query_local_sequence"], 52);
+        assert_eq!(value["query_attempt_id"], 1);
         assert_eq!(value["runtime_filter"]["kind"], "available");
         assert_eq!(
             value["runtime_filter"]["participants"][0]["participant"]["backend_id"],

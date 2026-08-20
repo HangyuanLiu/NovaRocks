@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
 use novarocks_failpoint::{
@@ -39,6 +39,9 @@ const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
 #[derive(serde::Deserialize)]
 struct LifecycleConvergenceWireSnapshot {
     execution_id: String,
+    query_process_namespace: String,
+    query_local_sequence: u64,
+    query_attempt_id: u64,
     error_source: Option<String>,
     participant_outcomes: Vec<LifecycleParticipantOutcomeWire>,
     telemetry_unavailable: Vec<LifecycleTelemetryUnavailableWire>,
@@ -273,6 +276,15 @@ fn query_lifecycle_structured_snapshot_from_fe(
 fn decode_query_lifecycle_structured_snapshot(
     wire: LifecycleConvergenceWireSnapshot,
 ) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
+    let process_namespace = decode_query_process_namespace(&wire.query_process_namespace)?;
+    ensure!(
+        wire.query_local_sequence > 0,
+        "FE lifecycle snapshot query_local_sequence must be nonzero"
+    );
+    ensure!(
+        wire.query_attempt_id > 0,
+        "FE lifecycle snapshot query_attempt_id must be nonzero"
+    );
     let error_source = match wire.error_source.as_deref() {
         None => None,
         Some("backend-attestation") => Some(QueryLifecycleErrorSource::BackendAttestation),
@@ -302,12 +314,27 @@ fn decode_query_lifecycle_structured_snapshot(
         .collect();
     Ok(Some(QueryLifecycleStructuredSnapshot {
         execution_id: Some(wire.execution_id),
+        process_namespace,
+        local_sequence: wire.query_local_sequence,
+        attempt_id: wire.query_attempt_id,
         error_source,
         participant_outcomes,
         telemetry_unavailable,
         runtime_filter: decode_runtime_filter_terminal_rollup(wire.runtime_filter)?,
         metrics: wire.metrics,
     }))
+}
+
+fn decode_query_process_namespace(value: &str) -> Result<u64> {
+    let digits = value
+        .strip_prefix("0x")
+        .context("FE lifecycle snapshot query_process_namespace must start with 0x")?;
+    ensure!(
+        digits.len() == 16,
+        "FE lifecycle snapshot query_process_namespace must contain exactly 16 hexadecimal digits"
+    );
+    u64::from_str_radix(digits, 16)
+        .with_context(|| format!("decode FE lifecycle snapshot query_process_namespace {value:?}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,6 +437,10 @@ pub struct QueryLifecycleTelemetryUnavailable {
 pub struct QueryLifecycleStructuredSnapshot {
     /// The immutable execution identity used to correlate all values below.
     pub execution_id: Option<String>,
+    /// Typed process attribution derived from the immutable query identity.
+    pub process_namespace: u64,
+    pub local_sequence: u64,
+    pub attempt_id: u64,
     pub error_source: Option<QueryLifecycleErrorSource>,
     pub participant_outcomes: Vec<ParticipantTerminalOutcomeKind>,
     pub telemetry_unavailable: Vec<QueryLifecycleTelemetryUnavailable>,
@@ -3891,7 +3922,7 @@ mod tests {
     use std::fs;
 
     fn lifecycle_debug_json(execution_id: &str) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "execution_id": execution_id,
             "error_source": null,
             "participant_outcomes": [],
@@ -3981,7 +4012,11 @@ mod tests {
                 }
             },
             "metrics": {}
-        })
+        });
+        value["query_process_namespace"] = serde_json::json!("0x000000000000000b");
+        value["query_local_sequence"] = serde_json::json!(12);
+        value["query_attempt_id"] = serde_json::json!(13);
+        value
     }
 
     fn decode_lifecycle_debug_json(value: serde_json::Value) -> QueryLifecycleStructuredSnapshot {
@@ -4002,6 +4037,9 @@ mod tests {
             panic!("runtime-filter fixture must be available");
         };
         assert_eq!(snapshot.execution_id.as_deref(), Some("11:12:13"));
+        assert_eq!(snapshot.process_namespace, 11);
+        assert_eq!(snapshot.local_sequence, 12);
+        assert_eq!(snapshot.attempt_id, 13);
         assert_eq!(participants.len(), 1);
         assert_eq!(participants[0].participant.backend_id, 7);
         assert_eq!(participants[0].participant.start_epoch, 11);
@@ -4099,6 +4137,32 @@ mod tests {
             format!("{error:#}").contains("future-terminal-state"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn lifecycle_debug_decode_rejects_missing_or_invalid_process_attribution() {
+        let mut missing_namespace = lifecycle_debug_json("11:12:13");
+        missing_namespace
+            .as_object_mut()
+            .expect("JSON object")
+            .remove("query_process_namespace");
+        assert!(
+            serde_json::from_value::<LifecycleConvergenceWireSnapshot>(missing_namespace).is_err()
+        );
+
+        let mut invalid_namespace = lifecycle_debug_json("11:12:13");
+        invalid_namespace["query_process_namespace"] = serde_json::json!("namespace=11");
+        let wire = serde_json::from_value(invalid_namespace).expect("wire envelope");
+        let error = decode_query_lifecycle_structured_snapshot(wire)
+            .expect_err("non-hex namespace must fail closed");
+        assert!(format!("{error:#}").contains("query_process_namespace"));
+
+        let mut zero_sequence = lifecycle_debug_json("11:12:13");
+        zero_sequence["query_local_sequence"] = serde_json::json!(0);
+        let wire = serde_json::from_value(zero_sequence).expect("wire envelope");
+        let error = decode_query_lifecycle_structured_snapshot(wire)
+            .expect_err("zero local sequence must fail closed");
+        assert!(format!("{error:#}").contains("query_local_sequence"));
     }
 
     #[test]

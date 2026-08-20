@@ -125,6 +125,7 @@ impl Scenario for CancelWithTerminalAckReplay {
         let target = start_blocking_runtime_filter_query(
             context.mysql_user(),
             context.mysql_port(),
+            context.remaining("connect blocking Runtime Filter query actor")?,
             runtime_filter_blocking_query(&tables),
         )?;
         let connection_id = target
@@ -307,7 +308,7 @@ fn runtime_filter_count_query(tables: &RuntimeFilterTables) -> String {
 
 fn runtime_filter_blocking_query(tables: &RuntimeFilterTables) -> String {
     format!(
-        "SELECT sleep(10) FROM (SELECT COUNT(*) AS matched_rows FROM ({join}) filtered) completed_join CROSS JOIN TABLE(generate_series(1, 1000000000)) series WHERE completed_join.matched_rows > 0",
+        "SELECT sleep(completed_join.matched_rows - completed_join.matched_rows + 10) FROM (SELECT COUNT(*) AS matched_rows FROM ({join}) filtered) completed_join WHERE completed_join.matched_rows > 0",
         join = runtime_filter_counting_join(tables),
     )
 }
@@ -416,13 +417,14 @@ struct BlockingQuery {
 fn start_blocking_runtime_filter_query(
     user: &str,
     port: u16,
+    connect_timeout: Duration,
     query: String,
 ) -> Result<BlockingQuery> {
     let (ready_tx, ready) = mpsc::sync_channel(1);
     let (done_tx, done) = mpsc::sync_channel(1);
     let user = user.to_string();
     let thread = thread::spawn(move || -> Result<()> {
-        let mut connection = mysql_actor::connect(&user, port, Duration::from_secs(10))
+        let mut connection = mysql_actor::connect_for_cancellation(&user, port, connect_timeout)
             .context("connect blocking Runtime Filter query actor")?;
         ready_tx
             .send(connection.connection_id())

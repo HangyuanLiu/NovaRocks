@@ -4820,6 +4820,9 @@ mod tests {
 
         let snapshot = harness::QueryLifecycleStructuredSnapshot {
             execution_id: Some("1:2:3".to_string()),
+            process_namespace: 1,
+            local_sequence: 2,
+            attempt_id: 3,
             error_source: None,
             participant_outcomes: Vec::new(),
             telemetry_unavailable: Vec::new(),
