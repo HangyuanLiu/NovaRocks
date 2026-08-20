@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(test)]
-
 //! Provider-neutral, test-only read fixture connector.
 //!
 //! Core test files need a `ConnectorControlBinding` that plans reads over a

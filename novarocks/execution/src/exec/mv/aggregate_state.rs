@@ -559,7 +559,7 @@ fn validate_loaded_row(
             (_, None) => return Err(format!("aggregate MV state corruption: COUNT state column `{}` is NULL for row id `{row_id}`", column.name())),
             (_, other) => return Err(format!("aggregate MV state corruption: COUNT state column `{}` has invalid value {other:?} for row id `{row_id}`", column.name())),
         };
-        if !allow_negative_counts && !(count > 0 || (!column.count_star() && count == 0)) {
+        if !allow_negative_counts && (count < 0 || (column.count_star() && count == 0)) {
             let restriction = if column.count_star() {
                 "positive"
             } else {

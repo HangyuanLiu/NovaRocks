@@ -948,6 +948,10 @@ fn canonicalize_array_inner_scalar(inner: &str) -> String {
 /// angle brackets (e.g. `int`, `array<int>`, `varchar`, `struct<col1 int>`) —
 /// render bare scalar names with StarRocks's display canonicalisation
 /// (int → int(11), …) and leave nested collection syntax untouched.
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 fn format_cast_type_modifier(modifier: &str) -> String {
     let trimmed = modifier.trim();
     format_cast_type_token(trimmed)

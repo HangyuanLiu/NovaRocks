@@ -59,6 +59,3 @@ pub use min_max::RuntimeMinMaxFilter;
 // Staged export for the B3 internal type model; follow-up tasks add production consumers.
 #[allow(unused_imports)]
 pub use types::{RuntimeDecimalWidth, RuntimeFilterType};
-
-pub(in crate::exec::runtime_filter) use bloom::SimdBlockFilter;
-pub(in crate::exec::runtime_filter) use in_filter::RuntimeInFilterValues;

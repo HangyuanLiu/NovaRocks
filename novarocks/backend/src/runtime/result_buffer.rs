@@ -153,6 +153,10 @@ pub enum FetchErrorKind {
 
 #[derive(Debug, Clone)]
 pub struct FetchError {
+    #[allow(
+        dead_code,
+        reason = "The structured legacy fetch error kind is read by protocol adapters outside this target."
+    )]
     pub kind: FetchErrorKind,
     pub message: String,
 }
@@ -169,6 +173,10 @@ struct BufferControlBlock {
     cancel_message: Option<String>,
     next_packet_seq: i64,
     mem_tracker: Option<Arc<MemTracker>>,
+    #[allow(
+        dead_code,
+        reason = "Legacy EOS templates are retained for protocol adapters outside the backend lib test configuration."
+    )]
     eos_template: Option<ResultBatch>,
 }
 
@@ -189,6 +197,10 @@ impl BufferControlBlock {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Legacy EOS construction is retained for protocol adapters outside the backend lib test configuration."
+    )]
     fn make_eos_result(&mut self) -> FetchResult {
         let seq = self.next_packet_seq;
         self.next_packet_seq += 1;
@@ -209,6 +221,10 @@ impl BufferControlBlock {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Legacy result dequeue is retained for protocol adapters outside the backend lib test configuration."
+    )]
     fn pop_next(&mut self) -> Option<FetchResult> {
         let out = self.queue.pop_front()?;
         let seq = self.next_packet_seq;
@@ -270,6 +286,10 @@ impl TrackedFetchResult {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Legacy result conversion is retained for protocol adapters outside the backend lib test configuration."
+    )]
     fn into_result(self, seq: i64) -> FetchResult {
         let TrackedFetchResult {
             mut result,
@@ -433,6 +453,10 @@ pub(crate) fn close_error(finst_id: UniqueId, message: String) -> ResultPublicat
     publication
 }
 
+#[allow(
+    dead_code,
+    reason = "Legacy result cancellation remains available to protocol adapters outside this target."
+)]
 pub(crate) fn cancel(finst_id: UniqueId) -> ResultPublication {
     cancel_with_message(finst_id, "Cancelled".to_string())
 }
@@ -457,6 +481,10 @@ fn cancel_with_message(finst_id: UniqueId, message: String) -> ResultPublication
     publication
 }
 
+#[allow(
+    dead_code,
+    reason = "Legacy sender creation remains available to protocol adapters outside this target."
+)]
 pub(crate) fn create_sender(finst_id: UniqueId) {
     let c = ctx();
     let mut guard = c.mu.lock().expect("ctx lock");
@@ -466,10 +494,18 @@ pub(crate) fn create_sender(finst_id: UniqueId) {
     block.fail_mode_mismatch(ResultBufferMode::Legacy);
 }
 
+#[allow(
+    dead_code,
+    reason = "Legacy fallible sender creation remains available to protocol adapters outside this target."
+)]
 pub(crate) fn try_create_sender(finst_id: UniqueId) -> Result<(), String> {
     try_create_sender_with_mode(finst_id, ResultBufferMode::Legacy)
 }
 
+#[allow(
+    dead_code,
+    reason = "Typed sender creation remains available to protocol adapters outside this target."
+)]
 pub(crate) fn create_typed_sender(finst_id: UniqueId) {
     let c = ctx();
     let mut guard = c.mu.lock().expect("ctx lock");
@@ -479,6 +515,10 @@ pub(crate) fn create_typed_sender(finst_id: UniqueId) {
     block.fail_mode_mismatch(ResultBufferMode::Typed);
 }
 
+#[allow(
+    dead_code,
+    reason = "Typed fallible sender creation remains available to protocol adapters outside this target."
+)]
 pub(crate) fn try_create_typed_sender(finst_id: UniqueId) -> Result<(), String> {
     try_create_sender_with_mode(finst_id, ResultBufferMode::Typed)
 }
@@ -504,6 +544,10 @@ pub(crate) fn discard(finst_id: UniqueId) -> ResultPublication {
     ResultPublication::Removed
 }
 
+#[allow(
+    dead_code,
+    reason = "Legacy registration inspection remains available to protocol adapters outside this target."
+)]
 pub(crate) fn is_registered(finst_id: UniqueId) -> bool {
     ctx().mu.lock().expect("ctx lock").contains_key(&finst_id)
 }
@@ -523,6 +567,10 @@ pub(crate) fn set_mem_tracker(finst_id: UniqueId, tracker: Arc<MemTracker>) {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Legacy EOS templates remain available to protocol adapters outside this target."
+)]
 pub(crate) fn set_eos_template(finst_id: UniqueId, template: ResultBatch) {
     let c = ctx();
     let mut guard = c.mu.lock().expect("ctx lock");
@@ -533,6 +581,10 @@ pub(crate) fn set_eos_template(finst_id: UniqueId, template: ResultBatch) {
     block.eos_template = Some(template);
 }
 
+#[allow(
+    dead_code,
+    reason = "Legacy fetch outcomes are retained for protocol adapters outside the backend lib test configuration."
+)]
 #[derive(Debug)]
 pub enum TryFetchResult {
     Ready(FetchResult),
@@ -553,6 +605,10 @@ pub(crate) enum TryFetchTypedResult {
 /// while holding the lock, avoiding the missed-wakeup race that would
 /// arise if the check and the condvar wait were not atomic with respect
 /// to the mutex.
+#[allow(
+    dead_code,
+    reason = "Legacy fetch polling remains available to protocol adapters outside this target."
+)]
 fn try_fetch_inner(
     guard: &mut HashMap<UniqueId, BufferControlBlock>,
     finst_id: UniqueId,
@@ -659,6 +715,10 @@ fn try_fetch_typed_inner(
     TryFetchTypedResult::NotReady
 }
 
+#[allow(
+    dead_code,
+    reason = "Legacy fetch polling remains available to protocol adapters outside this target."
+)]
 pub fn try_fetch(finst_id: UniqueId) -> TryFetchResult {
     let c = ctx();
     let mut guard = c.mu.lock().expect("ctx lock");
@@ -675,6 +735,10 @@ pub fn try_fetch(finst_id: UniqueId) -> TryFetchResult {
 /// The implementation uses a `Condvar` that is notified by every mutating
 /// operation (`insert`, `close_ok`, `close_error`, `cancel`).  The check and
 /// the wait are performed while holding the mutex, so no wakeup is missed.
+#[allow(
+    dead_code,
+    reason = "Legacy long-poll fetching remains available to protocol adapters outside this target."
+)]
 pub(crate) fn wait_fetch(finst_id: UniqueId, max_wait_ms: i64) -> TryFetchResult {
     let c = ctx();
     let mut guard = c.mu.lock().expect("ctx lock");
@@ -748,10 +812,18 @@ pub(crate) fn wait_fetch_typed(finst_id: UniqueId, max_wait_ms: i64) -> TryFetch
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Legacy fetch timeout fallback remains available to protocol adapters outside this target."
+)]
 fn fallback_fetch_wait_timeout() -> Duration {
     Duration::from_secs(300)
 }
 
+#[allow(
+    dead_code,
+    reason = "Legacy fetch timeout lookup remains available to protocol adapters outside this target."
+)]
 pub fn fetch_wait_timeout(finst_id: UniqueId) -> Duration {
     use crate::runtime::query_context::query_context_manager;
 
@@ -760,6 +832,10 @@ pub fn fetch_wait_timeout(finst_id: UniqueId) -> Duration {
         .unwrap_or_else(fallback_fetch_wait_timeout)
 }
 
+#[allow(
+    dead_code,
+    reason = "Legacy millisecond timeout lookup remains available to protocol adapters outside this target."
+)]
 pub fn fetch_wait_timeout_ms(finst_id: UniqueId) -> i64 {
     let millis = fetch_wait_timeout(finst_id).as_millis();
     i64::try_from(millis).unwrap_or(i64::MAX).max(1)

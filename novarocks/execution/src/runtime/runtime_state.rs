@@ -28,7 +28,6 @@ use crate::runtime::{ExecutionRuntime, execution_services::IoExecutor};
 use crate::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
-use tracing::debug;
 
 /// RuntimeState is a per-fragment-instance execution context, similar to StarRocks BE RuntimeState.
 ///
@@ -126,6 +125,10 @@ impl Clone for RuntimeState {
 }
 
 impl RuntimeState {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Runtime state construction accepts independently optional host-owned services."
+    )]
     pub fn new(
         query_options: Option<QueryOptions>,
         cache_options: Option<ExecutionCacheOptions>,

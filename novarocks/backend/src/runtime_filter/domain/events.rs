@@ -179,6 +179,10 @@ pub(crate) trait BackendRuntimeFilterEventObserver: Send + Sync {
 /// A no-op diagnostic observer. Production observation is owned by the
 /// participant emitter and never depends on this optional side channel.
 #[derive(Default)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) struct DiscardBackendRuntimeFilterEventObserver;
 
 impl BackendRuntimeFilterEventObserver for DiscardBackendRuntimeFilterEventObserver {

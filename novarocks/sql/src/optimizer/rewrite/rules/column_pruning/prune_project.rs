@@ -159,7 +159,7 @@ mod tests {
     use crate::optimizer::opt_expr::OptExpr;
     use crate::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
     use crate::optimizer::scalar::{self, ScalarArena, ScalarNode};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
     use std::cell::RefCell;

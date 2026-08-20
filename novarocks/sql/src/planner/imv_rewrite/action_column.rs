@@ -147,6 +147,10 @@ impl LogicalRewriteRule for ActionColumnValidationRule {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Action-column validation is retained for IMV rewrite rule paths enabled by feature-specific targets."
+)]
 fn validate(plan: &LogicalPlanNode) -> Result<(), String> {
     validate_with_change_stream(plan, &ImvChangeStreamDescriptor::default())
 }
@@ -398,7 +402,6 @@ fn subtree_has_delta(plan: &LogicalPlanNode) -> bool {
 fn sql_scan_source(source: &ScanSource) -> Option<&SqlScanSource> {
     match source {
         ScanSource::Sql(source) => Some(source),
-        _ => None,
     }
 }
 

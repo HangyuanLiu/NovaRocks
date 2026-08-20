@@ -776,7 +776,7 @@ mod tests {
     use crate::optimizer::statistics::{Confidence, CostEstimate, Statistics};
     use crate::planner::optimizer_bridge::scalar::intern_project_items;
     use crate::planner::physical::PhysicalPlanKind;
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use novarocks_catalog::schema::ColumnDef;
     use std::sync::Arc;
 

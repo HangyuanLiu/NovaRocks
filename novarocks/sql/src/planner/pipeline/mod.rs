@@ -21,6 +21,10 @@ use crate::planner::distributed::DistributedPlan;
 use crate::planner::payload::PlanAssertOneRowNode;
 use crate::planner::physical::{PhysicalPlanKind, PhysicalPlanNode, PreExpandKeyedAssertSpec};
 
+#[allow(
+    dead_code,
+    reason = "The pipeline entrypoint is retained for SQL compilation surfaces enabled outside this target."
+)]
 pub(crate) fn build_distributed_plan(
     physical: PhysicalPlanNode,
 ) -> Result<DistributedPlan, String> {
@@ -85,6 +89,10 @@ pub(crate) fn build_sql_write_distributed_plan_with_settings(
     crate::planner::distributed::write::plan::build_sql_write_distributed_plan(&physical, sink)
 }
 
+#[allow(
+    dead_code,
+    reason = "Change-stream distributed planning remains available to mutation compilation surfaces."
+)]
 pub(crate) fn build_sql_change_stream_distributed_plan(
     physical: PhysicalPlanNode,
     dag: crate::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,

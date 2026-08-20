@@ -146,6 +146,10 @@ impl BackendRpcClient {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The frozen native boundary keeps independently validated inputs explicit."
+    )]
     pub(crate) fn exchange_unary(
         &self,
         finst_id: UniqueId,

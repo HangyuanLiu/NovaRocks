@@ -76,7 +76,7 @@ pub(crate) fn find_residual_apply(expr: &OptExpr) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use crate::planner::logical::*;
-    use crate::planner::payload::*;
+
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::collections::HashSet;

@@ -62,7 +62,7 @@ pub(super) fn wrap_scalar_applies(
         current = LogicalPlanNode::new(
             LogicalPlanKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
-                inner_output_column_id: inner_output_column_id,
+                inner_output_column_id,
                 subquery_expr: TypedExpr {
                     kind: ExprKind::ColumnRef {
                         column_id: col_id,
@@ -142,10 +142,10 @@ pub(super) fn wrap_predicate_applies(
 
         current = LogicalPlanNode::new(
             LogicalPlanKind::Apply(LogicalApplyNode {
-                kind: kind,
-                subquery_expr: subquery_expr,
+                kind,
+                subquery_expr,
                 output_column: spec.output_column,
-                inner_output_column_id: inner_output_column_id,
+                inner_output_column_id,
                 correlation_column_ids: spec.correlation_column_ids,
                 correlation_conjuncts: Vec::new(),
                 residual_predicate: None,

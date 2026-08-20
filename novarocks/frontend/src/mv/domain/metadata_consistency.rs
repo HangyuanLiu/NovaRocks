@@ -21,6 +21,10 @@ use crate::mv::domain::storage_observation::MvPublishedBaseFact;
 /// Assert the lake descriptor's schema contract matches the store's contract.
 /// Fail-loud: the descriptor is the authoritative home (W2); a missing or
 /// drifted descriptor contract means a create/alter path failed to sync it.
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn ensure_descriptor_schema_contract_matches(
     descriptor_contract: Option<&MvSchemaContract>,
     stored_contract: &MvSchemaContract,
@@ -43,6 +47,10 @@ pub(crate) fn ensure_descriptor_schema_contract_matches(
 /// Assert the provenance watermark (from the MV table's current snapshot
 /// summary) matches the metadata store's last_refresh_snapshots. Fail-loud on
 /// drift — the summary is the authoritative watermark home (W3a).
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn ensure_summary_watermark_matches_store(
     provenance_bases: &[MvPublishedBaseFact],
     store_last_refresh_snapshots: &std::collections::BTreeMap<String, i64>,

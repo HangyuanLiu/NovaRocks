@@ -28,7 +28,7 @@ pub fn eval_map_literal(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    if args.len() % 2 != 0 {
+    if !args.len().is_multiple_of(2) {
         return Err(format!(
             "map literal expects an even number of key/value arguments, got {}",
             args.len()

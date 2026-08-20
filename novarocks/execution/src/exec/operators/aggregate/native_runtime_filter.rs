@@ -82,6 +82,10 @@ impl std::fmt::Debug for AggregateTopNProducerSessionFactory {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "The session factory exposes topology details for native aggregate runtime-filter integration."
+)]
 impl AggregateTopNProducerSessionFactory {
     pub(crate) fn from_plan(
         specs: &[AggregateTopNRuntimeFilterProducerBinding],

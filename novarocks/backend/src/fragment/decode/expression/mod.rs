@@ -76,8 +76,6 @@ impl NativeExpressionInputLayout {
     }
 }
 
-pub(crate) use min_max::extract_min_max_predicates;
-
 #[allow(dead_code)]
 pub(crate) fn decode_expr(
     e: &expr::Expr,

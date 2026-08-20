@@ -42,7 +42,7 @@ pub(crate) enum ResolvedTableRef {
 
 #[derive(Clone, Debug)]
 pub struct MvAnalysis {
-    pub resolved_refs: Vec<ResolvedTableRef>,
+    pub(crate) resolved_refs: Vec<ResolvedTableRef>,
     pub output_columns: Vec<SqlMvOutputColumnFacts>,
     /// Opaque SQL-owned carrier for refresh-property planning. Core retains it
     /// only to hand it back to SQL; it cannot inspect the analyzer tree.
@@ -65,6 +65,10 @@ impl PreparedMvSelect {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn prepare_mv_select(
     query: &sqlparser::ast::Query,
     current_catalog: Option<&str>,
@@ -103,6 +107,10 @@ fn prepare_mv_select_with_catalog_paths(
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn finish_mv_analysis<T>(prepared: PreparedMvSelect, source: T) -> MvAnalysis
 where
     T: SqlResolvedMvRefreshInputSource,
@@ -116,6 +124,10 @@ where
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn analyze_mv_select_with<Register, Analyze, T>(
     query: &sqlparser::ast::Query,
     current_catalog: Option<&str>,
@@ -503,6 +515,10 @@ pub fn validate_mv_partition_columns(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn validate_starrocks_mv_partition_columns(
     partition_by: Option<&[IcebergPartitionFieldExpr]>,
     output_columns: &[SqlMvOutputColumnFacts],

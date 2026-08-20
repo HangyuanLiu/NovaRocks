@@ -24,7 +24,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
+#[cfg(test)]
+use arrow::datatypes::Field;
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::persistence::schema as mv_schema;
@@ -95,17 +97,53 @@ pub struct IcebergMvRewriteContext {
 /// Debug-only view of an `IcebergMvRewriteContext`. No `Display` impl — log
 /// via `tracing::info!(summary = ?ctx.rewrite.summary(), ...)`.
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) struct CtxSummary<'a> {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub target: &'a TableIdentity,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub mv_id: i64,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub base_count: usize,
     pub base_fqns: Vec<String>,
     pub pinned_snapshots: Vec<(String, i64)>,
     pub previous_snapshots: Vec<(String, Option<i64>)>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub target_snapshot_id: Option<i64>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub schema_contract_version: u16,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub partition_contract_present: bool,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub visible_output_column_count: usize,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub hidden_apply_key_column: &'a str,
 }
 
@@ -246,6 +284,10 @@ impl IcebergMvRewriteContext {
     /// that do not execute a validated refresh plan. Production refresh
     /// execution must call `from_parts` with its contract baseline instead.
     #[allow(clippy::too_many_arguments)]
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn from_definition_parts(
         target: TableIdentity,
         mv_id: i64,
@@ -282,6 +324,10 @@ impl IcebergMvRewriteContext {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn summary(&self) -> CtxSummary<'_> {
         let n = self.base_refs.len();
         let mut base_fqns: Vec<String> = Vec::with_capacity(n);
@@ -1134,6 +1180,10 @@ pub(crate) mod tests_support {
 
     /// Returns a minimally-valid `Arc<IcebergMvRewriteContext>` for use in
     /// unit tests outside this module (e.g. `imv/entrypoint.rs`).
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn dummy_rewrite_context() -> Arc<IcebergMvRewriteContext> {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
@@ -1163,6 +1213,10 @@ pub(crate) mod tests_support {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn join_projection_rewrite_context() -> Arc<IcebergMvRewriteContext> {
         let mut mv_def = make_mv_definition();
         mv_def.base_table_refs = vec!["ice.db.l".to_string(), "ice.db.r".to_string()];
@@ -1240,6 +1294,10 @@ pub(crate) mod tests_support {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     fn join_base_contract(table_fqn: &str, object_id_value: &str, alias: &str) -> BaseContract {
         BaseContract {
             table_fqn: table_fqn.to_string(),
@@ -1265,6 +1323,10 @@ pub(crate) mod tests_support {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     fn qualified_field(table_fqn: &str, qualifier: &str, field_id: i32) -> QualifiedFieldLineage {
         QualifiedFieldLineage {
             table_fqn: table_fqn.to_string(),
@@ -1921,7 +1983,7 @@ mod tests {
             DataType::Binary,
             false,
         )]));
-        let field_ids: Arc<[i32]> = Arc::from(vec![200]);
+        let _field_ids: Arc<[i32]> = Arc::from(vec![200]);
 
         let columns = sql_target_columns(&schema);
 

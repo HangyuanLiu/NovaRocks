@@ -116,8 +116,10 @@ mod tests {
     fn codec_reports_the_typed_record_budget_error() {
         let mut value = stored_attachment();
         value.display_name = "x".repeat(1_024);
-        let mut limits = novarocks_spi::state_store::StateStoreLimits::default();
-        limits.max_value_bytes = 256;
+        let limits = novarocks_spi::state_store::StateStoreLimits {
+            max_value_bytes: 256,
+            ..novarocks_spi::state_store::StateStoreLimits::default()
+        };
         let error = encode(&DurableRecordStore::with_limits(limits), &value)
             .expect_err("record beyond the StateStore limit must fail before a write");
         assert!(matches!(

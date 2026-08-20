@@ -65,6 +65,10 @@ pub struct NlJoinProbeProcessorFactory {
 }
 
 impl NlJoinProbeProcessorFactory {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The nested-loop factory receives the complete frozen join plan contract."
+    )]
     pub(crate) fn new(
         arena: Arc<ExprArena>,
         join_type: NestedLoopJoinType,

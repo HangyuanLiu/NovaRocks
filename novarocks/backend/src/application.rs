@@ -22,8 +22,8 @@ use crate::fragment::{
 };
 use crate::metrics::MetricsHttpServer;
 use crate::query_lifecycle::{
-    NativeQueryLifecycleLocalRuntime, QueryControlAttachment, QueryLifecycleIngress,
-    QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
+    NativeQueryLifecycleLocalRuntime, QueryControlAttachment, QueryLifecycleError,
+    QueryLifecycleIngress, QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
 };
 use crate::rpc::server::{BackendRpcServerHandle, BackendRpcService};
 use crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress;
@@ -193,13 +193,10 @@ impl QueryLifecycleSweepTask {
         let join_handle = std::thread::Builder::new()
             .name("query-lifecycle-sweep".to_string())
             .spawn(move || {
-                loop {
-                    match stop_rx.recv_timeout(interval) {
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            registry.sweep_expired(Instant::now());
-                        }
-                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
+                while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    stop_rx.recv_timeout(interval)
+                {
+                    registry.sweep_expired(Instant::now());
                 }
             })
             .map_err(|error| format!("spawn query lifecycle sweep task: {error}"))?;
@@ -349,8 +346,8 @@ impl BackendApplicationHost {
         let sweep_result = self.query_lifecycle_sweep.stop();
         let metrics_result = self.metrics_http_server.stop();
         combine_shutdown_results(listener_shutdown, sweep_result)
-            .and_then(|()| metrics_result)
-            .and_then(|()| execution_shutdown)
+            .and(metrics_result)
+            .and(execution_shutdown)
             .map_err(|error| {
                 BackendApplicationError::new(BackendApplicationErrorKind::Shutdown, error)
             })
@@ -450,6 +447,10 @@ impl BackendApplicationHost {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "This library entrypoint is invoked by the backend server binary, not backend lib tests."
+)]
 pub fn run_backend_server(config: BackendServerConfig) -> Result<(), BackendApplicationError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -790,7 +791,7 @@ mod tests {
         ProtoQueryControlRequest {
             command: Some(protocol::query_control_request::Command::Attach(
                 ProtoQueryControlAttach {
-                    execution_id: manifest.as_proto().execution_id.clone(),
+                    execution_id: manifest.as_proto().execution_id,
                     init_digest: init
                         .digest()
                         .expect("validated InitQuery has digest")
@@ -809,7 +810,7 @@ mod tests {
     ) -> ProtoAbortQueryRequest {
         let manifest = init.manifest().expect("validated InitQuery has manifest");
         ProtoAbortQueryRequest {
-            execution_id: manifest.as_proto().execution_id.clone(),
+            execution_id: manifest.as_proto().execution_id,
             init_digest: digest.to_vec(),
             reason: reason.into(),
         }
@@ -860,6 +861,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "The mutex serializes loopback backend tests that bind listeners and must remain held for the full test."
+    )]
     async fn application_query_control_attachment_live_loopback_round_trip() {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
@@ -949,6 +954,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "The mutex serializes loopback backend tests that bind listeners and must remain held for the full test."
+    )]
     async fn application_query_control_heartbeat_timeout_fails_closed_with_open_socket() {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
@@ -1028,6 +1037,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "The mutex serializes loopback backend tests that bind listeners and must remain held for the full test."
+    )]
     async fn application_shutdown_closes_live_query_control_stream_and_fails_closed() {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
@@ -1121,6 +1134,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "The mutex serializes loopback backend tests that bind listeners and must remain held for the full test."
+    )]
     async fn application_malformed_init_query_returns_invalid_argument() {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
@@ -1139,6 +1156,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "The mutex serializes loopback backend tests that bind listeners and must remain held for the full test."
+    )]
     async fn application_malformed_abort_query_returns_invalid_argument() {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
@@ -1157,6 +1178,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "The mutex serializes loopback backend tests that bind listeners and must remain held for the full test."
+    )]
     async fn application_abort_digest_mismatch_is_rejected_without_terminating_entry() {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
@@ -1245,4 +1270,3 @@ mod tests {
         );
     }
 }
-use crate::query_lifecycle::QueryLifecycleError;

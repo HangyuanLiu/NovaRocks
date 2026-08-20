@@ -384,7 +384,7 @@ impl<'a> super::AnalyzerContext<'a> {
                             catalog_override.as_deref(),
                             &db_lower,
                             &tbl_lower,
-                            metadata_ty.clone(),
+                            metadata_ty,
                         )?
                         .planner;
                     let alias_name = alias.as_ref().map(|a| a.name.value.clone());

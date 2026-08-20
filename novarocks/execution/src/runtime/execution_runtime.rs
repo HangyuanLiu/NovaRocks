@@ -140,8 +140,8 @@ pub struct ExecutionRuntime {
 impl ExecutionRuntime {
     pub fn new(config: ExecutionRuntimeConfig) -> Result<Self, ExecutionRuntimeConfigError> {
         config.validate()?;
-        let services = ExecutionServices::new(&config)
-            .map_err(|error| ExecutionRuntimeConfigError::runtime(error))?;
+        let services =
+            ExecutionServices::new(&config).map_err(ExecutionRuntimeConfigError::runtime)?;
         let driver_executor = Arc::new(GlobalDriverExecutor::new(config.driver_threads));
         let scan_executor = Arc::new(ScanExecutor::new(
             config.scan_threads,

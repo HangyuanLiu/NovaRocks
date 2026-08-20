@@ -53,6 +53,10 @@ const ADD_FILES_ARTIFACT_CODEC_VERSION: u16 = 1;
 impl DmlService {
     /// Execute one parser-admitted ADD FILES command through the frontend
     /// application owner.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub fn execute_add_files(
         &self,
         engine: &dyn AddFilesEngine,
@@ -120,6 +124,10 @@ impl DmlService {
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn execute_add_files_operation(
     engine: &dyn AddFilesEngine,
     context: &RequestContext,
@@ -222,6 +230,10 @@ fn execute_add_files_operation(
 /// then persist the receipt through the fenced journal. The record binds this
 /// statement's immutable source scope, so a later owner can prove the fence was
 /// minted for the very source set it is reasoning about.
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn establish_and_record_fence(
     engine: &dyn AddFilesEngine,
     active: &mut ActiveDmlOperation,
@@ -269,6 +281,10 @@ fn establish_and_record_fence(
     Ok(active.stored.clone())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn finish_plan_failure(
     journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
@@ -284,6 +300,10 @@ fn finish_plan_failure(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn finish_outcome(
     engine: &dyn AddFilesEngine,
     journal: &mut ActiveDmlOperation,
@@ -323,6 +343,10 @@ fn finish_outcome(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn persist_unknown_then_reconcile(
     engine: &dyn AddFilesEngine,
     journal: &mut ActiveDmlOperation,
@@ -444,6 +468,10 @@ fn persist_unknown_then_reconcile(
     finish_outcome(engine, journal, stored, prepared, reconciled, false)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn persist_known_committed(
     journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
@@ -536,6 +564,10 @@ fn persist_known_committed(
 /// A confirmed provider commit transfers the scope to the table even if the
 /// frontend cannot retain its receipt.  Record that ownership truth and stop
 /// at manual inspection; releasing or freezing this source would be false.
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn persist_committed_manual(
     journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
@@ -594,6 +626,10 @@ fn persist_committed_manual(
     ))
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn persist_known_uncommitted(
     journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
@@ -644,6 +680,10 @@ fn persist_known_uncommitted(
     ))
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn persist_contract_failure(
     journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
@@ -660,6 +700,10 @@ fn persist_contract_failure(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn persist_frozen_manual(
     journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
@@ -718,6 +762,10 @@ fn persist_frozen_manual(
     ))
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn apply(
     journal: &mut ActiveDmlOperation,
     request: AddFilesMutationRequest,
@@ -784,6 +832,10 @@ fn planned_record(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn artifact(kind: AddFilesArtifactKind, bytes: Vec<u8>) -> Result<AddFilesArtifact, DmlError> {
     let total_length = u32::try_from(bytes.len())
         .map_err(|_| DmlError::journal_unavailable("ADD FILES artifact exceeds u32 length"))?;
@@ -834,6 +886,10 @@ fn validate_plan_facts(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_receipt(facts: &AddFilesPlanFacts, receipt: &AddFilesReceipt) -> Result<(), DmlError> {
     let matching = receipt.provider_id == facts.provider_id
         && receipt.instance_id == facts.instance_id
@@ -854,6 +910,10 @@ fn validate_receipt(facts: &AddFilesPlanFacts, receipt: &AddFilesReceipt) -> Res
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_evidence(
     operation_id: DmlOperationId,
     facts: &AddFilesPlanFacts,
@@ -886,6 +946,10 @@ fn validate_evidence(
     Ok(())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn add_files_record(stored: &StoredOperation) -> Result<AddFilesLifecycleRecord, DmlError> {
     match &stored.payload {
         OperationPayload::AddFilesLifecycle(record) => Ok(record.clone()),
@@ -893,6 +957,10 @@ fn add_files_record(stored: &StoredOperation) -> Result<AddFilesLifecycleRecord,
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn source_ownership(stored: &StoredOperation) -> Result<SourceScopeOwnership, DmlError> {
     Ok(add_files_record(stored)?.source_ownership)
 }

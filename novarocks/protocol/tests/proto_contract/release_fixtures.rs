@@ -437,7 +437,7 @@ fn release_report_query_terminal_request() -> novarocks::ReportQueryTerminalRequ
             outcome: Some(novarocks::participant_terminal_outcome::Outcome::Proof(
                 novarocks::TerminalizationProof {
                     version: 1,
-                    execution_id: snapshot.execution_id.clone(),
+                    execution_id: snapshot.execution_id,
                     backend: snapshot.backend.clone(),
                     init_digest: snapshot.init_digest.clone(),
                     digest: snapshot.digest.clone(),

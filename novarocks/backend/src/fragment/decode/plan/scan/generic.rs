@@ -201,12 +201,15 @@ pub(super) fn lower_connector_read_scan(
             .slot_ids()
             .iter()
             .map(|slot_id| {
-                variant_path_plan
+                if variant_path_plan
                     .specs
                     .iter()
                     .any(|spec| spec.source_slot_id == *slot_id)
-                    .then_some(ParquetSlotKind::Variant)
-                    .unwrap_or(ParquetSlotKind::Regular)
+                {
+                    ParquetSlotKind::Variant
+                } else {
+                    ParquetSlotKind::Regular
+                }
             })
             .collect();
         let output_slot_ids = output_schema.slot_ids().to_vec();

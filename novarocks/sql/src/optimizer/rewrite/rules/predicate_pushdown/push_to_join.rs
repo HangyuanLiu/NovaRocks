@@ -752,7 +752,7 @@ mod tests {
     use crate::optimizer::operator::ScanOp;
     use crate::optimizer::rewrite::context::RewriteContext;
     use crate::planner::optimizer_bridge::scalar::{intern_typed, materialize};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use novarocks_catalog::schema::ColumnDef;
 
     fn col_id(id: u32) -> ColumnId {

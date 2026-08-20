@@ -32,6 +32,10 @@ pub(crate) enum BackendReductionApply {
 pub(crate) enum BackendReductionStateError {
     Install(BackendInstallPolicyError),
     ReplayConflict,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     SequenceAfterClose,
     Reducer(ReducerError),
     OrderedContract,
@@ -102,6 +106,10 @@ impl BackendReductionState {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn policy(&self) -> &BackendInstallPolicy {
         &self.policy
     }

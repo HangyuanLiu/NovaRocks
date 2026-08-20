@@ -62,7 +62,15 @@ pub struct DmlService {
 
 #[derive(Debug)]
 pub(crate) enum DmlRecoveryProgress {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
     Statement(StatementRecoveryProgress),
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
     Ctas(CtasRecoveryProgress),
 }
 
@@ -154,6 +162,10 @@ impl DmlService {
     }
 
     /// Build a service with a custom admission gate (CP-3 fencing).
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
     pub(crate) fn with_admission(
         journal: Option<Arc<dyn OperationJournal>>,
         statistics: Arc<FrontendStatisticsService>,
@@ -172,6 +184,10 @@ impl DmlService {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn begin_write_operation(
         &self,
         request: CreatePreparingRequest,
@@ -200,6 +216,10 @@ impl DmlService {
         coordinator.claim_foreground(journal, operation)
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn begin_statement_operation(
         &self,
         request: CreateStatementOperationRequest,
@@ -226,6 +246,10 @@ impl DmlService {
         Ok(())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn recovery_candidates(
         &self,
         shard: u8,
@@ -235,6 +259,14 @@ impl DmlService {
             .recovery_candidates(shard, due_at_or_before_ms)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn defer_recovery_candidate(
         &self,
         candidate: DmlRecoveryCandidate,
@@ -254,6 +286,10 @@ impl DmlService {
     /// as the blanket deferral took it. CTAS converges through CP-3D, direct
     /// mutations through CP-3C, and unsupported families keep the bounded
     /// deferral. The lease is released either way.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn drive_recovery_candidate(
         &self,
         candidate: DmlRecoveryCandidate,
@@ -332,6 +368,10 @@ impl DmlService {
 
     /// Re-read and claim one recovery candidate under its exact operation
     /// lease, or report that it moved on since the scan observed it.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn claim_recovery_candidate(
         &self,
         candidate: DmlRecoveryCandidate,
@@ -352,6 +392,10 @@ impl DmlService {
     }
 
     /// Run one Iceberg write transaction with the given executor.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub fn run_write<E: WriteExecutor>(
         &self,
         spec: WriteTransactionSpec,
@@ -371,6 +415,10 @@ impl DmlService {
         runner.run(spec)
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn require_journal(&self) -> Result<&dyn OperationJournal, DmlError> {
         self.journal.as_deref().ok_or_else(|| {
             DmlError::journal_unavailable(
@@ -379,6 +427,10 @@ impl DmlService {
         })
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn require_journal_arc(&self) -> Result<Arc<dyn OperationJournal>, DmlError> {
         self.journal.clone().ok_or_else(|| {
             DmlError::journal_unavailable(
@@ -387,6 +439,10 @@ impl DmlService {
         })
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn require_coordinator(&self) -> Result<&DmlCoordinator, DmlError> {
         self.coordinator.as_ref().ok_or_else(|| {
             DmlError::coordination_unresolved(
@@ -410,6 +466,10 @@ impl DmlService {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(catalog);
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn local_statistics_columns(
         &self,
         database: &str,
@@ -436,6 +496,10 @@ impl DmlService {
     }
 
     /// Load a stored operation by id.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub fn load_operation(
         &self,
         operation_id: DmlOperationId,
@@ -444,11 +508,19 @@ impl DmlService {
     }
 
     /// List all durable operations for lifecycle inspection and recovery audits.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub fn list_operations(&self) -> Result<Vec<StoredOperation>, DmlError> {
         self.require_journal()?.list_operations()
     }
 
     /// List operations that have not reached a terminal state (recovery input).
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub fn list_unfinished_operations(&self) -> Result<Vec<StoredOperation>, DmlError> {
         self.require_journal()?.list_unfinished()
     }

@@ -69,6 +69,10 @@ impl MvRefreshPreparationRequest {
 /// Application-owned work handoff after SQL planning. SQL plans determine the
 /// semantic shape; this lifecycle envelope owns operation/cohort-bearing
 /// artifacts and is the only value admitted by frontend staging.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The refresh handoff keeps the exact prepared-work payload at the frontend boundary."
+)]
 pub enum PreparedMvRefreshWork {
     NoOp,
     MetadataOnly,

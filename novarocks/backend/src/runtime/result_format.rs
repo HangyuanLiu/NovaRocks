@@ -52,8 +52,16 @@ fn field_schemas_for_chunk_fields(chunk: &Chunk) -> Vec<FieldRenderSchema> {
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "Statistic formatting remains owned by Compat adapters outside the backend lib test configuration."
+)]
 const STATISTIC_DATA_VERSION_V1: i32 = 1;
 
+#[allow(
+    dead_code,
+    reason = "Statistic formatting remains owned by Compat adapters outside the backend lib test configuration."
+)]
 fn parse_lenenc_fields(
     row: &[u8],
     expected_columns: usize,
@@ -111,6 +119,10 @@ fn parse_lenenc_fields(
     Ok(fields)
 }
 
+#[allow(
+    dead_code,
+    reason = "Statistic formatting remains owned by Compat adapters outside the backend lib test configuration."
+)]
 fn required_i32_field(
     fields: &[Option<Vec<u8>>],
     index: usize,
@@ -129,10 +141,16 @@ fn required_i32_field(
 
 /// Builds the neutral Statistic batch envelope. The role adapter supplies the
 /// protocol-specific row encoder.
+type StatisticRowEncoder = fn(i32, &[Option<Vec<u8>>]) -> Result<Vec<u8>, String>;
+
+#[allow(
+    dead_code,
+    reason = "Statistic formatting remains owned by Compat adapters outside the backend lib test configuration."
+)]
 pub fn build_statistic_result_batch(
     chunk: &Chunk,
     projections: &[ResultProjection],
-    encoder: fn(i32, &[Option<Vec<u8>>]) -> Result<Vec<u8>, String>,
+    encoder: StatisticRowEncoder,
 ) -> Result<ResultBatch, String> {
     if projections.is_empty() {
         return Err("STATISTIC result sink requires non-empty projections".to_string());
@@ -214,6 +232,10 @@ pub fn build_result_batch(
     Ok(batch)
 }
 
+#[allow(
+    dead_code,
+    reason = "Empty result construction remains available to protocol adapters outside this target."
+)]
 pub fn empty_result_batch(presentation: ResultPresentation) -> Result<ResultBatch, String> {
     match presentation {
         ResultPresentation::MysqlText | ResultPresentation::HttpJson => Ok(ResultBatch::empty()),

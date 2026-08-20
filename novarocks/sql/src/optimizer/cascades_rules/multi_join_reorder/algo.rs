@@ -90,10 +90,11 @@ pub(crate) fn enumerate_orders(
     if let Some(tree) = left_deep(graph, arena) {
         candidates.push(tree);
     }
-    if caps.enable_dp && n <= caps.max_dp.min(MAX_MASK_ATOMS) {
-        if let Some(tree) = dp(graph, arena) {
-            candidates.push(tree);
-        }
+    if caps.enable_dp
+        && n <= caps.max_dp.min(MAX_MASK_ATOMS)
+        && let Some(tree) = dp(graph, arena)
+    {
+        candidates.push(tree);
     }
     if caps.enable_greedy && n <= caps.max_greedy.min(MAX_MASK_ATOMS) {
         candidates.extend(greedy_topk(graph, caps.topk, arena));
@@ -359,10 +360,10 @@ fn dp(graph: &MultiJoinGraph, arena: &mut ScalarArena) -> Option<JoinTree> {
                     left = (left.wrapping_sub(1)) & subset;
                     continue;
                 }
-                if let Some(cell) = try_partition(&memo, graph, left, right, arena) {
-                    if best.as_ref().is_none_or(|b| cell.cost < b.cost) {
-                        best = Some(cell);
-                    }
+                if let Some(cell) = try_partition(&memo, graph, left, right, arena)
+                    && best.as_ref().is_none_or(|b| cell.cost < b.cost)
+                {
+                    best = Some(cell);
                 }
                 left = (left.wrapping_sub(1)) & subset;
             }
@@ -655,7 +656,7 @@ fn count_predicate_conjuncts(arena: &ScalarArena, expr: ScalarId) -> usize {
 
 fn bounded_predicate_complexity(v: f64) -> f64 {
     if v.is_finite() {
-        v.max(1.0).min(REORDER_PREDICATE_COMPLEXITY_MAX)
+        v.clamp(1.0, REORDER_PREDICATE_COMPLEXITY_MAX)
     } else {
         1.0
     }

@@ -21,6 +21,10 @@ use crate::planner::table::{
 };
 use novarocks_catalog::schema::ColumnDef;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Target-state scans carry independently validated table, key, state, and partition facts."
+)]
 pub(crate) fn build_target_state_scan_source(
     binding: SqlTableBindingId,
     table: SqlTableIdentity,
@@ -97,9 +101,7 @@ mod tests {
             crate::planner::table::SqlMvTargetStatePartitionConstraint::Unpartitioned,
         );
 
-        let ScanSource::Sql(source) = source else {
-            panic!("expected SQL target-state scan source");
-        };
+        let ScanSource::Sql(source) = source;
 
         assert_eq!(source.binding, test_target_binding());
         assert_eq!(source.table.catalog, "ice");

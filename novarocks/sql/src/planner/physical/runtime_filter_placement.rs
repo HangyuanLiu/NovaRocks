@@ -731,15 +731,15 @@ fn tree_has_no_runtime_filters(node: &PhysicalPlanNode) -> bool {
     if !node.probe_runtime_filters.is_empty() {
         return false;
     }
-    if let PhysicalPlanKind::HashJoin(join) = &node.kind {
-        if !join.build_runtime_filters.is_empty() {
-            return false;
-        }
+    if let PhysicalPlanKind::HashJoin(join) = &node.kind
+        && !join.build_runtime_filters.is_empty()
+    {
+        return false;
     }
-    if let PhysicalPlanKind::HashAggregate(aggregate) = &node.kind {
-        if !aggregate.topn_runtime_filter_builds.is_empty() {
-            return false;
-        }
+    if let PhysicalPlanKind::HashAggregate(aggregate) = &node.kind
+        && !aggregate.topn_runtime_filter_builds.is_empty()
+    {
+        return false;
     }
     node.children.iter().all(tree_has_no_runtime_filters)
 }
@@ -1014,8 +1014,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "optimizer output must not carry runtime filters")]
     fn guard_rejects_preexisting_runtime_filter_intents_when_rule_disabled() {
-        let mut settings = SessionOptimizerSettings::default();
-        settings.disabled_rules = vec![RUNTIME_FILTER_RULE.to_string()];
+        let settings = SessionOptimizerSettings {
+            disabled_rules: vec![RUNTIME_FILTER_RULE.to_string()],
+            ..Default::default()
+        };
         let mut join = hash_join_node(
             JoinKind::Inner,
             JoinDistribution::Broadcast,

@@ -25,12 +25,14 @@ use std::sync::{Arc, Mutex};
 use crate::connector::ConnectorRegistry;
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use crate::runtime::sink_commit::{BackendSinkCommitPort, ConfiguredBackendSinkCommitPort};
-use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
+use novarocks_execution::runtime::execution_runtime::ExecutionRuntime;
+#[cfg(test)]
+use novarocks_execution::runtime::execution_runtime::ExecutionRuntimeConfig;
+use novarocks_execution::runtime::fragment::io::FragmentLookupClient;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeFrameTransmitter, ExchangeReceiverPort, FragmentCommitPort, FragmentResultWriter,
     UnavailableExchangeReceiverPort,
 };
-use novarocks_execution::runtime::fragment::io::{FragmentEventSink, FragmentLookupClient};
 use novarocks_execution::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
 };
@@ -41,8 +43,6 @@ use novarocks_spi::connector::{
     WriteCommitEvidenceLimits,
 };
 use tracing::error;
-#[cfg(test)]
-use tracing::warn;
 
 use super::control::{FragmentControlHandle, FragmentControlRegistry};
 #[cfg(test)]
@@ -165,6 +165,10 @@ impl NativeFragmentService {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The frozen native boundary keeps independently validated inputs explicit."
+    )]
     pub(crate) fn new_with_controls(
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
         lookup_client: Arc<dyn FragmentLookupClient>,
@@ -341,8 +345,8 @@ impl NativeFragmentService {
                 runtime_filter,
             )
             .map_err(NativeFragmentIngressError::new)?;
-        let query_mem_tracker = admission.query_mem_tracker();
-        let fragment_mem_tracker = admission.fragment_mem_tracker();
+        let _query_mem_tracker = admission.query_mem_tracker();
+        let _fragment_mem_tracker = admission.fragment_mem_tracker();
         // Staged execution can safely rendezvous after Start even when this
         // is the root result fragment: the runner-owned trigger is consumed
         // only after the gate releases and never exists in production.
@@ -493,8 +497,8 @@ impl NativeFragmentService {
                 runtime_filter,
             )
             .map_err(NativeFragmentIngressError::new)?;
-        let query_mem_tracker = admission.query_mem_tracker();
-        let fragment_mem_tracker = admission.fragment_mem_tracker();
+        let _query_mem_tracker = admission.query_mem_tracker();
+        let _fragment_mem_tracker = admission.fragment_mem_tracker();
         let failure_injection_eligible = !request.uses_result_sink();
         let event_sink = crate::fragment::lifecycle_fragment_event_sink(
             Arc::clone(&self.lifecycle),
@@ -810,12 +814,11 @@ mod tests {
         DormantFragmentHandle, FragmentOutcome, prepare_fragment,
     };
     use novarocks_protocol as proto;
-    use novarocks_protocol::lifecycle::{
-        AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantRole,
-        QueryControlAttach, QueryControlEndpoint, QueryInitOutcome, QueryInitRequest, QueryOptions,
-        StageFragment,
-    };
     use novarocks_protocol::lifecycle::{AttemptId as ProtocolAttemptId, QueryExecutionId};
+    use novarocks_protocol::lifecycle::{
+        ParticipantBackendIdentity, ParticipantManifest, ParticipantRole, QueryControlAttach,
+        QueryControlEndpoint, QueryInitOutcome, QueryInitRequest, QueryOptions, StageFragment,
+    };
     use novarocks_types::QueryId as ExecutionQueryId;
     use novarocks_types::QueryId;
     use novarocks_types::UniqueId;

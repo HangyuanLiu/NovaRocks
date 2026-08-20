@@ -2138,6 +2138,10 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         }
     }
 
+    #[allow(
+        private_interfaces,
+        reason = "The public maintenance-service trait exposes a frontend-private parsed command."
+    )]
     fn handle_typed_show_optimize(
         &self,
         statement: ParsedShowOptimize,

@@ -21,7 +21,7 @@
 //! collection is internal distributed work whose output is handed back to the
 //! connector control plane, never encoded as client MySQL rows.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -699,11 +699,13 @@ impl StatisticsScalarPartial {
             let value = match &metric {
                 StatisticsMetric::RowCount => StatisticsMetricValue::U64(self.row_count),
                 StatisticsMetric::NullCount { .. } => StatisticsMetricValue::U64(self.null_count),
-                StatisticsMetric::AverageSize { .. } => StatisticsMetricValue::F64(
-                    (self.row_count != 0)
-                        .then(|| self.total_size as f64 / self.row_count as f64)
-                        .unwrap_or(0.0),
-                ),
+                StatisticsMetric::AverageSize { .. } => {
+                    StatisticsMetricValue::F64(if self.row_count != 0 {
+                        self.total_size as f64 / self.row_count as f64
+                    } else {
+                        0.0
+                    })
+                }
                 StatisticsMetric::Minimum { .. } => self
                     .minimum
                     .as_ref()
@@ -1266,24 +1268,17 @@ impl StatisticsCollectionFinalizer {
         metrics
             .metrics()
             .iter()
-            .cloned()
             .map(|metric| {
-                let observed = match &metric {
+                let observed = match metric {
                     StatisticsMetric::RowCount => self.table.as_ref().and_then(|partial| {
-                        partial
-                            .metric_values([metric.clone()])
-                            .ok()?
-                            .remove(&metric)
+                        partial.metric_values([metric.clone()]).ok()?.remove(metric)
                     }),
                     StatisticsMetric::NullCount { column }
                     | StatisticsMetric::Minimum { column }
                     | StatisticsMetric::Maximum { column }
                     | StatisticsMetric::AverageSize { column } => {
                         self.columns.get(column).and_then(|partial| {
-                            partial
-                                .metric_values([metric.clone()])
-                                .ok()?
-                                .remove(&metric)
+                            partial.metric_values([metric.clone()]).ok()?.remove(metric)
                         })
                     }
                     StatisticsMetric::ThetaNdv { column } => self
@@ -1297,11 +1292,11 @@ impl StatisticsCollectionFinalizer {
                             value,
                             data_version.clone(),
                             StatisticsMetricSource::VisibleRowScan,
-                            visible_row_numeric_nature(&metric),
+                            visible_row_numeric_nature(metric),
                             StatisticsBasisRelation::Identical,
                         ))
                     })
-                    .unwrap_or_else(|| not_collected(&metric));
+                    .unwrap_or_else(|| not_collected(metric));
                 (metric.clone(), state)
             })
             .collect()
@@ -1401,6 +1396,10 @@ fn visible_row_numeric_nature(metric: &StatisticsMetric) -> StatisticsNumericNat
 /// Decode the provider-neutral visible-row artifact.  It is public within the
 /// Core crate because the Iceberg provider is still hosted here until SPI-5;
 /// it deliberately is not exposed as a connector-specific wire type.
+#[allow(
+    dead_code,
+    reason = "Retained for visible-row artifact contract regression coverage."
+)]
 pub(crate) fn decode_visible_row_artifact(
     bytes: &[u8],
 ) -> Result<
@@ -1790,6 +1789,10 @@ impl ThetaSketchPartial {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for deterministic Theta-partial serialization regression coverage."
+    )]
     pub(crate) fn compact_parts(&self) -> (u8, u64, Vec<u64>) {
         (self.lg_k, self.theta, self.retained_hashes.clone())
     }
@@ -1896,20 +1899,11 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableHandle,
-        StatisticsCollectionPlan,
+        ConnectorInstanceId, ConnectorTableHandle, StatisticsCollectionPlan,
     };
     use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
 
     use super::*;
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     /// Stand-in basis for collector tests that only assert on values. The
     /// collector labels every metric with the version it was handed, so any
@@ -1924,16 +1918,6 @@ mod tests {
             Some(StatisticsMetricState::Available(observation)) => Some(observation.value()),
             _ => None,
         }
-    }
-
-    fn connector_context() -> ConnectorRequestContext {
-        ConnectorRequestContext::try_new(
-            Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
-            1024,
-            4096,
-        )
-        .expect("valid connector context")
     }
 
     fn program_for_preparation() -> StatisticsCollectionProgram {

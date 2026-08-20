@@ -89,22 +89,46 @@ use crate::dml::reconcile::{
 /// Backoff for an operation whose evidence is insufficient right now: a missing
 /// fence receipt, an unreconstructable fenced identity, or a transient provider
 /// failure. Nothing has been concluded, so the due simply moves.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 pub(crate) const DML_WRITE_RECOVERY_UNRESOLVED_DELAY_MS: i64 = 5_000;
 /// Backoff for a proof-bound cleanup that did not complete. The obligation is
 /// retained (spec D5) and retried on a later cycle.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 pub(crate) const DML_WRITE_RECOVERY_CLEANUP_DELAY_MS: i64 = 15_000;
 /// Backoff for a fact this cycle cannot change: a superseded recovery attempt,
 /// unreadable external truth, or a retained provider continuation.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 pub(crate) const DML_WRITE_RECOVERY_BLOCKED_DELAY_MS: i64 = 30_000;
 
 /// Deadline for one historical provider action. Recovery is a background,
 /// bounded activity; it must never wait on a provider indefinitely.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 const DML_WRITE_RECOVERY_ACTION_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Domain separator for the frontend-owned digest of one immutable historical
 /// write request.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 const DML_HISTORICAL_WRITE_REQUEST_DOMAIN: &[u8] = b"novarocks.dml.historical-write-request.v1\0";
 /// Domain separator for the frontend-owned digest of the old immutable input.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 const DML_HISTORICAL_WRITE_INPUT_DOMAIN: &[u8] = b"novarocks.dml.historical-write-input.v1\0";
 
 /// The historical connector generation the frontend never recorded.
@@ -115,12 +139,20 @@ const DML_HISTORICAL_WRITE_INPUT_DOMAIN: &[u8] = b"novarocks.dml.historical-writ
 /// An all-zero incarnation is a sentinel for "unknown", never a claim about a
 /// real generation: it is deliberately not the current generation, so a
 /// provider can never mistake the recovering owner for the historical owner.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 const UNKNOWN_HISTORICAL_INCARNATION: [u8; 16] = [0; 16];
 
 /// Whether this operation kind belongs to the CP-3B distributed-write family.
 ///
 /// CTAS, TRUNCATE, ADD FILES and MV refresh have their own historical
 /// reconciliation owners (CP-3C/3D, MVX-3) and must not be driven here.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 pub(crate) const fn is_write_family(kind: OperationKind) -> bool {
     matches!(
         kind,
@@ -361,29 +393,93 @@ pub fn control_registry_resolver(
 /// be held open across a provider call. The seam exists so the convergence
 /// order can be verified against a recording ledger without a StateStore.
 pub(crate) trait HistoricalWriteRecoveryLedger {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
     fn stored(&self) -> &StoredOperation;
 
     /// Re-assert that this owner still holds the exact operation lease.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn check_authority(&self) -> Result<(), DmlError>;
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn load_external_fence(&self) -> Result<Option<DmlExternalFenceReceiptRecord>, DmlError>;
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn load_recovery(&self) -> Result<Option<DmlHistoricalWriteRecoveryRecord>, DmlError>;
 
     /// Mint this recovery attempt's external fence proposal from the *live*
     /// lease guard. CP-3A rule 3 forbids capturing a one-shot snapshot.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn external_fence_proposal(&self) -> Result<DmlExternalFenceProposal, DmlError>;
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn persist_recovery(
         &mut self,
         recovery: DmlHistoricalWriteRecoveryRecord,
         recovery_due_at_ms: Option<i64>,
     ) -> Result<(), DmlError>;
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn publish_fact(&mut self, fact: OperationFact) -> Result<(), DmlError>;
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn transition(&mut self, to: OperationState) -> Result<(), DmlError>;
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn reschedule(&mut self, recovery_due_at_ms: Option<i64>) -> Result<(), DmlError>;
 }
 
@@ -455,6 +551,10 @@ impl HistoricalWriteRecoveryLedger for ActiveDmlOperation {
 
 /// What one bounded recovery cycle achieved.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 pub(crate) enum WriteRecoveryProgress {
     /// This operation is not driven by the distributed-write profile.
     NotApplicable,
@@ -472,16 +572,32 @@ pub(crate) enum WriteRecoveryProgress {
     Unresolved,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 pub(crate) struct WriteRecoveryProfile {
     resolver: Arc<dyn HistoricalWriteRecoveryResolver>,
 }
 
 impl WriteRecoveryProfile {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
     pub(crate) fn new(resolver: Arc<dyn HistoricalWriteRecoveryResolver>) -> Self {
         Self { resolver }
     }
 
     /// Drive one bounded historical write recovery cycle.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn drive(
         &self,
         ledger: &mut dyn HistoricalWriteRecoveryLedger,
@@ -741,6 +857,10 @@ impl WriteRecoveryProfile {
     }
 
     /// Run the guarded cleanup, resolving a lost result from opaque evidence.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
     fn run_cleanup(
         &self,
         handle: &HistoricalWriteRecoveryHandle,
@@ -773,6 +893,14 @@ impl WriteRecoveryProfile {
     }
 
     /// Persist one recovery record with the due its obligations require.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn persist(
         &self,
         ledger: &mut dyn HistoricalWriteRecoveryLedger,
@@ -786,6 +914,14 @@ impl WriteRecoveryProfile {
     }
 
     /// Move the due and report progress without concluding anything.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn park(
         &self,
         ledger: &mut dyn HistoricalWriteRecoveryLedger,
@@ -811,6 +947,10 @@ impl WriteRecoveryProfile {
     /// A fence failure and unreadable external truth are never retried inside
     /// this cycle: they are facts about authority or evidence, not transient
     /// conditions. Everything else may be retried on a later cycle.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
     fn classify_provider_failure(
         &self,
         operation_id: crate::dml::model::DmlOperationId,
@@ -862,6 +1002,14 @@ impl WriteRecoveryProfile {
     /// evidence to ask the provider anything. That is deliberately not an
     /// error: nothing has gone wrong, and nothing may be concluded either.
     #[allow(clippy::type_complexity)]
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn historical_facts(
         &self,
         ledger: &dyn HistoricalWriteRecoveryLedger,
@@ -887,6 +1035,10 @@ impl WriteRecoveryProfile {
         ))
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged DML recovery and durable-journal integration."
+    )]
     fn descriptor(
         &self,
         facts: &HistoricalWriteFacts,
@@ -918,6 +1070,10 @@ impl WriteRecoveryProfile {
 
 /// Every fact one historical inspection needs, rebuilt from durable state only.
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 struct HistoricalWriteFacts {
     table: ConnectorTableIdentity,
     target_ref: ConnectorWriteTargetRef,
@@ -986,6 +1142,10 @@ pub(crate) fn reconstruct_historical_write_fence(
 
 /// Rebuild the historical facts, proving every reconstructed identity against
 /// the digests the durable fence receipt already sealed.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 fn historical_write_facts(
     stored: &StoredOperation,
     fence_record: &DmlExternalFenceReceiptRecord,
@@ -1068,6 +1228,10 @@ fn historical_write_facts(
 }
 
 /// Build the immutable historical write request record.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 fn historical_request_record(
     stored: &StoredOperation,
     fence_record: &DmlExternalFenceReceiptRecord,
@@ -1113,6 +1277,10 @@ fn historical_request_record(
 /// provider descriptor and incarnation are *neutral SPI fields*, not payload:
 /// reading them decodes nothing. Every other lifecycle leaves the historical
 /// generation unknown.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 fn historical_binding(
     table: &ConnectorTableIdentity,
     evidence: Option<&ExternalMutationEvidence>,
@@ -1129,6 +1297,10 @@ fn historical_binding(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 fn request_binding(
     request: &DmlHistoricalWriteRequestRecord,
 ) -> Result<ConnectorExecutionBindingKey, String> {
@@ -1143,6 +1315,10 @@ fn request_binding(
 }
 
 /// The durable SPI reconciliation evidence of this operation, if it has any.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 fn durable_evidence(stored: &StoredOperation) -> Result<Option<ExternalMutationEvidence>, String> {
     let OperationPayload::ConnectorWriteLifecycle(ConnectorWriteLifecycleRecord::CommitUnknown {
         evidence_wire,
@@ -1163,6 +1339,10 @@ fn durable_evidence(stored: &StoredOperation) -> Result<Option<ExternalMutationE
 /// confirmed. A provider that needs its own cohort digest to prove `Applied`
 /// answers `Ambiguous` here, which keeps the record unresolved rather than
 /// producing a wrong classification.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 fn historical_input_digest(
     stored: &StoredOperation,
     fence_record: &DmlExternalFenceReceiptRecord,
@@ -1178,6 +1358,10 @@ fn historical_input_digest(
 }
 
 /// Digest over the complete immutable request, excluding the digest field.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 fn request_digest(request: &DmlHistoricalWriteRequestRecord) -> Result<String, String> {
     let mut hasher = Sha256::new();
     hasher.update(DML_HISTORICAL_WRITE_REQUEST_DOMAIN);
@@ -1186,6 +1370,14 @@ fn request_digest(request: &DmlHistoricalWriteRequestRecord) -> Result<String, S
 }
 
 /// Project the raised fence and its provider receipt into the durable record.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn raised_fence_record(
     facts: &HistoricalWriteFacts,
     receipt: &ConnectorExternalFenceReceipt,
@@ -1219,6 +1411,10 @@ fn raised_fence_record(
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 fn table_identity(target: &OperationTarget) -> Result<ConnectorTableIdentity, String> {
     Ok(ConnectorTableIdentity {
         instance_id: ConnectorInstanceId::parse(target.catalog.as_str())
@@ -1228,6 +1424,10 @@ fn table_identity(target: &OperationTarget) -> Result<ConnectorTableIdentity, St
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 fn target_ref(target: &OperationTarget) -> Result<ConnectorWriteTargetRef, String> {
     match target.ref_name.as_deref() {
         None => Ok(ConnectorWriteTargetRef::main()),
@@ -1237,6 +1437,10 @@ fn target_ref(target: &OperationTarget) -> Result<ConnectorWriteTargetRef, Strin
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 const fn write_intent(kind: OperationKind) -> ConnectorWriteIntent {
     // The journal records the statement family, not the physical
     // partition-overwrite refinement. A provider classifies by stable operation
@@ -1253,6 +1457,10 @@ const fn write_intent(kind: OperationKind) -> ConnectorWriteIntent {
 /// Only `Preparing` proves nothing left the frontend. Everything from `Writing`
 /// on may have produced an irreversible external effect, and nothing here may
 /// be softened into "not dispatched".
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 const fn dispatch_certainty(state: OperationState) -> DmlHistoricalDispatchCertainty {
     match state {
         OperationState::Preparing => DmlHistoricalDispatchCertainty::ConfirmedNotDispatched,
@@ -1272,6 +1480,10 @@ const fn dispatch_certainty(state: OperationState) -> DmlHistoricalDispatchCerta
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 const fn writer_output_checkpointed(state: OperationState) -> bool {
     matches!(
         state,
@@ -1285,6 +1497,10 @@ const fn writer_output_checkpointed(state: OperationState) -> bool {
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 const fn commit_dispatched(state: OperationState) -> bool {
     matches!(
         state,
@@ -1305,6 +1521,10 @@ const fn commit_dispatched(state: OperationState) -> bool {
 /// Deriving them from the durable request (not from the live operation state)
 /// keeps the sealed request stable across recovery cycles even after the
 /// statement result has been published.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 fn checkpoints_from_request(
     request: &DmlHistoricalWriteRequestRecord,
 ) -> Vec<ConnectorHistoricalWriteCheckpoint> {
@@ -1383,6 +1603,10 @@ fn digest_bytes(value: &str, label: &str) -> Result<[u8; 32], String> {
 /// A raise minted by a different coordination attempt opens a new cycle: one
 /// cycle is owned by exactly one attempt, and a phase may never rewind inside
 /// a cycle.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 const fn next_cycle(existing: &DmlHistoricalWriteRecoveryRecord, attempt: Uuid) -> u32 {
     if existing.recovery_attempt_id.as_u128() == attempt.as_u128() {
         existing.recovery_cycle
@@ -1396,6 +1620,10 @@ const fn next_cycle(existing: &DmlHistoricalWriteRecoveryRecord, attempt: Uuid) 
 /// A carried result must keep its cleanup obligation visible, so a resumed
 /// cycle over a pending cleanup stays in `CleanupPending` rather than pretending
 /// it has no result yet.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 const fn phase_after_raise(
     carried: Option<&DmlHistoricalWriteResultRecord>,
 ) -> DmlHistoricalRecoveryPhase {
@@ -1412,6 +1640,10 @@ const fn phase_after_raise(
 ///
 /// Nothing terminal is claimed here: the record only becomes `Resolved` after
 /// the statement fact and the guarded cleanup have both been dealt with.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 const fn inspected_phase_for(outcome: &HistoricalWriteOutcome) -> DmlHistoricalRecoveryPhase {
     if !outcome.resolved {
         DmlHistoricalRecoveryPhase::Unresolved
@@ -1422,6 +1654,10 @@ const fn inspected_phase_for(outcome: &HistoricalWriteOutcome) -> DmlHistoricalR
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 const fn final_phase_for(
     progress: WriteRecoveryProgress,
     cleanup: DmlHistoricalCleanupState,
@@ -1440,6 +1676,10 @@ const fn final_phase_for(
 ///
 /// Only a resolved record may advertise `None`, and a record kept for manual
 /// retention must say so.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 const fn next_action_for(
     phase: DmlHistoricalRecoveryPhase,
     cleanup: Option<DmlHistoricalCleanupState>,
@@ -1454,6 +1694,10 @@ const fn next_action_for(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 const fn delay_for(progress: WriteRecoveryProgress) -> i64 {
     match progress {
         WriteRecoveryProgress::CleanupPending => DML_WRITE_RECOVERY_CLEANUP_DELAY_MS,
@@ -1469,6 +1713,10 @@ const fn delay_for(progress: WriteRecoveryProgress) -> i64 {
 /// The obligation is computed from the operation *and* its historical record, so
 /// a pending cleanup or an open cycle cannot be dropped because the
 /// user-visible statement result already became terminal (spec D5).
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 fn recovery_due_for(
     stored: &StoredOperation,
     record: &DmlHistoricalWriteRecoveryRecord,
@@ -1486,6 +1734,14 @@ fn recovery_due_for(
 /// The lifecycle state machine is never widened: when the current state cannot
 /// reach the fact directly, the only bridge taken is the ordinary
 /// `-> Committing` edge that already exists for every pre-commit state.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn publish_terminal(
     ledger: &mut dyn HistoricalWriteRecoveryLedger,
     fact: OperationFact,
@@ -1524,6 +1780,10 @@ fn publish_terminal(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 fn request_context() -> Result<ConnectorRequestContext, String> {
     ConnectorRequestContext::try_new(
         Instant::now() + DML_WRITE_RECOVERY_ACTION_DEADLINE,
@@ -1534,6 +1794,10 @@ fn request_context() -> Result<ConnectorRequestContext, String> {
     .map_err(|error| error.to_string())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 struct NeverCancelled;
 
 impl ConnectorCancellation for NeverCancelled {
@@ -1544,6 +1808,10 @@ impl ConnectorCancellation for NeverCancelled {
 
 /// Whether this error means the profile lost its authority rather than hit a
 /// transient failure. Used by the controller to decide how loudly to log.
+#[allow(
+    dead_code,
+    reason = "Retained for staged DML recovery and durable-journal integration."
+)]
 pub(crate) fn is_authority_loss(error: &DmlError) -> bool {
     matches!(
         error.kind(),
@@ -1566,7 +1834,7 @@ mod tests {
     use super::*;
     use crate::dml::model::{
         DML_EXTERNAL_FENCE_CODEC_VERSION, DML_OPERATION_SCHEMA_VERSION, DmlExternalFenceGeneration,
-        DmlExternalFenceIdentity, DmlHistoricalWriteDisposition, DmlOpaquePayload, DmlOperationId,
+        DmlExternalFenceIdentity, DmlOpaquePayload, DmlOperationId,
     };
 
     const CLUSTER: &str = "nova-cp3b-profile";
@@ -2395,7 +2663,8 @@ mod tests {
 
     #[test]
     fn a_pending_cleanup_survives_a_terminal_user_visible_result() {
-        for cleanup in [FacetCleanup::Refused] {
+        {
+            let cleanup = FacetCleanup::Refused;
             let facet = FakeFacet::new(FacetPlan::NotApplied, cleanup);
             let mut ledger = FakeLedger::new(OperationState::Committing);
             let progress = profile(&facet)

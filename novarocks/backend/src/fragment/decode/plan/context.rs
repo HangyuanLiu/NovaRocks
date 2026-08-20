@@ -28,9 +28,9 @@ use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_execution::exec::fragment::program::FragmentNodeId;
 use novarocks_execution::exec::node::scan::BoundScanRanges;
 use novarocks_execution::runtime::exchange::ExchangeKey;
-use novarocks_execution::runtime::fragment::{
-    ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
-};
+#[cfg(test)]
+use novarocks_execution::runtime::fragment::ExchangeInputAssignment;
+use novarocks_execution::runtime::fragment::{ExchangeInputAssignments, FragmentInstanceId};
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_protocol::FieldPath;
 use novarocks_protocol::lifecycle::ScanRangeParams;
@@ -48,6 +48,10 @@ use crate::fragment::decode::plan::layout::Layout;
 /// The query-scoped cancellation handle is deliberately opaque. This type
 /// never accepts a Core query manager or resolves cancellation itself.
 #[derive(Clone)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(crate) struct NativePlanDecodeContext {
     exchange_inputs: ExchangeInputAssignments,
     raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
@@ -79,6 +83,10 @@ impl Default for NativePlanDecodeContext {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 impl NativePlanDecodeContext {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(

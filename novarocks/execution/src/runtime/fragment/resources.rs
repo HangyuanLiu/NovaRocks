@@ -53,6 +53,10 @@ pub(crate) struct ResourceCleanupFaults {
     failed: std::collections::BTreeSet<ResourceKind>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Cleanup fault injection is retained for fragment lifecycle regression coverage."
+)]
 impl ResourceCleanupFaults {
     #[cfg(test)]
     pub(crate) fn with_failure(mut self, resource: ResourceKind) -> Self {
@@ -350,20 +354,20 @@ impl FragmentResources {
 
     pub(crate) fn rollback(&mut self) -> Vec<String> {
         let mut diagnostics = Vec::new();
-        if let Some(mut exchange) = self.exchange.take() {
-            if let Err(error) = exchange.rollback() {
-                diagnostics.push(error);
-            }
+        if let Some(mut exchange) = self.exchange.take()
+            && let Err(error) = exchange.rollback()
+        {
+            diagnostics.push(error);
         }
-        if let Some(mut result) = self.result.take() {
-            if let Err(error) = result.rollback() {
-                diagnostics.push(error);
-            }
+        if let Some(mut result) = self.result.take()
+            && let Err(error) = result.rollback()
+        {
+            diagnostics.push(error);
         }
-        if let Some(mut sink_commit) = self.sink_commit.take() {
-            if let Err(error) = sink_commit.rollback() {
-                diagnostics.push(error);
-            }
+        if let Some(mut sink_commit) = self.sink_commit.take()
+            && let Err(error) = sink_commit.rollback()
+        {
+            diagnostics.push(error);
         }
         diagnostics
     }

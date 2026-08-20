@@ -825,7 +825,7 @@ where
     let report_cleanup = report_server.stop().map_err(|error| error.to_string());
     let frontend_cleanup = frontend.shutdown().await.map_err(|error| error.to_string());
     combine_primary_and_cleanup(primary, server_cleanup, backend_cleanup, report_cleanup)
-        .and_then(|()| frontend_cleanup)
+        .and(frontend_cleanup)
         .map_err(anyhow::Error::msg)
 }
 

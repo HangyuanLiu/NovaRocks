@@ -65,10 +65,10 @@ impl RewriteRule for AggregatePushdownRule {
         let push = {
             let arena = arena_rc.borrow();
             let push = super::collector::collect_push_plan(&agg, expr.unary_input(), &arena);
-            if let Some(ref p) = push {
-                if !super::cost::should_push(p, &arena, &stats_input) {
-                    return Ok(RewriteResult::Unchanged);
-                }
+            if let Some(ref p) = push
+                && !super::cost::should_push(p, &arena, &stats_input)
+            {
+                return Ok(RewriteResult::Unchanged);
             }
             push
         };
@@ -105,7 +105,7 @@ mod tests {
     use crate::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
     use crate::optimizer::rewrite::result::RewriteResult;
     use crate::optimizer::stats_input::OptimizerStatsInput;
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
     use std::collections::HashMap;
 

@@ -707,20 +707,13 @@ fn find_or_create_slot(
             // For strict requests, only descend through a Filter whose predicate
             // contains the same variant_request — this preserves the pre-OptExpr
             // semantics that prevented spurious pushdown of unrelated projections.
-            if !request.strict {
-                let Some(input) = expr.children.get_mut(0) else {
-                    return None;
-                };
+            if !request.strict
+                || expr_contains_variant_request_scalar(arena, filter_op.predicate, request)
+            {
+                let input = expr.children.get_mut(0)?;
                 find_or_create_slot(arena, input, request, factory)
             } else {
-                if expr_contains_variant_request_scalar(arena, filter_op.predicate, request) {
-                    let Some(input) = expr.children.get_mut(0) else {
-                        return None;
-                    };
-                    find_or_create_slot(arena, input, request, factory)
-                } else {
-                    None
-                }
+                None
             }
         }
         _ => None,

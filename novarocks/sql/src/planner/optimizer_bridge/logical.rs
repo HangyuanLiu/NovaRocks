@@ -638,7 +638,7 @@ mod tests {
         LogicalPlanNode::new(
             LogicalPlanKind::Values(PlanValuesNode {
                 rows: vec![],
-                columns: columns,
+                columns,
             }),
             vec![],
             None,
@@ -914,8 +914,10 @@ mod tests {
         let mut physical = ScanToPhysical.apply(&logical_expr, &mut memo);
         assert_eq!(physical.len(), 1);
 
-        let mut execution_props = PlanExecutionProps::default();
-        execution_props.scalar_arena = Some(Arc::new(memo.scalars));
+        let execution_props = PlanExecutionProps {
+            scalar_arena: Some(Arc::new(memo.scalars)),
+            ..Default::default()
+        };
         let optimized = OptimizedOperatorNode {
             op: physical.remove(0).op,
             children: vec![],
@@ -929,9 +931,7 @@ mod tests {
         let PhysicalPlanKind::Scan(scan) = materialized.kind else {
             panic!("expected physical scan");
         };
-        let ScanSource::Sql(source) = scan.table.source else {
-            panic!("expected SQL-owned scan source");
-        };
+        let ScanSource::Sql(source) = scan.table.source;
         assert!(matches!(source.kind, SqlScanKind::ConnectorRead));
     }
 
@@ -959,9 +959,7 @@ mod tests {
         };
 
         let filter = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(PlanFilterNode {
-                predicate: predicate,
-            }),
+            LogicalPlanKind::Filter(PlanFilterNode { predicate }),
             vec![scan],
             None,
         );

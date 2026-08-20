@@ -55,6 +55,10 @@ pub(crate) struct BranchRefreshContract {
 /// could be spelled three ways in three files with nothing to keep them
 /// consistent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) enum MvTargetWriteEffect {
     /// Add rows only. No previously materialized row is retracted.
     Append,

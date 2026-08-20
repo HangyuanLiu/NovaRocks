@@ -536,7 +536,8 @@ mod tests {
 
     #[test]
     fn rejects_ineligible_or_inexact_shapes_atomically() {
-        let cases: Vec<(&str, Box<dyn Fn(&mut PhysicalPlanNode)>)> = vec![
+        type PlanMutation = Box<dyn Fn(&mut PhysicalPlanNode)>;
+        let cases: Vec<(&str, PlanMutation)> = vec![
             (
                 "zero limit",
                 Box::new(|plan| topn_mut(plan).limit = Some(0)),

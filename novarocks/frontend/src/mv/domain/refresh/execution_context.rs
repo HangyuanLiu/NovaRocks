@@ -18,6 +18,10 @@
 //! Provider-neutral limits applied while planning an MV refresh.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) struct MvRefreshPruningLimits {
     pub max_touched_groups: usize,
     pub max_affected_partitions: usize,
@@ -33,10 +37,18 @@ impl Default for MvRefreshPruningLimits {
 }
 
 impl MvRefreshPruningLimits {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn affected_partition_count_exceeds_limit(&self, partition_count: usize) -> bool {
         partition_count > self.max_affected_partitions
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn touched_group_count_exceeds_limit(&self, touched_group_count: usize) -> bool {
         touched_group_count > self.max_touched_groups
     }

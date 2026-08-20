@@ -25,6 +25,10 @@ use novarocks_types::SlotId;
 
 use super::{Chunk, ChunkSchema};
 
+#[allow(
+    dead_code,
+    reason = "Retained as a focused invariant helper for dictionary hydration callers."
+)]
 pub(crate) fn assert_no_dictionary(batch: &RecordBatch) -> Result<(), String> {
     for (idx, field) in batch.schema().fields().iter().enumerate() {
         if matches!(field.data_type(), DataType::Dictionary(_, _)) {
@@ -35,21 +39,25 @@ pub(crate) fn assert_no_dictionary(batch: &RecordBatch) -> Result<(), String> {
                 field.data_type()
             ));
         }
-        if let Some(column) = batch.columns().get(idx) {
-            if matches!(column.data_type(), DataType::Dictionary(_, _)) {
-                return Err(format!(
-                    "dictionary column must be hydrated before flat boundary: column {} field {} has array type {:?}",
-                    idx,
-                    field.name(),
-                    column.data_type()
-                ));
-            }
+        if let Some(column) = batch.columns().get(idx)
+            && matches!(column.data_type(), DataType::Dictionary(_, _))
+        {
+            return Err(format!(
+                "dictionary column must be hydrated before flat boundary: column {} field {} has array type {:?}",
+                idx,
+                field.name(),
+                column.data_type()
+            ));
         }
     }
     Ok(())
 }
 
 // Design: ADR-0005 (docs/adr/ADR-0005-low-cardinality-runtime-carrier-first.md)
+#[allow(
+    dead_code,
+    reason = "Retained for connector paths that require explicit dictionary hydration."
+)]
 pub(crate) fn hydrate_dictionary_columns(chunk: &Chunk) -> Result<Chunk, String> {
     hydrate_dictionary_columns_except(chunk, |_, _| false)
 }

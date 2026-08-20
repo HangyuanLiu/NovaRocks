@@ -129,14 +129,6 @@ fn literal_bool(value: bool) -> expr::Expr {
     }
 }
 
-fn sort_item() -> expr::SortItem {
-    expr::SortItem {
-        expr: Some(column_expr(1)),
-        asc: true,
-        nulls_first: false,
-    }
-}
-
 fn iceberg_table(table: &str, file_count: usize) -> plan::TableDef {
     plan::TableDef {
         name: table.to_string(),
@@ -279,10 +271,9 @@ fn node_from_proto(proto: &plan::DistributedNode) -> Result<INode, String> {
                 plan::plan_node::Kind::Scan(scan) => {
                     let table = scan.table.as_ref().ok_or("ScanNode.table missing")?;
                     let source = table.source.as_ref().ok_or("TableDef.source missing")?;
-                    let file_count = match source.kind.as_ref().ok_or("ScanSource.kind missing")? {
-                        plan::scan_source::Kind::ConnectorRead(source) => source.splits.len(),
-                        other => return Err(format!("unexpected scan source: {other:?}")),
-                    };
+                    let plan::scan_source::Kind::ConnectorRead(source) =
+                        source.kind.as_ref().ok_or("ScanSource.kind missing")?;
+                    let file_count = source.splits.len();
                     IPayload::Scan {
                         database: scan.database.clone(),
                         table: table.name.clone(),

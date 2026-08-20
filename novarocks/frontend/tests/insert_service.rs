@@ -271,6 +271,10 @@ struct FakeJournal {
     operations: Mutex<BTreeMap<Uuid, StoredOperation>>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for insert-service journal fixture inspection."
+)]
 impl FakeJournal {
     fn states(&self) -> Vec<OperationState> {
         self.operations

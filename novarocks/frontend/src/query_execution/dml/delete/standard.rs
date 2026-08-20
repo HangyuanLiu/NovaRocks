@@ -552,15 +552,15 @@ fn extract_scalar_fn_comparison<'a>(
     left: &'a Expr,
     right: &'a Expr,
 ) -> Option<(String, String, &'a Expr, bool)> {
-    if let Some((fn_name, col_name)) = expr_as_supported_scalar_fn_on_col(left) {
-        if is_literal_expr(right) {
-            return Some((fn_name, col_name, right, false));
-        }
+    if let Some((fn_name, col_name)) = expr_as_supported_scalar_fn_on_col(left)
+        && is_literal_expr(right)
+    {
+        return Some((fn_name, col_name, right, false));
     }
-    if let Some((fn_name, col_name)) = expr_as_supported_scalar_fn_on_col(right) {
-        if is_literal_expr(left) {
-            return Some((fn_name, col_name, left, true));
-        }
+    if let Some((fn_name, col_name)) = expr_as_supported_scalar_fn_on_col(right)
+        && is_literal_expr(left)
+    {
+        return Some((fn_name, col_name, left, true));
     }
     None
 }
@@ -576,15 +576,15 @@ fn extract_variant_get_comparison<'a>(
     left: &'a Expr,
     right: &'a Expr,
 ) -> Option<(String, &'a Expr, bool)> {
-    if let Some(col_name) = expr_as_variant_get_on_col(left) {
-        if is_literal_expr(right) {
-            return Some((col_name, right, false));
-        }
+    if let Some(col_name) = expr_as_variant_get_on_col(left)
+        && is_literal_expr(right)
+    {
+        return Some((col_name, right, false));
     }
-    if let Some(col_name) = expr_as_variant_get_on_col(right) {
-        if is_literal_expr(left) {
-            return Some((col_name, left, true));
-        }
+    if let Some(col_name) = expr_as_variant_get_on_col(right)
+        && is_literal_expr(left)
+    {
+        return Some((col_name, left, true));
     }
     None
 }
@@ -805,27 +805,6 @@ fn extract_string_literal(expr: &Expr) -> Option<&str> {
             _ => None,
         },
         Expr::Nested(nested) => extract_string_literal(&nested.expression),
-        _ => None,
-    }
-}
-
-/// Extract the integer value from a SQL literal expression (`123` or `-123`).
-fn extract_integer_literal(expr: &Expr) -> Option<i64> {
-    match expr {
-        Expr::Literal(literal) => match &literal.kind {
-            LiteralKind::Number(value) => value.parse::<i64>().ok(),
-            _ => None,
-        },
-        Expr::Unary(unary) if unary.operator == UnaryOperator::Minus => {
-            match unary.expression.as_ref() {
-                Expr::Literal(literal) => match &literal.kind {
-                    LiteralKind::Number(value) => value.parse::<i64>().ok().map(|n| -n),
-                    _ => None,
-                },
-                _ => None,
-            }
-        }
-        Expr::Nested(nested) => extract_integer_literal(&nested.expression),
         _ => None,
     }
 }

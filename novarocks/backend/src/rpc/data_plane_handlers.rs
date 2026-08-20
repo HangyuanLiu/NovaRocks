@@ -136,6 +136,10 @@ pub fn handle_lookup(req: proto::filter::LookupRequest) -> proto::filter::Lookup
     response
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for backend service integration and protocol compatibility."
+)]
 pub fn handle_lookup_close(query_id: QueryId, lookup_node_id: i32) -> Result<(), String> {
     crate::runtime::query_context::query_context_manager()
         .complete_lookup_fetcher(query_id, lookup_node_id)

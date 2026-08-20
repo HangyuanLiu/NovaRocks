@@ -477,7 +477,6 @@ mod typed_legacy {
     use crate::analysis::{BinOp, ExprKind, TypedExpr};
     use crate::column_id::ColumnId;
     use crate::planner::logical::*;
-    use crate::planner::payload::*;
 
     #[derive(Debug)]
     pub(crate) struct JoinEquiKey {
@@ -854,7 +853,7 @@ mod column_id_helper_tests {
     use crate::column_id::ColumnId;
     use crate::planner::logical::*;
     use crate::planner::payload::*;
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
 
@@ -982,7 +981,7 @@ mod column_id_helper_tests {
         LogicalPlanNode::new(
             LogicalPlanKind::Scan(PlanScanNode {
                 database: "default".to_string(),
-                table: table,
+                table,
                 alias: None,
                 columns: vec![
                     make_output_column(ids[0], "a"),

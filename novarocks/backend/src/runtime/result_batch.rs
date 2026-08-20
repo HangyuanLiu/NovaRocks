@@ -42,6 +42,10 @@ impl ResultBatch {
         Self::new(Vec::new(), false, 0, None)
     }
 
+    #[allow(
+        dead_code,
+        reason = "The packet-sequence builder is retained for protocol adapter tests outside this target."
+    )]
     pub fn with_packet_seq(mut self, packet_seq: i64) -> Self {
         self.packet_seq = packet_seq;
         self
@@ -59,6 +63,10 @@ impl ResultBatch {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Legacy fetch results are retained for protocol adapters outside the backend lib test configuration."
+)]
 #[derive(Clone, Debug)]
 pub(crate) struct FetchResult {
     pub(crate) packet_seq: i64,

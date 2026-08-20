@@ -51,7 +51,6 @@ impl SpillStorageConfig {
             .local_dirs
             .iter()
             .cloned()
-            .into_iter()
             .map(PathBuf::from)
             .collect::<Vec<_>>();
         let ipc_compression = storage.ipc_compression.parse::<SpillCodec>()?;

@@ -310,7 +310,7 @@ fn decode_hex_identifier(value: &str) -> Result<(), String> {
 
 fn decode_hex_utf8(value: &str, label: &str) -> Result<String, String> {
     if value.is_empty()
-        || value.len() % 2 != 0
+        || !value.len().is_multiple_of(2)
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())

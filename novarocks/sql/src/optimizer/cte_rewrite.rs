@@ -137,6 +137,10 @@ fn into_single_child(mut expr: OptExpr) -> OptExpr {
     expr.children.remove(0)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 fn adapt_opt_expr_output_with_qualifier(
     input: OptExpr,
     target_output_columns: &[OutputColumn],
@@ -336,6 +340,10 @@ fn opt_expr_output_columns(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 fn output_column_metadata_equal(left: &OutputColumn, right: &OutputColumn) -> bool {
     left.column_id == right.column_id
         && left.name == right.name
@@ -392,7 +400,7 @@ mod tests {
     };
     use crate::optimizer::opt_expr::OptExpr;
     use crate::optimizer::scalar::ScalarArena;
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
 
@@ -452,7 +460,7 @@ mod tests {
     fn consume_plan(cte_id: CteId, alias: &str) -> OptExpr {
         let output_columns = output_columns();
         OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
-            cte_id: cte_id,
+            cte_id,
             alias: alias.to_string(),
             producer_column_ids: output_columns.iter().map(|c| c.column_id).collect(),
             output_columns,
@@ -466,10 +474,10 @@ mod tests {
         producer_column_ids: Vec<ColumnId>,
     ) -> OptExpr {
         OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
-            cte_id: cte_id,
+            cte_id,
             alias: alias.to_string(),
             producer_column_ids,
-            output_columns: output_columns,
+            output_columns,
         }))
     }
 

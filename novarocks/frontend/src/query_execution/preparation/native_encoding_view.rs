@@ -79,6 +79,10 @@ impl<'a> NativeScanFactsView<'a> {
             .map(|read| NativeConnectorReadView { read })
     }
 
+    #[allow(
+        dead_code,
+        reason = "The frozen binding view remains available to native contract-test encoders."
+    )]
     pub(crate) fn bindings(self) -> &'a ScanExecutionBindings {
         self.bindings
     }
@@ -121,6 +125,10 @@ impl<'a> NativeScanBindingView<'a> {
             .map(|read| NativeRequiredReadView { read })
     }
 
+    #[allow(
+        dead_code,
+        reason = "The resolved scan binding remains available to native contract-test encoders."
+    )]
     pub(crate) fn binding(self) -> &'a ResolvedScanBinding {
         self.binding
     }

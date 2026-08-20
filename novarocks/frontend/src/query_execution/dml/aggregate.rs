@@ -32,6 +32,10 @@ use novarocks_sql::syntax::{
     aggregate_literal_key, compare_aggregate_literals, literal_from_batch,
 };
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 pub(crate) fn merge_aggregate_table_rows_if_needed(
     columns: &[ColumnDef],
     key_desc: Option<&TableKeyDesc>,
@@ -84,6 +88,10 @@ pub(crate) fn merge_aggregate_table_rows_if_needed(
     Ok(Some(merged_rows))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn merge_aggregate_table_row(
     existing: &mut [Literal],
     incoming: &[Literal],
@@ -110,6 +118,10 @@ fn merge_aggregate_table_row(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn merge_aggregate_table_value(
     existing: &mut Literal,
     incoming: &Literal,

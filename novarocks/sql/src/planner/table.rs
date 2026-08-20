@@ -322,7 +322,7 @@ pub struct SqlMvTargetLocatorScan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct BranchScope {
+pub struct BranchScope {
     pub(crate) branch_id_column_name: String,
     pub(crate) branch_id: i32,
 }
@@ -345,6 +345,10 @@ impl SqlMvTargetStateScan {
     /// Legacy resolver diagnostics do not carry table identity. Canonical SQL
     /// scans keep that identity on `SqlScanSource`; this label is deliberately
     /// diagnostic-only and must never be used for lookup.
+    #[allow(
+        dead_code,
+        reason = "Target-state names are retained for planner diagnostics."
+    )]
     pub(crate) fn fqn(&self) -> &'static str {
         "token-bound MV target"
     }
@@ -387,6 +391,10 @@ impl SqlMvTargetStateScan {
 impl SqlMvTargetLocatorScan {
     /// See `SqlMvTargetStateScan::fqn`: identity belongs to the enclosing
     /// tokenized source, not to locator facts.
+    #[allow(
+        dead_code,
+        reason = "Target-locator names are retained for planner diagnostics."
+    )]
     pub(crate) fn fqn(&self) -> &'static str {
         "token-bound MV target"
     }
@@ -628,9 +636,7 @@ mod imv_target_state_tests {
             },
         ));
 
-        let ScanSource::Sql(sql_source) = &source else {
-            panic!("expected SQL source");
-        };
+        let ScanSource::Sql(sql_source) = &source;
         let Some(scan) = sql_mv_target_state_scan(&source) else {
             panic!("expected SQL target-state scan source");
         };

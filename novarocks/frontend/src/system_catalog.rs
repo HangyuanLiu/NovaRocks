@@ -100,9 +100,7 @@ fn build_schemata_batch(catalog: &str, databases: &[String]) -> Result<Vec<Recor
     let schema_name = StringArray::from_iter_values(databases.iter().map(String::as_str));
     let default_charset = StringArray::from(vec!["utf8"; row_count]);
     let default_collation = StringArray::from(vec!["utf8_general_ci"; row_count]);
-    let sql_path: StringArray = std::iter::repeat::<Option<&str>>(None)
-        .take(row_count)
-        .collect();
+    let sql_path: StringArray = std::iter::repeat_n(None::<&str>, row_count).collect();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("catalog_name", DataType::Utf8, false),

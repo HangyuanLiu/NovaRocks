@@ -20,6 +20,10 @@
 use novarocks_execution::exec::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
 use novarocks_sql::planning::query_execution::{NativeMinMaxPredicate, NativeMinMaxPredicateValue};
 
+#[allow(
+    dead_code,
+    reason = "Retained for native scan-pruning integration while frontend lowering is feature-gated."
+)]
 pub(super) fn native_scan_min_max_predicates(
     predicates: &[novarocks_sql::plan_read::TypedExpr],
 ) -> Vec<MinMaxPredicate> {
@@ -29,6 +33,10 @@ pub(super) fn native_scan_min_max_predicates(
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained as the native scan-pruning conversion helper."
+)]
 fn native_predicate(predicate: NativeMinMaxPredicate) -> MinMaxPredicate {
     match predicate {
         NativeMinMaxPredicate::Eq { column, value } => MinMaxPredicate::Eq {
@@ -54,6 +62,10 @@ fn native_predicate(predicate: NativeMinMaxPredicate) -> MinMaxPredicate {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained as the native scan-pruning value conversion helper."
+)]
 fn native_value(value: NativeMinMaxPredicateValue) -> MinMaxPredicateValue {
     match value {
         NativeMinMaxPredicateValue::Boolean(value) => MinMaxPredicateValue::Boolean(value),

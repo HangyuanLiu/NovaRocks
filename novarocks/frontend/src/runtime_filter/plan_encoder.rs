@@ -515,7 +515,7 @@ mod tests {
         };
         let target = target.scan_domain_target.expect("scan-domain target");
         assert_eq!(target.field_ordinal, 17);
-        assert_eq!(target.nullable, true);
+        assert!(target.nullable);
         assert!(target.r#type.is_some());
     }
 }

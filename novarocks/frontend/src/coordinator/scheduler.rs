@@ -494,11 +494,15 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrontendBackendSnapshot, FrontendFragmentScheduler};
+    use super::FrontendBackendSnapshot;
     use crate::query_execution::contract::DistributedQueryErrorKind;
     use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_types::QueryId;
 
+    #[allow(
+        dead_code,
+        reason = "Disabled scheduler fixture retains stable attempt identity coverage."
+    )]
     fn execution_id(attempt: u64) -> QueryExecutionId {
         QueryExecutionId::new(
             QueryId::new(41, 73),

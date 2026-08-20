@@ -44,6 +44,10 @@ const INSERT_EFFECT_TAG: i8 = 3;
 /// The row budget is intentionally capped by the byte budget: every retained
 /// row consumes at least one byte of the result budget, while Arrow's actual
 /// allocation cost is accounted independently through `get_array_memory_size`.
+#[allow(
+    dead_code,
+    reason = "The bounded collector remains the typed connector-row-mutation API while its DML consumers are target-gated."
+)]
 pub struct BoundedRowMutationMatchCollector {
     context: ConnectorRequestContext,
     max_rows: u64,
@@ -54,6 +58,10 @@ pub struct BoundedRowMutationMatchCollector {
     batches: Vec<RecordBatch>,
 }
 
+#[allow(
+    dead_code,
+    reason = "The bounded collector API remains available to target-gated DML consumers."
+)]
 impl BoundedRowMutationMatchCollector {
     /// Convenience constructor for the coordinator's admitted query options.
     pub fn try_from_query_options(

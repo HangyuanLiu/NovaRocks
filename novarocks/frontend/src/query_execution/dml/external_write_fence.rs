@@ -128,6 +128,10 @@ impl ExternalWriteFenceAuthority {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     pub(crate) fn operation_id(&self) -> ConnectorWriteOperationId {
         self.operation_id
     }

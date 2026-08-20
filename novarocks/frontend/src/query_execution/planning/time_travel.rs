@@ -19,7 +19,6 @@
 //! statement schema lookup, and catalog-service table invalidation.
 //! Ordinary SELECT external tables resolve through the query catalog materializer.
 
-use crate::catalog_application::query_catalog::CatalogServiceSource;
 use crate::catalog_application::resolver::{CatalogAdmission, resolve_table_target};
 use crate::query_execution::kernels::{
     DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
@@ -37,6 +36,10 @@ use novarocks_sql::syntax::ObjectName;
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "The time-travel fixture retains optional file facts so cross-module tests can model every overlay shape."
+)]
 pub(crate) struct IcebergFileForQuery {
     pub(crate) path: String,
     pub(crate) size: i64,
@@ -50,6 +53,10 @@ pub(crate) struct IcebergFileForQuery {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "The test helper preserves construction of temporary Iceberg delete-file overlays."
+)]
 pub(crate) fn delete_temp_iceberg_file_for_query(
     path: String,
     size: i64,
@@ -192,7 +199,7 @@ impl_kernel_time_travel_resolver!(MvExecutionKernel);
 ///      so that `SELECT t.col FROM t FOR VERSION AS OF ...` resolves `t.col`.
 ///
 /// Tables without a version clause are left untouched.
-pub fn rewrite_time_travel_refs(
+pub(crate) fn rewrite_time_travel_refs(
     resolver: &impl TimeTravelResolver,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -409,6 +416,10 @@ fn rewrite_time_travel_in_factor(
 /// concrete scan in the shared local catalog.  `ANALYZE` only needs columns;
 /// it must not leave a provider table or file carrier visible to a later SQL
 /// request.
+#[allow(
+    dead_code,
+    reason = "Retained for statement-level connector schema resolution without catalog registration."
+)]
 pub(crate) fn external_schema_columns_for_statement(
     resolver: &impl TimeTravelResolver,
     current_catalog: Option<&str>,
@@ -450,6 +461,10 @@ pub(crate) fn external_schema_columns_for_statement(
 /// SQLX-1 query-local overlays use `__sqlx1_tt_<table>_<snapshot_id>`;
 /// recognize the legacy form as well so old statement materialization cannot
 /// mistake either identity for a durable catalog object.
+#[allow(
+    dead_code,
+    reason = "Retained to distinguish query-local time-travel overlay identities from durable catalog relations."
+)]
 fn is_synthetic_time_travel_table(table_name: &str) -> bool {
     if let Some(encoded) = table_name.strip_prefix("__sqlx1_tt_")
         && let Some((base, snapshot)) = encoded.rsplit_once('_')
@@ -464,7 +479,7 @@ fn is_synthetic_time_travel_table(table_name: &str) -> bool {
     }
 }
 
-/// Remove a durable local catalog relation after DDL replaces or drops it.
+// Remove a durable local catalog relation after DDL replaces or drops it.
 
 #[cfg(test)]
 fn validate_delta_file_change_ops(data_files: &[IcebergFileForQuery]) -> Result<Vec<i8>, String> {

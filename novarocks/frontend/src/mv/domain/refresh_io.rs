@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorTableResolution};
@@ -68,6 +68,10 @@ pub(crate) fn observe_current_refresh_base_with_ports(
     Ok(observation)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn single_snapshot_map(
     table_ref: &TableIdentity,
     snapshot_id: i64,
@@ -77,6 +81,10 @@ pub(crate) fn single_snapshot_map(
     snapshots
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn single_table_uuid_map(
     table_ref: &TableIdentity,
     table_uuid: &str,

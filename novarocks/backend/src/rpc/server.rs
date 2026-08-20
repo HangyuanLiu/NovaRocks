@@ -49,8 +49,7 @@ use crate::fragment::ingress::NativeFragmentIngress;
 use crate::query_lifecycle::QueryLifecycleIngress;
 use crate::query_lifecycle::rpc::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
-    handle_stage_fragments, handle_start_prepared_query, status_from_contract_error,
-    status_from_lifecycle_error,
+    handle_stage_fragments, handle_start_prepared_query, status_from_lifecycle_error,
 };
 use crate::runtime_filter::rpc::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,

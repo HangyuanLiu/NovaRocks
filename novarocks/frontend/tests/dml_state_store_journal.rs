@@ -91,6 +91,10 @@ const OPERATION_PREFIX: &str = "novarocks/frontend/dml/v1/operations/";
 const UNFINISHED_PREFIX: &str = "novarocks/frontend/dml/v1/unfinished/";
 const CTAS_RECOVERY_PREFIX: &str = "novarocks/frontend/dml/v1/ctas-recoveries/";
 
+#[allow(
+    dead_code,
+    reason = "Retained for state-store journal fixture construction."
+)]
 fn config(path: &std::path::Path) -> StateStoreHostConfig {
     config_with_max_value_bytes(path, None)
 }
@@ -247,6 +251,10 @@ impl TestTransactionValidator {
         self.calls.load(Ordering::SeqCst)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "The journal test double preserves the production DML error contract."
+    )]
     fn validate(&self) -> Result<(), DmlError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -2616,7 +2624,7 @@ async fn missing_or_corrupt_ctas_recovery_is_never_decoded_as_absent_target_trut
 
 #[test]
 fn ctas_recovery_preflight_enforces_opaque_and_total_bounds() {
-    assert!(DML_CTAS_RECOVERY_ENCODED_LIMIT > DML_OPAQUE_PAYLOAD_LIMIT);
+    const { assert!(DML_CTAS_RECOVERY_ENCODED_LIMIT > DML_OPAQUE_PAYLOAD_LIMIT) };
     let temp = TempDir::new().unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {

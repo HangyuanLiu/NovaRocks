@@ -148,9 +148,7 @@ fn same_unit_timestamp_metadata_mismatch(expected: &DataType, actual: &DataType)
 // any plain/router mix, so at most one plain stream edge exists per source and
 // the insert never overwrites. Re-adding a shape check here would duplicate a
 // planner-owned decision (guarded by `planner_topology_contract`).
-pub fn build_stream_edge_by_source<'a>(
-    edges: &'a [FragmentEdge],
-) -> BTreeMap<FragmentId, &'a FragmentEdge> {
+pub fn build_stream_edge_by_source(edges: &[FragmentEdge]) -> BTreeMap<FragmentId, &FragmentEdge> {
     let mut stream_edge_by_source = BTreeMap::new();
     for edge in edges {
         if !matches!(edge.edge_kind, FragmentEdgeKind::Stream) {
@@ -168,9 +166,9 @@ pub fn build_stream_edge_by_source<'a>(
 // this used to re-check, so grouping here only collects the sealed branches. Re-
 // adding a shape check here would duplicate a planner-owned decision (guarded by
 // `planner_topology_contract`).
-pub fn group_router_edges_by_source<'a>(
-    edges: &'a [FragmentEdge],
-) -> BTreeMap<(FragmentId, i32), Vec<&'a FragmentEdge>> {
+pub fn group_router_edges_by_source(
+    edges: &[FragmentEdge],
+) -> BTreeMap<(FragmentId, i32), Vec<&FragmentEdge>> {
     let mut grouped: BTreeMap<(FragmentId, i32), Vec<&FragmentEdge>> = BTreeMap::new();
     for edge in edges {
         let FragmentEdgeKind::ChangeStreamRouter {
@@ -344,6 +342,10 @@ fn native_unique_id(value: [u8; 16]) -> novarocks_protocol::common::UniqueId {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution contract and lifecycle integration."
+)]
 pub(crate) fn validate_fragment_output_kind(
     fragment_id: FragmentId,
     is_root: bool,
@@ -703,17 +705,19 @@ fn patch_native_change_stream_router_sink_in_place(
     Ok(())
 }
 
+type CteMulticastConsumer = (
+    FragmentId,
+    i32,
+    novarocks_protocol::plan::DataPartition,
+    Vec<i32>,
+    Vec<ColumnId>,
+);
+
 pub fn patch_native_cte_multicast_sink(
     fragment: &mut novarocks_protocol::plan::PlanFragment,
     fragment_id: FragmentId,
     cte_id: CteId,
-    consumers: &[(
-        FragmentId,
-        i32,
-        novarocks_protocol::plan::DataPartition,
-        Vec<i32>,
-        Vec<ColumnId>,
-    )],
+    consumers: &[CteMulticastConsumer],
     consumer_dests: &BTreeMap<
         FragmentId,
         Vec<novarocks_execution::runtime::endpoint::FragmentDestination>,

@@ -35,9 +35,8 @@ pub(crate) fn map_connector_partition_to_mv_key(
         .chain(contract.bases.iter())
         .find(|base| observation.table_object_id() == Some(&base.table_object_id))
         .ok_or_else(|| {
-            format!(
-                "MV partition mapping has no stable base contract for the observed table object ID"
-            )
+            "MV partition mapping has no stable base contract for the observed table object ID"
+                .to_string()
         })?;
 
     let mut mapped_fields = Vec::with_capacity(partition.fields.len());

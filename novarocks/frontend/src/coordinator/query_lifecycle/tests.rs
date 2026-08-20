@@ -327,6 +327,10 @@ fn protocol_terminal_outcome_event(
     ))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The wire fixture keeps each fragment observation field explicit."
+)]
 fn protocol_fragment_observation(
     execution_id: QueryExecutionId,
     digest: protocol_lifecycle::ParticipantManifestDigest,
@@ -355,6 +359,10 @@ fn protocol_fragment_observation(
 /// Production ownership is in `novarocks-backend`; this peer deliberately
 /// avoids adding a Frontend-to-Backend test dependency.
 trait QueryLifecycleIngress: Send + Sync + 'static {
+    #[allow(
+        dead_code,
+        reason = "Retained for generated FE client lifecycle contract coverage."
+    )]
     fn bind_backend_identity(&self, backend_id: u64) -> Result<(), QueryLifecycleError>;
 
     fn init_query(
@@ -418,12 +426,20 @@ trait BackendQueryControl: Send + Sync + 'static {
         ))
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for generated FE client lifecycle contract coverage."
+    )]
     fn coordinator_lost(&self, reason: QueryTerminationReason) -> Result<(), QueryLifecycleError>;
 }
 
 struct QueryControlAttachment {
     control: Arc<dyn BackendQueryControl>,
     events: tokio::sync::mpsc::Receiver<protocol_lifecycle::QueryControlEvent>,
+    #[allow(
+        dead_code,
+        reason = "Retained to model the complete control-stream attachment fixture."
+    )]
     observations: tokio::sync::watch::Receiver<Option<FragmentLiveObservation>>,
 }
 
@@ -635,6 +651,10 @@ struct RecordingTransport {
 }
 
 #[derive(Default)]
+#[expect(
+    clippy::type_complexity,
+    reason = "The transport fixture retains typed per-backend scripted outcomes."
+)]
 struct RecordingTransportState {
     init_results: BTreeMap<
         usize,
@@ -1061,10 +1081,7 @@ fn frontend_fragment_observation_rejects_conflicts_and_wrong_participants() {
         .expect("fixture old attempt execution id"),
         participant.digest,
         manifest_backend,
-        {
-            let id = first.fragment_instance_id().expect("fixture fragment id");
-            id
-        },
+        first.fragment_instance_id().expect("fixture fragment id"),
         2,
         0,
         0,
@@ -1350,7 +1367,7 @@ impl QueryControlSession for HeartbeatGateSession {
                     },
                 ));
             }
-            QueryControlCommand::TerminalAck { .. } => {}
+            QueryControlCommand::TerminalAck => {}
         }
         state.commands.push(command);
         Ok(())
@@ -2324,6 +2341,10 @@ fn frontend_query_lifecycle_query_registry_service_only_backend_loss_aborts_atte
 }
 
 #[derive(Default)]
+#[allow(
+    dead_code,
+    reason = "Retained for legacy cancellation dispatch lifecycle coverage."
+)]
 struct RecordingLegacyCancellationDispatcher {
     cancellations: std::sync::atomic::AtomicUsize,
 }
@@ -2983,7 +3004,7 @@ impl crate::native::generated::nova_rocks_grpc_server::NovaRocksGrpc
         let request = protocol_lifecycle::QueryAbortRequest::parse(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let response = self.ingress.abort_query(request).map_err(Self::status)?;
-        Ok(Response::new(response.as_proto().clone()))
+        Ok(Response::new(*response.as_proto()))
     }
 
     async fn query_control_stream(
@@ -3199,14 +3220,14 @@ impl QueryLifecycleIngress for LiveLifecycleIngress {
                 gate: self.gate.clone(),
                 manual_heartbeat_acks: self.manual_heartbeat_acks,
                 manual_terminal_acks: self.manual_terminal_acks,
-                execution_id: execution_id,
+                execution_id,
                 backend: self
                     .initialized_backend
                     .lock()
                     .expect("initialized backend")
                     .clone()
                     .expect("InitQuery precedes attach"),
-                digest: digest,
+                digest,
             }),
             events: receiver,
             observations,

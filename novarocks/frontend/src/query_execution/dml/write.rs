@@ -10,11 +10,23 @@ use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 pub(crate) struct BoundDistributedWriteRequest {
     pub(crate) request: DistributedQueryRequest,
     pub(crate) session: ConnectorWriteOperationSession,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The write binding keeps its exact distributed request payload unboxed at the execution boundary."
+)]
 pub(crate) enum BoundDistributedWriteBinding {
     Bound(BoundDistributedWriteRequest),
     AbortRequired {
@@ -23,6 +35,10 @@ pub(crate) enum BoundDistributedWriteBinding {
     },
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 pub(crate) fn bind_prepared_distributed_write_request(
     query_execution: &QueryExecutionService,
     execution: &QueryExecutionContext,
@@ -82,7 +98,7 @@ pub(crate) fn scan_preparation_options(
     execution: &QueryExecutionContext,
 ) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
     let target_parallelism = std::num::NonZeroUsize::new(execution.topology().targets().len())
-        .or_else(|| {
+        .or({
             #[cfg(test)]
             {
                 Some(std::num::NonZeroUsize::new(1).expect("one is non-zero"))

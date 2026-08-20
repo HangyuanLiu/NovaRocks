@@ -743,15 +743,15 @@ async fn bridge(
             Err(status) => Err(stream_status_error(status)),
         };
         let terminal = next.is_err();
-        if let Ok(event) = &next {
-            if let Err(error) = validate_control_event(event, &commands) {
-                if let Ok(mut commands) = commands.lock() {
-                    commands.sender.take();
-                    commands.terminal = Some(error.clone());
-                }
-                let _ = events.send(Err(error)).await;
-                break;
+        if let Ok(event) = &next
+            && let Err(error) = validate_control_event(event, &commands)
+        {
+            if let Ok(mut commands) = commands.lock() {
+                commands.sender.take();
+                commands.terminal = Some(error.clone());
             }
+            let _ = events.send(Err(error)).await;
+            break;
         }
         if events.send(next.clone()).await.is_err() {
             break;

@@ -3032,6 +3032,10 @@ pub struct TruncateLifecycleRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "details", rename_all = "SCREAMING_SNAKE_CASE")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The durable DML journal codec keeps its existing variant shape for backward-compatible persisted records."
+)]
 pub enum OperationPayload {
     ConnectorWriteLifecycle(ConnectorWriteLifecycleRecord),
     CtasSaga(CtasSagaRecord),

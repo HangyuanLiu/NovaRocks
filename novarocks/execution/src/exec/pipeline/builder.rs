@@ -180,6 +180,14 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_dop(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This compatibility entrypoint exposes the established pipeline assembly contract."
+)]
+#[allow(
+    dead_code,
+    reason = "Retained as a stable compatibility pipeline assembly entrypoint."
+)]
 pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop(
     plan: &ExecPlan,
     debug: bool,
@@ -203,6 +211,14 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This entrypoint forwards frozen pipeline and runtime-filter state without repacking it."
+)]
+#[allow(
+    dead_code,
+    reason = "Retained as a stable compatibility pipeline assembly entrypoint."
+)]
 pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_session(
     plan: &ExecPlan,
     debug: bool,
@@ -228,7 +244,10 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The pipeline assembly boundary receives every independently-owned runtime service."
+)]
 pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_session_and_lookup_client(
     plan: &ExecPlan,
     debug: bool,
@@ -259,7 +278,10 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
 }
 
 /// Build a native graph with runtime settings frozen by the application host.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Runtime settings remain explicit at the application-to-execution boundary."
+)]
 pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_settings(
     plan: &ExecPlan,
     debug: bool,
@@ -292,6 +314,14 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_settings(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The compatibility entrypoint exposes the established pipeline assembly contract."
+)]
+#[allow(
+    dead_code,
+    reason = "Retained as a stable compatibility pipeline assembly entrypoint."
+)]
 pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_session(
     plan: &ExecPlan,
     debug: bool,
@@ -319,6 +349,10 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_sess
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Pipeline assembly owns independently-configured execution services and limits."
+)]
 fn build_pipeline_graph_in_mode(
     plan: &ExecPlan,
     _debug: bool,
@@ -675,6 +709,10 @@ fn existing_hash_distribution_keys_for_slots(
     Some(keys.clone())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The generic set-operation builder keeps each typed factory explicit."
+)]
 fn build_distinct_set_op_pipeline<S, MakeShared, MakeSink, MakeSource>(
     inputs: &[ExecNode],
     node_id: i32,
@@ -1982,6 +2020,10 @@ fn new_source_pipeline_with_dop(
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    dead_code,
+    reason = "Retained to assemble pipelines with an explicit runtime-filter context in integration tests."
+)]
 fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
     plan: &ExecPlan,
     debug: bool,
@@ -2032,6 +2074,10 @@ mod tests {
             .expect("chunk schema")
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as a focused pipeline builder regression fixture."
+    )]
     fn lookup_node(node_id: i32, output_chunk_schema: ChunkSchemaRef) -> ExecNode {
         ExecNode {
             kind: ExecNodeKind::LookUp(LookUpNode {

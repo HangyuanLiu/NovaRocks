@@ -304,27 +304,25 @@ fn apply_inner(
             continue;
         };
 
-        if let Some(literal) = literal_by_column.get(&left_id).cloned() {
-            if !has_literal_equality_in_side(memo, right_group, &join_literals, right_id, literal) {
-                if let Some(column) = right_columns.get(&right_id) {
-                    right_new.push(make_eq_literal_predicate(
-                        &mut memo.scalars,
-                        column,
-                        literal,
-                    ));
-                }
-            }
+        if let Some(literal) = literal_by_column.get(&left_id).cloned()
+            && !has_literal_equality_in_side(memo, right_group, &join_literals, right_id, literal)
+            && let Some(column) = right_columns.get(&right_id)
+        {
+            right_new.push(make_eq_literal_predicate(
+                &mut memo.scalars,
+                column,
+                literal,
+            ));
         }
-        if let Some(literal) = literal_by_column.get(&right_id).cloned() {
-            if !has_literal_equality_in_side(memo, left_group, &join_literals, left_id, literal) {
-                if let Some(column) = left_columns.get(&left_id) {
-                    left_new.push(make_eq_literal_predicate(
-                        &mut memo.scalars,
-                        column,
-                        literal,
-                    ));
-                }
-            }
+        if let Some(literal) = literal_by_column.get(&right_id).cloned()
+            && !has_literal_equality_in_side(memo, left_group, &join_literals, left_id, literal)
+            && let Some(column) = left_columns.get(&left_id)
+        {
+            left_new.push(make_eq_literal_predicate(
+                &mut memo.scalars,
+                column,
+                literal,
+            ));
         }
     }
 
@@ -355,7 +353,7 @@ mod tests {
     use crate::common::{BinOp, LiteralValue};
     use crate::optimizer::operator::ScanOp;
     use crate::optimizer::scalar::{HashableLiteral, ScalarId, ScalarNode};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
 
     use arrow::datatypes::DataType;
 

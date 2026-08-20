@@ -148,7 +148,7 @@ mod tests {
     use crate::optimizer::opt_expr::OptExpr;
     use crate::optimizer::pattern::{OpKind, Pattern};
     use crate::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
 
     fn bool_literal_scalar(arena: &mut ScalarArena) -> ScalarId {

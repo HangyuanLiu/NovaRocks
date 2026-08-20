@@ -1098,6 +1098,10 @@ impl AttemptControl {
         })?
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for terminal-delivery state assertions in lifecycle coverage."
+    )]
     fn terminal_delivery_started(&self, terminal: &TerminalState) -> bool {
         self.state.load(Ordering::Acquire) == FINALIZING
             && self
@@ -1599,6 +1603,10 @@ impl AttemptControl {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for explicit terminal-reader shutdown during lifecycle tests."
+    )]
     fn stop_readers(&self) {
         self.terminal
             .0
@@ -1608,6 +1616,10 @@ impl AttemptControl {
         self.terminal.1.notify_all();
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for explicit terminal-reader joining during lifecycle tests."
+    )]
     fn join_readers(&self) {
         self.stop_readers();
         let readers =

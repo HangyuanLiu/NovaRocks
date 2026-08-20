@@ -494,6 +494,10 @@ pub(crate) struct ClusterBackendService {
     _test_runtime_owner: Option<Arc<tokio::runtime::Runtime>>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 impl ClusterBackendService {
     pub(crate) async fn open(
         config: ClusterBackendOpenConfig,
@@ -862,10 +866,10 @@ impl ClusterBackendService {
                 new_epoch: start_epoch,
             },
         );
-        if old_state != RuntimeBackendState::Live || old_epoch != start_epoch {
-            if advance_topology_revision(&mut state).is_err() {
-                return;
-            }
+        if (old_state != RuntimeBackendState::Live || old_epoch != start_epoch)
+            && advance_topology_revision(&mut state).is_err()
+        {
+            return;
         }
         drop(state);
         if let Some(event) = restarted {
@@ -1032,10 +1036,10 @@ impl ClusterBackendService {
             .state
             .lock()
             .map_err(|_| "lock frontend topology failed".to_string())?;
-        if !state
+        if state
             .entries
             .get(&backend_idx)
-            .is_some_and(|entry| entry.endpoint == endpoint)
+            .is_none_or(|entry| entry.endpoint != endpoint)
         {
             return Ok(());
         }
@@ -1058,10 +1062,10 @@ impl ClusterBackendService {
                     .decommission_started
                     .is_some_and(|started| started.elapsed() >= self.decommission_timeout());
                 if timed_out && !entry.decommission_timeout_event_sent {
-                    if let Ok(mut state) = self.state.lock() {
-                        if let Some(current) = state.entries.get_mut(&backend_idx) {
-                            current.decommission_timeout_event_sent = true;
-                        }
+                    if let Ok(mut state) = self.state.lock()
+                        && let Some(current) = state.entries.get_mut(&backend_idx)
+                    {
+                        current.decommission_timeout_event_sent = true;
                     }
                     self.dispatch_event(BackendQueryEvent::Unavailable {
                         backend_idx,

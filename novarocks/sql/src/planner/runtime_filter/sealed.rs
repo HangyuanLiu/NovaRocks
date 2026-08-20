@@ -30,6 +30,10 @@ use super::progress::JoinBuildProgressCatalog;
 #[derive(Clone, Debug)]
 pub struct SealedRuntimeFilterPlan {
     graph: Arc<RuntimeFilterGraph>,
+    #[allow(
+        dead_code,
+        reason = "Activation decisions are retained for frontend lifecycle preparation targets."
+    )]
     activation_decisions: Arc<ActivationDecisionCatalog>,
     join_progress: Arc<JoinBuildProgressCatalog>,
 }
@@ -51,6 +55,10 @@ impl SealedRuntimeFilterPlan {
         &self.graph
     }
 
+    #[allow(
+        dead_code,
+        reason = "The lifecycle projection is retained for frontend preparation targets."
+    )]
     pub(crate) fn activation_decisions(&self) -> &ActivationDecisionCatalog {
         &self.activation_decisions
     }

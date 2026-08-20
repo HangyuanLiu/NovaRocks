@@ -381,7 +381,7 @@ impl MvRefreshOwnershipRegistry {
     ///
     /// Re-registering the same MV replaces the entry: a takeover-then-reacquire
     /// must not leave the previous generation's fence reachable.
-    pub fn register(
+    pub(crate) fn register(
         &self,
         mv_id: i64,
         resource: ConnectorMvRefreshResourceIdentity,

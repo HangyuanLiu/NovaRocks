@@ -978,6 +978,10 @@ mod tests {
             super::super::super::merge_batch(&self.spec, 0, &state_ptrs, &view).unwrap();
         }
 
+        #[allow(
+            dead_code,
+            reason = "Retained to exercise fallible aggregate state merges in focused tests."
+        )]
         fn try_merge(&mut self, input: ArrayRef) -> Result<(), String> {
             let rows = input.len();
             let input_slot = Some(input);

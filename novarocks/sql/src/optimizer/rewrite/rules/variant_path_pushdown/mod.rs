@@ -21,8 +21,7 @@ pub(crate) use rule::VariantPathPushdownRule;
 
 #[cfg(test)]
 mod tests {
-    use crate::planner::logical::*;
-    use crate::planner::payload::*;
+
     use std::cell::RefCell;
     use std::num::{NonZeroU32, NonZeroU64};
     use std::rc::Rc;

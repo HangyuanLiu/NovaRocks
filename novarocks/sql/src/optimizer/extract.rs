@@ -370,6 +370,10 @@ mod tests {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
+    )]
     fn winner_for_test(
         group_id: GroupId,
         expr_index: usize,

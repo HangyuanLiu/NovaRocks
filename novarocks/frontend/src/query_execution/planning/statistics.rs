@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -44,10 +43,18 @@ pub struct QueryStatisticsContext {
 }
 
 impl QueryStatisticsContext {
+    #[allow(
+        dead_code,
+        reason = "Retained as the explicit empty statistics snapshot constructor for planning callers."
+    )]
     pub(crate) fn none() -> Self {
         Self::default()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as the unavailable-statistics compatibility constructor for planning callers."
+    )]
     pub(crate) fn unavailable() -> Self {
         Self::none()
     }
@@ -84,6 +91,10 @@ impl std::ops::Deref for QueryStatisticsContext {
 /// rule in `QueryStatisticsContext`.
 pub(crate) trait QueryStatisticsResolver {
     fn unified_statistics(&self) -> &UnifiedStatisticsResolver;
+    #[allow(
+        dead_code,
+        reason = "Retained for planning callers that must retain the resolver handle rather than a borrowed view."
+    )]
     fn unified_statistics_arc(&self) -> &Arc<UnifiedStatisticsResolver>;
 }
 

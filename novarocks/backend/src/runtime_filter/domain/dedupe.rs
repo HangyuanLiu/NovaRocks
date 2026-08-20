@@ -27,7 +27,15 @@ use super::{
     BackendRouteEdgeId,
 };
 
+type ContributionDigests = BTreeMap<BackendContributionRouteIdentity, [u8; 32]>;
+type DeliveryDigests = BTreeMap<BackendDeliveryRouteIdentity, [u8; 32]>;
+type RouteVersionState = BTreeMap<(BackendRouteEdgeId, LogicalVersion), ([u8; 32], bool)>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) enum BackendContributionAdmission {
     Fresh,
     DuplicateRetry,
@@ -54,19 +62,15 @@ pub(crate) struct BackendIngressDedupe {
 
 #[derive(Default)]
 struct BackendIngressDedupeState {
-    contributions:
-        BTreeMap<BackendChannelIdentity, BTreeMap<BackendContributionRouteIdentity, [u8; 32]>>,
-    deliveries: BTreeMap<BackendChannelIdentity, BTreeMap<BackendDeliveryRouteIdentity, [u8; 32]>>,
-    versions: BTreeMap<
-        BackendChannelIdentity,
-        BTreeMap<(BackendRouteEdgeId, LogicalVersion), ([u8; 32], bool)>,
-    >,
-    pending_deliveries:
-        BTreeMap<BackendChannelIdentity, BTreeMap<BackendDeliveryRouteIdentity, [u8; 32]>>,
-    pending_versions: BTreeMap<
-        BackendChannelIdentity,
-        BTreeMap<(BackendRouteEdgeId, LogicalVersion), ([u8; 32], bool)>,
-    >,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
+    contributions: BTreeMap<BackendChannelIdentity, ContributionDigests>,
+    deliveries: BTreeMap<BackendChannelIdentity, DeliveryDigests>,
+    versions: BTreeMap<BackendChannelIdentity, RouteVersionState>,
+    pending_deliveries: BTreeMap<BackendChannelIdentity, DeliveryDigests>,
+    pending_versions: BTreeMap<BackendChannelIdentity, RouteVersionState>,
 }
 
 impl BackendIngressDedupe {
@@ -82,6 +86,10 @@ impl BackendIngressDedupe {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn admit_contribution(
         &self,
         route: BackendContributionRouteIdentity,
@@ -143,13 +151,12 @@ impl BackendIngressDedupe {
                 .deliveries
                 .get(&channel)
                 .map_or(0, BTreeMap::len)
-                .checked_add(
+                .saturating_add(
                     state
                         .pending_deliveries
                         .get(&channel)
                         .map_or(0, BTreeMap::len),
-                )
-                .unwrap_or(usize::MAX);
+                );
             if retained >= self.max_identities_per_channel {
                 return BackendDeliveryAdmission::ResourceLimit;
             }
@@ -253,12 +260,12 @@ fn remove_pending_delivery(
             state.pending_deliveries.remove(&channel);
         }
     }
-    if let Some(version) = version {
-        if let Some(versions) = state.pending_versions.get_mut(&channel) {
-            versions.remove(&(route.route_edge_id(), version));
-            if versions.is_empty() {
-                state.pending_versions.remove(&channel);
-            }
+    if let Some(version) = version
+        && let Some(versions) = state.pending_versions.get_mut(&channel)
+    {
+        versions.remove(&(route.route_edge_id(), version));
+        if versions.is_empty() {
+            state.pending_versions.remove(&channel);
         }
     }
 }

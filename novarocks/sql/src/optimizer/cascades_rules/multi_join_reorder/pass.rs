@@ -165,12 +165,12 @@ fn inject_candidate(
 fn find_chain_roots(memo: &Memo) -> Vec<GroupId> {
     let mut mid_chain: HashSet<GroupId> = HashSet::new();
     for group in &memo.groups {
-        if let Some(expr) = group.logical_exprs.first() {
-            if is_inner_cross_join_op(&expr.op) {
-                for &child in &expr.children {
-                    if child_is_inner_cross_join(memo, child) {
-                        mid_chain.insert(child);
-                    }
+        if let Some(expr) = group.logical_exprs.first()
+            && is_inner_cross_join_op(&expr.op)
+        {
+            for &child in &expr.children {
+                if child_is_inner_cross_join(memo, child) {
+                    mid_chain.insert(child);
                 }
             }
         }
@@ -289,10 +289,10 @@ mod tests {
             .map(|i| leaf(memo, i, 1000.0 * i as f64, conf))
             .collect();
         let mut tree = JoinTree::Leaf(leaves[0]);
-        for i in 1..n as usize {
+        for (i, &leaf) in leaves.iter().enumerate().skip(1) {
             tree = JoinTree::Join {
                 left: Box::new(tree),
-                right: Box::new(JoinTree::Leaf(leaves[i])),
+                right: Box::new(JoinTree::Leaf(leaf)),
                 op: inner(memo, eq(col(i as u32), col(i as u32 + 1))),
             };
         }

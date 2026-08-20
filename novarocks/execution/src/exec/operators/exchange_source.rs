@@ -114,6 +114,10 @@ impl OperatorFactory for ExchangeSourceFactory {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "The source retains its expression arena for exchange execution contract compatibility."
+)]
 struct ExchangeSourceOperator {
     name: String,
     node: ExchangeSourceNode,
@@ -373,8 +377,8 @@ mod tests {
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
     use crate::exec::pipeline::binding::ExchangeBinding;
+    use crate::runtime::fragment::io::ExchangeReceiverPort;
     use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
-    use crate::runtime::fragment::io::{ExchangeReceiverKey, ExchangeReceiverPort};
     use crate::runtime::runtime_state::RuntimeState;
     use novarocks_types::SlotId;
 

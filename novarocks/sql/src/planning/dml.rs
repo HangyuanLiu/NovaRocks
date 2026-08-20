@@ -612,12 +612,13 @@ pub struct DmlChangeStreamCompileRequest<'a> {
 /// SQL facade so callers do not reproduce a physical-plan safety rule.
 pub fn dml_change_stream_optimizer_settings() -> crate::optimizer::options::SessionOptimizerSettings
 {
-    let mut settings = crate::optimizer::options::SessionOptimizerSettings::default();
     // A generated mutation plan carries before/after rows over independent
     // branches. A query runtime filter can describe only one branch, so it
     // must not suppress locator rows required by a DELETE route.
-    settings.enable_global_runtime_filter = Some(false);
-    settings
+    crate::optimizer::options::SessionOptimizerSettings {
+        enable_global_runtime_filter: Some(false),
+        ..Default::default()
+    }
 }
 
 /// Return deterministic SQL-owned optimizer settings material for a CTAS
@@ -1575,14 +1576,18 @@ mod tests {
 
     #[test]
     fn optimizer_settings_digest_material_is_stable_across_rule_order_and_duplicates() {
-        let mut unordered = SessionOptimizerSettings::default();
-        unordered.disabled_rules = vec![
-            "RuleB".to_string(),
-            "RuleA".to_string(),
-            "RuleB".to_string(),
-        ];
-        let mut canonical = SessionOptimizerSettings::default();
-        canonical.disabled_rules = vec!["RuleA".to_string(), "RuleB".to_string()];
+        let unordered = SessionOptimizerSettings {
+            disabled_rules: vec![
+                "RuleB".to_string(),
+                "RuleA".to_string(),
+                "RuleB".to_string(),
+            ],
+            ..Default::default()
+        };
+        let canonical = SessionOptimizerSettings {
+            disabled_rules: vec!["RuleA".to_string(), "RuleB".to_string()],
+            ..Default::default()
+        };
 
         assert_eq!(
             optimizer_settings_stable_digest_material(&unordered),

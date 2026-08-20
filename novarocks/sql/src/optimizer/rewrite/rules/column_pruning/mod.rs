@@ -128,7 +128,7 @@ mod tests {
 
     use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
     use crate::column_id::ColumnId;
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use novarocks_catalog::schema::ColumnDef;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -136,9 +136,8 @@ mod tests {
     use crate::optimizer::rewrite::context::RewriteContext;
     use crate::optimizer::rewrite::registry::query_rewrite_pipeline;
     use crate::optimizer::scalar::ScalarArena;
-    use crate::planner::logical::*;
+
     use crate::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
-    use crate::planner::payload::*;
 
     // -----------------------------------------------------------------------
     // Helper builders
@@ -188,7 +187,7 @@ mod tests {
         LogicalPlanNode::new(
             LogicalPlanKind::Scan(PlanScanNode {
                 database: "default".to_string(),
-                table: table,
+                table,
                 alias: None,
                 columns: cols
                     .iter()

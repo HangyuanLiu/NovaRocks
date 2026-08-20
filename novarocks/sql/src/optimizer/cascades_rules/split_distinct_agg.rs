@@ -410,7 +410,6 @@ fn apply_three_phase(
     let distinct_aggs: Vec<ScalarAggregateSpec> = distinct_indices
         .iter()
         .map(|idx| agg.aggregates[*idx].clone())
-        .into_iter()
         .map(|call| rebind_distinct_arg_to_phase_output(call, distinct_phase_arg))
         .collect();
     if distinct_aggs.is_empty() {
@@ -543,7 +542,6 @@ fn apply_four_phase(
     let distinct_aggs: Vec<ScalarAggregateSpec> = distinct_indices
         .iter()
         .map(|idx| agg.aggregates[*idx].clone())
-        .into_iter()
         .map(|call| rebind_distinct_arg_to_phase_output(call, distinct_phase_arg))
         .collect();
     if distinct_aggs.is_empty() {

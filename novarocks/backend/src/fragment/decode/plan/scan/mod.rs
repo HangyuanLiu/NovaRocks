@@ -22,11 +22,11 @@ mod generic;
 mod variant_path;
 
 use super::context::NativePlanDecodeContext;
-use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
+use super::error::NativeFragmentDecodeError;
 use super::node::DecodedNode;
 use novarocks_execution::exec::expr::ExprArena;
+use novarocks_protocol::FieldPath;
 use novarocks_protocol::plan;
-use novarocks_protocol::{FieldPath, ProtocolErrorKind};
 
 pub(crate) fn lower_scan_node(
     node: &plan::DistributedNode,
@@ -107,7 +107,6 @@ mod tests {
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::exec::node::scan::ScanMorsel;
-    use novarocks_execution::runtime::query_options::{QueryOptions, QueryOptionsParts};
     use novarocks_execution::runtime_filter::{
         RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics,
     };
@@ -150,6 +149,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn schema_field(field_id: i32, name: &str) -> plan::IcebergSchemaFieldDef {
         plan::IcebergSchemaFieldDef {
             field_id,
@@ -160,6 +163,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn table_info() -> plan::IcebergTableInfo {
         plan::IcebergTableInfo {
             catalog: "rest".to_string(),
@@ -177,6 +184,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn variant_table_info() -> plan::IcebergTableInfo {
         plan::IcebergTableInfo {
             schema: Some(plan::IcebergSchemaDef {
@@ -634,10 +645,18 @@ mod tests {
         assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn variant_scan_node() -> plan::DistributedNode {
         variant_scan_node_with_source_ids(1, 1)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn variant_scan_node_with_source_ids(
         variant_source_column_id: u32,
         scan_source_column_id: u32,
@@ -690,6 +709,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn column_ref(column_id: u32, name: &str, data_type: DataType) -> expr::Expr {
         expr::Expr {
             r#type: Some(type_desc(&data_type)),
@@ -702,6 +725,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn membership_consumer_binding(binding_id: u32, node_id: i32) -> plan::RuntimeFilterBinding {
         let schema = RuntimeFilterMembershipSchema::new(
             &DataType::Int64,
@@ -750,6 +777,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn lower_delta_scan_with_binding(
         node: &mut plan::DistributedNode,
     ) -> super::super::node::DecodedNode {
@@ -771,6 +802,10 @@ mod tests {
         lowered
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn file_range() -> native_proto::ScanRangeParams {
         native_proto::ScanRangeParams {
             range: Some(native_proto::ScanRange {
@@ -803,6 +838,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn int_literal(value: i64) -> expr::Expr {
         expr::Expr {
             r#type: Some(type_desc(&DataType::Int64)),
@@ -815,6 +854,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn greater_than(left: expr::Expr, right: expr::Expr) -> expr::Expr {
         expr::Expr {
             r#type: Some(type_desc(&DataType::Boolean)),
@@ -827,6 +870,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn equals(left: expr::Expr, right: expr::Expr) -> expr::Expr {
         expr::Expr {
             r#type: Some(type_desc(&DataType::Boolean)),
@@ -839,6 +886,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn not_equals(left: expr::Expr, right: expr::Expr) -> expr::Expr {
         expr::Expr {
             r#type: Some(type_desc(&DataType::Boolean)),
@@ -865,6 +916,10 @@ mod tests {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn file_range_with_deletion_vector() -> native_proto::ScanRangeParams {
         let mut range = file_range();
         let Some(native_proto::scan_range::Kind::File(file)) =
@@ -882,6 +937,10 @@ mod tests {
         range
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn file_range_with_change_op_and_pruning() -> native_proto::ScanRangeParams {
         let mut range = file_range();
         let Some(native_proto::scan_range::Kind::File(file)) =

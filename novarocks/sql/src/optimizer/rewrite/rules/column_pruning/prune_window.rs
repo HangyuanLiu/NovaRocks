@@ -200,7 +200,7 @@ mod tests {
     use crate::optimizer::operator::{Operator, ScalarWindowSpec, ScanOp, WindowOp};
     use crate::optimizer::opt_expr::OptExpr;
     use crate::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
     use std::collections::HashSet;

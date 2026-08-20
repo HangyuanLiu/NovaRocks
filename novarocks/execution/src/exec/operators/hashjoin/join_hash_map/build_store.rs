@@ -29,6 +29,10 @@ pub(crate) struct BuildStore {
     chunk: Arc<Chunk>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Store inspection helpers are retained for hash-join integration coverage."
+)]
 impl BuildStore {
     pub(crate) fn new(chunk: Chunk) -> Self {
         Self {

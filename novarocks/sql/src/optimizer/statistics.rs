@@ -70,6 +70,10 @@ pub enum Confidence {
     /// Measured source (MV materialized row count / runtime feedback / sampling).
     /// Strictly more trustworthy than catalog `Exact`.
     /// Currently has no producer (stub) — inert until a measured source lands.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     Measured,
 }
 
@@ -468,6 +472,10 @@ impl TableStatistics {
 #[derive(Clone, Debug)]
 pub(crate) struct SqlManifestColumnStatistics {
     pub(crate) null_count: Option<i64>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) value_count: Option<i64>,
     pub(crate) column_size: Option<i64>,
     pub(crate) lower_bound: Option<Vec<u8>>,
@@ -477,22 +485,65 @@ pub(crate) struct SqlManifestColumnStatistics {
 #[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct SqlManifestFileStatistics {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) path: String,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) size: i64,
     pub(crate) row_count: Option<i64>,
     pub(crate) column_stats: Option<HashMap<String, SqlManifestColumnStatistics>>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) partition_spec_id: Option<i32>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) partition_key: Option<String>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) first_row_id: Option<i64>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) data_sequence_number: Option<i64>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) ivm_change_op: Option<i8>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) included_positions: Option<Vec<i64>>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) delete_files: Vec<()>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) manifest_path: Option<String>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) partition_values: Vec<()>,
 }
 
-#[cfg(test)]
 #[cfg(test)]
 type IcebergColumnStats = SqlManifestColumnStatistics;
 

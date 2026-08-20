@@ -413,8 +413,10 @@ mod tests {
 
     #[test]
     fn state_store_limit_wins_when_it_is_tighter_than_record_limit() {
-        let mut limits = StateStoreLimits::default();
-        limits.max_value_bytes = 19;
+        let limits = StateStoreLimits {
+            max_value_bytes: 19,
+            ..StateStoreLimits::default()
+        };
         let record = TestRecord {
             payload: DurableOpaqueBytes::try_new(vec![0xff; 3]).expect("bounded payload"),
         };

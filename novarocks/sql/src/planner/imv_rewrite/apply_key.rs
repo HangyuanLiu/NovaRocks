@@ -60,44 +60,39 @@ impl InjectApplyKeyProjectRule {
 fn root_row_id_ref(
     plan: &LogicalPlanNode,
 ) -> Option<(ColumnId, String, arrow::datatypes::DataType, bool)> {
-    if let LogicalPlanKind::Project(p) = &plan.kind {
-        if let Some(item) = p
+    if let LogicalPlanKind::Project(p) = &plan.kind
+        && let Some(item) = p
             .items
             .iter()
             .find(|i| i.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
-        {
-            if let ExprKind::ColumnRef {
-                column_id, column, ..
-            } = &item.expr.kind
-            {
-                return Some((
-                    *column_id,
-                    column.clone(),
-                    item.expr.data_type.clone(),
-                    item.expr.nullable,
-                ));
-            }
-        }
+        && let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &item.expr.kind
+    {
+        return Some((
+            *column_id,
+            column.clone(),
+            item.expr.data_type.clone(),
+            item.expr.nullable,
+        ));
     }
-    if let LogicalPlanKind::Union(u) = &plan.kind {
-        if is_branch_delta_union(plan) {
-            if let Some(column) = u
-                .output_columns
-                .iter()
-                .find(|column| ImvRowIdColumn::matches(column))
-            {
-                return Some((
-                    column.column_id,
-                    column.name.clone(),
-                    column.data_type.clone(),
-                    column.nullable,
-                ));
-            }
-        }
+    if let LogicalPlanKind::Union(u) = &plan.kind
+        && is_branch_delta_union(plan)
+        && let Some(column) = u
+            .output_columns
+            .iter()
+            .find(|column| ImvRowIdColumn::matches(column))
+    {
+        return Some((
+            column.column_id,
+            column.name.clone(),
+            column.data_type.clone(),
+            column.nullable,
+        ));
     }
     descendant_internal_columns(plan)
         .into_iter()
-        .find(|c| ImvRowIdColumn::matches(c))
+        .find(ImvRowIdColumn::matches)
         .map(|c| (c.column_id, c.name, c.data_type, c.nullable))
 }
 
@@ -262,7 +257,7 @@ mod tests {
     use crate::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
     use crate::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use novarocks_catalog::schema::ColumnDef;
     use std::cell::RefCell;
     use std::rc::Rc;

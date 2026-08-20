@@ -55,6 +55,10 @@ impl DmlService {
     /// not be reparsed or sliced to classify an INSERT form. The one D8
     /// exception is `statement.source.text`, which becomes SQLP-6 query IR at
     /// the execution boundary through [`parse_insert_source_query`].
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub fn try_execute_insert(
         &self,
         engine: &dyn InsertEngine,
@@ -116,6 +120,10 @@ impl DmlService {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn execute_iceberg_source(
         &self,
         engine: &dyn InsertEngine,

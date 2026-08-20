@@ -420,9 +420,7 @@ fn prune_raw_join_row_id_output_from_branch(
     ];
     project.items.retain(|item| {
         !item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
-            && !row_id_ids
-                .iter()
-                .any(|row_id| *row_id == item.output_column_id)
+            && !row_id_ids.contains(&item.output_column_id)
     });
     Ok(())
 }
@@ -653,8 +651,9 @@ fn collect_branch_base_identities(
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
 ) -> Result<(), String> {
     match &plan.kind {
-        LogicalPlanKind::Scan(scan) => match &scan.table.source {
-            ScanSource::Sql(source) => match source.kind {
+        LogicalPlanKind::Scan(scan) => {
+            let ScanSource::Sql(source) = &scan.table.source;
+            match source.kind {
                 crate::planner::table::SqlScanKind::Delta { .. } => {
                     bases.push(plan_base_identity(
                         source,
@@ -670,9 +669,8 @@ fn collect_branch_base_identities(
                     )?);
                 }
                 _ => {}
-            },
-            _ => {}
-        },
+            }
+        }
         _ => {
             for child in &plan.children {
                 collect_branch_base_identities(child, bases, snapshot)?;
@@ -1001,13 +999,13 @@ fn field_name_for_lineage<'a>(
             field.table_fqn, base.table_fqn
         ));
     }
-    if let Some(alias) = &base.alias_at_create {
-        if !field.qualifier_at_create.eq_ignore_ascii_case(alias) {
-            return Err(format!(
-                "join refresh descriptor lineage qualifier {} does not match base alias {}",
-                field.qualifier_at_create, alias
-            ));
-        }
+    if let Some(alias) = &base.alias_at_create
+        && !field.qualifier_at_create.eq_ignore_ascii_case(alias)
+    {
+        return Err(format!(
+            "join refresh descriptor lineage qualifier {} does not match base alias {}",
+            field.qualifier_at_create, alias
+        ));
     }
     base.fields
         .iter()
@@ -2167,7 +2165,7 @@ mod tests {
     fn join_over(join_type: JoinKind) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
-                join_type: join_type,
+                join_type,
                 condition: Some(condition()),
             }),
             vec![

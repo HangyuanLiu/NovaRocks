@@ -45,6 +45,10 @@ pub(crate) enum PredicateDerivedKind {
     Range,
     RangeEnvelope,
     OrSideFilter,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     NotNull,
 }
 
@@ -53,7 +57,15 @@ pub(crate) struct PredicateGroup {
     pub(crate) expr: ScalarId,
     pub(crate) referenced_ids: BTreeSet<ColumnId>,
     pub(crate) key: PredicateKey,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) origin: PredicateOrigin,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) derived: PredicateDerivedKind,
     pub(crate) deterministic: bool,
 }

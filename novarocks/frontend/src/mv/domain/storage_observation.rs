@@ -141,6 +141,10 @@ impl MvSchemaValidationObservation {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn try_new_with_maximum_payload(
         table_uuid: String,
         schema_id: i32,
@@ -442,6 +446,10 @@ pub(crate) struct MvPublishedLakeFacts {
 }
 
 impl MvPublishedLakeFacts {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Published lake provenance is a frozen connector boundary with independently validated facts."
+    )]
     pub fn try_new(
         target_snapshot_id: i64,
         refresh_id: i64,
@@ -621,6 +629,10 @@ pub(crate) struct MvObservedRefreshMarker {
 }
 
 impl MvRefreshTargetObservation {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Target observation preserves each pinned provider fact as a separate validated boundary input."
+    )]
     pub fn try_new(
         table: ConnectorTableIdentity,
         table_uuid: String,
@@ -700,15 +712,27 @@ impl MvRefreshTargetObservation {
     }
 
     /// `main`'s snapshot chain, newest first.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub fn main_ancestor_snapshot_ids(&self) -> &[i64] {
         &self.main_ancestor_snapshot_ids
     }
 
     /// Marker recorded by `snapshot_id`, if that snapshot carries one.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub fn snapshot_marker(&self, snapshot_id: i64) -> Option<&MvObservedRefreshMarker> {
         self.snapshot_markers.get(&snapshot_id)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub fn table(&self) -> &ConnectorTableIdentity {
         &self.table
     }
@@ -743,6 +767,10 @@ impl MvRefreshTargetObservation {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub fn ref_snapshot_ids(&self) -> &BTreeMap<String, i64> {
         &self.ref_snapshot_ids
     }

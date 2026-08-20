@@ -463,7 +463,7 @@ mod tests {
     use crate::column_id::ColumnId;
     use crate::optimizer::operator::{LogicalJoinOp, ScanOp};
     use crate::optimizer::scalar::ScalarArena;
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
 
     use crate::planner::optimizer_bridge::scalar::{intern_typed, materialize};
     use arrow::datatypes::DataType;

@@ -928,10 +928,7 @@ fn subtree_untagged(expr: &OptExpr) -> bool {
         | Operator::LogicalCTEConsume(_) => expr.required_output_columns.is_none(),
         // Non-leaves: check the first child (which will itself be a leaf or
         // recurse further until a leaf is reached).
-        _ => expr
-            .children
-            .first()
-            .map_or(false, |child| subtree_untagged(child)),
+        _ => expr.children.first().is_some_and(subtree_untagged),
     }
 }
 
@@ -1004,7 +1001,7 @@ mod tests {
         SortOp, TableFunctionOp, UnionOp, ValuesOp, WindowOp,
     };
     use crate::optimizer::scalar::{ScalarArena, SortKey};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
     use std::cell::RefCell;

@@ -165,7 +165,7 @@ mod tests {
     use crate::optimizer::rewrite::context::RewriteContext;
     use crate::optimizer::rewrite::tree_binder::bind_tree;
     use crate::optimizer::scalar::ScalarArena;
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
 
@@ -257,7 +257,7 @@ mod tests {
         }
     }
 
-    fn scan_opt(arena: &mut ScalarArena, cols: &[&str]) -> OptExpr {
+    fn scan_opt(_arena: &mut ScalarArena, cols: &[&str]) -> OptExpr {
         OptExpr::leaf(Operator::LogicalScan(ScanOp {
             database: "db".into(),
             table: make_table_def(cols),
@@ -411,7 +411,7 @@ mod tests {
             },
             other => panic!("expected Changed, got {:?}", other),
         };
-        let (scan_out, scan_op) = scan_after_round1;
+        let (scan_out, _scan_op) = scan_after_round1;
         // Round 2: same predicate above scan that already carries it.
         let pred_id = {
             let arena_rc = ctx.scalar_arena();

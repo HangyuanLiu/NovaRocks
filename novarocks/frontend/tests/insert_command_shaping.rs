@@ -280,7 +280,7 @@ fn preserves_array_map_struct_literals() {
         ),
     ];
     assert_eq!(
-        reorder_insert_rows(&[values.clone()], &[], &target).expect("preserve values"),
+        reorder_insert_rows(std::slice::from_ref(&values), &[], &target).expect("preserve values"),
         vec![values]
     );
 }
@@ -315,7 +315,7 @@ fn supports_largeint_and_integral_float_array_inputs() {
         ),
     ];
     assert_eq!(
-        reorder_insert_rows(&[values.clone()], &[], &target).expect("preserve inputs"),
+        reorder_insert_rows(std::slice::from_ref(&values), &[], &target).expect("preserve inputs"),
         vec![values]
     );
 }

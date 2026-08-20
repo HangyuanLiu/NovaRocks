@@ -30,6 +30,10 @@ use crate::query_execution::outcome::ConnectorWriteCompletion;
 /// Commit a complete staged writer manifest through exactly the FE generation
 /// that planned it.  No registry lookup, generation substitution, or payload
 /// reconstruction is permitted here.
+#[allow(
+    dead_code,
+    reason = "The typed connector commit boundary remains available to target-gated write completion paths."
+)]
 pub(crate) fn commit(
     completion: &ConnectorWriteCompletion,
 ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {

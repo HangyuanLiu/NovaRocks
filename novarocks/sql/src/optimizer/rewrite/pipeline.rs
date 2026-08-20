@@ -47,6 +47,10 @@ pub(crate) struct RewritePipeline {
 }
 
 impl RewritePipeline {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) fn new(phases: Vec<RewritePhase>, rules: Vec<Box<dyn LogicalRewriteRule>>) -> Self {
         let mut stages: Vec<RewriteStage> = phases
             .into_iter()
@@ -74,6 +78,10 @@ impl RewritePipeline {
         self.stages.iter().map(|stage| stage.name()).collect()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) fn rule_names(&self) -> Vec<&'static str> {
         self.stages
             .iter()

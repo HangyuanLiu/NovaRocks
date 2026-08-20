@@ -92,7 +92,7 @@ mod tests {
     use crate::optimizer::operator::{Operator, ScanOp};
     use crate::optimizer::opt_expr::OptExpr;
     use crate::optimizer::scalar::ScalarArena;
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
 
     use crate::optimizer::statistics::{
         ColumnStatistic, Confidence, DistinctValueCount, TableStatistics,

@@ -97,6 +97,10 @@ struct TypedCommandRoute {
 }
 
 impl TypedCommandRoute {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The command router constructor keeps each typed command owner explicit."
+    )]
     fn new(
         catalog: CatalogCommandExecutor,
         statistics: StatisticsCommandExecutor,
@@ -339,6 +343,10 @@ fn table_statement_admission_error(
     None
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The typed DML boundary keeps one explicit engine per statement family."
+)]
 fn execute_typed_dml_statement(
     dml: &DmlService,
     insert_engine: &dyn InsertEngine,
@@ -874,50 +882,48 @@ impl FrontendQuerySession {
                             .execute_typed(&statement, &context, query_options)
                             .map_err(RoutedExecutionError::Engine)
                     }
-                } else {
-                    if let ParsedStatement::Catalog(
-                        novarocks_parser::ast::CatalogStatement::TruncateTable(statement),
-                    ) = &statement
-                    {
-                        dml.execute_truncate(
-                            truncate_engine.as_ref(),
-                            crate::query_execution::dml::truncate::command_from_typed_statement(
-                                statement,
-                            ),
-                            &context,
-                            Some(&query_options),
-                        )
-                        .map(|()| StatementResult::Ok)
-                        .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
-                    } else if let ParsedStatement::Iceberg(
-                        novarocks_parser::ast::IcebergStatement::AlterTable(iceberg_statement),
-                    ) = &statement
-                    {
-                        match crate::query_execution::dml::add_files::command_from_typed_statement(
-                            iceberg_statement,
-                        ) {
-                            Ok(command) => dml
-                                .execute_add_files(
-                                    add_files_engine.as_ref(),
-                                    command,
-                                    &context,
-                                    Some(&query_options),
-                                )
-                                .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
-                                .and_then(|count| {
-                                    add_files_status(count)
-                                        .map(StatementResult::Query)
-                                        .map_err(RoutedExecutionError::Engine)
-                                }),
-                            Err(_) => command_executor
-                                .execute_typed(&statement, &context, query_options)
-                                .map_err(RoutedExecutionError::Engine),
-                        }
-                    } else {
-                        command_executor
+                } else if let ParsedStatement::Catalog(
+                    novarocks_parser::ast::CatalogStatement::TruncateTable(statement),
+                ) = &statement
+                {
+                    dml.execute_truncate(
+                        truncate_engine.as_ref(),
+                        crate::query_execution::dml::truncate::command_from_typed_statement(
+                            statement,
+                        ),
+                        &context,
+                        Some(&query_options),
+                    )
+                    .map(|()| StatementResult::Ok)
+                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                } else if let ParsedStatement::Iceberg(
+                    novarocks_parser::ast::IcebergStatement::AlterTable(iceberg_statement),
+                ) = &statement
+                {
+                    match crate::query_execution::dml::add_files::command_from_typed_statement(
+                        iceberg_statement,
+                    ) {
+                        Ok(command) => dml
+                            .execute_add_files(
+                                add_files_engine.as_ref(),
+                                command,
+                                &context,
+                                Some(&query_options),
+                            )
+                            .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                            .and_then(|count| {
+                                add_files_status(count)
+                                    .map(StatementResult::Query)
+                                    .map_err(RoutedExecutionError::Engine)
+                            }),
+                        Err(_) => command_executor
                             .execute_typed(&statement, &context, query_options)
-                            .map_err(RoutedExecutionError::Engine)
+                            .map_err(RoutedExecutionError::Engine),
                     }
+                } else {
+                    command_executor
+                        .execute_typed(&statement, &context, query_options)
+                        .map_err(RoutedExecutionError::Engine)
                 }
             } else if is_query {
                 compiler
@@ -971,7 +977,7 @@ impl FrontendQuerySession {
 }
 
 fn with_allow_throw_exception(query_options: QueryOptions, enabled: bool) -> QueryOptions {
-    let mut raw = query_options.as_proto().clone();
+    let mut raw = *query_options.as_proto();
     raw.allow_throw_exception = enabled;
     QueryOptions::parse(raw).expect("allow_throw_exception does not invalidate query options")
 }
@@ -1569,16 +1575,16 @@ mod tests {
     use crate::common::backend_topology::BackendTopologySnapshot;
     use crate::common::query_cancellation::QueryCancellationSource;
     use crate::query_execution::dml::delete::{
-        DeleteCommit, DeleteEngine, DeleteOperation, DeletePrepared, DeleteWriteReport,
-        PrepareDeleteRequest, PreparedDelete,
+        DeleteEngine, DeleteOperation, DeletePrepared, DeleteWriteReport, PrepareDeleteRequest,
+        PreparedDelete,
     };
     use crate::query_execution::dml::insert::{
-        IcebergInsertCommit, IcebergPreparedInsert, IcebergWriteReport, PrepareIcebergInsert,
-        PreparedIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
+        IcebergPreparedInsert, IcebergWriteReport, PrepareIcebergInsert, PreparedIcebergInsert,
+        ResolveInsertTarget, ResolvedInsertTarget,
     };
     use crate::query_execution::dml::mutation::{
-        MutationAbort, MutationCommit, MutationEngine, MutationPrepared, MutationStageOutcome,
-        PrepareMutationRequest, PreparedMutation,
+        MutationEngine, MutationPrepared, MutationStageOutcome, PrepareMutationRequest,
+        PreparedMutation,
     };
     use novarocks_catalog::schema::ColumnDef;
 
@@ -1590,6 +1596,10 @@ mod tests {
     #[derive(Default)]
     struct RecordingCoreCommand {
         calls: AtomicUsize,
+        #[allow(
+            dead_code,
+            reason = "The fixture retains full execution contexts for targeted router assertions."
+        )]
         contexts: Mutex<Vec<QueryExecutionContext>>,
     }
 
@@ -1797,6 +1807,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "The test seam preserves the production DML error type."
+    )]
     fn not_ctas(
         _sql: &str,
         _context: &RequestContext,

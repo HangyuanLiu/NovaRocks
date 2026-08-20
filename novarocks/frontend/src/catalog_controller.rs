@@ -161,14 +161,13 @@ impl FrontendCatalogController {
             .lock()
             .map_err(|_| "catalog controller worker lock is poisoned".to_string())?
             .take();
-        if let Some(mut handle) = handle {
-            if tokio::time::timeout(self.config.shutdown_deadline, &mut handle)
+        if let Some(mut handle) = handle
+            && tokio::time::timeout(self.config.shutdown_deadline, &mut handle)
                 .await
                 .is_err()
-            {
-                handle.abort();
-                let _ = handle.await;
-            }
+        {
+            handle.abort();
+            let _ = handle.await;
         }
         self.projection.unpublish_all();
         self.publish_metrics();
@@ -1299,11 +1298,13 @@ mod tests {
             CatalogAdmission::Ready(_)
         ));
 
-        let mut config = CatalogProjectionConfig::default();
-        config.poll_interval = Duration::from_millis(1);
-        config.freshness_budget = Duration::from_millis(10);
-        config.retry_initial = Duration::from_millis(1);
-        config.retry_max = Duration::from_millis(2);
+        let config = CatalogProjectionConfig {
+            poll_interval: Duration::from_millis(1),
+            freshness_budget: Duration::from_millis(10),
+            retry_initial: Duration::from_millis(1),
+            retry_max: Duration::from_millis(2),
+            ..CatalogProjectionConfig::default()
+        };
         let unavailable_store: Arc<dyn StateStore> = Arc::new(PollUnavailableStore {
             inner: Arc::clone(&store),
         });

@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(test)]
-use crate::planner::vocabulary::ApplyKeySource;
-
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -47,9 +44,10 @@ use crate::planner::payload::{
     AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode, PlanValuesNode,
 };
 use crate::planner::plan_output_columns as planner_plan_output_columns;
+#[cfg(test)]
+use crate::planner::table::sql_mv_target_state_scan;
 use crate::planner::table::{
     SqlMvTargetStatePartitionConstraint, SqlMvTargetStateRowFilter, TableDef,
-    sql_mv_target_state_scan,
 };
 use novarocks_catalog::schema::ColumnDef;
 
@@ -231,6 +229,10 @@ pub(crate) fn build_aggregate_state_merge(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Target-state scan facts are independently validated planner inputs; grouping them would hide their distinct contracts."
+)]
 fn target_state_old_scan(
     target: &novarocks_catalog::identifier::TableIdentity,
     target_columns: Vec<ColumnDef>,
@@ -361,7 +363,7 @@ fn target_state_compact_old_scan_columns(
                         "Iceberg IMV aggregate rewrite target-state old input cannot resolve public column {name}"
                     )
                 })?;
-            Ok(allocate_imv_output_column(
+            allocate_imv_output_column(
                 ctx,
                 &column.0.name,
                 column.0.data_type.clone(),
@@ -371,7 +373,7 @@ fn target_state_compact_old_scan_columns(
                         .iter()
                         .any(|state| state.eq_ignore_ascii_case(&column.0.name))
                     || column.0.name.eq_ignore_ascii_case(row_id_column_name),
-            )?)
+            )
         })
         .collect()
 }
@@ -826,11 +828,7 @@ fn aggregate_delete_expr_for_output(
         if !output.name.eq_ignore_ascii_case(&visible.name) {
             continue;
         }
-        if layout
-            .group_key_source_indexes
-            .iter()
-            .any(|&idx| idx == visible_index)
-        {
+        if layout.group_key_source_indexes.contains(&visible_index) {
             return source_expr_by_name(input_outputs, old_outputs, &visible.name);
         }
         return Ok(typed_null(output.data_type.clone()));
@@ -868,11 +866,7 @@ fn aggregate_insert_expr_for_output(
         if !output.name.eq_ignore_ascii_case(&visible.name) {
             continue;
         }
-        if layout
-            .group_key_source_indexes
-            .iter()
-            .any(|&idx| idx == visible_index)
-        {
+        if layout.group_key_source_indexes.contains(&visible_index) {
             return source_expr_by_name(input_outputs, delta_outputs, &visible.name);
         }
         let state_column = single_state_column_for_visible(layout, visible_index)?;
@@ -1582,11 +1576,8 @@ fn existing_delta_action_column(plan: &LogicalPlanNode) -> Result<Option<ColumnI
     }
 
     fn visit(plan: &LogicalPlanNode, found: &mut Option<ColumnId>) -> Result<(), String> {
-        match &plan.kind {
-            LogicalPlanKind::ImvDelta(node) => {
-                merge_action(found, node.action_column)?;
-            }
-            _ => {}
+        if let LogicalPlanKind::ImvDelta(node) = &plan.kind {
+            merge_action(found, node.action_column)?;
         }
         for child in &plan.children {
             visit(child, found)?;
@@ -2098,9 +2089,8 @@ mod tests {
     use crate::planner::logical::*;
     use crate::planner::payload::*;
     use std::cell::RefCell;
-    use std::collections::BTreeMap;
+
     use std::rc::Rc;
-    use std::sync::Arc;
 
     use arrow::datatypes::DataType;
 
@@ -2772,9 +2762,7 @@ mod tests {
         let Some(target_state) = sql_mv_target_state_scan(&old_scan.table.source) else {
             panic!("expected IcebergMvTargetState source");
         };
-        let ScanSource::Sql(source) = &old_scan.table.source else {
-            panic!("expected SQL target-state source");
-        };
+        let ScanSource::Sql(source) = &old_scan.table.source;
         assert_eq!(source.table.catalog, "ice");
         assert_eq!(source.table.namespace, "db");
         assert_eq!(source.table.table, "mv");

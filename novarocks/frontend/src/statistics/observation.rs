@@ -436,7 +436,7 @@ fn estimate_column_min_max(
     collect_source_column_values(source, column_index, &mut values);
     let mut values = values
         .into_iter()
-        .filter_map(|literal| literal_to_stat_value(literal, data_type))
+        .filter_map(literal_to_stat_value)
         .collect::<Vec<_>>();
     values.sort_by(|left, right| compare_stat_values(left, right, data_type));
     (
@@ -461,7 +461,7 @@ fn collect_source_column_values<'a>(
     }
 }
 
-fn literal_to_stat_value(literal: &StatisticsLiteral, data_type: &DataType) -> Option<String> {
+fn literal_to_stat_value(literal: &StatisticsLiteral) -> Option<String> {
     match literal {
         StatisticsLiteral::Null => None,
         StatisticsLiteral::Bool(value) => Some(value.to_string()),
@@ -473,7 +473,7 @@ fn literal_to_stat_value(literal: &StatisticsLiteral, data_type: &DataType) -> O
             "[{}]",
             values
                 .iter()
-                .filter_map(|value| literal_to_stat_value(value, data_type))
+                .filter_map(literal_to_stat_value)
                 .collect::<Vec<_>>()
                 .join(",")
         )),
@@ -483,8 +483,8 @@ fn literal_to_stat_value(literal: &StatisticsLiteral, data_type: &DataType) -> O
                 .iter()
                 .filter_map(|(key, value)| Some(format!(
                     "{}:{}",
-                    literal_to_stat_value(key, data_type)?,
-                    literal_to_stat_value(value, data_type)?
+                    literal_to_stat_value(key)?,
+                    literal_to_stat_value(value)?
                 )))
                 .collect::<Vec<_>>()
                 .join(",")
@@ -493,7 +493,7 @@ fn literal_to_stat_value(literal: &StatisticsLiteral, data_type: &DataType) -> O
             "({})",
             values
                 .iter()
-                .filter_map(|value| literal_to_stat_value(value, data_type))
+                .filter_map(literal_to_stat_value)
                 .collect::<Vec<_>>()
                 .join(",")
         )),

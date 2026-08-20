@@ -1347,7 +1347,7 @@ mod tests {
         }
 
         fn claim_partition(
-            self: &Self,
+            &self,
             partition: PartitionId,
         ) -> Result<RuntimeFilterFinalDomainPartitionHandle, RuntimeFilterContractViolation>
         {

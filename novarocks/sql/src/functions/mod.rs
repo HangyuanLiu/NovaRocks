@@ -44,11 +44,11 @@ pub(crate) mod signature;
 
 use arrow::datatypes::DataType;
 
+#[cfg(test)]
+pub(crate) use resolver::resolve_scalar_function;
 pub(crate) use resolver::{
-    ResolveError, ResolvedScalarFunction, resolve_scalar_function,
-    resolve_scalar_function_signature,
+    ResolveError, ResolvedScalarFunction, resolve_scalar_function_signature,
 };
-pub(crate) use signature::{Signature, TypeSpec};
 
 /// Evaluation stability of a scalar function call.
 ///

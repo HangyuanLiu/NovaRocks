@@ -124,6 +124,10 @@ pub(crate) enum NativeFragmentDecodeError {
     Binding(novarocks_execution::exec::fragment::error::FragmentBindingError),
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 impl NativeFragmentDecodeError {
     #[cfg(test)]
     pub(crate) fn contains(&self, pattern: &str) -> bool {

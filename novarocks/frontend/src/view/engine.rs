@@ -23,7 +23,7 @@
 //! backends, or parser-internal column definitions.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::catalog_application::query_catalog::CatalogServiceSource;
 use crate::common::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};

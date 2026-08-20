@@ -35,6 +35,10 @@ use novarocks_protocol::plan;
 use novarocks_types::SlotId;
 use novarocks_types::wider_type;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen native boundary keeps independently validated inputs explicit."
+)]
 pub(super) fn lower_hash_join_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
@@ -221,6 +225,10 @@ fn hash_join_distribution_mode(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(super) fn exprs_equivalent(arena: &ExprArena, left: ExprId, right: ExprId) -> bool {
     if arena.data_type(left) != arena.data_type(right) {
         return false;
@@ -338,6 +346,10 @@ pub(super) fn exprs_equivalent(arena: &ExprArena, left: ExprId, right: ExprId) -
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 fn expr_id_slices_equivalent(arena: &ExprArena, left: &[ExprId], right: &[ExprId]) -> bool {
     left.len() == right.len()
         && left
@@ -346,6 +358,10 @@ fn expr_id_slices_equivalent(arena: &ExprArena, left: &[ExprId], right: &[ExprId
             .all(|(left, right)| exprs_equivalent(arena, *left, *right))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 fn common_sub_exprs_equivalent(
     arena: &ExprArena,
     left: &[(SlotId, ExprId)],

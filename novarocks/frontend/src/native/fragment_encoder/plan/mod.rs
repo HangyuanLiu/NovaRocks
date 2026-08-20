@@ -97,6 +97,10 @@ pub(super) fn encode_distributed_plan(
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 pub(super) fn encode_distributed_plan_with_context(
     src: &DistributedPlan,
     ctx: NativePlanEncodeContext<'_>,
@@ -142,6 +146,10 @@ pub(crate) fn encode_data_partition(src: &DataPartition) -> Result<plan::DataPar
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode, String> {
     encode_node_with_context(
         src,

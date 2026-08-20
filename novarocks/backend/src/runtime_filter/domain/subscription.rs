@@ -27,8 +27,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use novarocks_execution::runtime_filter::{
-    ArtifactUnsupportedReason, BlockingSnapshotSubscription, ConsumerActivation, LivePollOutcome,
-    LiveTerminal, LogicalVersion, NonBlockingLiveSubscription, RuntimeFilterSnapshot,
+    BlockingSnapshotSubscription, ConsumerActivation, LivePollOutcome, LiveTerminal,
+    LogicalVersion, NonBlockingLiveSubscription, RuntimeFilterSnapshot,
     RuntimeFilterSubscriptionHandle, SnapshotAcquireOutcome, UnavailableReason,
 };
 use novarocks_types::UniqueId;
@@ -188,13 +188,13 @@ impl BackendLiveSubscription {
     ) -> Result<(), BackendSubscriptionError> {
         let (emit_terminal, retained_version) = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            if let Some(latest) = &state.latest {
-                if snapshot.logical_version() < latest.logical_version() {
-                    return Err(BackendSubscriptionError::VersionRegression {
-                        observed: latest.logical_version(),
-                        published: snapshot.logical_version(),
-                    });
-                }
+            if let Some(latest) = &state.latest
+                && snapshot.logical_version() < latest.logical_version()
+            {
+                return Err(BackendSubscriptionError::VersionRegression {
+                    observed: latest.logical_version(),
+                    published: snapshot.logical_version(),
+                });
             }
             if state
                 .latest
@@ -314,6 +314,10 @@ fn merge_terminal(current: Option<LiveTerminal>, incoming: LiveTerminal) -> Live
 /// All Backend-local slots for a consumer binding and its authorized delivery
 /// routes. The group does not materialize artifacts or make evaluator choices.
 pub(crate) struct BackendSubscriptionGroup {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     activation: ConsumerActivation,
     route_edge_ids: BTreeSet<BackendRouteEdgeId>,
     slots: BTreeMap<UniqueId, BackendInstalledSubscriptionSlot>,
@@ -379,6 +383,10 @@ impl BackendSubscriptionGroup {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn activation(&self) -> ConsumerActivation {
         self.activation
     }

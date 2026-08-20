@@ -39,9 +39,17 @@ use novarocks_protocol::lifecycle::{
 pub(crate) enum QueryLifecycleErrorCode {
     InvalidManifest,
     Conflict,
+    #[allow(
+        dead_code,
+        reason = "Retained for backend lifecycle owners that report stale membership after test-only control paths."
+    )]
     StaleBackend,
     Capacity,
     Terminated,
+    #[allow(
+        dead_code,
+        reason = "Retained for backend lifecycle owners that surface transport failures after test-only control paths."
+    )]
     Transport,
     Internal,
 }
@@ -110,6 +118,10 @@ pub(crate) struct QueryControlAttachment {
     /// A single-slot, replaceable telemetry view. Correctness events remain on
     /// `events` so a congested profiler/progress producer cannot delay an ACK,
     /// drain barrier, or terminal snapshot.
+    #[allow(
+        dead_code,
+        reason = "The attachment preserves the telemetry receiver for native control-stream consumers outside this target."
+    )]
     pub(crate) observations: tokio::sync::watch::Receiver<Option<FragmentLiveObservation>>,
 }
 

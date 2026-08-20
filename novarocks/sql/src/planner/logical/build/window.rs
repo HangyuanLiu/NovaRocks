@@ -71,7 +71,7 @@ pub(super) fn build_window_and_project(
             LogicalPlanNode::new(
                 LogicalPlanKind::Sort(PlanSortNode {
                     items: sort_items,
-                    analytic_partition_by: analytic_partition_by,
+                    analytic_partition_by,
                     output_columns: vec![],
                     offset: None,
                     partition_limit: None,
@@ -84,8 +84,8 @@ pub(super) fn build_window_and_project(
 
         let windowed = LogicalPlanNode::new(
             LogicalPlanKind::Window(PlanWindowNode {
-                window_exprs: window_exprs,
-                output_columns: output_columns,
+                window_exprs,
+                output_columns,
             }),
             vec![sorted_input],
             None,

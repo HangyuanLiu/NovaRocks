@@ -212,6 +212,10 @@ where
         ReliableTransportFailureOutcome::RetryScheduled
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn schedule_all_pending_retries(&mut self) {
         for entry in self.pending.values_mut() {
             entry.retry_scheduled = true;
@@ -246,6 +250,10 @@ where
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn shutdown(&mut self) {
         self.shutdown = true;
         self.pending.clear();

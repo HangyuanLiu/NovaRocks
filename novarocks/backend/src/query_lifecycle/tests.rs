@@ -123,14 +123,7 @@ struct RecordingLocalRuntime {
 struct RecordingLocalRuntimeState {
     install_calls: Mutex<Vec<QueryExecutionId>>,
     abort_calls: Mutex<Vec<QueryExecutionId>>,
-    terminations: Mutex<
-        Vec<(
-            QueryExecutionId,
-            Vec<UniqueId>,
-            QueryTerminationReason,
-            String,
-        )>,
-    >,
+    terminations: Mutex<Vec<TerminationCall>>,
     releases: Mutex<Vec<QueryExecutionId>>,
     lifecycle_order: Mutex<Vec<(&'static str, QueryExecutionId)>>,
     install_gate: Mutex<InstallGate>,
@@ -138,6 +131,13 @@ struct RecordingLocalRuntimeState {
     fail_install: Mutex<bool>,
     fail_abort: Mutex<bool>,
 }
+
+type TerminationCall = (
+    QueryExecutionId,
+    Vec<UniqueId>,
+    QueryTerminationReason,
+    String,
+);
 
 #[derive(Default)]
 struct RecordingMetricsSink {
@@ -855,7 +855,7 @@ fn runtime_filter_contribution(
         }),
         deployment_epoch: execution_id.attempt_id().get(),
         participant_id,
-        lifecycle: Some(lifecycle.clone()),
+        lifecycle: Some(lifecycle),
         install: Some(install.clone()),
     };
     let mut digest = sha2::Sha256::new();
@@ -1468,7 +1468,6 @@ fn query_lifecycle_observations_coalesce_without_consuming_correctness_capacity(
 fn query_lifecycle_drain_and_snapshot_survive_saturated_heartbeat_queue() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
     let request = init_request_fixture(104, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
-    let execution_id = request.manifest().execution_id();
     assert_eq!(
         registry
             .init_query(request.clone())

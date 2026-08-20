@@ -30,12 +30,20 @@ use crate::optimizer::statistics::{CostEstimate, Statistics};
 pub(crate) enum JoinExecutionDistribution {
     Broadcast,
     Partitioned,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     Colocate,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PlanExecutionProps {
     pub output_property: PhysicalPropertySet,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub child_output_properties: Vec<PhysicalPropertySet>,
     pub join_distribution: Option<JoinExecutionDistribution>,
     /// Shared scalar arena that owns all `ScalarId` handles referenced by this

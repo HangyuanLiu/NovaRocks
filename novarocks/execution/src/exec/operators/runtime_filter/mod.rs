@@ -80,7 +80,15 @@ impl Clone for NativeOrderedLiveConsumerSet {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Ordered live-consumer helpers remain available for native scan integration paths."
+)]
 impl NativeOrderedLiveConsumerSet {
+    #[expect(
+        clippy::type_complexity,
+        reason = "The return value preserves each scan-domain binding with its independently optional snapshot."
+    )]
     pub(crate) fn scan_domain_snapshots(
         &self,
     ) -> Result<
@@ -455,6 +463,10 @@ impl NativeConsumerPredicate {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "The direct consumer API remains available for non-polling integration callers."
+)]
 impl RuntimeFilterConsumerSet {
     pub(crate) fn scan_domain_snapshots(
         &self,

@@ -112,9 +112,9 @@ fn comparator_sign(array: &ArrayRef, idx: usize) -> Result<i8, String> {
 fn validate_comparator(matrix: &[i8], len: usize, nulls: &[bool]) -> Result<(), String> {
     let at = |i: usize, j: usize| matrix[i * len + j];
 
-    for i in 0..len {
+    for (i, is_null) in nulls.iter().enumerate().take(len) {
         if at(i, i) != 0 {
-            if nulls[i] && at(i, i) > 0 {
+            if *is_null && at(i, i) > 0 {
                 continue;
             }
             if at(i, i) > 0 {

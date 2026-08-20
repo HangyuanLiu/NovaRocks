@@ -31,6 +31,10 @@ use novarocks_sql::plan_read::{
 };
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 pub(super) fn encoded_physical_variant_names_for_test() -> &'static [&'static str] {
     &[
         "Scan",

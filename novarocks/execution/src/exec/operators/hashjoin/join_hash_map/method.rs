@@ -128,6 +128,10 @@ impl JoinHashMapMethodKind {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Join map variants are stored inline to keep probe dispatch allocation-free."
+)]
 pub(crate) enum JoinHashMap {
     Chained(ChainedJoinHashMap),
     DirectInt(DirectIntJoinHashMap),
@@ -138,6 +142,10 @@ pub(crate) struct ChainedJoinHashMap {
     table: JoinHashTable,
 }
 
+#[allow(
+    dead_code,
+    reason = "The hash seed is retained for native runtime-filter-compatible direct map construction."
+)]
 pub(crate) struct DirectIntJoinHashMap {
     data_type: DataType,
     min: i64,
@@ -153,6 +161,10 @@ pub(crate) struct DirectIntJoinHashMap {
     accounted_bytes: i64,
 }
 
+#[allow(
+    dead_code,
+    reason = "The hash seed is retained for native runtime-filter-compatible direct set construction."
+)]
 pub(crate) struct DirectIntJoinHashSet {
     data_type: DataType,
     min: i64,
@@ -175,6 +187,10 @@ struct DirectIntStats {
     not_null: bool,
 }
 
+#[allow(
+    dead_code,
+    reason = "Alternate hash-map construction and lookup paths are retained for join integration coverage."
+)]
 impl JoinHashMap {
     pub(crate) fn new_chained(
         key_types: Vec<DataType>,
@@ -370,6 +386,10 @@ impl JoinHashMap {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Selection lookup remains available for the chained join-map implementation."
+)]
 impl ChainedJoinHashMap {
     fn lookup_selection(
         &self,
@@ -516,6 +536,10 @@ impl ChainedJoinHashMap {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Selection lookup remains available for the direct integer join-map implementation."
+)]
 impl DirectIntJoinHashMap {
     fn try_build(
         key_types: &[DataType],
@@ -1306,7 +1330,7 @@ mod tests {
 
     #[test]
     fn direct_map_range_cap_falls_back_to_chained() {
-        let build = int32_chunk(vec![Some(0), Some((16 * 1024 * 1024) as i32)]);
+        let build = int32_chunk(vec![Some(0), Some(16 * 1024 * 1024)]);
         let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
         let options = JoinHashMapBuildOptions {
             direct_range_row_multiplier: u64::MAX / 4,

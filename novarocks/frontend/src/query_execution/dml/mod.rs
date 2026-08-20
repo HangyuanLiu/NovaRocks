@@ -4,6 +4,10 @@ pub mod add_files;
 pub(crate) mod aggregate;
 pub mod ctas;
 pub mod delete;
+#[allow(
+    dead_code,
+    reason = "Retained as the staged typed DELETE predicate port until its connector owner is wired."
+)]
 pub(crate) mod delete_predicate_translate;
 pub mod external_write_fence;
 pub(crate) mod iceberg_ctas;

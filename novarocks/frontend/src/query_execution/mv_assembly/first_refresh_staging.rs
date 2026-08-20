@@ -273,6 +273,10 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     Ok(distributed)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Rebuilding a frozen MV rewrite context requires each independently pinned catalog and target fact."
+)]
 pub(crate) fn rebuild_frozen_mv_rewrite_context(
     ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
@@ -391,6 +395,10 @@ fn validate_frozen_join_base_facts(facts: &MvFirstRefreshLogicalContext) -> Resu
         })
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged MV execution assembly and recovery wiring."
+)]
 fn parse_query_from_sql(sql: &str) -> Result<sqlparser::ast::Query, String> {
     let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
     let statement = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)?;

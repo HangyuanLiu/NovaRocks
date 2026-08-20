@@ -257,10 +257,7 @@ pub(in crate::planner::distributed) fn build_topology_contract(
 /// planner never imports codegen: an Iceberg write is a terminal write; result,
 /// noop, and change-stream router sinks are not.
 fn is_terminal_write(sink: &DataSink) -> bool {
-    match sink {
-        DataSink::ConnectorWrite(_) => true,
-        _ => false,
-    }
+    matches!(sink, DataSink::ConnectorWrite(_))
 }
 
 /// Return the fragment ids in topological order (leaves first, root last).
@@ -904,7 +901,7 @@ mod tests {
     fn no_execution_anchor_when_no_terminal_exists() {
         // Exercised directly: an empty terminal set is only reachable behind a
         // cycle in a finite graph, which `topological_order` rejects first.
-        let fragments = vec![fragment(0, DataSink::Result)];
+        let fragments = [fragment(0, DataSink::Result)];
         let fragments_by_id = fragments.iter().map(|f| (f.fragment_id, f)).collect();
 
         let error = select_execution_anchor(&fragments_by_id, &[])

@@ -22,6 +22,10 @@ use crate::common::JoinKind;
 use crate::optimizer::rewrite::rules::predicate_pushdown::predicate_group::PredicateGroup;
 
 #[derive(Clone, Debug, Default)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) struct ClassifiedPredicates {
     pub(crate) left_pushdown: Vec<PredicateGroup>,
     pub(crate) right_pushdown: Vec<PredicateGroup>,
@@ -30,6 +34,10 @@ pub(crate) struct ClassifiedPredicates {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 enum SideTarget {
     Left,
     Right,
@@ -38,6 +46,10 @@ enum SideTarget {
     Outside,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) fn classify_predicate_groups(
     join_type: JoinKind,
     left_ids: &HashSet<ColumnId>,
@@ -63,6 +75,10 @@ pub(crate) fn classify_predicate_groups(
     out
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 fn classify_group(
     group: &PredicateGroup,
     left_ids: &HashSet<ColumnId>,
@@ -89,6 +105,10 @@ fn classify_group(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 fn may_push_left(join_type: JoinKind) -> bool {
     matches!(
         join_type,
@@ -101,6 +121,10 @@ fn may_push_left(join_type: JoinKind) -> bool {
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 fn may_push_right(join_type: JoinKind) -> bool {
     matches!(
         join_type,
@@ -112,6 +136,10 @@ fn may_push_right(join_type: JoinKind) -> bool {
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 fn may_place_cross_side_in_join(join_type: JoinKind) -> bool {
     matches!(join_type, JoinKind::Inner | JoinKind::Cross)
 }

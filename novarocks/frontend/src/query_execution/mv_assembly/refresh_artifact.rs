@@ -92,6 +92,10 @@ impl MvRefreshPublicationBase {
         &self.table_object_id
     }
 
+    #[expect(
+        clippy::wrong_self_convention,
+        reason = "The persisted refresh-publication accessor retains the established from-snapshot terminology."
+    )]
     pub(crate) const fn from_snapshot(&self) -> Option<i64> {
         self.from_snapshot
     }
@@ -303,6 +307,10 @@ pub(crate) struct MvFirstRefreshLogicalContext {
     pub(crate) previous_snapshot_ids: BTreeMap<String, i64>,
     pub(crate) previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     pub(crate) target_table_uuid: String,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged MV execution assembly and recovery wiring."
+    )]
     pub(crate) affected_partitions: crate::mv::domain::model::AffectedTargetPartitions,
     /// Base-table materializations admitted while the first-refresh artifact
     /// was prepared.  The overlays retain their exact control leases, files,
@@ -338,6 +346,10 @@ impl MvFirstRefreshLogicalArtifact {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "First-refresh artifacts preserve their direct typed payloads across assembly stages."
+)]
 pub(crate) enum MvFirstRefreshExecutionArtifact {
     Sql(SqlMvFirstRefreshArtifact),
     Logical(MvFirstRefreshLogicalArtifact),
@@ -526,6 +538,10 @@ impl PreparedMvFirstRefreshWrite {
         self
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged MV execution assembly and recovery wiring."
+    )]
     pub(crate) fn with_publication_intent(
         mut self,
         publication_intent: MvRefreshPublicationIntent,
@@ -559,6 +575,10 @@ impl MvFirstRefreshWritePreparer {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged MV execution assembly and recovery wiring."
+    )]
     pub(crate) fn prepare_full_overwrite(
         request: MvFirstRefreshWriteRequest,
         artifact: SqlMvFirstRefreshArtifact,
@@ -673,65 +693,6 @@ impl MvIncrementalWriteRequest {
     }
 }
 
-#[cfg(test)]
-mod incremental_tests {
-    use super::*;
-
-    #[test]
-    fn publication_intent_rejects_duplicate_base_identity() {
-        let base = MvRefreshPublicationBase::try_new(
-            "ice.db.base".to_string(),
-            ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"base-object-1"))
-                .expect("valid test object ID"),
-            None,
-            7,
-        )
-        .expect("base");
-        let error = MvRefreshPublicationIntent::try_new(
-            1,
-            2,
-            "token".to_string(),
-            MvRefreshPublicationTechnique::Full,
-            vec![base.clone(), base],
-            "fingerprint".to_string(),
-            "ice".to_string(),
-            "db".to_string(),
-            "mv".to_string(),
-            "__nova_mv_1".to_string(),
-        )
-        .expect_err("duplicate base must fail");
-        assert_eq!(
-            error,
-            "MV refresh publication intent has duplicate base identity"
-        );
-    }
-
-    #[test]
-    fn sqlx2_mv_incremental_request_rejects_missing_staging_identity() {
-        let result = MvIncrementalWriteRequest::try_new(
-            "ice".to_string(),
-            "db".to_string(),
-            "mv".to_string(),
-            String::new(),
-            Some("ice".to_string()),
-            "db".to_string(),
-            Some(7),
-            ConnectorExecutionBindingKey {
-                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("ice")
-                    .expect("instance"),
-                incarnation: novarocks_spi::connector::ConnectorInstanceIncarnation::from_bytes(
-                    [1; 16],
-                ),
-            },
-            ConnectorWriteOperationId::from_bytes([2; 16]),
-        );
-        match result {
-            Err(error) => assert_eq!(error, "invalid MV incremental write request identity"),
-            Ok(_) => panic!("missing staging branch must fail"),
-        }
-    }
-}
-
 /// Opaque incremental artifact owned by the application staging lifecycle.
 pub struct PreparedMvIncrementalWrite {
     request: MvIncrementalWriteRequest,
@@ -810,5 +771,64 @@ impl MvIncrementalWritePreparer {
             execution_artifact,
             publication_intent,
         })
+    }
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+
+    #[test]
+    fn publication_intent_rejects_duplicate_base_identity() {
+        let base = MvRefreshPublicationBase::try_new(
+            "ice.db.base".to_string(),
+            ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"base-object-1"))
+                .expect("valid test object ID"),
+            None,
+            7,
+        )
+        .expect("base");
+        let error = MvRefreshPublicationIntent::try_new(
+            1,
+            2,
+            "token".to_string(),
+            MvRefreshPublicationTechnique::Full,
+            vec![base.clone(), base],
+            "fingerprint".to_string(),
+            "ice".to_string(),
+            "db".to_string(),
+            "mv".to_string(),
+            "__nova_mv_1".to_string(),
+        )
+        .expect_err("duplicate base must fail");
+        assert_eq!(
+            error,
+            "MV refresh publication intent has duplicate base identity"
+        );
+    }
+
+    #[test]
+    fn sqlx2_mv_incremental_request_rejects_missing_staging_identity() {
+        let result = MvIncrementalWriteRequest::try_new(
+            "ice".to_string(),
+            "db".to_string(),
+            "mv".to_string(),
+            String::new(),
+            Some("ice".to_string()),
+            "db".to_string(),
+            Some(7),
+            ConnectorExecutionBindingKey {
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("ice")
+                    .expect("instance"),
+                incarnation: novarocks_spi::connector::ConnectorInstanceIncarnation::from_bytes(
+                    [1; 16],
+                ),
+            },
+            ConnectorWriteOperationId::from_bytes([2; 16]),
+        );
+        match result {
+            Err(error) => assert_eq!(error, "invalid MV incremental write request identity"),
+            Ok(_) => panic!("missing staging branch must fail"),
+        }
     }
 }

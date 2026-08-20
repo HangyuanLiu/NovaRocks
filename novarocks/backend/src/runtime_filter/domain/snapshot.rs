@@ -25,6 +25,10 @@ use novarocks_execution::runtime_filter::{
 use super::{BackendInstallPolicy, BackendInstallPolicyError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) enum BackendLogicalSnapshotError {
     InvalidContribution(BackendInstallPolicyError),
     VersionRegression,
@@ -45,12 +49,20 @@ impl std::error::Error for BackendLogicalSnapshotError {}
 /// artifact: later materialization turns this strict decoded contribution into
 /// a separate retained artifact for an Execution snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) struct BackendLogicalSnapshot {
     logical_version: LogicalVersion,
     contribution: Arc<contribution::RuntimeFilterContribution>,
 }
 
 impl BackendLogicalSnapshot {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn new(
         policy: &BackendInstallPolicy,
         logical_version: LogicalVersion,
@@ -65,6 +77,10 @@ impl BackendLogicalSnapshot {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn next_after(
         previous: &Self,
         policy: &BackendInstallPolicy,
@@ -77,10 +93,18 @@ impl BackendLogicalSnapshot {
         Self::new(policy, logical_version, contribution)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn logical_version(&self) -> LogicalVersion {
         self.logical_version
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn contribution(&self) -> &Arc<contribution::RuntimeFilterContribution> {
         &self.contribution
     }

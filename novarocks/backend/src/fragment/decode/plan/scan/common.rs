@@ -33,6 +33,10 @@ use novarocks_protocol::{common, plan};
 use novarocks_types::SlotId;
 
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(super) struct ProvenancedOutputColumn {
     column: common::OutputColumn,
     source_path: FieldPath,
@@ -41,6 +45,10 @@ pub(super) struct ProvenancedOutputColumn {
     slot_schema: ChunkSlotSchema,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 impl ProvenancedOutputColumn {
     pub(super) fn decode(
         column: common::OutputColumn,
@@ -111,6 +119,10 @@ impl ProvenancedOutputColumn {
 }
 
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(super) struct DecodedScanOutputColumns {
     columns: Vec<common::OutputColumn>,
     provenanced: Vec<ProvenancedOutputColumn>,
@@ -118,6 +130,10 @@ pub(super) struct DecodedScanOutputColumns {
     output_schema: ChunkSchemaRef,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 impl DecodedScanOutputColumns {
     pub(super) fn columns(&self) -> &[common::OutputColumn] {
         &self.columns
@@ -250,6 +266,10 @@ pub(super) fn output_column_data_type(
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(super) fn scan_batch_size(
     query_options: Option<&novarocks_execution::runtime::query_options::QueryOptions>,
 ) -> Result<usize, NativeFragmentLeafDecodeError> {
@@ -321,6 +341,10 @@ pub(super) fn parse_scan_limit(limit: i64) -> Result<Option<usize>, NativeFragme
 /// Loads the object-store configuration that was installed on this BE at
 /// startup. Native fragment payloads must not carry credentials or endpoint
 /// configuration because every BE receives the same deployment configuration.
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(super) fn reject_native_connector_cloud_properties(
     cloud_properties: &HashMap<String, String>,
 ) -> Result<(), NativeFragmentLeafDecodeError> {
@@ -335,6 +359,10 @@ pub(super) fn reject_native_connector_cloud_properties(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(super) fn table_location_map(table: &plan::IcebergTableInfo) -> HashMap<i64, String> {
     let mut locations = HashMap::new();
     if !table.location.is_empty() {

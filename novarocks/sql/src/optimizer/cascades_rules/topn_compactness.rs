@@ -743,7 +743,7 @@ mod tests {
     use crate::planner::optimizer_bridge::scalar::{
         intern_exprs, intern_project_items, intern_sort_items, materialize_sort_key,
     };
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
 
     fn col(id: u32) -> TypedExpr {

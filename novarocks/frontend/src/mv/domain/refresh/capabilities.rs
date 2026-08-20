@@ -24,6 +24,10 @@ use crate::mv::domain::refresh::snapshot::BaseSnapshotPolicy;
 /// What a NotDerivable partition derivation outcome means for the refresh.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PartitionPruningPolicy {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     Required,
     BestEffort,
 }
@@ -40,12 +44,12 @@ pub(crate) enum RefreshIdentity {
 /// Refresh-time capabilities reconstructed from a persisted MV schema contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefreshCapabilities {
-    pub snapshot_policy: BaseSnapshotPolicy,
+    pub(crate) snapshot_policy: BaseSnapshotPolicy,
     pub has_agg_state: bool,
-    pub identity: RefreshIdentity,
+    pub(crate) identity: RefreshIdentity,
     pub apply_key_column: String,
-    pub apply_key_value_type: ApplyKeyValueType,
-    pub partition_pruning: PartitionPruningPolicy,
+    pub(crate) apply_key_value_type: ApplyKeyValueType,
+    pub(crate) partition_pruning: PartitionPruningPolicy,
 }
 
 impl RefreshCapabilities {

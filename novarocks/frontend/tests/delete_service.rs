@@ -191,11 +191,19 @@ impl DeleteEngine for FakeDeleteEngine {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for delete-service journal fixture coverage."
+)]
 #[derive(Default)]
 struct FakeJournal {
     operations: Mutex<BTreeMap<Uuid, StoredOperation>>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for delete-service journal fixture inspection."
+)]
 impl FakeJournal {
     fn states(&self) -> Vec<OperationState> {
         self.operations

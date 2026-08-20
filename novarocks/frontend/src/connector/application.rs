@@ -138,6 +138,10 @@ pub fn test_request_context() -> ConnectorRequestContext {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::items_after_test_module,
+    reason = "The request-context tests remain adjacent to their test-only factory."
+)]
 mod request_context_tests {
     use std::time::{Duration, Instant};
 

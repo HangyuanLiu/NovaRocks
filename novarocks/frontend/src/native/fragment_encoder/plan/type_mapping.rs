@@ -387,6 +387,10 @@ pub(super) fn usize_to_u64(value: usize) -> u64 {
     value as u64
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 fn usize_to_u32(value: usize) -> Result<u32, String> {
     u32::try_from(value).map_err(|_| format!("value {value} does not fit in u32"))
 }

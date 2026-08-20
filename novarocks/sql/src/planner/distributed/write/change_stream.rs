@@ -104,6 +104,10 @@ pub(crate) struct SqlChangeStreamWriterRoute {
     pub(crate) cohort_id: ConnectorWriteCohortId,
     pub(crate) accepted_effects: Vec<ConnectorRowMutationEffect>,
     pub(crate) writer_fragment_id: FragmentId,
+    #[allow(
+        dead_code,
+        reason = "The writer sink is preserved for downstream write-route materialization."
+    )]
     pub(crate) sink: SqlWritePlanInput,
 }
 

@@ -51,6 +51,10 @@ impl<'a> NativeFragmentEncodingView<'a> {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "The unsealed encoding view remains available for contract-level native fragment tests."
+    )]
     pub(crate) fn unsealed(plan: &'a DistributedPlan, prepared: &'a PreparedFragmentSet) -> Self {
         Self {
             plan,
@@ -67,6 +71,10 @@ impl<'a> NativeFragmentEncodingView<'a> {
         NativeScanFactsView::new(self.prepared.scan_bindings())
     }
 
+    #[allow(
+        dead_code,
+        reason = "The prepared fragment view remains available for contract-level native encoding tests."
+    )]
     pub(crate) fn prepared(&self) -> &PreparedFragmentSet {
         self.prepared
     }
@@ -136,6 +144,10 @@ impl NativeFragmentAttachment {
         self.by_fragment.get(&fragment_id)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Consuming fragments remains available for contract-level native attachment tests."
+    )]
     pub(crate) fn into_fragments(self) -> btree_map::IntoIter<FragmentId, NativePlanFragment> {
         self.by_fragment.into_iter()
     }
@@ -181,6 +193,10 @@ impl NativeFragmentAttachment {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Contract-test fixture constructs native attachments without exposing a production constructor."
+)]
 pub(crate) fn native_fragment_attachment_for_contract_test(
     fragments: Vec<NativePlanFragment>,
 ) -> Result<NativeFragmentAttachment, String> {

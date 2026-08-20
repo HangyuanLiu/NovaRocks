@@ -66,6 +66,10 @@ pub(crate) struct Winner {
 }
 
 impl Winner {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
+    )]
     pub(crate) fn new(
         group_id: GroupId,
         expr_index: usize,
@@ -98,6 +102,10 @@ impl Winner {
     }
 
     #[cfg(test)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
+    )]
     pub(crate) fn from_legacy_total(
         group_id: GroupId,
         expr_index: usize,
@@ -271,22 +279,21 @@ impl SearchContext {
                     continue;
                 }
 
-                if alt.kind == PropertyAlternativeKind::BroadcastJoin {
-                    if let (Some(&probe_group_id), Some(&build_group_id)) =
+                if alt.kind == PropertyAlternativeKind::BroadcastJoin
+                    && let (Some(&probe_group_id), Some(&build_group_id)) =
                         (expr.children.first(), expr.children.get(1))
-                    {
-                        let probe_stats =
-                            stats_for_group(&memo.groups[probe_group_id], memo, &self.stats_input);
-                        let build_stats =
-                            stats_for_group(&memo.groups[build_group_id], memo, &self.stats_input);
-                        let feas = super::cost::broadcast_is_feasible(
-                            &probe_stats,
-                            &build_stats,
-                            &self.cost_options,
-                        );
-                        if !feasibility_is_advisory && !feas.feasible {
-                            continue;
-                        }
+                {
+                    let probe_stats =
+                        stats_for_group(&memo.groups[probe_group_id], memo, &self.stats_input);
+                    let build_stats =
+                        stats_for_group(&memo.groups[build_group_id], memo, &self.stats_input);
+                    let feas = super::cost::broadcast_is_feasible(
+                        &probe_stats,
+                        &build_stats,
+                        &self.cost_options,
+                    );
+                    if !feasibility_is_advisory && !feas.feasible {
+                        continue;
                     }
                 }
 
@@ -461,10 +468,7 @@ pub(crate) fn cost_estimate_for_total(
             }
 
             let dimension_cost = requested_total / weight;
-            if !dimension_cost.is_finite()
-                || dimension_cost < 0.0
-                || dimension_cost > MAX_FINITE_COST
-            {
+            if !dimension_cost.is_finite() || !(0.0..=MAX_FINITE_COST).contains(&dimension_cost) {
                 continue;
             }
 
@@ -1230,7 +1234,7 @@ mod tests {
 
     #[test]
     fn winner_records_hash_join_alternative_and_child_properties() {
-        let (mut memo, root) = make_two_table_inner_join_memo_for_test();
+        let (memo, root) = make_two_table_inner_join_memo_for_test();
         let mut ctx = SearchContext::new_for_test(empty_stats_input());
         let required = PhysicalPropertySet::gather();
         ctx.optimize_group(&memo, root, &required).expect("search");
@@ -1455,6 +1459,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn search_broadcast_feasibility_uses_context_cost_options() {
         let (mut memo, root) = make_two_table_inner_join_memo_for_test();
         let (probe_group, build_group) = inner_join_child_groups_for_test(&memo, root);
@@ -1512,6 +1520,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn search_prunes_broadcast_when_hash_table_exceeds_node_budget() {
         let (mut memo, root) = make_two_table_inner_join_memo_for_test();
         let (probe_group, build_group) = inner_join_child_groups_for_test(&memo, root);

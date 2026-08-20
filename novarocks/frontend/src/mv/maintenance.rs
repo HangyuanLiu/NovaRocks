@@ -161,10 +161,18 @@ pub(crate) struct MaintenanceAttempt {
 }
 
 impl MaintenanceAttempt {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn target(&self) -> &MaintenanceTarget {
         &self.target
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn evaluation(&self) -> &MaintenanceEvaluation {
         &self.evaluation
     }
@@ -175,6 +183,10 @@ pub(crate) enum MaintenanceAdmission {
     Disabled,
     AtCapacity,
     AlreadyActive,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     Admitted,
 }
 
@@ -190,6 +202,10 @@ pub(crate) struct MaintenanceExecutionReport {
 }
 
 impl MaintenanceExecutionReport {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn is_noop(&self) -> bool {
         self.evaluation.actions.is_empty()
     }
@@ -246,6 +262,10 @@ impl MaintenanceCoordinator {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn config(&self) -> &MaintenanceCoordinatorConfig {
         &self.config
     }
@@ -385,6 +405,10 @@ impl MaintenanceCoordinator {
 
     /// End a pre-dispatch or shutdown-cancelled attempt without converting it
     /// into success, a metadata observation, or an ordinary retry.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn cancel_attempt(&mut self, attempt: MaintenanceAttempt) {
         self.active.remove(&attempt.mv_id);
     }

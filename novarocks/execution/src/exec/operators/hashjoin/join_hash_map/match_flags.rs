@@ -21,6 +21,10 @@ pub(crate) struct BuildMatchFlags {
     flags: Vec<bool>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Match-flag inspection helpers are retained for outer-join regression coverage."
+)]
 impl BuildMatchFlags {
     pub(crate) fn new(row_count: usize) -> Self {
         Self {
@@ -50,9 +54,8 @@ impl BuildMatchFlags {
         self.flags
             .iter()
             .enumerate()
-            .filter_map(|(row, matched)| {
-                matched.then(|| u32::try_from(row).expect("join build row id exceeds u32"))
-            })
+            .filter(|&(_row, matched)| *matched)
+            .map(|(row, _matched)| u32::try_from(row).expect("join build row id exceeds u32"))
             .collect()
     }
 
@@ -60,9 +63,8 @@ impl BuildMatchFlags {
         self.flags
             .iter()
             .enumerate()
-            .filter_map(|(row, matched)| {
-                (!matched).then(|| u32::try_from(row).expect("join build row id exceeds u32"))
-            })
+            .filter(|&(_row, matched)| !matched)
+            .map(|(row, _matched)| u32::try_from(row).expect("join build row id exceeds u32"))
             .collect()
     }
 

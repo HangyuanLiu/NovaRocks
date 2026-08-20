@@ -3567,7 +3567,7 @@ fn collect_column_outer_status(
             *saw_column = true;
             let in_inner = inner_scope.contains_column_id(*column_id);
             let in_outer = outer_scope.contains_column_id(*column_id);
-            if !(in_outer && !in_inner) {
+            if !in_outer || in_inner {
                 *all_outer_only = false;
             }
         }

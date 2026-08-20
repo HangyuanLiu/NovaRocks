@@ -33,6 +33,10 @@ impl MvStorageEngine {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn backend_name(self) -> &'static str {
         match self {
             Self::StarRocks => "starrocks",
@@ -63,6 +67,10 @@ pub(crate) enum RefreshMode {
     Noop,
     Full,
     Incremental,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     Rebuild,
 }
 
@@ -77,6 +85,10 @@ impl MvPartitionKey {
         Self { spec_id, fields }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn canonical_string(&self) -> String {
         let mut out = format!("spec={}", self.spec_id);
         for field in &self.fields {
@@ -95,6 +107,10 @@ impl MvPartitionKey {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn encode_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -137,12 +153,20 @@ pub(crate) enum MvPartitionValue {
 /// this set". The empty allow-list is a legitimate state (no partition is
 /// affected); callers MUST NOT silently treat it as "no filter".
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) enum TargetPartitionFilter {
     None,
     AllowList(BTreeSet<MvPartitionKey>),
 }
 
 impl TargetPartitionFilter {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn matches(&self, key: &MvPartitionKey) -> bool {
         match self {
             Self::None => true,
@@ -150,6 +174,10 @@ impl TargetPartitionFilter {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn allow_list_len(&self) -> Option<usize> {
         match self {
             Self::None => None,
@@ -157,6 +185,10 @@ impl TargetPartitionFilter {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn is_allow_list(&self) -> bool {
         matches!(self, Self::AllowList(_))
     }
@@ -172,7 +204,7 @@ impl std::fmt::Display for TargetPartitionFilter {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AffectedTargetPartitions {
+pub(crate) enum AffectedTargetPartitions {
     Unpartitioned,
     Known {
         partitions: BTreeSet<MvPartitionKey>,
@@ -195,6 +227,10 @@ impl AffectedTargetPartitions {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn not_derived_reason(&self) -> Option<&str> {
         match self {
             Self::NotDerived { reason } => Some(reason.as_str()),
@@ -202,10 +238,18 @@ impl AffectedTargetPartitions {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn is_not_derived(&self) -> bool {
         matches!(self, Self::NotDerived { .. })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn partition_count(&self) -> usize {
         match self {
             Self::Unpartitioned | Self::NotDerived { .. } => 0,
@@ -219,6 +263,10 @@ impl AffectedTargetPartitions {
     /// never restrict the scan. The empty `Known` set legitimately produces an
     /// empty `AllowList` (nothing affected), which the locator honors by
     /// scanning zero files.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn to_target_partition_filter(&self) -> TargetPartitionFilter {
         match self {
             Self::Known { partitions } => TargetPartitionFilter::AllowList(partitions.clone()),
@@ -231,6 +279,10 @@ impl AffectedTargetPartitions {
 ///
 /// Cardinality contract: one opaque `Single` state per aggregate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) enum AggregateStateRole {
     /// Single opaque VARBINARY state column.
     Single,

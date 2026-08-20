@@ -121,6 +121,10 @@ impl BackendRoutingEdge {
         self.id
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn source(&self) -> &BackendRouteEndpoint {
         &self.source
     }
@@ -156,6 +160,10 @@ impl BackendRemoteRoute {
         self.edge_id
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn participant_id(&self) -> u32 {
         self.participant_id
     }
@@ -164,6 +172,10 @@ impl BackendRemoteRoute {
         &self.endpoint
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn target_role(&self) -> BackendRouteRole {
         self.target_role
     }
@@ -224,10 +236,10 @@ impl BackendRoutingChannel {
             if !outbound_ids.insert(edge.id()) {
                 return Err(BackendRoutingError::DuplicateRouteEdge(edge.id()));
             }
-            if let Some(inbound) = inbound_by_id.get(&edge.id()) {
-                if *inbound != edge || !edge.is_loopback_self() {
-                    return Err(BackendRoutingError::DuplicateRouteEdge(edge.id()));
-                }
+            if let Some(inbound) = inbound_by_id.get(&edge.id())
+                && (*inbound != edge || !edge.is_loopback_self())
+            {
+                return Err(BackendRoutingError::DuplicateRouteEdge(edge.id()));
             }
         }
         let mut participants = BTreeMap::new();
@@ -287,10 +299,18 @@ impl BackendRoutingShard {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn participant(&self) -> BackendParticipantIdentity {
         self.participant
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn local_participant_id(&self) -> u32 {
         self.local_participant_id
     }

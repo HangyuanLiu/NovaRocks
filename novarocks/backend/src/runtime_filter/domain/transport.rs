@@ -26,7 +26,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use novarocks_execution::runtime_filter::{PartitionId, RuntimeFilterBindingId};
+use novarocks_execution::runtime_filter::RuntimeFilterBindingId;
 use novarocks_types::UniqueId;
 
 use super::{
@@ -53,14 +53,26 @@ pub(crate) enum BackendEnvelopeKind {
 }
 
 impl BackendEnvelopeKind {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     const fn requires_producer_open(self) -> bool {
         matches!(self, Self::Contribution | Self::ProducerClosed)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     const fn requires_accept_status(self) -> bool {
         matches!(self, Self::Ack)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     const fn requires_payload(self) -> bool {
         matches!(
             self,
@@ -88,6 +100,10 @@ pub(crate) struct BackendContributionRouteIdentity {
 }
 
 impl BackendContributionRouteIdentity {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn new(
         stream: BackendProducerStreamIdentity,
         sequence: BackendTransportSequence,
@@ -95,10 +111,18 @@ impl BackendContributionRouteIdentity {
         Self { stream, sequence }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn stream(self) -> BackendProducerStreamIdentity {
         self.stream
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn sequence(self) -> BackendTransportSequence {
         self.sequence
     }
@@ -132,12 +156,20 @@ impl BackendDeliveryRouteIdentity {
         self.route_edge_id
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn sequence(self) -> BackendTransportSequence {
         self.sequence
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) struct BackendProducerInstanceRouteIdentity {
     channel: BackendChannelIdentity,
     producer_binding_id: RuntimeFilterBindingId,
@@ -145,6 +177,10 @@ pub(crate) struct BackendProducerInstanceRouteIdentity {
 }
 
 impl BackendProducerInstanceRouteIdentity {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn new(
         channel: BackendChannelIdentity,
         producer_binding_id: RuntimeFilterBindingId,
@@ -157,20 +193,36 @@ impl BackendProducerInstanceRouteIdentity {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn channel(self) -> BackendChannelIdentity {
         self.channel
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn producer_binding_id(self) -> RuntimeFilterBindingId {
         self.producer_binding_id
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn fragment_instance_id(self) -> UniqueId {
         self.fragment_instance_id
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) enum BackendRouteIdentity {
     Contribution(BackendContributionRouteIdentity),
     Delivery(BackendDeliveryRouteIdentity),
@@ -198,18 +250,62 @@ impl BackendProducerOpenMetadata {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BackendTransportError {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     ZeroRouteIdentity,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     IdentityKindMismatch(BackendEnvelopeKind),
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     PayloadRequired(BackendEnvelopeKind),
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     PayloadForbidden(BackendEnvelopeKind),
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     ProducerOpenRequired(BackendEnvelopeKind),
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     ProducerOpenForbidden(BackendEnvelopeKind),
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     AcceptStatusRequired(BackendEnvelopeKind),
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     AcceptStatusForbidden(BackendEnvelopeKind),
     ZeroLocalPartitionCount,
     EmptyRejectionReason,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     ZeroRpcDeadline,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     IdentityConflict,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     RetiredIdentity,
 }
 
@@ -227,6 +323,10 @@ impl std::error::Error for BackendTransportError {}
 /// Immutable Backend envelope. Payload bytes remain opaque here so the
 /// transport cannot interpret canonical contribution or artifact content.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) struct BackendRuntimeFilterEnvelope {
     kind: BackendEnvelopeKind,
     channel: BackendChannelIdentity,
@@ -238,6 +338,10 @@ pub(crate) struct BackendRuntimeFilterEnvelope {
 }
 
 impl BackendRuntimeFilterEnvelope {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn new(
         kind: BackendEnvelopeKind,
         channel: BackendChannelIdentity,
@@ -278,39 +382,75 @@ impl BackendRuntimeFilterEnvelope {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn kind(&self) -> BackendEnvelopeKind {
         self.kind
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn channel(&self) -> BackendChannelIdentity {
         self.channel
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn route_identity(&self) -> BackendRouteIdentity {
         self.route_identity
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn producer_open(&self) -> Option<BackendProducerOpenMetadata> {
         self.producer_open
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn accept_status(&self) -> Option<BackendAcceptStatus> {
         self.accept_status
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn schema_digest(&self) -> [u8; 32] {
         self.schema_digest
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn payload(&self) -> &Arc<[u8]> {
         &self.payload
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(self.payload.len())
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 fn validate_route(
     kind: BackendEnvelopeKind,
     route: BackendRouteIdentity,
@@ -336,6 +476,10 @@ fn validate_route(
         .ok_or(BackendTransportError::IdentityKindMismatch(kind))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 fn validate_presence(
     required: bool,
     present: bool,
@@ -393,12 +537,20 @@ impl BackendIngressResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) struct BackendTransportEnvelope {
     envelope: Arc<BackendRuntimeFilterEnvelope>,
     rpc_deadline: Duration,
 }
 
 impl BackendTransportEnvelope {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn new(
         envelope: Arc<BackendRuntimeFilterEnvelope>,
         rpc_deadline: Duration,
@@ -412,16 +564,28 @@ impl BackendTransportEnvelope {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn envelope(&self) -> &Arc<BackendRuntimeFilterEnvelope> {
         &self.envelope
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn rpc_deadline(&self) -> Duration {
         self.rpc_deadline
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) struct BackendRetryPolicy {
     retry_interval: Duration,
     max_attempts: u32,
@@ -431,6 +595,10 @@ pub(crate) struct BackendRetryPolicy {
 }
 
 impl BackendRetryPolicy {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn new(
         retry_interval: Duration,
         max_attempts: u32,
@@ -474,12 +642,20 @@ impl ReliableTransportPolicy for BackendRetryPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) enum BackendTransportResourceLimit {
     PendingEntries,
     PendingBytes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) enum BackendRetrySendOutcome {
     Buffered,
     ResourceLimit(BackendTransportResourceLimit),
@@ -488,6 +664,10 @@ pub(crate) enum BackendRetrySendOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) enum BackendAckOutcome {
     Released,
     ReleasedOnDuplicate,
@@ -503,16 +683,28 @@ pub(crate) enum BackendTransportFailOpenReason {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) struct BackendRetryTick {
     retried: Vec<Arc<BackendTransportEnvelope>>,
     failed_open: Vec<(BackendRouteIdentity, BackendTransportFailOpenReason)>,
 }
 
 impl BackendRetryTick {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn retried(&self) -> &[Arc<BackendTransportEnvelope>] {
         &self.retried
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn failed_open(&self) -> &[(BackendRouteIdentity, BackendTransportFailOpenReason)] {
         &self.failed_open
     }
@@ -520,6 +712,10 @@ impl BackendRetryTick {
 
 /// Bounded sender-side retry state. It is deliberately driven by the Service's
 /// query tick; this type starts no background task and does not perform I/O.
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) struct BackendReliableTransport {
     state: ReliableTransportState<
         BackendRouteIdentity,
@@ -529,12 +725,20 @@ pub(crate) struct BackendReliableTransport {
 }
 
 impl BackendReliableTransport {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn new(policy: BackendRetryPolicy) -> Self {
         Self {
             state: ReliableTransportState::new(policy),
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn send(
         &mut self,
         frame: Arc<BackendTransportEnvelope>,
@@ -565,6 +769,10 @@ impl BackendReliableTransport {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn acknowledge(
         &mut self,
         key: BackendRouteIdentity,
@@ -580,6 +788,10 @@ impl BackendReliableTransport {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn drive(&mut self, now: Instant) -> BackendRetryTick {
         // The legacy domain owner has no per-attempt I/O callback. Its query
         // tick therefore treats every unacknowledged frame as retry-eligible;
@@ -612,6 +824,10 @@ impl BackendReliableTransport {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn shutdown(&mut self) {
         self.state.shutdown();
     }

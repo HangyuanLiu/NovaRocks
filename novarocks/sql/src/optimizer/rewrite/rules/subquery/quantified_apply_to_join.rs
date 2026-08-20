@@ -167,7 +167,7 @@ fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>,
 #[cfg(test)]
 mod tests {
     use crate::planner::logical::*;
-    use crate::planner::payload::*;
+
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::rc::Rc;
@@ -188,7 +188,7 @@ mod tests {
     use crate::planner::logical::{LogicalApplyNode, LogicalJoinNode, LogicalPlanKind};
     use crate::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
 
     const OUTER_A: ColumnId = ColumnId(1);
     const OUTER_K: ColumnId = ColumnId(2);
@@ -233,7 +233,7 @@ mod tests {
                 database: "default".to_string(),
                 table: table_def(table),
                 alias: None,
-                columns: columns,
+                columns,
                 predicates: vec![],
                 required_columns: None,
                 variant_columns: vec![],
@@ -319,7 +319,7 @@ mod tests {
 
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
-                items: items,
+                items,
                 output_qualifier: None,
             }),
             vec![LogicalPlanNode::new(

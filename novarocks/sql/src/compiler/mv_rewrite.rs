@@ -1195,9 +1195,17 @@ pub(crate) struct SqlImvRewriteSnapshot {
     /// target-locator scan produced by the rewrite carries this token, so
     /// preparation cannot silently reacquire a newer target generation.
     pub(crate) target_binding: SqlTableBindingId,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) mv_id: i64,
     pub(crate) base_snapshots: Arc<[SqlImvBaseSnapshot]>,
     pub(crate) previous_snapshot_ids: BTreeMap<String, i64>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     pub(crate) target_snapshot_id: Option<i64>,
     pub(crate) target_table_uuid: String,
@@ -1279,6 +1287,10 @@ impl SqlImvRewriteSnapshot {
             })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) fn base_snapshot_for_identity(
         &self,
         table: &novarocks_catalog::identifier::TableIdentity,
@@ -1377,6 +1389,10 @@ pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[allow(
+    dead_code,
+    reason = "The snapshot-handle fixture remains available to focused SQL MV rewrite tests."
+)]
 pub(crate) fn test_incremental_snapshot_handle() -> SqlImvRewriteSnapshotHandle {
     SqlImvRewriteSnapshotHandle(test_incremental_snapshot())
 }
@@ -1385,6 +1401,10 @@ pub(crate) fn test_incremental_snapshot_handle() -> SqlImvRewriteSnapshotHandle 
 /// same tokenized scan vocabulary as production compiler artifacts; connector
 /// table metadata belongs to application-owned preparation tests.
 #[cfg(any(test, feature = "test-support"))]
+#[allow(
+    dead_code,
+    reason = "The generic tokenized scan fixture remains available to focused SQL MV rewrite tests."
+)]
 pub(crate) fn test_scan_source(kind: crate::planner::table::SqlScanKind) -> ScanSource {
     test_scan_source_for("ice", "db", "b", kind)
 }
@@ -1393,6 +1413,10 @@ pub(crate) fn test_scan_source(kind: crate::planner::table::SqlScanKind) -> Scan
 /// comparing physical table identity must not collapse unrelated tables into
 /// the shared default fixture identity.
 #[cfg(any(test, feature = "test-support"))]
+#[allow(
+    dead_code,
+    reason = "The explicit-table scan fixture remains available to physical identity rewrite tests."
+)]
 pub(crate) fn test_scan_source_for(
     catalog: &str,
     namespace: &str,
@@ -1411,6 +1435,10 @@ pub(crate) fn test_scan_source_for(
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[allow(
+    dead_code,
+    reason = "The current-version scan fixture remains available to focused SQL MV rewrite tests."
+)]
 pub(crate) fn test_data_scan_source() -> ScanSource {
     test_scan_source(crate::planner::table::SqlScanKind::Data {
         version: crate::planner::table::SqlTableVersionSelector::Current,
@@ -1418,6 +1446,10 @@ pub(crate) fn test_data_scan_source() -> ScanSource {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[allow(
+    dead_code,
+    reason = "The named current-version scan fixture remains available to identity rewrite tests."
+)]
 pub(crate) fn test_data_scan_source_for(catalog: &str, namespace: &str, table: &str) -> ScanSource {
     test_scan_source_for(
         catalog,
@@ -1430,6 +1462,10 @@ pub(crate) fn test_data_scan_source_for(catalog: &str, namespace: &str, table: &
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[allow(
+    dead_code,
+    reason = "The delta scan fixture remains available to incremental SQL MV rewrite tests."
+)]
 pub(crate) fn test_delta_scan_source(from_snapshot_id: i64, to_snapshot_id: i64) -> ScanSource {
     test_scan_source(crate::planner::table::SqlScanKind::Delta {
         from_snapshot_id,
@@ -1440,6 +1476,10 @@ pub(crate) fn test_delta_scan_source(from_snapshot_id: i64, to_snapshot_id: i64)
 /// Build aggregate-refresh facts without persisted records or connector
 /// metadata. Rule tests vary these compiler-facing values directly.
 #[cfg(any(test, feature = "test-support"))]
+#[allow(
+    dead_code,
+    reason = "The aggregate snapshot fixture remains available to aggregate rewrite-rule tests."
+)]
 pub(crate) fn test_aggregate_snapshot(
     state_columns: Vec<SqlImvAggregateStateColumnContract>,
     partition: Option<SqlImvPartitionContract>,
@@ -2121,6 +2161,10 @@ pub(crate) struct MvRewriteDefinition {
     pub(crate) last_refresh_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     /// Per-base-table reads (including failures) captured while admission
     /// froze this definition. The map is keyed by canonical `cat.ns.tbl`.
+    #[expect(
+        private_interfaces,
+        reason = "The stable SQL shape intentionally carries a crate-private implementation detail."
+    )]
     pub(crate) base_table_states: BTreeMap<String, MvRewriteBaseTableState>,
 }
 
@@ -2154,6 +2198,10 @@ struct AnalyzedMvRewriteCandidate {
     factory_after_analysis: ColumnRefFactory,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The inline SQL plan payload avoids an allocation at the compiler handoff boundary."
+)]
 enum SqlMvRewriteAnalysisEntry {
     Candidate(AnalyzedMvRewriteCandidate),
     Diagnostic(SqlMvRewriteDiagnostic),
@@ -2178,6 +2226,10 @@ impl SqlMvRewriteAnalysis {
 /// descriptor construction and catalog materialization happen before the
 /// application freezes request-local statistics. Statistics attachment and
 /// warn-and-skip selection are deliberately deferred to the seal phase.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
+)]
 pub(crate) fn analyze_candidates(
     definitions: &MvRewriteDefinitionIndex,
     analyzer_catalog: &dyn PlannerTableProvider,
@@ -2398,10 +2450,9 @@ fn definition_is_fresh(definition: &MvRewriteDefinition) -> Result<bool, String>
 fn collect_iceberg_fqns(plan: &LogicalPlanNode, output: &mut Vec<String>) {
     if let crate::planner::logical::LogicalPlanKind::Scan(scan) = &plan.kind
         && let Some(fqn) = scan_fqn(&scan.table.source)
+        && !output.contains(&fqn)
     {
-        if !output.contains(&fqn) {
-            output.push(fqn);
-        }
+        output.push(fqn);
     }
     for child in &plan.children {
         collect_iceberg_fqns(child, output);
@@ -2418,7 +2469,6 @@ fn scan_fqn(source: &ScanSource) -> Option<String> {
             )),
             _ => None,
         },
-        _ => None,
     }
 }
 

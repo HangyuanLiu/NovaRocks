@@ -38,11 +38,19 @@ use novarocks_sql::planning::mv::{
 use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
 use novarocks_types::mv_aggregate_layout::MvAggregateStateRole;
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) struct AggregateStateRead {
     pub(crate) result: QueryResult,
     pub(crate) source_layout: SqlMvAggregatePhysicalLayout,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn prepare_aggregate_first_refresh_chunks<F>(
     select_sql: &str,
     calls: &AggregateSqlCalls,
@@ -66,6 +74,10 @@ where
     normalize_and_materialize_aggregate_read(read, calls, &target_layout, calls)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn read_aggregate_state<F>(
     select_sql: &str,
     calls: &AggregateSqlCalls,
@@ -94,6 +106,10 @@ where
 /// The returned SQL is still a pure planning artifact. It contains neither a
 /// result-materialization callback nor a connector-side effect, so callers can
 /// attach it directly to a distributed writer sink.
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn prepare_aggregate_first_refresh_state_sql(
     select_sql: &str,
     calls: &AggregateSqlCalls,
@@ -115,6 +131,10 @@ pub(crate) fn prepare_aggregate_first_refresh_state_sql(
 
 /// Return each pinned state-shaped branch of a branch-UNION aggregate first
 /// refresh. The caller owns the common physical projection and final UNION ALL.
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn prepare_branch_union_aggregate_first_refresh_state_sqls(
     select_sql: &str,
     branch_count: usize,
@@ -147,6 +167,10 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_state_sqls(
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn prepare_branch_union_aggregate_first_refresh_chunks<F>(
     select_sql: &str,
     branch_count: usize,
@@ -204,6 +228,10 @@ where
     Ok(prepared)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn branch_union_first_refresh_branch_queries(
     select_sql: &str,
     branch_count: usize,
@@ -230,6 +258,10 @@ fn branch_union_first_refresh_branch_queries(
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn flatten_branch_union_all_set_expr(
     body: &sqlparser::ast::SetExpr,
     out: &mut Vec<sqlparser::ast::SetExpr>,
@@ -265,6 +297,10 @@ fn flatten_branch_union_all_set_expr(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn append_branch_id_to_chunks(chunks: Vec<Chunk>, branch_id: i32) -> Result<Vec<Chunk>, String> {
     chunks
         .into_iter()
@@ -272,6 +308,10 @@ fn append_branch_id_to_chunks(chunks: Vec<Chunk>, branch_id: i32) -> Result<Vec<
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn append_branch_id_to_chunk(chunk: Chunk, branch_id: i32) -> Result<Chunk, String> {
     let mut fields = chunk
         .batch
@@ -301,6 +341,10 @@ fn append_branch_id_to_chunk(chunk: Chunk, branch_id: i32) -> Result<Chunk, Stri
     record_batch_to_chunk(batch)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn parse_stored_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
     let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)
         .map_err(|error| format!("stored MV SELECT normalize error: {error}"))?;
@@ -312,6 +356,10 @@ fn parse_stored_select_query(sql: &str) -> Result<sqlparser::ast::Query, String>
     Ok(*query)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn normalize_and_materialize_aggregate_read(
     mut read: AggregateStateRead,
     source_calls: &AggregateSqlCalls,
@@ -380,6 +428,10 @@ fn normalize_and_materialize_aggregate_read(
     materialize_aggregate_result_chunks(read.result.chunks, target_layout.runtime_layout())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn aggregate_state_source_result_column_names(
     layout: &SqlMvAggregatePhysicalLayout,
     calls: &AggregateSqlCalls,
@@ -396,6 +448,10 @@ fn aggregate_state_source_result_column_names(
     Ok(names)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn validate_aggregate_layout_compatibility(
     branch_index: usize,
     source_calls: &AggregateSqlCalls,
@@ -579,6 +635,10 @@ fn validate_aggregate_layout_compatibility(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn exact_name_permutation(
     actual_names: &[&str],
     expected_names: &[String],
@@ -615,6 +675,10 @@ fn exact_name_permutation(
     Ok(permutation)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn aggregate_state_result_column_names(
     layout: &SqlMvAggregatePhysicalLayout,
     calls: &AggregateSqlCalls,
@@ -669,6 +733,10 @@ fn aggregate_state_result_column_names(
     Ok(names)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn reorder_and_rename_chunk_columns(
     chunk: Chunk,
     names: &[String],

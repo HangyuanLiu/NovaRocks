@@ -47,6 +47,10 @@ impl DataPartition {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "The random partition constructor is retained for distributed-plan fixture construction."
+    )]
     pub(crate) fn random() -> Self {
         Self {
             kind: PartitionKind::Random,
@@ -82,6 +86,10 @@ impl DataPartition {
 }
 
 /// Planner-owned fragment sink intent lowered by codegen.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Connector write sinks stay inline in the sealed public fragment contract to avoid an allocation during native plan encoding."
+)]
 #[derive(Clone, Debug)]
 pub enum DataSink {
     Result,

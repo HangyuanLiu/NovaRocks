@@ -63,6 +63,10 @@ impl SchedulingPlan {
     }
 
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "Scheduling test helper preserves per-fragment placement assertions."
+    )]
     pub(crate) fn placements_for_fragment_for_test(
         &self,
         fragment_id: FragmentId,

@@ -168,13 +168,12 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<PlanRewriteResult, String> {
 #[cfg(test)]
 mod tests {
     use crate::planner::logical::*;
-    use crate::planner::payload::*;
 
     use arrow::datatypes::DataType;
 
     use super::*;
     use crate::analysis::{ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use novarocks_catalog::schema::ColumnDef;
     use std::cell::RefCell;
     use std::rc::Rc;

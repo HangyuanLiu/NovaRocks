@@ -70,14 +70,6 @@ impl TableIdentity {
                     table_uuid: None,
                 },
             },
-            // Compiler callers must not retain a provider carrier after
-            // application admission.  This fallback preserves the previous
-            // conservative identity behavior without reconstructing any
-            // connector facts from a legacy scan variant.
-            _ => TableIdentity::Connector {
-                database: scan.database.clone(),
-                table: scan.table.name.clone(),
-            },
         }
     }
 }
@@ -251,7 +243,7 @@ mod tests {
     use super::*;
     use crate::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::column_id::ColumnId;
-    use crate::optimizer::scalar::{self, ScalarArena};
+    use crate::optimizer::scalar::ScalarArena;
     use crate::planner::logical::{LogicalJoinNode, LogicalPlanKind, LogicalPlanNode};
     use crate::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::planner::payload::PlanScanNode;

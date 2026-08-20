@@ -1455,7 +1455,7 @@ fn group_by_alias_expression_projects_aggregate_group_key() {
     )
     .expect("planner should succeed");
 
-    let LogicalPlanKind::Sort(sort) = &plan.kind else {
+    let LogicalPlanKind::Sort(_sort) = &plan.kind else {
         panic!("expected Sort root");
     };
     let LogicalPlanKind::Project(project) = &plan.unary_input().kind else {
@@ -1906,7 +1906,7 @@ fn sort_only_expression_extra_uses_traceable_output_column_id() {
     )
     .expect("planner should succeed");
 
-    let outer_proj = match &plan.kind {
+    let _outer_proj = match &plan.kind {
         LogicalPlanKind::Project(p) => p,
         other => panic!("expected outer strip Project, got {other:?}"),
     };
@@ -1983,7 +1983,7 @@ fn p2_order_by_select_alias_extra_path_preserves_inner_output_id() {
     let plan = parse_analyze_and_plan("SELECT o_orderkey AS x FROM orders ORDER BY x, o_custkey")
         .expect("planner should succeed");
 
-    let outer_proj = match &plan.kind {
+    let _outer_proj = match &plan.kind {
         LogicalPlanKind::Project(p) => p,
         other => panic!("expected outer strip Project, got {other:?}"),
     };
@@ -2226,9 +2226,7 @@ fn sqlx2_delta_relation_projects_token_bound_sql_scan_source() {
     let LogicalPlanKind::Scan(scan) = &plan.unary_input().kind else {
         panic!("expected Scan under Project, got {:?}", plan.unary_input());
     };
-    let ScanSource::Sql(source) = &scan.table.source else {
-        panic!("delta scan must not retain an Iceberg provider source");
-    };
+    let ScanSource::Sql(source) = &scan.table.source;
     assert_eq!(source.table.catalog, "cat");
     assert_eq!(source.table.namespace, "ns");
     assert_eq!(source.table.table, "iv_orders");
@@ -2246,7 +2244,7 @@ fn p2_rollup_materialized_key_has_real_id() {
     let plan = parse_analyze_and_plan("SELECT a + 1 AS k FROM t GROUP BY ROLLUP(a + 1)")
         .expect("planner should succeed");
     let (_project, aggregate) = root_project_over_aggregate(&plan);
-    let (repeat_plan, repeat) = first_repeat_node(&plan);
+    let (repeat_plan, _repeat) = first_repeat_node(&plan);
     let LogicalPlanKind::Project(repeat_input_project) = &repeat_plan.unary_input().kind else {
         panic!(
             "expected Repeat input Project, got {:?}",
@@ -2573,7 +2571,7 @@ fn apply_where_spec_emits_apply_below_where_filter() {
     let plan = parse_analyze_and_plan_apply(sql).expect("Apply framework plan must succeed");
 
     // Root shape: Project → Filter(WHERE) → Apply → Scan
-    let LogicalPlanKind::Project(project) = &plan.kind else {
+    let LogicalPlanKind::Project(_project) = &plan.kind else {
         panic!("expected Project root, got {plan:?}");
     };
     let filter_plan = plan.unary_input();
@@ -2616,7 +2614,7 @@ fn apply_having_spec_emits_apply_above_aggregate() {
         parse_analyze_and_plan_apply(sql).expect("Apply framework plan must succeed for HAVING");
 
     // Walk down: Project → Filter(HAVING) → Apply → Aggregate → ...
-    let LogicalPlanKind::Project(project) = &plan.kind else {
+    let LogicalPlanKind::Project(_project) = &plan.kind else {
         panic!("expected Project root, got {plan:?}");
     };
     let having_filter_plan = plan.unary_input();
@@ -2765,11 +2763,11 @@ fn plan_exists_builds_apply_exists() {
         "test query must record a correlated EXISTS predicate spec"
     );
 
-    let LogicalPlanKind::Project(project) = &plan.kind else {
+    let LogicalPlanKind::Project(_project) = &plan.kind else {
         panic!("expected Project root, got {plan:?}");
     };
     let filter_plan = plan.unary_input();
-    let LogicalPlanKind::Filter(filter) = &filter_plan.kind else {
+    let LogicalPlanKind::Filter(_filter) = &filter_plan.kind else {
         panic!(
             "expected residual WHERE Filter under Project, got {:?}",
             filter_plan

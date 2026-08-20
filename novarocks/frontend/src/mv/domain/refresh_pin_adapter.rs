@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
 use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
+#[cfg(test)]
+use std::sync::Arc;
 
 /// Capture refresh pins from the exact connector-control and storage-observation
 /// capabilities selected by the caller.  This keeps an EXPLAIN or foreground
@@ -94,6 +94,10 @@ fn invoke_after_capture_hook() {
 /// materialization before any post-capture work can observe a newer table
 /// generation.
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn invoke_after_capture_hook_for_test() {
     invoke_after_capture_hook();
 }
@@ -116,12 +120,20 @@ fn clear_after_capture_hook() {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) struct AfterCaptureHookGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 #[cfg(test)]
 impl AfterCaptureHookGuard {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn install(hook: Arc<dyn Fn() + Send + Sync>) -> Self {
         let lock = lock_after_capture_hook_for_test();
         set_after_capture_hook(hook);

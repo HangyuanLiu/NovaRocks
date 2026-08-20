@@ -39,6 +39,10 @@ use crate::runtime::runtime_state::RuntimeState;
 use novarocks_types::QueryId;
 
 /// Fragment-scoped runtime context shared across drivers and operator instances.
+#[allow(
+    dead_code,
+    reason = "Legacy progress reporting remains represented while application hosts complete migration."
+)]
 pub struct FragmentContext {
     next_driver_id: AtomicI32,
     profiler: Option<Profiler>,
@@ -61,6 +65,10 @@ pub struct FragmentContext {
     event_scheduler: Arc<EventScheduler>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Legacy progress inspection remains available while application hosts complete migration."
+)]
 impl FragmentContext {
     pub(crate) fn new(
         profiler: Option<Profiler>,

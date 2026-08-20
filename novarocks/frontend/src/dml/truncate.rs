@@ -82,6 +82,10 @@ struct DurableTruncateFailureV1<'a> {
 impl DmlService {
     /// Executes one already-admitted typed TRUNCATE command through the
     /// durable direct-mutation lifecycle.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub fn execute_truncate(
         &self,
         engine: &dyn TruncateEngine,
@@ -137,6 +141,10 @@ impl DmlService {
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn execute_truncate_operation(
     engine: &dyn TruncateEngine,
     context: &RequestContext,
@@ -226,6 +234,10 @@ fn execute_truncate_operation(
 /// successful run licenses dispatch; every failure returns before `execute` is
 /// reached and leaves the operation recoverable for historical data-mutation
 /// recovery to classify.
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn establish_and_record_fence(
     engine: &dyn TruncateEngine,
     active: &mut ActiveDmlOperation,
@@ -272,6 +284,10 @@ fn establish_and_record_fence(
     Ok(active.stored.clone())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn finish_plan_failure(
     journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
@@ -292,6 +308,10 @@ fn finish_plan_failure(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn finish_outcome(
     engine: &dyn TruncateEngine,
     journal: &mut ActiveDmlOperation,
@@ -412,6 +432,10 @@ fn finish_outcome(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn persist_known_committed(
     journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
@@ -503,6 +527,10 @@ fn persist_known_committed(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn persist_invalid_committed_receipt(
     journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
@@ -556,6 +584,10 @@ fn persist_invalid_committed_receipt(
     ))
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn persist_known_uncommitted(
     journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
@@ -588,6 +620,10 @@ fn persist_known_uncommitted(
     ))
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn persist_possibly_dispatched(
     journal: &mut ActiveDmlOperation,
     mut stored: StoredOperation,
@@ -633,6 +669,10 @@ fn persist_possibly_dispatched(
     ))
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn persist_reconcile_corruption(
     journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
@@ -669,6 +709,10 @@ fn persist_reconcile_corruption(
     ))
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn persist(
     journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
@@ -705,6 +749,10 @@ fn planned_record(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn outcome_record(
     stored: &StoredOperation,
     phase: TruncateLifecyclePhase,
@@ -718,6 +766,10 @@ fn outcome_record(
     Ok(record)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn outcome_record_without_new_fact(
     stored: &StoredOperation,
     phase: TruncateLifecyclePhase,
@@ -729,6 +781,10 @@ fn outcome_record_without_new_fact(
     Ok(record)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn truncate_record(stored: &StoredOperation) -> Result<TruncateLifecycleRecord, DmlError> {
     match &stored.payload {
         OperationPayload::TruncateLifecycle(record) => Ok(record.clone()),
@@ -741,12 +797,20 @@ fn truncate_record(stored: &StoredOperation) -> Result<TruncateLifecycleRecord, 
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn durable_evidence(stored: &StoredOperation) -> Result<Option<String>, DmlError> {
     Ok(truncate_record(stored)?
         .outcome
         .and_then(|outcome| outcome.evidence))
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn preflight_external_truth(
     journal: &mut ActiveDmlOperation,
     stored: &StoredOperation,
@@ -883,6 +947,10 @@ fn receipt_contract_failure(error: impl std::fmt::Display) -> TruncateFailure {
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_evidence(
     operation_id: DmlOperationId,
     facts: &TruncatePlanFacts,

@@ -31,9 +31,9 @@ use novarocks_spi::connector::{
     ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReconcileRequest,
     ConnectorMetadataMaintenanceResolver, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTablePlanningFacts, ConnectorTableRequest,
-    ConnectorTableResolution, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome,
 };
 
 use crate::common::engine_error::EngineError;
@@ -611,7 +611,7 @@ mod tests {
         ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMaxCompactableDataFiles,
         ConnectorMetadata, ConnectorMetadataMaintenance, ConnectorMetadataMaintenancePlanSummary,
         ConnectorMetadataMaintenanceReceiptSummary, ConnectorNamespaceRequest, ConnectorProviderId,
-        ConnectorTableMetadata,
+        ConnectorTableMetadata, ConnectorTablePlanningFacts,
     };
 
     use super::*;

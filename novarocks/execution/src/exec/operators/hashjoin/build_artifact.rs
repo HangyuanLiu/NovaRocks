@@ -48,6 +48,10 @@ pub(crate) struct JoinBuildArtifact {
 }
 
 #[derive(Clone)]
+#[allow(
+    dead_code,
+    reason = "Reserved typed view for native join runtime-filter integration."
+)]
 pub(crate) struct JoinBuildRuntimeFilterView;
 
 impl JoinBuildArtifact {
@@ -116,6 +120,10 @@ pub(crate) struct BuildView {
     required: BuildComponentRequirements,
 }
 
+#[allow(
+    dead_code,
+    reason = "The build view exposes typed runtime-filter state for native join integration."
+)]
 impl BuildView {
     pub(crate) fn new(
         artifact: Arc<JoinBuildArtifact>,

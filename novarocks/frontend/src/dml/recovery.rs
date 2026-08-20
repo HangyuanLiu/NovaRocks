@@ -148,16 +148,15 @@ impl DmlRecoveryController {
 
     pub(crate) async fn shutdown(&mut self) {
         self.stop.send_replace(true);
-        if let Some(mut task) = self.task.take() {
-            if tokio::time::timeout(Duration::from_secs(5), &mut task)
+        if let Some(mut task) = self.task.take()
+            && tokio::time::timeout(Duration::from_secs(5), &mut task)
                 .await
                 .is_err()
-            {
-                tracing::warn!(
-                    "DML recovery controller exceeded the 5s shutdown target; draining its in-flight StateStore operation before teardown"
-                );
-                let _ = task.await;
-            }
+        {
+            tracing::warn!(
+                "DML recovery controller exceeded the 5s shutdown target; draining its in-flight StateStore operation before teardown"
+            );
+            let _ = task.await;
         }
     }
 }

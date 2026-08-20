@@ -22,6 +22,10 @@ use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue}
 use novarocks_execution::exec::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
 
 #[derive(Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 enum Comparison {
     Eq,
     Lt,
@@ -30,6 +34,10 @@ enum Comparison {
     Ge,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(crate) fn extract_min_max_predicates(
     arena: &ExprArena,
     root: ExprId,
@@ -40,6 +48,10 @@ pub(crate) fn extract_min_max_predicates(
     out
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 fn collect(
     arena: &ExprArena,
     id: ExprId,
@@ -70,6 +82,10 @@ fn collect(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 fn push_comparison(
     arena: &ExprArena,
     left: ExprId,
@@ -97,6 +113,10 @@ fn push_comparison(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 fn comparison_from_slot_literal(
     arena: &ExprArena,
     slot_expr: ExprId,
@@ -129,6 +149,10 @@ fn comparison_from_slot_literal(
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 fn min_max_value(literal: &LiteralValue) -> Option<MinMaxPredicateValue> {
     Some(match literal {
         LiteralValue::Null | LiteralValue::Decimal256 { .. } => return None,

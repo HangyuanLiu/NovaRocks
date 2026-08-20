@@ -34,6 +34,10 @@ pub(crate) struct AggregateStreamingState {
     buffer_limit: usize,
 }
 
+#[allow(
+    dead_code,
+    reason = "The explicit constructor is retained for streaming aggregate assembly tests."
+)]
 impl AggregateStreamingState {
     /// Create a new streaming state expecting `sink_count` sink operators to finish.
     /// With DOP > 1 there are multiple sink drivers sharing this state; all must finish

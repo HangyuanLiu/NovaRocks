@@ -373,17 +373,17 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{RankingWindowPredicatePushdownRule, rank_upper_bound};
-    use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, SortItem, TypedExpr};
+    use crate::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::column_id::ColumnId;
     use crate::optimizer::operator::{
-        FilterOp, LogicalJoinOp, Operator, ProjectOp, ScalarProjectItem, ScalarWindowSpec, SortOp,
-        ValuesOp, WindowOp,
+        FilterOp, Operator, ProjectOp, ScalarProjectItem, ScalarWindowSpec, SortOp, ValuesOp,
+        WindowOp,
     };
     use crate::optimizer::opt_expr::OptExpr;
     use crate::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
     use crate::optimizer::rewrite::result::RewriteResult;
     use crate::optimizer::rewrite::rule::LogicalRewriteRule;
-    use crate::optimizer::scalar::{self, ScalarArena, ScalarId, SortKey};
+    use crate::optimizer::scalar::{ScalarArena, SortKey};
 
     fn make_ctx(arena: ScalarArena) -> RewriteContext {
         let mut ctx = RewriteContext::new(

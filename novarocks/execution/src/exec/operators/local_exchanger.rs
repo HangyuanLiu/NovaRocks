@@ -159,6 +159,10 @@ pub(crate) struct LocalExchanger {
     popped_chunks: Vec<AtomicU64>,
 }
 
+#[allow(
+    dead_code,
+    reason = "The explicit constructor is retained for local-exchange integration tests."
+)]
 impl LocalExchanger {
     pub(crate) fn new(
         partition_count: usize,

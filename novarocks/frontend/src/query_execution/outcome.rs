@@ -84,6 +84,10 @@ pub struct WriteExecutionOutcome {
 }
 
 impl WriteExecutionOutcome {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution contract and lifecycle integration."
+    )]
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -270,6 +274,10 @@ impl ConnectorWriteCompletion {
         Ok((attachment, input))
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution contract and lifecycle integration."
+    )]
     pub(crate) fn commit_context(&self) -> &novarocks_spi::connector::ConnectorRequestContext {
         self.session.request_context()
     }
@@ -579,6 +587,14 @@ impl QueryOutcomeFactory {
         }))
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution contract and lifecycle integration."
+    )]
+    #[expect(
+        clippy::wrong_self_convention,
+        reason = "The established outcome translator name describes its execution-result input."
+    )]
     pub(crate) fn from_execution_result(
         self,
         result: QueryExecutionResult,

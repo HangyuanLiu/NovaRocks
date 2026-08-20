@@ -57,6 +57,10 @@ pub struct DmlMutationAuthority {
 }
 
 impl DmlMutationAuthority {
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub fn try_new(
         coordination_attempt_id: Uuid,
         validator: Arc<dyn DmlMutationAuthorityValidator>,
@@ -83,6 +87,10 @@ impl DmlMutationAuthority {
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 pub fn dml_operation_resource_key(operation_id: DmlOperationId) -> Result<ResourceKey, DmlError> {
     debug_assert_eq!(DML_COORDINATION_RESOURCE_CODEC_VERSION, 1);
     ResourceKey::try_from(Bytes::from(format!(
@@ -92,6 +100,10 @@ pub fn dml_operation_resource_key(operation_id: DmlOperationId) -> Result<Resour
 }
 
 pub trait OperationJournal: Send + Sync {
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn create_preparing_admitted(
         &self,
         _request: CreatePreparingRequest,
@@ -102,6 +114,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn create_statement_operation_admitted(
         &self,
         _request: CreateStatementOperationRequest,
@@ -112,6 +128,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn claim_operation(
         &self,
         _request: DmlCoordinationClaimRequest,
@@ -122,6 +142,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn claim_operation_admitted(
         &self,
         _request: DmlCoordinationClaimRequest,
@@ -133,6 +157,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn transition_authorized(
         &self,
         _operation_id: DmlOperationId,
@@ -147,6 +175,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn record_fact_authorized(
         &self,
         _operation_id: DmlOperationId,
@@ -161,6 +193,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn mutate_statement_operation_authorized(
         &self,
         _request: OperationMutationRequest,
@@ -172,6 +208,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn apply_add_files_mutation_authorized(
         &self,
         _request: AddFilesMutationRequest,
@@ -189,6 +229,10 @@ pub trait OperationJournal: Send + Sync {
     /// The mutation validates the live lease fence and the expected operation
     /// revision inside the same StateStore transaction that writes the receipt,
     /// so a stale holder can never install a fence receipt.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn record_external_fence_authorized(
         &self,
         _request: DmlExternalFenceMutationRequest,
@@ -206,6 +250,10 @@ pub trait OperationJournal: Send + Sync {
     ///
     /// The mutation is fenced exactly like every other authorized mutation and
     /// refuses to drop a retained cleanup obligation.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn record_historical_write_recovery_authorized(
         &self,
         _request: DmlHistoricalWriteRecoveryMutationRequest,
@@ -225,6 +273,10 @@ pub trait OperationJournal: Send + Sync {
     /// immutable source scope the fence was minted for. The mutation validates
     /// the live lease fence and the expected operation revision inside the same
     /// StateStore transaction that writes the receipt.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn record_direct_mutation_fence_authorized(
         &self,
         _request: DmlDirectMutationFenceMutationRequest,
@@ -243,6 +295,10 @@ pub trait OperationJournal: Send + Sync {
     /// The mutation is fenced exactly like every other authorized mutation. It
     /// refuses to drop a retained cleanup obligation, and it refuses a result
     /// bound to any source scope other than the sealed request's.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn record_historical_data_mutation_recovery_authorized(
         &self,
         _request: DmlHistoricalDataMutationRecoveryMutationRequest,
@@ -258,6 +314,10 @@ pub trait OperationJournal: Send + Sync {
     /// supersession, and cleanup-retention facts beside the top-level saga.
     /// The live lease authority, operation revision, and encoded bound are
     /// validated in the same transaction that advances the operation.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn record_ctas_recovery_authorized(
         &self,
         _request: DmlCtasRecoveryMutationRequest,
@@ -269,6 +329,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn load_external_fence(
         &self,
         _operation_id: DmlOperationId,
@@ -278,6 +342,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn load_historical_write_recovery(
         &self,
         _operation_id: DmlOperationId,
@@ -291,6 +359,10 @@ pub trait OperationJournal: Send + Sync {
     /// the caller asks a provider to establish it. Failing closed keeps the
     /// fence-before-dispatch ordering honest: a receipt that could never be
     /// recorded must not be created.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn preflight_external_fence(
         &self,
         _request: &DmlExternalFenceMutationRequest,
@@ -302,6 +374,10 @@ pub trait OperationJournal: Send + Sync {
 
     /// Validate that a historical write recovery record can be durably encoded
     /// before the caller raises a fence or inspects the old operation.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn preflight_historical_write_recovery(
         &self,
         _request: &DmlHistoricalWriteRecoveryMutationRequest,
@@ -311,6 +387,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn load_direct_mutation_fence(
         &self,
         _operation_id: DmlOperationId,
@@ -320,6 +400,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn load_ctas_recovery(
         &self,
         _operation_id: DmlOperationId,
@@ -329,6 +413,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn load_historical_data_mutation_recovery(
         &self,
         _operation_id: DmlOperationId,
@@ -342,6 +430,10 @@ pub trait OperationJournal: Send + Sync {
     /// encoded before the caller asks a provider to establish it. Failing closed
     /// keeps the fence-before-dispatch ordering honest for a destructive
     /// TRUNCATE just as it does for a distributed write.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn preflight_direct_mutation_fence(
         &self,
         _request: &DmlDirectMutationFenceMutationRequest,
@@ -353,6 +445,10 @@ pub trait OperationJournal: Send + Sync {
 
     /// Validate that a historical data-mutation recovery record can be durably
     /// encoded before the caller raises a fence or inspects the old operation.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn preflight_historical_data_mutation_recovery(
         &self,
         _request: &DmlHistoricalDataMutationRecoveryMutationRequest,
@@ -362,6 +458,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn preflight_ctas_recovery(
         &self,
         _request: &DmlCtasRecoveryMutationRequest,
@@ -371,6 +471,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn recovery_candidates(
         &self,
         _shard: u8,
@@ -381,6 +485,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn reschedule_recovery_due(
         &self,
         _request: DmlRecoveryDueRescheduleRequest,
@@ -398,18 +506,46 @@ pub trait OperationJournal: Send + Sync {
     // Focused-test compatibility surface for pre-coordination fake journals.
     // FrontendApplicationHost never composes the unfenced DmlService mode;
     // production routes use only the admitted/authorized methods above.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn create_preparing(&self, request: CreatePreparingRequest)
     -> Result<DmlOperationId, DmlError>;
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn transition(&self, operation_id: DmlOperationId, to: OperationState) -> Result<(), DmlError>;
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn record_fact(
         &self,
         operation_id: DmlOperationId,
         fact: OperationFact,
     ) -> Result<(), DmlError>;
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn load(&self, operation_id: DmlOperationId) -> Result<Option<StoredOperation>, DmlError>;
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn list_operations(&self) -> Result<Vec<StoredOperation>, DmlError>;
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn list_unfinished(&self) -> Result<Vec<StoredOperation>, DmlError>;
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn create_statement_operation(
         &self,
         _request: CreateStatementOperationRequest,
@@ -419,6 +555,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn mutate_statement_operation(
         &self,
         _request: OperationMutationRequest,
@@ -434,6 +574,10 @@ pub trait OperationJournal: Send + Sync {
     /// Journals must opt in with their real storage limits. Failing closed is
     /// intentional: executing without this guarantee could make the external
     /// truth impossible to record.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn preflight_statement_operation(&self, _operation: &StoredOperation) -> Result<(), DmlError> {
         Err(DmlError::journal_unavailable(
             "statement-specific DML operation preflight is not supported by this journal",
@@ -443,6 +587,10 @@ pub trait OperationJournal: Send + Sync {
     /// ADD FILES requires a single atomic publication of its operation change,
     /// bounded raw artifacts, and source-scope ownership transition. Generic
     /// journals must reject it rather than silently degrade to a second store.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn apply_add_files_mutation(
         &self,
         _request: AddFilesMutationRequest,
@@ -452,6 +600,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn load_add_files_artifact(
         &self,
         _operation_id: DmlOperationId,
@@ -462,6 +614,10 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn preflight_add_files_mutation(
         &self,
         _request: &AddFilesMutationRequest,

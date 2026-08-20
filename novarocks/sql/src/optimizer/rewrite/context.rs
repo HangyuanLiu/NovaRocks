@@ -57,6 +57,10 @@ impl Default for RewritePolicy {
 
 #[derive(Clone)]
 pub(crate) struct RewriteContext {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     consumer: RewriteConsumer,
     disabled_rules: HashSet<String>,
     session_settings: SessionOptimizerSettings,
@@ -122,6 +126,10 @@ impl RewriteContext {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) fn consumer(&self) -> RewriteConsumer {
         self.consumer
     }

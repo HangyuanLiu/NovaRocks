@@ -77,9 +77,7 @@ pub(super) fn plan_select_scoped(
 
     if let Some(predicate) = select.filter.take() {
         current = LogicalPlanNode::new(
-            LogicalPlanKind::Filter(PlanFilterNode {
-                predicate: predicate,
-            }),
+            LogicalPlanKind::Filter(PlanFilterNode { predicate }),
             vec![current],
             None,
         );
@@ -111,7 +109,7 @@ pub(super) fn plan_select_scoped(
                 grouping_ids: repeat_info.grouping_ids,
                 all_rollup_columns: repeat_info.all_rollup_columns,
                 all_rollup_column_ids: repeat_info.all_rollup_column_ids,
-                grouping_key_aliases: grouping_key_aliases,
+                grouping_key_aliases,
                 grouping_fn_args: repeat_info.grouping_fn_args,
                 grouping_fn_arg_ids: repeat_info.grouping_fn_arg_ids,
                 grouping_fn_ids: repeat_info.grouping_fn_ids,
@@ -165,7 +163,7 @@ pub(super) fn plan_select_scoped(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: aggregate_group_by,
                 aggregates: agg_calls,
-                output_columns: output_columns,
+                output_columns,
                 already_pushed: false,
             }),
             vec![current],
@@ -278,9 +276,9 @@ fn build_distinct(
     }
     LogicalPlanNode::new(
         LogicalPlanKind::Aggregate(LogicalAggregateNode {
-            group_by: group_by,
+            group_by,
             aggregates: vec![],
-            output_columns: output_columns,
+            output_columns,
             already_pushed: false,
         }),
         vec![input],

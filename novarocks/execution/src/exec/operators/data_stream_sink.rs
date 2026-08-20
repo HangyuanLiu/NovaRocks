@@ -59,6 +59,10 @@ static DATA_STREAM_PAYLOAD_IDENTITIES: OnceLock<Mutex<Vec<(UniqueId, i32, bool)>
     OnceLock::new();
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for distributed sink end-of-stream assertions."
+)]
 pub(crate) fn take_eos_be_number_for_test(fragment_instance_id: UniqueId) -> Option<i32> {
     let mut identities = DATA_STREAM_PAYLOAD_IDENTITIES
         .get_or_init(|| Mutex::new(Vec::new()))

@@ -76,6 +76,10 @@ impl AggregateOutputLayout {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Full aggregate output materialization is retained for physical-plan inspection paths."
+    )]
     pub(crate) fn full_output_columns(&self) -> Vec<OutputColumn> {
         self.group_key_columns
             .iter()
@@ -84,6 +88,10 @@ impl AggregateOutputLayout {
             .collect()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Aggregate layout membership checks are retained for physical-plan validation paths."
+    )]
     pub(crate) fn contains_column_id(&self, column_id: ColumnId) -> bool {
         self.group_key_columns
             .iter()

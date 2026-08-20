@@ -94,6 +94,10 @@ fn stored_refresh_policy(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn initial_refresh_configuration_for_create(
     policy: &MaterializedViewRefreshPolicy,
 ) -> crate::mv::domain::repository::InitialMvRefreshConfiguration {
@@ -107,6 +111,10 @@ pub(crate) fn initial_refresh_configuration_for_create(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn refresh_metadata_request_for_create(
     mv_id: i64,
     policy: &MaterializedViewRefreshPolicy,
@@ -392,6 +400,10 @@ pub fn list_mvs_with_backend(
 /// to obtain visible-shaped types for SQL's aggregate physical-layout builder, which expects
 /// types matching `shape.visible_outputs` — not the state-shaped columns that
 /// the rewritten SELECT (AVG → SUM + COUNT) produces.
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn normalize_incremental_mv_base_ref(
     base_ref: &novarocks_catalog::identifier::TableIdentity,
 ) -> Result<(String, String, String), String> {
@@ -402,6 +414,10 @@ fn normalize_incremental_mv_base_ref(
     ))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn validate_incremental_mv_base_ref(
     query: &sqlparser::ast::Query,
     base_ref: &novarocks_catalog::identifier::TableIdentity,
@@ -438,6 +454,10 @@ pub(crate) fn validate_incremental_mv_base_ref(
     Ok(expected)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn write_mv_delete_temp_parquet(
     namespace: &str,
     table_name: &str,

@@ -165,6 +165,10 @@ pub(crate) fn gather_join_batch(
     Ok(Some(batch))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for alternate hash-join gather paths under integration coverage."
+)]
 pub(crate) fn gather_join_batches(
     left: &Chunk,
     right: &Chunk,

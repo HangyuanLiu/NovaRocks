@@ -297,7 +297,7 @@ mod tests {
     use super::*;
     use crate::analysis::OutputColumn;
     use crate::column_id::ColumnId;
-    use crate::plan_read::table::{ScanSource, TableDef};
+    use crate::plan_read::table::TableDef;
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
 

@@ -218,15 +218,27 @@ impl LogicalPlanNode {
         self.child(1)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Destructive child extraction remains available to rewrite rules compiled in feature-specific targets."
+    )]
     pub(crate) fn take_child(&mut self, index: usize) -> LogicalPlanNode {
         self.children.remove(index)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Single-child extraction remains available to rewrite rules compiled in feature-specific targets."
+    )]
     pub(crate) fn take_single_child(&mut self) -> LogicalPlanNode {
         assert_eq!(self.children.len(), 1, "expected one logical plan child");
         self.children.remove(0)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Two-child extraction remains available to rewrite rules compiled in feature-specific targets."
+    )]
     pub(crate) fn take_two_children(&mut self) -> (LogicalPlanNode, LogicalPlanNode) {
         assert_eq!(self.children.len(), 2, "expected two logical plan children");
         let right = self.children.remove(1);
@@ -234,6 +246,10 @@ impl LogicalPlanNode {
         (left, right)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Ownership-consuming extraction remains available to rewrite rules compiled in feature-specific targets."
+    )]
     pub(crate) fn into_single_child(mut self) -> LogicalPlanNode {
         assert_eq!(self.children.len(), 1, "expected one logical plan child");
         self.children.remove(0)

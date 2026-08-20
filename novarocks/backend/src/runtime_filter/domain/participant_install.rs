@@ -116,24 +116,52 @@ impl BackendMaterializationPolicy {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn bloom_bits_per_key(&self) -> u32 {
         self.bloom_bits_per_key
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn bloom_hash_count(&self) -> u32 {
         self.bloom_hash_count
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn bloom_seed(&self) -> u64 {
         self.bloom_seed
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn bloom_algorithm_version(&self) -> u16 {
         self.bloom_algorithm_version
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn max_total_retained_bytes(&self) -> usize {
         self.max_total_retained_bytes
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn max_scratch_bytes_per_job(&self) -> usize {
         self.max_scratch_bytes_per_job
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn max_concurrent_jobs(&self) -> usize {
         self.max_concurrent_jobs
     }
@@ -168,6 +196,10 @@ impl BackendOutboundMaterializationGroup {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn owner(&self) -> BackendMaterializationOwner {
         self.owner
     }
@@ -369,6 +401,10 @@ impl BackendChannelInstall {
     pub(crate) const fn materialization_policy(&self) -> &BackendMaterializationPolicy {
         &self.materialization_policy
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn max_reducer_bytes(&self) -> usize {
         self.max_reducer_bytes
     }

@@ -27,22 +27,38 @@ use novarocks_types::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for backend service integration and protocol compatibility."
+)]
 pub(crate) enum ResultSinkType {
     MySqlProtocol,
     HttpProtocol,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for backend service integration and protocol compatibility."
+)]
 pub(crate) enum ResultSinkFormat {
     Json,
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(
+    dead_code,
+    reason = "Retained for backend service integration and protocol compatibility."
+)]
 pub(crate) struct ResultSinkConfig {
     pub(crate) sink_type: ResultSinkType,
     pub(crate) format: Option<ResultSinkFormat>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for backend service integration and protocol compatibility."
+)]
 impl ResultSinkConfig {
     pub(crate) fn mysql() -> Self {
         Self {
@@ -59,6 +75,10 @@ impl ResultSinkConfig {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for backend service integration and protocol compatibility."
+)]
 fn columns_for_projections(
     chunk: &Chunk,
     projections: &[ResultProjection],
@@ -70,6 +90,10 @@ fn columns_for_projections(
     Ok(out)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for backend service integration and protocol compatibility."
+)]
 fn primitives_for_projections(projections: &[ResultProjection]) -> Vec<PrimitiveType> {
     projections
         .iter()
@@ -77,6 +101,10 @@ fn primitives_for_projections(projections: &[ResultProjection]) -> Vec<Primitive
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for backend service integration and protocol compatibility."
+)]
 fn primitives_for_chunk_fields(chunk: &Chunk) -> Vec<PrimitiveType> {
     chunk
         .chunk_schema()
@@ -86,6 +114,10 @@ fn primitives_for_chunk_fields(chunk: &Chunk) -> Vec<PrimitiveType> {
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for backend service integration and protocol compatibility."
+)]
 fn field_schemas_for_projections(projections: &[ResultProjection]) -> Vec<FieldRenderSchema> {
     projections
         .iter()
@@ -93,6 +125,10 @@ fn field_schemas_for_projections(projections: &[ResultProjection]) -> Vec<FieldR
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for backend service integration and protocol compatibility."
+)]
 fn field_schemas_for_chunk_fields(chunk: &Chunk) -> Vec<FieldRenderSchema> {
     chunk
         .chunk_schema()
@@ -102,21 +138,29 @@ fn field_schemas_for_chunk_fields(chunk: &Chunk) -> Vec<FieldRenderSchema> {
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for backend service integration and protocol compatibility."
+)]
 pub(crate) fn build_empty_fetch_result_batch_template(
     config: ResultSinkConfig,
 ) -> Result<ResultBatch, String> {
-    if config.sink_type == ResultSinkType::HttpProtocol {
-        if config.format != Some(ResultSinkFormat::Json) {
-            return Err(format!(
-                "HTTP_PROTOCAL result sink only supports JSON format, got {:?}",
-                config.format
-            ));
-        }
+    if config.sink_type == ResultSinkType::HttpProtocol
+        && config.format != Some(ResultSinkFormat::Json)
+    {
+        return Err(format!(
+            "HTTP_PROTOCAL result sink only supports JSON format, got {:?}",
+            config.format
+        ));
     }
 
     Ok(ResultBatch::empty())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for backend service integration and protocol compatibility."
+)]
 pub(crate) fn build_fetch_result_batch_for_chunk(
     chunk: &Chunk,
     projections: Option<&[ResultProjection]>,

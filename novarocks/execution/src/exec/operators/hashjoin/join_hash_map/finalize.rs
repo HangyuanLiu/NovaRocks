@@ -59,10 +59,8 @@ pub(crate) fn select_probe_rows_from_flags(flags: &[bool], want_matched: bool) -
     flags
         .iter()
         .enumerate()
-        .filter_map(|(row, matched)| {
-            (*matched == want_matched)
-                .then(|| u32::try_from(row).expect("join probe row id exceeds u32"))
-        })
+        .filter(|&(_row, matched)| *matched == want_matched)
+        .map(|(row, _matched)| u32::try_from(row).expect("join probe row id exceeds u32"))
         .collect()
 }
 

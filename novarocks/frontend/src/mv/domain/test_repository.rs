@@ -63,8 +63,16 @@ thread_local! {
     static AFTER_CREATE: RefCell<Option<Arc<dyn Fn() + Send + Sync>>> = const { RefCell::new(None) };
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) struct TestMvRepositoryFailureGuard;
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn fail_next_mv_repository_command(
     point: TestMvRepositoryFailurePoint,
 ) -> TestMvRepositoryFailureGuard {
@@ -78,8 +86,16 @@ impl Drop for TestMvRepositoryFailureGuard {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) struct TestMvRepositoryAfterCreateGuard;
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn after_next_mv_repository_create(
     callback: Arc<dyn Fn() + Send + Sync>,
 ) -> TestMvRepositoryAfterCreateGuard {
@@ -148,17 +164,16 @@ impl InMemoryMvRepository {
             ));
         }
         let definition = definition_from_request(mv_id, request.definition, request.refresh);
-        if let Some(target) = Self::target(&definition) {
-            if state
+        if let Some(target) = Self::target(&definition)
+            && state
                 .definitions
                 .values()
                 .any(|candidate| Self::target(candidate).as_ref() == Some(&target))
-            {
-                return Err(MvRepositoryError::new(
-                    MvRepositoryErrorKind::Conflict,
-                    format!("MV target {} already exists", target.display_name()),
-                ));
-            }
+        {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                format!("MV target {} already exists", target.display_name()),
+            ));
         }
         let dependencies = request
             .dependencies
@@ -175,10 +190,10 @@ impl InMemoryMvRepository {
         Ok(definition)
     }
 
-    fn refresh_mut<'a>(
-        state: &'a mut State,
+    fn refresh_mut(
+        state: &mut State,
         refresh_id: i64,
-    ) -> Result<&'a mut StoredMvRefresh, MvRepositoryError> {
+    ) -> Result<&mut StoredMvRefresh, MvRepositoryError> {
         state.refreshes.get_mut(&refresh_id).ok_or_else(|| {
             MvRepositoryError::new(
                 MvRepositoryErrorKind::NotFound,

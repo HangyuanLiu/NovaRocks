@@ -37,6 +37,10 @@ pub(crate) enum ProducerBindingTarget {
 }
 
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(crate) struct DecodedRuntimeFilterBinding {
     pub(crate) binding_id: u32,
     pub(crate) channel_id: u32,
@@ -120,6 +124,10 @@ pub(crate) struct NativeRuntimeFilterDecodeLedger {
     consumed: BTreeMap<u32, ()>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 impl NativeRuntimeFilterDecodeLedger {
     pub(crate) fn decode(
         enclosing_fragment_id: u32,

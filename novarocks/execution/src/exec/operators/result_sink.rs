@@ -37,10 +37,18 @@ use crate::runtime::runtime_state::RuntimeState;
 
 #[derive(Clone)]
 /// Shared handle that stores buffered result chunks and terminal status for client fetch.
+#[allow(
+    dead_code,
+    reason = "Result-sink types remain available for embedded execution integration tests."
+)]
 pub struct ResultSinkHandle {
     inner: Arc<Mutex<Vec<Chunk>>>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Result-sink handle helpers remain available for embedded execution integration tests."
+)]
 impl ResultSinkHandle {
     pub fn new() -> Self {
         Self {
@@ -61,11 +69,19 @@ impl Default for ResultSinkHandle {
 }
 
 /// Factory for result sinks that append output chunks to query result buffers.
+#[allow(
+    dead_code,
+    reason = "Result-sink factory remains available for embedded execution integration tests."
+)]
 pub struct ResultSinkFactory {
     name: String,
     handle: ResultSinkHandle,
 }
 
+#[allow(
+    dead_code,
+    reason = "Result-sink factory remains available for embedded execution integration tests."
+)]
 impl ResultSinkFactory {
     pub fn new(handle: ResultSinkHandle) -> Self {
         Self::new_with_plan_node_id(handle, None)
@@ -99,6 +115,10 @@ impl OperatorFactory for ResultSinkFactory {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Result-sink operator remains available for embedded execution integration tests."
+)]
 struct ResultSinkOperator {
     name: String,
     handle: ResultSinkHandle,

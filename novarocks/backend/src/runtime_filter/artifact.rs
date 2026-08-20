@@ -151,6 +151,7 @@ macro_rules! digest {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         pub(crate) struct $name([u8; 32]);
         impl $name {
+#[allow(dead_code, reason = "Retained for staged backend runtime-filter domain and materialization integration.")]
             pub(crate) const fn new(bytes: [u8; 32]) -> Self {
                 Self(bytes)
             }
@@ -272,6 +273,10 @@ impl ResidentFilterIndex {
     /// Exact query for the retained numeric bitset representation. Bloom is
     /// intentionally not exposed here: its scalar framing is typed and is
     /// evaluated only by the later Backend artifact-query adapter.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn bitset_contains_i64(
         &self,
         encoded: &[u8],
@@ -339,6 +344,10 @@ impl ResidentMembershipIndex {
     /// Exact primitive query for the fixed-width Int64 resident layout. Other
     /// schema kinds remain typed capability-unsupported rather than falling
     /// back to a logical-domain decode.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn contains_i64(
         &self,
         encoded: &[u8],
@@ -377,6 +386,10 @@ impl ResidentMembershipIndex {
         Ok(Some(false))
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn range_may_match_i64(
         &self,
         encoded: &[u8],
@@ -419,6 +432,10 @@ impl ResidentMembershipIndex {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 fn fixed_i64_at(bytes: &[u8], offset: usize) -> Result<i64, ArtifactContractError> {
     let start = offset
         .checked_mul(8)
@@ -438,6 +455,10 @@ pub(crate) struct PhysicalArtifact {
     version: LogicalVersion,
     contains_null: bool,
     canonical_bytes: Arc<[u8]>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     canonical_digest: [u8; 32],
     membership_index: Option<ResidentMembershipIndex>,
     filter_index: Option<ResidentFilterIndex>,
@@ -483,12 +504,20 @@ impl PhysicalArtifact {
     pub(crate) fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn canonical_digest(&self) -> [u8; 32] {
         self.canonical_digest
     }
     pub(crate) const fn membership_index(&self) -> Option<&ResidentMembershipIndex> {
         self.membership_index.as_ref()
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn filter_index(&self) -> Option<&ResidentFilterIndex> {
         self.filter_index.as_ref()
     }
@@ -657,7 +686,15 @@ pub(crate) enum ArtifactContractError {
     SchemaMismatch,
     EncodedSizeExceeded,
     ResidentSizeOverflow,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     InvalidMembershipIndex,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     InvalidResidentFilterIndex,
     RetentionCapacityExceeded,
     RetentionSizeMismatch,

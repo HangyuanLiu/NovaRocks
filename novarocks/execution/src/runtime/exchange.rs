@@ -422,6 +422,10 @@ impl ExecutionExchangeRegistry {
         self.push_chunks_with_stats(key, sender_id, be_number, chunks, eos, 0, 0);
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Exchange transport accounting remains explicit at the receive boundary."
+    )]
     pub fn push_chunks_with_stats(
         &self,
         key: ExchangeKey,

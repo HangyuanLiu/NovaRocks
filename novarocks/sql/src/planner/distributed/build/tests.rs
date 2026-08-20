@@ -16,11 +16,12 @@ use crate::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
 };
 use crate::column_id::ColumnId;
+use crate::planner::distributed::FrontierEdge;
 use crate::planner::distributed::activation_decision::DraftRuntimeFilterGraph;
 use crate::planner::distributed::runtime_filter_progress::build_join_progress_proof_catalog;
 use crate::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
-    FragmentEdgeKind, FragmentStreamKind, FrontierEdge, PartitionKind, PlanFragment,
+    FragmentEdgeKind, FragmentStreamKind, PartitionKind, PlanFragment,
 };
 use crate::planner::payload::{
     AggregateCall, PlanAssertOneRowNode, PlanCTEAnchorNode, PlanCTEConsumeNode, PlanCTEProduceNode,
@@ -52,7 +53,7 @@ use crate::planner::runtime_filter::graph::{
     RuntimeFilterBindingRoleData, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
     RuntimeFilterGraph, RuntimeFilterGraphData,
 };
-use crate::planner::table::{ScanSource, TableDef};
+use crate::planner::table::TableDef;
 use novarocks_catalog::schema::ColumnDef;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1406,15 +1407,14 @@ fn draft_runtime_filter_population_preserves_join_structure_without_sealed_activ
         &sealed_graph,
         "producer.contribution_kinds",
         |binding| {
-            if let RuntimeFilterBindingRole::Producer(producer) = &mut binding.role {
-                if !producer
+            if let RuntimeFilterBindingRole::Producer(producer) = &mut binding.role
+                && !producer
                     .contribution_kinds
                     .insert(ContributionKind::FinalDomainShard)
-                {
-                    producer
-                        .contribution_kinds
-                        .remove(&ContributionKind::FinalDomainShard);
-                }
+            {
+                producer
+                    .contribution_kinds
+                    .remove(&ContributionKind::FinalDomainShard);
             }
         },
     );
@@ -1455,15 +1455,14 @@ fn draft_runtime_filter_population_preserves_join_structure_without_sealed_activ
         "the consumer target mutation must not be a no-op"
     );
     assert_snapshot_detects_binding_mutation(&sealed_graph, "consumer.capabilities", |binding| {
-        if let RuntimeFilterBindingRole::Consumer(consumer) = &mut binding.role {
-            if !consumer
+        if let RuntimeFilterBindingRole::Consumer(consumer) = &mut binding.role
+            && !consumer
                 .capabilities
                 .insert(ArtifactCapability::OrderedRange)
-            {
-                consumer
-                    .capabilities
-                    .remove(&ArtifactCapability::OrderedRange);
-            }
+        {
+            consumer
+                .capabilities
+                .remove(&ArtifactCapability::OrderedRange);
         }
     });
     assert_snapshot_detects_binding_mutation(&sealed_graph, "consumer.target", |binding| {

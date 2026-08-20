@@ -942,6 +942,10 @@ backends = ["127.0.0.1:9070"]
     // I1: dispatch_standalone_role must pass the pre-loaded cfg to the
     // all-in-one closure, not drop it.
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The startup fixture changes only the standalone server section."
+    )]
     fn test_i1_all_in_one_closure_receives_validated_config() {
         use novarocks_server::app_config::StandaloneServerConfig;
         let mut cfg = novarocks_server::app_config::NovaRocksConfig::default();

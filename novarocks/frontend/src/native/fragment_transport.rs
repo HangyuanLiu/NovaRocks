@@ -95,6 +95,10 @@ pub enum FetchOutcome {
 /// Query startup belongs exclusively to the query lifecycle Stage/Start
 /// barrier. Query lifecycle owns cancellation and terminal convergence after
 /// that barrier has entered `Running`.
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 pub trait FragmentDispatcher: Send + Sync + 'static {
     /// Poll for the next result chunk from the root fragment on the given backend.
     fn fetch_result(

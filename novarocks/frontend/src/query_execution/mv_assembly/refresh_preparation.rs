@@ -40,8 +40,6 @@ use crate::mv::domain::refresh::capabilities::RefreshCapabilities;
 use crate::mv::domain::refresh::definition::{
     load_iceberg_mv_definition_by_target, mv_definition_fingerprint, parse_mv_select_query,
 };
-#[cfg(test)]
-use crate::mv::domain::refresh::execution_policy::should_use_join_delta_append_only_fast_path;
 use crate::mv::domain::refresh::execution_policy::{
     non_join_incremental_write_mode, select_join_incremental_execution_mode,
 };
@@ -54,8 +52,6 @@ use crate::mv::domain::refresh::observation::{
 };
 use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
 use crate::mv::domain::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
-#[cfg(test)]
-use crate::mv::domain::refresh::repartition::RepartitionShape;
 use crate::mv::domain::refresh::repartition::select_repartition_shape;
 use crate::mv::domain::refresh::rewrite_context::{
     admitted_change_facts, build_neutral_refresh_rewrite_context,
@@ -381,6 +377,10 @@ fn execution_binding_key_for_target(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Managed repartition preparation keeps the frozen lease, partition contract, and operation identity explicit."
+)]
 fn prepare_managed_repartition_transition(
     source: &IcebergMvCorePorts,
     current_catalog: Option<&str>,

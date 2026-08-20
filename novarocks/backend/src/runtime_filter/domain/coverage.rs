@@ -28,6 +28,7 @@ macro_rules! id {
                 Self(raw)
             }
 
+#[allow(dead_code, reason = "Retained for staged backend runtime-filter domain and materialization integration.")]
             pub(crate) const fn get(self) -> $raw {
                 self.0
             }

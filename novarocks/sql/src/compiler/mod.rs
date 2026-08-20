@@ -109,6 +109,10 @@ impl SqlStatisticsPlan {
         stats_ref
     }
 
+    #[allow(
+        dead_code,
+        reason = "The next statistics reference is retained for the pending distributed explain handoff."
+    )]
     pub(crate) fn set_next_stats_ref(&mut self, next_stats_ref: u32) {
         self.next_stats_ref = next_stats_ref;
     }
@@ -186,12 +190,20 @@ impl SqlImvPlanningInput {
 /// The function implementation and its execution kernels are explicitly out
 /// of scope for this compiler-facing contract.
 pub trait SqlFunctionCatalog: Send + Sync {
+    #[expect(
+        private_interfaces,
+        reason = "The stable SQL shape intentionally carries a crate-private implementation detail."
+    )]
     fn resolve_scalar_signature(
         &self,
         name: &str,
         arg_types: &[arrow::datatypes::DataType],
     ) -> Result<crate::functions::ResolvedScalarFunction, crate::functions::ResolveError>;
 
+    #[expect(
+        private_interfaces,
+        reason = "The stable SQL shape intentionally carries a crate-private implementation detail."
+    )]
     fn volatility(&self, name: &str) -> crate::functions::FunctionVolatility;
 }
 
@@ -281,6 +293,10 @@ pub struct SqlStatementInput {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The inline SQL plan payload avoids an allocation at the compiler handoff boundary."
+)]
 enum SqlStatementInputKind {
     Sql(String),
     ParsedQuery(Box<sqlparser::ast::Query>),
@@ -565,6 +581,10 @@ pub(crate) struct SqlAnalysisOutput {
     pub(crate) factory: crate::column_id::ColumnRefFactory,
 }
 
+#[allow(
+    dead_code,
+    reason = "Optimizer metadata remains part of the compiler terminal until the lifecycle handoff consumes it."
+)]
 pub(crate) struct SqlOptimizedOutput {
     pub(crate) optimized_tree: crate::optimizer::OptimizedOperatorNode,
     pub(crate) statistics: SqlStatisticsPlan,
@@ -572,6 +592,10 @@ pub(crate) struct SqlOptimizedOutput {
     pub(crate) mv_rewrite_diagnostics: Vec<mv_rewrite::SqlMvRewriteDiagnostic>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Distributed compiler metadata remains available for the later explain and lifecycle handoff."
+)]
 pub(crate) struct SqlDistributedOutput {
     pub(crate) distributed_plan: crate::planner::distributed::DistributedPlan,
     pub(crate) statistics: SqlStatisticsPlan,
@@ -588,7 +612,15 @@ pub struct SqlCompileOutput {
     kind: SqlCompileOutputKind,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The inline SQL plan payload avoids an allocation at the compiler handoff boundary."
+)]
 enum SqlCompileOutputKind {
+    #[allow(
+        dead_code,
+        reason = "The opaque analysis terminal is retained for callers that stop before physical planning."
+    )]
     Analysis(SqlAnalysisOutput),
     Logical(SqlAnalysisOutput),
     Optimized(SqlOptimizedOutput),
@@ -1108,18 +1140,20 @@ impl SqlCompiler {
         }
         let mut settings = request.session.optimizer_settings.clone();
         if !matches!(request.intent, SqlCompileIntent::LogicalOnly)
-            && !(logical_input
-                && matches!(request.environment, SqlPlanningEnvironment::NotApplicable))
+            && (!logical_input
+                || !matches!(request.environment, SqlPlanningEnvironment::NotApplicable))
         {
             apply_planning_environment(&mut settings, request.environment)?;
         }
-        let mut change_stream = logical_input
-            .then(|| {
+        let mut change_stream = if logical_input {
+            {
                 crate::planner::imv_rewrite::change_stream::build_change_stream_descriptor(
                     &logical_plan,
                 )
-            })
-            .unwrap_or_default();
+            }
+        } else {
+            Default::default()
+        };
         if let Some(input) = request.imv_rewrite {
             if !matches!(
                 request.intent,
@@ -1861,6 +1895,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn compiler_session_settings_expose_static_predicate_pushdown_policy() {
         assert!(SessionOptimizerSettings::default().connector_static_predicate_pushdown_enabled());
 
@@ -1925,8 +1963,6 @@ mod tests {
 
     #[test]
     fn mv_refresh_analysis_terminal_returns_only_opaque_analysis_input() {
-        use novarocks_catalog::provider::CatalogProvider as _;
-
         let mut catalog = crate::catalog::local::PlannerMemoryCatalog::default();
         catalog
             .create_database("db")
@@ -1969,8 +2005,6 @@ mod tests {
 
     #[test]
     fn mv_refresh_analysis_terminal_fails_closed_for_missing_table() {
-        use novarocks_catalog::provider::CatalogProvider as _;
-
         let mut catalog = crate::catalog::local::PlannerMemoryCatalog::default();
         catalog
             .create_database("db")

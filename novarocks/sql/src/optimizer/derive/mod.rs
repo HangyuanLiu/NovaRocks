@@ -326,6 +326,10 @@ pub(crate) fn estimate_enforcer_cost_estimate(
 }
 
 /// Estimate the cost of an enforcer given group statistics.
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) fn estimate_enforcer_cost(enforcer: &EnforcerKind, stats: &Statistics) -> TotalCost {
     let options = CostOptions::default();
     estimate_enforcer_cost_estimate(enforcer, stats, &options).total_with_options(&options)

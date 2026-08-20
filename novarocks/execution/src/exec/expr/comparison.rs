@@ -1971,7 +1971,9 @@ mod tests {
         builder.finish()
     }
 
-    fn create_test_map_array_nullable_values(rows: &[Option<&[(i32, Option<i64>)]>]) -> MapArray {
+    type NullableMapRow<'a> = Option<&'a [(i32, Option<i64>)]>;
+
+    fn create_test_map_array_nullable_values(rows: &[NullableMapRow<'_>]) -> MapArray {
         let mut builder = MapBuilder::new(
             Some(MapFieldNames {
                 entry: "entries".to_string(),
@@ -2163,7 +2165,12 @@ mod tests {
 
     #[test]
     fn dictionary_utf8_missing_comparison_operators_use_logical_values() {
-        let cases: [(&str, fn(ExprId, ExprId) -> ExprNode, Vec<Option<bool>>); 4] = [
+        type DictionaryComparisonCase = (
+            &'static str,
+            fn(ExprId, ExprId) -> ExprNode,
+            Vec<Option<bool>>,
+        );
+        let cases: [DictionaryComparisonCase; 4] = [
             (
                 "ne",
                 ExprNode::Ne,

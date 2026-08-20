@@ -80,15 +80,15 @@ pub(crate) fn derive_inner_join_predicates(
                 ) {
                     derived.push(group);
                 }
-            } else if same_column(arena, constraint.column, right) {
-                if let Some(group) = substitute_constraint_column(
+            } else if same_column(arena, constraint.column, right)
+                && let Some(group) = substitute_constraint_column(
                     arena,
                     constraint,
                     left,
                     derived_kind_for_constraint(&constraint.kind),
-                ) {
-                    derived.push(group);
-                }
+                )
+            {
+                derived.push(group);
             }
         }
     }
@@ -239,10 +239,10 @@ fn derive_or_branch_side_filters(
         let mut conjuncts = Vec::new();
         scalar_expr::split_conjuncts(arena, branch, &mut conjuncts);
         for conjunct in conjuncts {
-            if let Some(pair) = extract_column_pair_equality(arena, conjunct) {
-                if is_cross_side_pair(arena, pair.0, pair.1, left_ids, right_ids) {
-                    pairs.push(pair);
-                }
+            if let Some(pair) = extract_column_pair_equality(arena, conjunct)
+                && is_cross_side_pair(arena, pair.0, pair.1, left_ids, right_ids)
+            {
+                pairs.push(pair);
             }
             if let Some(constraint) = extract_column_literal_constraint(arena, conjunct) {
                 constraints.push(constraint);

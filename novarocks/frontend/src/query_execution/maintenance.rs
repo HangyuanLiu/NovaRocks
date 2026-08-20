@@ -240,6 +240,10 @@ impl MaintenanceAttemptContext {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution contract and lifecycle integration."
+    )]
     fn connector_request_context(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
@@ -656,6 +660,10 @@ pub trait TableMaintenanceService: Send + Sync {
 
     /// Executes the read-only typed `SHOW ALTER TABLE OPTIMIZE` presentation
     /// without creating a maintenance engine or re-entering a raw parser.
+    #[allow(
+        private_interfaces,
+        reason = "The typed SHOW OPTIMIZE parser carrier is intentionally confined to the table-maintenance boundary."
+    )]
     fn handle_typed_show_optimize(
         &self,
         _statement: crate::table_maintenance::ParsedShowOptimize,
@@ -1184,8 +1192,6 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         descriptor: novarocks_spi::connector::ConnectorHistoricalMaintenanceDescriptor,
         attempt: &MaintenanceAttemptContext,
     ) -> Result<HistoricalMaintenanceInspection, String> {
-        use novarocks_spi::connector::ConnectorHistoricalMaintenanceResolver;
-
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| error.to_string())?;
         let lease = match self

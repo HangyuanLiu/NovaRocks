@@ -187,6 +187,10 @@ pub struct StoredMaintenanceTargetV1 {
     /// The StateStore representation is lowercase hex and is therefore at
     /// most 512 bytes before JSON framing. It remains opaque outside the SPI:
     /// Frontend may persist and compare it but must not parse or rewrite it.
+    #[allow(
+        private_interfaces,
+        reason = "The serialized maintenance schema keeps its bounded opaque identity internal."
+    )]
     pub object_id: DurableOpaqueBytes<MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES>,
 }
 
@@ -1195,8 +1199,10 @@ mod durable_record_budget_tests {
         // with_limits has no StateStore attached. A failed encode therefore
         // proves rejection occurs before any transaction, index, or record
         // write can be opened.
-        let mut restricted = StateStoreLimits::default();
-        restricted.max_value_bytes = actual_bytes - 1;
+        let restricted = StateStoreLimits {
+            max_value_bytes: actual_bytes - 1,
+            ..StateStoreLimits::default()
+        };
         let error = DurableRecordStore::with_limits(restricted)
             .encode(&record)
             .expect_err("one byte below the actual encoding must fail before writing");

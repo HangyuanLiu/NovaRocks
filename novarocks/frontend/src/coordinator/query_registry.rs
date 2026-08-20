@@ -55,6 +55,10 @@ pub(crate) struct QueryLifecycleConvergenceSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The available variant owns the complete terminal runtime-filter snapshot."
+)]
 pub(crate) enum RuntimeFilterTerminalRollupSnapshot {
     Available(RuntimeFilterTerminalRollup),
     Unavailable(RuntimeFilterTerminalRollupUnavailable),
@@ -440,11 +444,11 @@ impl FrontendQueryRegistry {
             let mut active = self.active.lock().expect("frontend query registry lock");
             active
                 .values_mut()
-                .filter_map(|query| {
+                .map(|query| {
                     query.record_failure(format!(
                         "backend topology revision changed from {previous_revision} to {revision}"
                     ));
-                    Some(request_cancellation(query))
+                    request_cancellation(query)
                 })
                 .collect::<Vec<_>>()
         };
@@ -454,6 +458,10 @@ impl FrontendQueryRegistry {
     }
 
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "Registry test helper preserves explicit backend ownership setup."
+    )]
     pub(crate) fn set_scheduled_backends(
         &self,
         query_id: QueryId,
@@ -467,6 +475,10 @@ impl FrontendQueryRegistry {
     }
 
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "Registry test helper preserves explicit terminal-attempt assertions."
+    )]
     pub(crate) fn finish_attempt(&self, query_id: QueryId) -> Result<(), DistributedQueryError> {
         if self
             .active
@@ -622,10 +634,10 @@ impl FrontendQueryRegistry {
                 None
             }
         };
-        if let Some(control) = control {
-            if control.retain_terminal_ingress() {
-                self.retain_terminal_control(control);
-            }
+        if let Some(control) = control
+            && control.retain_terminal_ingress()
+        {
+            self.retain_terminal_control(control);
         }
     }
 
@@ -637,14 +649,13 @@ impl FrontendQueryRegistry {
             .lock()
             .expect("frontend retained terminal ingress lock");
         retained.retain(|_, ingress| ingress.expires_at > now);
-        if retained.len() >= TERMINAL_INGRESS_RETAINED_CAPACITY {
-            if let Some(oldest) = retained
+        if retained.len() >= TERMINAL_INGRESS_RETAINED_CAPACITY
+            && let Some(oldest) = retained
                 .iter()
                 .min_by_key(|(_, ingress)| ingress.expires_at)
                 .map(|(execution_id, _)| *execution_id)
-            {
-                retained.remove(&oldest);
-            }
+        {
+            retained.remove(&oldest);
         }
         retained.insert(
             execution_id,
@@ -749,10 +760,10 @@ fn request_cancellation(query: &mut ActiveQuery) -> CancellationDispatch {
 }
 
 fn dispatch_cancellation(cancellation: Option<CancellationDispatch>) {
-    if let Some(cancellation) = cancellation {
-        if let Some(control) = cancellation.active_attempt {
-            control.request_abort(cancellation.reason);
-        }
+    if let Some(cancellation) = cancellation
+        && let Some(control) = cancellation.active_attempt
+    {
+        control.request_abort(cancellation.reason);
     }
 }
 

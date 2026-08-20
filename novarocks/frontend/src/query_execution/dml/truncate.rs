@@ -177,6 +177,10 @@ pub struct TruncateEvidence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The external TRUNCATE outcome retains its direct typed payload contract."
+)]
 pub enum TruncateOutcome {
     KnownCommitted {
         effect: TruncateEffect,
@@ -393,6 +397,10 @@ impl TruncateEngine for DmlExecutionKernel {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The externally visible TRUNCATE outcome preserves its typed failure payload."
+)]
 fn downcast_prepared(
     prepared: &dyn TruncatePrepared,
 ) -> Result<&CorePreparedTruncate, TruncateOutcome> {

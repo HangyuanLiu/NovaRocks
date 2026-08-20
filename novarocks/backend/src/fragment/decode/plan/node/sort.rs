@@ -29,6 +29,10 @@ use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::{FieldPath, ProtocolErrorKind};
 use novarocks_protocol::{expr, plan};
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen native boundary keeps independently validated inputs explicit."
+)]
 pub(super) fn lower_sort_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
@@ -142,6 +146,10 @@ pub(super) fn lower_sort_node(
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(super) fn lower_sort_items(
     node_kind: &str,
     items: &[expr::SortItem],

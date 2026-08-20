@@ -77,6 +77,10 @@ struct LifecycleTelemetryUnavailableDebug {
 
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The typed frontend protocol model intentionally keeps payloads inline."
+)]
 enum RuntimeFilterTerminalRollupDebug {
     Available {
         participants: Vec<RuntimeFilterParticipantTerminalDebug>,
@@ -183,6 +187,10 @@ struct RuntimeFilterUniqueIdDebug {
 
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The typed frontend protocol model intentionally keeps payloads inline."
+)]
 enum RuntimeFilterTerminalTotalsDebug {
     Available {
         channels: RuntimeFilterChannelTotalsDebug,
@@ -800,6 +808,10 @@ impl NovaRocksGrpc for FrontendReportService {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The gRPC boundary returns tonic status directly."
+)]
 fn report_response_from_ack(
     ack: QueryTerminalReportAck,
 ) -> Result<proto::ReportQueryTerminalResponse, tonic::Status> {

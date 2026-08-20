@@ -24,10 +24,18 @@ use crate::optimizer::statistics::{ColumnStatistic, Confidence};
 use super::arith::sat_mul;
 use super::selectivity::extract_column_id;
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 const DEFAULT_EXPR_NDV: f64 = 10.0;
 const DEFAULT_JOIN_KEY_NDV: f64 = 40.0;
 
 /// Get the NDV for an expression from column statistics.
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) fn get_expr_ndv(
     arena: &ScalarArena,
     expr: ScalarId,

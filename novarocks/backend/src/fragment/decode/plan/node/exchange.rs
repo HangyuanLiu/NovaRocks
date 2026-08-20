@@ -17,8 +17,6 @@
 
 //! Fragment exchange-node decoding.
 
-use std::time::Duration;
-
 use super::common::parse_optional_nonnegative_i64;
 use super::{DecodedNode, NativePlanDecodeContext, sort};
 use crate::fragment::decode::plan::error::NativeFragmentDecodeError;

@@ -19,6 +19,10 @@ use crate::optimizer::rewrite::phase::RewritePhase;
 use crate::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
 use crate::optimizer::rewrite::rules;
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) fn default_rewrite_phases() -> Vec<RewritePhase> {
     vec![
         RewritePhase::LogicalNormalize,
@@ -104,10 +108,18 @@ pub(crate) fn query_rewrite_pipeline() -> RewritePipeline {
     ])
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) fn mv_rewrite_pipeline() -> RewritePipeline {
     RewritePipeline::new(default_rewrite_phases(), Vec::new())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) fn is_known_rewrite_rule_name(name: &str) -> bool {
     let query_pipeline = query_rewrite_pipeline();
     let mv_pipeline = mv_rewrite_pipeline();

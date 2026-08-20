@@ -303,14 +303,6 @@ fn int_expr(value: i64) -> IExpr {
     }
 }
 
-fn bool_expr(value: bool) -> IExpr {
-    IExpr {
-        ty: scalar_type(common::PrimitiveType::Boolean),
-        nullable: false,
-        kind: IExprKind::Literal(ILiteral::Bool(value)),
-    }
-}
-
 fn string_expr(value: &str) -> IExpr {
     IExpr {
         ty: scalar_type(common::PrimitiveType::Varchar),

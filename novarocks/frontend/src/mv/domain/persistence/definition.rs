@@ -22,6 +22,10 @@ use std::collections::BTreeMap;
 use crate::common::persisted_query_definition::PersistedQueryDefinition;
 use crate::mv::domain::persistence::schema::{MvPartitionContract, MvSchemaContract};
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) const MV_DEFINITION_SUBJECT: &str = "mv.definition";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +113,10 @@ impl StoredMvRefreshPolicy {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn accepts_interval(&self) -> bool {
         matches!(self, Self::AsyncInterval)
     }

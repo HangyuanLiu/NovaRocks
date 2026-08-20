@@ -31,6 +31,10 @@ use novarocks_protocol::FieldPath;
 use novarocks_protocol::{common as proto_common, plan};
 use novarocks_types::SlotId;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen native boundary keeps independently validated inputs explicit."
+)]
 pub(super) fn lower_set_op_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
@@ -112,6 +116,10 @@ pub(super) fn lower_set_op_node(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen native boundary keeps independently validated inputs explicit."
+)]
 fn normalize_set_op_inputs(
     node_id: i32,
     children: Vec<DecodedNode>,
@@ -195,7 +203,10 @@ fn normalize_set_op_inputs(
         })
         .collect()
 }
-
+#[expect(
+    clippy::items_after_test_module,
+    reason = "Focused decode tests remain adjacent to their helpers."
+)]
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
@@ -239,6 +250,10 @@ mod tests {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen native boundary keeps independently validated inputs explicit."
+)]
 fn normalize_set_op_inputs_by_position(
     node_id: i32,
     children: Vec<DecodedNode>,

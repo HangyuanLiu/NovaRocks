@@ -602,92 +602,6 @@ pub(super) fn any_value_spec(arg: ScalarId, output_column_id: ColumnId) -> Scala
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::optimizer::operator::{AggregateOutputLayout, LogicalAggregateOp};
-
-    fn output_column(column_id: ColumnId, name: &str) -> OutputColumn {
-        OutputColumn {
-            column_id,
-            name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            is_internal: false,
-        }
-    }
-
-    #[test]
-    fn is_count_aggregate_result_uses_layout_when_group_key_is_hidden() {
-        let mut arena = ScalarArena::new();
-        let group_id = ColumnId::new_for_test(1);
-        let count_id = ColumnId::new_for_test(2);
-        let group = arena.intern(ScalarNode::ColumnRef(group_id), DataType::Int64, false);
-        let aggregate = OptExpr::new(
-            Operator::LogicalAggregate(LogicalAggregateOp::single(
-                vec![group],
-                vec![ScalarAggregateSpec {
-                    output_column_id: count_id,
-                    name: "count".to_string(),
-                    args: vec![],
-                    distinct: false,
-                    order_by: vec![],
-                }],
-                AggregateOutputLayout::new(
-                    vec![output_column(group_id, "k")],
-                    vec![output_column(count_id, "count(1)")],
-                ),
-                vec![output_column(count_id, "count(1)")],
-            )),
-            vec![],
-        );
-
-        assert!(is_count_aggregate_result(&aggregate, &arena, count_id));
-    }
-
-    #[test]
-    fn opt_output_columns_widens_outer_join_nullable_side() {
-        let arena = ScalarArena::new();
-        let left_col = output_column(ColumnId::new_for_test(1), "l");
-        let right_col = output_column(ColumnId::new_for_test(2), "r");
-        let left = OptExpr::new(
-            Operator::LogicalValues(crate::optimizer::operator::ValuesOp {
-                columns: vec![left_col.clone()],
-                rows: vec![],
-            }),
-            vec![],
-        );
-        let right = OptExpr::new(
-            Operator::LogicalValues(crate::optimizer::operator::ValuesOp {
-                columns: vec![right_col.clone()],
-                rows: vec![],
-            }),
-            vec![],
-        );
-
-        let left_outer = opt_output_columns(
-            &join(left.clone(), right.clone(), JoinKind::LeftOuter, None),
-            &arena,
-        )
-        .expect("left outer output columns");
-        assert!(!left_outer[0].nullable);
-        assert!(left_outer[1].nullable);
-
-        let right_outer = opt_output_columns(
-            &join(left.clone(), right.clone(), JoinKind::RightOuter, None),
-            &arena,
-        )
-        .expect("right outer output columns");
-        assert!(right_outer[0].nullable);
-        assert!(!right_outer[1].nullable);
-
-        let full_outer = opt_output_columns(&join(left, right, JoinKind::FullOuter, None), &arena)
-            .expect("full outer output columns");
-        assert!(full_outer[0].nullable);
-        assert!(full_outer[1].nullable);
-    }
-}
-
 pub(super) fn sort_key(expr: ScalarId) -> SortKey {
     SortKey {
         expr,
@@ -791,5 +705,91 @@ fn scan_column_map_inner(expr: &OptExpr, map: &mut HashMap<ColumnId, (String, St
     }
     for child in &expr.children {
         scan_column_map_inner(child, map);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::optimizer::operator::{AggregateOutputLayout, LogicalAggregateOp};
+
+    fn output_column(column_id: ColumnId, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id,
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    #[test]
+    fn is_count_aggregate_result_uses_layout_when_group_key_is_hidden() {
+        let mut arena = ScalarArena::new();
+        let group_id = ColumnId::new_for_test(1);
+        let count_id = ColumnId::new_for_test(2);
+        let group = arena.intern(ScalarNode::ColumnRef(group_id), DataType::Int64, false);
+        let aggregate = OptExpr::new(
+            Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![group],
+                vec![ScalarAggregateSpec {
+                    output_column_id: count_id,
+                    name: "count".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    order_by: vec![],
+                }],
+                AggregateOutputLayout::new(
+                    vec![output_column(group_id, "k")],
+                    vec![output_column(count_id, "count(1)")],
+                ),
+                vec![output_column(count_id, "count(1)")],
+            )),
+            vec![],
+        );
+
+        assert!(is_count_aggregate_result(&aggregate, &arena, count_id));
+    }
+
+    #[test]
+    fn opt_output_columns_widens_outer_join_nullable_side() {
+        let arena = ScalarArena::new();
+        let left_col = output_column(ColumnId::new_for_test(1), "l");
+        let right_col = output_column(ColumnId::new_for_test(2), "r");
+        let left = OptExpr::new(
+            Operator::LogicalValues(crate::optimizer::operator::ValuesOp {
+                columns: vec![left_col.clone()],
+                rows: vec![],
+            }),
+            vec![],
+        );
+        let right = OptExpr::new(
+            Operator::LogicalValues(crate::optimizer::operator::ValuesOp {
+                columns: vec![right_col.clone()],
+                rows: vec![],
+            }),
+            vec![],
+        );
+
+        let left_outer = opt_output_columns(
+            &join(left.clone(), right.clone(), JoinKind::LeftOuter, None),
+            &arena,
+        )
+        .expect("left outer output columns");
+        assert!(!left_outer[0].nullable);
+        assert!(left_outer[1].nullable);
+
+        let right_outer = opt_output_columns(
+            &join(left.clone(), right.clone(), JoinKind::RightOuter, None),
+            &arena,
+        )
+        .expect("right outer output columns");
+        assert!(right_outer[0].nullable);
+        assert!(!right_outer[1].nullable);
+
+        let full_outer = opt_output_columns(&join(left, right, JoinKind::FullOuter, None), &arena)
+            .expect("full outer output columns");
+        assert!(full_outer[0].nullable);
+        assert!(full_outer[1].nullable);
     }
 }

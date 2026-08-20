@@ -83,7 +83,15 @@ pub(crate) struct AnalyticSharedState {
     queue_tracker: Arc<OnceLock<Arc<MemTracker>>>,
 }
 
+#[allow(
+    dead_code,
+    reason = "The full constructor is retained for analytic operator integration tests."
+)]
 impl AnalyticSharedState {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The constructor accepts the complete analytic plan payload at its ownership boundary."
+    )]
     pub(crate) fn new(
         arena: Arc<ExprArena>,
         partition_exprs: Vec<ExprId>,

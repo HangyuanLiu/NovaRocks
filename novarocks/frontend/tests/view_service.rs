@@ -149,9 +149,9 @@ impl ViewEngine for FakeViewEngine {
         _context: &ConnectorRequestContext,
         policy: novarocks_spi::connector::DropPolicy,
     ) -> Result<(), String> {
-        if self.views.lock().unwrap().remove(target).is_some() {
-            Ok(())
-        } else if policy == novarocks_spi::connector::DropPolicy::NoOpIfMissing {
+        if self.views.lock().unwrap().remove(target).is_some()
+            || policy == novarocks_spi::connector::DropPolicy::NoOpIfMissing
+        {
             Ok(())
         } else {
             Err(format!(

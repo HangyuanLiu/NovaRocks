@@ -1536,6 +1536,10 @@ async fn apply_claim(
 /// is already durable, `Some` fails a job whose external effect this frontend
 /// cannot prove. Both are takeovers, so the live lease is the authority and the
 /// record is rebound to the recovering attempt.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Recovery terminalization keeps validated durable ownership inputs explicit."
+)]
 async fn apply_recovered_terminal(
     transaction: &mut dyn WriteTransaction,
     durable: &DurableRecordStore,
@@ -4198,6 +4202,10 @@ async fn apply_metadata_unresolved(
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Metadata transitions keep independently validated durable state inputs explicit."
+)]
 async fn metadata_transition_state(
     transaction: &mut dyn WriteTransaction,
     durable: &DurableRecordStore,
@@ -8390,6 +8398,10 @@ async fn apply_cleanup_transition(
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Cleanup transitions keep independently validated durable state inputs explicit."
+)]
 async fn cleanup_write_transition(
     transaction: &mut dyn WriteTransaction,
     durable: &DurableRecordStore,

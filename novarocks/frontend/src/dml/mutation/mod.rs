@@ -153,6 +153,10 @@ fn write_transaction_spec(prepared: &PreparedMutation, subkind: &str) -> WriteTr
 impl DmlService {
     /// Executes an UPDATE or MERGE already classified by SQLP-5's typed AST.
     /// The statement family comes from the variant, never from `source` text.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub fn try_execute_typed_mutation(
         &self,
         engine: &dyn MutationEngine,
@@ -189,6 +193,10 @@ impl DmlService {
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn admit_mutation(
     statement: &DmlStatement,
     source: &str,

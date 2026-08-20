@@ -702,10 +702,9 @@ mod tests {
             .collect()
     }
 
-    fn append_slot_quad_rows(
-        chunk: Chunk,
-        out: &mut Vec<(Option<i32>, Option<i32>, Option<i32>, Option<i32>)>,
-    ) {
+    type SlotQuad = (Option<i32>, Option<i32>, Option<i32>, Option<i32>);
+
+    fn append_slot_quad_rows(chunk: Chunk, out: &mut Vec<SlotQuad>) {
         let left_k = int32_options_by_slot(&chunk, LEFT_K_SLOT_ID);
         let left_v = int32_options_by_slot(&chunk, LEFT_V_SLOT_ID);
         let right_k = int32_options_by_slot(&chunk, RIGHT_K_SLOT_ID);

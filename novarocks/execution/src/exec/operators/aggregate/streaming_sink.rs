@@ -84,6 +84,10 @@ struct StreamingAggregateRuntimeFilterExecution {
 }
 
 impl AggregateStreamingSinkFactory {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The factory mirrors the frozen aggregate plan contract without an intermediate allocation."
+    )]
     pub(crate) fn new_native(
         node_id: i32,
         arena: Arc<ExprArena>,
@@ -1084,6 +1088,10 @@ impl Drop for AggregateStreamingSinkOperator {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained as a streaming aggregate TopN runtime-filter regression fixture."
+)]
 pub(super) fn aggregate_streaming_topn_test_operator(
     topn_producers: Vec<AggregateTopNRuntimeFilterProducerBinding>,
     session_factory: AggregateTopNProducerSessionFactory,

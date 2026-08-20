@@ -27,11 +27,19 @@ use novarocks_protocol::novarocks as native_proto;
 use super::error::NativeFragmentDecodeError;
 
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(crate) struct NativeSubmissionMetadata {
     backend_num: i32,
     typed_result_sink: bool,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 impl NativeSubmissionMetadata {
     pub(crate) fn new(backend_num: i32, typed_result_sink: bool) -> Self {
         Self {
@@ -49,6 +57,10 @@ impl NativeSubmissionMetadata {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(crate) fn decode_destinations(
     src: &[native_proto::Destination],
 ) -> Result<Vec<FragmentDestination>, NativeFragmentDecodeError> {
@@ -72,6 +84,10 @@ pub(crate) fn decode_destinations(
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(crate) fn decode_scan_range_params(
     src: &native_proto::ScanRangeParams,
 ) -> Result<ScanRangeParams, NativeFragmentDecodeError> {
@@ -81,6 +97,10 @@ pub(crate) fn decode_scan_range_params(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 fn decode_endpoint_at(
     src: &str,
     path: FieldPath,
@@ -89,6 +109,10 @@ fn decode_endpoint_at(
         .map_err(|detail| NativeFragmentDecodeError::invalid_value(path, detail))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(super) fn decode_scan_range_params_at(
     src: &native_proto::ScanRangeParams,
     path: FieldPath,
@@ -109,6 +133,10 @@ pub(super) fn decode_scan_range_params_at(
         .map_err(|error| NativeFragmentDecodeError::invalid_value(path, error.detail()))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 fn unique_id(src: &novarocks_protocol::common::UniqueId) -> UniqueId {
     UniqueId::new(src.hi, src.lo)
 }

@@ -206,6 +206,10 @@ pub(crate) fn columns_equivalent(
         .unwrap_or(false)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) fn passthrough_project_column_remap(
     arena: &ScalarArena,
     items: &[ScalarProjectItem],
@@ -259,6 +263,10 @@ pub(crate) fn remap_sort_keys_through_project(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScanTopNCapability {
     NoOrdering,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     OrderedTopK,
 }
 

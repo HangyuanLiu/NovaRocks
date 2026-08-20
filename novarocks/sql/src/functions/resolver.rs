@@ -174,6 +174,10 @@ fn binding_enforced_for_arity(candidates: &[Signature], n_args: usize) -> bool {
 /// This compatibility wrapper preserves the existing return-type-only API.
 /// It retains the underlying `ResolveError`, so callers using a legacy
 /// fallback can still honor `NoMatchingSignature::binding_enforced`.
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) fn resolve_scalar_function(
     name: &str,
     arg_types: &[DataType],

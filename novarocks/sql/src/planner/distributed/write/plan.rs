@@ -458,8 +458,8 @@ mod tests {
 
     use super::super::change_stream::ChangeStreamWriteDagSpec;
     use super::super::contract::{ConnectorWriteInputBinding, test_support};
-    use super::super::sink::ConnectorWritePlanInput;
-    use crate::analysis::{ExprKind, OutputColumn};
+
+    use crate::analysis::OutputColumn;
     use crate::column_id::ColumnId;
     use crate::planner::distributed::test_support::DistributedPlanDraftBuilder;
     use crate::planner::distributed::{
@@ -467,7 +467,7 @@ mod tests {
     };
     use crate::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 
-    use super::{with_connector_write_sink, with_sql_change_stream_write, with_sql_write_sink};
+    use super::{with_sql_change_stream_write, with_sql_write_sink};
 
     #[test]
     fn sqlx2_write_sink_uses_only_the_sql_contract() {

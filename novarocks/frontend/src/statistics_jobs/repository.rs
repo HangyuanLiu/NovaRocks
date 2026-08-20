@@ -557,6 +557,10 @@ impl StatisticsJobRepository {
         .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The durable job transition keeps its independently validated state inputs explicit."
+    )]
     async fn transition_with_fence(
         &self,
         job_id: Uuid,

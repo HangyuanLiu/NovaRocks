@@ -143,6 +143,10 @@ fn write_transaction_spec(prepared: &PreparedDelete) -> WriteTransactionSpec {
 impl DmlService {
     /// Executes a parser-owned DELETE variant. `source` is carried only for
     /// AST-span slices during preparation; it is never reparsed here.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub fn execute_delete(
         &self,
         engine: &dyn DeleteEngine,

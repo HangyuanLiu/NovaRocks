@@ -49,6 +49,7 @@ pub(super) fn read_i32_le(data: &[u8], offset: &mut usize) -> Result<i32, String
     Ok(value)
 }
 
+#[allow(dead_code, reason = "Retained for runtime-filter codec compatibility.")]
 pub(super) fn read_u32_le(data: &[u8], offset: &mut usize) -> Result<u32, String> {
     Ok(read_i32_le(data, offset)? as u32)
 }

@@ -148,6 +148,10 @@ impl FrontendQueryLifecycleConfig {
         self.terminal_drain_timeout
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for terminal ACK timeout policy consumers compiled in target-gated lifecycle paths."
+    )]
     pub(super) const fn terminal_ack_timeout(self) -> Duration {
         self.terminal_ack_timeout
     }
@@ -940,6 +944,10 @@ pub(super) fn attach_all(
     errors
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The attach failure retains the session so the caller can close it deterministically."
+)]
 fn attach_one(
     transport: &dyn QueryLifecycleTransport,
     participant: &MaterializedParticipant,

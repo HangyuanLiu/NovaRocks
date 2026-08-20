@@ -59,7 +59,15 @@ pub struct RuntimeBitsetFilter {
     min_max: RuntimeMinMaxFilter,
 }
 
+#[allow(
+    dead_code,
+    reason = "Bitset inspection helpers are retained for runtime-filter codec compatibility."
+)]
 impl RuntimeBitsetFilter {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The compact bitset filter is decoded directly from its wire representation."
+    )]
     pub(in crate::exec::runtime_filter) fn new(
         filter_id: i32,
         slot_id: SlotId,
@@ -586,144 +594,6 @@ fn fill_bitset_from_arrays(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use arrow::array::{ArrayRef, Decimal128Array, StringArray, TimestampMicrosecondArray};
-
-    use super::*;
-
-    fn decimal_type(width: RuntimeDecimalWidth, precision: u8, scale: i8) -> RuntimeFilterType {
-        RuntimeFilterType::Decimal {
-            width,
-            precision: Some(precision),
-            scale: Some(scale),
-        }
-    }
-
-    fn decimal_array(values: Vec<Option<i128>>, precision: u8, scale: i8) -> ArrayRef {
-        Arc::new(
-            Decimal128Array::from(values)
-                .with_precision_and_scale(precision, scale)
-                .expect("decimal precision and scale"),
-        )
-    }
-
-    fn min_max_for(ltype: RuntimeFilterType) -> RuntimeMinMaxFilter {
-        RuntimeMinMaxFilter::full_range(ltype).expect("runtime min/max full range")
-    }
-
-    #[test]
-    fn decimal64_compact_domain_builds_and_filters() {
-        let scale = 2;
-        let ltype = decimal_type(RuntimeDecimalWidth::Decimal64, 18, scale);
-        let build = decimal_array(
-            vec![Some(100_i128), Some(101_i128), Some(103_i128)],
-            18,
-            scale,
-        );
-        let filter = maybe_build_runtime_bitset_filter(
-            7,
-            SlotId(3),
-            ltype,
-            0,
-            16,
-            &[build],
-            min_max_for(ltype),
-        )
-        .expect("build decimal64 bitset")
-        .expect("decimal64 compact domain should use bitset");
-
-        let probe = decimal_array(
-            vec![
-                Some(99_i128),
-                Some(100_i128),
-                Some(101_i128),
-                Some(102_i128),
-                Some(103_i128),
-                None,
-            ],
-            18,
-            scale,
-        );
-        let mut keep = vec![true; probe.len()];
-        apply_bitset_filter(&filter, &ltype, filter.has_null(), probe, &mut keep)
-            .expect("filter decimal64 probe");
-
-        assert_eq!(keep, vec![false, true, true, false, true, false]);
-    }
-
-    #[test]
-    fn decimal32_compact_domain_builds_and_filters() {
-        let scale = 1;
-        let ltype = decimal_type(RuntimeDecimalWidth::Decimal32, 9, scale);
-        let build = decimal_array(
-            vec![Some(-12_i128), Some(-10_i128), Some(-9_i128)],
-            9,
-            scale,
-        );
-        let filter = maybe_build_runtime_bitset_filter(
-            8,
-            SlotId(4),
-            ltype,
-            0,
-            16,
-            &[build],
-            min_max_for(ltype),
-        )
-        .expect("build decimal32 bitset")
-        .expect("decimal32 compact domain should use bitset");
-
-        let probe = decimal_array(
-            vec![
-                Some(-13_i128),
-                Some(-12_i128),
-                Some(-11_i128),
-                Some(-10_i128),
-                Some(-9_i128),
-                None,
-            ],
-            9,
-            scale,
-        );
-        let mut keep = vec![true; probe.len()];
-        apply_bitset_filter(&filter, &ltype, filter.has_null(), probe, &mut keep)
-            .expect("filter decimal32 probe");
-
-        assert_eq!(keep, vec![false, true, false, true, true, false]);
-    }
-
-    #[test]
-    fn datetime_and_varchar_still_fall_back_to_bloom() {
-        let datetime = Arc::new(TimestampMicrosecondArray::from(vec![Some(1_000_i64)])) as ArrayRef;
-        let datetime_filter = maybe_build_runtime_bitset_filter(
-            9,
-            SlotId(5),
-            RuntimeFilterType::TimestampMicros,
-            0,
-            1,
-            &[datetime],
-            min_max_for(RuntimeFilterType::TimestampMicros),
-        )
-        .expect("build datetime bitset fallback");
-        assert!(datetime_filter.is_none());
-
-        let varchar = Arc::new(StringArray::from(vec![Some("a"), Some("b")])) as ArrayRef;
-        let varchar_filter = maybe_build_runtime_bitset_filter(
-            10,
-            SlotId(6),
-            RuntimeFilterType::Utf8,
-            0,
-            2,
-            &[varchar],
-            min_max_for(RuntimeFilterType::Utf8),
-        )
-        .expect("build varchar bitset fallback");
-        assert!(varchar_filter.is_none());
-    }
-}
-
 fn apply_bitset_filter(
     filter: &RuntimeBitsetFilter,
     ltype: &RuntimeFilterType,
@@ -949,4 +819,142 @@ fn apply_bitset_filter(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Decimal128Array, StringArray, TimestampMicrosecondArray};
+
+    use super::*;
+
+    fn decimal_type(width: RuntimeDecimalWidth, precision: u8, scale: i8) -> RuntimeFilterType {
+        RuntimeFilterType::Decimal {
+            width,
+            precision: Some(precision),
+            scale: Some(scale),
+        }
+    }
+
+    fn decimal_array(values: Vec<Option<i128>>, precision: u8, scale: i8) -> ArrayRef {
+        Arc::new(
+            Decimal128Array::from(values)
+                .with_precision_and_scale(precision, scale)
+                .expect("decimal precision and scale"),
+        )
+    }
+
+    fn min_max_for(ltype: RuntimeFilterType) -> RuntimeMinMaxFilter {
+        RuntimeMinMaxFilter::full_range(ltype).expect("runtime min/max full range")
+    }
+
+    #[test]
+    fn decimal64_compact_domain_builds_and_filters() {
+        let scale = 2;
+        let ltype = decimal_type(RuntimeDecimalWidth::Decimal64, 18, scale);
+        let build = decimal_array(
+            vec![Some(100_i128), Some(101_i128), Some(103_i128)],
+            18,
+            scale,
+        );
+        let filter = maybe_build_runtime_bitset_filter(
+            7,
+            SlotId(3),
+            ltype,
+            0,
+            16,
+            &[build],
+            min_max_for(ltype),
+        )
+        .expect("build decimal64 bitset")
+        .expect("decimal64 compact domain should use bitset");
+
+        let probe = decimal_array(
+            vec![
+                Some(99_i128),
+                Some(100_i128),
+                Some(101_i128),
+                Some(102_i128),
+                Some(103_i128),
+                None,
+            ],
+            18,
+            scale,
+        );
+        let mut keep = vec![true; probe.len()];
+        apply_bitset_filter(&filter, &ltype, filter.has_null(), probe, &mut keep)
+            .expect("filter decimal64 probe");
+
+        assert_eq!(keep, vec![false, true, true, false, true, false]);
+    }
+
+    #[test]
+    fn decimal32_compact_domain_builds_and_filters() {
+        let scale = 1;
+        let ltype = decimal_type(RuntimeDecimalWidth::Decimal32, 9, scale);
+        let build = decimal_array(
+            vec![Some(-12_i128), Some(-10_i128), Some(-9_i128)],
+            9,
+            scale,
+        );
+        let filter = maybe_build_runtime_bitset_filter(
+            8,
+            SlotId(4),
+            ltype,
+            0,
+            16,
+            &[build],
+            min_max_for(ltype),
+        )
+        .expect("build decimal32 bitset")
+        .expect("decimal32 compact domain should use bitset");
+
+        let probe = decimal_array(
+            vec![
+                Some(-13_i128),
+                Some(-12_i128),
+                Some(-11_i128),
+                Some(-10_i128),
+                Some(-9_i128),
+                None,
+            ],
+            9,
+            scale,
+        );
+        let mut keep = vec![true; probe.len()];
+        apply_bitset_filter(&filter, &ltype, filter.has_null(), probe, &mut keep)
+            .expect("filter decimal32 probe");
+
+        assert_eq!(keep, vec![false, true, false, true, true, false]);
+    }
+
+    #[test]
+    fn datetime_and_varchar_still_fall_back_to_bloom() {
+        let datetime = Arc::new(TimestampMicrosecondArray::from(vec![Some(1_000_i64)])) as ArrayRef;
+        let datetime_filter = maybe_build_runtime_bitset_filter(
+            9,
+            SlotId(5),
+            RuntimeFilterType::TimestampMicros,
+            0,
+            1,
+            &[datetime],
+            min_max_for(RuntimeFilterType::TimestampMicros),
+        )
+        .expect("build datetime bitset fallback");
+        assert!(datetime_filter.is_none());
+
+        let varchar = Arc::new(StringArray::from(vec![Some("a"), Some("b")])) as ArrayRef;
+        let varchar_filter = maybe_build_runtime_bitset_filter(
+            10,
+            SlotId(6),
+            RuntimeFilterType::Utf8,
+            0,
+            2,
+            &[varchar],
+            min_max_for(RuntimeFilterType::Utf8),
+        )
+        .expect("build varchar bitset fallback");
+        assert!(varchar_filter.is_none());
+    }
 }

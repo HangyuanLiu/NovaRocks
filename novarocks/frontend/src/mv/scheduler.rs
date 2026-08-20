@@ -87,6 +87,10 @@ pub(crate) enum ScheduledRefreshReason {
 pub(crate) struct ScheduledRefreshRequest {
     pub(crate) definition: StoredMvDefinition,
     pub(crate) target: MvTarget,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) reason: ScheduledRefreshReason,
 }
 
@@ -95,6 +99,10 @@ pub(crate) struct ScheduledRefreshRequest {
 /// run the existing frontend refresh lifecycle.  They return only a typed
 /// terminal result to the scheduler; scheduling policy never inspects a
 /// display string from that work.
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) trait ScheduledRefreshRunner: Send + Sync {
     fn execute(&self, request: ScheduledRefreshRequest) -> ScheduledRefreshDisposition;
 }
@@ -288,10 +296,18 @@ impl FrontendMvScheduler {
         Ok(decision)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn pending_len(&self) -> usize {
         self.queue.len()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn running_len(&self) -> usize {
         self.running_mv_ids.len()
     }

@@ -40,7 +40,7 @@ pub enum PolicyField {
     MaxRetries,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GraphValidationErrorKind {
+pub(crate) enum GraphValidationErrorKind {
     ChannelIdMismatch {
         map_key: ChannelId,
         object_id: ChannelId,
@@ -93,7 +93,7 @@ pub enum GraphValidationErrorKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GraphValidationError {
+pub(crate) struct GraphValidationError {
     pub channel_id: Option<ChannelId>,
     pub binding_id: Option<BindingId>,
     pub kind: GraphValidationErrorKind,
@@ -125,7 +125,7 @@ impl ActivationContract for ConsumerActivation {
 }
 
 impl<A: ActivationContract> RuntimeFilterGraphData<A> {
-    pub fn validate(&self) -> Result<(), GraphValidationError> {
+    pub(crate) fn validate(&self) -> Result<(), GraphValidationError> {
         self.validate_channels()?;
         self.validate_bindings()?;
         self.validate_channel_relationships()

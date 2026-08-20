@@ -328,7 +328,8 @@ mod tests {
         ];
 
         for (func, input_type, expected_intermediate, expected_final) in cases {
-            let kernels = build_kernel_set(&[func.clone()], &[input_type]).expect(&func.name);
+            let kernels =
+                build_kernel_set(std::slice::from_ref(&func), &[input_type]).expect(&func.name);
             assert_eq!(
                 kernels.entries[0].output_type(true),
                 expected_intermediate,

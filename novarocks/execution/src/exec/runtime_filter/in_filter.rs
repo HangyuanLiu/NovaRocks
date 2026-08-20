@@ -999,6 +999,10 @@ where
     Some((min.to_vec(), max.to_vec()))
 }
 
+#[allow(
+    dead_code,
+    reason = "In-filter codec helpers are retained for runtime-filter compatibility."
+)]
 impl RuntimeInFilter {
     pub(in crate::exec::runtime_filter) fn new(
         filter_id: i32,
