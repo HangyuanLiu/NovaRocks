@@ -25,21 +25,9 @@ use novarocks_frontend::deployment::{
     FeDeploymentViewSource, FeDeploymentViewSourceErrorKind, SqliteSingleFeDeploymentViewSource,
 };
 use novarocks_spi::state_store::FeDeploymentView;
-use novarocks_state_store::{StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig};
 
 const EXPECTED_REVISION_HEX: &str =
     "e9864ac5f4d17bc604c7273b2246e98ddd2c66bfa39fc0d7bb1337087f66e387";
-
-fn sqlite_config(cluster_id: &str, deployment_owner: &str) -> StateStoreConfig {
-    StateStoreConfig {
-        cluster_id: cluster_id.to_owned(),
-        limits: StateStoreLimitOverrides::default(),
-        provider: StateStoreProviderConfig::Sqlite {
-            path: "/tmp/novarocks-state-store.sqlite".into(),
-            deployment_owner: deployment_owner.to_owned(),
-        },
-    }
-}
 
 fn ready<T>(future: impl Future<Output = T>) -> T {
     let waker = Waker::noop();
@@ -63,11 +51,8 @@ fn hexadecimal(bytes: &[u8]) -> String {
 }
 
 fn sqlite_source(cluster_id: &str, deployment_owner: &str) -> SqliteSingleFeDeploymentViewSource {
-    SqliteSingleFeDeploymentViewSource::try_from_state_store_config(&sqlite_config(
-        cluster_id,
-        deployment_owner,
-    ))
-    .expect("valid SQLite configuration must create a deployment source")
+    SqliteSingleFeDeploymentViewSource::new(cluster_id, deployment_owner)
+        .expect("valid deployment identity must create a source")
 }
 
 #[test]
@@ -117,10 +102,8 @@ fn sqlite_revision_changes_with_cluster_or_owner() {
 }
 
 #[test]
-fn rejects_invalid_sqlite_config() {
-    let error = match SqliteSingleFeDeploymentViewSource::try_from_state_store_config(
-        &sqlite_config("cluster-a", " "),
-    ) {
+fn rejects_invalid_deployment_identity() {
+    let error = match SqliteSingleFeDeploymentViewSource::new("cluster-a", " ") {
         Ok(_) => panic!("invalid SQLite configuration must be rejected"),
         Err(error) => error,
     };
@@ -132,22 +115,14 @@ fn rejects_invalid_sqlite_config() {
 }
 
 #[test]
-fn rejects_deferred_provider_without_io() {
-    let config = StateStoreConfig {
-        cluster_id: "cluster-a".to_owned(),
-        limits: StateStoreLimitOverrides::default(),
-        provider: StateStoreProviderConfig::Mysql {
-            database: "novarocks_control_plane".to_owned(),
-        },
-    };
-
-    let error = match SqliteSingleFeDeploymentViewSource::try_from_state_store_config(&config) {
-        Ok(_) => panic!("deferred provider must be rejected before any I/O"),
+fn rejects_empty_cluster_without_io() {
+    let error = match SqliteSingleFeDeploymentViewSource::new(" ", "fe-a") {
+        Ok(_) => panic!("empty deployment identity must be rejected before any I/O"),
         Err(error) => error,
     };
 
     assert_eq!(
         error.kind(),
-        FeDeploymentViewSourceErrorKind::UnsupportedProvider
+        FeDeploymentViewSourceErrorKind::InvalidConfiguration
     );
 }

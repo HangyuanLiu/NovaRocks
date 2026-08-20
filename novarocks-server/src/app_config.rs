@@ -18,11 +18,11 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer};
 use std::path::{Path, PathBuf};
 
-use novarocks_state_store::StateStoreLimitOverrides;
-use novarocks_state_store::config::{
+use crate::state_store_config::{
     FoundationDbClientConfig, MySqlClientConfig, MySqlTlsMode, StateStoreAppConfig,
     StateStoreConfig, StateStoreProviderConfig,
 };
+use crate::state_store_limits::StateStoreLimitOverrides;
 use novarocks_types::ClusterRole;
 use uuid::Uuid;
 
@@ -1710,7 +1710,7 @@ impl Default for CacheConfig {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_state_store::config::StateStoreProviderConfig;
+    use crate::state_store_config::StateStoreProviderConfig;
 
     use super::{
         DEFAULT_MEM_LIMIT_SPEC, NovaRocksConfig, RuntimeConfig, StandaloneServerConfig,

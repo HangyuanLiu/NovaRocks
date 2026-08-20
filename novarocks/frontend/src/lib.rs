@@ -41,6 +41,7 @@ mod query_lifecycle_error;
 pub mod runtime;
 pub mod runtime_filter;
 mod server;
+pub mod state_store;
 pub mod statistics;
 pub mod statistics_jobs;
 pub mod system_catalog;
@@ -70,6 +71,10 @@ pub use query_lifecycle_error::{QueryLifecycleError, QueryLifecycleErrorCode};
 pub use server::{
     FrontendServerConfig, build_frontend_query_session_factory,
     open_frontend_application_for_server, run_frontend_server, run_frontend_server_until_shutdown,
+};
+pub use state_store::{
+    OperationId, RunFailure, RunSuccess, StateStoreHost, StateStoreHostInput,
+    StateStoreProviderRegistry, derive_transaction_id, run_side_effect_free,
 };
 pub use statistics::FrontendStatisticsService;
 pub use system_catalog::SystemCatalogService;

@@ -23,11 +23,9 @@ use tokio::runtime::Handle;
 
 use crate::query_execution::dml::ctas::CtasEngine;
 use crate::query_execution::service::QueryExecutionService;
+use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
-use novarocks_state_store::{
-    StateStoreHost, StateStoreHostConfig, builtin_state_store_provider_registry,
-};
 
 use crate::catalog_application::FrontendCatalogApplicationPort;
 use crate::catalog_attachment::CatalogAttachmentRepository;
@@ -37,7 +35,6 @@ use crate::coordination::FrontendCoordinationRuntime;
 use crate::coordinator::{
     BackendQueryActivity, FrontendDistributedQueryCoordinator, QueryLifecycleConvergenceReader,
 };
-use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
 use crate::dml::recovery::DmlRecoveryController;
 use crate::dml::{DmlService, StateStoreOperationJournal};
 use crate::mv::maintenance::MaintenanceCoordinatorConfig;
@@ -313,16 +310,36 @@ impl FrontendExecutionConfig {
 
 impl FrontendApplicationHost {
     pub async fn open(
-        config: Option<StateStoreHostConfig>,
+        state_store: Option<StateStoreHostInput>,
         execution: FrontendExecutionConfig,
         backend: ClusterBackendOpenConfig,
         data_runtime: Handle,
     ) -> Result<Self, FrontendApplicationError> {
-        Self::open_with_factories(config, execution, backend, Vec::new(), data_runtime).await
+        Self::open_with_factories(state_store, execution, backend, Vec::new(), data_runtime).await
     }
 
     pub async fn open_with_factories(
-        config: Option<StateStoreHostConfig>,
+        state_store: Option<StateStoreHostInput>,
+        execution: FrontendExecutionConfig,
+        backend: ClusterBackendOpenConfig,
+        connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
+        data_runtime: Handle,
+    ) -> Result<Self, FrontendApplicationError> {
+        let registry = StateStoreProviderRegistry::new();
+        Self::open_with_factories_and_state_store_registry(
+            state_store,
+            &registry,
+            execution,
+            backend,
+            connector_factories,
+            data_runtime,
+        )
+        .await
+    }
+
+    pub async fn open_with_factories_and_state_store_registry(
+        state_store: Option<StateStoreHostInput>,
+        state_store_registry: &StateStoreProviderRegistry,
         execution: FrontendExecutionConfig,
         backend: ClusterBackendOpenConfig,
         connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
@@ -366,8 +383,10 @@ impl FrontendApplicationHost {
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
         };
 
-        if let Some(config) = config
-            && let Err(error) = host.open_configured(config).await
+        if let Some(state_store) = state_store
+            && let Err(error) = host
+                .open_configured(state_store, state_store_registry)
+                .await
         {
             return Err(host.cleanup_open_error(error).await);
         }
@@ -982,31 +1001,18 @@ impl FrontendApplicationHost {
 
     async fn open_configured(
         &mut self,
-        config: StateStoreHostConfig,
+        input: StateStoreHostInput,
+        registry: &StateStoreProviderRegistry,
     ) -> Result<(), FrontendApplicationError> {
-        let source = SqliteSingleFeDeploymentViewSource::try_from_state_store_config(
-            &config.state_store.store,
-        )
-        .map_err(|error| {
-            FrontendApplicationError::new(FrontendApplicationErrorKind::DeploymentSource, error)
-        })?;
-        let deployment = source.snapshot().await.map_err(|error| {
-            FrontendApplicationError::new(FrontendApplicationErrorKind::DeploymentSource, error)
-        })?;
-        let registry = builtin_state_store_provider_registry().map_err(|error| {
-            FrontendApplicationError::new(FrontendApplicationErrorKind::StateStoreHost, error)
-        })?;
         self.state_store_host = Some(
-            StateStoreHost::open(
-                &registry,
-                config,
-                deployment,
-                Instant::now() + STATE_STORE_OPEN_TIMEOUT,
-            )
-            .await
-            .map_err(|error| {
-                FrontendApplicationError::new(FrontendApplicationErrorKind::StateStoreHost, error)
-            })?,
+            StateStoreHost::open(registry, input, Instant::now() + STATE_STORE_OPEN_TIMEOUT)
+                .await
+                .map_err(|error| {
+                    FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::StateStoreHost,
+                        error,
+                    )
+                })?,
         );
 
         Ok(())
@@ -1189,17 +1195,17 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::time::{Duration, Instant};
 
-    use async_trait::async_trait;
-    use bytes::Bytes;
-    use novarocks_spi::state_store::{
-        FeDeploymentView, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
-        StateStoreProviderAccessMode, StateStoreProviderDescriptor, StateStoreProviderFactory,
-        StateStoreProviderInstance,
+    use crate::state_store::{
+        StateStoreHost, StateStoreProviderRegistration, StateStoreProviderRegistry,
+        testing::{
+            TEST_STATE_STORE_PROVIDER_ID, input as test_state_store_input,
+            registry as test_state_store_registry,
+        },
     };
-    use novarocks_state_store::{
-        SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHost,
-        StateStoreHostConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
-        StateStoreProviderRegistration, StateStoreProviderRegistry,
+    use async_trait::async_trait;
+    use novarocks_spi::state_store::{
+        StateStoreError, StateStoreErrorKind, StateStoreOpenRequest, StateStoreProviderAccessMode,
+        StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
     };
 
     use super::{
@@ -1207,10 +1213,9 @@ mod tests {
         FrontendExecutionConfig,
     };
 
-    const SECRET_CONFIG_VALUE: &str = "client-secret-must-not-leak";
     const DESCRIPTOR: StateStoreProviderDescriptor = StateStoreProviderDescriptor::new(
-        SQLITE_STATE_STORE_PROVIDER_ID,
-        StateStoreProviderAccessMode::ExclusiveSingleFrontend,
+        TEST_STATE_STORE_PROVIDER_ID,
+        StateStoreProviderAccessMode::SharedMultiFrontend,
         novarocks_spi::state_store::MAX_KEY_BYTES,
     );
 
@@ -1239,35 +1244,15 @@ mod tests {
 
     #[tokio::test]
     async fn frontend_stringification_preserves_host_primary_and_cleanup_context() {
-        let temp = tempfile::tempdir().expect("temporary host diagnostics directory");
         let mut registry = StateStoreProviderRegistry::new();
         registry
-            .register(StateStoreProviderRegistration::available(
-                SQLITE_STATE_STORE_PROVIDER_ID,
-                novarocks_spi::state_store::MAX_KEY_BYTES,
-                |_| Ok(Box::new(FailingFactory)),
-            ))
+            .register(StateStoreProviderRegistration::new(DESCRIPTOR, |_| {
+                Ok(Box::new(FailingFactory))
+            }))
             .expect("register diagnostic provider");
         let host_error = match StateStoreHost::open(
             &registry,
-            StateStoreHostConfig {
-                state_store: StateStoreAppConfig {
-                    store: StateStoreConfig {
-                        cluster_id: "diagnostic-cluster".to_owned(),
-                        limits: StateStoreLimitOverrides::default(),
-                        provider: StateStoreProviderConfig::Sqlite {
-                            path: temp.path().join("state-store.sqlite"),
-                            deployment_owner: SECRET_CONFIG_VALUE.to_owned(),
-                        },
-                    },
-                    mysql_client: None,
-                },
-                foundationdb_client: None,
-            },
-            FeDeploymentView {
-                active_fe_count: NonZeroUsize::new(1).unwrap(),
-                topology_revision: Bytes::from_static(b"topology-r1"),
-            },
+            test_state_store_input("diagnostic-cluster"),
             Instant::now() + Duration::from_secs(1),
         )
         .await
@@ -1285,29 +1270,15 @@ mod tests {
         let diagnostic = frontend_error.to_string();
 
         assert!(diagnostic.contains("StateStoreHost"));
-        assert!(diagnostic.contains("Open (sqlite)"));
+        assert!(diagnostic.contains("Open (frontend-unit-test)"));
         assert!(diagnostic.contains("injected provider primary failure"));
         assert!(diagnostic.contains("injected provider cleanup failure"));
-        assert!(!diagnostic.contains(SECRET_CONFIG_VALUE));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_bootstraps_and_stops_catalog_projection_with_state_store() {
-        let temp = tempfile::tempdir().expect("temporary catalog controller directory");
-        let state_store = StateStoreHostConfig {
-            state_store: StateStoreAppConfig {
-                store: StateStoreConfig {
-                    cluster_id: "catalog-controller-host-test".to_string(),
-                    limits: StateStoreLimitOverrides::default(),
-                    provider: StateStoreProviderConfig::Sqlite {
-                        path: temp.path().join("state-store.sqlite"),
-                        deployment_owner: "catalog-controller-host-test".to_string(),
-                    },
-                },
-                mysql_client: None,
-            },
-            foundationdb_client: None,
-        };
+        let state_store = test_state_store_input("catalog-controller-host-test");
+        let registry = test_state_store_registry();
         let backend = crate::topology::ClusterBackendOpenConfig::new(
             novarocks_types::ClusterRole::AllInOne,
             Vec::new(),
@@ -1316,14 +1287,16 @@ mod tests {
             Duration::from_secs(1),
         )
         .expect("valid all-in-one backend config");
-        let host = FrontendApplicationHost::open(
+        let host = FrontendApplicationHost::open_with_factories_and_state_store_registry(
             Some(state_store),
+            &registry,
             FrontendExecutionConfig::new(
                 "127.0.0.1",
                 0,
                 NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
             ),
             backend,
+            Vec::new(),
             tokio::runtime::Handle::current(),
         )
         .await

@@ -23,6 +23,10 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 
+use crate::state_store::OperationId;
+use crate::state_store::coordination::{
+    AcquireOutcome, AttemptId, CoordinationError, CoordinationErrorKind, LeaseGuard, WriteAdmission,
+};
 use async_trait::async_trait;
 use novarocks_spi::connector::{
     ConnectorClusterIdentity, ConnectorError, ConnectorEstablishedWriteFence,
@@ -31,10 +35,6 @@ use novarocks_spi::connector::{
     ConnectorWriteTargetRef,
 };
 use novarocks_spi::state_store::{StateStore, TransactionId, WriteTransaction};
-use novarocks_state_store::OperationId;
-use novarocks_state_store::coordination::{
-    AcquireOutcome, AttemptId, CoordinationError, CoordinationErrorKind, LeaseGuard, WriteAdmission,
-};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
@@ -535,7 +535,7 @@ impl DmlExternalFenceProposal {
     reason = "Preserves the frozen DML error contract without a broad ABI migration."
 )]
 fn external_fence_generation(
-    token: &novarocks_state_store::coordination::FencingToken,
+    token: &crate::state_store::coordination::FencingToken,
     coordination_attempt_id: Uuid,
 ) -> Result<DmlExternalFenceGeneration, DmlError> {
     Ok(DmlExternalFenceGeneration {
@@ -1463,9 +1463,7 @@ fn map_coordination_error(error: CoordinationError) -> DmlError {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_state_store::coordination::{
-        ControlPlaneIncarnation, FencingToken, ResourceEpoch,
-    };
+    use crate::state_store::coordination::{ControlPlaneIncarnation, FencingToken, ResourceEpoch};
 
     use super::*;
 

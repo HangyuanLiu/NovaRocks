@@ -35,7 +35,7 @@ write_package() {
 write_fixture() {
   local root="$1"
   mkdir -p "$root"
-  for package in novarocks-connector-iceberg novarocks-server novarocks-frontend novarocks-backend novarocks-state-store novarocks-fs novarocks-spi; do
+  for package in novarocks-connector-iceberg novarocks-server novarocks-frontend novarocks-backend novarocks-state-store-sqlite novarocks-fs novarocks-spi; do
     write_package "$root" "$package"
   done
   cat >"$root/Cargo.toml" <<'EOF'
@@ -45,7 +45,7 @@ members = [
   "novarocks-server",
   "novarocks-frontend",
   "novarocks-backend",
-  "novarocks-state-store",
+  "novarocks-state-store-sqlite",
   "novarocks-fs",
   "novarocks-spi",
 ]
@@ -61,7 +61,7 @@ EOF
 
 [dependencies]
 novarocks-connector-iceberg = { path = "../novarocks-connector-iceberg" }
-novarocks-state-store = { path = "../novarocks-state-store" }
+novarocks-state-store-sqlite = { path = "../novarocks-state-store-sqlite" }
 EOF
 }
 

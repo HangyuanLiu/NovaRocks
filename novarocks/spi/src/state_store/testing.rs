@@ -34,6 +34,10 @@ use super::{
     StateStoreMetrics, StateStoreMetricsSnapshot, StateStoreOperation, StateStoreOutcome,
     StoreIdentity, StoreRevision, TransactionId, Value, VersionToken, WriteTransaction,
 };
+use super::{
+    StateStoreOpenRequest, StateStoreProviderDescriptor, StateStoreProviderFactory,
+    StateStoreProviderInstance, StateStoreProviderLifecycle,
+};
 
 const IN_MEMORY_PROVIDER_ID: super::StateStoreProviderId =
     super::StateStoreProviderId::new("in-memory-test");
@@ -139,6 +143,74 @@ impl InMemoryStateStore {
     }
 }
 
+/// Test-only provider adapter for Frontend consumer tests. It deliberately
+/// lives with the SPI reference store so consumer crates never depend on a
+/// concrete production provider merely to exercise host lifecycle behavior.
+pub struct InMemoryStateStoreProviderFactory {
+    descriptor: StateStoreProviderDescriptor,
+}
+
+impl InMemoryStateStoreProviderFactory {
+    pub const fn new(descriptor: StateStoreProviderDescriptor) -> Self {
+        Self { descriptor }
+    }
+}
+
+#[async_trait]
+impl StateStoreProviderFactory for InMemoryStateStoreProviderFactory {
+    fn descriptor(&self) -> &StateStoreProviderDescriptor {
+        &self.descriptor
+    }
+
+    async fn open(
+        self: Box<Self>,
+        request: StateStoreOpenRequest,
+    ) -> Result<Box<dyn StateStoreProviderInstance>, StateStoreError> {
+        if std::time::Instant::now() >= request.deadline {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::DeadlineExceeded,
+                "in-memory test provider deadline exceeded",
+            ));
+        }
+        Ok(Box::new(InMemoryStateStoreProviderInstance {
+            descriptor: self.descriptor,
+            state_store: Some(Arc::new(InMemoryStateStore::with_limits(
+                request.cluster_id,
+                request.limits,
+            ))),
+        }))
+    }
+}
+
+struct InMemoryStateStoreProviderInstance {
+    descriptor: StateStoreProviderDescriptor,
+    state_store: Option<Arc<dyn StateStore>>,
+}
+
+#[async_trait]
+impl StateStoreProviderInstance for InMemoryStateStoreProviderInstance {
+    fn descriptor(&self) -> &StateStoreProviderDescriptor {
+        &self.descriptor
+    }
+
+    fn lifecycle(&self) -> StateStoreProviderLifecycle {
+        if self.state_store.is_some() {
+            StateStoreProviderLifecycle::Ready
+        } else {
+            StateStoreProviderLifecycle::Stopped
+        }
+    }
+
+    fn state_store(&self) -> Option<Arc<dyn StateStore>> {
+        self.state_store.clone()
+    }
+
+    async fn shutdown(&mut self, _deadline: std::time::Instant) -> Result<(), StateStoreError> {
+        self.state_store.take();
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl StateStore for InMemoryStateStore {
     fn limits(&self) -> &StateStoreLimits {
@@ -172,21 +244,10 @@ impl StateStore for InMemoryStateStore {
         let started = std::time::Instant::now();
         let (base_revision, snapshot) = self.begin_snapshot();
         let mut inner = self.inner.lock().expect("in-memory state store");
-        if inner.commits.contains_key(&transaction_id) {
-            let error = StateStoreError::new(
-                StateStoreErrorKind::Conflict,
-                "transaction id is already reserved",
-            );
-            self.metrics.record_operation(
-                StateStoreOperation::Begin,
-                StateStoreOutcome::Error,
-                started.elapsed(),
-            );
-            return Err(error);
-        }
         inner
             .commits
-            .insert(transaction_id, CommitResolution::Unresolved);
+            .entry(transaction_id)
+            .or_insert(CommitResolution::Unresolved);
         drop(inner);
         self.metrics.record_operation(
             StateStoreOperation::Begin,
@@ -613,6 +674,18 @@ fn apply_commit(
     base_revision: u64,
     mutations: &[Mutation],
 ) -> CommitOutcome {
+    match inner.commits.get(&transaction_id) {
+        Some(CommitResolution::Committed(receipt)) => {
+            return CommitOutcome::Committed(receipt.clone());
+        }
+        Some(CommitResolution::NotCommitted) => {
+            return CommitOutcome::DefiniteFailure(StateStoreError::new(
+                StateStoreErrorKind::InvalidRequest,
+                "transaction id is terminally not committed",
+            ));
+        }
+        Some(CommitResolution::Unresolved) | None => {}
+    }
     if inner.revision != base_revision {
         inner
             .commits

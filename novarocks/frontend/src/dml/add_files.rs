@@ -1584,21 +1584,23 @@ mod tests {
     /// operation without authority cannot dispatch.
     fn coordination() -> Arc<crate::coordination::FrontendCoordinationRuntime> {
         let dir = tempfile::tempdir().expect("temp dir").keep();
-        let registry = novarocks_state_store::builtin_state_store_provider_registry()
+        let registry = crate::state_store::testing::builtin_state_store_provider_registry()
             .expect("provider registry");
         let runtime = shared_runtime();
         let host = runtime
-            .block_on(novarocks_state_store::StateStoreHost::open(
+            .block_on(crate::state_store::testing::StateStoreHost::open(
                 &registry,
-                novarocks_state_store::StateStoreHostConfig {
-                    state_store: novarocks_state_store::StateStoreAppConfig {
-                        store: novarocks_state_store::StateStoreConfig {
+                crate::state_store::testing::StateStoreHostConfig {
+                    state_store: crate::state_store::testing::StateStoreAppConfig {
+                        store: crate::state_store::testing::StateStoreConfig {
                             cluster_id: "add-files-focused-test".to_string(),
-                            limits: novarocks_state_store::StateStoreLimitOverrides::default(),
-                            provider: novarocks_state_store::StateStoreProviderConfig::Sqlite {
-                                path: dir.join("state.sqlite"),
-                                deployment_owner: "add-files-fe".to_string(),
-                            },
+                            limits: crate::state_store::testing::StateStoreLimitOverrides::default(
+                            ),
+                            provider:
+                                crate::state_store::testing::StateStoreProviderConfig::Sqlite {
+                                    path: dir.join("state.sqlite"),
+                                    deployment_owner: "add-files-fe".to_string(),
+                                },
                         },
                         mysql_client: None,
                     },

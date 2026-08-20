@@ -53,11 +53,13 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, ConnectorTableHandle, ConnectorTableObjectId,
 };
 use novarocks_spi::state_store::{FeDeploymentView, StateStore};
-use novarocks_state_store::OperationId;
-use novarocks_state_store::coordination::{
+mod common;
+use common::state_store_fixture as state_store_test;
+use state_store_test::OperationId;
+use state_store_test::coordination::{
     ClockHealth, CoordinationError, IncarnationGate, LeaseClock, LeaseManager,
 };
-use novarocks_state_store::{
+use state_store_test::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
@@ -252,7 +254,7 @@ fn context() -> MaintenanceRequestContext<'static> {
 
 fn sqlite_config(path: &Path) -> StateStoreConfig {
     StateStoreConfig {
-        cluster_id: "table-maintenance-service-test".to_string(),
+        cluster_id: format!("table-maintenance-service-test-{}", path.display()),
         limits: StateStoreLimitOverrides::default(),
         provider: StateStoreProviderConfig::Sqlite {
             path: path.to_path_buf(),

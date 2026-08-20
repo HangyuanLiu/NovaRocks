@@ -16,11 +16,10 @@
 // under the License.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use novarocks_frontend::StateStoreHost;
 use novarocks_frontend::dml::{
     CoordinatedWriteReport, DmlErrorKind, DmlService, OperationKind, OperationState,
     OperationTarget, StateStoreOperationJournal, WriteExecutor, WriteTransactionSpec,
@@ -29,11 +28,10 @@ use novarocks_spi::connector::{
     ConnectorWriteAbortOutcome, ConnectorWriteReceipt, ExternalMutationEffect,
     ExternalMutationFinalization, ExternalMutationOutcome,
 };
-use novarocks_spi::state_store::{FeDeploymentView, StateStore};
-use novarocks_state_store::{
-    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
-    StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
-};
+use novarocks_spi::state_store::StateStore;
+
+mod common;
+use common::state_store_fixture;
 
 struct FakeExecutor;
 
@@ -116,37 +114,13 @@ fn receipt(bytes: &'static [u8]) -> ConnectorWriteReceipt {
 }
 
 async fn open_journal(
-    path: &std::path::Path,
+    _path: &std::path::Path,
 ) -> (
     StateStoreHost,
     Arc<dyn StateStore>,
     StateStoreOperationJournal,
 ) {
-    let registry = builtin_state_store_provider_registry().expect("provider registry");
-    let host = StateStoreHost::open(
-        &registry,
-        StateStoreHostConfig {
-            state_store: StateStoreAppConfig {
-                store: StateStoreConfig {
-                    cluster_id: "dml-service-test".to_string(),
-                    limits: StateStoreLimitOverrides::default(),
-                    provider: StateStoreProviderConfig::Sqlite {
-                        path: path.to_path_buf(),
-                        deployment_owner: "dml-service-fe".to_string(),
-                    },
-                },
-                mysql_client: None,
-            },
-            foundationdb_client: None,
-        },
-        FeDeploymentView {
-            active_fe_count: NonZeroUsize::new(1).unwrap(),
-            topology_revision: Bytes::from_static(b"dml-service-topology"),
-        },
-        Instant::now() + Duration::from_secs(5),
-    )
-    .await
-    .expect("open SQLite StateStore");
+    let host = state_store_fixture::open("dml-service-test").await;
     let store = host.state_store().expect("StateStore exposure");
     let journal =
         StateStoreOperationJournal::open(Arc::clone(&store), tokio::runtime::Handle::current())

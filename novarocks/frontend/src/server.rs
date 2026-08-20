@@ -22,10 +22,10 @@ use std::task::Poll;
 use tokio::runtime::Handle;
 
 use crate::capabilities as core_capabilities;
+use crate::state_store::{StateStoreHostInput, StateStoreProviderRegistry};
 use crate::{QuerySessionFactory, ResolvedMysqlListenerSettings};
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::connector::MvStorageObservationPort;
-use novarocks_state_store::StateStoreHostConfig;
 
 use crate::query_execution::maintenance::{
     BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory,
@@ -66,7 +66,9 @@ pub struct FrontendServerConfig {
     pub mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     /// Typed StateStore host input. The FE remains the owner of opening and
     /// shutting down this host; the server only supplies the composition data.
-    pub state_store_host_config: Option<StateStoreHostConfig>,
+    pub state_store_input: Option<StateStoreHostInput>,
+    /// Concrete provider registrations supplied only by Server composition.
+    pub state_store_provider_registry: StateStoreProviderRegistry,
 }
 
 /// Opens the frontend services once for an externally composed server. The
@@ -76,8 +78,9 @@ pub async fn open_frontend_application_for_server(
     config: &FrontendServerConfig,
     data_runtime: Handle,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
-    FrontendApplicationHost::open_with_factories(
-        config.state_store_host_config.clone(),
+    FrontendApplicationHost::open_with_factories_and_state_store_registry(
+        config.state_store_input.clone(),
+        &config.state_store_provider_registry,
         config.execution.clone(),
         config.backend_open.clone(),
         config.connector_control_factories.clone(),
@@ -474,7 +477,7 @@ async fn run_frontend_server_until_shutdown_with_ports<
 ) -> Result<(), FrontendApplicationError>
 where
     F: Future<Output = ()> + Send,
-    OpenHost: FnOnce(Option<StateStoreHostConfig>) -> OpenHostFuture,
+    OpenHost: FnOnce(Option<StateStoreHostInput>) -> OpenHostFuture,
     OpenHostFuture: Future<Output = Result<Host, FrontendApplicationError>>,
     ExtractService: FnOnce(&Host) -> Service,
     Serve: FnOnce(FrontendServerConfig, Service, F) -> ServeFuture,
@@ -482,8 +485,8 @@ where
     ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
     ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
 {
-    let state_store_host_config = config.state_store_host_config.clone();
-    let host = open_host(state_store_host_config).await?;
+    let state_store_input = config.state_store_input.clone();
+    let host = open_host(state_store_input).await?;
     let service = extract_service(&host);
     let server_result = serve(config, service, shutdown).await;
     let shutdown_result = shutdown_host(host).await;
@@ -515,7 +518,7 @@ async fn run_frontend_server_with_signal_and_ports<
 where
     S: Future<Output = Result<(), E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
-    OpenHost: FnOnce(Option<StateStoreHostConfig>) -> OpenHostFuture,
+    OpenHost: FnOnce(Option<StateStoreHostInput>) -> OpenHostFuture,
     OpenHostFuture: Future<Output = Result<Host, FrontendApplicationError>>,
     ExtractService: FnOnce(&Host) -> Service,
     Serve: FnOnce(FrontendServerConfig, Service, ShutdownSignal) -> ServeFuture,
@@ -523,8 +526,8 @@ where
     ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
     ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
 {
-    let state_store_host_config = config.state_store_host_config.clone();
-    let host = open_host(state_store_host_config).await?;
+    let state_store_input = config.state_store_input.clone();
+    let host = open_host(state_store_input).await?;
     let service = extract_service(&host);
     let server_result = run_server_until_signal(config, service, signal, serve).await;
     let shutdown_result = shutdown_host(host).await;
@@ -633,16 +636,15 @@ mod tests {
         run_frontend_server_with_signal_and_ports,
     };
     use crate::catalog_application::CatalogAdmission;
+    use crate::state_store::{
+        StateStoreProviderRegistry,
+        testing::{input as test_state_store_input, registry as test_state_store_registry},
+    };
     use crate::{
         ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
         FrontendApplicationHost, FrontendExecutionConfig,
     };
     use crate::{QueryServiceErrorKind, QuerySessionOpenRequest, ResolvedMysqlListenerSettings};
-    use novarocks_state_store::{
-        FoundationDbClientConfig, StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig,
-        StateStoreLimitOverrides, StateStoreProviderConfig,
-    };
-    use uuid::Uuid;
 
     #[derive(Debug)]
     struct RecordingHostPort;
@@ -679,7 +681,8 @@ mod tests {
             ),
             connector_control_factories: Vec::new(),
             mv_storage_observation: Arc::new(UnavailableMvStorageObservationPort),
-            state_store_host_config: None,
+            state_store_input: None,
+            state_store_provider_registry: StateStoreProviderRegistry::new(),
         }
     }
 
@@ -732,23 +735,11 @@ mod tests {
     /// through the frontend application port.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cp2_production_composition_owns_catalog_ddl_through_the_state_store_attachment() {
-        let temp = tempfile::tempdir().expect("temporary cutover directory");
-        let state_store = StateStoreHostConfig {
-            state_store: StateStoreAppConfig {
-                store: StateStoreConfig {
-                    cluster_id: "cp2-cutover".to_string(),
-                    limits: StateStoreLimitOverrides::default(),
-                    provider: StateStoreProviderConfig::Sqlite {
-                        path: temp.path().join("state-store.sqlite"),
-                        deployment_owner: "cp2-cutover".to_string(),
-                    },
-                },
-                mysql_client: None,
-            },
-            foundationdb_client: None,
-        };
-        let host = FrontendApplicationHost::open_with_factories(
+        let state_store = test_state_store_input("cp2-cutover");
+        let registry = test_state_store_registry();
+        let host = FrontendApplicationHost::open_with_factories_and_state_store_registry(
             Some(state_store),
+            &registry,
             FrontendExecutionConfig::new(
                 "127.0.0.1",
                 0,
@@ -1113,32 +1104,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_process_config_pairs_foundationdb_client_with_state_store_for_host() {
-        let cluster_file = tempfile::NamedTempFile::new().expect("FoundationDB cluster file");
+    async fn full_process_config_passes_provider_neutral_state_store_input_to_host() {
         let mut config = frontend_config();
-        let foundationdb_client = FoundationDbClientConfig {
-            disable_multi_version_client: true,
-            tls_cert_path: None,
-            tls_key_path: None,
-            tls_ca_path: None,
-            tls_verify_peers: None,
-            tls_password_env: None,
-        };
-        config.state_store_host_config = Some(StateStoreHostConfig {
-            state_store: StateStoreAppConfig {
-                store: StateStoreConfig {
-                    cluster_id: "frontend-cluster".to_owned(),
-                    limits: StateStoreLimitOverrides::default(),
-                    provider: StateStoreProviderConfig::Foundationdb {
-                        cluster_file: cluster_file.path().to_path_buf(),
-                        keyspace_id: Uuid::nil(),
-                    },
-                },
-                mysql_client: None,
-            },
-            foundationdb_client: Some(foundationdb_client.clone()),
-        });
-        let captured = Arc::new(Mutex::new(None::<StateStoreHostConfig>));
+        let input = test_state_store_input("frontend-cluster");
+        config.state_store_input = Some(input.clone());
+        let captured = Arc::new(Mutex::new(None));
         let captured_in_port = Arc::clone(&captured);
 
         run_frontend_server_until_shutdown_with_ports(
@@ -1162,12 +1132,7 @@ mod tests {
             .lock()
             .expect("captured config lock")
             .clone()
-            .expect("state store host config");
-        assert!(matches!(
-            captured.state_store.store.provider,
-            StateStoreProviderConfig::Foundationdb { cluster_file: ref path, keyspace_id }
-                if path == cluster_file.path() && keyspace_id == Uuid::nil()
-        ));
-        assert_eq!(captured.foundationdb_client, Some(foundationdb_client));
+            .expect("state store input");
+        assert_eq!(captured, input);
     }
 }

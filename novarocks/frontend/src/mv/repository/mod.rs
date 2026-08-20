@@ -48,11 +48,11 @@ use crate::mv::domain::repository::{
     RecordExternalCommitAndFinalizeRequest, RecordFrontendMvRecoveryCleanupOutcomeRequest,
     RecordFrontendMvRecoveryObservationRequest,
 };
+use crate::state_store::metrics::StateStoreMetrics;
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_spi::state_store::{
     Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore, WriteTransaction,
 };
-use novarocks_state_store::metrics::StateStoreMetrics;
 use uuid::Uuid;
 
 use crate::catalog_attachment::{CatalogAttachmentVersioned, assert_attachment_versions};
@@ -633,7 +633,7 @@ impl StateStoreMvRepository {
             .await;
         match outcome {
             Ok(value) => Ok(value),
-            Err(novarocks_state_store::RunFailure::CommitUnknown {
+            Err(crate::state_store::RunFailure::CommitUnknown {
                 transaction_id,
                 error,
             }) => {

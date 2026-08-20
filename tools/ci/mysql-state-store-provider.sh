@@ -54,17 +54,11 @@ cargo test -p novarocks-spi
 cargo check -p novarocks-spi --no-default-features
 "$SCRIPT_DIR/check-spi-dependency-boundary.py" \
   --manifest-path "$WORKSPACE_ROOT/Cargo.toml"
-cargo test -p novarocks-state-store --lib
-cargo test -p novarocks-state-store --test state_store_contract
-cargo test -p novarocks-state-store --test state_store_sqlite
+cargo test -p novarocks-state-store-mysql --lib --features state-store-test-hooks
 cargo test -p novarocks-server --test state_store_app_config -- --list | \
   awk '$1 == "foundationdb_config_feature_off_open_fails_without_fallback:" { n++ } END { exit(n != 1) }'
 cargo test -p novarocks-server --test state_store_app_config foundationdb_config_feature_off_open_fails_without_fallback -- --exact
-cargo check -p novarocks-state-store --no-default-features
-if cargo tree -p novarocks-state-store -e features --no-default-features | rg -q 'mysql_async|mysql_common v0\.37'; then
-  echo "mysql_async leaked into the feature-off dependency tree" >&2
-  exit 1
-fi
+cargo check -p novarocks-state-store-mysql --all-features
 cargo build -p novarocks-server --profile dev-opt
 
 READINESS_DB="$NOVAROCKS_MYSQL_DATABASE"
@@ -84,19 +78,19 @@ cleanup_probe_db
 export NOVAROCKS_MYSQL_DATABASE="$READINESS_DB"
 trap - EXIT
 
-cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql_runtime -- --nocapture --test-threads=1
-cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql -- --list | \
+cargo test -p novarocks-state-store-mysql --test state_store_mysql_runtime --features state-store-test-hooks -- --nocapture --test-threads=1
+cargo test -p novarocks-state-store-mysql --test state_store_mysql --features state-store-test-hooks -- --list | \
   awk '$1 == "mysql_provider_state_store_accepts_3072_and_rejects_3073_before_io:" { n++ } END { exit(n != 1) }'
-cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks \
+cargo test -p novarocks-state-store-mysql --features state-store-test-hooks \
   --test state_store_mysql mysql_provider_state_store_accepts_3072_and_rejects_3073_before_io \
   -- --exact --nocapture --test-threads=1
-cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql -- --list | \
+cargo test -p novarocks-state-store-mysql --features state-store-test-hooks --test state_store_mysql -- --list | \
   awk '$1 == "mysql_suite:" { n++ } END { exit(n != 1) }'
-cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks \
+cargo test -p novarocks-state-store-mysql --features state-store-test-hooks \
   --test state_store_mysql mysql_suite -- --exact --nocapture --test-threads=1
-cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql_cross_process -- --list | \
+cargo test -p novarocks-state-store-mysql --features state-store-test-hooks --test state_store_mysql_cross_process -- --list | \
   awk '$1 == "mysql_cross_process_suite:" { n++ } END { exit(n != 1) }'
-cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks \
+cargo test -p novarocks-state-store-mysql --features state-store-test-hooks \
   --test state_store_mysql_cross_process mysql_cross_process_suite \
   -- --exact --nocapture --test-threads=1
 cargo build -p novarocks-server --profile dev-opt --features mysql-state-store-provider

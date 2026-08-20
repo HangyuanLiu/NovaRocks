@@ -17,11 +17,11 @@
 
 use crate::maintenance::MaintenanceTarget;
 use crate::query_execution::maintenance::OptimizeJobState;
+use crate::state_store::coordination::FencingToken;
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorTableObjectId, ConnectorWriteExecutionId, MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES,
 };
-use novarocks_state_store::coordination::FencingToken;
 use serde::ser::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;

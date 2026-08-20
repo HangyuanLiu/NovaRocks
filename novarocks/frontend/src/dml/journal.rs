@@ -17,10 +17,10 @@
 
 use std::sync::Arc;
 
+use crate::state_store::coordination::ResourceKey;
 use async_trait::async_trait;
 use bytes::Bytes;
 use novarocks_spi::state_store::WriteTransaction;
-use novarocks_state_store::coordination::ResourceKey;
 use uuid::{Uuid, Version};
 
 use crate::dml::error::DmlError;

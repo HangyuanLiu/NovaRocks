@@ -35,12 +35,14 @@ use novarocks_spi::{
     connector::{ConnectorCancellation, ConnectorRequestContext},
     state_store::{FeDeploymentView, StateStore},
 };
-use novarocks_state_store::{
+mod common;
+use common::state_store_fixture as state_store_test;
+use sqlparser::ast::{DataType, Query, Statement};
+use sqlparser::parser::Parser;
+use state_store_test::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
-use sqlparser::ast::{DataType, Query, Statement};
-use sqlparser::parser::Parser;
 use tempfile::TempDir;
 
 #[derive(Default)]
@@ -328,7 +330,7 @@ async fn open_sqlite_store(
         StateStoreHostConfig {
             state_store: StateStoreAppConfig {
                 store: StateStoreConfig {
-                    cluster_id: "view-service-test".to_string(),
+                    cluster_id: format!("view-service-test-{}", path.display()),
                     limits: StateStoreLimitOverrides::default(),
                     provider: StateStoreProviderConfig::Sqlite {
                         path: path.to_path_buf(),

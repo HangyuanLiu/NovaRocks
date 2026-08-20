@@ -3250,6 +3250,7 @@ dependencies = [
 name = "novarocks-frontend"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "apache-avro",
  "arrow",
  "arrow-buffer",
@@ -3271,7 +3272,6 @@ dependencies = [
  "novarocks-protocol",
  "novarocks-spi",
  "novarocks-sql",
- "novarocks-state-store",
  "novarocks-types",
  "novarocks-user-error",
  "novarocks-version",
@@ -3352,7 +3352,9 @@ dependencies = [
  "novarocks-frontend",
  "novarocks-fs",
  "novarocks-spi",
- "novarocks-state-store",
+ "novarocks-state-store-foundationdb",
+ "novarocks-state-store-mysql",
+ "novarocks-state-store-sqlite",
  "novarocks-test-support",
  "novarocks-types",
  "serde",
@@ -3400,20 +3402,36 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-state-store"
+name = "novarocks-state-store-foundationdb"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
  "foundationdb",
- "fs2",
  "futures",
  "hex",
- "libc",
+ "novarocks-spi",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "novarocks-state-store-mysql"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "futures",
+ "hex",
  "mysql_async",
  "novarocks-spi",
- "rusqlite",
  "rustls",
  "serde",
  "serde_json",
@@ -3421,6 +3439,20 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "novarocks-state-store-sqlite"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "fs2",
+ "novarocks-spi",
+ "rusqlite",
+ "tempfile",
+ "tokio",
  "uuid",
 ]
 

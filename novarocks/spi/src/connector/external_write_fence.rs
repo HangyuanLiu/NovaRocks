@@ -24,7 +24,7 @@
 //! The value is deliberately provider-neutral and bounded.  It carries only
 //! cluster identity as a digest, the control-plane generation scalars, the
 //! stable write operation identity, the coordination attempt identity, and the
-//! resource identity.  This SPI never depends on `novarocks-state-store`: a
+//! resource identity. This SPI never depends on a StateStore provider: a
 //! provider must not hold a coordination lease fence or reach a state store.
 //!
 //! Four invariants are frozen here and enforced jointly with the provider:

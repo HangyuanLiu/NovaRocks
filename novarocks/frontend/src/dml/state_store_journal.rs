@@ -19,13 +19,13 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
 
+use crate::state_store::metrics::StateStoreMetrics;
+use crate::state_store::{OperationId, RunFailure, run_side_effect_free};
 use bytes::Bytes;
 use novarocks_spi::state_store::{
     Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore, Value,
     WriteTransaction,
 };
-use novarocks_state_store::metrics::StateStoreMetrics;
-use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::runtime::{Handle, RuntimeFlavor};
@@ -1760,7 +1760,7 @@ impl StateStoreOperationJournal {
 
     async fn finish_mutation<T>(
         &self,
-        result: Result<novarocks_state_store::RunSuccess<Result<T, DmlError>>, RunFailure>,
+        result: Result<crate::state_store::RunSuccess<Result<T, DmlError>>, RunFailure>,
         operation_key: Key,
         mutation_id: Uuid,
         committed_value: T,
@@ -1786,7 +1786,7 @@ impl StateStoreOperationJournal {
     async fn finish_statement_mutation(
         &self,
         result: Result<
-            novarocks_state_store::RunSuccess<Result<StoredOperation, DmlError>>,
+            crate::state_store::RunSuccess<Result<StoredOperation, DmlError>>,
             RunFailure,
         >,
         operation_key: Key,

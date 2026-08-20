@@ -30,15 +30,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::maintenance::MaintenanceTarget;
-use bytes::{BufMut, Bytes, BytesMut};
-use novarocks_spi::connector::ConnectorInstanceId;
-use novarocks_spi::state_store::WriteTransaction;
-use novarocks_state_store::OperationId;
-use novarocks_state_store::coordination::{
+use crate::state_store::OperationId;
+use crate::state_store::coordination::{
     AcquireOutcome, AttemptId, CoordinationError, CoordinationErrorKind, HolderId, IncarnationGate,
     LeaseCancellationReason, LeaseFence, LeaseManager, LeaseObservation, LeaseSettings,
     ResourceKey, WriteAdmission,
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use novarocks_spi::connector::ConnectorInstanceId;
+use novarocks_spi::state_store::WriteTransaction;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
@@ -308,7 +308,7 @@ impl MaintenanceCoordination {
 
 struct MaintenanceLeaseAttemptInner {
     attempt_id: Uuid,
-    guard: Arc<AsyncMutex<novarocks_state_store::coordination::LeaseGuard>>,
+    guard: Arc<AsyncMutex<crate::state_store::coordination::LeaseGuard>>,
     fence_rx: watch::Receiver<LeaseFence>,
     failure_rx: watch::Receiver<Option<CoordinationError>>,
     cancellation_rx: watch::Receiver<Option<LeaseCancellationReason>>,
@@ -338,7 +338,7 @@ pub struct MaintenanceLeaseAttempt {
 impl MaintenanceLeaseAttempt {
     fn start(
         attempt_id: Uuid,
-        guard: novarocks_state_store::coordination::LeaseGuard,
+        guard: crate::state_store::coordination::LeaseGuard,
         runtime: &Handle,
     ) -> Self {
         let initial_fence = guard.fence();
@@ -489,7 +489,7 @@ impl MaintenanceLeaseAttempt {
 }
 
 async fn run_renewal_loop(
-    guard: Arc<AsyncMutex<novarocks_state_store::coordination::LeaseGuard>>,
+    guard: Arc<AsyncMutex<crate::state_store::coordination::LeaseGuard>>,
     renew_after: Duration,
     fence_tx: watch::Sender<LeaseFence>,
     failure_tx: watch::Sender<Option<CoordinationError>>,
@@ -534,17 +534,18 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
+    use crate::OperationId;
     use crate::maintenance::MaintenanceTarget;
-    use bytes::Bytes;
-    use novarocks_spi::state_store::{FeDeploymentView, StateStore, TransactionId};
-    use novarocks_state_store::coordination::{
+    use crate::state_store::coordination::{
         ClockHealth, CoordinationError, CoordinationErrorKind, IncarnationGate, LeaseClock,
         LeaseManager, LeaseSettings,
     };
-    use novarocks_state_store::{
-        OperationId, StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
+    use crate::state_store::testing::{
+        StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
         StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
     };
+    use bytes::Bytes;
+    use novarocks_spi::state_store::{FeDeploymentView, StateStore, TransactionId};
     use tempfile::TempDir;
     use tokio::runtime::Handle;
     use tokio::time::timeout;
@@ -703,7 +704,7 @@ mod tests {
             ) || matches!(
                 failure,
                 MaintenanceAuthorityFailure::Cancelled(
-                    novarocks_state_store::coordination::LeaseCancellationReason::ClockUnsafe
+                    crate::state_store::coordination::LeaseCancellationReason::ClockUnsafe
                 )
             ),
             "unexpected maintenance authority failure: {failure:?}"

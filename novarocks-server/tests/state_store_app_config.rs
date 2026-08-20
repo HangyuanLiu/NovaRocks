@@ -20,12 +20,15 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks_server::app_config::NovaRocksConfig;
-use novarocks_spi::state_store::FeDeploymentView;
-use novarocks_state_store::{
-    FOUNDATIONDB_STATE_STORE_PROVIDER_ID, MySqlTlsMode, StateStoreHost, StateStoreHostConfig,
-    StateStoreHostErrorKind, StateStoreProviderConfig, builtin_state_store_provider_registry,
+use novarocks_frontend::state_store::{
+    StateStoreHost, StateStoreHostErrorKind, StateStoreHostInput,
 };
+use novarocks_server::app_config::NovaRocksConfig;
+use novarocks_server::composition::state_store_provider_registry;
+use novarocks_server::state_store_config::{
+    FOUNDATIONDB_STATE_STORE_PROVIDER_ID, MySqlTlsMode, StateStoreProviderConfig,
+};
+use novarocks_spi::state_store::{FeDeploymentView, StateStoreLimits};
 use uuid::Uuid;
 
 #[test]
@@ -415,16 +418,17 @@ disable_multi_version_client = true
     .expect("write config");
     let loaded = NovaRocksConfig::load_from_file(config_path.path())
         .expect("load FoundationDB config from TOML");
-    let registry = builtin_state_store_provider_registry().expect("built-in provider registry");
+    let registry = state_store_provider_registry(&loaded).expect("server provider registry");
     let error = match StateStoreHost::open(
         &registry,
-        StateStoreHostConfig {
-            state_store: loaded.state_store.expect("state store config"),
-            foundationdb_client: loaded.foundationdb_client,
-        },
-        FeDeploymentView {
-            active_fe_count: NonZeroUsize::new(3).expect("three FEs"),
-            topology_revision: Bytes::from_static(b"topology-r1"),
+        StateStoreHostInput {
+            cluster_id: "cluster-a".to_owned(),
+            provider_id: FOUNDATIONDB_STATE_STORE_PROVIDER_ID,
+            limits: StateStoreLimits::default(),
+            deployment: FeDeploymentView {
+                active_fe_count: NonZeroUsize::new(3).expect("three FEs"),
+                topology_revision: Bytes::from_static(b"topology-r1"),
+            },
         },
         Instant::now() + Duration::from_secs(5),
     )

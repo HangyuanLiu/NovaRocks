@@ -19,7 +19,9 @@ use novarocks_frontend::mv::repository::StateStoreMvRepository;
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_spi::state_store::FeDeploymentView;
 use novarocks_sql::planning::mv::ApplyKeySource;
-use novarocks_state_store::{
+mod common;
+use common::state_store_fixture as state_store_test;
+use state_store_test::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
@@ -101,6 +103,7 @@ fn limited_repository() -> (
     Arc<StateStoreMvRepository>,
 ) {
     let temp = tempfile::tempdir().expect("temporary StateStore directory");
+    let cluster_id = format!("mv-partition-limit-test-{}", temp.path().display());
     let runtime = tokio::runtime::Runtime::new().expect("repository runtime");
     let registry = builtin_state_store_provider_registry().expect("built-in StateStore providers");
     let host = runtime
@@ -109,7 +112,7 @@ fn limited_repository() -> (
             StateStoreHostConfig {
                 state_store: StateStoreAppConfig {
                     store: StateStoreConfig {
-                        cluster_id: "mv-partition-limit-test".to_string(),
+                        cluster_id,
                         limits: StateStoreLimitOverrides {
                             max_page_size: Some(2),
                             ..StateStoreLimitOverrides::default()

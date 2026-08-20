@@ -31,6 +31,7 @@ use crate::common::backend_topology::{
     LiveBackendTarget, publish_backend_topology_metrics,
 };
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use crate::state_store::{OperationId, RunFailure, run_side_effect_free};
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -38,7 +39,6 @@ use bytes::Bytes;
 use novarocks_spi::state_store::{
     CommitResolution, Key, Precondition, StateRecord, StateStore, Value,
 };
-use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
 use novarocks_types::ClusterRole;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Handle, RuntimeFlavor};
@@ -281,12 +281,12 @@ impl RepositoryMutation {
 #[derive(Clone)]
 struct ClusterBackendRepository {
     store: Arc<dyn StateStore>,
-    metrics: Arc<novarocks_state_store::metrics::StateStoreMetrics>,
+    metrics: Arc<crate::state_store::metrics::StateStoreMetrics>,
 }
 
 impl ClusterBackendRepository {
     fn new(store: Arc<dyn StateStore>) -> Self {
-        let metrics = Arc::new(novarocks_state_store::metrics::StateStoreMetrics::new(
+        let metrics = Arc::new(crate::state_store::metrics::StateStoreMetrics::new(
             store.metrics_snapshot().provider,
         ));
         Self { store, metrics }

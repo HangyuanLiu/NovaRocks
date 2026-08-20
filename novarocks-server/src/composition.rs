@@ -21,6 +21,13 @@ use std::time::Duration;
 
 use crate::app_config::NovaRocksConfig;
 use crate::network;
+#[cfg(feature = "mysql-state-store-provider")]
+use crate::state_store_config::MySqlTlsMode;
+use crate::state_store_config::{
+    FOUNDATIONDB_STATE_STORE_PROVIDER_ID, MYSQL_STATE_STORE_PROVIDER_ID,
+    SQLITE_STATE_STORE_PROVIDER_ID, StateStoreProviderConfig,
+};
+use crate::state_store_limits::resolve_state_store_limits;
 use anyhow::Context;
 use novarocks_backend::{
     BackendApplicationHost, BackendDataRuntime, BackendServerConfig, QueryLifecycleRegistryConfig,
@@ -39,7 +46,11 @@ use novarocks_execution::runtime::execution_runtime::{
 };
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendExecutionConfig, FrontendQueryControlTimeouts,
-    FrontendServerConfig, common::backend_topology::BackendTopologyPort,
+    FrontendServerConfig,
+    common::backend_topology::BackendTopologyPort,
+    state_store::{
+        StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
+    },
 };
 use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
 use novarocks_spi::connector::{
@@ -53,6 +64,10 @@ use novarocks_spi::connector::{
     MvRefreshBaseObservation, MvRefreshTargetObservation, MvSchemaValidationObservation,
     MvStorageObservationPort, WriteCommitEvidenceLimits,
 };
+use novarocks_spi::state_store::{
+    MAX_KEY_BYTES, StateStoreProviderAccessMode, StateStoreProviderDescriptor,
+};
+use novarocks_state_store_sqlite::SqliteStateStoreContribution;
 
 const BACKEND_SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -533,6 +548,8 @@ pub fn compose_frontend_server_config(
         port_override,
     )
     .map_err(|error| anyhow::anyhow!("resolve MySQL listener settings: {error}"))?;
+    let state_store_provider_registry = state_store_provider_registry(config)?;
+    let state_store_input = state_store_input(config)?;
     Ok(FrontendServerConfig {
         execution,
         backend_open,
@@ -542,7 +559,8 @@ pub fn compose_frontend_server_config(
         mysql_listener,
         connector_control_factories: compose_frontend_control_factories(config, runtime)?,
         mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
-        state_store_host_config: state_store_host_config(config),
+        state_store_input,
+        state_store_provider_registry,
     })
 }
 
@@ -641,16 +659,166 @@ pub fn compose_connector_file_planning_resources(
     ))
 }
 
-pub fn state_store_host_config(
+pub fn state_store_input(config: &NovaRocksConfig) -> anyhow::Result<Option<StateStoreHostInput>> {
+    let Some(state_store) = &config.state_store else {
+        return Ok(None);
+    };
+    let (provider_id, max_key_bytes, deployment) = match &state_store.store.provider {
+        StateStoreProviderConfig::Sqlite {
+            deployment_owner, ..
+        } => {
+            let source = novarocks_frontend::deployment::SqliteSingleFeDeploymentViewSource::new(
+                &state_store.store.cluster_id,
+                deployment_owner,
+            )?;
+            (
+                SQLITE_STATE_STORE_PROVIDER_ID,
+                MAX_KEY_BYTES,
+                source.snapshot_value(),
+            )
+        }
+        StateStoreProviderConfig::Foundationdb { .. } => {
+            return Err(anyhow::anyhow!(
+                "UnsupportedDeployment: FoundationDB StateStore requires the SSCP-2A deployment source"
+            ));
+        }
+        StateStoreProviderConfig::Mysql { .. } => {
+            return Err(anyhow::anyhow!(
+                "UnsupportedDeployment: MySQL StateStore requires the SSCP-2A deployment source"
+            ));
+        }
+    };
+    let limits = resolve_state_store_limits(&state_store.store.limits, max_key_bytes)?;
+    Ok(Some(StateStoreHostInput {
+        cluster_id: state_store.store.cluster_id.clone(),
+        provider_id,
+        limits,
+        deployment,
+    }))
+}
+
+pub fn state_store_provider_registry(
     config: &NovaRocksConfig,
-) -> Option<novarocks_state_store::StateStoreHostConfig> {
-    config
-        .state_store
-        .clone()
-        .map(|state_store| novarocks_state_store::StateStoreHostConfig {
-            state_store,
-            foundationdb_client: config.foundationdb_client.clone(),
-        })
+) -> anyhow::Result<StateStoreProviderRegistry> {
+    let mut registry = StateStoreProviderRegistry::new();
+    let Some(state_store) = &config.state_store else {
+        return Ok(registry);
+    };
+    match &state_store.store.provider {
+        StateStoreProviderConfig::Sqlite {
+            path,
+            deployment_owner,
+        } => {
+            let contribution =
+                SqliteStateStoreContribution::new(path.clone(), deployment_owner.clone());
+            let descriptor = StateStoreProviderDescriptor::new(
+                SQLITE_STATE_STORE_PROVIDER_ID,
+                StateStoreProviderAccessMode::ExclusiveSingleFrontend,
+                MAX_KEY_BYTES,
+            );
+            registry.register(StateStoreProviderRegistration::new(descriptor, move |_| {
+                Ok(Box::new(contribution.clone().into_factory()))
+            }))?;
+        }
+        StateStoreProviderConfig::Mysql {
+            database: _database,
+        } => {
+            let descriptor = StateStoreProviderDescriptor::new(
+                MYSQL_STATE_STORE_PROVIDER_ID,
+                StateStoreProviderAccessMode::SharedMultiFrontend,
+                3072,
+            );
+            #[cfg(feature = "mysql-state-store-provider")]
+            {
+                let client = state_store
+                    .mysql_client
+                    .clone()
+                    .expect("validated MySQL StateStore client configuration");
+                let database = _database.clone();
+                registry.register(StateStoreProviderRegistration::new(descriptor, move |_| {
+                    let client = novarocks_state_store_mysql::MySqlClientConfig {
+                        host: client.host.clone(),
+                        port: client.port,
+                        username: client.username.clone(),
+                        password_env: client.password_env.clone(),
+                        tls_mode: match client.tls_mode {
+                            MySqlTlsMode::Disabled => novarocks_state_store_mysql::MySqlTlsMode::Disabled,
+                            MySqlTlsMode::Required => novarocks_state_store_mysql::MySqlTlsMode::Required,
+                            MySqlTlsMode::VerifyIdentity => novarocks_state_store_mysql::MySqlTlsMode::VerifyIdentity,
+                        },
+                        tls_ca_path: client.tls_ca_path.clone(),
+                        tls_cert_path: client.tls_cert_path.clone(),
+                        tls_key_path: client.tls_key_path.clone(),
+                        connect_timeout_ms: client.connect_timeout_ms,
+                        pool_min: client.pool_min,
+                        pool_max: client.pool_max,
+                        inactive_connection_ttl_ms: client.inactive_connection_ttl_ms,
+                    };
+                    novarocks_state_store_mysql::MysqlStateStoreProviderFactory::try_new(
+                        database.clone(),
+                        client,
+                    )
+                    .map(|factory| Box::new(factory) as Box<dyn novarocks_spi::state_store::StateStoreProviderFactory>)
+                    .map_err(|_| novarocks_frontend::state_store::StateStoreHostError::new(
+                        novarocks_frontend::state_store::StateStoreHostErrorKind::InvalidConfiguration,
+                        Some(MYSQL_STATE_STORE_PROVIDER_ID),
+                        "MySQL StateStore provider configuration is invalid",
+                    ))
+                }))?;
+            }
+            #[cfg(not(feature = "mysql-state-store-provider"))]
+            registry.register(StateStoreProviderRegistration::unavailable(
+                descriptor,
+                "MySQL StateStore provider is not compiled in; enable mysql-state-store-provider",
+            ))?;
+        }
+        StateStoreProviderConfig::Foundationdb {
+            cluster_file: _cluster_file,
+            keyspace_id: _keyspace_id,
+        } => {
+            let descriptor = StateStoreProviderDescriptor::new(
+                FOUNDATIONDB_STATE_STORE_PROVIDER_ID,
+                StateStoreProviderAccessMode::SharedMultiFrontend,
+                MAX_KEY_BYTES,
+            );
+            #[cfg(feature = "foundationdb-provider")]
+            {
+                let client = config
+                    .foundationdb_client
+                    .clone()
+                    .expect("validated FoundationDB StateStore client configuration");
+                let provider = novarocks_state_store_foundationdb::FoundationDbProviderConfig {
+                    cluster_file: _cluster_file.clone(),
+                    keyspace_id: *_keyspace_id,
+                };
+                let client = novarocks_state_store_foundationdb::FoundationDbClientConfig {
+                    disable_multi_version_client: client.disable_multi_version_client,
+                    tls_cert_path: client.tls_cert_path.clone(),
+                    tls_key_path: client.tls_key_path.clone(),
+                    tls_ca_path: client.tls_ca_path.clone(),
+                    tls_verify_peers: client.tls_verify_peers.clone(),
+                    tls_password_env: client.tls_password_env.clone(),
+                };
+                registry.register(StateStoreProviderRegistration::new(descriptor, move |_| {
+                    novarocks_state_store_foundationdb::foundationdb_provider_factory(
+                        provider.clone(),
+                        client.clone(),
+                    )
+                    .map_err(|error| novarocks_frontend::state_store::StateStoreHostError::new(
+                        novarocks_frontend::state_store::StateStoreHostErrorKind::ProviderNotCompiled,
+                        Some(FOUNDATIONDB_STATE_STORE_PROVIDER_ID),
+                        format!("FoundationDB StateStore provider construction failed: {error:?}"),
+                    ))
+                }))?;
+            }
+            #[cfg(not(feature = "foundationdb-provider"))]
+            registry.register(StateStoreProviderRegistration::unavailable(
+                descriptor,
+                "FoundationDB StateStore provider is not compiled in; enable foundationdb-provider",
+            ))?;
+        }
+    }
+    Ok(registry)
 }
 
 pub fn run_all_in_one(
