@@ -30,13 +30,29 @@ pub(crate) enum BranchSide {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) enum BranchDeltaSide {
     Left,
     Right,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) const JOIN_LEFT_ROW_ID_COLUMN: &str = "__nova_left_row_id";
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) const JOIN_RIGHT_ROW_ID_COLUMN: &str = "__nova_right_row_id";
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) const JOIN_DELTA_TARGET_LOCATOR_TABLE: &str = "__nr_join_delta_target_locator";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,6 +64,10 @@ pub struct JoinDeltaBranchPlan {
 }
 
 impl JoinDeltaBranchPlan {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn delta_side(&self) -> Result<BranchDeltaSide, String> {
         match (self.left, self.right) {
             (BranchSide::Delta(_), BranchSide::Snapshot(_)) => Ok(BranchDeltaSide::Left),
@@ -85,6 +105,10 @@ pub fn plan_join_delta_branches(
     plans
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn rewrite_join_branch_query(
     query: &sqlparser::ast::Query,
     plan: &JoinDeltaBranchPlan,
@@ -113,6 +137,10 @@ pub(crate) fn rewrite_join_branch_query(
     Ok(query)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn rewrite_join_delta_coalesce_query(
     query: &sqlparser::ast::Query,
     branches: &[JoinDeltaBranchPlan],
@@ -141,6 +169,10 @@ pub(crate) fn rewrite_join_delta_coalesce_query(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries(
     query: &sqlparser::ast::Query,
     branch_queries: Vec<sqlparser::ast::Query>,
@@ -156,6 +188,10 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
     query: &sqlparser::ast::Query,
     branch_queries: Vec<sqlparser::ast::Query>,
@@ -248,6 +284,10 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
     Ok(parsed)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn rewrite_join_delta_append_only_query(
     query: &sqlparser::ast::Query,
     branch_query: sqlparser::ast::Query,
@@ -264,6 +304,10 @@ pub(crate) fn rewrite_join_delta_append_only_query(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn wrap_join_apply_key_query(
     query: &sqlparser::ast::Query,
     source_query: sqlparser::ast::Query,
@@ -305,10 +349,14 @@ fn wrap_join_apply_key_query(
     let sqlparser::ast::TableFactor::Derived { subquery, .. } = &mut from.relation else {
         return Err("join apply-key rewrite generated non-derived FROM".to_string());
     };
-    *subquery = Box::new(source_query);
+    **subquery = source_query;
     Ok(parsed)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn is_append_only_join_delta_eligible(query: &sqlparser::ast::Query) -> bool {
     let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
         return false;
@@ -328,11 +376,19 @@ pub(crate) fn is_append_only_join_delta_eligible(query: &sqlparser::ast::Query) 
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 struct BranchRewrite {
     alias: sqlparser::ast::Ident,
     is_delta: bool,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn payload_projection_columns(
     query: &sqlparser::ast::Query,
 ) -> Result<Vec<sqlparser::ast::Ident>, String> {
@@ -349,6 +405,10 @@ fn payload_projection_columns(
     Ok(columns)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn payload_projection_column(
     item: &sqlparser::ast::SelectItem,
 ) -> Result<sqlparser::ast::Ident, String> {
@@ -366,6 +426,10 @@ fn payload_projection_column(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn projection_expr_default_name(expr: &sqlparser::ast::Expr) -> Option<sqlparser::ast::Ident> {
     match expr {
         sqlparser::ast::Expr::Identifier(ident) => Some(ident.clone()),
@@ -375,6 +439,10 @@ fn projection_expr_default_name(expr: &sqlparser::ast::Expr) -> Option<sqlparser
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn validate_payload_projection_column(
     ident: &sqlparser::ast::Ident,
     seen: &mut std::collections::BTreeSet<String>,
@@ -395,6 +463,10 @@ fn validate_payload_projection_column(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn is_reserved_payload_projection_name(normalized: &str) -> bool {
     matches!(
         normalized,
@@ -415,10 +487,18 @@ fn is_reserved_payload_projection_name(normalized: &str) -> bool {
         || normalized.starts_with("__nr_join_delta_branch_")
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn join_delta_branch_cte_name(index: usize) -> String {
     format!("__nr_join_delta_branch_{index}")
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn change_stream_select_list(
     payload_columns: &[sqlparser::ast::Ident],
     left_uuid: &str,
@@ -440,6 +520,10 @@ fn change_stream_select_list(
     items.join(", ")
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn payload_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
     let mut items = vec![MV_JOIN_APPLY_KEY_COLUMN_NAME.to_string()];
     items.extend(payload_columns.iter().map(|ident| ident.to_string()));
@@ -450,12 +534,20 @@ fn payload_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> S
     items.join(", ")
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn payload_group_by_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
     let mut items = vec![MV_JOIN_APPLY_KEY_COLUMN_NAME.to_string()];
     items.extend(payload_columns.iter().map(|ident| ident.to_string()));
     items.join(", ")
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn key_shape_select_list() -> String {
     [
         MV_JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
@@ -465,6 +557,10 @@ fn key_shape_select_list() -> String {
     .join(", ")
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn valid_payload_select_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
     let mut items = payload_columns
         .iter()
@@ -476,6 +572,10 @@ fn valid_payload_select_list(payload_columns: &[sqlparser::ast::Ident]) -> Strin
     items.join(", ")
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn final_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
     let mut items = payload_columns
         .iter()
@@ -494,6 +594,10 @@ fn final_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> Str
     items.join(", ")
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn join_delta_target_locator_relation(namespace: &str) -> String {
     format!(
         "{}.{}",
@@ -502,14 +606,26 @@ pub(crate) fn join_delta_target_locator_relation(namespace: &str) -> String {
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn quote_sql_identifier(identifier: &str) -> String {
     format!("`{}`", identifier.replace('`', "``"))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn parse_query_from_sql(sql: &str) -> Result<sqlparser::ast::Query, String> {
     let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
     let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)?;
@@ -519,6 +635,10 @@ fn parse_query_from_sql(sql: &str) -> Result<sqlparser::ast::Query, String> {
     Ok(*query)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn replace_branch_cte_queries(
     query: &mut sqlparser::ast::Query,
     branch_queries: Vec<sqlparser::ast::Query>,
@@ -542,11 +662,15 @@ fn replace_branch_cte_queries(
                 cte.alias.name.value
             ));
         }
-        cte.query = Box::new(branch_query);
+        *cte.query = branch_query;
     }
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn rewrite_branch_factor(
     factor: &mut sqlparser::ast::TableFactor,
     base: &novarocks_catalog::identifier::TableIdentity,
@@ -604,6 +728,10 @@ fn rewrite_branch_factor(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn table_factor_alias(
     factor: &sqlparser::ast::TableFactor,
 ) -> Option<Option<sqlparser::ast::Ident>> {
@@ -613,6 +741,10 @@ fn table_factor_alias(
     Some(alias.as_ref().map(|alias| alias.name.clone()))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn base_table_object_name(
     base: &novarocks_catalog::identifier::TableIdentity,
 ) -> sqlparser::ast::ObjectName {
@@ -623,6 +755,10 @@ fn base_table_object_name(
     ])
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn build_nr_ivm_delta_table_factor_for_join(
     base: &novarocks_catalog::identifier::TableIdentity,
     window: SnapshotWindow,
@@ -666,6 +802,10 @@ fn build_nr_ivm_delta_table_factor_for_join(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn append_join_hidden_projection(
     select: &mut sqlparser::ast::Select,
     left_branch: &BranchRewrite,
@@ -691,6 +831,10 @@ fn append_join_hidden_projection(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn change_op_alias(alias: &sqlparser::ast::Ident) -> sqlparser::ast::SelectItem {
     qualified_alias(
         alias,
@@ -699,10 +843,18 @@ fn change_op_alias(alias: &sqlparser::ast::Ident) -> sqlparser::ast::SelectItem 
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn row_id_alias(alias: &sqlparser::ast::Ident, output: &str) -> sqlparser::ast::SelectItem {
     qualified_alias(alias, "_row_id", output)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn qualified_alias(
     qualifier: &sqlparser::ast::Ident,
     column: &str,

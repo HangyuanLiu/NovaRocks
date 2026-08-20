@@ -3652,6 +3652,10 @@ fn narrowing_integer_cast_can_return_null(source: &DataType, target: &DataType) 
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 fn bind_scalar_function_call(name: &str, args: Vec<TypedExpr>) -> Result<BoundScalarCall, String> {
     bind_scalar_function_call_with_catalog(
         crate::functions::builtin_sql_function_catalog(),
@@ -4266,9 +4270,7 @@ fn parse_array_sortby_lambda(expr: &sqlast::Expr) -> Option<(String, &sqlast::Ex
     }
 }
 
-fn find_lambda_argument<'a>(
-    arg_exprs: &[&'a sqlast::Expr],
-) -> Option<(usize, Vec<String>, sqlast::Expr)> {
+fn find_lambda_argument(arg_exprs: &[&sqlast::Expr]) -> Option<(usize, Vec<String>, sqlast::Expr)> {
     if let Some((idx, params, body)) = arg_exprs
         .first()
         .and_then(|expr| parse_lambda_expr(expr))

@@ -22,7 +22,7 @@ use std::sync::Mutex;
 #[cfg(test)]
 use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, Int64Array, StringArray};
 #[cfg(test)]
-use arrow::compute::{cast, concat_batches, filter_record_batch};
+use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -49,6 +49,10 @@ fn write_commit_has_files(write_commit: &crate::query_execution::write::WriteCom
         .any(|writer| !writer.connector_staged_report_frames.is_empty())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn row_lineage_input_request(
     columns: &[novarocks_catalog::schema::ColumnDef],
 ) -> novarocks_spi::connector::ConnectorWriteInputRequest {
@@ -80,6 +84,10 @@ fn row_lineage_input_request(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn deletion_vector_input_request() -> novarocks_spi::connector::ConnectorWriteInputRequest {
     use novarocks_spi::connector::{ConnectorWriteFieldRequest, ConnectorWriteInputRequest};
 
@@ -102,6 +110,10 @@ fn deletion_vector_input_request() -> novarocks_spi::connector::ConnectorWriteIn
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn data_input_request(
     columns: &[novarocks_catalog::schema::ColumnDef],
 ) -> novarocks_spi::connector::ConnectorWriteInputRequest {
@@ -126,6 +138,10 @@ fn data_input_request(
 /// handles and aggregate report routing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DmlRowMutationEffectSet {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     UpdateMor,
     Merge {
         matched_update: bool,
@@ -138,7 +154,7 @@ enum DmlRowMutationEffectSet {
 /// routes are activated only after the frontend has persisted the operation
 /// intent that owns this exact operation id.
 #[derive(Clone)]
-struct DmlChangeStreamPreparations {
+pub(crate) struct DmlChangeStreamPreparations {
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
     lease: novarocks_spi::connector::ConnectorWriteLease,
     preparation: novarocks_spi::connector::ConnectorRowMutationPreparation,
@@ -458,6 +474,10 @@ fn compile_dml_change_stream_write(
 /// Core-private staged mutation execution retained behind `MutationEngine`'s
 /// opaque handles.  It intentionally has no journal or SQL routing policy.
 pub(crate) trait MutationExecution: Send + Sync {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     fn stage(&self) -> Result<QueryExecutionResult, String>;
     fn needs_abort_on_stage_error(&self) -> bool {
         false
@@ -1401,6 +1421,10 @@ pub(crate) fn stage_prepared_update_mutation(
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn materialize_update_matches(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
@@ -2455,6 +2479,10 @@ fn run_cow_cohort_writes(
     final_result.ok_or_else(|| "COW operation has no provider-sealed cohorts".to_string())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "One COW cohort requires separately validated execution, routing, and fence inputs."
+)]
 fn run_one_cow_cohort(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
@@ -2637,6 +2665,10 @@ fn build_cow_update_distributed_execution(
     }))
 }
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 struct MatchedUpdateBatch {
     row_ids: Vec<i64>,
     file_paths: Vec<String>,
@@ -2653,6 +2685,10 @@ struct MatchedUpdateBatch {
 /// generic validator checks the signed match contract before activation and
 /// the Provider alone groups identities into cohort recipes.
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn cow_selection_from_matched_update(
     matched: &MatchedUpdateBatch,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
@@ -2665,6 +2701,10 @@ fn cow_selection_from_matched_update(
 /// carry null target identity/before-image fields: the signed contract and
 /// Provider both treat logical `Insert` as outside target-row uniqueness.
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn cow_selection_from_matched_and_insert(
     matched: &MatchedUpdateBatch,
     insert_batch: Option<&RecordBatch>,
@@ -2853,6 +2893,10 @@ fn cow_selection_from_matched_and_insert(
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn execute_update_match_query(
     state: &DmlExecutionKernel,
     current_catalog: Option<&str>,
@@ -3005,6 +3049,10 @@ fn execute_exact_cow_match_query(
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn matched_update_batch_from_query_result(
     result: QueryResult,
 ) -> Result<MatchedUpdateBatch, String> {
@@ -3016,6 +3064,10 @@ fn matched_update_batch_from_query_result(
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn matched_update_batch_from_record_batch(
     batch: &RecordBatch,
 ) -> Result<MatchedUpdateBatch, String> {
@@ -3116,6 +3168,10 @@ fn matched_update_batch_from_record_batch(
 
 #[cfg(test)]
 impl MatchedUpdateBatch {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     fn append(&mut self, mut next: Self) {
         let batch_offset = self.new_rows.len();
         self.row_ids.append(&mut next.row_ids);
@@ -3134,6 +3190,10 @@ impl MatchedUpdateBatch {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn empty_matched_update_batch() -> Result<MatchedUpdateBatch, String> {
     Ok(MatchedUpdateBatch {
         row_ids: Vec::new(),
@@ -3147,6 +3207,10 @@ fn empty_matched_update_batch() -> Result<MatchedUpdateBatch, String> {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn required_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a ArrayRef, String> {
     let idx = batch
         .schema()
@@ -3534,12 +3598,11 @@ pub(crate) fn stage_prepared_merge_mutation(
         completion,
     })
 }
-#[allow(clippy::too_many_arguments)]
-struct MergeInsertColumns {
+pub(crate) struct MergeInsertColumns {
     columns: Vec<MergeInsertColumn>,
 }
 
-struct MergeInsertColumn {
+pub(crate) struct MergeInsertColumn {
     name: String,
     /// `Some(idx)` when the user supplied a value for this target column at
     /// position `idx` in the `VALUES` tuple. `None` means "no value
@@ -3623,6 +3686,10 @@ fn resolve_merge_insert_columns(
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 struct MergeMatchRows {
     /// The full RecordBatch from the MERGE match SELECT, with rows for both
     /// matched and unmatched cases. Filters for each side are derived from
@@ -3632,12 +3699,20 @@ struct MergeMatchRows {
 
 #[cfg(test)]
 impl MergeMatchRows {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     fn empty() -> Self {
         Self {
             full: RecordBatch::new_empty(Arc::new(Schema::empty())),
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     fn matched_batch(&self) -> Result<RecordBatch, String> {
         if self.full.num_rows() == 0 {
             return Ok(self.full.clone());
@@ -3647,6 +3722,10 @@ impl MergeMatchRows {
             .map_err(|e| format!("filter MERGE matched rows failed: {e}"))
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     fn unmatched_insert_batch(
         &self,
         target_columns: &[novarocks_catalog::schema::ColumnDef],
@@ -3695,6 +3774,10 @@ impl MergeMatchRows {
             .map_err(|e| format!("build MERGE INSERT batch failed: {e}"))
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     fn row_filter(&self, kind: &str, apply_col: &str) -> Result<BooleanArray, String> {
         let kind_col = cast(
             required_column(&self.full, "__nr_match_kind")?,
@@ -3727,6 +3810,14 @@ impl MergeMatchRows {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "MERGE match materialization retains its independently validated schema and routing inputs."
+)]
 fn materialize_merge_match(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
@@ -3833,9 +3924,9 @@ fn materialize_merge_match(
         &target_sql,
         &target_alias,
         &source_sql,
-        &on_sql,
-        matched_predicate_sql.as_deref(),
-        not_matched_predicate_sql.as_deref(),
+        on_sql,
+        matched_predicate_sql,
+        not_matched_predicate_sql,
         target_columns,
         &matched_assignments_sql_borrow,
         &insert_values_sql_borrow,
@@ -4111,8 +4202,8 @@ fn build_merge_mor_change_stream_write_plan(
         &target_alias,
         &source_sql,
         &stmt.on_sql,
-        matched_predicate_sql.as_deref(),
-        not_matched_predicate_sql.as_deref(),
+        matched_predicate_sql,
+        not_matched_predicate_sql,
         target_columns,
         &matched_assignments_sql_borrow,
         &insert_values_sql_borrow,
@@ -4157,6 +4248,10 @@ fn build_merge_mor_change_stream_write_plan(
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn execute_merge_match_query(
     state: &DmlExecutionKernel,
     current_catalog: Option<&str>,
@@ -4179,6 +4274,10 @@ fn execute_merge_match_query(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "MERGE SQL construction keeps all user-visible clauses and frozen target facts explicit."
+)]
 fn build_merge_match_query_sql(
     target_sql: &str,
     target_alias: &str,
@@ -4278,6 +4377,10 @@ fn build_merge_match_query_sql(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn build_merge_unmatched_insert_query(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
@@ -4423,6 +4526,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     fn non_null_col(name: &str) -> ColumnDef {
         ColumnDef {
             name: name.to_string(),

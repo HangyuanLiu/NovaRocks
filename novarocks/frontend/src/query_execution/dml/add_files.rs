@@ -429,6 +429,10 @@ impl AddFilesEngine for DmlExecutionKernel {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The externally visible ADD FILES outcome preserves its typed failure payload."
+)]
 fn downcast_prepared(
     prepared: &dyn AddFilesPrepared,
 ) -> Result<&CorePreparedAddFiles, AddFilesOutcome> {

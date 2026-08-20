@@ -96,6 +96,10 @@ pub struct NativeSubmissionEncodingView<'a> {
 }
 
 impl<'a> NativeSubmissionEncodingView<'a> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Native submission must retain independently frozen fragment, schedule, connector, and output facts."
+    )]
     pub(crate) fn new(
         handoff_id: u64,
         execution_id: QueryExecutionId,
@@ -363,6 +367,10 @@ mod tests {
     use crate::query_execution::contract::QueryId;
     use novarocks_protocol::lifecycle::AttemptId;
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution contract and lifecycle integration."
+    )]
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(
             QueryId::new(7, 9),
@@ -374,9 +382,7 @@ mod tests {
     #[test]
     fn view_rejects_duplicate_placement_key() {
         let key = NativeSubmissionKey::new(2, 3, UniqueId::new(5, 7));
-        let error = validate_keys(&[key, key], key)
-            .err()
-            .expect("duplicate key must be rejected");
+        let error = validate_keys(&[key, key], key).expect_err("duplicate key must be rejected");
         assert!(error.message().contains("repeats a sealed placement key"));
     }
 }

@@ -265,6 +265,10 @@ pub(crate) struct GrpcRuntimeFilterEnvelopeSink {
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 impl GrpcRuntimeFilterEnvelopeSink {
     pub(crate) fn new(runtime: BackendDataRuntime) -> Arc<Self> {
         Self::new_with_client_and_capacities(

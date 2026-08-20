@@ -659,10 +659,9 @@ fn scan_cost_size(scan: &ScanOp, stats: &Statistics) -> f64 {
             .columns
             .iter()
             .find(|column| column.name.eq_ignore_ascii_case(required_name))
+            && !column_ids.contains(&column.column_id)
         {
-            if !column_ids.contains(&column.column_id) {
-                column_ids.push(column.column_id);
-            }
+            column_ids.push(column.column_id);
         }
     }
 
@@ -714,9 +713,9 @@ fn table_column_width(table_stats: &TableStatistics, column_name: &str) -> f64 {
         .unwrap_or(DEFAULT_ROW_WIDTH)
 }
 
-fn scan_bound_table_statistics<'a>(
+fn scan_bound_table_statistics(
     scan: &ScanOp,
-    stats_input: Option<&'a OptimizerStatsInput>,
+    stats_input: Option<&OptimizerStatsInput>,
 ) -> Option<TableStatistics> {
     let stats_ref = scan.stats_ref?;
     stats_input?
@@ -957,10 +956,9 @@ fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> 
     let network_cost = if is_broadcast {
         finite_non_negative_cost(build_size * fanout)
     } else if is_shuffle {
-        if backends <= 1.0 {
-            0.0
-        } else if child_output_is_hash_partitioned(input.child_outputs.first())
-            && child_output_is_hash_partitioned(input.child_outputs.get(1))
+        if backends <= 1.0
+            || (child_output_is_hash_partitioned(input.child_outputs.first())
+                && child_output_is_hash_partitioned(input.child_outputs.get(1)))
         {
             0.0
         } else {
@@ -1171,6 +1169,10 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) fn compute_cost_from_input(input: &CostInput<'_>) -> TotalCost {
     compute_cost_estimate(input).total_with_options(input.options)
 }
@@ -1203,6 +1205,10 @@ fn compute_legacy_cost_with_properties(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) fn compute_cost_with_properties(
     op: &Operator,
     own_stats: &Statistics,
@@ -1236,9 +1242,9 @@ mod tests {
     use crate::optimizer::property::{DistributionSpec, OrderingSpec};
     use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
     use crate::optimizer::statistics::{ColumnStatistic, Confidence, CostEstimate};
-    use crate::planner::logical::*;
+
     use crate::planner::optimizer_bridge::scalar::intern_typed;
-    use crate::planner::payload::*;
+
     use std::collections::HashMap;
 
     fn stats(rows: f64, avg_size: f64) -> Statistics {
@@ -1516,6 +1522,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
+    )]
     fn broadcast_input_with_scalars<'a>(
         op: &'a Operator,
         own: &'a Statistics,
@@ -1651,6 +1661,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn broadcast_decision_keeps_cross_join_forced_when_infeasible() {
         let probe = stats(1_000.0, 64.0);
         let mut build = stats(1_000_000.0, 2048.0);
@@ -1753,6 +1767,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn estimated_build_hash_table_bytes_sanitizes_options() {
         let build = stats(100.0, 8.0);
         let payload = safe_compute_size(&build);
@@ -1808,6 +1826,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn confidence_risk_multiplier_invalid_values_fall_back_to_neutral() {
         let mut o = CostOptions::default();
 
@@ -1861,6 +1883,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn invalid_risk_multiplier_never_makes_infeasible_build_feasible() {
         for invalid_multiplier in [f64::NAN, -2.0] {
             let mut o = CostOptions::default();
@@ -1882,6 +1908,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn layer1_per_node_floor_never_divides_by_backend_count() {
         let mut o = CostOptions::default();
         let mut profile = ClusterResourceProfile::default();
@@ -1903,6 +1933,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn cluster_network_floor_can_reject_when_per_node_memory_fits() {
         let mut o = CostOptions::default();
         let mut profile = ClusterResourceProfile::default();
@@ -1953,6 +1987,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn small_exact_build_is_feasible() {
         let mut o = CostOptions::default();
         let mut profile = ClusterResourceProfile::default();
@@ -1971,6 +2009,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn huge_exact_big_memory_allows_wide_but_rejects_extremely_narrow_build() {
         let mut o = CostOptions::default();
         let mut profile = ClusterResourceProfile::default();
@@ -2816,6 +2858,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn single_node_broadcast_and_shuffle_network_are_zero() {
         let mut options = CostOptions::default();
         let mut profile = ClusterResourceProfile::default();
@@ -2864,6 +2910,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn q9_shape_broadcast_total_below_shuffle_total() {
         let mut options = CostOptions::default();
         options.memory_weight = 0.15;
@@ -3708,6 +3758,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn apply_profile_syncs_backend_factor_projection() {
         let mut opts = CostOptions::default();
         let mut profile = ClusterResourceProfile::default();
@@ -3718,6 +3772,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn apply_profile_clamps_backend_factor_to_one() {
         for backend_count in [0.0, 0.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -2.0] {
             let mut opts = CostOptions::default();

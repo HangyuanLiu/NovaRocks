@@ -19,7 +19,7 @@
 
 use crate::query_execution::kernels::ViewExecutionKernel;
 use crate::runtime::statement_result::StatementResult;
-use crate::view::{ViewRequestContext, ViewService, ViewStatementResult};
+use crate::view::{ViewRequestContext, ViewStatementResult};
 use novarocks_spi::connector::ConnectorRequestContext;
 
 #[derive(Clone)]

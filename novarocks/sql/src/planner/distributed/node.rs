@@ -68,6 +68,14 @@ pub enum ExchangeFlavor {
 /// is overlay-only. `SetOp { UnionDistinct }` is still rejected during M1
 /// conversion and must be rewritten before fragmentation.
 #[allow(dead_code)]
+#[expect(
+    private_interfaces,
+    reason = "The public distributed plan shape is consumed by the frontend, while node payload construction remains SQL-internal."
+)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Distributed plan payloads are intentionally stored inline to preserve the frozen frontend plan representation."
+)]
 #[derive(Clone, Debug)]
 pub enum DistributedNodeKind {
     Scan(PlanScanNode),
@@ -183,6 +191,10 @@ pub fn distributed_kind_to_physical(kind: &DistributedNodeKind) -> PhysicalPlanK
 }
 
 #[allow(dead_code)]
+#[expect(
+    private_interfaces,
+    reason = "The frontend needs the distributed node envelope, but runtime-filter and statistics construction remains SQL-internal."
+)]
 #[derive(Clone, Debug)]
 pub struct DistributedNode {
     pub node_id: i32,

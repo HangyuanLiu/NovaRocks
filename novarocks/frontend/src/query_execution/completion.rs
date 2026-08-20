@@ -24,6 +24,10 @@
 use crate::runtime::query_result::build_string_query_result;
 use crate::runtime::statement_result::StatementResult;
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Prepared query operations preserve their direct immediate and distributed boundary payloads."
+)]
 pub enum PreparedQueryOperation {
     Immediate(PreparedImmediateQuery),
     Distributed(PreparedDistributedQuery),
@@ -92,6 +96,10 @@ pub struct PreparedQueryCompletion {
     formatter: PreparedQueryFormatter,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Completion formatting retains the exact profile payload paired with the distributed request."
+)]
 enum PreparedQueryFormatter {
     Result,
     Profile(PreparedProfileFormatter),

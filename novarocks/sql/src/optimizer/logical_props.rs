@@ -363,7 +363,7 @@ mod tests {
         FilterOp, JoinDistribution, LogicalJoinOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
         ScanOp,
     };
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
 
     fn col(arena: &mut ScalarArena, id: u32) -> ScalarId {
         arena.intern(ScalarNode::ColumnRef(ColumnId(id)), DataType::Int64, false)

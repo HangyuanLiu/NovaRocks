@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(test)]
-use crate::planner::vocabulary::ApplyKeySource;
-
 use arrow::datatypes::DataType;
 
 use crate::analysis::OutputColumn;
@@ -329,9 +326,6 @@ fn plan_kind(plan: &LogicalPlanNode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use crate::planner::logical::*;
-    use crate::planner::payload::*;
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
 
     use super::*;
     use crate::analysis::{

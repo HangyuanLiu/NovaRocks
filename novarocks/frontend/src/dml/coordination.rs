@@ -87,6 +87,10 @@ impl DmlCoordinator {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn admission(&self) -> Result<Arc<dyn DmlIntentAdmissionValidator>, DmlError> {
         if self.closing.load(Ordering::Acquire) {
             return Err(DmlError::coordination_unresolved(
@@ -102,6 +106,10 @@ impl DmlCoordinator {
         Ok(Arc::new(CurrentDmlAdmission { admission }))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn claim_foreground(
         &self,
         journal: Arc<dyn OperationJournal>,
@@ -111,6 +119,10 @@ impl DmlCoordinator {
         self.claim_inner(journal, operation, Some(admission))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn claim_recovery(
         &self,
         journal: Arc<dyn OperationJournal>,
@@ -119,6 +131,10 @@ impl DmlCoordinator {
         self.claim_inner(journal, operation, None)
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn claim_inner(
         &self,
         journal: Arc<dyn OperationJournal>,
@@ -295,6 +311,10 @@ impl DmlCoordinator {
         first_error.map_or(Ok(()), Err)
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn blocking<T>(
         &self,
         future: impl Future<Output = Result<T, DmlError>>,
@@ -347,6 +367,10 @@ pub struct DmlExternalFenceProposal {
 }
 
 impl DmlExternalFenceProposal {
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn try_new(
         operation_id: DmlOperationId,
         cluster_id: String,
@@ -377,6 +401,10 @@ impl DmlExternalFenceProposal {
     /// Focused-test proposal. Production always mints one from the live lease
     /// guard through [`DmlOperationAuthority::external_fence`].
     #[cfg(test)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn testing(
         operation_id: DmlOperationId,
         cluster_id: &str,
@@ -434,6 +462,10 @@ impl DmlExternalFenceProposal {
     /// This is the frontend half of the CP-3B D5 double check: an executor that
     /// established some *other* fence must never be able to make the runner
     /// record a receipt for it and then dispatch.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub fn validate_established(
         &self,
         established: &ConnectorEstablishedWriteFence,
@@ -448,6 +480,10 @@ impl DmlExternalFenceProposal {
     /// sealed. The check itself is identical and deliberately shared: a
     /// TRUNCATE must not be able to journal a receipt for some other fence and
     /// then dispatch.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub fn validate_established_receipt(
         &self,
         fence: &ConnectorExternalOperationFence,
@@ -494,6 +530,10 @@ impl DmlExternalFenceProposal {
 /// live lease guard. Keeping it pure makes the "always the latest token" rule
 /// checkable: every field comes from the argument, so nothing about an earlier
 /// token can survive into a later fence.
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn external_fence_generation(
     token: &novarocks_state_store::coordination::FencingToken,
     coordination_attempt_id: Uuid,
@@ -512,6 +552,10 @@ fn external_fence_generation(
 /// separates attempts; this component keeps the total order strict inside an
 /// epoch and stays monotone across claims because a later claim mints a later
 /// UUIDv7 timestamp.
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn coordination_attempt_fence_generation(attempt_id: Uuid) -> Result<u64, DmlError> {
     let timestamp = attempt_id.get_timestamp().ok_or_else(|| {
         DmlError::journal_corruption("DML coordination attempt id carries no UUIDv7 timestamp")
@@ -566,6 +610,10 @@ impl DmlOperationAuthority {
         });
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn check_before_dispatch(&self) -> Result<(), DmlError> {
         if self.closing.load(Ordering::Acquire)
             || self.inner.lost.load(Ordering::Acquire)
@@ -618,6 +666,10 @@ impl DmlOperationAuthority {
             .map_err(|error| error.with_operation_id(self.inner.operation_id))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn journal_authority(&self) -> Result<DmlMutationAuthority, DmlError> {
         DmlMutationAuthority::try_new(
             self.inner.coordination_attempt_id,
@@ -634,6 +686,10 @@ impl DmlOperationAuthority {
     /// call, exactly like the dynamic latest-fence validator above. Nothing is
     /// cached: a renewed or superseded lease must be observable here, so no
     /// caller can dispatch behind a fence built from a stale token.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn external_fence(&self) -> Result<DmlExternalFenceProposal, DmlError> {
         let runtime = self.runtime.clone();
         let this = self.clone();
@@ -726,6 +782,10 @@ impl DmlOperationAuthority {
             .expect("DML renewal task lock poisoned") = Some(handle);
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn release(&self) -> Result<(), DmlError> {
         let runtime = self.runtime.clone();
         let this = self.clone();
@@ -888,6 +948,10 @@ impl ActiveDmlOperation {
     /// There is deliberately no unfenced answer: an operation without a
     /// coordination authority cannot prove which control-plane generation owns
     /// it, so it must not reach a writer or a commit at all.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn external_fence(&self) -> Result<DmlExternalFenceProposal, DmlError> {
         if let Some(authority) = self.authority.as_ref() {
             return authority.external_fence();
@@ -914,6 +978,10 @@ impl ActiveDmlOperation {
     /// Establishing first and failing to record afterwards would leave a
     /// provider-side marker with no durable frontend proof, which is exactly
     /// the ambiguity historical write recovery must not have to guess about.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn preflight_external_fence(
         &self,
         proposal: &DmlExternalFenceProposal,
@@ -934,6 +1002,10 @@ impl ActiveDmlOperation {
             .map_err(|error| error.with_operation_id(self.operation_id()))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn record_external_fence(
         &mut self,
         fence: DmlExternalFenceReceiptRecord,
@@ -969,6 +1041,10 @@ impl ActiveDmlOperation {
     /// first and failing to record afterwards would leave external truth fenced
     /// with no durable frontend proof — exactly the ambiguity historical
     /// data-mutation recovery must not have to guess about.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn preflight_direct_mutation_fence(
         &self,
         proposal: &DmlExternalFenceProposal,
@@ -999,6 +1075,10 @@ impl ActiveDmlOperation {
     /// operation revision, and the coordination attempt inside the same
     /// StateStore transaction that writes the receipt, so a superseded holder
     /// can never install one.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn record_direct_mutation_fence(
         &mut self,
         fence: DmlDirectMutationFenceReceiptRecord,
@@ -1029,6 +1109,10 @@ impl ActiveDmlOperation {
 
     /// Validate and persist the provider-neutral CTAS recovery side record
     /// under the same live operation authority as the top-level saga.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn record_ctas_recovery(
         &mut self,
         recovery: DmlCtasRecoveryRecord,
@@ -1059,6 +1143,10 @@ impl ActiveDmlOperation {
         Ok(())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn external_fence_journal_authority(&self) -> Result<DmlMutationAuthority, DmlError> {
         #[cfg(test)]
         if self.authority.is_none()
@@ -1072,12 +1160,20 @@ impl ActiveDmlOperation {
         self.journal_authority()
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn check_before_dispatch(&self) -> Result<(), DmlError> {
         self.authority
             .as_ref()
             .map_or(Ok(()), DmlOperationAuthority::check_before_dispatch)
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn transition(
         &mut self,
         to: OperationState,
@@ -1105,6 +1201,10 @@ impl ActiveDmlOperation {
         Ok(())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn record_fact(
         &mut self,
         fact: OperationFact,
@@ -1132,6 +1232,10 @@ impl ActiveDmlOperation {
         Ok(())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn mutate_statement(
         &mut self,
         state: OperationState,
@@ -1169,6 +1273,10 @@ impl ActiveDmlOperation {
         Ok(())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn apply_add_files_mutation(
         &mut self,
         mut request: AddFilesMutationRequest,
@@ -1196,6 +1304,10 @@ impl ActiveDmlOperation {
         Ok(())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn reschedule_recovery_due(
         &mut self,
         recovery_due_at_ms: Option<i64>,
@@ -1215,12 +1327,20 @@ impl ActiveDmlOperation {
         Ok(())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn release(&self) -> Result<(), DmlError> {
         self.authority
             .as_ref()
             .map_or(Ok(()), DmlOperationAuthority::release)
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn journal_authority(&self) -> Result<DmlMutationAuthority, DmlError> {
         #[cfg(test)]
         if self.authority.is_none()
@@ -1239,6 +1359,10 @@ impl ActiveDmlOperation {
             .journal_authority()
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn reload(&mut self) -> Result<(), DmlError> {
         self.stored = self.journal.load(self.operation_id())?.ok_or_else(|| {
             DmlError::journal_unresolved(format!(
@@ -1255,6 +1379,10 @@ impl ActiveDmlOperation {
     /// still needs the bounded recovery scan. CP-3B and CP-3D add obligations
     /// the operation state cannot express: open historical write recovery and
     /// retained CTAS staging must survive a terminal user-visible outcome.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn effective_recovery_due(
         &self,
         state: OperationState,
@@ -1283,6 +1411,10 @@ impl ActiveDmlOperation {
     /// obligation, so "unsupported" and "absent" are the same answer. Every
     /// other failure propagates: a journal that could answer but did not must
     /// never be allowed to silently drop a pending cleanup.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn open_historical_write_recovery(
         &self,
     ) -> Result<Option<DmlHistoricalWriteRecoveryRecord>, DmlError> {
@@ -1297,6 +1429,10 @@ impl ActiveDmlOperation {
     }
 
     /// The open CTAS recovery record, if this journal keeps one.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn open_ctas_recovery(&self) -> Result<Option<DmlCtasRecoveryRecord>, DmlError> {
         match self.journal.load_ctas_recovery(self.operation_id()) {
             Ok(record) => Ok(record),

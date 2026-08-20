@@ -69,6 +69,10 @@ pub struct SortProcessorFactory {
 }
 
 impl SortProcessorFactory {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The sort factory mirrors the frozen physical sort-node contract."
+    )]
     pub fn new(
         node_id: i32,
         arena: Arc<ExprArena>,
@@ -96,6 +100,10 @@ impl SortProcessorFactory {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The TopN factory mirrors the frozen physical sort-node contract."
+    )]
     pub fn new_topn(
         node_id: i32,
         arena: Arc<ExprArena>,
@@ -123,6 +131,10 @@ impl SortProcessorFactory {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The internal constructor preserves the complete sort configuration without an allocation-only options type."
+    )]
     fn new_internal(
         node_id: i32,
         arena: Arc<ExprArena>,
@@ -1205,7 +1217,6 @@ mod tests {
             Some(2), // per-partition cap = 2
         );
 
-        use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
         let mut op = factory.create(1, 0);
         let proc = op.as_processor_mut().expect("processor");
         let state = crate::runtime::runtime_state::RuntimeState::default();
@@ -1337,7 +1348,6 @@ mod tests {
         );
 
         // Instantiate the operator and drive it through the push/set_finishing/pull cycle.
-        use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
         let mut op = factory.create(1, 0);
         let proc = op.as_processor_mut().expect("processor");
 

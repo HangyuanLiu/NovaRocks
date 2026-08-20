@@ -36,6 +36,10 @@ use novarocks_protocol::plan;
 use novarocks_types::SlotId;
 use novarocks_types::aggregate::{infer_agg_function_types, mangle_distinct_aggregate_name};
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen native boundary keeps independently validated inputs explicit."
+)]
 pub(super) fn lower_hash_aggregate_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,

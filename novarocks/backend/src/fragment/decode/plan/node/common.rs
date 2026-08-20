@@ -30,12 +30,20 @@ use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::{FieldPath, ProtocolErrorKind};
 use novarocks_protocol::{common as proto_common, plan};
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(crate) fn unsupported<T>(kind: &str) -> Result<T, String> {
     Err(format!(
         "{kind} native proto node lowering is not implemented"
     ))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(crate) fn exec_node_kind_label(kind: &ExecNodeKind) -> &'static str {
     match kind {
         ExecNodeKind::Scan(_) => "Scan",

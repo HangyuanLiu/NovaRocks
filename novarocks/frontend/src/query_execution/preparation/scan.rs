@@ -147,6 +147,10 @@ pub(crate) fn fixture_planning_lease(instance_id: &str) -> ConnectorControlPlann
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for isolated frontend scan-materialization regression fixtures."
+)]
 pub(crate) fn fixture_query_scan_materialization(instance_id: &str) -> QueryScanMaterialization {
     use std::sync::Arc;
 
@@ -201,6 +205,10 @@ pub(crate) struct PlannedConnectorRead {
     pub(crate) batch: ConnectorBatchBudget,
     /// Keeps the exact FE control generation alive through the BE ensure
     /// barrier. It is never encoded into a fragment carrier.
+    #[allow(
+        dead_code,
+        reason = "The lease is retained for its drop-time ownership release through BE admission."
+    )]
     pub(crate) planning_lease: ConnectorControlPlanningLease,
     /// FE-local remote read ownership. This never enters a native carrier.
     pub(crate) read_session: Option<novarocks_spi::connector::ConnectorReadSessionLease>,

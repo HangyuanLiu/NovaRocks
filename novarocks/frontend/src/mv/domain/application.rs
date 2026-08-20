@@ -166,6 +166,10 @@ impl From<&CreateMaterializedViewStmt> for MvCreateStatement {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The SQL-facing statement carrier retains its direct create payload to preserve the existing application boundary."
+)]
 pub enum MvApplicationStatement {
     Create(MvCreateStatement),
     Unhandled,

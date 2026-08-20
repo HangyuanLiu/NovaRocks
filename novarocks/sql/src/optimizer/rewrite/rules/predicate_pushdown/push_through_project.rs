@@ -419,7 +419,7 @@ mod tests {
     use crate::optimizer::rewrite::context::RewriteContext;
     use crate::optimizer::rewrite::tree_binder::bind_tree;
     use crate::optimizer::scalar::ScalarArena;
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
 
@@ -520,7 +520,7 @@ mod tests {
         }
     }
 
-    fn scan_opt(arena: &mut ScalarArena, cols: &[(&str, ColumnId)]) -> OptExpr {
+    fn scan_opt(_arena: &mut ScalarArena, cols: &[(&str, ColumnId)]) -> OptExpr {
         OptExpr::leaf(Operator::LogicalScan(ScanOp {
             database: "db".into(),
             table: make_table_def(cols),

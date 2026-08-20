@@ -70,6 +70,10 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdmitError {
     DeleteRequiresWhere,
+    #[allow(
+        dead_code,
+        reason = "The manifest keeps this typed capability code while parser validation owns the form rejection."
+    )]
     DeleteUnsupportedForm,
     UpdateUnsupportedForm,
     MergeUnsupportedForm,

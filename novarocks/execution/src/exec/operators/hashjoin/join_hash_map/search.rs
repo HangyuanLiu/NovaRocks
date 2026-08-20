@@ -24,6 +24,10 @@ pub(crate) struct JoinSelection {
     pub(crate) build: Vec<u32>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Selection compaction remains available for alternate join probe paths."
+)]
 impl JoinSelection {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -120,6 +124,10 @@ pub(crate) struct ProbeMask {
     keep: Vec<bool>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Probe-mask inspection helpers are retained for outer-join regression coverage."
+)]
 impl ProbeMask {
     pub(crate) fn new(len: usize, value: bool) -> Self {
         Self {
@@ -150,9 +158,8 @@ impl ProbeMask {
         self.keep
             .iter()
             .enumerate()
-            .filter_map(|(row, keep)| {
-                (*keep == value).then(|| u32::try_from(row).expect("join probe row id exceeds u32"))
-            })
+            .filter(|&(_row, keep)| *keep == value)
+            .map(|(row, _keep)| u32::try_from(row).expect("join probe row id exceeds u32"))
             .collect()
     }
 

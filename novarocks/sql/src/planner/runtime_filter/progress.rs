@@ -30,6 +30,10 @@ pub struct FrontierEdge {
 /// filter after only its build-side frontier completes, independent of the
 /// probe side and of the rest of the fragment.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    private_interfaces,
+    reason = "Build-progress proofs retain SQL-internal channel and binding identities for deterministic scheduling."
+)]
 pub struct JoinBuildProgressProof {
     pub channel: ChannelId,
     pub producer_binding: BindingId,
@@ -56,7 +60,7 @@ pub struct JoinBuildProgressSkip {
     pub rule: FrontierSkip,
 }
 
-type JoinBuildProgressKey = (ChannelId, BindingId, u32);
+pub(crate) type JoinBuildProgressKey = (ChannelId, BindingId, u32);
 
 /// Planner-sealed build-progress facts. Successful proofs and fail-closed skip
 /// provenance share the same expected producer tuple without conflating their
@@ -78,24 +82,33 @@ impl JoinBuildProgressCatalog {
     }
 
     #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.proofs.is_empty() && self.skips.is_empty()
+    }
+
+    #[cfg(test)]
     pub fn values(&self) -> impl Iterator<Item = &JoinBuildProgressProof> {
         self.proofs.values()
     }
 
-    pub fn get(&self, key: &JoinBuildProgressKey) -> Option<&JoinBuildProgressProof> {
+    pub(crate) fn get(&self, key: &JoinBuildProgressKey) -> Option<&JoinBuildProgressProof> {
         self.proofs.get(key)
     }
 
-    pub fn skipped(&self, key: &JoinBuildProgressKey) -> Option<&JoinBuildProgressSkip> {
+    pub(crate) fn skipped(&self, key: &JoinBuildProgressKey) -> Option<&JoinBuildProgressSkip> {
         self.skips.get(key)
     }
 
-    pub fn insert_proof(&mut self, key: JoinBuildProgressKey, proof: JoinBuildProgressProof) {
+    pub(crate) fn insert_proof(
+        &mut self,
+        key: JoinBuildProgressKey,
+        proof: JoinBuildProgressProof,
+    ) {
         self.skips.remove(&key);
         self.proofs.insert(key, proof);
     }
 
-    pub fn insert_skip(&mut self, key: JoinBuildProgressKey, skip: JoinBuildProgressSkip) {
+    pub(crate) fn insert_skip(&mut self, key: JoinBuildProgressKey, skip: JoinBuildProgressSkip) {
         self.proofs.remove(&key);
         self.skips.insert(key, skip);
     }

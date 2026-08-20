@@ -109,6 +109,10 @@ struct RecordingQueryInitBarrier {
     aborts: Arc<AtomicUsize>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Lifecycle test fixture captures the initialized plan for cross-module assertions."
+)]
 struct CapturingQueryInitBarrier {
     plan: Arc<Mutex<Option<QueryInitPlan>>>,
     finalizes: Arc<AtomicUsize>,

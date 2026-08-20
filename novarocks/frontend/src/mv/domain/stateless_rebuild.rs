@@ -216,6 +216,10 @@ pub fn execute_typed_novarocks_imv_stateless_rebuild(
 /// checks the test-only env flag before calling this; the lib-harness tests
 /// call it directly so they can exercise the `full` round-trip without racing
 /// on process env.
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn execute_request(
     connector_control: &dyn ConnectorControlResolver,
     mv_storage_observation: &dyn MvStorageObservationPort,

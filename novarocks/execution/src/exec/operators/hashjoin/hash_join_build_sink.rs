@@ -84,7 +84,15 @@ impl HashJoinBuildRuntimeFilterExecution {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Compatibility construction is retained for native hash-join callers during migration."
+)]
 impl HashJoinBuildSinkFactory {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The compatibility constructor preserves the established native hash-join factory contract."
+    )]
     pub(crate) fn new_native(
         arena: Arc<ExprArena>,
         join_type: JoinType,
@@ -110,6 +118,10 @@ impl HashJoinBuildSinkFactory {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Runtime-filter bindings are frozen alongside the native hash-join factory contract."
+    )]
     pub(crate) fn new_native_with_runtime_filters(
         arena: Arc<ExprArena>,
         join_type: JoinType,

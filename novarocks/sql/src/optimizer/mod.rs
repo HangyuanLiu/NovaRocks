@@ -186,6 +186,10 @@ pub(crate) fn optimize_with_root_distribution_and_test_table_statistics(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
+)]
 fn optimize_with_root_property(
     plan_expr: OptExpr,
     scalar_arena: ScalarArena,
@@ -354,7 +358,7 @@ fn optimizer_rejects_unbound_scan_stats() {
 
     use crate::common::OutputColumn;
     use crate::optimizer::operator::{Operator, ScanOp};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
 
     let expr = OptExpr::leaf(Operator::LogicalScan(ScanOp {
         database: "db".to_string(),
@@ -394,6 +398,10 @@ fn optimizer_rejects_unbound_scan_stats() {
 ///
 /// Used by the server-side `SET disable_optimizer_rules` parser to
 /// detect typos in rule names so they can be surfaced via `warn!`
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 /// without rejecting the SET statement.
 pub(crate) fn is_known_rule_name(name: &str) -> bool {
     cascades_rules::all_transformation_rules()
@@ -1089,9 +1097,7 @@ mod is_known_rule_name_tests {
     #[test]
     fn sqlx2_planner_vocabulary_optimizer_uses_tokenized_scan_facts() {
         let table = iceberg_table("cat", "ns", "t", &["value"]);
-        let ScanSource::Sql(source) = table.source else {
-            panic!("optimizer test table must use SQL-owned scan facts");
-        };
+        let ScanSource::Sql(source) = table.source;
         assert_eq!(source.table.catalog, "cat");
         assert_eq!(source.table.namespace, "ns");
         assert_eq!(source.table.table, "t");
@@ -1468,7 +1474,7 @@ mod is_known_rule_name_tests {
         use crate::column_id::ColumnRefFactory;
         use crate::optimizer::property::DistributionSpec;
         use crate::planner::logical::LogicalPlanKind;
-        use crate::planner::table::{ScanSource, TableDef};
+        use crate::planner::table::TableDef;
         use novarocks_catalog::schema::ColumnDef;
 
         struct MinimalCatalog;
@@ -1565,7 +1571,7 @@ mod is_known_rule_name_tests {
         use crate::common::SqlTopNType;
         use crate::optimizer::operator::Operator;
         use crate::optimizer::optimized_tree::OptimizedOperatorNode;
-        use crate::planner::table::{ScanSource, TableDef};
+        use crate::planner::table::TableDef;
         use novarocks_catalog::schema::ColumnDef;
 
         struct RankingCatalog;
@@ -1704,7 +1710,7 @@ mod is_known_rule_name_tests {
     fn scalar_subquery_decorrelates_to_join() {
         use crate::catalog::PlannerTableProvider;
         use crate::column_id::ColumnRefFactory;
-        use crate::planner::table::{ScanSource, TableDef};
+        use crate::planner::table::TableDef;
         use novarocks_catalog::schema::ColumnDef;
 
         // Minimal catalog providing t1(k1, k2) and t2(k1, k2) — the same

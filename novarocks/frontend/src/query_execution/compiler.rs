@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -23,31 +22,25 @@ pub use crate::query_execution::post_compile::{
     NativeFragmentEncodingInput, PreparedDistributedQueryAssembly,
 };
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
+#[cfg(test)]
 use crate::query_execution::{PreparedImmediateQuery, PreparedQueryCompletion, StatementResult};
-use crate::runtime::query_result::{QueryResult, build_string_query_result};
+use crate::runtime::query_result::QueryResult;
+#[cfg(test)]
+use crate::runtime::query_result::build_string_query_result;
 use novarocks_protocol::lifecycle::QueryOptions;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
 #[cfg(test)]
 use crate::catalog_application::query_materializer::build_catalog_service_provider;
-#[cfg(test)]
-use crate::mv::domain::application::UnavailableMvApplicationService;
 use crate::mv::domain::repository::MvRepository;
-#[cfg(test)]
-use crate::mv::domain::repository::UnavailableMvRepository;
 use novarocks_catalog::identifier::normalize_identifier;
-#[cfg(test)]
-use novarocks_catalog::memory::DEFAULT_DATABASE;
 pub use novarocks_sql::planning::catalog::TableLookupMode;
 
+use crate::catalog_application::query_catalog::{CatalogServiceSource, catalog_service_snapshot};
 use crate::query_execution::kernels as domain;
 use crate::query_execution::planning::time_travel::{
     has_time_travel_refs, rewrite_time_travel_refs,
 };
-#[cfg(test)]
-use novarocks_sql::syntax::{sql_type_to_arrow_type, sqlparser_expr_to_literal};
-
-use crate::catalog_application::query_catalog::{CatalogServiceSource, catalog_service_snapshot};
 
 macro_rules! impl_kernel_catalog_service_source {
     ($kernel:ty) => {
@@ -906,6 +899,10 @@ pub(crate) fn test_query_execution_service()
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "All-in-one integration fixture serializes tests that share a loopback backend."
+)]
 pub(crate) struct TestSerializationGuard {
     _guard: std::sync::MutexGuard<'static, ()>,
 }
@@ -917,6 +914,10 @@ unsafe impl Send for TestSerializationGuard {}
 unsafe impl Sync for TestSerializationGuard {}
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "All-in-one integration fixture acquires the guard that serializes shared loopback tests."
+)]
 pub(crate) fn acquire_standalone_test_guard() -> TestSerializationGuard {
     use std::sync::{Mutex, OnceLock};
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -928,11 +929,19 @@ pub(crate) fn acquire_standalone_test_guard() -> TestSerializationGuard {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Shared test fixture provides the in-memory MV repository to external frontend tests."
+)]
 pub(crate) fn test_mv_repository() -> Arc<dyn MvRepository> {
     Arc::new(crate::mv::domain::test_repository::InMemoryMvRepository::default())
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The distributed fixture retains both its sealed assembly and completion contract for integration tests."
+)]
 pub enum TestPreparedQueryOperation {
     Immediate(PreparedImmediateQuery),
     Distributed {
@@ -1223,6 +1232,10 @@ fn is_query_sql(sql: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Shared frontend test fixture preserves explicit all-in-one request contexts."
+)]
 fn test_request_context(
     current_catalog: Option<&str>,
     current_database: &str,
@@ -1235,6 +1248,10 @@ fn test_request_context(
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Shared frontend test fixture preserves explicit role-scoped request contexts."
+)]
 fn test_request_context_with_role(
     current_catalog: Option<&str>,
     current_database: &str,
@@ -1274,6 +1291,10 @@ fn test_request_context_with_role(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for the view compilation compatibility path exercised by integration tests."
+)]
 fn resolve_default_view_database(
     name: &novarocks_sql::syntax::ObjectName,
     current_catalog: Option<&str>,
@@ -1291,6 +1312,10 @@ fn resolve_default_view_database(
     normalize_identifier(database).map(Some)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained as the standalone planning timestamp helper for integration tests."
+)]
 fn standalone_now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1299,6 +1324,10 @@ fn standalone_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for named-partition overwrite SQL normalization coverage."
+)]
 fn rewrite_named_partition_insert_overwrite(sql: &str) -> Result<String, String> {
     let re = regex::Regex::new(
         r#"(?is)^\s*insert\s+overwrite\s+(?:table\s+)?(?P<table>(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)){0,2})\s+partition\s*\([^)]*\)\s+(?P<rest>.*)$"#,
@@ -1312,6 +1341,10 @@ fn rewrite_named_partition_insert_overwrite(sql: &str) -> Result<String, String>
     Ok(format!("INSERT OVERWRITE PARTITIONS {table} {rest}"))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for explicit backend-management role validation coverage."
+)]
 fn require_backend_management_role(
     statement: &str,
     role: novarocks_types::ClusterRole,
@@ -1358,10 +1391,10 @@ fn optimizer_settings_for_execution(
     let mut settings = execution
         .map(|execution| execution.optimizer_settings().clone())
         .unwrap_or_default();
-    if settings.cbo_broadcast_backend_count.is_none() {
-        if let Some(execution) = execution {
-            settings.effective_backend_count = Some(execution.topology().targets().len() as f64);
-        }
+    if settings.cbo_broadcast_backend_count.is_none()
+        && let Some(execution) = execution
+    {
+        settings.effective_backend_count = Some(execution.topology().targets().len() as f64);
     }
     settings
 }
@@ -1370,22 +1403,16 @@ pub(crate) fn scan_preparation_options(
     settings: &novarocks_sql::compiler::SessionOptimizerSettings,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
-    let target_parallelism = std::num::NonZeroUsize::new(execution.topology().targets().len())
-        .or_else(|| {
-            // Unit fixtures deliberately use an empty synthetic topology. A
-            // production request must instead fail before provider planning.
-            #[cfg(test)]
-            {
-                Some(std::num::NonZeroUsize::new(1).expect("one is non-zero"))
-            }
-            #[cfg(not(test))]
-            {
-                None
-            }
-        })
-        .ok_or_else(|| {
-            "connector split preparation requires a non-empty admitted backend topology".to_string()
-        })?;
+    let live_target_parallelism = std::num::NonZeroUsize::new(execution.topology().targets().len());
+    #[cfg(test)]
+    let target_parallelism = live_target_parallelism.or(Some(
+        std::num::NonZeroUsize::new(1).expect("one is non-zero"),
+    ));
+    #[cfg(not(test))]
+    let target_parallelism = live_target_parallelism;
+    let target_parallelism = target_parallelism.ok_or_else(|| {
+        "connector split preparation requires a non-empty admitted backend topology".to_string()
+    })?;
     Ok(
         crate::query_execution::preparation::ScanPreparationOptions::new(
             settings.connector_static_predicate_pushdown_enabled(),
@@ -1444,12 +1471,16 @@ fn prepare_explain_query_with_ports(
 fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> QueryOptions {
     let mut raw = query_options
         .as_ref()
-        .map(|options| options.as_proto().clone())
+        .map(|options| *options.as_proto())
         .unwrap_or_default();
     raw.enable_profile = true;
     QueryOptions::parse(raw).expect("enabling query profiling does not invalidate query options")
 }
 
+#[allow(
+    dead_code,
+    reason = "Test-only convenience helper preserves output-name shuffle assertions."
+)]
 pub(crate) fn iceberg_write_shuffle_by_output_name(
     output_name: impl Into<String>,
 ) -> novarocks_sql::compiler::RootDistributionRequirement {
@@ -1463,6 +1494,10 @@ pub(crate) fn iceberg_write_shuffle_by_output_index(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    dead_code,
+    reason = "Test-only compilation entrypoint is retained for direct Iceberg write planning coverage."
+)]
 pub(crate) fn prepare_query_as_iceberg_write(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
@@ -1594,6 +1629,10 @@ pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_query_local_overl
     )
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The sealed variant owns the exact provider registration required to prevent write-session substitution."
+)]
 pub(crate) enum DistributedConnectorWrite {
     Begin(crate::query_execution::contract::ConnectorWritePlanningTemplate),
     Sealed(crate::query_execution::contract::ConnectorWriteExecutionRegistration),
@@ -1758,7 +1797,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         DmlQueryExecutionKernel::connector_control(state),
-        &connector_context,
+        connector_context,
         Some(table_bindings.as_ref()),
         scan_resolver,
         scan_preparation_options(&optimizer_settings, execution)?,
@@ -1803,9 +1842,17 @@ fn change_stream_write_test_observer()
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Test observer guard is retained for cross-module change-stream write assertions."
+)]
 pub(crate) struct ChangeStreamWriteTestObserverGuard;
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Test observer guard exposes captured change-stream build observations."
+)]
 impl ChangeStreamWriteTestObserverGuard {
     fn take_observations(&self) -> Vec<ChangeStreamWriteBuildObservation> {
         change_stream_write_test_observer()
@@ -1829,6 +1876,10 @@ impl Drop for ChangeStreamWriteTestObserverGuard {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Test-only observer installation is retained for cross-module change-stream write assertions."
+)]
 pub(crate) fn install_change_stream_write_test_observer(
     short_circuit_after_build: bool,
 ) -> ChangeStreamWriteTestObserverGuard {
@@ -1980,6 +2031,10 @@ pub(crate) fn prepare_planned_iceberg_change_stream_write(
     ))
 }
 
+#[allow(
+    dead_code,
+    reason = "Test-only bound-write assembly remains available to exercise sealed request construction."
+)]
 fn prepare_distributed_write_request_with_execution(
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
@@ -2007,6 +2062,10 @@ fn prepare_distributed_write_request_with_execution(
 /// Callers that need typed abort certainty retain `session` until a terminal
 /// commit or abort decision instead of letting an intermediate error discard
 /// that provider-owned capability.
+#[allow(
+    dead_code,
+    reason = "Test-only sealed request fixture preserves terminal-path assertions."
+)]
 pub(crate) struct BoundDistributedWriteRequest {
     pub(crate) request: crate::query_execution::contract::DistributedQueryRequest,
     pub(crate) session: crate::query_execution::write_operation::ConnectorWriteOperationSession,
@@ -2015,6 +2074,14 @@ pub(crate) struct BoundDistributedWriteRequest {
 /// A request-construction failure after `begin_write_operation` still owns an
 /// exact provider session.  The caller must issue its terminal abort through
 /// that session rather than dropping it as an ordinary planning error.
+#[allow(
+    dead_code,
+    reason = "Test-only binding outcome preserves abort-versus-bound request assertions."
+)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The bound variant retains the exact provider session until the caller reaches a terminal decision."
+)]
 pub(crate) enum BoundDistributedWriteBinding {
     Bound(BoundDistributedWriteRequest),
     AbortRequired {
@@ -2023,6 +2090,10 @@ pub(crate) enum BoundDistributedWriteBinding {
     },
 }
 
+#[allow(
+    dead_code,
+    reason = "Test-only binding helper preserves sealed distributed write request assertions."
+)]
 pub(crate) fn bind_prepared_distributed_write_request(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
@@ -2059,6 +2130,10 @@ pub(crate) fn bind_prepared_distributed_write_request(
     ))
 }
 
+#[allow(
+    dead_code,
+    reason = "Test-only execution helper preserves bound distributed write terminal-path assertions."
+)]
 fn execute_bound_distributed_write_request(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     request: crate::query_execution::contract::DistributedQueryRequest,
@@ -2078,14 +2153,15 @@ fn execute_bound_distributed_write_request(
 }
 
 fn change_stream_write_optimizer_settings() -> novarocks_sql::compiler::SessionOptimizerSettings {
-    let mut settings = novarocks_sql::compiler::SessionOptimizerSettings::default();
     // A change-stream write carries old/new row pairs and target locators across
     // independent fragments. A query runtime filter may describe only one data
     // branch, so pushing it into a locator scan can suppress rows required by a
     // DELETE. Keep this system-generated mutation plan free of runtime filters;
     // its explicit predicates and connector pruning remain enabled.
-    settings.enable_global_runtime_filter = Some(false);
-    settings
+    novarocks_sql::compiler::SessionOptimizerSettings {
+        enable_global_runtime_filter: Some(false),
+        ..Default::default()
+    }
 }
 
 /// Application-owned post-compile assembly for the canonical SQL kernel.
@@ -2296,6 +2372,10 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
     build_string_query_result("Explain String", lines)
 }
 
+#[allow(
+    dead_code,
+    reason = "Test-only result execution helper preserves direct native query assembly coverage."
+)]
 fn execute_distributed_result_with_execution(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
@@ -2374,6 +2454,10 @@ fn execute_distributed_write_with_execution(
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Test-only profile execution helper preserves direct native profile assembly coverage."
+)]
 fn execute_distributed_profile_with_execution(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
@@ -2404,12 +2488,20 @@ fn execute_distributed_profile_with_execution(
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "All-in-one integration fixture retains a loopback backend for frontend-only tests."
+)]
 pub(crate) struct StandaloneLoopbackTestBackend {
     pub(crate) exchange_port: u16,
     _test_guard: TestSerializationGuard,
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "All-in-one integration fixture installs the loopback backend used by frontend-only tests."
+)]
 pub(crate) fn install_all_in_one_loopback_backend_for_test() -> StandaloneLoopbackTestBackend {
     let test_guard = acquire_standalone_test_guard();
     StandaloneLoopbackTestBackend {
@@ -2419,6 +2511,10 @@ pub(crate) fn install_all_in_one_loopback_backend_for_test() -> StandaloneLoopba
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "All-in-one integration fixture retains the in-process exchange endpoint sentinel."
+)]
 const fn in_process_exchange_endpoint_sentinel() -> u16 {
     // The test coordinator is in-process and never opens a native listener.
     // The lifetime-held TestSerializationGuard keeps this nonzero topology
@@ -2430,6 +2526,10 @@ const fn in_process_exchange_endpoint_sentinel() -> u16 {
 // EXPLAIN COSTS helper
 // ---------------------------------------------------------------------------
 
+#[allow(
+    dead_code,
+    reason = "Parser helper is retained for EXPLAIN compatibility parsing coverage."
+)]
 fn trim_ascii_whitespace_end(sql: &str, mut idx: usize) -> usize {
     let bytes = sql.as_bytes();
     while idx > 0 && bytes[idx - 1].is_ascii_whitespace() {
@@ -2438,6 +2538,10 @@ fn trim_ascii_whitespace_end(sql: &str, mut idx: usize) -> usize {
     idx
 }
 
+#[allow(
+    dead_code,
+    reason = "Parser helper is retained for EXPLAIN compatibility parsing coverage."
+)]
 fn find_table_ref_start(sql: &str, mut idx: usize) -> usize {
     let bytes = sql.as_bytes();
     while idx > 0 {
@@ -2451,6 +2555,10 @@ fn find_table_ref_start(sql: &str, mut idx: usize) -> usize {
     idx
 }
 
+#[allow(
+    dead_code,
+    reason = "Parser helper is retained for EXPLAIN compatibility parsing coverage."
+)]
 fn find_word_start(sql: &str, mut idx: usize) -> usize {
     let bytes = sql.as_bytes();
     while idx > 0 && is_identifier_byte(Some(bytes[idx - 1])) {
@@ -2459,6 +2567,10 @@ fn find_word_start(sql: &str, mut idx: usize) -> usize {
     idx
 }
 
+#[allow(
+    dead_code,
+    reason = "Parser helper is retained for EXPLAIN compatibility parsing coverage."
+)]
 fn skip_ascii_whitespace(bytes: &[u8], mut idx: usize) -> usize {
     while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
         idx += 1;
@@ -2466,10 +2578,18 @@ fn skip_ascii_whitespace(bytes: &[u8], mut idx: usize) -> usize {
     idx
 }
 
+#[allow(
+    dead_code,
+    reason = "Parser helper is retained for EXPLAIN compatibility parsing coverage."
+)]
 fn is_identifier_byte(byte: Option<u8>) -> bool {
     byte.is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
 }
 
+#[allow(
+    dead_code,
+    reason = "Parser helper is retained for EXPLAIN compatibility parsing coverage."
+)]
 fn find_matching_paren(sql: &str, open: usize) -> Option<usize> {
     let bytes = sql.as_bytes();
     if bytes.get(open) != Some(&b'(') {
@@ -2616,7 +2736,7 @@ mod tests {
             ..Default::default()
         })
         .expect("valid protocol query options");
-        let mut expected_raw = options.as_proto().clone();
+        let mut expected_raw = *options.as_proto();
         expected_raw.enable_profile = true;
         let expected = QueryOptions::parse(expected_raw).expect("valid profile options");
 

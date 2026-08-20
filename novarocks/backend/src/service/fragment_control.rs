@@ -20,10 +20,18 @@ use crate::runtime::result_buffer;
 use novarocks_types::UniqueId;
 use tracing::info;
 
+#[allow(
+    dead_code,
+    reason = "Retained for backend service integration and protocol compatibility."
+)]
 pub fn cancel_runtime_fragment(finst_id: UniqueId) {
     cancel_with_manager(finst_id, query_context_manager());
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for backend service integration and protocol compatibility."
+)]
 pub(crate) fn cancel_with_manager(finst_id: UniqueId, mgr: std::sync::Arc<QueryContextManager>) {
     let cancel_reason = format!("query canceled by FE: finst={}", finst_id);
     let cancel_result = mgr.cancel_finst(finst_id, cancel_reason);

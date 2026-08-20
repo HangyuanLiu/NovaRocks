@@ -568,7 +568,6 @@ fn finalize_published(
     let mut recovery = refresh.frontend_recovery.clone().ok_or(())?;
     recovery.observation = Some(observation.clone());
     let rows = observation.resulting_row_count.ok_or(())?;
-    let rows = i64::try_from(rows).map_err(|_| ())?;
     // The current target head may have advanced beyond this publication after
     // the marker commit. Durable MV refresh facts must retain the exact marker
     // snapshot proven by the committed version, not the later observed head.

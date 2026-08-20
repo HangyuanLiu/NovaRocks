@@ -25,6 +25,10 @@ use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue}
 use novarocks_protocol::{FieldPath, ProtocolErrorKind};
 use novarocks_protocol::{common, expr};
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(crate) fn lower_literal(
     literal: &expr::LiteralExpr,
     data_type: &DataType,

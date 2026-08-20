@@ -46,7 +46,6 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
 use crate::query_execution::mv_native_write::{
     MvRefreshProviderActivation, MvRefreshProviderActivationSink, PreparedMvNativeWriteAssembly,
 };
-use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt, ConnectorControlRegistry,

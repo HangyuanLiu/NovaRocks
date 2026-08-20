@@ -29,7 +29,7 @@ use super::contract::{
 use super::coverage::Coverage;
 
 #[derive(Clone, Debug)]
-pub struct RuntimeFilterChannelSpec {
+pub(crate) struct RuntimeFilterChannelSpec {
     pub channel_id: ChannelId,
     pub logical_domain: RuntimeFilterLogicalDomain,
     pub lifecycle: RuntimeFilterLifecycle,
@@ -86,7 +86,7 @@ pub struct ConsumerRequirementData<A> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PlanLocation {
+pub(crate) struct PlanLocation {
     pub fragment_id: PlanFragmentId,
     pub node_id: PlanNodeId,
 }
@@ -104,7 +104,7 @@ pub enum RuntimeFilterBindingRoleData<A> {
 }
 
 #[derive(Clone, Debug)]
-pub struct RuntimeFilterBindingSpecData<A> {
+pub(crate) struct RuntimeFilterBindingSpecData<A> {
     pub binding_id: BindingId,
     pub channel_id: ChannelId,
     pub coverage_witness_id: Option<CoverageWitnessId>,
@@ -129,19 +129,19 @@ impl<A> Default for RuntimeFilterGraphData<A> {
     }
 }
 
-pub type ConsumerRequirement = ConsumerRequirementData<ConsumerActivation>;
-pub type RuntimeFilterBindingRole = RuntimeFilterBindingRoleData<ConsumerActivation>;
-pub type RuntimeFilterBindingSpec = RuntimeFilterBindingSpecData<ConsumerActivation>;
+pub(crate) type ConsumerRequirement = ConsumerRequirementData<ConsumerActivation>;
+pub(crate) type RuntimeFilterBindingRole = RuntimeFilterBindingRoleData<ConsumerActivation>;
+pub(crate) type RuntimeFilterBindingSpec = RuntimeFilterBindingSpecData<ConsumerActivation>;
 pub type RuntimeFilterGraph = RuntimeFilterGraphData<ConsumerActivation>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GraphBuildError {
+pub(crate) enum GraphBuildError {
     DuplicateChannel(ChannelId),
     DuplicateBinding(BindingId),
 }
 
 impl<A> RuntimeFilterGraphData<A> {
-    pub fn insert_channel(
+    pub(crate) fn insert_channel(
         &mut self,
         channel: RuntimeFilterChannelSpec,
     ) -> Result<(), GraphBuildError> {
@@ -152,7 +152,7 @@ impl<A> RuntimeFilterGraphData<A> {
         Ok(())
     }
 
-    pub fn insert_binding(
+    pub(crate) fn insert_binding(
         &mut self,
         binding: RuntimeFilterBindingSpecData<A>,
     ) -> Result<(), GraphBuildError> {
@@ -175,23 +175,26 @@ impl<A> RuntimeFilterGraphData<A> {
         self.bindings.len()
     }
 
-    pub fn channel(&self, channel_id: ChannelId) -> Option<&RuntimeFilterChannelSpec> {
+    pub(crate) fn channel(&self, channel_id: ChannelId) -> Option<&RuntimeFilterChannelSpec> {
         self.channels.get(&channel_id)
     }
 
-    pub fn binding(&self, binding_id: BindingId) -> Option<&RuntimeFilterBindingSpecData<A>> {
+    pub(crate) fn binding(
+        &self,
+        binding_id: BindingId,
+    ) -> Option<&RuntimeFilterBindingSpecData<A>> {
         self.bindings.get(&binding_id)
     }
 
-    pub fn channels(&self) -> impl Iterator<Item = &RuntimeFilterChannelSpec> {
+    pub(crate) fn channels(&self) -> impl Iterator<Item = &RuntimeFilterChannelSpec> {
         self.channels.values()
     }
 
-    pub fn bindings(&self) -> impl Iterator<Item = &RuntimeFilterBindingSpecData<A>> {
+    pub(crate) fn bindings(&self) -> impl Iterator<Item = &RuntimeFilterBindingSpecData<A>> {
         self.bindings.values()
     }
 
-    pub fn map_consumer_activations<B, E>(
+    pub(crate) fn map_consumer_activations<B, E>(
         self,
         mut decide: impl FnMut(BindingId, ChannelId, PlanLocation, &A) -> Result<B, E>,
     ) -> Result<RuntimeFilterGraphData<B>, E> {
@@ -275,7 +278,7 @@ impl<A> RuntimeFilterGraphData<A> {
     }
 
     #[cfg(test)]
-    pub fn binding_mut_for_test(
+    pub(crate) fn binding_mut_for_test(
         &mut self,
         binding_id: BindingId,
     ) -> Option<&mut RuntimeFilterBindingSpecData<A>> {

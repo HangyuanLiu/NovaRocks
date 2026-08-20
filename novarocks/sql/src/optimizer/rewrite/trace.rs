@@ -66,6 +66,10 @@ impl RewriteTrace {
         &self.events
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) fn phase_started(&mut self, phase: RewritePhase) {
         self.events.push(RewriteTraceEvent::PhaseStarted {
             stage: phase.as_str(),
@@ -78,6 +82,10 @@ impl RewriteTrace {
             .push(RewriteTraceEvent::PhaseStarted { phase, stage });
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) fn stage_names(&self) -> Vec<&'static str> {
         self.events
             .iter()
@@ -157,6 +165,10 @@ impl RewriteTrace {
         });
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) fn changed_rules_count(&self) -> usize {
         self.events
             .iter()
@@ -164,6 +176,10 @@ impl RewriteTrace {
             .count()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) fn rejected_rules_count(&self) -> usize {
         self.events
             .iter()
@@ -171,6 +187,10 @@ impl RewriteTrace {
             .count()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) fn failed_rules_count(&self) -> usize {
         self.events
             .iter()

@@ -422,6 +422,10 @@ fn ensure_top_level_union_branch_supported(plan: &LogicalPlanNode) -> Result<(),
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Plan-kind rendering is retained for detailed IMV rewrite diagnostics."
+)]
 fn plan_kind(plan: &LogicalPlanNode) -> &'static str {
     plan_kind_from_kind(&plan.kind)
 }
@@ -438,7 +442,6 @@ fn take_unary_child(children: &mut Vec<LogicalPlanNode>) -> LogicalPlanNode {
 #[cfg(test)]
 mod tests {
     use crate::planner::logical::*;
-    use crate::planner::payload::*;
 
     use arrow::datatypes::DataType;
 
@@ -456,7 +459,7 @@ mod tests {
     };
     use crate::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use novarocks_catalog::schema::ColumnDef;
 
     #[test]
@@ -756,7 +759,7 @@ mod tests {
     fn source_union(all: bool) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Union(LogicalUnionNode {
-                all: all,
+                all,
                 output_columns: vec![output_column(1, "k"), output_column(2, "v")],
             }),
             vec![scan("t1", 1), scan("t2", 10)],
@@ -767,7 +770,7 @@ mod tests {
     fn project_filter_union(all: bool) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Union(LogicalUnionNode {
-                all: all,
+                all,
                 output_columns: vec![output_column(1, "k"), output_column(2, "v")],
             }),
             vec![project_over_filter("t1", 1), project_over_filter("t2", 10)],

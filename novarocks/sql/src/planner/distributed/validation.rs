@@ -252,13 +252,13 @@ fn validate_structure(
         validate_node_fragment_ownership(fragment.fragment_id, &fragment.root)?;
 
         if fragment.fragment_id == root_fragment_id {
-            let root_sink_supported = match fragment.sink {
+            let root_sink_supported = matches!(
+                fragment.sink,
                 DataSink::Result
-                | DataSink::Statistics(_)
-                | DataSink::ConnectorWrite(_)
-                | DataSink::ChangeStreamRouter(_) => true,
-                _ => false,
-            };
+                    | DataSink::Statistics(_)
+                    | DataSink::ConnectorWrite(_)
+                    | DataSink::ChangeStreamRouter(_)
+            );
             if !root_sink_supported {
                 return Err(format!(
                     "lower_distributed_plan root fragment id={} must use result, statistics, connector write, or change-stream router sink",
@@ -267,10 +267,8 @@ fn validate_structure(
             }
             ensure_unpartitioned("root output_partition", &fragment.output_partition)?;
         } else {
-            let non_root_sink_supported = match fragment.sink {
-                DataSink::Noop | DataSink::ConnectorWrite(_) => true,
-                _ => false,
-            };
+            let non_root_sink_supported =
+                matches!(fragment.sink, DataSink::Noop | DataSink::ConnectorWrite(_));
             if non_root_sink_supported {
                 continue;
             }
@@ -1700,7 +1698,6 @@ mod tests {
         assert!(err.contains("router_group_id=0"), "{err}");
     }
 
-    #[test]
     #[test]
     fn structural_validation_rejects_repeated_router_target_exchange() {
         // Distinct opaque routes that target the same exchange are rejected.

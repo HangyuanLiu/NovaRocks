@@ -41,17 +41,16 @@ use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::ColumnDefault;
 use novarocks_catalog::schema::SqlType;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorInstanceId, ConnectorTableHandle, ConnectorTableIdentity,
-    ConnectorTableRequest, ConnectorTableResolution, ConnectorWriteAdmissionPurpose,
+    ConnectorError, ConnectorTableHandle, ConnectorWriteAdmissionPurpose,
     ConnectorWriteFieldRequest, ConnectorWriteInputRequest, ConnectorWriteIntent,
     ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
     ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
 };
 use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
-use novarocks_sql::syntax::{
-    Literal, bytes_to_latin1_string, column_default_to_literal, latin1_string_to_bytes,
-};
+#[cfg(test)]
+use novarocks_sql::syntax::bytes_to_latin1_string;
+use novarocks_sql::syntax::{Literal, column_default_to_literal, latin1_string_to_bytes};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IcebergWriteInput {
@@ -92,6 +91,10 @@ impl IcebergWritePreparationOptions {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     pub(crate) fn with_snapshot_properties(
         mut self,
         snapshot_properties: BTreeMap<String, String>,
@@ -392,9 +395,9 @@ pub(crate) fn prepare_iceberg_connector_write_with_table(
     }
 }
 
-/// Resolve an opaque Iceberg write target through the connector metadata
-/// capability owned by the exact generation observed at write admission.
-/// Core only forwards the target identity; it never builds a handle payload.
+// Resolve an opaque Iceberg write target through the connector metadata
+// capability owned by the exact generation observed at write admission.
+// Core only forwards the target identity; it never builds a handle payload.
 
 pub(crate) struct PreparedIcebergWrite {
     executor: PreparedIcebergWriteExecutor,
@@ -634,6 +637,10 @@ fn sql_write_source_columns(
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn append_source_to_query(
     source: &IcebergWriteInput,
     insert_columns: &[String],
@@ -722,7 +729,7 @@ fn wrap_insert_query_with_write_projection(
     };
     let alias_columns = alias_source_columns
         .into_iter()
-        .map(|column| sql_identifier(column))
+        .map(sql_identifier)
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
@@ -1153,6 +1160,10 @@ fn sql_type_name(sql_type: &SqlType) -> Result<String, String> {
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 fn target_string(t: &TargetBackend) -> String {
     format!("{}.{}.{}", t.catalog, t.namespace, t.table)
 }

@@ -89,7 +89,7 @@ pub(super) fn plan_relation_scoped(
                     database: scan.database,
                     table: scan.table,
                     alias: scan.alias,
-                    columns: columns,
+                    columns,
                     predicates: vec![],
                     required_columns: None,
                     variant_columns: vec![],
@@ -137,7 +137,7 @@ pub(super) fn plan_relation_scoped(
                             args: unnest.args,
                             output_columns: unnest.output_columns,
                             alias: unnest.alias,
-                            is_left_join: is_left_join,
+                            is_left_join,
                         }),
                         vec![left],
                         None,
@@ -148,8 +148,8 @@ pub(super) fn plan_relation_scoped(
                     let right = plan_relation_scoped(right, cte_registry, factory)?;
                     Ok(LogicalPlanNode::new(
                         LogicalPlanKind::Join(LogicalJoinNode {
-                            join_type: join_type,
-                            condition: condition,
+                            join_type,
+                            condition,
                         }),
                         vec![left, right],
                         None,
@@ -177,10 +177,10 @@ pub(super) fn plan_relation_scoped(
             producer_column_ids,
         } => Ok(LogicalPlanNode::new(
             LogicalPlanKind::CTEConsume(PlanCTEConsumeNode {
-                cte_id: cte_id,
-                alias: alias,
-                output_columns: output_columns,
-                producer_column_ids: producer_column_ids,
+                cte_id,
+                alias,
+                output_columns,
+                producer_column_ids,
             }),
             vec![],
             None,
@@ -239,12 +239,7 @@ fn plan_iceberg_metadata_scan(
             is_internal: false,
         })
         .collect();
-    let ScanSource::Sql(source) = rel.table.source else {
-        return Err(format!(
-            "iceberg metadata table {} was not projected into a SQL binding source",
-            rel.table.name
-        ));
-    };
+    let ScanSource::Sql(source) = rel.table.source;
     if !matches!(
         source.kind,
         crate::planner::table::SqlScanKind::Metadata { .. }
@@ -330,12 +325,7 @@ fn plan_iceberg_delta_scan(
             is_internal: false,
         });
     }
-    let ScanSource::Sql(source) = rel.table.source else {
-        return Err(format!(
-            "iceberg delta scan {}.{}.{} requires a token-bound SQL scan source",
-            rel.catalog, rel.namespace, rel.table_name
-        ));
-    };
+    let ScanSource::Sql(source) = rel.table.source;
     if !matches!(
         &source.kind,
         crate::planner::table::SqlScanKind::Data { .. }
@@ -426,22 +416,18 @@ pub(super) fn plan_set_operation_scoped(
         SetOpKind::Union => Ok(LogicalPlanNode::new(
             LogicalPlanKind::Union(LogicalUnionNode {
                 all: set_op.all,
-                output_columns: output_columns,
+                output_columns,
             }),
             vec![left, right],
             None,
         )),
         SetOpKind::Intersect => Ok(LogicalPlanNode::new(
-            LogicalPlanKind::Intersect(LogicalIntersectNode {
-                output_columns: output_columns,
-            }),
+            LogicalPlanKind::Intersect(LogicalIntersectNode { output_columns }),
             vec![left, right],
             None,
         )),
         SetOpKind::Except => Ok(LogicalPlanNode::new(
-            LogicalPlanKind::Except(LogicalExceptNode {
-                output_columns: output_columns,
-            }),
+            LogicalPlanKind::Except(LogicalExceptNode { output_columns }),
             vec![left, right],
             None,
         )),
@@ -460,7 +446,7 @@ pub(super) fn plan_values(
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Values(PlanValuesNode {
             rows: values.rows,
-            columns: columns,
+            columns,
         }),
         vec![],
         None,

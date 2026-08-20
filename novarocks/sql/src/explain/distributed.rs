@@ -1681,15 +1681,10 @@ fn format_scan_pruned_type(data_type: &DataType, top_level: bool) -> String {
 }
 
 fn scan_supports_min_max_stats(table: &TableDef, required_columns: &[String]) -> bool {
-    match &table.source {
-        ScanSource::Sql(source) => match source.kind {
-            crate::planner::table::SqlScanKind::Data { .. }
-            | crate::planner::table::SqlScanKind::FrozenInputSet { .. } => {}
-            _ => return false,
-        },
-        // Admission projects every executable scan into `SqlScanSource`
-        // before it can reach the compiler.  A legacy carrier here would
-        // mean a caller bypassed the query-local binding boundary.
+    let ScanSource::Sql(source) = &table.source;
+    match source.kind {
+        crate::planner::table::SqlScanKind::Data { .. }
+        | crate::planner::table::SqlScanKind::FrozenInputSet { .. } => {}
         _ => return false,
     }
     required_columns.iter().all(|required| {
@@ -1764,7 +1759,7 @@ mod tests {
     use crate::planner::physical::{
         PhysicalPlanStats, PlannerBroadcastDecision, PlannerConfidence,
     };
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use novarocks_catalog::schema::ColumnDef;
 
     fn explain_distributed_plan_analyze(
@@ -2906,6 +2901,10 @@ mod tests {
             .unwrap_or_else(ScalarArena::new)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for distributed EXPLAIN fixture construction in targeted tests."
+    )]
     fn table_def() -> TableDef {
         TableDef {
             name: "t".to_string(),

@@ -49,6 +49,7 @@ use novarocks_spi::connector::{
 
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use novarocks_sql::plan_read::FragmentId;
+#[cfg(test)]
 pub(crate) use novarocks_types::QueryId;
 
 /// Query options resolved by core before ownership crosses into frontend.
@@ -844,6 +845,25 @@ impl fmt::Display for DistributedQueryError {
 
 impl std::error::Error for DistributedQueryError {}
 
+/// Frontend-owned distributed query execution port.
+pub trait DistributedQueryCoordinator: Send + Sync + 'static {
+    fn begin_write_operation(
+        &self,
+        _registration: ConnectorWriteOperationRegistration,
+        _lease: ConnectorWriteLease,
+    ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
+        Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::Rejected,
+            "distributed query coordinator has no connector write operation service",
+        ))
+    }
+
+    fn execute(
+        &self,
+        request: DistributedQueryRequest,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::reconstruct_runtime_query_options;
@@ -929,23 +949,4 @@ mod tests {
         assert_eq!(spill.spill_mem_table_size, Some(512));
         assert_eq!(spill.spill_mem_table_num, Some(4));
     }
-}
-
-/// Frontend-owned distributed query execution port.
-pub trait DistributedQueryCoordinator: Send + Sync + 'static {
-    fn begin_write_operation(
-        &self,
-        _registration: ConnectorWriteOperationRegistration,
-        _lease: ConnectorWriteLease,
-    ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
-        Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::Rejected,
-            "distributed query coordinator has no connector write operation service",
-        ))
-    }
-
-    fn execute(
-        &self,
-        request: DistributedQueryRequest,
-    ) -> Result<DistributedQueryOutcome, DistributedQueryError>;
 }

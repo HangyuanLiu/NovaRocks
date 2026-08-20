@@ -28,14 +28,13 @@ use novarocks_failpoint::QueryLifecycleFaultKind;
 use novarocks_failpoint::{claim_matching_fault, configured_root};
 use novarocks_protocol::lifecycle::terminal::p0_max_encoded_len;
 use novarocks_protocol::lifecycle::{
-    FragmentLiveObservation, FragmentTerminalSnapshot, NegativeAttestation,
-    ParticipantManifestDigest, ParticipantRole, ParticipantTerminalOutcome, QueryAbortRequest,
-    QueryControlAttach, QueryControlEndpoint, QueryControlEvent, QueryExecutionId, QueryInitAck,
-    QueryInitOutcome, QueryInitRequest, QueryStageAck, QueryStageOutcome, QueryStageRequest,
-    QueryStartAck, QueryStartOutcome, QueryStartRequest, QueryTerminalAck,
-    QueryTerminalProfileContributionV1, QueryTerminalReportAck, QueryTerminalReportOutcome,
-    QueryTerminalSnapshot, QueryTerminationAck, QueryTerminationReason, StageDigest,
-    StageDigestVersion, TerminalizationProof,
+    FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantManifestDigest, ParticipantRole,
+    ParticipantTerminalOutcome, QueryAbortRequest, QueryControlAttach, QueryControlEndpoint,
+    QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitOutcome, QueryInitRequest,
+    QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
+    QueryStartRequest, QueryTerminalAck, QueryTerminalProfileContributionV1,
+    QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminalSnapshot, QueryTerminationAck,
+    QueryTerminationReason, StageDigest, StageDigestVersion,
 };
 use novarocks_types::UniqueId;
 use prost::Message;
@@ -87,6 +86,10 @@ fn generated_id(value: novarocks_protocol::common::UniqueId) -> UniqueId {
     UniqueId::new(value.hi, value.lo)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for lifecycle protocol-fixture targets that convert manifest fragment identifiers."
+)]
 fn expected_fragment_ids(
     manifest: &novarocks_protocol::lifecycle::ParticipantManifest,
 ) -> Vec<UniqueId> {
@@ -214,6 +217,10 @@ fn protocol_connector_staged_report_frame(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The sealed terminal-fragment carrier has one parameter per required protocol field."
+)]
 fn terminal_fragment_snapshot(
     fragment_instance_id: UniqueId,
     backend_num: i32,
@@ -872,7 +879,7 @@ impl QueryTerminalFallbackTransport for GrpcQueryTerminalFallbackTransport {
             endpoint.host().to_string(),
             endpoint.port(),
         )
-        .map_err(|error| QueryTerminalFallbackTransportError::unavailable(error))?;
+        .map_err(QueryTerminalFallbackTransportError::unavailable)?;
         let response = client
             .blocking_report_query_terminal_with_timeout(
                 novarocks_protocol::novarocks::ReportQueryTerminalRequest {
@@ -880,7 +887,7 @@ impl QueryTerminalFallbackTransport for GrpcQueryTerminalFallbackTransport {
                 },
                 timeout,
             )
-            .map_err(|error| QueryTerminalFallbackTransportError::unavailable(error))?;
+            .map_err(QueryTerminalFallbackTransportError::unavailable)?;
         let outcome = match novarocks_protocol::novarocks::ReportQueryTerminalOutcome::try_from(
             response.outcome,
         ) {
@@ -904,6 +911,7 @@ impl QueryTerminalFallbackTransport for GrpcQueryTerminalFallbackTransport {
     }
 }
 
+#[derive(Default)]
 struct QueryLifecycleRegistryState {
     entries: BTreeMap<QueryExecutionId, Arc<QueryLifecycleEntry>>,
     fragment_executions: BTreeMap<UniqueId, QueryExecutionId>,
@@ -943,32 +951,6 @@ pub(crate) struct QueryLifecycleRestorationStatus {
     pub(crate) pre_init_tombstones: usize,
     pub(crate) tombstone_index: usize,
     pub(crate) restored: bool,
-}
-
-impl Default for QueryLifecycleRegistryState {
-    fn default() -> Self {
-        Self {
-            entries: BTreeMap::new(),
-            fragment_executions: BTreeMap::new(),
-            tombstones: VecDeque::new(),
-            active_entries: 0,
-            init_conflicts: 0,
-            admission_rejected: 0,
-            heartbeat_timeouts: 0,
-            terminations: 0,
-            termination_reasons: [0; 6],
-            pre_init_tombstones: BTreeMap::new(),
-            terminal_retained: BTreeMap::new(),
-            terminal_retained_bytes: 0,
-            terminal_facts: 0,
-            terminal_locally_drained: 0,
-            terminal_records_frozen: 0,
-            terminal_acknowledged: 0,
-            terminal_retention_expired: 0,
-            terminal_fallback_accepted: 0,
-            terminal_fallback_rejected: 0,
-        }
-    }
 }
 
 struct InitWorkspace {
@@ -1020,6 +1002,10 @@ struct RegistryQueryControl {
     execution_id: QueryExecutionId,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for lifecycle unit targets that record legacy fragment outcomes."
+)]
 fn fragment_snapshot_from_outcome(
     fragment_instance_id: UniqueId,
     backend_num: i32,
@@ -1147,6 +1133,10 @@ impl QueryLifecycleRegistry {
     }
 
     #[cfg(test)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The test constructor injects every lifecycle dependency to exercise failure paths deterministically."
+    )]
     pub(crate) fn new_with_clock_metrics_terminal_fallback_and_runtime_filter_factory(
         local_backend_id: u64,
         local_start_epoch: u64,
@@ -1201,6 +1191,10 @@ impl QueryLifecycleRegistry {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "This constructor wires each production lifecycle dependency before selecting the runtime-filter factory."
+    )]
     fn new_with_backend_identity(
         runtime: BackendDataRuntime,
         local_backend_id: Option<u64>,
@@ -1223,6 +1217,10 @@ impl QueryLifecycleRegistry {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "This constructor accepts the complete production lifecycle dependency set and explicit runtime-filter factory."
+    )]
     fn new_with_backend_identity_and_runtime_filter_factory(
         local_backend_id: Option<u64>,
         local_start_epoch: u64,
@@ -1495,15 +1493,14 @@ impl QueryLifecycleRegistry {
                     .get(&execution_id)
                     .map(|tombstone| tombstone.reason)
                     .unwrap_or(QueryTerminationReason::CoordinatorAbort);
-                if !state.pre_init_tombstones.contains_key(&execution_id) {
-                    state.pre_init_tombstones.insert(
-                        execution_id,
-                        PreInitTombstone {
-                            digest,
-                            reason,
-                            terminated_at: self.clock.now(),
-                        },
-                    );
+                if let std::collections::btree_map::Entry::Vacant(e) =
+                    state.pre_init_tombstones.entry(execution_id)
+                {
+                    e.insert(PreInitTombstone {
+                        digest,
+                        reason,
+                        terminated_at: self.clock.now(),
+                    });
                     state.tombstones.push_back(execution_id);
                     state.terminations = state.terminations.saturating_add(1);
                     state.termination_reasons[termination_reason_index(reason)] = state
@@ -2634,6 +2631,10 @@ impl QueryLifecycleRegistry {
         requested_reason
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for lifecycle unit targets that record legacy execution outcomes instead of terminal facts."
+    )]
     pub(crate) fn record_fragment_terminal(
         &self,
         execution_id: QueryExecutionId,
@@ -2767,7 +2768,8 @@ impl QueryLifecycleRegistry {
             let complete = expected
                 .iter()
                 .all(|id| state.completed_fragments.contains(id));
-            let local_drained = if complete
+
+            if complete
                 && outcome == novarocks_protocol::novarocks::QueryTerminalFragmentOutcome::Succeeded
                 && !state.local_drained_emitted
             {
@@ -2778,8 +2780,7 @@ impl QueryLifecycleRegistry {
                 ))
             } else {
                 None
-            };
-            local_drained
+            }
         };
         if let Some((permit, events)) = local_drained {
             self.increment_terminal_metric(|metrics| {
@@ -3076,7 +3077,7 @@ impl QueryLifecycleRegistry {
             (
                 backend,
                 state.terminal_facts.values().cloned().collect::<Vec<_>>(),
-                expected.iter().copied().collect::<Vec<_>>(),
+                expected.to_vec(),
                 state.runtime_filter.clone(),
                 state.runtime_filter_installed,
             )
@@ -3318,14 +3319,14 @@ impl QueryLifecycleRegistry {
                 .terminal_test_faults
                 .lock()
                 .expect("query lifecycle terminal test faults lock");
-            if let Some(kinds) = faults.get_mut(&execution_id) {
-                if let Some(index) = kinds.iter().position(|candidate| *candidate == kind) {
-                    kinds.remove(index);
-                    if kinds.is_empty() {
-                        faults.remove(&execution_id);
-                    }
-                    return Ok(true);
+            if let Some(kinds) = faults.get_mut(&execution_id)
+                && let Some(index) = kinds.iter().position(|candidate| *candidate == kind)
+            {
+                kinds.remove(index);
+                if kinds.is_empty() {
+                    faults.remove(&execution_id);
                 }
+                return Ok(true);
             }
         }
         let Some(root) = configured_root() else {
@@ -4038,12 +4039,11 @@ impl QueryLifecycleRegistry {
             .entries
             .get(&execution_id)
             .cloned()?;
-        let reason = entry
+        entry
             .state
             .lock()
             .expect("query lifecycle entry lock")
-            .termination_reason;
-        reason
+            .termination_reason
     }
 
     #[cfg(test)]

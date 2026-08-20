@@ -31,8 +31,8 @@ use crate::query_execution::maintenance::{
     BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory,
 };
 use crate::{
-    ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
-    FrontendApplicationHost, FrontendExecutionConfig, FrontendQueryControlTimeouts,
+    ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationHost,
+    FrontendExecutionConfig,
 };
 
 type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -202,8 +202,8 @@ pub fn build_frontend_query_session_factory(
             ))),
         };
     }
-    if let Some(sink) = host.mv_background_engine_sink() {
-        if let Err(error) = core_capabilities::bind_mv_background_engine(
+    if let Some(sink) = host.mv_background_engine_sink()
+        && let Err(error) = core_capabilities::bind_mv_background_engine(
             sink.as_ref(),
             core_capabilities::MvBackgroundPorts::new(
                 Arc::clone(&catalog_service),
@@ -213,17 +213,17 @@ pub fn build_frontend_query_session_factory(
                 Arc::clone(&mv_storage_observation),
             ),
             Arc::clone(&maintenance_engine),
-        ) {
-            let primary = FrontendApplicationError::server(format!(
-                "bind frontend MV background engine failed: {error}"
-            ));
-            return match maintenance_service.shutdown() {
-                Ok(()) => Err(primary),
-                Err(cleanup_error) => Err(primary.with_cleanup_context(format!(
-                    "shutdown table maintenance service after MV background bind failure: {cleanup_error}"
-                ))),
-            };
-        }
+        )
+    {
+        let primary = FrontendApplicationError::server(format!(
+            "bind frontend MV background engine failed: {error}"
+        ));
+        return match maintenance_service.shutdown() {
+            Ok(()) => Err(primary),
+            Err(cleanup_error) => Err(primary.with_cleanup_context(format!(
+                "shutdown table maintenance service after MV background bind failure: {cleanup_error}"
+            ))),
+        };
     }
 
     let query_compiler =

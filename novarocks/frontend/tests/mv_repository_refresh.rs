@@ -1317,7 +1317,7 @@ fn two_frontends_competing_for_one_target_yield_a_single_owner() {
     )
     .expect("stable target resource");
 
-    let winner = runtime
+    let _winner = runtime
         .block_on(acquire_refresh_ownership(&first, 42, resource.clone()))
         .expect("the first frontend acquires an uncontended target");
 
@@ -1347,7 +1347,6 @@ fn two_frontends_competing_for_one_target_yield_a_single_owner() {
     // The per-refresh handle is deliberately not the lease lifetime: ownership
     // stays sticky for the target so a later refresh on the same frontend does
     // not race an asynchronous release from this one.
-    drop(winner);
     assert!(
         first.registry.holds(42),
         "dropping one refresh handle must not release sticky target ownership"

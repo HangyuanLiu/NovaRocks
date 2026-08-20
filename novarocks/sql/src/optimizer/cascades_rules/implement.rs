@@ -428,7 +428,7 @@ impl Rule for FilterToPhysical {
         };
         vec![NewExpr {
             op: Operator::PhysicalFilter(FilterOp {
-                predicate: op.predicate.clone(),
+                predicate: op.predicate,
             }),
             children: expr.children.clone(),
         }]
@@ -601,7 +601,7 @@ impl Rule for JoinToNestLoop {
         vec![NewExpr {
             op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
                 join_type: op.join_type,
-                condition: op.condition.clone(),
+                condition: op.condition,
             }),
             children: expr.children.clone(),
         }]
@@ -1520,7 +1520,7 @@ mod join_demotion_tests {
     use crate::optimizer::memo::{LogicalProperties, MExpr, Memo};
     use crate::optimizer::operator::{LogicalJoinOp, ScanOp};
     use crate::optimizer::scalar::ScalarId;
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
 
     use crate::planner::optimizer_bridge::scalar::{intern_typed, materialize};
     use arrow::datatypes::{DataType, Field};

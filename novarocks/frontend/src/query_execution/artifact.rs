@@ -35,7 +35,9 @@ use sha2::{Digest, Sha256};
 
 use crate::common::backend_topology::LiveBackendTarget;
 use crate::native::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBatch};
-use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind, QueryId};
+#[cfg(test)]
+use crate::query_execution::contract::QueryId;
+use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::launch::{QueryLaunchBarrier, StageBatch, StageParticipantBinding};
 use crate::query_execution::lifecycle_plan::{
     QueryInitBarrier, QueryInitOptions, QueryLifecycleLease,
@@ -56,9 +58,7 @@ use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoin
 use novarocks_protocol::lifecycle::{
     AttemptId as ProtocolAttemptId, QueryExecutionId as ProtocolQueryExecutionId,
 };
-use novarocks_protocol::lifecycle::{
-    ExchangeRouteManifest, QueryExecutionId, RuntimeFilterContribution, StageFragment,
-};
+use novarocks_protocol::lifecycle::{ExchangeRouteManifest, QueryExecutionId, StageFragment};
 use novarocks_protocol::plan::RuntimeFilterBindingTable;
 use novarocks_protocol::{common, novarocks};
 use novarocks_sql::plan_read::{FragmentEdgeKind, FragmentStreamKind, PartitionKind};
@@ -318,6 +318,10 @@ impl<'a> RuntimeFilterBindingEncodingView<'a> {
     /// Seal the only valid empty binding attachment.  Callers cannot use this
     /// to discard bindings: any fragment that requires one is rejected before
     /// the attachment is created.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution contract and lifecycle integration."
+    )]
     pub(crate) fn seal_empty(
         self,
     ) -> Result<RuntimeFilterBindingAttachment, DistributedQueryError> {
@@ -1986,7 +1990,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field};
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,

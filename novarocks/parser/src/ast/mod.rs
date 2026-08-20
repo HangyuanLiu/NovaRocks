@@ -110,10 +110,6 @@ pub use window::{
 use crate::Span;
 
 /// A top-level SQL statement.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "the public AST intentionally exposes typed statement payloads by value; boxing Query would cause a broad API migration"
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
     Backend(BackendStatement),

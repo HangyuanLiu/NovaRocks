@@ -69,6 +69,10 @@ impl BackendChannelIdentity {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn participant(self) -> BackendParticipantIdentity {
         self.participant
     }

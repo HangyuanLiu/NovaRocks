@@ -37,7 +37,7 @@ pub fn query_result_to_user_variable_literal(result: &QueryResult) -> Result<Str
         return Err("Subquery returns more than 1 row".to_string());
     }
     for chunk in &result.chunks {
-        if chunk.len() == 0 {
+        if chunk.is_empty() {
             continue;
         }
         let column = chunk

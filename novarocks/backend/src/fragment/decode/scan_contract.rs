@@ -112,6 +112,10 @@ mod tests {
     use novarocks_protocol::FieldPath;
     use novarocks_protocol::plan;
 
+    #[expect(
+        clippy::needless_update,
+        reason = "The fixture keeps explicit defaulted proto fields for wire-contract readability."
+    )]
     #[test]
     fn classifies_connector_read_as_file_assignment() {
         let root = plan::DistributedNode {

@@ -482,13 +482,13 @@ impl MvSchemaContract {
                 actual: self.target.hidden_apply_key.column_name.clone(),
             });
         }
-        if let Some(branch) = &self.branch {
-            if branch.branch_id_column.column_name != BRANCH_ID_COLUMN_NAME {
-                return Err(ContractSelfCheckError::BranchIdColumnNameWrong {
-                    expected: BRANCH_ID_COLUMN_NAME.to_string(),
-                    actual: branch.branch_id_column.column_name.clone(),
-                });
-            }
+        if let Some(branch) = &self.branch
+            && branch.branch_id_column.column_name != BRANCH_ID_COLUMN_NAME
+        {
+            return Err(ContractSelfCheckError::BranchIdColumnNameWrong {
+                expected: BRANCH_ID_COLUMN_NAME.to_string(),
+                actual: branch.branch_id_column.column_name.clone(),
+            });
         }
         match self.target.hidden_apply_key.source {
             ApplyKeySource::JoinRowKey => match &self.join {
@@ -509,13 +509,13 @@ impl MvSchemaContract {
                 }
             }
         }
-        if let Some(branch) = &self.branch {
-            if branch.inner_apply_key_source != self.target.hidden_apply_key.source {
-                return Err(ContractSelfCheckError::BranchInnerApplyKeyMismatch {
-                    branch_source: branch.inner_apply_key_source,
-                    hidden_apply_key_source: self.target.hidden_apply_key.source,
-                });
-            }
+        if let Some(branch) = &self.branch
+            && branch.inner_apply_key_source != self.target.hidden_apply_key.source
+        {
+            return Err(ContractSelfCheckError::BranchInnerApplyKeyMismatch {
+                branch_source: branch.inner_apply_key_source,
+                hidden_apply_key_source: self.target.hidden_apply_key.source,
+            });
         }
         if let Some(aggregate) = &self.aggregate {
             if aggregate.row_id_column_name != GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME {

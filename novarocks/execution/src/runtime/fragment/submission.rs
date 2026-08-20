@@ -604,7 +604,7 @@ mod tests {
     use crate::exec::node::union_all::UnionAllNode;
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
-    use crate::runtime::endpoint::RuntimeEndpoint;
+
     use crate::runtime::exchange::ExchangeKey;
     use crate::runtime::fragment::instance::{
         BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
@@ -1803,7 +1803,6 @@ mod tests {
         .expect("matching split destination groups");
     }
 
-    #[test]
     #[test]
     fn static_exchange_validation_precedes_dynamic_scan_validation() {
         let scan_id = FragmentNodeId::new(10);

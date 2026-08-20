@@ -75,6 +75,10 @@ impl fmt::Display for ColumnId {
 
 /// Metadata about a column, stored in the [`ColumnRefFactory`].
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "Column metadata keeps the full schema identity for planner paths that are feature-gated in this target."
+)]
 pub(crate) struct ColumnMeta {
     pub id: ColumnId,
     pub name: String,
@@ -101,7 +105,7 @@ pub(crate) struct ColumnRefFactory {
 }
 
 impl ColumnRefFactory {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             next_id: 1,
             columns: Vec::new(),
@@ -109,7 +113,7 @@ impl ColumnRefFactory {
     }
 
     /// Allocate a new [`ColumnId`] for a column with the given metadata.
-    pub fn create(
+    pub(crate) fn create(
         &mut self,
         qualifier: Option<String>,
         name: String,
@@ -131,7 +135,7 @@ impl ColumnRefFactory {
     /// Reserve all ids below `next_id` so future `create()` calls cannot
     /// collide with ids allocated by a rewrite stage that manages its own
     /// column counter.
-    pub fn reserve_until(&mut self, next_id: u32) {
+    pub(crate) fn reserve_until(&mut self, next_id: u32) {
         let next_id = next_id.max(1);
         while self.next_id < next_id {
             let id = ColumnId(self.next_id);
@@ -150,7 +154,7 @@ impl ColumnRefFactory {
     ///
     /// # Panics
     /// Panics if `id` was not allocated by this factory.
-    pub fn get(&self, id: ColumnId) -> &ColumnMeta {
+    pub(crate) fn get(&self, id: ColumnId) -> &ColumnMeta {
         assert!(
             id.0 >= 1 && (id.0 as usize) <= self.columns.len(),
             "ColumnId {} out of range (factory has {} columns)",
@@ -162,7 +166,11 @@ impl ColumnRefFactory {
 
     /// Return a human-readable display name for the column: `"qualifier.name"`
     /// or just `"name"`.
-    pub fn display_name(&self, id: ColumnId) -> String {
+    #[allow(
+        dead_code,
+        reason = "Display-name construction is retained for planner diagnostics compiled in feature-specific targets."
+    )]
+    pub(crate) fn display_name(&self, id: ColumnId) -> String {
         let m = self.get(id);
         if let Some(q) = &m.qualifier {
             format!("{}.{}", q, m.name)
@@ -172,19 +180,31 @@ impl ColumnRefFactory {
     }
 
     /// Return just the column name (without qualifier).
-    pub fn column_name(&self, id: ColumnId) -> &str {
+    #[allow(
+        dead_code,
+        reason = "Retained for planner diagnostics and feature-gated rewrite paths."
+    )]
+    pub(crate) fn column_name(&self, id: ColumnId) -> &str {
         &self.get(id).name
     }
 
     /// Return the number of columns allocated so far.
-    pub fn len(&self) -> usize {
+    #[allow(
+        dead_code,
+        reason = "Retained for planner diagnostics and feature-gated rewrite paths."
+    )]
+    pub(crate) fn len(&self) -> usize {
         self.columns.len()
     }
 
     /// Returns the next `ColumnId` value that `create` would allocate, without
     /// allocating it. Used to seed downstream allocators (e.g. IMV rewrite)
     /// so they never collide with ids this factory has already handed out.
-    pub fn peek_next_id(&self) -> u32 {
+    #[allow(
+        dead_code,
+        reason = "Retained for planner diagnostics and feature-gated rewrite paths."
+    )]
+    pub(crate) fn peek_next_id(&self) -> u32 {
         self.next_id
     }
 }

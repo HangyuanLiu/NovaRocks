@@ -31,6 +31,10 @@ use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_protocol::FieldPath;
 use novarocks_protocol::plan;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen native boundary keeps independently validated inputs explicit."
+)]
 pub(super) fn lower_nest_loop_join_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,

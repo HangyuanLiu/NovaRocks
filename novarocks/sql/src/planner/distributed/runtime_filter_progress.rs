@@ -25,7 +25,9 @@ pub(crate) use crate::planner::runtime_filter::progress::{
     JoinBuildProgressSkip,
 };
 
-use super::{DistributedNode, DistributedNodeKind, FragmentId, PlanFragment};
+#[cfg(test)]
+use super::FragmentId;
+use super::{DistributedNode, DistributedNodeKind, PlanFragment};
 
 /// Fragment-local input-closure audit.
 ///
@@ -318,6 +320,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for runtime-filter progress fixture variants."
+    )]
     fn producer_graph(fragment_id: FragmentId, join_node_id: i32) -> RuntimeFilterGraph {
         let mut graph = RuntimeFilterGraph::default();
         graph
@@ -351,6 +357,10 @@ mod tests {
         graph
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for runtime-filter frontier fixture variants."
+    )]
     fn fragment_edge(
         source_fragment_id: FragmentId,
         target_fragment_id: FragmentId,

@@ -202,7 +202,7 @@ fn refresh_status_for_mv_with_repository(
     let retry_after_time = mv
         .last_scheduler_error
         .as_ref()
-        .and_then(|_| mv.next_refresh_after_ms)
+        .and(mv.next_refresh_after_ms)
         .filter(|next| *next > now_ms)
         .map(|value| value.to_string());
     if mv.refresh_paused {

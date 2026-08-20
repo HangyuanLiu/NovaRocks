@@ -124,6 +124,10 @@ pub fn validate_target_snapshot(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn recorded_target_snapshot_id(
     target: &IcebergMvTarget,
     mv_definition: &StoredMvDefinition,

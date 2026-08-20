@@ -34,6 +34,10 @@ use crate::runtime::fragment::instance::{FragmentInstanceSpec, FragmentSinkAssig
 use crate::runtime::fragment::io::ExchangeFrameTransmitter;
 use crate::runtime::fragment::io::FragmentResultSession;
 
+#[allow(
+    dead_code,
+    reason = "Compatibility materialization entrypoint retained for fragment sink integration callers."
+)]
 pub(crate) fn materialize_fragment_sink(
     program: &FragmentProgram,
     instance: &FragmentInstanceSpec,
@@ -71,6 +75,10 @@ pub(crate) fn materialize_fragment_sink_with_result(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Compatibility materialization entrypoint retained for fragment sink integration callers."
+)]
 pub(crate) fn materialize_fragment_sink_components(
     program: &FragmentSinkSpec,
     assignment: &FragmentSinkAssignment,
@@ -91,6 +99,10 @@ pub(crate) fn materialize_fragment_sink_components(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Compatibility materialization entrypoint retained for fragment sink integration callers."
+)]
 pub(crate) fn materialize_fragment_sink_components_with_result(
     program: &FragmentSinkSpec,
     assignment: &FragmentSinkAssignment,
@@ -113,6 +125,10 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
     .map(|materialized| materialized.factory)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Sink materialization joins independently-owned plan, assignment, transport, and result services."
+)]
 fn materialize_fragment_sink_components_with_result_and_statistics(
     program: &FragmentSinkSpec,
     root_plan: Option<&crate::exec::node::ExecPlan>,
@@ -164,7 +180,7 @@ fn materialize_fragment_sink_components_with_result_and_statistics(
                 sender_id,
             },
         ) => {
-            let input = stream_input(&stream, destinations.clone())?;
+            let input = stream_input(stream, destinations.clone())?;
             Ok(MaterializedFragmentSink {
                 factory: Box::new(DataStreamSinkFactory::new(
                     input,
@@ -181,7 +197,7 @@ fn materialize_fragment_sink_components_with_result_and_statistics(
             FragmentSinkProgram::MultiCastDataStream(grouped),
             FragmentSinkAssignment::DestinationGroups { groups, sender_id },
         ) => materialize_multicast(
-            &grouped,
+            grouped,
             groups,
             fragment_instance_id,
             *sender_id,
@@ -196,7 +212,7 @@ fn materialize_fragment_sink_components_with_result_and_statistics(
             FragmentSinkProgram::SplitDataStream(split),
             FragmentSinkAssignment::DestinationGroups { groups, sender_id },
         ) => materialize_split(
-            &split,
+            split,
             groups,
             fragment_instance_id,
             *sender_id,
@@ -208,7 +224,7 @@ fn materialize_fragment_sink_components_with_result_and_statistics(
             statistics_handle: None,
         }),
         (FragmentSinkProgram::ConnectorWrite(connector), FragmentSinkAssignment::None) => {
-            ConnectorWriteSinkFactory::try_new(&connector)
+            ConnectorWriteSinkFactory::try_new(connector)
                 .map(|factory| MaterializedFragmentSink {
                     factory: Box::new(factory) as Box<dyn OperatorFactory>,
                     statistics_handle: None,

@@ -149,8 +149,6 @@ impl LogicalRewriteRule for InjectRowIdRule {
 
 #[cfg(test)]
 mod tests {
-    use crate::planner::logical::*;
-    use crate::planner::payload::*;
 
     use arrow::datatypes::DataType;
 

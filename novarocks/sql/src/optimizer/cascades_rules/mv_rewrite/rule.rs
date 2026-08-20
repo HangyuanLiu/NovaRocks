@@ -652,14 +652,10 @@ fn same_iceberg_table(
     b: &crate::planner::table::TableDef,
 ) -> bool {
     use crate::planner::table::ScanSource;
-    match (&a.source, &b.source) {
-        (ScanSource::Sql(ta), ScanSource::Sql(tb)) => {
-            ta.table.catalog == tb.table.catalog
-                && ta.table.namespace == tb.table.namespace
-                && ta.table.table == tb.table.table
-        }
-        _ => false,
-    }
+    let (ScanSource::Sql(ta), ScanSource::Sql(tb)) = (&a.source, &b.source);
+    ta.table.catalog == tb.table.catalog
+        && ta.table.namespace == tb.table.namespace
+        && ta.table.table == tb.table.table
 }
 
 #[cfg(test)]

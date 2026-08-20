@@ -111,8 +111,20 @@ pub(crate) trait BackendMaterializedDeliverySink: Send + Sync {
 
 #[derive(Debug)]
 pub(crate) enum BackendRuntimeFilterSessionError {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     MissingProducer,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     InstallPolicy(BackendInstallPolicyError),
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     Reduction(BackendReductionStateError),
     ProducerShapeMismatch,
     ConsumerContractMismatch,
@@ -140,6 +152,10 @@ impl BackendRuntimeFilterSessionSubmission {
         self.outcome
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn publication(&self) -> Option<&BackendReducedLogicalSnapshot> {
         self.publication.as_ref()
     }
@@ -329,6 +345,10 @@ impl BackendRuntimeFilterSession {
             })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn terminal_progress(&self) -> BackendCoverageProgress {
         self.terminal
             .as_ref()
@@ -418,10 +438,10 @@ impl BackendRuntimeFilterSession {
         let (apply, publication) = reduction
             .submit(stream, sequence, contribution)
             .map_err(reduction_violation)?;
-        if let Some(snapshot) = publication.as_ref() {
-            if self.channel.lifecycle() == super::BackendChannelLifecycle::MonotonicUpdates {
-                self.publish_reduced_snapshot(snapshot, None)?;
-            }
+        if let Some(snapshot) = publication.as_ref()
+            && self.channel.lifecycle() == super::BackendChannelLifecycle::MonotonicUpdates
+        {
+            self.publish_reduced_snapshot(snapshot, None)?;
         }
         drop(reduction);
         Ok(BackendRuntimeFilterSessionSubmission {
@@ -790,6 +810,10 @@ impl BackendRuntimeFilterSession {
         Ok(())
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn record_cancelled_if_open(&self) {
         self.record_channel_event(|channel| BackendRuntimeFilterEvent::ChannelCancelled {
             channel,

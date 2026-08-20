@@ -47,6 +47,10 @@ use super::context::NativePlanDecodeContext;
 use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use super::layout::Layout;
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(crate) fn decode_fragment_sink_program(
     fragment: &plan::PlanFragment,
     layout: &Layout,
@@ -550,6 +554,10 @@ fn unique_id_bytes(hi: i64, lo: i64) -> [u8; 16] {
     bytes
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(crate) fn decode_fragment_sink_assignment(
     sink: &plan::DataSink,
     instance: &native_proto::InstanceParams,
@@ -635,7 +643,7 @@ fn decode_data_stream_branch(
     context: &str,
     ctx: Option<&NativePlanDecodeContext>,
 ) -> Result<DataStreamSinkBranchProgram, NativeFragmentLeafDecodeError> {
-    let decoded = (|| -> Result<DataStreamSinkBranchProgram, NativeFragmentLeafDecodeError> {
+    (|| -> Result<DataStreamSinkBranchProgram, NativeFragmentLeafDecodeError> {
         let partition = stream.output_partition.as_ref().ok_or_else(|| {
             NativeFragmentLeafDecodeError::at_field(
                 ProtocolErrorKind::MissingField,
@@ -695,8 +703,7 @@ fn decode_data_stream_branch(
                 error,
             )
         })
-    })();
-    decoded
+    })()
 }
 
 fn decode_output_slot_ids(
@@ -960,7 +967,7 @@ fn decode_router_output_slots(
     output_columns: &[common::OutputColumn],
     field: &'static str,
 ) -> Result<Vec<SlotId>, NativeFragmentLeafDecodeError> {
-    let decoded = (|| -> Result<Vec<SlotId>, NativeFragmentLeafDecodeError> {
+    {
         let mut seen = std::collections::HashSet::new();
         ordinals
         .iter()
@@ -974,8 +981,7 @@ fn decode_router_output_slots(
             Ok(slot_id)
         })
         .collect()
-    })();
-    decoded
+    }
 }
 
 fn decode_row_mutation_effect(value: i32) -> Result<ConnectorRowMutationEffect, String> {
@@ -1000,6 +1006,10 @@ fn decode_route_id(value: &[u8]) -> Result<[u8; 32], String> {
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 fn decode_stream_destination_list(
     group: &plan::StreamDestinationList,
     path: FieldPath,
@@ -1029,6 +1039,10 @@ fn decode_stream_destination_list(
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 fn decode_instance_destinations(
     destinations: &[native_proto::Destination],
 ) -> Result<Vec<FragmentDestination>, NativeFragmentDecodeError> {

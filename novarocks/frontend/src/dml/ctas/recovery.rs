@@ -111,6 +111,10 @@ impl CtasRecoveryProfile {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn drive(
         &self,
         active: &mut ActiveDmlOperation,
@@ -209,10 +213,11 @@ impl CtasRecoveryProfile {
                 } else {
                     DmlCtasCleanupRetention::NotRequired
                 };
-                recovery.next_action = recovery
-                    .requires_recovery_scan()
-                    .then_some(StatementNextAction::ManualInspect)
-                    .unwrap_or(StatementNextAction::None);
+                recovery.next_action = if recovery.requires_recovery_scan() {
+                    StatementNextAction::ManualInspect
+                } else {
+                    StatementNextAction::None
+                };
                 let due = recovery
                     .requires_recovery_scan()
                     .then_some(now_ms.saturating_add(CTAS_RECOVERY_MANUAL_DELAY_MS));
@@ -229,6 +234,10 @@ impl CtasRecoveryProfile {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn raise_current_fence(
         &self,
         active: &mut ActiveDmlOperation,
@@ -385,6 +394,10 @@ impl CtasRecoveryProfile {
     /// Prove that the historical distributed writer cannot still mutate the
     /// retained staged target. Catalog visibility alone is insufficient: a
     /// possibly-dispatched writer must first be fenced and classified by the
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn write_cleanup_authorized(
         &self,
         active: &mut ActiveDmlOperation,
@@ -633,6 +646,10 @@ impl CtasRecoveryProfile {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn cleanup_staging(
         &self,
         active: &mut ActiveDmlOperation,
@@ -770,6 +787,10 @@ fn durable_write_cleanup_decision(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn persist_typed_catalog_failure(
     active: &mut ActiveDmlOperation,
     recovery: &mut DmlCtasRecoveryRecord,
@@ -803,6 +824,10 @@ fn persist_typed_catalog_failure(
     Ok(())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn projected_takeover_size(
     recovery: &DmlCtasRecoveryRecord,
     generation: crate::dml::model::DmlExternalFenceGeneration,
@@ -831,6 +856,10 @@ fn projected_takeover_size(
         .map_err(DmlError::journal_corruption)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn park_exhausted_history(
     active: &mut ActiveDmlOperation,
     recovery: &mut DmlCtasRecoveryRecord,
@@ -850,6 +879,10 @@ fn park_exhausted_history(
     )
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn historical_descriptor(
     recovery: &DmlCtasRecoveryRecord,
     saga: &crate::dml::model::CtasSagaRecord,
@@ -969,11 +1002,15 @@ fn historical_descriptor(
     .map_err(DmlError::executor)
 }
 
-fn latest_checkpoint_for_action<'a>(
-    recovery: &'a DmlCtasRecoveryRecord,
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
+fn latest_checkpoint_for_action(
+    recovery: &DmlCtasRecoveryRecord,
     action: DmlCtasActionKind,
     base: Uuid,
-) -> Result<Option<&'a DmlCtasDispatchCheckpointRecord>, DmlError> {
+) -> Result<Option<&DmlCtasDispatchCheckpointRecord>, DmlError> {
     let mut leaf = base;
     for _ in 0..=recovery.child_supersessions.len() {
         let successors = recovery
@@ -997,6 +1034,10 @@ fn latest_checkpoint_for_action<'a>(
         .find(|checkpoint| checkpoint.action == action && checkpoint.child_operation_id == leaf))
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn persist_observation(
     active: &mut ActiveDmlOperation,
     recovery: &mut DmlCtasRecoveryRecord,
@@ -1106,6 +1147,10 @@ fn persist_observation(
     persist(active, recovery, Some(now_ms))
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn ensure_abort_checkpoint(
     recovery: &mut DmlCtasRecoveryRecord,
     saga: &crate::dml::model::CtasSagaRecord,
@@ -1141,6 +1186,10 @@ fn ensure_abort_checkpoint(
     Ok(())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn decode_ctas_write_evidence(
     encoded: &str,
 ) -> Result<novarocks_spi::connector::ExternalMutationEvidence, DmlError> {
@@ -1150,6 +1199,10 @@ fn decode_ctas_write_evidence(
         .map_err(DmlError::journal_corruption)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn historical_write_request(
     saga: &crate::dml::model::CtasSagaRecord,
     recovery: &DmlCtasRecoveryRecord,
@@ -1296,6 +1349,10 @@ fn historical_write_checkpoints(
     ]
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn finish_success(
     active: &mut ActiveDmlOperation,
     observation: &ConnectorHistoricalCtasObservation,
@@ -1381,6 +1438,10 @@ fn finish_success(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn finish_aborted(
     active: &mut ActiveDmlOperation,
     observation: &ConnectorHistoricalCtasObservation,
@@ -1415,6 +1476,10 @@ fn finish_aborted(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn finish_cleanup_aborted(
     active: &mut ActiveDmlOperation,
     receipt: &novarocks_spi::connector::ConnectorHistoricalCtasCleanupReceipt,
@@ -1458,6 +1523,10 @@ fn finish_cleanup_aborted(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn finish_conflict(
     active: &mut ActiveDmlOperation,
     observation: &ConnectorHistoricalCtasObservation,
@@ -1493,6 +1562,10 @@ fn finish_conflict(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn finish_unresolved(
     active: &mut ActiveDmlOperation,
     observation: &ConnectorHistoricalCtasObservation,
@@ -1530,6 +1603,10 @@ fn finish_unresolved(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn park(
     active: &mut ActiveDmlOperation,
     recovery: &mut DmlCtasRecoveryRecord,
@@ -1553,6 +1630,10 @@ fn park(
     )
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn persist(
     active: &mut ActiveDmlOperation,
     recovery: &mut DmlCtasRecoveryRecord,
@@ -1562,6 +1643,10 @@ fn persist(
     active.record_ctas_recovery(recovery.clone(), due)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn table_identity(active: &ActiveDmlOperation) -> Result<ConnectorTableIdentity, DmlError> {
     Ok(ConnectorTableIdentity {
         instance_id: ConnectorInstanceId::parse(&active.stored.target.catalog)
@@ -1571,6 +1656,10 @@ fn table_identity(active: &ActiveDmlOperation) -> Result<ConnectorTableIdentity,
     })
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn historical_binding(
     saga: &crate::dml::model::CtasSagaRecord,
 ) -> Result<ConnectorExecutionBindingKey, DmlError> {
@@ -1594,6 +1683,10 @@ fn historical_binding(
     })
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn create_policy(saga: &crate::dml::model::CtasSagaRecord) -> Result<CreatePolicy, DmlError> {
     match saga.create_policy.as_str() {
         crate::dml::model::CTAS_CREATE_POLICY_FAIL_IF_EXISTS => Ok(CreatePolicy::FailIfExists),
@@ -1604,6 +1697,10 @@ fn create_policy(saga: &crate::dml::model::CtasSagaRecord) -> Result<CreatePolic
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn request_context() -> Result<ConnectorRequestContext, DmlError> {
     ConnectorRequestContext::try_new(
         Instant::now() + CTAS_RECOVERY_ACTION_DEADLINE,

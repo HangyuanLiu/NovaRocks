@@ -27,12 +27,20 @@ use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(crate) struct NativeFragmentCancelRequest {
     query_id: QueryId,
     fragment_instance_ids: Vec<UniqueId>,
     reason: String,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 impl NativeFragmentCancelRequest {
     pub(crate) fn new(
         query_id: QueryId,
@@ -75,6 +83,10 @@ impl fmt::Display for NativeFragmentIngressError {
 }
 impl std::error::Error for NativeFragmentIngressError {}
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(crate) trait NativeFragmentIngress: Send + Sync + 'static {
     fn ensure_connector_execution_binding(
         &self,

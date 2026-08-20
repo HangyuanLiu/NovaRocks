@@ -604,7 +604,7 @@ use legacy::lift_correlated_inner;
 #[cfg(test)]
 mod tests {
     use crate::planner::logical::*;
-    use crate::planner::payload::*;
+
     use arrow::datatypes::DataType;
 
     use super::*;
@@ -612,7 +612,7 @@ mod tests {
     use crate::column_id::ColumnId;
     use crate::planner::logical::LogicalPlanKind;
     use crate::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
 
     const INNER_K: ColumnId = ColumnId(1);
     const OUTER_K: ColumnId = ColumnId(2);
@@ -765,9 +765,7 @@ mod tests {
 
     fn filter_with_predicate(input: LogicalPlanNode, predicate: TypedExpr) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Filter(PlanFilterNode {
-                predicate: predicate,
-            }),
+            LogicalPlanKind::Filter(PlanFilterNode { predicate }),
             vec![input],
             None,
         )

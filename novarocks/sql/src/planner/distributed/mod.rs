@@ -16,12 +16,6 @@
 // under the License.
 
 mod activation_decision;
-#[cfg(test)]
-pub(crate) use crate::planner::runtime_filter::activation::{
-    ActivationConstraint, ActivationFallback, RequiredLiveReason,
-};
-#[cfg(test)]
-pub(crate) use activation_decision::DraftRuntimeFilterGraph;
 pub(crate) mod boundary;
 pub(crate) mod build;
 mod fragment;
@@ -36,7 +30,6 @@ pub(crate) mod write;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_support;
 
-pub use boundary::{BoundaryCatalog, ExecutionColumnIdAllocator};
 pub use boundary::{BoundaryColumn, BoundaryContract, BoundaryKind, ExecutionColumnId};
 pub use fragment::{DataPartition, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
 pub use fragment::{DataSink, PartitionKind, PlanFragment};
@@ -46,13 +39,10 @@ pub use node::{
     distributed_kind_to_physical,
 };
 pub use output::{
-    ConnectorWriteOutputContract, FinalizedAggregateLayout, FragmentEdgeOutputCatalog,
-    NodeExecutionColumn, NodeExecutionOutput, NodeOutputCatalog, WriteContractCatalog,
+    FragmentEdgeOutputCatalog, NodeExecutionColumn, NodeExecutionOutput, NodeOutputCatalog,
+    WriteContractCatalog,
 };
-pub(crate) use runtime_filter_progress::{
-    FrontierEdge, FrontierSkip, JoinBuildProgressCatalog, JoinBuildProgressProof,
-    JoinBuildProgressSkip,
-};
+#[cfg(test)]
+pub(crate) use runtime_filter_progress::FrontierEdge;
 pub use seal::DistributedPlan;
 pub(crate) use seal::native_encoder_test_fixture_plan;
-pub use topology::TopologyContract;

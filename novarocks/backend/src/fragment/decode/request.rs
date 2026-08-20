@@ -83,6 +83,10 @@ pub(crate) fn decode_native_query_execution_id(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 impl NativeFragmentRequest {
     pub(crate) fn try_decode(
         execution_id: QueryExecutionId,
@@ -179,6 +183,10 @@ impl NativeFragmentRequest {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 struct MissingExecutionResolver;
 
 impl ConnectorExecutionResolver for MissingExecutionResolver {
@@ -196,6 +204,10 @@ impl ConnectorExecutionResolver for MissingExecutionResolver {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 struct NeverCancelled;
 
 impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {

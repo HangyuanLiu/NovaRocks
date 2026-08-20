@@ -146,6 +146,10 @@ pub struct ProjectProcessorFactory {
 }
 
 impl ProjectProcessorFactory {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The projection factory receives the complete lowered node contract."
+    )]
     pub fn new(
         node_id: i32,
         is_subordinate: bool,

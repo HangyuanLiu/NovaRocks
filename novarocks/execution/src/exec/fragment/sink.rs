@@ -32,6 +32,10 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::SlotId;
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The frozen fragment sink program keeps its typed payload inline for transport clarity."
+)]
 #[derive(Clone, Debug)]
 pub enum FragmentSinkProgram {
     Result,
@@ -398,6 +402,10 @@ impl StatisticsSinkProgram {
 }
 
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "The lowered sink retains the optional limit for protocol compatibility."
+)]
 pub struct DataStreamSinkProgram {
     dest_node_id: i32,
     output_exprs: Vec<ExprId>,

@@ -798,7 +798,7 @@ pub(crate) fn sum_profile_counters_by_name_from_profile_trees<'a>(
     sums
 }
 
-fn sum_profile_counters_by_name_rec<'a>(node: &ProfileNode, sums: &mut HashMap<&'a str, i64>) {
+fn sum_profile_counters_by_name_rec(node: &ProfileNode, sums: &mut HashMap<&str, i64>) {
     for counter in &node.counters {
         if let Some(total) = sums.get_mut(counter.name.as_str()) {
             *total = total.saturating_add(counter.value);
@@ -1098,7 +1098,7 @@ mod tests {
         collect_per_fragment_profile_summaries, merge_actual_metrics,
     };
     use crate::query_execution::contract::QueryId;
-    use novarocks_execution::runtime::profile::{ProfileUnit, Profiler, RuntimeProfileTree};
+    use novarocks_execution::runtime::profile::{ProfileUnit, Profiler};
     use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
     use novarocks_protocol::{common, novarocks};
 
@@ -1426,6 +1426,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Dictionary metrics are emitted as distinct stable counters for the query-profile contract."
+    )]
     fn add_dictionary_metrics(
         parent: &Profiler,
         name: &str,

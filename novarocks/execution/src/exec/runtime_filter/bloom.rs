@@ -54,6 +54,10 @@ pub(in crate::exec::runtime_filter) struct SimdBlockFilter {
     directory: Vec<u32>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Bloom codec helpers are retained for runtime-filter compatibility."
+)]
 impl SimdBlockFilter {
     pub(in crate::exec::runtime_filter) fn empty() -> Self {
         Self {
@@ -177,7 +181,15 @@ pub struct RuntimeBloomFilter {
     min_max: RuntimeMinMaxFilter,
 }
 
+#[allow(
+    dead_code,
+    reason = "Bloom inspection helpers are retained for runtime-filter compatibility."
+)]
 impl RuntimeBloomFilter {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The bloom filter is decoded directly from its wire representation."
+    )]
     pub(in crate::exec::runtime_filter) fn new(
         filter_id: i32,
         slot_id: SlotId,

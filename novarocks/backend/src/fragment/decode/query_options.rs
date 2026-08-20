@@ -14,7 +14,7 @@ pub(crate) fn decode_query_options(
 ) -> Result<QueryOptions, ProtocolError> {
     let path = FieldPath::root("instance_params").field("query_options");
     validate_protocol_options(src, path.clone())?;
-    let validated = ProtocolQueryOptions::parse(src.clone()).map_err(|error| {
+    let validated = ProtocolQueryOptions::parse(*src).map_err(|error| {
         ProtocolError::new(
             path.clone(),
             ProtocolErrorKind::InvalidValue,
@@ -58,7 +58,7 @@ pub(crate) fn decode_query_options(
             datacache_sharing_work_period: (src.datacache_sharing_work_period > 0)
                 .then_some(src.datacache_sharing_work_period),
         },
-        spill: decode_spill_config(&src, path.field("spill_options"))?,
+        spill: decode_spill_config(src, path.field("spill_options"))?,
     })
 }
 
@@ -93,7 +93,7 @@ fn validate_protocol_options(
 
 fn decode_spill_config(
     src: &novarocks::QueryOptions,
-    path: FieldPath,
+    _path: FieldPath,
 ) -> Result<Option<SpillConfig>, ProtocolError> {
     if !src.enable_spill {
         return Ok(None);

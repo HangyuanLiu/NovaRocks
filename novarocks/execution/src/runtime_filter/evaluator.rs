@@ -403,10 +403,10 @@ pub(crate) fn fixed_value<const WIDTH: usize>(
         })
 }
 
-pub(crate) fn utf8_value<'a>(
-    data: &'a ArrayData,
+pub(crate) fn utf8_value(
+    data: &ArrayData,
     row: usize,
-) -> Result<&'a str, RuntimeFilterContractViolation> {
+) -> Result<&str, RuntimeFilterContractViolation> {
     if data.buffers().len() != 2 {
         return Err(violation(
             "runtime-filter Arrow UTF-8 array does not have offset and values buffers",

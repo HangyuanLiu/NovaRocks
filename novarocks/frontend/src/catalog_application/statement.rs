@@ -1598,15 +1598,11 @@ fn ensure_no_iceberg_mv_targets_in_scope(
         })?;
     let targets = definitions
         .iter()
-        .filter_map(|definition| {
-            definition
-                .storage_engine
-                .eq_ignore_ascii_case("iceberg")
-                .then(|| {
-                    crate::mv::domain::persistence::dependency::stored_definition_dependency_ref(
-                        definition, None,
-                    )
-                })
+        .filter(|&definition| definition.storage_engine.eq_ignore_ascii_case("iceberg"))
+        .map(|definition| {
+            crate::mv::domain::persistence::dependency::stored_definition_dependency_ref(
+                definition, None,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     crate::mv::domain::dependency::scope::validate_no_iceberg_mv_targets_in_scope(
@@ -1805,6 +1801,7 @@ impl ColumnPath {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn parse(input: &str) -> Result<Self, String> {
         if input.is_empty() {
             return Err("column path is empty".to_string());
@@ -2426,29 +2423,6 @@ fn peek_token_word_eq(parser: &Parser<'_>, word: &str) -> bool {
         &parser.peek_token_ref().token,
         Token::Word(token_word) if token_word.value.eq_ignore_ascii_case(word)
     )
-}
-
-fn expect_word(parser: &mut Parser<'_>, word: &str) -> Result<(), String> {
-    let token = parser.next_token();
-    match token.token {
-        Token::Word(token_word) if token_word.value.eq_ignore_ascii_case(word) => Ok(()),
-        other => Err(format!("expected {word}, got {other}")),
-    }
-}
-
-fn consume_optional_final_semicolon(parser: &mut Parser<'_>) -> Result<(), String> {
-    if parser.consume_token(&Token::SemiColon) && parser.peek_token_ref().token == Token::SemiColon
-    {
-        return Err("only one final semicolon is allowed".to_string());
-    }
-    Ok(())
-}
-
-fn expect_parser_eof(parser: &Parser<'_>) -> Result<(), String> {
-    match parser.peek_token_ref().token {
-        Token::EOF => Ok(()),
-        ref other => Err(format!("unexpected token after statement: {other}")),
-    }
 }
 
 /// Check if SQL looks like ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES ...

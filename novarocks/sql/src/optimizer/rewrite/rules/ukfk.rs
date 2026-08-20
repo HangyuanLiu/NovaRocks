@@ -551,13 +551,8 @@ fn foreign_key_matches(
 }
 
 fn sql_ukfk_facts(scan: &ScanOp) -> Option<&SqlUkFkTableFacts> {
-    match &scan.table.source {
-        ScanSource::Sql(source) => Some(source.ukfk_facts()),
-        // A non-SQL source cannot carry admission-frozen constraint facts.
-        // Keep the rewrite conservative while rejecting the stale carrier at
-        // the compiler boundary rather than reconstructing provider state.
-        _ => None,
-    }
+    let ScanSource::Sql(source) = &scan.table.source;
+    Some(source.ukfk_facts())
 }
 
 fn normalize_identifier(raw: &str) -> String {
@@ -695,7 +690,7 @@ mod tests {
     use crate::optimizer::operator::{AggregateOutputLayout, LogicalAggregateOp};
     use crate::optimizer::rewrite::tree_binder::bind_tree;
     use crate::optimizer::scalar::{HashableLiteral, ScalarNode};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use novarocks_catalog::schema::ColumnDef;
 
     fn output_col(id: u32, name: &str) -> OutputColumn {

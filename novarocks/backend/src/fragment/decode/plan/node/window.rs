@@ -37,6 +37,10 @@ use novarocks_protocol::FieldPath;
 use novarocks_protocol::{expr, plan};
 use novarocks_types::SlotId;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen native boundary keeps independently validated inputs explicit."
+)]
 pub(super) fn lower_window_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
@@ -183,7 +187,7 @@ pub(super) fn lower_window_node(
         )?;
 
         let mut functions = Vec::with_capacity(group_indices.len());
-        for (_local_idx, expr_idx) in group_indices.iter().copied().enumerate() {
+        for expr_idx in group_indices.iter().copied() {
             let expr = &window.window_exprs[expr_idx];
             functions.push(lower_window_function(
                 expr,
@@ -635,6 +639,10 @@ fn validate_window_frame(
     Ok(())
 }
 
+#[expect(
+    clippy::items_after_test_module,
+    reason = "Focused decode tests remain adjacent to their helpers."
+)]
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;

@@ -72,6 +72,10 @@ fn output_has_action_column(plan: &LogicalPlanNode) -> bool {
 
 /// Returns the action column descriptor from the first descendant Scan/Project
 /// in the subtree that exposes one, or `None` if no descendant carries it.
+#[allow(
+    dead_code,
+    reason = "The action-column probe supports IMV rewrite branches not selected by this target."
+)]
 fn first_propagated_action_column(plan: &LogicalPlanNode) -> Option<OutputColumn> {
     match &plan.kind {
         LogicalPlanKind::Scan(scan) => scan
@@ -758,7 +762,6 @@ fn subtree_has_version_scan(plan: &LogicalPlanNode) -> bool {
 fn sql_scan_source(source: &ScanSource) -> Option<&SqlScanSource> {
     match source {
         ScanSource::Sql(source) => Some(source),
-        _ => None,
     }
 }
 
@@ -785,7 +788,6 @@ fn is_version_scan_source(source: &ScanSource) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::planner::logical::*;
-    use crate::planner::payload::*;
 
     use arrow::datatypes::DataType;
 

@@ -229,6 +229,10 @@ impl<'a> PreparedFragmentSchedulingView<'a> {
         self.scan_bindings.connector_read(fragment_id, node_id)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Boundary projection remains available to target-gated native encoding paths."
+    )]
     pub(crate) fn boundary_projection(
         self,
         fragment_id: FragmentId,
@@ -238,6 +242,10 @@ impl<'a> PreparedFragmentSchedulingView<'a> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The fragment preparation boundary keeps each frozen planning fact explicit."
+)]
 pub(super) fn prepared_fragment(
     fragment_id: FragmentId,
     runtime_filter_bindings: Vec<SqlRuntimeFilterBindingFacts>,

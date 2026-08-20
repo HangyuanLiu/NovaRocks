@@ -349,6 +349,10 @@ pub trait CoordinatorReportEndpointSink: Send + Sync + 'static {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 pub(crate) struct NoopBackendQueryEventSink;
 
 #[cfg(test)]
@@ -363,6 +367,10 @@ impl BackendQueryEventSink for NoopBackendQueryEventSink {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 pub(crate) struct NoopCoordinatorReportEndpointSink;
 
 #[cfg(test)]
@@ -371,6 +379,10 @@ impl CoordinatorReportEndpointSink for NoopCoordinatorReportEndpointSink {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 pub(crate) struct NoopBackendTopologyPort;
 
 #[cfg(test)]

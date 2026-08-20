@@ -1441,6 +1441,18 @@ fn hash_column(
     Ok(())
 }
 
+pub fn build_compressed_flags(
+    ctx: &CompressedKeyContext,
+    views: &[GroupKeyArrayView<'_>],
+    num_rows: usize,
+) -> Result<Vec<bool>, String> {
+    let mut flags = Vec::with_capacity(num_rows);
+    for row in 0..num_rows {
+        flags.push(compressed_key_is_valid(ctx, views, row)?);
+    }
+    Ok(flags)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1531,16 +1543,4 @@ mod tests {
         assert_eq!(encode_group_key_row(&large_binary, 1).unwrap(), None);
         assert!(encode_group_key_row(&large_binary, 2).unwrap().is_some());
     }
-}
-
-pub fn build_compressed_flags(
-    ctx: &CompressedKeyContext,
-    views: &[GroupKeyArrayView<'_>],
-    num_rows: usize,
-) -> Result<Vec<bool>, String> {
-    let mut flags = Vec::with_capacity(num_rows);
-    for row in 0..num_rows {
-        flags.push(compressed_key_is_valid(ctx, views, row)?);
-    }
-    Ok(flags)
 }

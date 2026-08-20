@@ -42,6 +42,10 @@ const FLAG_CONTAINS_NULL: u8 = 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArtifactCodecError {
     ContractViolation,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     Malformed,
     Truncated,
     UnknownVersion,

@@ -26,7 +26,6 @@
 
 use std::collections::BTreeSet;
 
-use arrow::datatypes::DataType;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::ConnectorWriteFieldToken;
 

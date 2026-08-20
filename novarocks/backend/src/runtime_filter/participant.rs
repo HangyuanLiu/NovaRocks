@@ -745,6 +745,10 @@ impl RuntimeFilterParticipant {
         (self.close_hook)(self, reason)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn capture_runtime_filter_observation(&self) -> RuntimeFilterObservationSnapshot {
         self.observation.capture()
     }
@@ -1006,6 +1010,10 @@ impl BackendParticipantOutbound {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The contribution envelope is frozen from distinct backend routing facts at the native boundary."
+    )]
     fn forward_producer_contribution(
         &self,
         channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
@@ -1509,7 +1517,7 @@ impl RuntimeFilterFinalDomainCompletion for BackendFinalDomainCompletion {
     }
 
     fn claim_partition(
-        self: &Self,
+        &self,
         partition: novarocks_execution::runtime_filter::PartitionId,
     ) -> Result<RuntimeFilterFinalDomainPartitionHandle, RuntimeFilterContractViolation> {
         if partition.get() >= self.local_partition_count {
@@ -1688,6 +1696,15 @@ fn violation(
 
 fn outbound_violation(detail: impl Into<Arc<str>>) -> RuntimeFilterContractViolation {
     violation(RuntimeFilterContractViolationKind::ContractMismatch, detail)
+}
+
+fn execution_placeholder_membership_schema()
+-> Result<novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema, ()> {
+    novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema::new(
+        &arrow::datatypes::DataType::Boolean,
+        novarocks_execution::runtime_filter::RuntimeFilterNullSemantics::NeverMatches,
+    )
+    .map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -2730,13 +2747,4 @@ mod tests {
             )
         ));
     }
-}
-
-fn execution_placeholder_membership_schema()
--> Result<novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema, ()> {
-    novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema::new(
-        &arrow::datatypes::DataType::Boolean,
-        novarocks_execution::runtime_filter::RuntimeFilterNullSemantics::NeverMatches,
-    )
-    .map_err(|_| ())
 }

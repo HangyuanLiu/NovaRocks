@@ -123,6 +123,10 @@ impl AnalyzerScope {
     /// USING-clause joins record a canonical qualifier so that downstream
     /// resolution against codegen scopes (which contain both sides' bindings)
     /// picks the correct slot.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(super) fn canonical_qualifier_for(&self, name: &str) -> Option<String> {
         self.canonical_qualifier.get(&name.to_lowercase()).cloned()
     }

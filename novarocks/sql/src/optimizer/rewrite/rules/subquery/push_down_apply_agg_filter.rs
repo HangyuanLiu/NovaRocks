@@ -351,7 +351,7 @@ mod tests {
     };
     use crate::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::planner::payload::{AggregateCall, PlanFilterNode, PlanScanNode, PlanValuesNode};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
 
     // ---- Column ID constants ------------------------------------------------
     const T2_K: ColumnId = ColumnId(1); // t2.k  (inner correlation column)

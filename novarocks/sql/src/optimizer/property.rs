@@ -319,6 +319,10 @@ pub(crate) enum OrderingSpec {
 }
 
 impl OrderingSpec {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) fn from_sort_keys<I>(items: I) -> Self
     where
         I: IntoIterator<Item = SortKey>,

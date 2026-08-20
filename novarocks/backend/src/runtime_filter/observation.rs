@@ -67,13 +67,29 @@ pub(crate) enum RuntimeFilterObservationError {
     UnknownTransportRoute(BackendTransportEventIdentity),
     UnknownConsumer(BackendConsumerSubscriptionIdentity),
     IdentityMismatch,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     ConflictingChannelTerminal {
         channel: BackendChannelIdentity,
         observed: RuntimeFilterChannelTerminal,
         incoming: RuntimeFilterChannelTerminal,
     },
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     DeliveryConflict,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     DeliveryResourceLimit,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     InvalidRowEffect,
 }
 
@@ -213,6 +229,10 @@ impl RuntimeFilterTransportObservation {
         self.failed_open
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -356,6 +376,10 @@ impl RuntimeFilterObservationSnapshot {
         &self.consumers
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn anomalies(&self) -> &RuntimeFilterObservationAnomalies {
         &self.anomalies
     }
@@ -374,22 +398,42 @@ pub(crate) struct RuntimeFilterObservationAnomalies {
 }
 
 impl RuntimeFilterObservationAnomalies {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn unattributed(&self) -> RuntimeFilterUnattributedObservations {
         self.unattributed
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn conflicting_reports(&self) -> RuntimeFilterConflictingReportObservations {
         self.conflicting_reports
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn saturated(&self) -> u64 {
         self.saturated
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn late_after_seal(&self) -> u64 {
         self.late_after_seal
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn rejected(&self) -> u64 {
         self.rejected
     }
@@ -407,24 +451,52 @@ pub(crate) struct RuntimeFilterUnattributedObservations {
 }
 
 impl RuntimeFilterUnattributedObservations {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn participant(&self) -> u64 {
         self.participant
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn channel(&self) -> u64 {
         self.channel
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn producer_instance(&self) -> u64 {
         self.producer_instance
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn producer_stream(&self) -> u64 {
         self.producer_stream
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn transport_route(&self) -> u64 {
         self.transport_route
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn consumer(&self) -> u64 {
         self.consumer
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn identity_mismatch(&self) -> u64 {
         self.identity_mismatch
     }
@@ -438,12 +510,24 @@ pub(crate) struct RuntimeFilterConflictingReportObservations {
 }
 
 impl RuntimeFilterConflictingReportObservations {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn channel_terminal(&self) -> u64 {
         self.channel_terminal
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn consumer_outcome(&self) -> u64 {
         self.consumer_outcome
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) const fn consumer_terminal(&self) -> u64 {
         self.consumer_terminal
     }
@@ -637,6 +721,10 @@ impl RuntimeFilterObservationStore {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn reject(&self, error: RuntimeFilterObservationError) {
         let mut state = self.lock();
         if state.sealed.is_some() {
@@ -646,6 +734,10 @@ impl RuntimeFilterObservationStore {
         record_anomaly(&mut state, error, &self.saturated);
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn capture(&self) -> RuntimeFilterObservationSnapshot {
         let state = self.lock();
         state
@@ -736,6 +828,10 @@ impl RuntimeFilterObservationEmitter {
             .register_producer_instance(channel, fragment_instance_id, partition_count);
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn capture(&self) -> RuntimeFilterObservationSnapshot {
         self.store.capture()
     }
@@ -756,6 +852,10 @@ impl RuntimeFilterObservationEmitter {
         snapshot
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn reject(&self, error: RuntimeFilterObservationError) {
         self.store.reject(error);
     }

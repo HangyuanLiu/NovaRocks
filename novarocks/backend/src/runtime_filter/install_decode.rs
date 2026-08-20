@@ -24,7 +24,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use arrow::datatypes::DataType;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime_filter::{
     ConsumerActivation, RuntimeFilterBindingId, RuntimeFilterChannelId,
@@ -44,9 +43,7 @@ use sha2::Digest;
 
 use crate::fragment::decode::type_decode::decode_type;
 use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
-use crate::runtime_filter::artifact::{
-    ArtifactKind, ConsumerArtifactProfile, ConsumerProfileId, HashContractDigest,
-};
+use crate::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile, HashContractDigest};
 use crate::runtime_filter::domain::{
     BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall, BackendCoverage,
     BackendCoverageWitnessId, BackendEnvelopeKind, BackendMaterializationOwner,
@@ -97,7 +94,7 @@ pub(crate) fn decode_runtime_filter_contribution(
         }),
         deployment_epoch: execution_id.attempt_id().get(),
         participant_id: wire.participant_id,
-        lifecycle: wire.lifecycle.clone(),
+        lifecycle: wire.lifecycle,
         install: wire.install.clone(),
     };
     let mut hasher = sha2::Sha256::new();
@@ -1055,13 +1052,7 @@ fn decode_materialization_policy(
             "bloom bits per key does not fit u32",
         )
     })?;
-    let bloom_hash_count = u32::try_from(wire.bloom_hash_count).map_err(|_| {
-        codec_error(
-            path.clone().field("bloom_hash_count"),
-            ProtocolErrorKind::OutOfRange,
-            "bloom hash count does not fit u32",
-        )
-    })?;
+    let bloom_hash_count = wire.bloom_hash_count;
     BackendMaterializationPolicy::new(
         bloom_bits_per_key,
         bloom_hash_count,
@@ -1815,7 +1806,7 @@ mod tests {
             }),
             deployment_epoch: execution_id.attempt_id().get(),
             participant_id: 3,
-            lifecycle: Some(lifecycle.clone()),
+            lifecycle: Some(lifecycle),
             install: Some(install.clone()),
         };
         let mut digest = sha2::Sha256::new();

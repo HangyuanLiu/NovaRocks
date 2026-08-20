@@ -52,6 +52,10 @@ pub fn sql_cancellation_observation(
     Arc::new(QueryCancellationObservation::new(view))
 }
 
+#[allow(
+    dead_code,
+    reason = "Post-compile planning inputs remain explicit for target-gated native assembly callers."
+)]
 pub(crate) struct PostCompilePlanningContext<'a> {
     pub(crate) table_bindings:
         Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
@@ -59,6 +63,10 @@ pub(crate) struct PostCompilePlanningContext<'a> {
     pub(crate) connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
 }
 
+#[allow(
+    dead_code,
+    reason = "The aggregate planning input is retained for target-gated native assembly callers."
+)]
 pub(crate) struct QueryPlanningInputs<'a> {
     pub(crate) analyze_request: SqlAnalyzeRequest<'a>,
     pub(crate) post_compile: PostCompilePlanningContext<'a>,

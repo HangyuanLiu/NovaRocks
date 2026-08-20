@@ -51,6 +51,10 @@ pub struct ListMvsRequest {
 }
 
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub struct RefreshRequest {
     pub target: MvTarget,
     pub current_catalog: Option<String>,
@@ -85,6 +89,10 @@ pub struct IcebergRefreshPlan {
 }
 
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub struct RefreshOutcome {
     pub mv_id: Option<i64>,
     pub target: MvTarget,
@@ -96,22 +104,38 @@ pub struct RefreshOutcome {
 }
 
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub enum BackendRefreshOutcome {
     StarRocks(StarRocksTableRefreshOutcome),
     Iceberg(IcebergRefreshOutcome),
 }
 
 #[derive(Clone, Debug, Default)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub struct StarRocksTableRefreshOutcome {
     pub completed_inside_execute: bool,
 }
 
 #[derive(Clone, Debug, Default)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub struct IcebergRefreshOutcome {
     pub completed_inside_execute: bool,
 }
 
 #[derive(Clone)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub struct RefreshCtx {
     pub refresh_id: Option<i64>,
     pub expected_target_snapshot_id: Option<i64>,
@@ -120,6 +144,10 @@ pub struct RefreshCtx {
 }
 
 impl RefreshCtx {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub fn new(connector_context: novarocks_spi::connector::ConnectorRequestContext) -> Self {
         Self {
             refresh_id: None,

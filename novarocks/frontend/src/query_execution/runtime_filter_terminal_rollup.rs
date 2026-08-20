@@ -80,6 +80,10 @@ pub(crate) struct RuntimeFilterParticipantTerminalDetails {
 /// Query totals are diagnostic-only: either the complete checked sum or an
 /// explicit reason why no honest total can be represented.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Diagnostic terminal telemetry retains the complete available totals without losing unavailable reasons."
+)]
 pub(crate) enum RuntimeFilterTerminalTotalsTelemetry {
     Available(RuntimeFilterTerminalTotals),
     Unavailable(RuntimeFilterTerminalTotalsUnavailable),

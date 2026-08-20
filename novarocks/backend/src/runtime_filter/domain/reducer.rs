@@ -116,6 +116,10 @@ impl MembershipReducer {
         &self.domain
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn into_domain(self) -> ValueDomainDelta {
         self.domain
     }
@@ -133,11 +137,9 @@ fn empty_membership_values(data_type: &DataType) -> Option<MembershipValues> {
         DataType::Float64 => MembershipValues::float64([]),
         DataType::Utf8 => MembershipValues::utf8(std::iter::empty::<String>()),
         DataType::Date32 => MembershipValues::date32([]),
-        DataType::Timestamp(unit, timezone) => MembershipValues::timestamp(
-            unit.clone(),
-            timezone.as_ref().map(|value| value.to_string()),
-            [],
-        ),
+        DataType::Timestamp(unit, timezone) => {
+            MembershipValues::timestamp(*unit, timezone.as_ref().map(|value| value.to_string()), [])
+        }
         DataType::Decimal128(precision, scale) => {
             MembershipValues::decimal128(*precision, *scale, []).ok()?
         }

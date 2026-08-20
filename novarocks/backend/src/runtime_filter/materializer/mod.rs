@@ -44,6 +44,10 @@ pub(crate) struct MaterializationAdmission {
 /// Frozen physical Bloom parameters.  The Backend profile digest remains the
 /// authority: callers must prove the derived contract digest matches it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) struct BloomMaterializationPolicy {
     pub(crate) algorithm_version: u16,
     pub(crate) seed: u64,
@@ -66,6 +70,10 @@ impl MaterializationAdmission {
     pub(crate) const fn max_artifact_bytes(&self) -> usize {
         self.max_artifact_bytes
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn with_retained_budget(
         max_artifact_bytes: usize,
         retained_budget: Arc<crate::runtime_filter::artifact::ArtifactRetainedBudget>,
@@ -78,6 +86,10 @@ impl MaterializationAdmission {
             )),
         }
     }
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     pub(crate) fn with_budgets(
         max_artifact_bytes: usize,
         retained_budget: Arc<crate::runtime_filter::artifact::ArtifactRetainedBudget>,
@@ -116,6 +128,10 @@ impl MaterializationAdmission {
 pub(crate) enum MaterializationOutcome {
     Published(Arc<ArtifactBundle>),
     Unsupported(NoAcceptedRepresentation),
+    #[allow(
+        dead_code,
+        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    )]
     Unavailable(MaterializationUnavailable),
 }
 
@@ -208,6 +224,10 @@ pub(crate) fn materialize_membership(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 pub(crate) fn materialize_membership_with_policy(
     channel_id: u32,
     domain: &ValueDomainDelta,
@@ -228,31 +248,30 @@ pub(crate) fn materialize_membership_with_policy(
         );
     }
     let mut exact = Vec::new();
-    if profile.accepts(ArtifactKind::ValueSet) {
-        if let Ok(bytes) = leaf::encode_membership_leaf(domain, schema, logical_version) {
-            exact.push((ArtifactKind::ValueSet, bytes));
-        }
+    if profile.accepts(ArtifactKind::ValueSet)
+        && let Ok(bytes) = leaf::encode_membership_leaf(domain, schema, logical_version)
+    {
+        exact.push((ArtifactKind::ValueSet, bytes));
     }
-    if profile.accepts(ArtifactKind::Bitset) {
-        if let Ok(plan) = BitsetPlan::new(domain.values()) {
-            if let Ok(bits) = bitset::build_bits(domain.values(), plan) {
-                let mut payload = Vec::with_capacity(25 + bits.len());
-                payload.push(plan.type_tag());
-                payload.extend_from_slice(&plan.min().to_be_bytes());
-                payload.extend_from_slice(&plan.max().to_be_bytes());
-                payload.extend_from_slice(&plan.bit_count().to_be_bytes());
-                payload.extend_from_slice(&bits);
-                if let Ok(bytes) = leaf::encode_physical_leaf(
-                    ArtifactKind::Bitset,
-                    schema,
-                    logical_version,
-                    domain.contains_null(),
-                    None,
-                    &payload,
-                ) {
-                    exact.push((ArtifactKind::Bitset, bytes));
-                }
-            }
+    if profile.accepts(ArtifactKind::Bitset)
+        && let Ok(plan) = BitsetPlan::new(domain.values())
+        && let Ok(bits) = bitset::build_bits(domain.values(), plan)
+    {
+        let mut payload = Vec::with_capacity(25 + bits.len());
+        payload.push(plan.type_tag());
+        payload.extend_from_slice(&plan.min().to_be_bytes());
+        payload.extend_from_slice(&plan.max().to_be_bytes());
+        payload.extend_from_slice(&plan.bit_count().to_be_bytes());
+        payload.extend_from_slice(&bits);
+        if let Ok(bytes) = leaf::encode_physical_leaf(
+            ArtifactKind::Bitset,
+            schema,
+            logical_version,
+            domain.contains_null(),
+            None,
+            &payload,
+        ) {
+            exact.push((ArtifactKind::Bitset, bytes));
         }
     }
     if let Some((kind, bytes)) = exact.into_iter().min_by_key(|(_, bytes)| bytes.len()) {
@@ -329,6 +348,10 @@ pub(crate) fn materialize_membership_with_policy(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 fn membership_value_count(
     values: &novarocks_execution::runtime_filter::contribution::MembershipValues,
 ) -> usize {
@@ -374,6 +397,10 @@ fn membership_value_count(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+)]
 fn publish_leaf(
     channel_id: u32,
     kind: ArtifactKind,

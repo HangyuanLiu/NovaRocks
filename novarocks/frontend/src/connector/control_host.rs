@@ -99,6 +99,10 @@ pub trait ConnectorControlRetirementSink: Send + Sync + 'static {
     fn retire(&self, retirement: ConnectorControlRetirement);
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 impl ConnectorControlHost {
     pub fn new() -> Self {
         Self::with_factories(Vec::new()).expect("an empty connector factory set is valid")
@@ -1037,6 +1041,10 @@ impl ConnectorControlRegistry for ConnectorControlHost {
 }
 
 #[derive(Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 enum LeaseKind {
     Planning,
     Mutation,
@@ -1126,9 +1134,7 @@ fn queue_retirement(
     state: &mut ControlHostState,
     key: ConnectorExecutionBindingKey,
 ) -> Option<ConnectorControlRetirement> {
-    let Some(generation) = state.generations.remove(&key) else {
-        return None;
-    };
+    let generation = state.generations.remove(&key)?;
     debug_assert_eq!(generation.state, ControlGenerationState::Retiring);
     state.retired.insert(key.clone());
     let installed_backends = state

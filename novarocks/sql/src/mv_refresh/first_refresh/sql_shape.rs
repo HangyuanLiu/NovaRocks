@@ -106,10 +106,18 @@ impl SqlMvSnapshotPin {
         self.snapshots.is_empty()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(super) fn snapshot_map(&self) -> &BTreeMap<String, i64> {
         &self.snapshots
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(super) fn table_object_id_map(&self) -> &BTreeMap<String, ConnectorTableObjectId> {
         &self.table_object_ids
     }

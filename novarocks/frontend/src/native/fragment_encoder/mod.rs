@@ -23,9 +23,7 @@ pub(crate) mod instance;
 pub(crate) mod plan;
 pub(crate) mod submission;
 
-pub use bundle::{
-    NativeFragmentAttachment, NativeFragmentEncodingView, encode_native_fragment_bundle,
-};
+pub use bundle::encode_native_fragment_bundle;
 pub(crate) use instance::encode_instance_params;
 pub(crate) use plan::encode_data_partition;
 

@@ -120,7 +120,7 @@ mod tests {
         TableFunctionOp, TopNOp, TopNPhase, UnionOp, ValuesOp, WindowOp,
     };
     use crate::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
 
     fn bool_literal_scalar(arena: &mut ScalarArena) -> ScalarId {
         arena.intern(

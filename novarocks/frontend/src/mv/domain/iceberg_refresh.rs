@@ -26,11 +26,6 @@ use arrow::datatypes::DataType;
 use serde::Serialize;
 
 use crate::catalog_application::CatalogApplicationPort;
-#[cfg(test)]
-use crate::catalog_application::query_bindings::{
-    MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
-    QueryTableBindingStore,
-};
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::common::engine_error::EngineError;
 use crate::mv::domain::analysis::refresh_property::{
@@ -48,9 +43,7 @@ use crate::mv::domain::application::{
     PrepareMvCreateRequest, PreparedMvCreate, PreparedMvDefinition,
 };
 #[cfg(test)]
-use crate::mv::domain::application::{
-    MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
-};
+use crate::mv::domain::application::{MvIncrementalJoinMode, MvIncrementalWriteMode};
 use crate::mv::domain::dependency::model::{MvDependencyObjectType, MvDependencyStorageEngine};
 use crate::mv::domain::lifecycle::{
     BackendRefreshPlan, IcebergRefreshPlan, RefreshError, RefreshPlan,
@@ -70,8 +63,6 @@ use crate::mv::domain::persistence::schema::{
 use crate::mv::domain::refresh::apply_key::ApplyKeyContract;
 use crate::mv::domain::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::domain::refresh::contract::ImvRefreshContract;
-#[cfg(test)]
-use crate::mv::domain::refresh::definition::mv_definition_fingerprint;
 use crate::mv::domain::refresh::definition::{
     load_iceberg_mv_definition_by_target, parse_iceberg_table_refs, parse_mv_select_query,
 };
@@ -79,11 +70,6 @@ use crate::mv::domain::refresh::definition::{
 use crate::mv::domain::refresh::execution_policy::{
     explain_refresh_full_guard, non_join_incremental_write_mode,
     select_join_incremental_execution_mode, should_use_join_delta_append_only_fast_path,
-};
-#[cfg(test)]
-use crate::mv::domain::refresh::non_join_incremental::{
-    NonJoinBaseChange, NonJoinIncrementalChangePlan, full_rebuild_reason_message,
-    plan_non_join_incremental_changes,
 };
 use crate::mv::domain::refresh::observation::{
     observe_current_refresh_base, observe_schema_validation_for_table,
@@ -96,12 +82,6 @@ use crate::mv::domain::refresh::planning::{
 #[cfg(test)]
 use crate::mv::domain::refresh::repartition::{RepartitionShape, select_repartition_shape};
 use crate::mv::domain::refresh::rewrite_context::observe_and_admit_change_window_for_table;
-#[cfg(test)]
-use crate::mv::domain::refresh::rewrite_context::{
-    admitted_change_facts, build_neutral_refresh_rewrite_context,
-};
-#[cfg(test)]
-use crate::mv::domain::refresh::schema_contract::validate_repartition_schema_contract;
 use crate::mv::domain::refresh::schema_contract::{
     validate_aggregate_schema_contract_for_base, validate_aggregate_schema_contract_metadata,
 };
@@ -117,8 +97,6 @@ use crate::mv::domain::refresh::target_apply::{
     join_apply_key_table_column,
 };
 use crate::mv::domain::refresh_io::acquire_mv_refresh_lock;
-#[cfg(test)]
-use crate::mv::domain::refresh_pin_adapter::capture_refresh_snapshot_pin_with_ports;
 use crate::mv::domain::repository::CreateMvRepositoryRequest;
 use crate::mv::domain::repository::MvRepository;
 use crate::mv::domain::schema_validation::{
@@ -133,14 +111,10 @@ use crate::runtime::statement_result::StatementResult;
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
 use novarocks_spi::connector::MvStorageObservationPort;
-#[cfg(test)]
-use novarocks_spi::connector::{
-    ConnectorChangeWindowAdmission, ConnectorExecutionBindingKey, ConnectorTableIdentity,
-};
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorInstanceId};
 use novarocks_sql::planning::mv::FULL_REFRESH_DISABLED_MESSAGE;
 #[cfg(test)]
-use novarocks_sql::planning::mv::MvRefreshFinalizeFacts;
+use novarocks_sql::planning::mv::MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME;
 use novarocks_sql::planning::mv::UnionBranchKind;
 use novarocks_sql::planning::mv::{
     MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
@@ -150,11 +124,6 @@ use novarocks_sql::planning::mv::{
     SqlMvJoinAliases, SqlMvJoinContractKindFacts, SqlMvLineageScope, SqlMvObservedFieldFacts,
     SqlMvObservedSchemaFacts, SqlMvOutputColumnFacts, SqlMvPersistedApplyKeySourceFacts,
     extract_join_aliases, extract_single_scan_table_fqn, mv_apply_key_source_from_column_name,
-};
-#[cfg(test)]
-use novarocks_sql::planning::mv::{
-    MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-    extract_aggregate_sql_calls,
 };
 use novarocks_sql::syntax::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr,
@@ -168,8 +137,16 @@ use novarocks_sql::syntax::{
 trait IcebergMvRefreshSource:
     crate::catalog_application::query_catalog::CatalogServiceSource + Send + Sync
 {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort>;
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     fn repository(&self) -> &dyn MvRepository;
     fn storage_observation(&self) -> &dyn MvStorageObservationPort;
 }
@@ -1527,6 +1504,10 @@ fn validate_union_projection_schema_contract_for_base(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn union_branch_inner_apply_key(
     branch_kind: UnionBranchKind,
 ) -> SqlMvApplyKeySourceFacts {
@@ -1691,6 +1672,10 @@ fn descriptor_dependency_from_request(request: &CreateMvDependencyRequest) -> De
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn refresh_policy_descriptor_json(
     policy: &MaterializedViewRefreshPolicy,
     paused: bool,
@@ -1913,7 +1898,10 @@ fn iceberg_aggregate_target_columns_from_layout(
 /// (`extract_aggregate_sql_calls` / `extract_join_aliases` /
 /// `extract_single_scan_table_fqn`) over `canonical_query` (or its first branch)
 /// plus the resolved `MvAnalysis`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Schema-contract construction keeps independently resolved refresh inputs explicit."
+)]
 fn build_iceberg_mv_schema_contract(
     refresh_contract: &ImvRefreshContract,
     property: &RefreshFragmentProperty,
@@ -3102,7 +3090,6 @@ mod tests {
     use super::*;
     use crate::mv::domain::refresh::apply_key::ApplyKeyValueType;
     use crate::mv::domain::refresh::capabilities::PartitionPruningPolicy;
-    use arrow::datatypes::DataType;
 
     #[test]
     fn aggregate_incremental_inserts_use_row_delta() {
@@ -3139,18 +3126,8 @@ mod tests {
             novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
             novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
         ];
-        assert!(
-            effects
-                .iter()
-                .any(|effect| *effect
-                    == novarocks_spi::connector::ConnectorRowMutationEffect::Delete)
-        );
-        assert!(
-            effects
-                .iter()
-                .any(|effect| *effect
-                    == novarocks_spi::connector::ConnectorRowMutationEffect::Replace)
-        );
+        assert!(effects.contains(&novarocks_spi::connector::ConnectorRowMutationEffect::Delete));
+        assert!(effects.contains(&novarocks_spi::connector::ConnectorRowMutationEffect::Replace));
     }
 
     #[test]
@@ -3237,6 +3214,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     fn parse_select_query(sql: &str) -> sqlparser::ast::Query {
         let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize");
         let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse");
@@ -3439,25 +3420,9 @@ mod tests {
     }
 }
 
-/// A-family `Aggregate(UNION ALL(b1..bn))` refresh execution (fan-in over
-/// multiple bases).
-///
-/// UNION ALL sits BELOW the aggregate, so the same group key folds across
-/// branches and the ordinary group-row-id apply key applies — there is no
-/// `__branch_id__` (that is the B-family / branch-union concern). The rewrite (`RewriteUnionAggregateDelta` + the aggregate-state
-/// stage) and IMV scan binding already fan a per-branch delta window off the
-/// multi-base pin, exactly like `refresh_join_aggregate_iceberg_mv` does for
-/// its two bases. This orchestration just pins/loads every fan-in base, builds
-/// one refresh context over all of them, and drives the shared aggregate merge
-/// with one canonical `NonJoinBaseChange` per base.
-///
-/// Structurally this mirrors `refresh_iceberg_union_projection_mv` (multi-base
-/// first/metadata/incremental dispatch) but uses the aggregate contract
-/// validators, the aggregate first-refresh path, and the aggregate merge
-/// options. Field-id rebind is not supported on the fan-in path yet; a base
-/// whose columns were rebound is accepted by the contract check but its SELECT
-/// is not rewritten, matching the pre-existing single-base behavior closely
-/// enough for the unchanged-schema case this build targets.
+// A-family aggregate-union execution is orchestrated by the shared fan-in
+// refresh path below. It pins every base, builds one refresh context, and
+// drives the aggregate merge with one canonical change per base.
 
 /// The per-shape payload distinguishing the two `AllBasesRequired` aggregate
 /// refresh variants that share the wrapper [`refresh_fan_in_aggregate_iceberg_mv`].
@@ -3468,6 +3433,10 @@ mod tests {
 /// `GroupRowId` aggregate fanning in over a UNION ALL of scans. Both produce an
 /// `AllBasesRequired` snapshot policy and an aggregate state contract; only the
 /// branch-contract validation and the first-refresh strategy differ.
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 enum AllBasesAggregateRefresh<'a> {
     /// Aggregate-over-UNION-ALL fan-in: one aggregate above a union of scans.
     /// The aggregate-call surface is sourced from the focused extractor
@@ -3497,6 +3466,10 @@ enum AllBasesAggregateRefresh<'a> {
     },
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn target_fqn_string(target: &IcebergMvTarget) -> String {
     format!("{}.{}.{}", target.catalog, target.namespace, target.table)
 }
@@ -3799,8 +3772,8 @@ struct RefreshDefinitionFingerprint<'a> {
 
 fn refresh_execution_definition_fingerprint(
     mv_definition: &StoredMvDefinition,
-    current_catalog: Option<&str>,
-    current_database: &str,
+    _current_catalog: Option<&str>,
+    _current_database: &str,
 ) -> Result<String, String> {
     let canonical_select_sql = canonicalize_iceberg_mv_select_query(
         &parse_mv_select_query(&mv_definition.query_definition.raw_query_source)?,
@@ -3969,7 +3942,7 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
                 &base_refs,
                 branch_count,
                 dispatch_schema_contract,
-                &connector_context,
+                connector_context,
             );
         }
         // Aggregate shapes: single-base, fan-in, branch-union, and join
@@ -3989,7 +3962,7 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
                 &base_refs,
                 &caps,
                 &canonical_select_query,
-                &connector_context,
+                connector_context,
             );
         }
         // Join / single-base projection-filter: fall through to the inline
@@ -4302,7 +4275,10 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Union projection planning keeps each frozen target, snapshot, and connector input explicit."
+)]
 fn plan_iceberg_union_projection_mv_refresh(
     source: &dyn IcebergMvRefreshSource,
     iceberg_target: &IcebergMvTarget,
@@ -4487,7 +4463,6 @@ fn plan_iceberg_union_projection_mv_refresh(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Plan the `AllBasesRequired` aggregate refresh variants (fan-in
 /// `GroupRowId` and branch-union `BranchScoped`). Extracted from
 /// `plan_iceberg_aggregate_mv_refresh` (I2) to mirror the execute-side
@@ -4496,7 +4471,10 @@ fn plan_iceberg_union_projection_mv_refresh(
 /// combined base-snapshot statuses, and build one multi-base refresh plan; only
 /// the up-front branch-contract vs fan-in base-ref validation and the log label
 /// differ. Behavior is byte-for-byte identical to the inline block it replaced.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "All-bases aggregate planning preserves each independently validated base and connector fact."
+)]
 fn plan_iceberg_all_bases_aggregate_mv_refresh(
     source: &dyn IcebergMvRefreshSource,
     iceberg_target: &IcebergMvTarget,
@@ -4663,6 +4641,10 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
     ))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Aggregate refresh planning must keep the independently frozen SQL, target, snapshot, and connector facts explicit."
+)]
 fn plan_iceberg_aggregate_mv_refresh(
     source: &dyn IcebergMvRefreshSource,
     iceberg_target: &IcebergMvTarget,
@@ -4950,6 +4932,10 @@ fn plan_iceberg_aggregate_mv_refresh(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The final plan constructor preserves each separately validated refresh contract fact."
+)]
 fn build_iceberg_refresh_plan(
     mv_definition: &StoredMvDefinition,
     target: MvTarget,
@@ -4995,10 +4981,18 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 struct CatalogRegistrationFailureGuard;
 
 #[cfg(test)]
 impl CatalogRegistrationFailureGuard {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     fn install(message: impl Into<String>) -> Self {
         CATALOG_REGISTRATION_FAILURE.with(|slot| {
             assert!(
@@ -5030,10 +5024,18 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 struct AfterCreateTargetHookGuard;
 
 #[cfg(test)]
 impl AfterCreateTargetHookGuard {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     fn install(hook: Arc<dyn Fn() + Send + Sync>) -> Self {
         AFTER_CREATE_TARGET_HOOK.with(|slot| {
             assert!(
@@ -5063,15 +5065,27 @@ fn run_after_create_target_hook() {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 type AfterObserveBeforeCaptureHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 struct AfterObserveBeforeCaptureHookRegistration {
     owner: std::thread::ThreadId,
     hook: AfterObserveBeforeCaptureHook,
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn after_observe_before_capture_hook_slot()
 -> &'static std::sync::Mutex<Option<AfterObserveBeforeCaptureHookRegistration>> {
     static HOOK: std::sync::OnceLock<
@@ -5081,6 +5095,10 @@ fn after_observe_before_capture_hook_slot()
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn invoke_after_observe_before_capture_hook() {
     let current_thread = std::thread::current().id();
     let hook = after_observe_before_capture_hook_slot()
@@ -5096,12 +5114,20 @@ fn invoke_after_observe_before_capture_hook() {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 struct AfterObserveBeforeCaptureHookGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 #[cfg(test)]
 impl AfterObserveBeforeCaptureHookGuard {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     fn install(hook: AfterObserveBeforeCaptureHook) -> Self {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         let lock = LOCK
@@ -5128,6 +5154,10 @@ impl Drop for AfterObserveBeforeCaptureHookGuard {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn optional_snapshot_map(pin: &RefreshSnapshotPin) -> BTreeMap<String, Option<i64>> {
     pin.to_snapshot_map()
         .into_iter()
@@ -5135,6 +5165,10 @@ fn optional_snapshot_map(pin: &RefreshSnapshotPin) -> BTreeMap<String, Option<i6
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn validate_refresh_pin_table_object_ids_against_baseline(
     baseline: &RefreshStateBaseline,
     pin: &RefreshSnapshotPin,
@@ -5239,6 +5273,10 @@ pub fn join_base_refs_for_schema_contract<'a>(
     Ok((left, right))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn rewrite_snapshot_table_factor(
     factor: &mut sqlparser::ast::TableFactor,
     base: &TableIdentity,
@@ -5288,6 +5326,10 @@ fn rewrite_snapshot_table_factor(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn object_name_matches_base(
     name: &sqlparser::ast::ObjectName,
     base: &TableIdentity,
@@ -5308,6 +5350,10 @@ fn object_name_matches_base(
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn object_name_identifier_parts(name: &sqlparser::ast::ObjectName) -> Vec<String> {
     name.0
         .iter()
@@ -5318,10 +5364,18 @@ fn object_name_identifier_parts(name: &sqlparser::ast::ObjectName) -> Vec<String
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn synthetic_snapshot_table_name(base: &TableIdentity, snapshot_id: i64) -> String {
     format!("{}__at_{}", base.table, snapshot_id)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn synthetic_snapshot_object_name(
     base: &TableIdentity,
     snapshot_id: i64,
@@ -5334,6 +5388,10 @@ fn synthetic_snapshot_object_name(
     ])
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn refresh_explain_rewrite_disabled_rules(
     is_aggregate_refresh: bool,
     optimizer_settings: &novarocks_sql::compiler::SessionOptimizerSettings,
@@ -5662,6 +5720,10 @@ mod join_delta_append_only_fast_path_tests {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn normalize_join_branch_snapshot_tables(
     query: &mut sqlparser::ast::Query,
     branch: &crate::mv::domain::iceberg_join_branch::JoinDeltaBranchPlan,
@@ -5686,6 +5748,10 @@ fn normalize_join_branch_snapshot_tables(
 }
 
 #[derive(Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 struct RewriteMergeRefreshOptions {
     apply_key: ApplyKeyContract,
 }

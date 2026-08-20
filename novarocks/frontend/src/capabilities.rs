@@ -216,6 +216,10 @@ pub struct CatalogCommandPorts {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     mv_repository: Arc<dyn MvRepository>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    #[allow(
+        dead_code,
+        reason = "The frozen catalog-command port keeps the view-service dependency explicit."
+    )]
     view_service: Arc<dyn ViewService>,
 }
 
@@ -383,6 +387,10 @@ pub struct MvCommandPorts {
     create_application: Arc<dyn MvApplicationService>,
     refresh_service: Arc<FrontendMvService>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
+    #[allow(
+        dead_code,
+        reason = "The frozen MV-command port keeps query execution available for the boundary."
+    )]
     query_execution: QueryExecutionService,
 }
 

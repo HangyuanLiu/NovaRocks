@@ -37,6 +37,10 @@ pub(crate) enum MvBackgroundEngineErrorKind {
     RecoveryRequired,
     Corruption,
     InvariantViolation,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     ShutdownCancelled,
 }
 

@@ -629,6 +629,10 @@ pub(crate) enum Operator {
     LogicalGenerateSeries(GenerateSeriesOp),
     LogicalTableFunction(TableFunctionOp),
     LogicalRepeat(RepeatOp),
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     LogicalChangeEventExpand(ChangeEventExpandOp),
     LogicalCTEAnchor(CTEAnchorOp),
     LogicalCTEProduce(CTEProduceOp),

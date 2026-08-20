@@ -173,7 +173,7 @@ pub(super) fn adapt_plan_output_with_qualifier(
 
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Project(PlanProjectNode {
-            items: items,
+            items,
             output_qualifier: output_qualifier.map(str::to_string),
         }),
         vec![input],

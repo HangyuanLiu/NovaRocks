@@ -194,6 +194,10 @@ pub(crate) struct BackendNativeRuntimeFilterEnvelope {
     payload: Arc<[u8]>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 impl BackendNativeRuntimeFilterEnvelope {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -401,6 +405,10 @@ pub(crate) fn decode_runtime_filter_envelope_response(
     Ok((identity, status))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The native transport adapter returns tonic status directly."
+)]
 pub(crate) fn handle_runtime_filter_envelope(
     ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
     request: proto::filter::RuntimeFilterEnvelope,
@@ -462,7 +470,7 @@ pub(crate) fn handle_runtime_filter_envelope(
     )
     .map_err(transport_error)?;
 
-    let acked_route_identity = Some(route_identity.clone());
+    let acked_route_identity = Some(route_identity);
     let result = ingress.accept(envelope);
     if drop_accepted_contribution_response(&result, kind, query_id, deployment_epoch)? {
         return Err(tonic::Status::deadline_exceeded(
@@ -499,6 +507,10 @@ pub(crate) fn handle_runtime_filter_envelope(
 /// returned, so the exact retry reaches the ordinary domain dedupe owner and
 /// receives its Duplicate acknowledgement.
 #[cfg(debug_assertions)]
+#[expect(
+    clippy::result_large_err,
+    reason = "The native transport adapter returns tonic status directly."
+)]
 fn drop_accepted_contribution_response(
     result: &BackendIngressResult,
     kind: BackendEnvelopeKind,
@@ -523,6 +535,10 @@ fn drop_accepted_contribution_response(
 }
 
 #[cfg(debug_assertions)]
+#[expect(
+    clippy::result_large_err,
+    reason = "The native transport adapter returns tonic status directly."
+)]
 fn runtime_filter_fault_execution_id(
     query_id: UniqueId,
     deployment_epoch: u64,
@@ -552,6 +568,10 @@ fn drop_accepted_contribution_response(
     Ok(false)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The native transport adapter returns tonic status directly."
+)]
 fn decode_kind(
     kind: i32,
 ) -> Result<crate::runtime_filter::domain::BackendEnvelopeKind, tonic::Status> {
@@ -659,6 +679,10 @@ fn encode_route_identity(
     proto::filter::RuntimeFilterRouteIdentity { value: Some(value) }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The native transport adapter returns tonic status directly."
+)]
 fn decode_route_identity(
     route_identity: &proto::filter::RuntimeFilterRouteIdentity,
 ) -> Result<BackendNativeRouteIdentity, tonic::Status> {
@@ -1239,7 +1263,7 @@ mod tests {
             let ingress = Arc::new(RecordingIngress::new(result));
             let request =
                 valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
-            let expected_route = request.route_identity.clone();
+            let expected_route = request.route_identity;
             let response = handle_runtime_filter_envelope(ingress.clone(), request).unwrap();
 
             assert_eq!(response.accept_status, expected_status as i32);

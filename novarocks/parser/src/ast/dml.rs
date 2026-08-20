@@ -192,21 +192,21 @@ pub(crate) fn write_sql(statement: &DmlStatement, output: &mut String) {
             }
             name(&v.target, output);
             ident_list(&v.columns, output);
-            if let Some(p) = &v.partitions {
-                if !p.dynamic {
-                    output.push_str(" PARTITIONS (");
-                    for (i, e) in p.entries.iter().enumerate() {
-                        if i > 0 {
-                            output.push_str(", ");
-                        }
-                        ident(&e.name, output);
-                        if let Some(v) = &e.value {
-                            output.push_str(" = ");
-                            output.push_str(&crate::printer::print_expr(v));
-                        }
+            if let Some(p) = &v.partitions
+                && !p.dynamic
+            {
+                output.push_str(" PARTITIONS (");
+                for (i, e) in p.entries.iter().enumerate() {
+                    if i > 0 {
+                        output.push_str(", ");
                     }
-                    output.push(')');
+                    ident(&e.name, output);
+                    if let Some(v) = &e.value {
+                        output.push_str(" = ");
+                        output.push_str(&crate::printer::print_expr(v));
+                    }
                 }
+                output.push(')');
             }
             output.push(' ');
             output.push_str(&v.source.text);

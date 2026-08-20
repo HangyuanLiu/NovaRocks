@@ -142,10 +142,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
         .range
         .as_ref()
         .and_then(|range| range.kind.as_ref())
-        .expect("scan range kind")
-    else {
-        panic!("expected native file scan range");
-    };
+        .expect("scan range kind");
     assert_eq!(file.file_format, "PARQUET");
     assert_eq!(file.full_path.as_deref(), Some("s3://bucket/data.parquet"));
     assert_eq!(file.included_positions, vec![3, 5, 8]);
@@ -165,7 +162,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     assert_eq!(pruning.max_int_value, Some(20));
     let opts = encoded.query_options.as_ref().expect("query options");
     assert_eq!(opts, &instance::encode_query_options(&query_options));
-    novarocks_protocol::lifecycle::QueryOptions::parse(opts.clone())
+    novarocks_protocol::lifecycle::QueryOptions::parse(*opts)
         .expect("frontend query-options projection satisfies the Protocol contract");
     assert_eq!(opts.batch_size, 4096);
     assert_eq!(opts.query_timeout, 60);

@@ -21,6 +21,10 @@ pub(crate) struct QueryLifecycleTransportError {
     kind: QueryLifecycleTransportErrorKind,
     detail: String,
 }
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 impl QueryLifecycleTransportError {
     pub(crate) fn new(kind: QueryLifecycleTransportErrorKind, detail: impl Into<String>) -> Self {
         Self {

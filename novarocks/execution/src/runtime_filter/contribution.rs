@@ -219,7 +219,7 @@ impl MembershipValues {
             Self::Utf8(_) => DataType::Utf8,
             Self::Date32(_) => DataType::Date32,
             Self::Timestamp { unit, timezone, .. } => {
-                DataType::Timestamp(unit.clone(), timezone.clone().map(Into::into))
+                DataType::Timestamp(*unit, timezone.clone().map(Into::into))
             }
             Self::Decimal128 {
                 precision, scale, ..
@@ -1202,7 +1202,7 @@ fn decode_membership(
                 return Err(ContributionCodecError::SchemaMismatch);
             }
             MembershipValues::Timestamp {
-                unit: unit.clone(),
+                unit: *unit,
                 timezone: actual_timezone,
                 values: read_set_count(&mut r, |r| r.i64())?,
             }
@@ -1537,7 +1537,7 @@ fn value_domain_from_array(
             }
             ValueDomainDelta::new(
                 MembershipValues::timestamp(
-                    unit.clone(),
+                    *unit,
                     timezone.as_ref().map(|value| value.as_ref()),
                     values,
                 ),

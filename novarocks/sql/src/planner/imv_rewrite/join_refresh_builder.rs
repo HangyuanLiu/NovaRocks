@@ -33,11 +33,14 @@ use crate::planner::logical::{
 use crate::planner::payload::{AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode};
 use crate::planner::table::{
     ScanSource, SqlMvTargetLocatorScan, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
-    sql_mv_target_locator_scan,
 };
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::ConnectorTableObjectId;
 
+#[allow(
+    dead_code,
+    reason = "Retained for IMV join-refresh rule variants enabled by other targets."
+)]
 pub(crate) fn build_join_apply_key_project(
     input: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
@@ -57,6 +60,10 @@ pub(crate) fn build_join_apply_key_project(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for IMV constant-insert refresh variants enabled by other targets."
+)]
 pub(crate) fn build_join_apply_key_project_with_constant_insert_action(
     input: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
@@ -131,6 +138,10 @@ pub(crate) fn build_join_apply_key_append_project(
     ))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained as the shared implementation for feature-gated join refresh projections."
+)]
 fn build_join_apply_key_project_with_action(
     input: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
@@ -172,6 +183,10 @@ fn build_join_apply_key_project_with_action(
 }
 
 #[derive(Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "Both action projection modes remain part of the join-refresh construction contract."
+)]
 enum JoinApplyActionProjection {
     InputColumn,
     ConstantInsert,
@@ -196,6 +211,10 @@ impl JoinRefreshTargetLocatorBinding {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The coalesce builder receives separately validated descriptor, locator, and output-identity facts."
+)]
 pub(crate) fn build_join_delta_coalesce_plan_with_locator(
     branch_union: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
@@ -320,7 +339,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         ColumnId(locator_file_column_id),
         ColumnId(locator_pos_column_id),
     );
-    Ok(build_final_coalesce_project(
+    build_final_coalesce_project(
         locator_checked,
         desc,
         &payload_mappings,
@@ -331,7 +350,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         ColumnId(locator_pos_column_id),
         ColumnId(locator_row_id_column_id),
         ColumnId(locator_last_updated_seq_column_id),
-    )?)
+    )
 }
 
 fn build_payload_coalesce_aggregate(
@@ -544,6 +563,10 @@ fn pending_count_expr(net_column: &OutputColumn, op: BinOp) -> TypedExpr {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The join shell preserves independently typed locator and output identity facts for validation."
+)]
 fn build_locator_join_shell(
     left: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
@@ -594,6 +617,10 @@ fn build_locator_join_shell(
     ))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Locator scan construction keeps each bound target-column identity explicit for planner validation."
+)]
 fn build_target_locator_scan(
     desc: &JoinRefreshDescriptor,
     locator: &JoinRefreshTargetLocatorBinding,
@@ -750,6 +777,10 @@ fn build_locator_assert_filter(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Final projection construction retains independently checked payload and locator identities."
+)]
 fn build_final_coalesce_project(
     input: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
@@ -1019,6 +1050,10 @@ fn locator_column_ref(column_id: ColumnId, name: &str, data_type: DataType) -> T
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for join-refresh output identity validation in feature-gated rule paths."
+)]
 fn validate_apply_key_project_output_ids(
     desc: &JoinRefreshDescriptor,
     apply_key_column_id: u32,

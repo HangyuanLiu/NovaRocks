@@ -134,6 +134,10 @@ impl StateStoreOperationJournal {
         })
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn blocking<T>(
         &self,
         future: impl Future<Output = Result<T, DmlError>>,
@@ -1430,6 +1434,10 @@ impl StateStoreOperationJournal {
     }
 
     // Design: ADR-0054 (docs/adr/ADR-0054-frontend-dml-operation-authority-boundary.md)
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The durable mutation boundary must carry each independently validated authority and retry fact."
+    )]
     async fn mutate_operation_authorized_async(
         &self,
         operation_id: DmlOperationId,
@@ -2395,6 +2403,10 @@ impl OperationJournal for StateStoreOperationJournal {
 }
 
 impl StateStoreOperationJournal {
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn preflight_add_files_mutation_shape(
         &self,
         request: &AddFilesMutationRequest,
@@ -2464,6 +2476,10 @@ impl DmlSideRecord {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn key(&self, operation_id: DmlOperationId) -> Result<Key, DmlError> {
         match self {
             Self::ExternalFence(_) => external_fence_key(operation_id),
@@ -2476,6 +2492,10 @@ impl DmlSideRecord {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn decode(&self, key: &Key, value: Value) -> Result<Self, DmlError> {
         match self {
             Self::ExternalFence(_) => decode_external_fence(key, value)
@@ -2494,6 +2514,10 @@ impl DmlSideRecord {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn encode(&self, max_value_bytes: usize) -> Result<Value, DmlError> {
         let encoded = match self {
             Self::ExternalFence(record) => serde_json::to_vec(record.as_ref()),
@@ -2513,6 +2537,10 @@ impl DmlSideRecord {
         Value::try_from(Bytes::from(encoded)).map_err(DmlError::journal_unavailable)
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn validate_against(
         &self,
         operation: &StoredOperation,
@@ -2662,6 +2690,10 @@ impl DmlSideRecord {
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_ctas_recovery_against_saga(
     recovery: &DmlCtasRecoveryRecord,
     saga: &CtasSagaRecord,
@@ -2750,26 +2782,50 @@ fn validate_ctas_recovery_against_saga(
     Ok(())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn external_fence_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
     key_for(EXTERNAL_FENCE_PREFIX, operation_id)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn historical_write_recovery_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
     key_for(HISTORICAL_WRITE_RECOVERY_PREFIX, operation_id)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn direct_mutation_fence_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
     key_for(DIRECT_MUTATION_FENCE_PREFIX, operation_id)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn historical_data_mutation_recovery_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
     key_for(HISTORICAL_DATA_MUTATION_RECOVERY_PREFIX, operation_id)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn ctas_recovery_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
     key_for(CTAS_RECOVERY_PREFIX, operation_id)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn decode_external_fence(
     key: &Key,
     value: Value,
@@ -2781,6 +2837,10 @@ fn decode_external_fence(
     Ok(record)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn decode_historical_write_recovery(
     key: &Key,
     value: Value,
@@ -2792,6 +2852,10 @@ fn decode_historical_write_recovery(
     Ok(record)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn decode_direct_mutation_fence(
     key: &Key,
     value: Value,
@@ -2803,6 +2867,10 @@ fn decode_direct_mutation_fence(
     Ok(record)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn decode_historical_data_mutation_recovery(
     key: &Key,
     value: Value,
@@ -2814,6 +2882,10 @@ fn decode_historical_data_mutation_recovery(
     Ok(record)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn decode_ctas_recovery(key: &Key, value: Value) -> Result<DmlCtasRecoveryRecord, DmlError> {
     decode_key(CTAS_RECOVERY_PREFIX, key)?;
     let record: DmlCtasRecoveryRecord =
@@ -2881,6 +2953,10 @@ async fn load_ctas_recovery_in(
 /// obligation. Both arguments are the records that will be durable after this
 /// mutation, so a mutation that resolves a recovery may release the scan in the
 /// same transaction.
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_historical_retention(
     operation_id: DmlOperationId,
     historical: Option<&DmlHistoricalWriteRecoveryRecord>,
@@ -2923,6 +2999,10 @@ fn validate_historical_retention(
 /// `validate_operation` can only prove the "an obligation always keeps a due"
 /// half, because a decoded operation cannot see its side records. This is the
 /// mutation-time check that also proves the converse.
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_recovery_due_scope(
     operation: &StoredOperation,
     historical: Option<&DmlHistoricalWriteRecoveryRecord>,
@@ -2944,6 +3024,10 @@ fn validate_recovery_due_scope(
     Ok(())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_persisted_authority(
     operation: &StoredOperation,
     authority: &DmlMutationAuthority,
@@ -2963,6 +3047,10 @@ fn validate_persisted_authority(
     Ok(())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_coordination_provenance(
     provenance: &crate::dml::model::DmlCoordinationProvenance,
 ) -> Result<(), DmlError> {
@@ -3156,10 +3244,18 @@ async fn update_recovery_due_index(
     Ok(())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn operation_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
     key_for(OPERATION_PREFIX, operation_id)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn unfinished_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
     key_for(UNFINISHED_PREFIX, operation_id)
 }
@@ -3168,6 +3264,10 @@ fn recovery_due_shard(operation_id: DmlOperationId) -> u8 {
     Sha256::digest(operation_id.as_uuid().as_bytes())[0] & (DML_RECOVERY_SHARD_COUNT - 1)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn recovery_due_shard_prefix(shard: u8) -> Result<Key, DmlError> {
     if shard >= DML_RECOVERY_SHARD_COUNT {
         return Err(DmlError::journal_corruption(
@@ -3180,6 +3280,10 @@ fn recovery_due_shard_prefix(shard: u8) -> Result<Key, DmlError> {
     Key::try_from(Bytes::from(key)).map_err(DmlError::journal_corruption)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn recovery_due_key(
     operation_id: DmlOperationId,
     recovery_due_at_ms: i64,
@@ -3192,6 +3296,10 @@ fn recovery_due_key(
     Key::try_from(Bytes::from(key)).map_err(DmlError::journal_corruption)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn decode_recovery_due_key(key: &Key) -> Result<(u8, i64, DmlOperationId), DmlError> {
     let suffix = key
         .as_bytes()
@@ -3231,6 +3339,10 @@ fn decode_recovery_due_key(key: &Key) -> Result<(u8, i64, DmlOperationId), DmlEr
     Ok((shard, recovery_due_at_ms, operation_id))
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn recovery_due_record(operation: &StoredOperation) -> Result<StoredRecoveryDueV1, DmlError> {
     let recovery_due_at_ms = operation.recovery_due_at_ms.ok_or_else(|| {
         DmlError::journal_corruption("DML operation has no recovery due timestamp")
@@ -3248,12 +3360,20 @@ fn recovery_due_record(operation: &StoredOperation) -> Result<StoredRecoveryDueV
     })
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn encode_recovery_due(operation: &StoredOperation) -> Result<Value, DmlError> {
     let bytes = serde_json::to_vec(&recovery_due_record(operation)?)
         .map_err(DmlError::journal_corruption)?;
     Value::try_from(Bytes::from(bytes)).map_err(DmlError::journal_unavailable)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn decode_recovery_due(key: &Key, value: Value) -> Result<StoredRecoveryDueV1, DmlError> {
     let (_, due_at_ms, operation_id) = decode_recovery_due_key(key)?;
     let indexed: StoredRecoveryDueV1 =
@@ -3279,6 +3399,10 @@ fn is_uuid_v7(value: Uuid) -> bool {
         && value.get_variant() == uuid::Variant::RFC4122
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_recovery_due_identity(
     operation: &StoredOperation,
     indexed: &StoredRecoveryDueV1,
@@ -3293,6 +3417,10 @@ fn validate_recovery_due_identity(
     Ok(())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_recovery_due_record(
     operation: &StoredOperation,
     indexed: StateRecord,
@@ -3301,6 +3429,10 @@ fn validate_recovery_due_record(
     validate_recovery_due_identity(operation, &due)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn add_files_artifact_chunk_key(
     operation_id: DmlOperationId,
     artifact: &AddFilesArtifactDescriptor,
@@ -3321,6 +3453,10 @@ fn add_files_artifact_chunk_key(
     Key::try_from(Bytes::from(key)).map_err(DmlError::journal_corruption)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn add_files_source_scope_key(provider_id: &str, scope_digest: &str) -> Result<Key, DmlError> {
     if provider_id.is_empty() || !is_sha256(Some(scope_digest)) {
         return Err(DmlError::journal_corruption(
@@ -3334,6 +3470,10 @@ fn add_files_source_scope_key(provider_id: &str, scope_digest: &str) -> Result<K
     Key::try_from(Bytes::from(key)).map_err(DmlError::journal_corruption)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn encode_add_files_source_scope(
     value: &StoredAddFilesSourceScopeV1,
     max_value_bytes: usize,
@@ -3347,6 +3487,10 @@ fn encode_add_files_source_scope(
     Value::try_from(Bytes::from(encoded)).map_err(DmlError::journal_unavailable)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn decode_add_files_source_scope(
     key: &Key,
     value: Value,
@@ -3364,6 +3508,10 @@ fn decode_add_files_source_scope(
     Ok(record)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_add_files_artifact_bytes(artifact: &AddFilesArtifact) -> Result<(), DmlError> {
     validate_add_files_artifact(&artifact.descriptor)?;
     if artifact.bytes.len() != artifact.descriptor.total_length as usize
@@ -3388,6 +3536,10 @@ fn validate_add_files_artifact_bytes(artifact: &AddFilesArtifact) -> Result<(), 
     Ok(())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn source_scope_record_from_operation(
     operation: &StoredOperation,
     provider_id: String,
@@ -3418,6 +3570,10 @@ fn source_scope_record_from_operation(
     })
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn key_for(prefix: &[u8], operation_id: DmlOperationId) -> Result<Key, DmlError> {
     let mut key = Vec::with_capacity(prefix.len() + 32);
     key.extend_from_slice(prefix);
@@ -3425,6 +3581,10 @@ fn key_for(prefix: &[u8], operation_id: DmlOperationId) -> Result<Key, DmlError>
     Key::try_from(Bytes::from(key)).map_err(DmlError::journal_corruption)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn decode_key(prefix: &[u8], key: &Key) -> Result<DmlOperationId, DmlError> {
     let suffix = key
         .as_bytes()
@@ -3448,6 +3608,10 @@ fn decode_key(prefix: &[u8], key: &Key) -> Result<DmlOperationId, DmlError> {
     Ok(operation_id)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn encode_operation(operation: &StoredOperation) -> Result<Value, DmlError> {
     if operation.schema_version != DML_OPERATION_SCHEMA_VERSION {
         return Err(DmlError::journal_corruption(format!(
@@ -3460,6 +3624,10 @@ fn encode_operation(operation: &StoredOperation) -> Result<Value, DmlError> {
     Value::try_from(Bytes::from(bytes)).map_err(DmlError::journal_unavailable)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn encode_operation_with_limit(
     operation: &StoredOperation,
     max_value_bytes: usize,
@@ -3475,6 +3643,10 @@ fn encode_operation_with_limit(
     Ok(value)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn decode_operation(key: Key, value: Value) -> Result<StoredOperation, DmlError> {
     let key_id = decode_key(OPERATION_PREFIX, &key)?;
     let operation: StoredOperation =
@@ -3489,6 +3661,10 @@ fn decode_operation(key: Key, value: Value) -> Result<StoredOperation, DmlError>
     Ok(operation)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn encode_unfinished(operation_id: DmlOperationId) -> Result<Value, DmlError> {
     let record = StoredUnfinishedOperationV1 {
         schema_version: DML_UNFINISHED_SCHEMA_VERSION,
@@ -3498,6 +3674,10 @@ fn encode_unfinished(operation_id: DmlOperationId) -> Result<Value, DmlError> {
     Value::try_from(Bytes::from(bytes)).map_err(DmlError::journal_unavailable)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn decode_unfinished(key: Key, value: Value) -> Result<DmlOperationId, DmlError> {
     let key_id = decode_key(UNFINISHED_PREFIX, &key)?;
     let record: StoredUnfinishedOperationV1 =
@@ -3517,6 +3697,10 @@ fn decode_unfinished(key: Key, value: Value) -> Result<DmlOperationId, DmlError>
     Ok(record.operation_id)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_operation(operation: &StoredOperation) -> Result<(), DmlError> {
     if operation.schema_version != DML_OPERATION_SCHEMA_VERSION {
         return Err(DmlError::journal_corruption(format!(
@@ -3579,6 +3763,10 @@ fn validate_operation(operation: &StoredOperation) -> Result<(), DmlError> {
     Ok(())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_payload_shape(operation: &StoredOperation) -> Result<(), DmlError> {
     match (&operation.operation_kind, &operation.payload) {
         (
@@ -3623,6 +3811,10 @@ fn validate_payload_shape(operation: &StoredOperation) -> Result<(), DmlError> {
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_add_files_record(record: &AddFilesLifecycleRecord) -> Result<(), DmlError> {
     if record.connector_operation_id.is_nil() || record.source_location.is_empty() {
         return Err(DmlError::journal_corruption(
@@ -3714,6 +3906,10 @@ fn validate_add_files_record(record: &AddFilesLifecycleRecord) -> Result<(), Dml
     Ok(())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_add_files_artifact(artifact: &AddFilesArtifactDescriptor) -> Result<(), DmlError> {
     if artifact.codec_version == 0
         || artifact.total_length == 0
@@ -3733,6 +3929,10 @@ fn is_sha256(value: Option<&str>) -> bool {
     })
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_ctas_record(record: &CtasSagaRecord) -> Result<(), DmlError> {
     let child_ids = [
         record.prepare_operation_id,
@@ -3899,6 +4099,10 @@ fn validate_ctas_record(record: &CtasSagaRecord) -> Result<(), DmlError> {
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn require_ctas_outcome(
     label: &str,
     fact: Option<&DurableExternalFact>,
@@ -3913,6 +4117,10 @@ fn require_ctas_outcome(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_ctas_external_fact_shape(
     label: &str,
     fact: &DurableExternalFact,
@@ -3965,6 +4173,10 @@ fn validate_ctas_external_fact_shape(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_exact_connector_owner(
     provider_id: Option<&str>,
     instance_id: Option<&str>,
@@ -3999,6 +4211,10 @@ fn validate_exact_connector_owner(
     Ok(())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_external_fact(fact: Option<&DurableExternalFact>) -> Result<(), DmlError> {
     let Some(fact) = fact else {
         return Ok(());
@@ -4021,6 +4237,10 @@ fn validate_external_fact(fact: Option<&DurableExternalFact>) -> Result<(), DmlE
     Ok(())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_fact_shape(operation: &StoredOperation) -> Result<(), DmlError> {
     let OperationPayload::ConnectorWriteLifecycle(record) = &operation.payload else {
         return Ok(());
@@ -4065,6 +4285,10 @@ fn validate_fact_shape(operation: &StoredOperation) -> Result<(), DmlError> {
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn validate_connector_write_lifecycle(
     record: &ConnectorWriteLifecycleRecord,
 ) -> Result<(), DmlError> {

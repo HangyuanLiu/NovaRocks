@@ -160,6 +160,10 @@ pub struct RequestContext {
     execution: QueryExecutionContext,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 impl RequestContext {
     pub fn new(session: RequestSessionContext, execution: QueryExecutionContext) -> Self {
         Self { session, execution }

@@ -298,6 +298,10 @@ impl FrontendExecutionConfig {
         self
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for frontend application-builder coverage that injects projection timing."
+    )]
     pub(crate) fn with_catalog_projection_config(
         mut self,
         config: CatalogProjectionConfig,
@@ -921,6 +925,10 @@ impl FrontendApplicationHost {
     }
 
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "Retained as the integration-test entry point for the frontend coordinator."
+    )]
     pub(crate) fn execute_distributed_query_for_test(
         &self,
         request: crate::query_execution::contract::DistributedQueryRequest,

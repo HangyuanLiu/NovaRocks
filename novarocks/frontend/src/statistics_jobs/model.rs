@@ -240,7 +240,7 @@ impl From<&StoredStatisticsJobV3> for StatisticsJob {
 
 #[cfg(test)]
 mod durable_record_budget_tests {
-    use novarocks_spi::state_store::{MAX_VALUE_BYTES, StateStoreLimits};
+    use novarocks_spi::state_store::StateStoreLimits;
 
     use super::*;
     use crate::durable::DurableRecordStore;
@@ -298,7 +298,6 @@ mod durable_record_budget_tests {
             .expect("maximal bounded statistics record must fit");
         let actual_bytes = encoded.as_bytes().len();
         assert!(actual_bytes <= STATISTICS_JOB_RECORD_ENCODED_LIMIT);
-        assert!(STATISTICS_JOB_RECORD_ENCODED_LIMIT <= MAX_VALUE_BYTES);
 
         let same_target = StoredStatisticsJobV3 {
             job_id: Uuid::new_v4(),
@@ -316,8 +315,10 @@ mod durable_record_budget_tests {
 
         // This encoder has no StateStore handle: rejection proves the error
         // is raised before a transaction, job value, or index can be written.
-        let mut restricted = StateStoreLimits::default();
-        restricted.max_value_bytes = actual_bytes - 1;
+        let restricted = StateStoreLimits {
+            max_value_bytes: actual_bytes - 1,
+            ..StateStoreLimits::default()
+        };
         let error = DurableRecordStore::with_limits(restricted)
             .encode(&record)
             .expect_err("restricted record budget must reject before writing");

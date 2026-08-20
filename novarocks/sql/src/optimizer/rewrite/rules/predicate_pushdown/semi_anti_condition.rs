@@ -183,7 +183,7 @@ mod tests {
     use crate::optimizer::rewrite::context::RewriteContext;
     use crate::optimizer::rewrite::tree_binder::bind_tree;
     use crate::optimizer::scalar::ScalarArena;
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use novarocks_catalog::schema::ColumnDef;
 
     use crate::planner::optimizer_bridge::scalar::intern_typed;
@@ -273,7 +273,7 @@ mod tests {
         }
     }
 
-    fn make_scan(arena: &mut ScalarArena, table_name: &str, cols: &[&str]) -> OptExpr {
+    fn make_scan(_arena: &mut ScalarArena, table_name: &str, cols: &[&str]) -> OptExpr {
         let table = TableDef {
             name: table_name.into(),
             columns: cols

@@ -123,6 +123,10 @@ pub(crate) fn external_table_object_ref(
 
 /// Build a legacy native StarRocks identity while reading persisted state.
 /// New connector-backed tables must use `external_table_object_ref`.
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn starrocks_table_object_ref(database: &str, table: &str) -> MvDependencyObjectRef {
     MvDependencyObjectRef {
         catalog: None,

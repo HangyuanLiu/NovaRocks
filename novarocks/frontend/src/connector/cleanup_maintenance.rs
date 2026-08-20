@@ -39,6 +39,10 @@ use novarocks_spi::connector::{
 /// The durable frontend owner needs to distinguish an invalid pre-dispatch
 /// request from an execute response that may have reached the provider.
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The typed frontend protocol model intentionally keeps payloads inline."
+)]
 pub enum CleanupBatchExecution {
     Receipt(BatchReceipt),
     /// The prepared batch was dispatched, but a receipt is unavailable. The

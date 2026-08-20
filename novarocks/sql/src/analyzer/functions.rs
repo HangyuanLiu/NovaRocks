@@ -747,6 +747,10 @@ fn is_state_combinator_aggregate_function(name: &str) -> bool {
 // Scalar function return type inference
 // ---------------------------------------------------------------------------
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> DataType {
     infer_scalar_return_type_with_catalog(
         crate::functions::builtin_sql_function_catalog(),

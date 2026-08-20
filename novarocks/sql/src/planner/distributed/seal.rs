@@ -82,6 +82,10 @@ impl DistributedPlan {
     /// The immutable SQL planning facts sealed with this distributed plan.
     /// Preparation retains a clone of this handle rather than a reconstructed
     /// runtime-filter graph.
+    #[allow(
+        dead_code,
+        reason = "The sealed runtime-filter projection is retained for lifecycle integration targets."
+    )]
     pub(crate) fn sealed_runtime_filter_plan(&self) -> &SealedRuntimeFilterPlan {
         &self.data.runtime_filter_plan
     }
@@ -96,6 +100,10 @@ impl DistributedPlan {
         self.data.runtime_filter_plan.join_progress()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Activation decisions remain available to distributed lifecycle integration targets."
+    )]
     pub(in crate::planner::distributed) fn activation_decisions(
         &self,
     ) -> &crate::planner::runtime_filter::activation::ActivationDecisionCatalog {
@@ -872,6 +880,10 @@ mod tests {
         );
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for sealed runtime-filter catalog regression coverage."
+    )]
     fn seal_catalog_covers_each_consumer_in_binding_id_order() {
         let mut draft = super::test_support::single_fragment_draft(Some(0));
         draft.runtime_filter_graph = valid_non_empty_graph();

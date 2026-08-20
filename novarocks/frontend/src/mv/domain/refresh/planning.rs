@@ -68,15 +68,19 @@ pub enum RefreshStateBaseline {
 pub struct RefreshPlanContract {
     pub mv_id: Option<i64>,
     pub target: MvTarget,
-    pub storage_engine: MvStorageEngine,
+    pub(crate) storage_engine: MvStorageEngine,
     pub decision: ExecutableRefreshDecision,
     pub state_baseline: RefreshStateBaseline,
     pub base_refs: Vec<TableIdentity>,
     pub snapshot_pins: BTreeMap<String, Option<i64>>,
-    pub affected_partitions: AffectedTargetPartitions,
+    pub(crate) affected_partitions: AffectedTargetPartitions,
 }
 
 impl RefreshPlanContract {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn mode(&self) -> RefreshMode {
         self.decision.mode()
     }

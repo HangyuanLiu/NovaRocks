@@ -181,10 +181,8 @@ impl ConnectorReaderGroup {
                     }
                     None => Ok(()),
                 });
-            if was_closed {
-                if let Some(marker) = registered.marker.as_ref() {
-                    marker.emit("CLOSE");
-                }
+            if was_closed && let Some(marker) = registered.marker.as_ref() {
+                marker.emit("CLOSE");
             }
             if let Err(error) = result {
                 cleanup_errors.push(error);
@@ -261,10 +259,8 @@ impl ConnectorBatchReader for GroupedConnectorBatchReader {
             })
             .transpose();
         self.unregister();
-        if was_closed {
-            if let Some(marker) = self.marker.as_ref() {
-                marker.emit("CLOSE");
-            }
+        if was_closed && let Some(marker) = self.marker.as_ref() {
+            marker.emit("CLOSE");
         }
         result.map(|_| ())
     }
@@ -340,6 +336,10 @@ mod connector_reader_group_tests {
 /// source has already been scheduled. The generic runtime never decodes the
 /// range or split payload.
 #[derive(Clone)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(crate) enum ConnectorSplitAppend {
     Plain {
         splits: Vec<ConnectorSplit>,
@@ -363,6 +363,10 @@ pub struct ConnectorScheduledUnit {
     storage_tablet_id: Option<i64>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 impl ConnectorScheduledUnit {
     fn plain(unit: ConnectorPreparedScanUnit) -> Self {
         Self {
@@ -803,6 +807,10 @@ impl ConnectorReadBinding {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 impl ConnectorReadScanSource {
     pub(crate) fn new(
         binding: Arc<ConnectorExecutionBinding>,

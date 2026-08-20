@@ -95,6 +95,10 @@ impl FrontendMvService {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Frontend MV composition keeps independently owned ports explicit at the application boundary."
+    )]
     pub(crate) fn with_refresh_dependencies(
         repository: Arc<dyn MvRepository>,
         query_execution: QueryExecutionService,
@@ -404,6 +408,10 @@ struct FrontendMvBackgroundRuntime {
     stop_tx: mpsc::Sender<()>,
     refresh_worker: Option<thread::JoinHandle<()>>,
     maintenance_stop_tx: mpsc::Sender<()>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     maintenance_wakeup_tx: mpsc::SyncSender<()>,
     maintenance_worker: Option<thread::JoinHandle<()>>,
 }
@@ -580,10 +588,8 @@ fn run_scheduled_refreshes(
                 now_unix_millis(),
             ) {
                 tracing::warn!(mv_id = request.definition.mv_id, error = %error, "persist frontend MV scheduler outcome failed");
-            } else if completed {
-                if let Some(wakeup_tx) = &dependencies.maintenance_wakeup_tx {
-                    let _ = wakeup_tx.try_send(());
-                }
+            } else if completed && let Some(wakeup_tx) = &dependencies.maintenance_wakeup_tx {
+                let _ = wakeup_tx.try_send(());
             }
         }
     });

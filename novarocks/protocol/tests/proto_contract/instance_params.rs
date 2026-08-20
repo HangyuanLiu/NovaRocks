@@ -173,7 +173,6 @@ fn query_options() -> novarocks::QueryOptions {
         enable_file_metacache: true,
         enable_file_pagecache: true,
         enable_parquet_reader_page_index: true,
-        ..Default::default()
     }
 }
 

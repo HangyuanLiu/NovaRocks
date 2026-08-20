@@ -35,17 +35,14 @@ mod transport;
 pub(crate) const MAX_RUNTIME_FILTER_PRODUCER_PARTITIONS_PER_INSTANCE: u32 = 16_384;
 
 pub(crate) use coverage::{
-    BackendCoverage, BackendCoverageError, BackendCoverageProgress, BackendCoverageState,
-    BackendCoverageWitnessId, BackendCoverageWitnessProgress,
+    BackendCoverage, BackendCoverageProgress, BackendCoverageState, BackendCoverageWitnessId,
 };
-pub(crate) use dedupe::{
-    BackendContributionAdmission, BackendDeliveryAdmission, BackendIngressDedupe,
-};
+pub(crate) use dedupe::{BackendDeliveryAdmission, BackendIngressDedupe};
 #[cfg(test)]
 pub(crate) use events::CollectingBackendRuntimeFilterEventObserver;
 pub(crate) use events::{
     BackendRuntimeFilterEvent, BackendRuntimeFilterEventObserver, BackendTransportEventIdentity,
-    BackendTransportEventKind, DiscardBackendRuntimeFilterEventObserver,
+    BackendTransportEventKind,
 };
 pub(crate) use identity::{
     BackendChannelIdentity, BackendConsumerSubscriptionIdentity, BackendParticipantIdentity,
@@ -55,7 +52,7 @@ pub(crate) use install::{BackendInstallPolicy, BackendInstallPolicyError};
 pub(crate) use participant_install::{
     BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall,
     BackendMaterializationOwner, BackendMaterializationPolicy, BackendOutboundMaterializationGroup,
-    BackendParticipantInstall, BackendParticipantInstallError, BackendProducerInstall,
+    BackendParticipantInstall, BackendProducerInstall,
 };
 pub(crate) use reducer::{MembershipReducer, ReducerError};
 pub(crate) use reduction_state::{
@@ -68,23 +65,15 @@ pub(crate) use routing::{
 };
 pub(crate) use session::{
     BackendMaterializedDelivery, BackendMaterializedDeliverySink, BackendRuntimeFilterSession,
-    BackendRuntimeFilterSessionError, BackendRuntimeFilterSessionSubmission,
 };
-pub(crate) use snapshot::{
-    BackendLogicalSnapshot, BackendLogicalSnapshotError, BackendReducedLogicalDomain,
-    BackendReducedLogicalSnapshot,
-};
-pub(crate) use subscription::{
-    BackendBlockingSubscription, BackendLiveSubscription, BackendSubscriptionError,
-    BackendSubscriptionGroup,
-};
+#[cfg(test)]
+pub(crate) use snapshot::BackendLogicalSnapshot;
+pub(crate) use snapshot::{BackendReducedLogicalDomain, BackendReducedLogicalSnapshot};
+pub(crate) use subscription::{BackendSubscriptionError, BackendSubscriptionGroup};
 pub(crate) use transport::{
-    BackendAcceptStatus, BackendAckOutcome, BackendContributionRouteIdentity,
-    BackendDeliveryRouteIdentity, BackendEnvelopeKind, BackendIngressResult,
-    BackendProducerInstanceRouteIdentity, BackendProducerOpenMetadata, BackendReliableTransport,
-    BackendRetryPolicy, BackendRetrySendOutcome, BackendRetryTick, BackendRouteIdentity,
-    BackendRuntimeFilterEnvelope, BackendTransportEnvelope, BackendTransportError,
-    BackendTransportFailOpenReason, BackendTransportResourceLimit,
+    BackendAcceptStatus, BackendContributionRouteIdentity, BackendDeliveryRouteIdentity,
+    BackendEnvelopeKind, BackendIngressResult, BackendProducerOpenMetadata,
+    BackendTransportFailOpenReason,
 };
 
 #[cfg(test)]

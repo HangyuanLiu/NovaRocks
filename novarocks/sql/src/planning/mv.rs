@@ -2026,16 +2026,15 @@ fn classify_join_aggregate_mv_query(
     })
 }
 
+type AggregateSelectOutputs = (
+    Vec<GroupKeyShape>,
+    Vec<AggregateCallShape>,
+    Vec<VisibleAggregateOutput>,
+);
+
 pub fn classify_aggregate_select_outputs(
     select: &sqlparser::ast::Select,
-) -> Result<
-    (
-        Vec<GroupKeyShape>,
-        Vec<AggregateCallShape>,
-        Vec<VisibleAggregateOutput>,
-    ),
-    String,
-> {
+) -> Result<AggregateSelectOutputs, String> {
     let group_by_exprs = aggregate_group_by_exprs(&select.group_by)?;
     for expr in group_by_exprs {
         reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
@@ -2198,15 +2197,19 @@ fn collect_equi_join_keys(
         sqlparser::ast::Expr::Nested(inner) => {
             collect_equi_join_keys(inner, left_alias, right_alias, out)
         }
-        sqlparser::ast::Expr::BinaryOp { left, op, right }
-            if matches!(op, sqlparser::ast::BinaryOperator::And) =>
-        {
+        sqlparser::ast::Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::And,
+            right,
+        } => {
             collect_equi_join_keys(left, left_alias, right_alias, out)?;
             collect_equi_join_keys(right, left_alias, right_alias, out)
         }
-        sqlparser::ast::Expr::BinaryOp { left, op, right }
-            if matches!(op, sqlparser::ast::BinaryOperator::Eq) =>
-        {
+        sqlparser::ast::Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::Eq,
+            right,
+        } => {
             let left_q = qualified_column_alias(left)?;
             let right_q = qualified_column_alias(right)?;
             if left_q.eq_ignore_ascii_case(left_alias) && right_q.eq_ignore_ascii_case(right_alias)
@@ -2439,15 +2442,15 @@ fn classify_aggregate_call(
     }
 
     let function_name = function.name.to_string().to_ascii_lowercase();
-    if function_name == "count" {
-        if let Some(duplicate_treatment) = &args.duplicate_treatment {
-            return match duplicate_treatment {
-                sqlparser::ast::DuplicateTreatment::Distinct => {
-                    classify_count_distinct_from_distinct_syntax(&args.args, output_name)
-                }
-                sqlparser::ast::DuplicateTreatment::All => Err(aggregate_error()),
-            };
-        }
+    if function_name == "count"
+        && let Some(duplicate_treatment) = &args.duplicate_treatment
+    {
+        return match duplicate_treatment {
+            sqlparser::ast::DuplicateTreatment::Distinct => {
+                classify_count_distinct_from_distinct_syntax(&args.args, output_name)
+            }
+            sqlparser::ast::DuplicateTreatment::All => Err(aggregate_error()),
+        };
     }
     if args.duplicate_treatment.is_some() {
         return Err(format!(
@@ -3541,6 +3544,10 @@ mod tests {
         classify_incremental_mv_query(&query)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for incremental MV parser fixtures compiled by other targets."
+    )]
     fn name(s: &str) -> sqlparser::ast::ObjectName {
         let parts = s
             .split('.')

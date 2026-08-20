@@ -118,7 +118,7 @@ fn protocol_unique_id(id: novarocks_types::UniqueId) -> common::UniqueId {
 fn protocol_exchange_route(
     route: &novarocks_protocol::lifecycle::ExchangeRouteManifest,
 ) -> novarocks::ExchangeRouteManifest {
-    route.as_proto().clone()
+    *route.as_proto()
 }
 
 fn duration_millis(duration: Duration) -> Result<u64, DistributedQueryError> {
@@ -246,6 +246,10 @@ impl QueryInitOptions {
 
 pub struct QueryInitPlan {
     execution_id: QueryExecutionId,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution contract and lifecycle integration."
+    )]
     query_deadline_unix_ms: u64,
     participants: Vec<QueryInitParticipant>,
 }
@@ -255,6 +259,10 @@ impl QueryInitPlan {
         self.execution_id
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution contract and lifecycle integration."
+    )]
     pub(crate) const fn query_deadline_unix_ms(&self) -> u64 {
         self.query_deadline_unix_ms
     }
@@ -579,7 +587,7 @@ pub(crate) fn compile_query_init_plan(
                 .into_iter()
                 .map(protocol_unique_id)
                 .collect(),
-            query_options: Some(options.query_options.as_proto().clone()),
+            query_options: Some(*options.query_options.as_proto()),
             query_deadline_unix_ms: options.query_deadline_unix_ms,
             exchange_routes: fragments
                 .exchange_routes

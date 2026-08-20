@@ -109,6 +109,10 @@ pub trait WriteExecutor {
 }
 
 pub(crate) trait WriteAdmission: Send + Sync {
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn admit(&self) -> Result<(), DmlError>;
 }
 
@@ -140,6 +144,10 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub fn run(&self, spec: WriteTransactionSpec) -> Result<WriteTransactionOutcome, DmlError> {
         self.admission.admit()?;
         let operation_id = self.journal.create_preparing(preparing_request(&spec))?;
@@ -189,6 +197,10 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn complete_abort(
         &self,
         operation_id: DmlOperationId,
@@ -212,6 +224,10 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn complete_terminal(
         &self,
         operation_id: DmlOperationId,
@@ -243,6 +259,10 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn finish_committed(
         &self,
         operation_id: DmlOperationId,
@@ -271,6 +291,10 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
         })
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn record_outcome(
         &self,
         operation_id: DmlOperationId,
@@ -283,6 +307,10 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
         )
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn known_uncommitted(
         &self,
         operation_id: DmlOperationId,
@@ -329,6 +357,10 @@ impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn run(
         mut self,
         spec: WriteTransactionSpec,
@@ -341,6 +373,10 @@ impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
         result
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn run_inner(
         &mut self,
         spec: &WriteTransactionSpec,
@@ -414,6 +450,10 @@ impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
     /// licenses dispatch; every failure returns before any writer is reached
     /// and leaves the operation recoverable in `Writing` for historical write
     /// recovery to classify.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn establish_external_fence(&mut self, spec: &WriteTransactionSpec) -> Result<(), DmlError> {
         let proposal = self.operation.external_fence()?;
         self.operation.preflight_external_fence(&proposal)?;
@@ -429,6 +469,10 @@ impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
             .record_external_fence(record, recovery_due_at_ms)
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn complete_abort(
         &mut self,
         spec: &WriteTransactionSpec,
@@ -465,6 +509,10 @@ impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn complete_terminal(
         &mut self,
         spec: &WriteTransactionSpec,
@@ -514,6 +562,10 @@ impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn finish_committed(
         &mut self,
         spec: &WriteTransactionSpec,
@@ -564,6 +616,10 @@ impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
         })
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn record_outcome(
         &mut self,
         outcome: &ExternalMutationOutcome<ConnectorWriteReceipt>,
@@ -573,6 +629,10 @@ impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
         self.record_fact(fact)
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn known_uncommitted(&mut self, message: String) -> Result<WriteTransactionOutcome, DmlError> {
         let failure =
             ConnectorMutationFailure::new(ConnectorMutationFailureKind::Internal, message.clone());
@@ -580,6 +640,10 @@ impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
         Err(DmlError::executor(message))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn record_fact(&mut self, fact: crate::dml::model::OperationFact) -> Result<(), DmlError> {
         let recovery_due_at_ms = if fact.state.is_finished() {
             None
@@ -593,12 +657,20 @@ impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
         self.operation.stored.recovery_due_at_ms
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn transition_recoverable(&mut self, to: OperationState) -> Result<(), DmlError> {
         let recovery_due_at_ms = self.recovery_due();
         self.operation.transition(to, recovery_due_at_ms)
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn empty_receipt() -> Result<ConnectorWriteReceipt, DmlError> {
     ConnectorWriteReceipt::try_new(bytes::Bytes::from_static(b"connector-write-noop"))
         .map_err(DmlError::journal_corruption)

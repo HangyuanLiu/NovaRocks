@@ -31,6 +31,10 @@ pub enum RepartitionShape {
 }
 
 impl RepartitionShape {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::ProjectionFilterSingleBase => "projection/filter single-base",

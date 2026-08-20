@@ -40,6 +40,10 @@ const CONTROL_STREAM_CAPACITY: usize = 16;
 pub(crate) type QueryControlResponseStream =
     ReceiverStream<Result<proto::QueryControlResponse, tonic::Status>>;
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The tonic service boundary must preserve Status without changing its generated signature."
+)]
 pub(crate) fn handle_init_query(
     ingress: &dyn QueryLifecycleIngress,
     request: proto::InitQueryRequest,
@@ -88,6 +92,10 @@ pub(crate) fn handle_init_query(
     Ok(ack.as_proto().clone())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The tonic service boundary must preserve Status without changing its generated signature."
+)]
 pub(crate) fn handle_abort_query(
     ingress: &dyn QueryLifecycleIngress,
     request: proto::AbortQueryRequest,
@@ -97,7 +105,7 @@ pub(crate) fn handle_abort_query(
         .abort_query(request)
         .map_err(status_from_lifecycle_error)?;
     emit_query_lifecycle_abort_marker();
-    Ok(response.as_proto().clone())
+    Ok(*response.as_proto())
 }
 
 fn emit_query_lifecycle_abort_marker() {
@@ -107,6 +115,10 @@ fn emit_query_lifecycle_abort_marker() {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The tonic service boundary must preserve Status without changing its generated signature."
+)]
 pub(crate) fn handle_stage_fragments(
     ingress: &dyn QueryLifecycleIngress,
     request: proto::StageFragmentsRequest,
@@ -114,13 +126,13 @@ pub(crate) fn handle_stage_fragments(
     let request = QueryStageRequest::parse(request).map_err(status_from_contract_error)?;
     let execution_id = request.execution_id();
     let response = ingress.stage_fragments(request);
-    if response.outcome().is_staged() {
-        if let Some(scope) = claim_backend_fault(
+    if response.outcome().is_staged()
+        && let Some(scope) = claim_backend_fault(
             QueryLifecycleFaultKind::HeartbeatStopAfterStage,
             execution_id,
-        )? {
-            register_staged_heartbeat_stop(scope);
-        }
+        )?
+    {
+        register_staged_heartbeat_stop(scope);
     }
     if response.outcome().is_staged()
         && let Some(scope) =
@@ -141,6 +153,10 @@ pub(crate) fn handle_stage_fragments(
     Ok(response.as_proto().clone())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The tonic service boundary must preserve Status without changing its generated signature."
+)]
 pub(crate) fn handle_start_prepared_query(
     ingress: &dyn QueryLifecycleIngress,
     request: proto::StartPreparedQueryRequest,
@@ -270,6 +286,10 @@ pub(crate) async fn handle_query_control_stream(
     Ok(ReceiverStream::new(outbound_rx))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The control-stream task receives one explicitly named resource for each lifecycle responsibility."
+)]
 async fn run_attached_control_stream(
     mut inbound: tonic::Streaming<proto::QueryControlRequest>,
     mut lease: CoordinatorLease,
@@ -547,6 +567,10 @@ fn staged_heartbeat_stop(_execution_id: QueryExecutionId) -> Option<QueryLifecyc
 }
 
 #[cfg(debug_assertions)]
+#[expect(
+    clippy::result_large_err,
+    reason = "The debug-only fault seam returns tonic Status at its gRPC-facing boundary."
+)]
 fn claim_backend_fault(
     kind: QueryLifecycleFaultKind,
     execution_id: QueryExecutionId,
@@ -610,6 +634,10 @@ fn wait_for_runner_owned_restart(scope: &QueryLifecycleFaultScope) {
 fn wait_for_runner_owned_restart(_scope: &QueryLifecycleFaultScope) {}
 
 #[cfg(debug_assertions)]
+#[expect(
+    clippy::result_large_err,
+    reason = "The debug-only fault seam returns tonic Status at its gRPC-facing boundary."
+)]
 fn observe_backend_fault(
     kind: QueryLifecycleFaultKind,
     execution_id: QueryExecutionId,

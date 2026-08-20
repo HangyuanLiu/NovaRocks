@@ -328,9 +328,9 @@ fn frame(
     payload.extend_from_slice(body);
     Ok(payload)
 }
-fn parse_frame(
-    payload: &[u8],
-) -> Result<(FrameKind, [u8; 32], u64, &[u8]), ArtifactWireCodecError> {
+type DecodedFrame<'a> = (FrameKind, [u8; 32], u64, &'a [u8]);
+
+fn parse_frame(payload: &[u8]) -> Result<DecodedFrame<'_>, ArtifactWireCodecError> {
     let mut r = Reader::new(payload);
     if r.take(4)? != MAGIC {
         return Err(ArtifactWireCodecError::Malformed);

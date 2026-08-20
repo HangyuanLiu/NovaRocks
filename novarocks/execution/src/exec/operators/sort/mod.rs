@@ -95,8 +95,7 @@ pub(crate) fn merged_sort_schema_for_chunks(chunks: &[Chunk]) -> Result<SchemaRe
                 schema.fields().len()
             ));
         }
-        for idx in 0..field_count {
-            let expected = &fields[idx];
+        for (idx, expected) in fields.clone().iter().enumerate().take(field_count) {
             let actual = schema.field(idx);
             let actual = sort_field_from_array(actual, chunk.batch.column(idx));
             if expected.name() != actual.name()
@@ -317,6 +316,12 @@ pub(crate) fn append_stable_row_index_sort_column(
     });
 }
 
+pub(crate) use chunks_sorter_full_sort::ChunksSorterFullSort;
+pub(crate) use chunks_sorter_heap_sort::ChunksSorterHeapSort;
+pub(crate) use chunks_sorter_topn::{ChunksSorterPartitionTopN, ChunksSorterTopN};
+pub use sort_processor::SortProcessorFactory;
+pub(crate) use spillable_chunks_sorter::SpillableChunksSorter;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,9 +437,3 @@ mod tests {
         assert_eq!(actual, vec![0, 1, 2]);
     }
 }
-
-pub(crate) use chunks_sorter_full_sort::ChunksSorterFullSort;
-pub(crate) use chunks_sorter_heap_sort::ChunksSorterHeapSort;
-pub(crate) use chunks_sorter_topn::{ChunksSorterPartitionTopN, ChunksSorterTopN};
-pub use sort_processor::SortProcessorFactory;
-pub(crate) use spillable_chunks_sorter::SpillableChunksSorter;

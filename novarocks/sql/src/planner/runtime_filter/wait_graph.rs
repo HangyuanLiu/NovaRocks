@@ -92,6 +92,10 @@ pub struct CycleStep {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "All proof rejection variants are retained for deterministic runtime-filter diagnostics."
+)]
 pub enum ProofRejection {
     PayloadChannelMismatch,
     PayloadProducerBindingMismatch,
@@ -120,6 +124,10 @@ pub enum RefinedWaitGraphBuildError {
 type WaitGraph = BTreeMap<WaitNode, BTreeSet<(WaitNode, WaitEdgeKind)>>;
 
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "Refined wait provenance remains available to lifecycle diagnostic targets."
+)]
 pub struct RefinedWaitGraph {
     succ: WaitGraph,
     fallbacks: BTreeMap<WaitProvenance, ProofFallback>,
@@ -127,6 +135,10 @@ pub struct RefinedWaitGraph {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Cycle renderings are retained for runtime-filter validation diagnostics."
+)]
 pub struct RefinedCycle {
     steps: Vec<CycleStep>,
     fallbacks: BTreeMap<WaitProvenance, ProofFallback>,
@@ -478,6 +490,10 @@ pub fn build_refined_wait_graph(
 }
 
 impl RefinedWaitGraph {
+    #[allow(
+        dead_code,
+        reason = "Cycle detection remains available to runtime-filter validation targets."
+    )]
     pub fn find_cycle(&self) -> Option<RefinedCycle> {
         match find_cycle_steps(&self.succ) {
             Some(steps) => Some(RefinedCycle {
@@ -553,6 +569,10 @@ impl RefinedWaitGraph {
 }
 
 impl RefinedCycle {
+    #[allow(
+        dead_code,
+        reason = "Primary wait extraction remains available to cycle diagnostics."
+    )]
     pub fn primary_wait(&self) -> WaitProvenance {
         self.steps
             .iter()
@@ -564,6 +584,10 @@ impl RefinedCycle {
             .expect("a refined-graph cycle must cross a wait or backpressure edge")
     }
 
+    #[allow(
+        dead_code,
+        reason = "Cycle rendering remains available to lifecycle diagnostics."
+    )]
     pub fn render(&self) -> Vec<String> {
         self.steps
             .iter()
@@ -712,6 +736,10 @@ fn find_cycle_steps(succ: &WaitGraph) -> Option<Vec<CycleStep>> {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Wait-node rendering supports cycle diagnostics in feature-gated targets."
+)]
 fn render_wait_node(node: WaitNode) -> String {
     match node {
         WaitNode::Frag(fragment) => format!("frag {fragment}"),
@@ -722,6 +750,10 @@ fn render_wait_node(node: WaitNode) -> String {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Cycle-step rendering supports runtime-filter diagnostics in feature-gated targets."
+)]
 fn render_cycle_step(
     step: &CycleStep,
     fallbacks: &BTreeMap<WaitProvenance, ProofFallback>,
@@ -746,6 +778,10 @@ fn render_cycle_step(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Wait provenance rendering supports runtime-filter diagnostics in feature-gated targets."
+)]
 fn render_wait_provenance(
     edge: &str,
     wait: &WaitProvenance,
@@ -886,19 +922,20 @@ mod tests {
                 },
             })
             .unwrap();
-        for (binding_id, fragment_id, node_id, role) in [(
-            BindingId::new(100),
-            2,
-            10,
-            RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
-                contribution_kinds: BTreeSet::from([
-                    ContributionKind::ValueDomainDelta,
-                    ContributionKind::ProducerClosed,
-                ]),
-                completion_requirement: CompletionRequirement::ProducerClosed,
-                target: ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
-            }),
-        )] {
+        {
+            let (binding_id, fragment_id, node_id, role) = (
+                BindingId::new(100),
+                2,
+                10,
+                RuntimeFilterBindingRoleData::Producer(ProducerRequirement {
+                    contribution_kinds: BTreeSet::from([
+                        ContributionKind::ValueDomainDelta,
+                        ContributionKind::ProducerClosed,
+                    ]),
+                    completion_requirement: CompletionRequirement::ProducerClosed,
+                    target: ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
+                }),
+            );
             graph
                 .insert_binding(RuntimeFilterBindingSpecData {
                     binding_id,

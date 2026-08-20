@@ -235,7 +235,7 @@ fn status_unique_id_and_output_column_survive_proto_roundtrip() {
 
     let unique_id = common::UniqueId {
         hi: 0x1122_3344_5566_7788,
-        lo: -0x1020_3040_5060_708,
+        lo: -0x0102_0304_0506_0708,
     };
     assert_eq!(unique_id, roundtrip_message(&unique_id));
 

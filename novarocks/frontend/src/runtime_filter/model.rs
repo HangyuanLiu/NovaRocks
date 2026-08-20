@@ -376,6 +376,10 @@ fn validate_install_keys(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 pub(crate) struct FrontendRuntimeFilterDeployment {
     artifact_id: RuntimeFilterArtifactId,
     query_id: common::UniqueId,
@@ -384,6 +388,10 @@ pub(crate) struct FrontendRuntimeFilterDeployment {
     participants: BTreeMap<usize, FrontendRuntimeFilterParticipant>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 impl FrontendRuntimeFilterDeployment {
     pub(crate) fn new(
         artifact_id: RuntimeFilterArtifactId,
@@ -450,7 +458,7 @@ impl FrontendRuntimeFilterDeployment {
     }
 
     pub(crate) fn query_id(&self) -> common::UniqueId {
-        self.query_id.clone()
+        self.query_id
     }
 
     pub(crate) const fn deployment_epoch(&self) -> u64 {

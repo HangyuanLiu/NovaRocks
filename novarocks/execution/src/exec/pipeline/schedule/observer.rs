@@ -35,6 +35,10 @@ use crate::exec::pipeline::schedule::event_scheduler::{DriverKey, EventScheduler
 pub use crate::runtime::observable::{DeferNotify, Observable, Observer};
 use tracing::debug;
 
+#[allow(
+    dead_code,
+    reason = "Retained for scheduler notification observability tests."
+)]
 static NOTIFY_COUNT: AtomicU64 = AtomicU64::new(0);
 static OBSERVER_NOT_BLOCKED_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 

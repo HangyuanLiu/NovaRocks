@@ -188,7 +188,6 @@ fn sql_base_scan_source(source: &ScanSource) -> Result<SqlScanSource, String> {
         ScanSource::Sql(_) => {
             Err("BindIcebergScan requires a data or frozen-input SQL scan source".to_string())
         }
-        _ => Err("BindIcebergScan requires a token-bound SQL scan source".to_string()),
     }
 }
 

@@ -423,22 +423,46 @@ pub(crate) trait StatementRecoveryLedger {
     fn stored(&self) -> &StoredOperation;
 
     /// Re-assert that this owner still holds the exact operation lease.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn check_authority(&self) -> Result<(), DmlError>;
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn load_direct_mutation_fence(
         &self,
     ) -> Result<Option<DmlDirectMutationFenceReceiptRecord>, DmlError>;
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn load_recovery(&self) -> Result<Option<DmlHistoricalDataMutationRecoveryRecord>, DmlError>;
 
     /// The opaque SPI evidence wire the historical attempt journalled when its
     /// commit outcome was unknown, if it has any.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn load_evidence_wire(&self) -> Result<Option<Vec<u8>>, DmlError>;
 
     /// Mint this recovery attempt's external fence proposal from the *live*
     /// lease guard. CP-3A rule 3 forbids capturing a one-shot snapshot.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn external_fence_proposal(&self) -> Result<DmlExternalFenceProposal, DmlError>;
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn persist_recovery(
         &mut self,
         recovery: DmlHistoricalDataMutationRecoveryRecord,
@@ -447,12 +471,20 @@ pub(crate) trait StatementRecoveryLedger {
 
     /// Publish one statement outcome under the same authority, with the due the
     /// open recovery still requires.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn publish_statement_outcome(
         &mut self,
         outcome: StatementOutcomeMutation,
         recovery_due_at_ms: Option<i64>,
     ) -> Result<(), DmlError>;
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn reschedule(&mut self, recovery_due_at_ms: Option<i64>) -> Result<(), DmlError>;
 }
 
@@ -614,6 +646,10 @@ impl StatementRecoveryProfile {
     }
 
     /// Drive one bounded historical direct data-mutation recovery cycle.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     pub(crate) fn drive(
         &self,
         ledger: &mut dyn StatementRecoveryLedger,
@@ -928,6 +964,10 @@ impl StatementRecoveryProfile {
     }
 
     /// Persist one recovery record with the due its obligations require.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn persist(
         &self,
         ledger: &mut dyn StatementRecoveryLedger,
@@ -941,6 +981,10 @@ impl StatementRecoveryProfile {
     }
 
     /// Move the due and report progress without concluding anything.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn park(
         &self,
         ledger: &mut dyn StatementRecoveryLedger,
@@ -1024,6 +1068,10 @@ impl StatementRecoveryProfile {
     /// evidence to ask the provider anything. That is deliberately not an
     /// error: nothing has gone wrong, and nothing may be concluded either.
     #[allow(clippy::type_complexity)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
     fn historical_facts(
         &self,
         ledger: &dyn StatementRecoveryLedger,
@@ -1499,6 +1547,10 @@ fn fenced_resource_digest(
 }
 
 /// Project the raised fence and its provider receipt into the durable record.
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn raised_fence_record(
     facts: &HistoricalDataMutationFacts,
     receipt: &ConnectorExternalFenceReceipt,
@@ -1796,6 +1848,10 @@ fn historical_failure_record(
 /// An empty result means nothing may be published: the durable statement
 /// result already answers this operation, or the disposition proves nothing
 /// one-way about it.
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn statement_outcome_mutations(
     facts: &HistoricalDataMutationFacts,
     stored: &StoredOperation,
@@ -1916,6 +1972,10 @@ fn finalization_states(
 }
 
 /// Rebuild the statement payload with the recovered outcome attached.
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
 fn statement_payload(
     facts: &HistoricalDataMutationFacts,
     stored: &StoredOperation,

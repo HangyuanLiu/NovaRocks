@@ -209,7 +209,7 @@ impl RuntimeMinMaxFilter {
         let mut max: Option<MinMaxValue> = None;
         for array in arrays {
             match ltype {
-                t if t == RuntimeFilterType::Boolean => {
+                RuntimeFilterType::Boolean => {
                     let arr = as_array::<BooleanArray>(array, "Boolean")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -219,7 +219,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == RuntimeFilterType::Int8 => {
+                RuntimeFilterType::Int8 => {
                     let arr = as_array::<Int8Array>(array, "Int8")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -229,7 +229,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == RuntimeFilterType::Int16 => {
+                RuntimeFilterType::Int16 => {
                     let arr = as_array::<Int16Array>(array, "Int16")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -239,7 +239,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == RuntimeFilterType::Int32 => {
+                RuntimeFilterType::Int32 => {
                     let arr = as_array::<Int32Array>(array, "Int32")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -249,7 +249,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == RuntimeFilterType::Int64 => {
+                RuntimeFilterType::Int64 => {
                     let arr = as_array::<Int64Array>(array, "Int64")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -259,7 +259,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == RuntimeFilterType::LargeInt => {
+                RuntimeFilterType::LargeInt => {
                     let arr = as_array::<FixedSizeBinaryArray>(array, "FixedSizeBinary(16)")?;
                     if arr.value_length() != largeint::LARGEINT_BYTE_WIDTH {
                         return Err(
@@ -275,7 +275,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == RuntimeFilterType::Float32 => {
+                RuntimeFilterType::Float32 => {
                     let arr = as_array::<Float32Array>(array, "Float32")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -289,7 +289,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == RuntimeFilterType::Float64 => {
+                RuntimeFilterType::Float64 => {
                     let arr = as_array::<Float64Array>(array, "Float64")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -303,7 +303,7 @@ impl RuntimeMinMaxFilter {
                         update_min_max(value, &mut min, &mut max)?;
                     }
                 }
-                t if t == RuntimeFilterType::Date32 => {
+                RuntimeFilterType::Date32 => {
                     let arr = as_array::<Date32Array>(array, "Date32")?;
                     for i in 0..arr.len() {
                         if arr.is_null(i) {
@@ -453,7 +453,7 @@ impl RuntimeMinMaxFilter {
             return Err("runtime min/max selection size mismatch".to_string());
         }
         match self.ltype {
-            t if t == RuntimeFilterType::Boolean => {
+            RuntimeFilterType::Boolean => {
                 let (min, max) = self.bool_range()?;
                 let arr = as_array::<BooleanArray>(array, "Boolean")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
@@ -472,7 +472,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == RuntimeFilterType::Int8 => {
+            RuntimeFilterType::Int8 => {
                 let (min, max) = self.i8_range()?;
                 let arr = as_array::<Int8Array>(array, "Int8")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
@@ -491,7 +491,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == RuntimeFilterType::Int16 => {
+            RuntimeFilterType::Int16 => {
                 let (min, max) = self.i16_range()?;
                 let arr = as_array::<Int16Array>(array, "Int16")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
@@ -510,7 +510,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == RuntimeFilterType::Int32 => {
+            RuntimeFilterType::Int32 => {
                 let (min, max) = self.i32_range()?;
                 let arr = as_array::<Int32Array>(array, "Int32")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
@@ -529,7 +529,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == RuntimeFilterType::Int64 => {
+            RuntimeFilterType::Int64 => {
                 let (min, max) = self.i64_range()?;
                 let arr = as_array::<Int64Array>(array, "Int64")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
@@ -548,7 +548,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == RuntimeFilterType::LargeInt => {
+            RuntimeFilterType::LargeInt => {
                 let (min, max) = self.i128_range()?;
                 let arr = as_array::<FixedSizeBinaryArray>(array, "FixedSizeBinary(16)")?;
                 if arr.value_length() != largeint::LARGEINT_BYTE_WIDTH {
@@ -570,7 +570,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == RuntimeFilterType::Float32 => {
+            RuntimeFilterType::Float32 => {
                 let (min, max) = self.f32_range()?;
                 let arr = as_array::<Float32Array>(array, "Float32")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
@@ -589,7 +589,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == RuntimeFilterType::Float64 => {
+            RuntimeFilterType::Float64 => {
                 let (min, max) = self.f64_range()?;
                 let arr = as_array::<Float64Array>(array, "Float64")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
@@ -608,7 +608,7 @@ impl RuntimeMinMaxFilter {
                     }
                 }
             }
-            t if t == RuntimeFilterType::Date32 => {
+            RuntimeFilterType::Date32 => {
                 let (min, max) = self.date32_range()?;
                 let arr = as_array::<Date32Array>(array, "Date32")?;
                 for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {

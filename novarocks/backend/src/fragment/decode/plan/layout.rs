@@ -30,6 +30,7 @@ use crate::fragment::decode::type_decode::decode_field_type;
 #[cfg(test)]
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_protocol::ProtocolErrorKind;
+#[cfg(test)]
 use novarocks_protocol::common;
 use novarocks_types::SlotId;
 
@@ -39,6 +40,10 @@ pub(crate) struct Layout {
     index: HashMap<SlotId, usize>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 impl Layout {
     #[allow(dead_code)]
     pub(crate) fn for_slots(slots: impl IntoIterator<Item = SlotId>) -> Self {
@@ -170,6 +175,10 @@ pub(crate) fn slot_schemas_from_output_columns(
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(crate) fn slot_ids_from_output_columns(
     cols: &[common::OutputColumn],
 ) -> Result<Vec<SlotId>, NativeFragmentLeafDecodeError> {
@@ -244,10 +253,9 @@ fn decode_output_columns(
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::{DataType, Field, Fields};
+    use arrow::datatypes::{DataType, Field};
 
     use super::*;
-    use novarocks_protocol::common;
     use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
@@ -319,22 +327,9 @@ mod tests {
 
     #[test]
     fn decodes_decimal_list_struct_and_logical_field_metadata() {
-        let payload_field = field_with_logical_type(
+        let _payload_field = field_with_logical_type(
             Field::new("payload", DataType::Utf8, true),
             LogicalType::Json,
-        );
-        let complex_field = Field::new(
-            "complex",
-            DataType::Struct(Fields::from(vec![
-                Arc::new(Field::new("price", DataType::Decimal128(18, 4), false)),
-                Arc::new(Field::new(
-                    "tags",
-                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                    true,
-                )),
-                Arc::new(payload_field.clone()),
-            ])),
-            true,
         );
         let cols = vec![common::OutputColumn {
             column_id: 99,

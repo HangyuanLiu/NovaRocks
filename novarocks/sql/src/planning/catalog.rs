@@ -924,9 +924,7 @@ mod tests {
         );
         validate_materialization_binding(&materialization, binding)
             .expect("target locator retains frozen binding");
-        let ScanSource::Sql(source) = &materialization.planner.source else {
-            panic!("target locator must use SQL scan source");
-        };
+        let ScanSource::Sql(source) = &materialization.planner.source;
         let SqlScanKind::MvTargetLocator { facts } = &source.kind else {
             panic!("target locator must retain its specialized scan kind");
         };

@@ -219,6 +219,10 @@ fn encode_exchange_flavor(src: &ExchangeFlavor) -> Result<plan::ExchangeFlavor, 
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen frontend boundary keeps independently validated inputs explicit."
+)]
 pub(super) fn encode_table_def_with_context(
     src: &SqlTableDefRead,
     scan_node_id: Option<i32>,
@@ -459,6 +463,10 @@ fn resolved_execution_kind(execution: NativeScanExecutionKind) -> &'static str {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen frontend boundary keeps independently validated inputs explicit."
+)]
 fn encode_scan_source(
     src: &SqlScanSourceRead,
     scan_node_id: Option<i32>,

@@ -31,7 +31,7 @@ use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
 use novarocks_parser::ast::{CreateView, ViewStatement};
 use novarocks_spi::state_store::StateStore;
 use novarocks_types::SlotId;
-use sqlparser::ast::{ObjectName, ObjectNamePart, Query, Statement};
+use sqlparser::ast::{Query, Statement};
 use sqlparser::parser::Parser;
 use tokio::runtime::Handle;
 

@@ -51,6 +51,10 @@ use self::sql_shape::{
 /// this value.  It deliberately carries neither a connector table handle nor
 /// a write operation/cohort: those are lifecycle facts and are attached only
 /// after the application admits an exact write lease.
+#[allow(
+    dead_code,
+    reason = "The first-refresh input contract is retained while application-side admission wiring is staged."
+)]
 pub(crate) struct SqlMvFirstRefreshPlannerInput {
     pub(crate) shape: MvFirstRefreshShape,
     pub(crate) target_contract: MvFirstRefreshTargetContract,
@@ -62,6 +66,14 @@ pub(crate) struct SqlMvFirstRefreshPlannerInput {
 /// A first-refresh artifact before it becomes an immutable plan.  The logical
 /// variant contains only SQL planner values; it intentionally has no refresh
 /// context or provider authority.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The inline SQL plan payload avoids an allocation at the compiler handoff boundary."
+)]
+#[allow(
+    dead_code,
+    reason = "The first-refresh artifact input preserves the staged SQL-to-application handoff contract."
+)]
 pub(crate) enum SqlMvFirstRefreshArtifactInput {
     Sql(MvFirstRefreshPhysicalSql),
     Logical {
@@ -77,6 +89,10 @@ pub(crate) enum SqlMvFirstRefreshArtifactInput {
 /// contract, root distribution requirement and query-local binding token.  In
 /// particular, it contains no operation/cohort ID, connector handle/request
 /// context, prepared write, catalog object or commit lifecycle value.
+#[allow(
+    dead_code,
+    reason = "The immutable first-refresh plan is retained for the pending application handoff."
+)]
 pub(crate) struct SqlMvFirstRefreshPlan {
     shape: MvFirstRefreshShape,
     target_contract: MvFirstRefreshTargetContract,
@@ -85,6 +101,14 @@ pub(crate) struct SqlMvFirstRefreshPlan {
     artifact: SqlMvFirstRefreshPlanArtifact,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The inline SQL plan payload avoids an allocation at the compiler handoff boundary."
+)]
+#[allow(
+    dead_code,
+    reason = "The first-refresh artifact remains part of the retained immutable handoff contract."
+)]
 pub(crate) enum SqlMvFirstRefreshPlanArtifact {
     Sql(MvFirstRefreshPhysicalSql),
     Logical {
@@ -94,9 +118,17 @@ pub(crate) enum SqlMvFirstRefreshPlanArtifact {
 }
 
 /// Canonical, side-effect-free SQL planner for an MV first refresh.
+#[allow(
+    dead_code,
+    reason = "The side-effect-free planner is retained until application-side first-refresh admission is wired."
+)]
 pub(crate) struct SqlMvFirstRefreshPlanner;
 
 impl SqlMvFirstRefreshPlanner {
+    #[allow(
+        dead_code,
+        reason = "The planner entry point is retained with its staged first-refresh handoff contract."
+    )]
     pub(crate) fn plan(
         input: SqlMvFirstRefreshPlannerInput,
     ) -> Result<SqlMvFirstRefreshPlan, String> {
@@ -137,22 +169,42 @@ impl SqlMvFirstRefreshPlanner {
 }
 
 impl SqlMvFirstRefreshPlan {
+    #[allow(
+        dead_code,
+        reason = "The retained handoff plan exposes its validated SQL shape."
+    )]
     pub(crate) const fn shape(&self) -> MvFirstRefreshShape {
         self.shape
     }
 
+    #[allow(
+        dead_code,
+        reason = "The retained handoff plan exposes its frozen target contract."
+    )]
     pub(crate) fn target_contract(&self) -> &MvFirstRefreshTargetContract {
         &self.target_contract
     }
 
+    #[allow(
+        dead_code,
+        reason = "The retained handoff plan exposes its frozen target binding."
+    )]
     pub(crate) const fn target_binding(&self) -> SqlTableBindingId {
         self.target_binding
     }
 
+    #[allow(
+        dead_code,
+        reason = "The retained handoff plan exposes its root distribution requirement."
+    )]
     pub(crate) fn root_distribution(&self) -> &RootDistributionRequirement {
         &self.root_distribution
     }
 
+    #[allow(
+        dead_code,
+        reason = "The retained handoff plan exposes its frozen SQL artifact."
+    )]
     pub(crate) fn into_artifact(self) -> SqlMvFirstRefreshPlanArtifact {
         self.artifact
     }
@@ -1209,6 +1261,10 @@ const fn incremental_route_effect_code(route: i32) -> i64 {
 /// snapshot is consumed only after canonical planning to construct the join
 /// append descriptor; injecting it here would silently change the prior Core
 /// canonical-query semantics.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
+)]
 fn plain_join_first_refresh_logical_request<'a>(
     query: sqlparser::ast::Query,
     current_catalog: Option<String>,
@@ -1542,6 +1598,10 @@ fn base_field_name(
         })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
+)]
 fn build_join_descriptor(
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
     left: &novarocks_catalog::identifier::TableIdentity,
@@ -1685,6 +1745,10 @@ impl MvFirstRefreshPhysicalSql {
 /// Validated logical shape of a first-refresh append.  All variants have one
 /// empty target and therefore one sealed primary append cohort.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "The validated first-refresh shapes are retained until application-side refresh admission consumes them."
+)]
 pub(crate) enum MvFirstRefreshShape {
     Projection,
     UnionProjection,
@@ -2008,6 +2072,10 @@ pub(crate) fn prepare_union_projection_first_refresh_write_sql(
     ))
 }
 
+#[allow(
+    dead_code,
+    reason = "The aggregate first-refresh SQL builder is retained for the staged application handoff."
+)]
 pub(crate) fn prepare_aggregate_first_refresh_write_sql(
     select_sql: &str,
     calls: &SqlAggregateCalls,
@@ -2025,6 +2093,10 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "The schema-aware aggregate builder is retained for the staged first-refresh handoff."
+)]
 pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema(
     select_sql: &str,
     calls: &SqlAggregateCalls,
@@ -2078,6 +2150,10 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema_and_i
 /// as a single aggregate.  The canonical SELECT already contains the pinned
 /// UNION ALL input, so keeping this as a separate entry point makes the shape
 /// contract explicit without reintroducing a frontend materialization phase.
+#[allow(
+    dead_code,
+    reason = "The fan-in aggregate builder is retained for the staged first-refresh handoff."
+)]
 pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql(
     select_sql: &str,
     calls: &SqlAggregateCalls,
@@ -2095,6 +2171,10 @@ pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "The schema-aware fan-in builder is retained for the staged first-refresh handoff."
+)]
 pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema(
     select_sql: &str,
     calls: &SqlAggregateCalls,
@@ -2138,6 +2218,10 @@ pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schem
 /// state-shaped SELECT.  Its join/fan-in relationship lives below the common
 /// aggregate project and therefore remains BE-owned all the way to the
 /// connector writer.
+#[allow(
+    dead_code,
+    reason = "The composed aggregate builder is retained for the staged first-refresh handoff."
+)]
 pub(crate) fn prepare_composed_aggregate_first_refresh_write_sql(
     select_sql: &str,
     calls: &SqlAggregateCalls,
@@ -2154,6 +2238,10 @@ pub(crate) fn prepare_composed_aggregate_first_refresh_write_sql(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "The branch-union aggregate builder is retained for the staged first-refresh handoff."
+)]
 pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql(
     select_sql: &str,
     branch_count: usize,

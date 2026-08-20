@@ -476,7 +476,7 @@ fn ensure_exposes_columns(
 
 #[cfg(test)]
 mod tests {
-    use crate::planner::logical::*;
+
     use crate::planner::payload::*;
     use std::cell::RefCell;
     use std::collections::HashSet;
@@ -501,7 +501,7 @@ mod tests {
     };
     use crate::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::planner::payload::{AggregateCall, PlanScanNode, PlanValuesNode};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
 
     // ---- Column ID constants --------------------------------------------------
     const T1_K: ColumnId = ColumnId(1); // left (outer) key column

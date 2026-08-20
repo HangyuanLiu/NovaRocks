@@ -229,6 +229,10 @@ impl Default for FragmentPrepareContext {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Failure-injection builders are retained for fragment lifecycle regression coverage."
+)]
 impl FragmentPrepareContext {
     pub fn new(
         profiler: Option<Profiler>,
@@ -310,6 +314,10 @@ impl FragmentPrepareContext {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Fault-injection construction keeps independently-owned execution services explicit."
+    )]
     pub fn new_with_execution_overrides(
         profiler: Option<Profiler>,
         mem_tracker: Option<Arc<MemTracker>>,
@@ -403,6 +411,10 @@ impl FragmentPrepareContext {
     }
 }
 
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Failure injection points intentionally describe the lifecycle point after which they fire."
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PrepareFailurePoint {
     AfterSinkCommit,
@@ -410,6 +422,10 @@ enum PrepareFailurePoint {
     AfterExchange,
 }
 
+#[allow(
+    dead_code,
+    reason = "Failure-point descriptions are retained for lifecycle fault-injection diagnostics."
+)]
 impl PrepareFailurePoint {
     const fn detail(self) -> &'static str {
         match self {
@@ -421,10 +437,18 @@ impl PrepareFailurePoint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Start failure injection remains available for lifecycle regression coverage."
+)]
 enum StartFailurePoint {
     AfterSubmit,
 }
 
+#[allow(
+    dead_code,
+    reason = "Failure-point descriptions are retained for lifecycle fault-injection diagnostics."
+)]
 impl StartFailurePoint {
     const fn detail(self) -> &'static str {
         match self {
@@ -433,6 +457,10 @@ impl StartFailurePoint {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "The dormant handle retains fault-injection state for lifecycle regression coverage."
+)]
 pub struct DormantFragmentHandle {
     prepared: PreparedPipelineExecution,
     resources: FragmentResources,

@@ -39,6 +39,10 @@ use novarocks_types::UniqueId;
 
 use super::{encode_data_partition, encode_instance_params};
 
+#[expect(
+    clippy::type_complexity,
+    reason = "The CTE exchange payload follows the frozen native fragment contract."
+)]
 pub(crate) fn encode_native_submission(
     view: &NativeSubmissionEncodingView<'_>,
 ) -> Result<NativeSubmissionAttachment, String> {
@@ -190,16 +194,14 @@ pub(crate) fn encode_native_submission(
                     ));
                 }
                 let mut native_fragment = template.clone();
-                if is_writer {
-                    if let Some(attachment) = connector_attachment {
-                        patch_connector_writer(
-                            &mut native_fragment,
-                            fragment_id,
-                            placement,
-                            attachment,
-                            &mut consumed_connector_writers,
-                        )?;
-                    }
+                if is_writer && let Some(attachment) = connector_attachment {
+                    patch_connector_writer(
+                        &mut native_fragment,
+                        fragment_id,
+                        placement,
+                        attachment,
+                        &mut consumed_connector_writers,
+                    )?;
                 }
                 for (&node_id, splits) in &placement.connector_splits {
                     assembly::patch_native_connector_read_splits(

@@ -24,6 +24,10 @@ pub(crate) enum RewritePhase {
 }
 
 impl RewritePhase {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::LogicalNormalize => "LogicalNormalize",

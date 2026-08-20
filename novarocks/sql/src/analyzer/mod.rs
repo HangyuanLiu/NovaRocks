@@ -113,6 +113,10 @@ pub(crate) fn analyze_with_function_catalog(
 /// ColumnIds allocated by this analysis never collide with ids the caller
 /// already minted (used by MV rewrite candidate preparation, which analyzes
 /// the MV defining SQL inside an already-planned user query).
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) fn analyze_with_factory(
     query: &sqlast::Query,
     catalog: &dyn PlannerTableProvider,
@@ -201,6 +205,10 @@ pub(super) struct AnalyzerContext<'a> {
 
 impl<'a> AnalyzerContext<'a> {
     /// Create a new empty AnalyzerScope sharing this context's factory.
+    #[expect(
+        private_interfaces,
+        reason = "The stable SQL shape intentionally carries a crate-private implementation detail."
+    )]
     pub(super) fn new_scope(&self) -> scope::AnalyzerScope {
         scope::AnalyzerScope::new(self.factory.clone())
     }
@@ -1868,7 +1876,7 @@ impl<'a> AnalyzerContext<'a> {
             }
             Relation::IcebergMetadataScan(rel) => {
                 let cols = crate::analyzer::iceberg_metadata::metadata_table_schema(
-                    rel.metadata_table_type.clone(),
+                    rel.metadata_table_type,
                 );
                 let qualifier = rel.alias.as_deref().unwrap_or(&rel.table.name);
                 for col in &cols {
@@ -2870,7 +2878,7 @@ fn replace_grouping_calls_with_markers(
                 args,
                 next_marker,
             )),
-            form: form.clone(),
+            form: *form,
             negated: *negated,
         },
         sqlast::Expr::InList {
@@ -3229,7 +3237,7 @@ fn replace_grouping_calls_with_markers(
                 args,
                 next_marker,
             )),
-            trim_where: trim_where.clone(),
+            trim_where: *trim_where,
             trim_what: trim_what
                 .as_ref()
                 .map(|expr| Box::new(replace_grouping_calls_with_markers(expr, args, next_marker))),
@@ -4063,7 +4071,7 @@ mod tests {
     }
 
     fn metadata_table_columns(metadata_table_type: &SqlMetadataTableKind) -> Vec<ColumnDef> {
-        crate::analyzer::iceberg_metadata::metadata_table_schema(metadata_table_type.clone())
+        crate::analyzer::iceberg_metadata::metadata_table_schema(*metadata_table_type)
             .into_iter()
             .map(|column| ColumnDef {
                 name: column.name,

@@ -536,15 +536,15 @@ impl ConnectorWriteOperationSession {
             .cohorts
             .get_mut(&attempt.cohort_id())
             .ok_or_else(|| invalid("connector write attempt references an unknown cohort"))?;
-        if let Some(accepted) = &cohort.accepted {
-            if accepted.execution_id() == attempt.execution_id() {
-                if accepted != &attempt {
-                    return Err(invalid(
-                        "connector write accepted attempt changed before being superseded",
-                    ));
-                }
-                cohort.accepted = None;
+        if let Some(accepted) = &cohort.accepted
+            && accepted.execution_id() == attempt.execution_id()
+        {
+            if accepted != &attempt {
+                return Err(invalid(
+                    "connector write accepted attempt changed before being superseded",
+                ));
             }
+            cohort.accepted = None;
         }
         match cohort.superseded.get(&attempt.execution_id()) {
             Some(existing) if existing == &attempt => Ok(()),
@@ -2051,20 +2051,5 @@ mod tests {
             ConnectorWriteAbortOutcome::KnownUncommitted { .. }
         ));
         assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
-    }
-
-    fn evidence() -> ExternalMutationEvidence {
-        ExternalMutationEvidence::try_new(
-            1,
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("session-test").expect("provider id"),
-                instance_id: owner().instance_id,
-            },
-            owner().incarnation,
-            novarocks_spi::connector::ConnectorMutationOperationId::new(),
-            "write",
-            Bytes::from_static(b"evidence"),
-        )
-        .expect("external mutation evidence")
     }
 }

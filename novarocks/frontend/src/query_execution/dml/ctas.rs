@@ -920,10 +920,18 @@ impl CoreCtasTargetSession {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     pub(crate) fn write_lease(&self) -> ConnectorWriteLease {
         self.write_lease.clone()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     pub(crate) fn context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
         self.context.clone()
     }
@@ -1095,6 +1103,10 @@ impl CtasSourceExecutionGate {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution DML recovery and connector wiring."
+)]
 pub(crate) fn mutation_failure(failure: ConnectorMutationFailure) -> CtasFailure {
     let kind = match failure.kind() {
         novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest => {
@@ -1160,8 +1172,20 @@ struct CorePreparedCtasSource {
     gate: Arc<CtasSourceExecutionGate>,
     preflight: CoreCtasTargetPreflight,
     command: CtasCommand,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     target: crate::catalog_application::resolver::TargetBackend,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     current_catalog: Option<String>,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     current_database: String,
     query_options: Option<QueryOptions>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,

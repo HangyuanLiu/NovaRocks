@@ -190,7 +190,7 @@ fn eval_variant_get_impl(
         None
     };
     let result_type = target_type.clone().unwrap_or(DataType::LargeBinary);
-    if chunk.len() == 0 {
+    if chunk.is_empty() {
         return Ok(new_empty_array(&result_type));
     }
 

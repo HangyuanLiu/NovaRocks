@@ -522,7 +522,7 @@ fn materialize_bindings(
             instances
                 .entry((channel_id, binding_id, participant_id(*backend_idx)?))
                 .or_default()
-                .insert(instance.clone());
+                .insert(*instance);
         }
     }
     validate_channel_bindings(channels, &bindings)?;
@@ -889,7 +889,7 @@ fn core_channel(
         let profile = artifact_profile(channel, capabilities)?;
         consumers.push(filter::RuntimeFilterConsumerDeployment {
             binding_id: *binding_id,
-            activation: Some(activation.clone()),
+            activation: Some(*activation),
             capabilities: capabilities.iter().copied().map(capability_wire).collect(),
             artifact_profile: Some(profile.clone()),
             route_edge_ids: route_ids.iter().copied().collect(),
@@ -968,7 +968,7 @@ fn core_channel(
         reduction: Some(channel.reduction.clone()),
         allowed_contribution_kinds: channel.contribution_kinds.clone(),
         completion_requirement: channel_completion(bindings, channel.channel_id)?,
-        policy: Some(channel.policy.clone()),
+        policy: Some(channel.policy),
         core_budget: Some(filter::RuntimeFilterCoreBudget {
             max_reducer_bytes: policy.core_budget_bytes,
         }),
@@ -1039,7 +1039,7 @@ fn routing_channel(
             .is_some_and(|bindings| bindings.contains(binding))
         {
             for instance in expected {
-                producer_instances.insert((*binding, instance.clone()), *producer);
+                producer_instances.insert((*binding, *instance), *producer);
             }
         }
     }
@@ -1523,14 +1523,13 @@ fn channel_completion(
         .values()
         .filter(|binding| binding.channel_id == channel_id)
     {
-        if let BindingRole::Producer { completion: value } = binding.role {
-            if let Some(previous) = completion.replace(value)
-                && previous != value
-            {
-                return Err(compilation_error(format!(
-                    "runtime filter channel {channel_id} has incompatible producer completion requirements"
-                )));
-            }
+        if let BindingRole::Producer { completion: value } = binding.role
+            && let Some(previous) = completion.replace(value)
+            && previous != value
+        {
+            return Err(compilation_error(format!(
+                "runtime filter channel {channel_id} has incompatible producer completion requirements"
+            )));
         }
     }
     completion.ok_or_else(|| {

@@ -110,9 +110,11 @@ fn min_max_state_union(fn_name: &str, a: &[u8], b: &[u8]) -> Result<Vec<u8>, Str
     encode_multiset(&entries, &key_type)
 }
 
+type MinMaxStateOp = fn(&[u8], &[u8]) -> Result<Vec<u8>, String>;
+
 fn eval_min_max_state_union(
     fn_name: &str,
-    op: fn(&[u8], &[u8]) -> Result<Vec<u8>, String>,
+    op: MinMaxStateOp,
     arena: &ExprArena,
     args: &[ExprId],
     chunk: &Chunk,
@@ -154,7 +156,7 @@ fn eval_min_max_state_visible(
 
 fn eval_min_max_state_union_arrays(
     fn_name: &str,
-    op: fn(&[u8], &[u8]) -> Result<Vec<u8>, String>,
+    op: MinMaxStateOp,
     lhs: &ArrayRef,
     rhs: &ArrayRef,
 ) -> Result<ArrayRef, String> {

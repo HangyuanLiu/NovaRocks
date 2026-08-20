@@ -41,6 +41,10 @@ pub fn sat_add(a: f64, b: f64) -> (f64, bool) {
 
 /// `a / b`. Guards `b <= 0` (returns the numerator + saturated=true rather
 /// than NaN/inf).
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub fn sat_div(a: f64, b: f64) -> (f64, bool) {
     if b <= 0.0 {
         let (v, _) = clamp_row_count(a);

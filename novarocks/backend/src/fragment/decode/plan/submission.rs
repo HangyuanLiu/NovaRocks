@@ -24,10 +24,8 @@ use std::time::Duration;
 use crate::connector::ConnectorRegistry;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::fragment::program::{
-    FragmentContractVersion, FragmentProgram, FragmentProgramOptions, FragmentSinkSpec,
-    ScanSourceContract,
+    FragmentContractVersion, FragmentProgramOptions, FragmentSinkSpec, ScanSourceContract,
 };
-use novarocks_execution::exec::node::ExecPlan;
 use novarocks_execution::runtime::fragment::{
     FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSubmission, ScanAssignments,
 };

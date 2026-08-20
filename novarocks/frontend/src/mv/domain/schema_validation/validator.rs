@@ -208,10 +208,10 @@ fn validate_observations_after_identity(
     if base.schema_id() == contract.base.schema_id_at_create
         && target.schema_id() == contract.target.schema_id_at_create
     {
-        if contract.aggregate.is_some() {
-            if let Some(err) = check_target_schema(contract, target.fields()) {
-                return ContractDecision::Incompatible(err);
-            }
+        if contract.aggregate.is_some()
+            && let Some(err) = check_target_schema(contract, target.fields())
+        {
+            return ContractDecision::Incompatible(err);
         }
         return ContractDecision::CompatibleSafe;
     }
@@ -778,9 +778,7 @@ mod tests {
         contract: &MvSchemaContract,
         observed: &MvSchemaValidationPartitionContract,
     ) -> Option<SchemaEvolutionError> {
-        if contract.target.partition.is_none() {
-            return None;
-        }
+        contract.target.partition.as_ref()?;
         super::check_target_partition_spec(contract, observed)
     }
 
@@ -1842,8 +1840,8 @@ mod tests {
         let int_type = "int";
         let long_type = "long";
         let mut contract = join_schema_contract();
-        let mut left = join_base_table("left-uuid", 1, "left_id", int_type.clone(), true);
-        let mut right = join_base_table("right-uuid", 2, "right_id", int_type.clone(), true);
+        let mut left = join_base_table("left-uuid", 1, "left_id", int_type, true);
+        let mut right = join_base_table("right-uuid", 2, "right_id", int_type, true);
         let mut target = join_target_table();
 
         contract.target.hidden_apply_key.column_name = "wrong".to_string();

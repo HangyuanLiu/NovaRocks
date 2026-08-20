@@ -100,6 +100,14 @@ pub(super) fn prepare_scan_bindings(
     Ok(bindings)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Recursive scan preparation carries the complete frozen planning context explicitly."
+)]
+#[expect(
+    clippy::only_used_in_recursion,
+    reason = "Fragment identity is intentionally forwarded only while recursively walking the distributed plan."
+)]
 fn collect_scan_bindings(
     fragment_id: FragmentId,
     node: &DistributedNode,
@@ -144,6 +152,10 @@ fn collect_scan_bindings(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Scan preparation keeps independently-owned planning and execution bindings explicit."
+)]
 fn prepare_scan_node(
     fragment_id: FragmentId,
     node_id: i32,
@@ -264,18 +276,17 @@ fn prepare_scan_node(
             (Vec::new(), Vec::new(), Some(read))
         }
         ResolvedScanExecution::AdmittedConnectorRead(materialization) => {
-            let static_predicates = options
-                .enable_connector_static_predicate_pushdown
-                .then(|| {
-                    let QueryScanMaterialization { schema, .. } = materialization;
-                    let connector_schema_fields = schema
-                        .fields()
-                        .iter()
-                        .map(|field| field.name().as_str())
-                        .collect::<Vec<_>>();
-                    lower_static_connector_predicates(scan, &connector_schema_fields)
-                })
-                .unwrap_or_default();
+            let static_predicates = if options.enable_connector_static_predicate_pushdown {
+                let QueryScanMaterialization { schema, .. } = materialization;
+                let connector_schema_fields = schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect::<Vec<_>>();
+                lower_static_connector_predicates(scan, &connector_schema_fields)
+            } else {
+                Vec::new()
+            };
             let planned = plan_connector_read(
                 context.clone(),
                 scan,

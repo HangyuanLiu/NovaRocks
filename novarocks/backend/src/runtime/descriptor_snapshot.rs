@@ -23,9 +23,17 @@ use novarocks_execution::exec::row_position::RowPositionDescriptor;
 use novarocks_execution::exec::row_position::RowPositionType;
 use novarocks_types::SlotId;
 
+#[allow(
+    dead_code,
+    reason = "Descriptor snapshots are consumed by native plan decode targets outside the backend lib test configuration."
+)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IcebergTableLocationMap(HashMap<i64, String>);
 
+#[allow(
+    dead_code,
+    reason = "Descriptor snapshots are consumed by native plan decode targets outside the backend lib test configuration."
+)]
 impl IcebergTableLocationMap {
     pub fn from_snapshot(snapshot: &DescriptorSnapshot) -> Self {
         Self(
@@ -45,6 +53,10 @@ impl IcebergTableLocationMap {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Logical descriptor types are retained for native plan decode targets outside the backend lib test configuration."
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DescriptorLogicalType {
     Null,
@@ -72,6 +84,10 @@ pub enum DescriptorLogicalType {
     Unknown,
 }
 
+#[allow(
+    dead_code,
+    reason = "Logical descriptor helpers are retained for native plan decode targets outside the backend lib test configuration."
+)]
 impl DescriptorLogicalType {
     #[allow(dead_code)]
     pub fn is_int32(&self) -> bool {
@@ -94,6 +110,10 @@ impl DescriptorLogicalType {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Descriptor slots are retained for native plan decode targets outside the backend lib test configuration."
+)]
 #[derive(Clone, Debug)]
 pub struct DescriptorSlot {
     pub tuple_id: i32,
@@ -117,6 +137,10 @@ pub struct DescriptorIcebergSchema {
     pub fields: Option<Vec<DescriptorIcebergSchemaField>>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Descriptor table kinds are retained for native plan decode targets outside the backend lib test configuration."
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DescriptorTableKind {
     Iceberg,
@@ -124,6 +148,10 @@ pub enum DescriptorTableKind {
     Other,
 }
 
+#[allow(
+    dead_code,
+    reason = "Descriptor table metadata is retained for native plan decode targets outside the backend lib test configuration."
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DescriptorTable {
     pub id: i64,
@@ -132,6 +160,10 @@ pub struct DescriptorTable {
     pub iceberg_schema: Option<DescriptorIcebergSchema>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Descriptor snapshots are consumed by native plan decode targets outside the backend lib test configuration."
+)]
 #[derive(Clone, Debug, Default)]
 pub struct DescriptorSnapshot {
     slots_by_tuple_slot: HashMap<(i32, SlotId), DescriptorSlot>,
@@ -140,6 +172,10 @@ pub struct DescriptorSnapshot {
     tables_by_id: HashMap<i64, DescriptorTable>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Descriptor snapshot helpers are consumed by native plan decode targets outside the backend lib test configuration."
+)]
 impl DescriptorSnapshot {
     pub fn new(
         slots: Vec<DescriptorSlot>,

@@ -338,10 +338,7 @@ fn apply_query_modifiers(
     // Wrap with Limit if LIMIT/OFFSET is present.
     if limit.is_some() || offset.is_some() {
         body_plan = LogicalPlanNode::new(
-            LogicalPlanKind::Limit(PlanLimitNode {
-                limit: limit,
-                offset: offset,
-            }),
+            LogicalPlanKind::Limit(PlanLimitNode { limit, offset }),
             vec![body_plan],
             None,
         );
@@ -350,7 +347,7 @@ fn apply_query_modifiers(
     if let Some(items) = final_projection {
         body_plan = LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
-                items: items,
+                items,
                 output_qualifier: None,
             }),
             vec![body_plan],

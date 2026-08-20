@@ -444,7 +444,7 @@ fn lower_call_procedure(
     statement: &CallProcedure,
     context: MaintenanceRequestContext<'_>,
 ) -> Result<ParsedMaintenanceStatement, String> {
-    let named = normalize_procedure_args(&statement)?;
+    let named = normalize_procedure_args(statement)?;
     let table = required_string_arg(&named, "table")?;
     let name_parts =
         resolve_procedure_table_name(&statement.catalog, context.current_database, &table)?;

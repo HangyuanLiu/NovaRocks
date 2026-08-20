@@ -114,6 +114,10 @@ pub(crate) enum RuntimeFilterLifecycle {
 pub struct TopKSummaryRequirement(NonZeroU32);
 
 impl TopKSummaryRequirement {
+    #[allow(
+        dead_code,
+        reason = "Retained for TopK runtime-filter planning variants enabled by other targets."
+    )]
     pub fn try_new(k: u32) -> Option<Self> {
         NonZeroU32::new(k).map(Self)
     }
@@ -124,6 +128,10 @@ impl TopKSummaryRequirement {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[allow(
+    dead_code,
+    reason = "All reduction variants remain part of the frozen runtime-filter planner contract."
+)]
 pub enum ReductionRequirement {
     SetUnion,
     TightenOrderedBound,

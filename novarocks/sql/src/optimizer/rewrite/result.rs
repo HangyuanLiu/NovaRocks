@@ -20,6 +20,10 @@ use crate::optimizer::opt_expr::OptExpr;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RewriteDiagnosticKind {
     Rejected,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     Error,
 }
 
@@ -39,6 +43,10 @@ impl RewriteDiagnostic {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub(crate) fn error(rule: &'static str, message: impl Into<String>) -> Self {
         Self {
             rule,
@@ -49,6 +57,10 @@ impl RewriteDiagnostic {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The inline SQL plan payload avoids an allocation at the compiler handoff boundary."
+)]
 pub(crate) enum RewriteResult {
     Unchanged,
     Changed(OptExpr),

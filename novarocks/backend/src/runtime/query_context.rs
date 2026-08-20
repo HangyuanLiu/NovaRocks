@@ -39,6 +39,10 @@ enum QueryExecutionGeneration {
     Native(NonZeroU64),
 }
 
+#[allow(
+    dead_code,
+    reason = "Legacy query-context callers retain the first native attempt outside the lifecycle-aware backend target."
+)]
 fn legacy_native_attempt() -> NonZeroU64 {
     NonZeroU64::new(1).expect("one is a nonzero native attempt")
 }
@@ -52,6 +56,10 @@ pub(crate) struct QueryExecutionKey {
 impl QueryExecutionKey {
     /// Legacy native callers predate lifecycle attempts. New native lifecycle
     /// code must use `native_attempt`.
+    #[allow(
+        dead_code,
+        reason = "Legacy query-context callers retain this non-lifecycle execution key constructor."
+    )]
     pub(crate) fn native(query_id: QueryId) -> Self {
         Self {
             query_id,
@@ -77,6 +85,10 @@ impl QueryExecutionKey {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Cleanup leases are retained for execution integrations that own query-scoped external resources."
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QueryContextGeneration {
     Native(NonZeroU64),
@@ -86,6 +98,10 @@ pub struct QueryCleanupLease {
     release: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Cleanup lease methods are retained for execution integrations that own query-scoped external resources."
+)]
 impl QueryCleanupLease {
     /// Creates a query-scoped cleanup action for a consumer-owned resource.
     pub fn from_release(release: impl FnOnce() + Send + 'static) -> Self {
@@ -132,6 +148,10 @@ mod query_cleanup_lease_tests {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Query context fields are consumed by native execution integrations outside the backend lib test configuration."
+)]
 pub(crate) struct QueryContext {
     #[allow(dead_code)]
     pub(crate) query_id: QueryId,
@@ -158,11 +178,19 @@ pub(crate) struct QueryContext {
 struct RuntimeFilterQueryCancellationAction;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Lookup-fetcher lifecycle states are retained for connector lookup integrations outside the backend lib test configuration."
+)]
 pub enum LookupFetcherLifecycle {
     Exact(usize),
     Unknown,
 }
 
+#[allow(
+    dead_code,
+    reason = "Query context helpers are consumed by native execution integrations outside the backend lib test configuration."
+)]
 impl QueryContext {
     pub(crate) fn new(
         query_id: QueryId,
@@ -209,19 +237,11 @@ impl QueryContext {
 
     fn matches_execution(&self, key: QueryExecutionKey) -> bool {
         self.query_id == key.query_id
-            && matches!(
-                (self.execution_generation, key.generation),
-                (
-                    QueryContextGeneration::Native(_),
-                    QueryExecutionGeneration::Native(_)
-                )
-            )
             && match (self.execution_generation, key.generation) {
                 (
                     QueryContextGeneration::Native(current),
                     QueryExecutionGeneration::Native(requested),
                 ) => current == requested,
-                _ => false,
             }
     }
 
@@ -292,16 +312,15 @@ impl QueryContext {
         descs: &HashMap<i32, RowPositionDescriptor>,
     ) -> Result<(), String> {
         for (tuple_id, incoming) in descs {
-            if let Some(existing) = self.row_pos_descs.get(tuple_id) {
-                if existing.row_position_type != incoming.row_position_type
+            if let Some(existing) = self.row_pos_descs.get(tuple_id)
+                && (existing.row_position_type != incoming.row_position_type
                     || existing.row_source_slot != incoming.row_source_slot
                     || existing.fetch_ref_slots != incoming.fetch_ref_slots
-                    || existing.lookup_ref_slots != incoming.lookup_ref_slots
-                {
-                    return Err(format!(
-                        "conflicting row position descriptor for tuple_id={tuple_id}"
-                    ));
-                }
+                    || existing.lookup_ref_slots != incoming.lookup_ref_slots)
+            {
+                return Err(format!(
+                    "conflicting row position descriptor for tuple_id={tuple_id}"
+                ));
             }
         }
         Ok(())
@@ -440,11 +459,19 @@ pub struct NativeQueryExecutionResourceSnapshot {
     pub active_fragments: usize,
 }
 
+#[allow(
+    dead_code,
+    reason = "Fragment cancellation results are retained for native execution integrations outside the backend lib test configuration."
+)]
 pub(crate) struct FinstCancelResult {
     pub(crate) query_id: Option<QueryId>,
     pub(crate) finsts: Vec<UniqueId>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Query-context manager APIs are consumed by native execution integrations outside the backend lib test configuration."
+)]
 impl QueryContextManager {
     pub fn native_execution_resource_snapshot(&self) -> NativeQueryExecutionResourceSnapshot {
         let inner = self.inner.lock().expect("query context manager lock");
@@ -717,6 +744,10 @@ impl QueryContextManager {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "This internal constructor accepts the complete query registration contract before atomically installing context state."
+    )]
     fn get_or_register_internal_with_generation(
         &self,
         query_id: QueryId,
@@ -1252,7 +1283,7 @@ impl QueryContextManager {
         {
             context.cancelled_by_fe = true;
         }
-        RuntimeFilterQueryCancellationAction::default()
+        RuntimeFilterQueryCancellationAction
     }
 
     fn execute_runtime_filter_query_cancellation(
@@ -1263,7 +1294,10 @@ impl QueryContextManager {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "Legacy abort remains available to non-lifecycle native fragment test fixtures."
+    )]
     pub(crate) fn abort_query(&self, query_id: QueryId) -> Vec<UniqueId> {
         let (cancellation, finsts, exchange_ports) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
@@ -1727,9 +1761,9 @@ mod sender_error_tests {
 mod native_lifecycle_cleanup_tests {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
-    use super::{QueryContext, QueryContextManager, QueryContextManagerInner, QueryId};
+    use super::{QueryContextManager, QueryContextManagerInner, QueryId};
     use novarocks_types::UniqueId;
 
     fn test_manager() -> QueryContextManager {

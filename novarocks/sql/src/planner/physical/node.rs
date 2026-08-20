@@ -143,6 +143,14 @@ pub(crate) struct PhysicalPlanNode {
 }
 
 #[allow(dead_code)]
+#[expect(
+    private_interfaces,
+    reason = "The optimizer bridge exposes plan variants while payload construction remains internal to SQL planning."
+)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Physical plan payloads remain inline to avoid changing the established plan traversal representation."
+)]
 #[derive(Clone, Debug)]
 pub enum PhysicalPlanKind {
     Scan(PlanScanNode),

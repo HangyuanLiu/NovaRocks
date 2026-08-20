@@ -427,10 +427,13 @@ impl ReadTransaction for DuplicateRangeTransaction {
 
     async fn range(&mut self, request: &RangeRequest) -> Result<RangePage, StateStoreError> {
         Ok(RangePage {
-            records: (request.range.start <= self.record.key
-                && self.record.key < request.range.end)
-                .then(|| vec![self.record.clone(), self.record.clone()])
-                .unwrap_or_default(),
+            records: if request.range.start <= self.record.key
+                && self.record.key < request.range.end
+            {
+                vec![self.record.clone(), self.record.clone()]
+            } else {
+                Vec::new()
+            },
             continuation: None,
         })
     }

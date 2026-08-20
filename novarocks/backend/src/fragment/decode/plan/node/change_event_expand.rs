@@ -34,6 +34,10 @@ use novarocks_protocol::plan;
 use novarocks_spi::connector::ConnectorRowMutationEffect;
 use novarocks_types::SlotId;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen native boundary keeps independently validated inputs explicit."
+)]
 pub(super) fn lower_change_event_expand_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,

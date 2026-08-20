@@ -24,7 +24,7 @@
 
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -33,7 +33,7 @@ use novarocks_spi::state_store::StateStore;
 use novarocks_state_store::OperationId;
 use novarocks_state_store::coordination::{
     AcquireOutcome, AttemptId, CoordinationError, CoordinationErrorKind, LeaseFence, LeaseManager,
-    ResourceKey, WriteAdmission,
+    ResourceKey,
 };
 use uuid::Uuid;
 

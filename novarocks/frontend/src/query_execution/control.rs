@@ -213,6 +213,10 @@ impl QueryControlService {
     }
 
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution contract and lifecycle integration."
+    )]
     pub(crate) fn for_test() -> Self {
         Self::new(Arc::new(TestQueryControlPort))
     }
@@ -280,6 +284,10 @@ impl Drop for ActiveStatementLease {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged query-execution contract and lifecycle integration."
+)]
 struct TestQueryControlPort;
 
 #[cfg(test)]

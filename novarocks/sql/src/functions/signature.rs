@@ -58,6 +58,10 @@ pub(crate) enum TypeSpec {
     /// `DataType::Decimal128(_, _)`. (We don't yet propagate decimal scale
     /// derivation through the registry — the legacy `infer_*` path is still
     /// responsible for that until Step B.)
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     AnyDecimal128,
     /// `List<inner>`. `inner` may itself be `Any(...)` for polymorphic
     /// signatures such as `array_append(List<T>, T) -> List<T>`.

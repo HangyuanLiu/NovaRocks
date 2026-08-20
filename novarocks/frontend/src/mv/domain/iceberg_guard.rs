@@ -54,10 +54,18 @@ impl IcebergMvUserMutation {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn is_iceberg_mv_table_properties(props: &HashMap<String, String>) -> bool {
     props.contains_key(MV_DESCRIPTOR_PACKAGE_ID_PROP)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn reject_if_iceberg_mv_properties(
     target: &TargetBackend,
     props: &HashMap<String, String>,

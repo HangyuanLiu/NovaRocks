@@ -22,6 +22,10 @@ use crate::mv::domain::refresh::planning::{RefreshPlanContract, RefreshStateBase
 use crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision;
 use novarocks_catalog::identifier::TableIdentity;
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) struct RefreshExecutionObservation<'a> {
     pub(crate) backend: MvStorageEngine,
     pub(crate) mv_id: Option<i64>,
@@ -32,32 +36,64 @@ pub(crate) struct RefreshExecutionObservation<'a> {
 }
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) struct ValidatedRefreshExecution<'a> {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     contract: &'a RefreshPlanContract,
 }
 
 impl<'a> ValidatedRefreshExecution<'a> {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn decision(&self) -> ExecutableRefreshDecision {
         self.contract.decision
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn target(&self) -> &'a MvTarget {
         &self.contract.target
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn base_refs(&self) -> &'a [TableIdentity] {
         &self.contract.base_refs
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn state_baseline(&self) -> &'a RefreshStateBaseline {
         &self.contract.state_baseline
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn affected_partitions(&self) -> &'a AffectedTargetPartitions {
         &self.contract.affected_partitions
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn validate_refresh_execution<'a>(
     contract: &'a RefreshPlanContract,
     observation: &RefreshExecutionObservation<'_>,
@@ -154,6 +190,10 @@ pub(crate) fn validate_refresh_execution<'a>(
     Ok(ValidatedRefreshExecution { contract })
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn dispatch_refresh_decision<T, E>(
     decision: ExecutableRefreshDecision,
     skip_empty: impl FnOnce() -> Result<T, E>,
@@ -169,6 +209,10 @@ pub(crate) fn dispatch_refresh_decision<T, E>(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn unique_base_refs(source: &str, base_refs: &[TableIdentity]) -> Result<BTreeSet<String>, String> {
     let mut fqns = BTreeSet::new();
     for base_ref in base_refs {
@@ -182,6 +226,10 @@ fn unique_base_refs(source: &str, base_refs: &[TableIdentity]) -> Result<BTreeSe
     Ok(fqns)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn set_mismatch(label: &str, expected: &BTreeSet<String>, observed: &BTreeSet<String>) -> String {
     let missing = expected.difference(observed).cloned().collect::<Vec<_>>();
     let extra = observed.difference(expected).cloned().collect::<Vec<_>>();

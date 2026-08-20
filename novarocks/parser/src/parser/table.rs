@@ -485,8 +485,7 @@ fn range_values(parser: &mut StatementParser<'_, '_>) -> Result<(String, usize),
         range_tuple(parser)?;
         parser.consume_symbol(Symbol::Comma)?;
         range_tuple(parser)?;
-        let end = parser.consume_symbol(Symbol::RParen)?.end();
-        end
+        parser.consume_symbol(Symbol::RParen)?.end()
     };
     Ok((parser.source_slice(Span::new(start, end)).to_owned(), end))
 }

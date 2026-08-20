@@ -25,6 +25,10 @@ mod convert_tz;
 mod current_date;
 mod current_time;
 mod current_timestamp;
+#[expect(
+    clippy::module_inception,
+    reason = "The module name mirrors the SQL date-function namespace."
+)]
 mod date;
 mod date_add;
 mod date_format;

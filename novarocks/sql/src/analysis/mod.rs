@@ -59,6 +59,10 @@ pub struct SortItem {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The inline SQL plan payload avoids an allocation at the compiler handoff boundary."
+)]
 pub(crate) enum QueryBody {
     Select(ResolvedSelect),
     SetOperation(ResolvedSetOp),
@@ -315,10 +319,18 @@ pub enum ExprKind {
         /// Semantics resolved by the request's immutable function catalog.
         /// The optimizer bridge preserves this value instead of reclassifying
         /// by name from ambient process state.
+        #[expect(
+            private_interfaces,
+            reason = "The stable SQL shape intentionally carries a crate-private implementation detail."
+        )]
         volatility: crate::functions::FunctionVolatility,
     },
     /// Higher-order function lambda expression.
     LambdaFunction {
+        #[expect(
+            private_interfaces,
+            reason = "The stable SQL shape intentionally carries a crate-private implementation detail."
+        )]
         params: Vec<LambdaParam>,
         body: Box<TypedExpr>,
     },
@@ -387,6 +399,10 @@ pub enum ExprKind {
     #[allow(dead_code)]
     SubqueryPlaceholder {
         id: usize,
+        #[expect(
+            private_interfaces,
+            reason = "The stable SQL shape intentionally carries a crate-private implementation detail."
+        )]
         kind: SubqueryKind,
         data_type: DataType,
     },

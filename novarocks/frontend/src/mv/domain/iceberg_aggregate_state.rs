@@ -31,12 +31,20 @@ use novarocks_execution::exec::mv::aggregate_state::{
 };
 use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) struct IcebergAggregateMergeResult {
     pub(crate) delete_row_ids: Vec<String>,
     pub(crate) insert_chunks: Vec<Chunk>,
     pub(crate) new_total_rows: i64,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 struct AggregateStateMergeCoreResult {
     old_row_ids: BTreeSet<String>,
     touched_row_ids: BTreeSet<String>,
@@ -44,6 +52,10 @@ struct AggregateStateMergeCoreResult {
     new_total_rows: i64,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn merge_aggregate_target_state(
     layout: &SqlMvAggregatePhysicalLayout,
     old_chunks: &[Chunk],
@@ -71,6 +83,10 @@ pub(crate) fn merge_aggregate_target_state(
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn merge_aggregate_state_chunks_for_change_stream(
     old_chunks: &[Chunk],
     delta_chunks: &[Chunk],
@@ -84,6 +100,10 @@ pub(crate) fn merge_aggregate_state_chunks_for_change_stream(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn merge_aggregate_state_chunks_for_change_stream_with_pruning_limits(
     old_chunks: &[Chunk],
     delta_chunks: &[Chunk],
@@ -99,6 +119,10 @@ pub(crate) fn merge_aggregate_state_chunks_for_change_stream_with_pruning_limits
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn merge_aggregate_state_chunks_core(
     old_chunks: &[Chunk],
     delta_chunks: &[Chunk],
@@ -151,6 +175,10 @@ fn merge_aggregate_state_chunks_core(
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn build_aggregate_change_chunks(
     layout: &SqlMvAggregatePhysicalLayout,
     merge: IcebergAggregateMergeResult,
@@ -197,6 +225,10 @@ pub(crate) fn build_aggregate_change_chunks(
     Ok(chunks)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn build_aggregate_change_stream_chunks(
     layout: &SqlMvAggregatePhysicalLayout,
     old_chunks: &[Chunk],
@@ -226,6 +258,10 @@ fn build_aggregate_change_stream_chunks(
     Ok(chunks)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn append_change_op_to_physical_chunk(
     layout: &SqlMvAggregatePhysicalLayout,
     chunk: Chunk,
@@ -249,6 +285,10 @@ fn append_change_op_to_physical_chunk(
     record_batch_to_chunk(batch)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn validate_physical_aggregate_schema(
     layout: &SqlMvAggregatePhysicalLayout,
     batch: &RecordBatch,
@@ -313,6 +353,10 @@ fn validate_physical_aggregate_schema(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn delta_row_ids(
     layout: &SqlMvAggregatePhysicalLayout,
     delta_chunks: &[Chunk],
@@ -344,6 +388,10 @@ fn delta_row_ids(
     Ok(row_ids)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn physical_row_ids(
     layout: &SqlMvAggregatePhysicalLayout,
     chunks: &[Chunk],
@@ -375,6 +423,10 @@ fn physical_row_ids(
     Ok(row_ids)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn filter_physical_chunks_by_row_ids(
     layout: &SqlMvAggregatePhysicalLayout,
     chunks: &[Chunk],

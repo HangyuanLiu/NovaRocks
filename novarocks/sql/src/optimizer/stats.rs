@@ -382,6 +382,10 @@ pub(crate) fn derive_statistics(
         Operator::PhysicalHashJoin(join) => {
             let left_stats = child_statistics(memo, &expr.children, 0);
             let right_stats = child_statistics(memo, &expr.children, 1);
+            #[expect(
+                clippy::type_complexity,
+                reason = "The tuple mirrors the independent statistics facts returned to the estimator."
+            )]
             let eq_key_ndvs: Vec<(f64, f64, Confidence, Option<(ColumnId, ColumnId)>)> = join
                 .eq_conditions
                 .iter()
@@ -2685,7 +2689,7 @@ mod tests {
                     source: sql_test_scan_source(name),
                 },
                 alias: None,
-                columns: columns,
+                columns,
                 predicates: vec![],
                 required_columns: None,
                 variant_columns: vec![],

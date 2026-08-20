@@ -129,10 +129,10 @@ impl MvActivityGate {
         let mut state = lock(&self.inner);
         state.stopping = true;
         for entry in state.entries.values_mut() {
-            if let Some(active) = &entry.active {
-                if let Some(source) = &active.cancellation {
-                    let _ = source.request(QueryCancellationReason::ServerShutdown);
-                }
+            if let Some(active) = &entry.active
+                && let Some(source) = &active.cancellation
+            {
+                let _ = source.request(QueryCancellationReason::ServerShutdown);
             }
         }
     }

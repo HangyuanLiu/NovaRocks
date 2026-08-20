@@ -174,6 +174,10 @@ pub(crate) struct OptimizerOptions {
     /// blowup. Defaults to 5000.
     pub cbo_max_groups: usize,
     /// Wall-clock budget for the entire `optimize()` call (existing constant; documented here).
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub optimize_timeout: Duration,
     /// Runtime-filter build-side maximum size gate (bytes).
     /// Shuffle joins with a build side larger than this are skipped.
@@ -193,6 +197,10 @@ pub(crate) struct OptimizerOptions {
     pub rf_probe_min_selectivity: f64,
     /// Hard cap on runtime-filter descriptors emitted by one optimize call.
     /// Prevents complex plans from producing unbounded RF lists.
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     pub rf_max_count: usize,
     /// Whether probe runtime filters may be placed across shuffle exchanges at
     /// all. When true, crossing is further gated per-join-distribution by
@@ -414,6 +422,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn from_session_overrides_profile_and_syncs_backend_factor() {
         let mut settings = SessionOptimizerSettings::default();
         settings.cbo_broadcast_backend_count = Some(16.0);
@@ -442,6 +454,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn from_session_uses_engine_snapshot_when_set_unset() {
         let mut settings = SessionOptimizerSettings::default();
         settings.cbo_broadcast_backend_count = None;
@@ -461,6 +477,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn from_session_explicit_set_overrides_engine_snapshot() {
         // SET takes precedence over the engine-written snapshot.
         let mut settings = SessionOptimizerSettings::default();
@@ -544,6 +564,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn global_runtime_filter_defaults_enabled_and_honors_explicit_override() {
         let settings = SessionOptimizerSettings::default();
         assert!(settings.global_runtime_filter_enabled());
@@ -558,6 +582,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn mv_rewrite_enabled_defaults_to_true() {
         let settings = SessionOptimizerSettings::default();
         assert!(settings.mv_rewrite_enabled());
@@ -570,6 +598,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
+    )]
     fn connector_static_predicate_pushdown_defaults_enabled_and_honors_override() {
         let settings = SessionOptimizerSettings::default();
         assert!(settings.connector_static_predicate_pushdown_enabled());

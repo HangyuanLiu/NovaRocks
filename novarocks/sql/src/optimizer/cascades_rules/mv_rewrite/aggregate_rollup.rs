@@ -80,6 +80,10 @@ fn norm_agg(
 
 /// Decide whether (and how) the query aggregate can be answered from the MV.
 /// Returns None when not rewritable.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
+)]
 pub(crate) fn plan_rollup(
     query_group_by: &[ScalarId],
     query_aggregates: &[ScalarAggregateSpec],

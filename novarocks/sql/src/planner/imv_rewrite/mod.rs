@@ -36,6 +36,14 @@ pub(crate) fn opt_expr_to_plan(
 /// Intermediate result type used by closures passed to [`bridge_apply_result`].
 /// Mirrors [`RewriteResult`] but holds a [`LogicalPlanNode`] in the `Changed`
 /// variant so closures can work with plan-level types directly.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Rewrite results retain the logical plan inline because this internal handoff is short-lived and allocation-free."
+)]
+#[allow(
+    dead_code,
+    reason = "Rejected rewrite diagnostics remain part of the internal bridge contract for rule implementations enabled by other targets."
+)]
 pub(crate) enum PlanRewriteResult {
     Unchanged,
     Changed(crate::planner::logical::LogicalPlanNode),

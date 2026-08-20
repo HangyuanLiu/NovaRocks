@@ -302,6 +302,10 @@ fn build_target_locator_join(
     ))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Locator scan output binds several independently validated target and sequence identities."
+)]
 fn build_target_locator_scan(
     ext: &ImvExtension,
     input: &LocatorJoinInput,

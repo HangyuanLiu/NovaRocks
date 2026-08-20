@@ -73,12 +73,11 @@ pub(crate) fn cross_join_batches(
         }
     }
 
-    if !left_indices.is_empty() {
-        if let Some(batch) =
+    if !left_indices.is_empty()
+        && let Some(batch) =
             gather_join_batch(left, right, &left_indices, &right_indices, output_schema)?
-        {
-            output_batches.push(batch);
-        }
+    {
+        output_batches.push(batch);
     }
 
     Ok(output_batches)

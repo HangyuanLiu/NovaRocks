@@ -92,6 +92,10 @@ impl ConnectorWriteCommitInput {
     /// Extract the generic carrier from a completed write. Once any generic
     /// report is present every registered writer must contribute exactly one
     /// complete logical report.
+    #[allow(
+        dead_code,
+        reason = "The generic carrier extractor remains available to target-gated connector write completion paths."
+    )]
     pub(crate) fn try_extract(
         write_commit: &WriteCommitInput,
     ) -> Result<Option<Self>, DistributedQueryError> {
@@ -545,6 +549,10 @@ pub(crate) fn reassemble_connector_staged_report(
     Ok(report)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for native connector staged-report contract regression coverage."
+)]
 pub(crate) fn decode_connector_staged_report_frame(
     frame: &novarocks::ConnectorStagedReportFrame,
 ) -> Result<novarocks_spi::connector::ConnectorStagedReportFrame, DistributedQueryError> {
@@ -624,9 +632,7 @@ fn connector_writer_identity_from_native(
             "connector staged report binding incarnation",
         )?),
     };
-    let fragment_id = i32::try_from(writer.fragment_id).map_err(|_| {
-        contract_violation("connector staged report writer fragment id exceeds the SPI range")
-    })?;
+    let fragment_id = writer.fragment_id;
     Ok(ConnectorWriterIdentity::new(
         operation_id,
         novarocks_spi::connector::ConnectorWriteCohortId::from_bytes(connector_digest_bytes(
@@ -817,22 +823,18 @@ fn validate_connector_frame_identity(
             "connector staged report writer identity does not match its native owner".to_string(),
         );
     }
-    if let Some(execution_id) = expected_execution_id {
-        if writer.execution_query_id != query_id_to_be_bytes(execution_id)
-            || writer.execution_attempt_id != execution_id.attempt_id().get()
-        {
-            return Err(
-                "connector staged report belongs to a different query execution attempt"
-                    .to_string(),
-            );
-        }
+    if let Some(execution_id) = expected_execution_id
+        && (writer.execution_query_id != query_id_to_be_bytes(execution_id)
+            || writer.execution_attempt_id != execution_id.attempt_id().get())
+    {
+        return Err(
+            "connector staged report belongs to a different query execution attempt".to_string(),
+        );
     }
-    if let Some(fragment_id) = expected_fragment_id {
-        if i64::from(writer.fragment_id) != i64::from(fragment_id) {
-            return Err(
-                "connector staged report belongs to a different writer fragment".to_string(),
-            );
-        }
+    if let Some(fragment_id) = expected_fragment_id
+        && i64::from(writer.fragment_id) != i64::from(fragment_id)
+    {
+        return Err("connector staged report belongs to a different writer fragment".to_string());
     }
     Ok(())
 }

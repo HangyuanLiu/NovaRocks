@@ -126,7 +126,7 @@ mod tests {
             (mv_b.clone(), vec![mv_c.clone()]),
         ];
 
-        let err = validate_no_cycle_for_edges(&mv_c, &[mv_a.clone()], &existing)
+        let err = validate_no_cycle_for_edges(&mv_c, std::slice::from_ref(&mv_a), &existing)
             .expect_err("c -> a should form a cycle");
         assert_eq!(
             err,

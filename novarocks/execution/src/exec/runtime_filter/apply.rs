@@ -222,12 +222,12 @@ fn apply_dictionary_fold(
         return Err("runtime filter dictionary selection size mismatch".to_string());
     }
     let keys = dict.keys();
-    for row in 0..dict.len() {
-        if !keep[row] {
+    for (row, selected) in keep.iter_mut().enumerate().take(dict.len()) {
+        if !*selected {
             continue;
         }
         if dict.is_null(row) {
-            keep[row] = fold.null_accepts;
+            *selected = fold.null_accepts;
             continue;
         }
         let code = keys.value(row);
@@ -237,7 +237,7 @@ fn apply_dictionary_fold(
                 code, row
             )
         })?;
-        keep[row] = fold.accepts.get(code).copied().ok_or_else(|| {
+        *selected = fold.accepts.get(code).copied().ok_or_else(|| {
             format!(
                 "runtime filter dictionary code out of bounds: code={} values_len={}",
                 code,
@@ -261,6 +261,10 @@ fn filter_chunk_by_keep(chunk: Chunk, keep: Vec<bool>) -> Result<Option<Chunk>, 
 }
 
 /// Apply IN filters to a chunk and return the filtered chunk.
+#[allow(
+    dead_code,
+    reason = "The direct in-filter API remains available for compatibility callers."
+)]
 pub fn filter_chunk_by_in_filters(
     filters: &[Arc<RuntimeInFilter>],
     chunk: Chunk,
@@ -561,9 +565,10 @@ mod tests {
     use super::*;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::exec::runtime_filter::in_filter::RuntimeInFilterValues;
     use crate::exec::runtime_filter::{
         RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeBloomFilter, RuntimeFilterType, RuntimeInFilter,
-        RuntimeInFilterValues, RuntimeMembershipFilter, RuntimeMinMaxFilter,
+        RuntimeMembershipFilter, RuntimeMinMaxFilter,
     };
     use arrow::array::{
         Array, ArrayRef, DictionaryArray, Int32Array, LargeStringArray, StringArray,

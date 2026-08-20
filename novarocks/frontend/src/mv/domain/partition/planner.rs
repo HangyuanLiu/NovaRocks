@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(test)]
-use novarocks_sql::planning::mv::ApplyKeySource;
-
 use crate::mv::domain::model::{AffectedTargetPartitions, MvPartitionKey};
 use crate::mv::domain::partition::mapping::map_connector_partition_to_mv_key;
 use crate::mv::domain::persistence::schema::MvSchemaContract;

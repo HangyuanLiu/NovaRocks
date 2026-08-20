@@ -29,17 +29,14 @@ pub struct MaterializedViewDistribution {
     pub bucket_count: Option<u32>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum MaterializedViewRefreshPolicy {
+    #[default]
     Manual,
     AsyncOnChange,
-    AsyncInterval { interval_ms: i64 },
-}
-
-impl Default for MaterializedViewRefreshPolicy {
-    fn default() -> Self {
-        Self::Manual
-    }
+    AsyncInterval {
+        interval_ms: i64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

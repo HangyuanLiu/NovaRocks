@@ -178,7 +178,7 @@ mod tests {
         let val = names.iter().position(|n| *n == "imv-validation").unwrap();
         assert!(ak < pd && pd < val, "stage order: {names:?}");
         assert!(
-            p.rule_names().iter().any(|n| *n == "DerivePartitionSpec"),
+            p.rule_names().contains(&"DerivePartitionSpec"),
             "DerivePartitionSpec must be registered"
         );
     }
@@ -204,9 +204,7 @@ mod tests {
             "stage order: {names:?}"
         );
         assert!(
-            p.rule_names()
-                .iter()
-                .any(|n| *n == "BuildChangeStreamDescriptor"),
+            p.rule_names().contains(&"BuildChangeStreamDescriptor"),
             "BuildChangeStreamDescriptor must be registered"
         );
     }
@@ -231,7 +229,7 @@ mod tests {
         let p = build_imv_pipeline();
         let names = p.stage_names();
         assert!(
-            !names.iter().any(|n| *n == "imv-join-delta"),
+            !names.contains(&"imv-join-delta"),
             "imv-join-delta stage must be removed: {names:?}"
         );
         let union = names
@@ -255,7 +253,7 @@ mod tests {
         assert!(union < agg, "stage order: {names:?}");
         assert!(agg < pushdown, "stage order: {names:?}");
         assert!(
-            p.rule_names().iter().any(|n| *n == "RewriteJoinDelta"),
+            p.rule_names().contains(&"RewriteJoinDelta"),
             "RewriteJoinDelta must run inside imv-delta-pushdown"
         );
     }

@@ -180,6 +180,10 @@ impl NativeFragmentQueryRuntime {
 
     /// Legacy native admission retained for non-lifecycle test fixtures. The
     /// distributed backend always calls the attempt-aware variant above.
+    #[allow(
+        dead_code,
+        reason = "Legacy admission remains available to non-lifecycle native fragment test fixtures."
+    )]
     pub fn prepare_admission(
         &self,
         query_id: QueryId,
@@ -208,6 +212,10 @@ impl NativeFragmentQueryRuntime {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Legacy registration remains available to non-lifecycle native fragment test fixtures."
+    )]
     pub fn register_fragment(
         &self,
         query_id: QueryId,
@@ -226,6 +234,10 @@ impl NativeFragmentQueryRuntime {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Legacy cancellation remains available to non-lifecycle native fragment test fixtures."
+    )]
     pub fn cancel_query(&self, query_id: QueryId, reason: String) -> Vec<UniqueId> {
         self.manager.cancel_query(query_id, reason)
     }
@@ -264,6 +276,10 @@ impl NativeFragmentQueryRuntime {
         self.publish_resource_snapshot();
     }
 
+    #[allow(
+        dead_code,
+        reason = "Legacy unregistration remains available to non-lifecycle native fragment test fixtures."
+    )]
     pub fn unregister_fragment(&self, fragment_instance_id: UniqueId) {
         self.manager.unregister_finst(fragment_instance_id);
     }

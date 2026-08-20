@@ -26,9 +26,8 @@ use novarocks_frontend::dml::{
     OperationTarget, StateStoreOperationJournal, WriteExecutor, WriteTransactionSpec,
 };
 use novarocks_spi::connector::{
-    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorWriteAbortOutcome,
-    ConnectorWriteReceipt, ExternalMutationEffect, ExternalMutationFinalization,
-    ExternalMutationOutcome,
+    ConnectorWriteAbortOutcome, ConnectorWriteReceipt, ExternalMutationEffect,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use novarocks_spi::state_store::{FeDeploymentView, StateStore};
 use novarocks_state_store::{

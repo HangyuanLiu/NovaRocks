@@ -562,7 +562,7 @@ mod tests {
     use crate::planner::payload::{
         AggregateCall, PlanFilterNode, PlanLimitNode, PlanProjectNode, PlanScanNode,
     };
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
 
     fn check_preconditions(
         where_pred: &TypedExpr,

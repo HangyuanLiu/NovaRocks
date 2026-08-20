@@ -53,7 +53,7 @@ impl<T: ?Sized> AmbiguousIfClone<()> for T {
     const TOKEN: () = ();
 }
 
-impl<T: ?Sized + Clone> AmbiguousIfClone<NegativeImplMarker> for T {
+impl<T: Clone> AmbiguousIfClone<NegativeImplMarker> for T {
     const TOKEN: () = ();
 }
 
@@ -77,16 +77,18 @@ impl<T: ?Sized> AmbiguousIfDeserializeOwned<()> for T {
     const TOKEN: () = ();
 }
 
-impl<T: ?Sized + serde::de::DeserializeOwned> AmbiguousIfDeserializeOwned<NegativeImplMarker>
-    for T
-{
+impl<T: serde::de::DeserializeOwned> AmbiguousIfDeserializeOwned<NegativeImplMarker> for T {
     const TOKEN: () = ();
 }
 
+#[allow(
+    path_statements,
+    reason = "These associated-constant references are compile-time negative trait-contract assertions."
+)]
 const _: () = {
-    let _ = <SqlAnalyzedQuery as AmbiguousIfClone<_>>::TOKEN;
-    let _ = <SqlAnalyzedQuery as AmbiguousIfSerialize<_>>::TOKEN;
-    let _ = <SqlAnalyzedQuery as AmbiguousIfDeserializeOwned<_>>::TOKEN;
+    <SqlAnalyzedQuery as AmbiguousIfClone<_>>::TOKEN;
+    <SqlAnalyzedQuery as AmbiguousIfSerialize<_>>::TOKEN;
+    <SqlAnalyzedQuery as AmbiguousIfDeserializeOwned<_>>::TOKEN;
 };
 
 struct EmptyCatalog;

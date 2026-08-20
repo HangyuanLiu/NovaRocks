@@ -30,6 +30,10 @@ use crate::mv::domain::refresh::target_apply::{
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_sql::planning::mv::{MV_BRANCH_ID_COLUMN_NAME, MV_HIDDEN_APPLY_KEY_COLUMN_NAME};
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn prepare_projection_full_read_sql(
     select_sql: &str,
     pin: &RefreshSnapshotPin,
@@ -53,6 +57,10 @@ pub(crate) fn prepare_projection_full_read_sql(
     iceberg_mv_physical_select_sql(&statement.to_string())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn prepare_projection_first_refresh_chunks<F>(
     select_sql: &str,
     pin: &RefreshSnapshotPin,
@@ -68,6 +76,10 @@ where
     read(&physical_sql)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn prepare_union_projection_full_read_sql(
     select_sql: &str,
     branch_count: usize,
@@ -122,6 +134,10 @@ pub(crate) fn prepare_union_projection_full_read_sql(
     Ok(statement.to_string())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn validate_union_projection_set_expr(
     set_expr: &sqlparser::ast::SetExpr,
     branch_count: usize,
@@ -180,6 +196,10 @@ fn validate_union_projection_set_expr(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn append_union_projection_hidden_columns(
     set_expr: &mut sqlparser::ast::SetExpr,
     next_branch_id: &mut i32,
@@ -223,6 +243,10 @@ fn append_union_projection_hidden_columns(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn prepare_union_projection_first_refresh_chunks<F>(
     select_sql: &str,
     branch_count: usize,

@@ -90,10 +90,18 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) struct DefinitionLoadCounterGuard;
 
 #[cfg(test)]
 impl DefinitionLoadCounterGuard {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn install(counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
         DEFINITION_LOAD_COUNTER.with(|slot| {
             assert!(

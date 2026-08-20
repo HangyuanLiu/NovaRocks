@@ -69,6 +69,10 @@ struct ScanSourceRuntimeFilterExecution {
     ordered_live_consumers: NativeOrderedLiveConsumerSet,
 }
 
+#[allow(
+    dead_code,
+    reason = "Native scan source test constructors are retained for runtime-filter integration coverage."
+)]
 impl ScanSourceFactory {
     pub(crate) fn new_native(
         scan: ScanNode,
@@ -446,11 +450,7 @@ impl ScanSourceOperator {
     fn propagate_native_ordered_live_consumers(&mut self) {
         let mut runners = self.async_runners.lock().expect("scan runner lock");
         for runner in runners.iter_mut() {
-            runner.set_native_ordered_live_consumers(
-                self.native_ordered_live_consumers
-                    .as_ref()
-                    .map(NativeOrderedLiveConsumerSet::clone),
-            );
+            runner.set_native_ordered_live_consumers(self.native_ordered_live_consumers.clone());
         }
     }
 
@@ -931,6 +931,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as a dictionary scan regression fixture."
+    )]
     struct DictionaryScanOp;
 
     impl ScanOp for DictionaryScanOp {

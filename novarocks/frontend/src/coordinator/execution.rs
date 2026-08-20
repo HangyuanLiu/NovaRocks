@@ -37,9 +37,9 @@ use crate::query_execution::contract::{
     DistributedQueryErrorKind, DistributedQueryIntent, DistributedQueryOutcome,
     DistributedQueryRequest, ProfileTerminalBuilder,
 };
-use crate::query_execution::lifecycle_plan::{
-    QueryInitOptions, QueryLifecycleLease, QueryLifecycleTarget,
-};
+#[cfg(test)]
+use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
+use crate::query_execution::lifecycle_plan::{QueryInitOptions, QueryLifecycleLease};
 use crate::query_execution::write::WriteTerminalBuilder;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use novarocks_protocol::lifecycle::{
@@ -111,6 +111,10 @@ impl QueryIdSource for UniqueQueryIdSource {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Shared coordinator test fixture provides a deterministic query id source."
+)]
 struct FixedQueryIdSource(QueryId);
 
 #[cfg(test)]
@@ -121,6 +125,10 @@ impl QueryIdSource for FixedQueryIdSource {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Shared coordinator test fixture provides a no-op connector binding dispatcher."
+)]
 struct TestConnectorBindingDispatcher;
 
 #[cfg(test)]
@@ -211,15 +219,27 @@ impl ConnectorBindingInstallObserver for FrontendConnectorBindingInstallObserver
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained as the coordinator-owned live topology test fixture."
+)]
 pub(crate) struct FrontendLiveBackendTopology {
     state: Mutex<FrontendLiveBackendTopologyState>,
 }
 
+#[allow(
+    dead_code,
+    reason = "State is retained solely by the coordinator-owned live topology test fixture."
+)]
 struct FrontendLiveBackendTopologyState {
     revision: u64,
     live: Vec<LiveBackendTarget>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained as the coordinator-owned live topology test fixture API."
+)]
 impl FrontendLiveBackendTopology {
     pub(crate) fn new() -> Self {
         Self {
@@ -266,6 +286,10 @@ impl FrontendReportEndpointBinding {
     }
 
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "Coordinator test fixture builds the report endpoint from a socket address."
+    )]
     fn from_socket_addr(endpoint: SocketAddr) -> Self {
         Self::new(endpoint.ip().to_string(), endpoint.port())
     }
@@ -302,6 +326,10 @@ impl crate::common::backend_topology::CoordinatorReportEndpointSink
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Coordinator test fixture models fixed and sequenced backend services."
+)]
 enum BackendServicesSource {
     Fixed {
         scheduler: FrontendFragmentScheduler,
@@ -327,14 +355,26 @@ struct QueryBackendServices {
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Coordinator test fixture provides an immediately ready lifecycle transport."
+)]
 pub(crate) fn ready_lifecycle_transport_for_test() -> Arc<dyn QueryLifecycleTransport> {
     Arc::new(ReadyLifecycleTransportForTest)
 }
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Coordinator test fixture provides the ready lifecycle transport implementation."
+)]
 struct ReadyLifecycleTransportForTest;
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "Coordinator test fixture stores ready control events for lifecycle assertions."
+)]
 struct ReadyLifecycleSessionForTest {
     events: Mutex<VecDeque<QueryControlEvent>>,
 }
@@ -597,6 +637,10 @@ fn build_lifecycle_config(
 }
 
 impl FrontendDistributedQueryCoordinator {
+    #[expect(
+        private_interfaces,
+        reason = "The public composition entrypoint receives the frontend-owned native runtime."
+    )]
     pub fn new(
         advertised_report_host: String,
         configured_report_port: u16,
@@ -631,6 +675,10 @@ impl FrontendDistributedQueryCoordinator {
     }
 
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "Coordinator test constructor retains explicit dependency injection for lifecycle coverage."
+    )]
     pub(crate) fn new_for_test(
         query_id: QueryId,
         report_endpoint: SocketAddr,
@@ -656,6 +704,14 @@ impl FrontendDistributedQueryCoordinator {
     }
 
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "Coordinator test constructor retains an injected topology for lifecycle coverage."
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The test constructor keeps independent topology and lifecycle fixtures explicit."
+    )]
     pub(crate) fn new_for_test_with_topology(
         query_id: QueryId,
         report_endpoint: SocketAddr,
@@ -690,6 +746,10 @@ impl FrontendDistributedQueryCoordinator {
     }
 
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "Coordinator test constructor retains sequenced backends for retry coverage."
+    )]
     pub(crate) fn new_for_test_with_backend_sequence(
         query_id: QueryId,
         report_endpoint: SocketAddr,
@@ -1061,14 +1121,10 @@ impl FrontendDistributedQueryCoordinator {
             return Err(failed(message));
         }
 
-        let terminal_set = match query_lifecycle_lease
+        let terminal_set = query_lifecycle_lease
             .take()
             .expect("query lifecycle lease is present through query completion")
-            .finalize()
-        {
-            Ok(terminal_set) => terminal_set,
-            Err(error) => return Err(error),
-        };
+            .finalize()?;
         if !terminal_set.is_success() {
             return Err(failed(
                 "query terminal snapshot set contains a failed, cancelled, or incomplete fragment",

@@ -19,6 +19,10 @@
 
 use std::collections::BTreeMap;
 
+#[allow(
+    dead_code,
+    reason = "Typed Iceberg policy retains full provider commit facts for target-gated write paths."
+)]
 pub(crate) struct IcebergWriteCommitPolicy {
     pub(crate) base_snapshot_id: Option<i64>,
     pub(crate) base_snapshot_map: BTreeMap<String, i64>,
@@ -26,6 +30,10 @@ pub(crate) struct IcebergWriteCommitPolicy {
     pub(crate) snapshot_properties: BTreeMap<String, String>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Typed Iceberg validation policy remains part of the captured write transaction contract."
+)]
 pub(crate) struct IcebergWriteValidationPolicy {
     pub(crate) require_v3_for_branch: bool,
 }
@@ -34,6 +42,10 @@ pub(crate) enum IcebergWriteSource {
     CoordinatedPlan,
 }
 
+#[allow(
+    dead_code,
+    reason = "The captured write transaction spec retains all policy facets for target-gated execution paths."
+)]
 pub(crate) struct IcebergWriteTransactionSpec {
     pub(crate) is_overwrite: bool,
     pub(crate) attempt_id: String,

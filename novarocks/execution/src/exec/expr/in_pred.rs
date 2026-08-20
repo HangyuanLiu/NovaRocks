@@ -215,6 +215,10 @@ fn eq_signed_integer_input_with_candidate(
     Ok(Some(builder.finish()))
 }
 
+#[expect(
+    clippy::if_same_then_else,
+    reason = "Nested NULL semantics keep explicit branches for SQL three-valued logic."
+)]
 fn eq_with_candidate(
     array: &ArrayRef,
     candidate: &ArrayRef,
@@ -607,7 +611,7 @@ fn eq_utf8_json_with_numeric_candidate(
         };
         let matched = json_value_from_text_or_variant(input.value(row))
             .map(|lhs_json| lhs_json == candidate_json)
-            .unwrap_or_else(|| input.value(row) == candidate_json.to_string());
+            .unwrap_or_else(|| input.value(row) == candidate_json);
         builder.append_value(matched);
     }
     Ok(builder.finish())
@@ -681,6 +685,10 @@ fn normalize_scalar_candidate_types(
     Ok((left, right))
 }
 
+#[expect(
+    clippy::if_same_then_else,
+    reason = "Nested NULL semantics keep explicit branches for SQL three-valued logic."
+)]
 fn compare_values_for_in(
     left: &ArrayRef,
     left_idx: usize,
@@ -791,9 +799,9 @@ fn compare_list_values_for_in(
     let mut result = Some(true);
     for offset in 0..l_len {
         let item = compare_values_for_in(
-            &l_values,
+            l_values,
             l_start + offset,
-            &r_values,
+            r_values,
             r_start + offset,
             lhs_is_literal_like,
             single_candidate,

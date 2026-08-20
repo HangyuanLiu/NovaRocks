@@ -33,7 +33,7 @@ use super::common::{binary_value_or_empty, row_count, row_index};
 
 thread_local! {
     static HLL_REGISTERS: RefCell<[u8; HLL_REGISTERS_COUNT]> =
-        RefCell::new([0u8; HLL_REGISTERS_COUNT]);
+        const { RefCell::new([0u8; HLL_REGISTERS_COUNT]) };
 }
 
 pub fn approx_count_distinct_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {

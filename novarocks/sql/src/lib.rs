@@ -41,9 +41,6 @@ pub(crate) mod analyzer;
 pub(crate) mod explain;
 pub(crate) mod planner;
 
-pub(crate) use parser::ast::{
-    ColumnAggregation, Literal, TableColumnDef, TableKeyDesc, TableKeyKind,
-};
 #[cfg(test)]
 mod common_tests {
     use arrow::datatypes::DataType;

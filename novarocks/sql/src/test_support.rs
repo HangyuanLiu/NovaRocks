@@ -508,7 +508,7 @@ fn native_hash_exchange_plan() -> Result<DistributedPlan, String> {
         cte_id: None,
         cte_exchange_nodes: Vec::new(),
     };
-    let mut builder = crate::planner::distributed::test_support::DistributedPlanDraftBuilder::new(
+    let builder = crate::planner::distributed::test_support::DistributedPlanDraftBuilder::new(
         vec![source, target],
         Some(1),
         vec![FragmentEdge {

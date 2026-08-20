@@ -164,6 +164,14 @@ where
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "The gRPC validation boundary returns tonic status directly."
+)]
+#[allow(
+    dead_code,
+    reason = "Retained for direct native wire validation callers."
+)]
 pub(crate) fn validate_stage_fragments_request_wire(bytes: &[u8]) -> Result<(), Status> {
     match scan_stage_fragments_request(bytes) {
         Ok(()) => Ok(()),

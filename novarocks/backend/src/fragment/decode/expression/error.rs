@@ -28,6 +28,10 @@ pub(crate) struct NativeExpressionLeafDecodeError {
     detail: String,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 impl NativeExpressionLeafDecodeError {
     pub(crate) fn at_collection(kind: ProtocolErrorKind, detail: impl fmt::Display) -> Self {
         Self {

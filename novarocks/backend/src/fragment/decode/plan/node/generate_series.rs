@@ -82,7 +82,7 @@ pub(super) fn lower_generate_series_node(
         Some(ctx),
     )?;
 
-    let output_columns = vec![bigint_output_column(
+    let output_columns = [bigint_output_column(
         generate_series.output_column_id,
         if generate_series.column_name.is_empty() {
             "generate_series"

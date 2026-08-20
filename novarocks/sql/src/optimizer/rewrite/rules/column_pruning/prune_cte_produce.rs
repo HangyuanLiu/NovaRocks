@@ -69,10 +69,10 @@ impl LogicalRewriteRule for PruneCTEProduceColumns {
             .filter(|column| needed.contains(&column.column_id))
             .cloned()
             .collect::<Vec<_>>();
-        if output_columns.is_empty() {
-            if let Some(first) = original_output_columns.first().cloned() {
-                output_columns.push(first);
-            }
+        if output_columns.is_empty()
+            && let Some(first) = original_output_columns.first().cloned()
+        {
+            output_columns.push(first);
         }
         if output_columns.len() == original_len {
             return Ok(RewriteResult::Unchanged);

@@ -71,6 +71,10 @@ pub(crate) struct DecodedNode {
     pub(crate) layout: Layout,
     pub(crate) output_schema: ChunkSchemaRef,
 }
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific native integration and regression coverage."
+)]
 pub(super) fn collect_scan_assignment_kinds(
     root: &plan::DistributedNode,
     root_path: FieldPath,
@@ -1611,6 +1615,10 @@ mod tests {
     use novarocks_protocol::{common, expr, plan};
     use novarocks_types::SlotId;
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     struct DummyScanOp;
 
     impl novarocks_execution::exec::node::scan::ScanOp for DummyScanOp {
@@ -1693,6 +1701,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn null_literal(data_type: DataType) -> expr::Expr {
         expr::Expr {
             r#type: Some(type_desc(&data_type)),
@@ -1808,6 +1820,10 @@ mod tests {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn one_col_values_node_typed(
         node_id: i32,
         column_id: u32,
@@ -1871,6 +1887,10 @@ mod tests {
         decode_node(node, &mut arena, &NativePlanDecodeContext::default()).expect("lower node")
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn decode_error(
         node: &plan::DistributedNode,
     ) -> crate::fragment::decode::plan::error::NativeFragmentDecodeError {
@@ -1882,6 +1902,10 @@ mod tests {
         .expect_err("invalid node must fail")
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for target-specific native integration and regression coverage."
+    )]
     fn assert_children_error(node: &plan::DistributedNode) {
         let error = decode_error(node);
         let protocol = error.protocol().expect("protocol error");

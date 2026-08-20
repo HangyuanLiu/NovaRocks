@@ -271,8 +271,8 @@ mod tests {
     use crate::analysis::{BinOp, ExprKind, OutputColumn, TypedExpr};
     use crate::optimizer::operator::{LogicalJoinOp, ScanOp};
     use crate::optimizer::rewrite::context::RewriteContext;
-    use crate::optimizer::scalar::{self, ScalarArena};
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::optimizer::scalar::ScalarArena;
+    use crate::planner::table::TableDef;
     use novarocks_catalog::schema::ColumnDef;
 
     fn make_ctx(arena: ScalarArena) -> RewriteContext {

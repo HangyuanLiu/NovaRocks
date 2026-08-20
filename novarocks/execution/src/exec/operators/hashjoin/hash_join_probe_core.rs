@@ -144,7 +144,15 @@ pub(crate) struct HashJoinProbeCore {
     out_probe_timer: Option<CounterRef>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Probe helpers are retained for join-shape coverage and native runtime-filter integration."
+)]
 impl HashJoinProbeCore {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The probe core constructor owns the complete join plan contract."
+    )]
     pub(crate) fn new_native(
         arena: Arc<ExprArena>,
         join_type: JoinType,
@@ -714,6 +722,10 @@ impl HashJoinProbeCore {
         Ok(newly_marked)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Residual-match bookkeeping is kept explicit to avoid a mutable shared state bundle."
+    )]
     fn compact_null_aware_selection(
         &mut self,
         probe: &Chunk,
@@ -740,6 +752,10 @@ impl HashJoinProbeCore {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Cross-product probing keeps its independently-owned buffers explicit."
+    )]
     fn compact_cross_selection_in_chunks(
         &mut self,
         probe: &Chunk,
@@ -1138,16 +1154,16 @@ impl HashJoinProbeCore {
             self.record_search_ns(search_start);
             self.lookup_hit_rows = self.lookup_hit_rows.saturating_add(stats.lookup_hit_rows);
             self.lookup_miss_rows = self.lookup_miss_rows.saturating_add(stats.lookup_miss_rows);
-            if !selection.is_empty() {
-                if let Some(pred) = self.residual_predicate {
-                    self.residual_rows_checked = self
-                        .residual_rows_checked
-                        .saturating_add(stats.lookup_hit_rows);
-                    self.residual_group_rows_total = self
-                        .residual_group_rows_total
-                        .saturating_add(selection.len() as u64);
-                    self.compact_selection_by_residual(&probe, build_chunk, &mut selection, pred)?;
-                }
+            if !selection.is_empty()
+                && let Some(pred) = self.residual_predicate
+            {
+                self.residual_rows_checked = self
+                    .residual_rows_checked
+                    .saturating_add(stats.lookup_hit_rows);
+                self.residual_group_rows_total = self
+                    .residual_group_rows_total
+                    .saturating_add(selection.len() as u64);
+                self.compact_selection_by_residual(&probe, build_chunk, &mut selection, pred)?;
             }
 
             let probe_finalize = finalize_probe_rows(probe.len(), &selection, false, "outer join")?;
@@ -1171,28 +1187,26 @@ impl HashJoinProbeCore {
                 output_batches.extend(gathered.batches);
             }
 
-            if output_unmatched_probe {
-                if !unmatched.is_empty() {
-                    let output_start = std::time::Instant::now();
-                    let batch = if self.probe_is_left {
-                        crate::exec::operators::hashjoin::join_hash_map::gather::gather_left_with_null_right(
+            if output_unmatched_probe && !unmatched.is_empty() {
+                let output_start = std::time::Instant::now();
+                let batch = if self.probe_is_left {
+                    crate::exec::operators::hashjoin::join_hash_map::gather::gather_left_with_null_right(
                             &probe,
                             &unmatched,
                             &self.right_chunk_schema.arrow_schema_ref(),
                             &output_schema,
                         )?
-                    } else {
-                        crate::exec::operators::hashjoin::join_hash_map::gather::gather_null_left_with_right(
+                } else {
+                    crate::exec::operators::hashjoin::join_hash_map::gather::gather_null_left_with_right(
                             &probe,
                             &unmatched,
                             &self.left_chunk_schema.arrow_schema_ref(),
                             &output_schema,
                         )?
-                    };
-                    self.record_out_probe_ns(output_start);
-                    if let Some(batch) = batch {
-                        output_batches.push(batch);
-                    }
+                };
+                self.record_out_probe_ns(output_start);
+                if let Some(batch) = batch {
+                    output_batches.push(batch);
                 }
             }
         }
@@ -1901,6 +1915,10 @@ mod tests {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as a focused left-semi join regression fixture."
+    )]
     fn left_semi_probe_core() -> HashJoinProbeCore {
         let left_schema = schema_kv("lk", "lv");
         let right_schema = schema_kv("rk", "rw");
@@ -1928,6 +1946,10 @@ mod tests {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as a focused hash-join state regression assertion."
+    )]
     fn assert_probe_core_unloaded(core: &HashJoinProbeCore) {
         assert!(!core.is_build_loaded());
         assert!(core.build_requirements.is_none());

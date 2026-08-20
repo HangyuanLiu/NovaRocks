@@ -61,6 +61,10 @@ use crate::exec::node::values::ValuesNode;
 pub type ExecResult = Result<Chunk, String>;
 pub type BoxedExecIter = Box<dyn Iterator<Item = ExecResult> + Send>;
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Execution nodes intentionally retain typed plans inline to avoid indirection during lowering."
+)]
 #[derive(Clone, Debug)]
 pub enum ExecNodeKind {
     AssertNumRows(AssertNumRowsNode),

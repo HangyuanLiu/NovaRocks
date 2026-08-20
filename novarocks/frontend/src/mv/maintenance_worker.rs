@@ -73,8 +73,20 @@ pub(crate) struct FrontendMaintenancePassReport {
 
 #[derive(Clone, Debug)]
 pub(crate) struct FrontendMaintenanceAttemptReport {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) mv_id: i64,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) target: MaintenanceTarget,
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) execution: MaintenanceExecutionReport,
 }
 
@@ -118,6 +130,10 @@ impl FrontendMaintenanceWorker {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged materialized-view integration and recovery wiring."
+    )]
     pub(crate) fn config(&self) -> MaintenanceCoordinatorConfig {
         self.coordinator
             .lock()

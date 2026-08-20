@@ -85,7 +85,7 @@ impl Rule for JoinCommutativity {
         vec![NewExpr {
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: commute_join_kind(op.join_type),
-                condition: op.condition.clone(),
+                condition: op.condition,
             }),
             children: vec![right, left],
         }]

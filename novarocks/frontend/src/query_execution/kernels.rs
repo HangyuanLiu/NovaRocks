@@ -143,6 +143,10 @@ impl QueryPreparationKernel {
         &self.query_execution
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for query-preparation callers that require the admitted topology service."
+    )]
     pub(crate) fn backend_topology(&self) -> &BackendTopologyService {
         &self.backend_topology
     }
@@ -275,6 +279,10 @@ impl CatalogCommandKernel {
 /// The backend is injected directly; the obsolete string-keyed
 /// `ConnectorRegistry` is intentionally not represented here.
 #[derive(Clone)]
+#[allow(
+    dead_code,
+    reason = "The MV kernel keeps all owned ports explicit for refresh and activation paths compiled in other targets."
+)]
 pub struct MvExecutionKernel {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -287,6 +295,10 @@ pub struct MvExecutionKernel {
     query_execution: QueryExecutionService,
 }
 
+#[allow(
+    dead_code,
+    reason = "MV kernel accessors are retained as narrow ports for refresh and activation paths compiled in other targets."
+)]
 impl MvExecutionKernel {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -557,6 +569,10 @@ impl SessionCatalogResolver {
 
 /// Parser-private command family selected by Core syntax classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "The typed command-family vocabulary is retained for the staged frontend command-router cutover."
+)]
 pub(crate) enum CommandDomain {
     Query,
     Dml,
@@ -573,11 +589,19 @@ pub(crate) enum CommandDomain {
 /// must hand this token back to the matching typed Core capability rather than
 /// reparsing SQL or using an arbitrary-SQL executor.
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "The normalized command token is retained for the staged frontend command-router cutover."
+)]
 pub(crate) struct PreparedCommand {
     domain: CommandDomain,
     normalized_sql: String,
 }
 
+#[allow(
+    dead_code,
+    reason = "The normalized command token accessors are retained for the staged frontend command-router cutover."
+)]
 impl PreparedCommand {
     pub(crate) const fn domain(&self) -> CommandDomain {
         self.domain
@@ -590,6 +614,10 @@ impl PreparedCommand {
 
 /// Pure statement-family classifier.  It performs no catalog lookup, config
 /// read, topology snapshot, or recovery action.
+#[allow(
+    dead_code,
+    reason = "The typed command classifier is retained for the staged frontend command-router cutover."
+)]
 pub(crate) fn classify_command(sql: &str) -> Result<PreparedCommand, String> {
     let normalized_sql = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
     let upper = normalized_sql.trim_start().to_ascii_uppercase();
@@ -655,10 +683,18 @@ pub(crate) fn classify_command(sql: &str) -> Result<PreparedCommand, String> {
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Helper retained solely by the staged typed command classifier."
+)]
 fn starts_with_any(sql: &str, prefixes: &[&str]) -> bool {
     prefixes.iter().any(|prefix| sql.starts_with(prefix))
 }
 
+#[allow(
+    dead_code,
+    reason = "Helper retained solely by the staged typed command classifier."
+)]
 fn is_query_prefix(sql: &str) -> bool {
     let mut words = sql.split_whitespace();
     match words.next() {

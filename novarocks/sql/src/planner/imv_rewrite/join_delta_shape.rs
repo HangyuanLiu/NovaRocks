@@ -265,7 +265,6 @@ fn subtree_has_delta_marker_or_scan(plan: &LogicalPlanNode) -> bool {
 fn sql_scan_source(source: &ScanSource) -> Option<&SqlScanSource> {
     match source {
         ScanSource::Sql(source) => Some(source),
-        _ => None,
     }
 }
 
@@ -302,7 +301,7 @@ fn is_supported_marker_input(plan: &LogicalPlanNode) -> bool {
 mod tests {
     use super::*;
     use crate::planner::logical::*;
-    use crate::planner::payload::*;
+
     use arrow::datatypes::DataType;
 
     use crate::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
@@ -479,7 +478,7 @@ mod tests {
     fn project_with_items(input: LogicalPlanNode, items: Vec<ProjectItem>) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
-                items: items,
+                items,
                 output_qualifier: None,
             }),
             vec![input],

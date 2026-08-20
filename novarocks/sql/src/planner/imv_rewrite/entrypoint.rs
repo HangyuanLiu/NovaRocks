@@ -18,9 +18,6 @@
 //! Entrypoint for the IMV rewrite pipeline. See
 //! docs/design/specs/2026-05-26-incremental-mv-optimizer-foundation-design.md.
 
-#[cfg(test)]
-use crate::planner::vocabulary::ApplyKeySource;
-
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -458,32 +455,56 @@ pub(crate) mod tests {
     use crate::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::binding::{SqlTableBindingId, SqlTableBindingScopeId};
+
     use crate::column_id::{ColumnId, ColumnRefFactory};
+    #[allow(
+        unused_imports,
+        reason = "Used by package-level IMV rewrite tests that are not compiled in the workspace feature set."
+    )]
     use crate::common::ImvVersionRef;
     use crate::optimizer::opt_expr::OptExpr;
     use crate::optimizer::rewrite::context::RewriteContext;
     use crate::optimizer::rewrite::phase::RewritePhase;
+    #[allow(
+        unused_imports,
+        reason = "Used by package-level IMV rewrite tests that are not compiled in the workspace feature set."
+    )]
     use crate::optimizer::rewrite::registry::query_rewrite_pipeline;
     use crate::optimizer::rewrite::result::RewriteResult;
     use crate::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
     use crate::optimizer::scalar::ScalarArena;
     use crate::planner::imv_rewrite::action_column::ImvActionColumn;
+    #[allow(
+        unused_imports,
+        reason = "Used by package-level IMV rewrite tests that are not compiled in the workspace feature set."
+    )]
     use crate::planner::imv_rewrite::annotation::ImvPartitionAnnotation;
     use crate::planner::imv_rewrite::change_stream::AggregateChangeStreamShape;
     use crate::planner::imv_rewrite::marker::plan_contains_imv_marker;
+    #[allow(
+        unused_imports,
+        reason = "Used by package-level IMV rewrite tests that are not compiled in the workspace feature set."
+    )]
     use crate::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
-    use crate::planner::logical::*;
+    #[allow(
+        unused_imports,
+        reason = "Used by package-level IMV rewrite tests that are not compiled in the workspace feature set."
+    )]
+    use crate::planner::logical::LogicalImvVersionNode;
     use crate::planner::logical::{
         LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode, LogicalUnionNode,
     };
-    use crate::planner::payload::*;
+
     use crate::planner::payload::{
         AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode, PlanValuesNode,
     };
     use crate::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
     };
+    #[allow(
+        unused_imports,
+        reason = "Used by package-level IMV rewrite tests that are not compiled in the workspace feature set."
+    )]
     use crate::planner::vocabulary::{
         BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
     };
@@ -493,13 +514,17 @@ pub(crate) mod tests {
     /// Set up a fresh ScalarArena on `ctx`, convert `plan` to `OptExpr`, and
     /// return the `OptExpr`. Use this when calling `pipeline.rewrite()` directly
     /// in tests that don't go through `run_imv_rewrite`.
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn plan_to_opt_expr_with_arena(plan: &LogicalPlanNode, ctx: &mut RewriteContext) -> OptExpr {
         let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
         crate::planner::optimizer_bridge::logical::to_optimizer_expr(plan, &mut arena.borrow_mut())
     }
     use std::collections::{HashMap, HashSet};
-    use std::num::{NonZeroU32, NonZeroU64};
+
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn test_column_ref_factory() -> Rc<RefCell<ColumnRefFactory>> {
@@ -529,6 +554,10 @@ pub(crate) mod tests {
         .expect("physical optimization")
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn empty_values_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Values(PlanValuesNode {
@@ -540,6 +569,10 @@ pub(crate) mod tests {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn normalization_column_ref(column: &OutputColumn) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -552,6 +585,10 @@ pub(crate) mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn normalization_aggregate_outputs() -> (OutputColumn, OutputColumn, OutputColumn) {
         (
             normalization_output_column(1, "g1", DataType::Utf8, false),
@@ -560,6 +597,10 @@ pub(crate) mod tests {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn normalization_output_column(
         id: u32,
         name: &str,
@@ -575,6 +616,10 @@ pub(crate) mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn normalization_project_item(
         source: &OutputColumn,
         output_id: u32,
@@ -587,6 +632,10 @@ pub(crate) mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn normalization_project_over_aggregate(project_items: Vec<ProjectItem>) -> LogicalPlanNode {
         let (g1, g2, sum_output) = normalization_aggregate_outputs();
         let child = LogicalPlanNode::new(
@@ -742,10 +791,18 @@ pub(crate) mod tests {
         );
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn iceberg_scan_plan() -> LogicalPlanNode {
         iceberg_scan_plan_with_column_id(1)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn iceberg_scan_plan_with_column_id(column_id: u32) -> LogicalPlanNode {
         let column = ColumnDef {
             name: "k".to_string(),
@@ -791,6 +848,10 @@ pub(crate) mod tests {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn top_level_project_filter_union_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Union(LogicalUnionNode {
@@ -808,6 +869,10 @@ pub(crate) mod tests {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn project_filter_branch(first_id: u32) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Project(PlanProjectNode {
@@ -841,6 +906,10 @@ pub(crate) mod tests {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn column_ref(id: u32, name: &str, data_type: DataType, nullable: bool) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -853,6 +922,10 @@ pub(crate) mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn project_output_names(project: &PlanProjectNode) -> Vec<String> {
         project
             .items
@@ -861,6 +934,10 @@ pub(crate) mod tests {
             .collect()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn locator_join_left_input(plan: &LogicalPlanNode) -> &LogicalPlanNode {
         let LogicalPlanKind::Project(_) = &plan.kind else {
             panic!("expected root Project over target locator join, got {plan:?}");
@@ -886,6 +963,10 @@ pub(crate) mod tests {
         join_plan.left()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn find_delta_scan(plan: &LogicalPlanNode) -> Option<&PlanScanNode> {
         match &plan.kind {
             LogicalPlanKind::Scan(scan)
@@ -903,6 +984,10 @@ pub(crate) mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn find_union_plan(plan: &LogicalPlanNode) -> Option<&LogicalPlanNode> {
         match &plan.kind {
             LogicalPlanKind::Union(_) => Some(plan),
@@ -910,10 +995,18 @@ pub(crate) mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn dummy_mv_ctx() -> Arc<crate::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
         crate::compiler::mv_rewrite::test_incremental_snapshot()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn aggregate_mv_ctx_customized(
         mutate: impl FnOnce(&mut crate::compiler::mv_rewrite::SqlImvRewriteSnapshot),
     ) -> Arc<crate::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
@@ -955,10 +1048,18 @@ pub(crate) mod tests {
         Arc::new(snapshot)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn aggregate_mv_ctx() -> Arc<crate::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
         aggregate_mv_ctx_customized(|_| {})
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn partitioned_aggregate_mv_ctx() -> Arc<crate::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
         aggregate_mv_ctx_customized(|snapshot| {
             Arc::make_mut(&mut snapshot.schema_contract)
@@ -974,14 +1075,26 @@ pub(crate) mod tests {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn join_aggregate_mv_ctx() -> Arc<crate::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
         crate::compiler::mv_rewrite::test_join_snapshot(true)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn join_projection_mv_ctx() -> Arc<crate::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
         crate::compiler::mv_rewrite::test_join_snapshot(false)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn join_aggregate_mv_ctx_customized(
         mutate: impl FnOnce(&mut crate::compiler::mv_rewrite::SqlImvRewriteSnapshot),
     ) -> Arc<crate::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
@@ -990,6 +1103,10 @@ pub(crate) mod tests {
         Arc::new(snapshot)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn aggregate_plan() -> LogicalPlanNode {
         let columns = vec![
             ColumnDef {
@@ -1172,6 +1289,10 @@ pub(crate) mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn join_aggregate_plan() -> LogicalPlanNode {
         let left = project_all(join_base_scan("l", 1, 22), 1);
         let right = project_all(join_base_scan("r", 10, 44), 10);
@@ -1264,6 +1385,10 @@ pub(crate) mod tests {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn join_projection_filter_plan() -> LogicalPlanNode {
         let LogicalPlanKind::Project(project) = join_projection_plan().kind else {
             unreachable!("join projection helper must return Project");
@@ -1308,6 +1433,10 @@ pub(crate) mod tests {
         LogicalPlanNode::new(LogicalPlanKind::Project(project), vec![filter], None)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn join_projection_left_filter_plan() -> LogicalPlanNode {
         let LogicalPlanKind::Project(project) = join_projection_plan().kind else {
             unreachable!("join projection helper must return Project");
@@ -1358,6 +1487,10 @@ pub(crate) mod tests {
     /// Test-only rule that asserts ImvExtension is reachable from the
     /// RewriteContext. Captures whether the observed target fqn matched into
     /// an AtomicBool for assertion outside the rule.
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     struct AssertMvCtxVisibleRule {
         saw_mv_ctx: Arc<AtomicBool>,
         expected_target: String,
@@ -1492,6 +1625,10 @@ pub(crate) mod tests {
 
     // ── Task-4 helpers ──────────────────────────────────────────────────────
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     struct CountingRule {
         name: &'static str,
         matches_called: Arc<std::sync::atomic::AtomicUsize>,
@@ -1591,6 +1728,10 @@ pub(crate) mod tests {
 
     // ── Task-5 helpers ──────────────────────────────────────────────────────
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     struct FailingDummyRule;
 
     impl LogicalRewriteRule for FailingDummyRule {
@@ -1747,6 +1888,10 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[expect(
+        unreachable_patterns,
+        reason = "The test asserts the frozen SQL-source invariant while preserving its explicit failure diagnostic."
+    )]
     fn imv_pipeline_binds_root_delta_scan() {
         // Disable InjectApplyKeyProject and ActionColumnValidation so this
         // test stays focused on scan binding (snapshot-id promotion) without
@@ -1782,6 +1927,10 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[expect(
+        unreachable_patterns,
+        reason = "The test asserts the frozen SQL-source invariant while preserving its explicit failure diagnostic."
+    )]
     fn imv_pipeline_binds_version_from_scan() {
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::ImvVersion(LogicalImvVersionNode {
@@ -1814,6 +1963,10 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[expect(
+        unreachable_patterns,
+        reason = "The test asserts the frozen SQL-source invariant while preserving its explicit failure diagnostic."
+    )]
     fn imv_pipeline_binds_version_to_scan() {
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::ImvVersion(LogicalImvVersionNode {
@@ -2744,9 +2897,8 @@ pub(crate) mod tests {
             node: &mut crate::optimizer::OptimizedOperatorNode,
             tokens: JoinRefreshCoalesceBindingTokens,
         ) {
-            if let crate::optimizer::Operator::PhysicalScan(scan) = &mut node.op
-                && let ScanSource::Sql(source) = &mut scan.table.source
-            {
+            if let crate::optimizer::Operator::PhysicalScan(scan) = &mut node.op {
+                let ScanSource::Sql(source) = &mut scan.table.source;
                 source.binding = match source.table.table.as_str() {
                     "l" => tokens.left,
                     "r" => tokens.right,
@@ -2836,6 +2988,10 @@ pub(crate) mod tests {
         assert_join_delta_union_shape(union_plan, signed_action_id);
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn assert_aggregate_change_stream_outcome(outcome: &ImvRewriteOutcome) {
         let aggregate = outcome
             .annotation
@@ -2856,6 +3012,10 @@ pub(crate) mod tests {
         assert_aggregate_change_stream_shape(&outcome.plan);
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn assert_aggregate_change_stream_shape(plan: &LogicalPlanNode) {
         assert!(
             contains_target_state_scan(plan),
@@ -2871,6 +3031,10 @@ pub(crate) mod tests {
         );
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn assert_project_refs_resolve_to_child_outputs(plan: &LogicalPlanNode) {
         if let LogicalPlanKind::Project(project) = &plan.kind {
             let child_output_ids = crate::planner::plan_output_columns(plan.unary_input())
@@ -2896,6 +3060,10 @@ pub(crate) mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn assert_physical_project_refs_resolve_to_child_outputs(
         plan: &crate::optimizer::OptimizedOperatorNode,
     ) {
@@ -2972,6 +3140,10 @@ pub(crate) mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn collect_column_refs(expr: &TypedExpr, refs: &mut HashSet<ColumnId>) {
         match &expr.kind {
             ExprKind::ColumnRef { column_id, .. } => {
@@ -3056,6 +3228,10 @@ pub(crate) mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn find_signed_delta_project(plan: &LogicalPlanNode) -> &LogicalPlanNode {
         if let LogicalPlanKind::Project(_) = &plan.kind
             && matches!(
@@ -3078,6 +3254,10 @@ pub(crate) mod tests {
             .expect("expected signed aggregate projection")
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn contains_signed_delta_project(plan: &LogicalPlanNode) -> bool {
         matches!(
             &plan.kind,
@@ -3090,6 +3270,10 @@ pub(crate) mod tests {
         ) || plan.children.iter().any(contains_signed_delta_project)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
         matches!(
             &plan.kind,
@@ -3106,6 +3290,10 @@ pub(crate) mod tests {
         ) || plan.children.iter().any(contains_target_state_scan)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn assert_join_delta_union_shape(union_plan: &LogicalPlanNode, signed_action_id: ColumnId) {
         let LogicalPlanKind::Union(union) = &union_plan.kind else {
             panic!("expected Union, got {union_plan:?}");
@@ -3150,6 +3338,10 @@ pub(crate) mod tests {
         );
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn assert_normalized_branch(
         plan: &LogicalPlanNode,
         signed_action_id: ColumnId,
@@ -3173,6 +3365,10 @@ pub(crate) mod tests {
         join_plan
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn collect_branch_binding(
         plan: &LogicalPlanNode,
         signed_action_id: ColumnId,
@@ -3217,6 +3413,10 @@ pub(crate) mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn signed_action_column_id(aggregate: &LogicalAggregateNode) -> ColumnId {
         let signed_input = &aggregate.aggregates[0].args[0];
         let ExprKind::FunctionCall { args, .. } = &signed_input.kind else {
@@ -3228,6 +3428,10 @@ pub(crate) mod tests {
         *column_id
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
+    )]
     fn assert_project_scan_any_table(plan: &LogicalPlanNode) -> &PlanScanNode {
         let LogicalPlanKind::Project(_) = &plan.kind else {
             panic!("expected Project");

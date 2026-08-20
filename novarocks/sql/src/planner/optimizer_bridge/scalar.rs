@@ -302,6 +302,10 @@ pub(crate) fn materialize_window_exprs(
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "Column sort-key interning is retained for optimizer bridge callers enabled in feature-specific targets."
+)]
 pub(crate) fn intern_column_sort_key(
     arena: &mut ScalarArena,
     key: &crate::optimizer::property::SortKey,
@@ -324,6 +328,10 @@ pub(crate) fn intern_column_sort_key(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::items_after_test_module,
+    reason = "The scalar conversion helpers stay adjacent to their callers; moving the large test module would obscure that local relationship."
+)]
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
@@ -932,6 +940,10 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Column-id expression materialization remains available to optimizer bridge fixture and rewrite paths."
+)]
 pub(crate) fn column_id_expr(id: ColumnId, data_type: DataType, nullable: bool) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::ColumnRef {

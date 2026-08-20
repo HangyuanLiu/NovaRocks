@@ -65,6 +65,10 @@ const SCAN_TIME: &str = "ScanTime";
 const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
 const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
 
+#[allow(
+    dead_code,
+    reason = "The ordered scan chunk form is retained for late-pruning integration coverage."
+)]
 type PositionedChunk = (Chunk, Option<Vec<i64>>);
 
 struct IoExecScope {
@@ -139,6 +143,10 @@ struct RowPositionState {
     scan_range_id: i32,
 }
 
+#[allow(
+    dead_code,
+    reason = "Late-pruning observability is retained for scan integration coverage."
+)]
 impl ScanAsyncRunner {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
@@ -788,6 +796,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as a focused scan runtime-filter test fixture."
+    )]
     fn int32_chunk(values: Vec<i32>) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let array = Arc::new(Int32Array::from(values)) as arrow::array::ArrayRef;
@@ -800,6 +812,7 @@ mod tests {
         Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
+    #[allow(dead_code, reason = "Retained as a focused ordered-scan test fixture.")]
     fn ordered_file_morsel(path: &str) -> ScanMorsel {
         ScanMorsel::FileRange {
             path: path.to_string(),
@@ -811,6 +824,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as a focused scan result assertion helper."
+    )]
     fn int64_values(chunk: &Chunk) -> Vec<i64> {
         chunk.columns()[0]
             .as_any()
@@ -855,6 +872,10 @@ mod tests {
             .collect()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as a focused scan runtime-filter test fixture."
+    )]
     fn in_filter(filter_id: i32, values: Vec<i32>) -> Vec<RuntimeInFilter> {
         let array = Arc::new(Int32Array::from(values)) as arrow::array::ArrayRef;
         let mut filter =
@@ -866,6 +887,10 @@ mod tests {
         vec![filter]
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as a focused scan runtime-filter test fixture."
+    )]
     fn string_in_filter(filter_id: i32, values: Vec<&str>) -> Vec<RuntimeInFilter> {
         let array = Arc::new(StringArray::from(values)) as arrow::array::ArrayRef;
         let mut filter =
@@ -877,6 +902,7 @@ mod tests {
         vec![filter]
     }
 
+    #[allow(dead_code, reason = "Retained as a focused scan pruning test fixture.")]
     fn pruning_membership_filter(filter_id: i32, values: Vec<i32>) -> RuntimeMembershipFilter {
         let build_values = Arc::new(Int32Array::from(values)) as arrow::array::ArrayRef;
         RuntimeMembershipFilter::Bloom(
@@ -891,6 +917,7 @@ mod tests {
         )
     }
 
+    #[allow(dead_code, reason = "Retained as a focused scan pruning test fixture.")]
     fn pruning_string_membership_filter(
         filter_id: i32,
         values: Vec<&str>,
@@ -908,6 +935,10 @@ mod tests {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained as a focused scan passthrough test fixture."
+    )]
     fn passthrough_membership_filter(filter_id: i32) -> RuntimeMembershipFilter {
         let min_max =
             RuntimeMinMaxFilter::full_range(RuntimeFilterType::Int32).expect("min/max range");
@@ -922,6 +953,7 @@ mod tests {
         ))
     }
 
+    #[allow(dead_code, reason = "Retained as a focused scan pruning test fixture.")]
     fn pruning_min_max_filter(values: Vec<i32>) -> RuntimeMinMaxFilter {
         let array = Arc::new(Int32Array::from(values)) as arrow::array::ArrayRef;
         RuntimeMinMaxFilter::from_arrays(RuntimeFilterType::Int32, std::slice::from_ref(&array))

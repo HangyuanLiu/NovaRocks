@@ -414,9 +414,8 @@ mod tests {
         for &(left, right, ndv) in &[(1000.0, 500.0, 50.0), (10.0, 8.0, 10.0), (1e6, 1e3, 1e4)] {
             let (rows, _) =
                 estimate_join_cardinality(&inp(JoinKind::Inner, left, right, vec![(ndv, ndv)]));
-            let expected = (left * right / ndv)
-                .min(crate::optimizer::estimate::arith::MAX_ROW_COUNT)
-                .max(1.0);
+            let expected =
+                (left * right / ndv).clamp(1.0, crate::optimizer::estimate::arith::MAX_ROW_COUNT);
             assert!(
                 (rows - expected).abs() <= expected * 1e-9 + 1.0,
                 "left={left} right={right} ndv={ndv}: {rows} vs {expected}"
@@ -648,10 +647,10 @@ mod tests {
     fn semi_and_anti_bounded_by_left() {
         let (semi, _) =
             estimate_join_cardinality(&inp(JoinKind::LeftSemi, 1000.0, 50.0, vec![(10.0, 10.0)]));
-        assert!(semi <= 1000.0 && semi >= 1.0);
+        assert!((1.0..=1000.0).contains(&semi));
         let (anti, _) =
             estimate_join_cardinality(&inp(JoinKind::LeftAnti, 1000.0, 50.0, vec![(10.0, 10.0)]));
-        assert!(anti <= 1000.0 && anti >= 1.0);
+        assert!((1.0..=1000.0).contains(&anti));
     }
 
     #[test]

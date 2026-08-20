@@ -31,6 +31,10 @@ use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use crate::parser::ast::{ArithmeticOp, DefaultLiteral, Expr, Literal};
 use novarocks_catalog::schema::{ColumnDefault, SqlType, validate_column_default};
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Result<Expr, String> {
     use sqlparser::ast as sqlast;
     match expr {
@@ -182,6 +186,10 @@ pub(crate) fn parse_datetime_string_to_micros(s: &str) -> Result<i64, String> {
 /// Unix epoch. Mirrors `parse_datetime_string_to_micros` but keeps nanosecond
 /// precision for Iceberg v3 `timestamp_ns` columns. Errors if the value is
 /// outside the nanosecond-representable range (~1677-09-21 .. 2262-04-11).
+#[allow(
+    dead_code,
+    reason = "Retained for the staged Iceberg v3 timestamp-nanosecond write path."
+)]
 pub(crate) fn parse_datetime_string_to_nanos(s: &str) -> Result<i64, String> {
     use chrono::NaiveDateTime;
     let s = s.trim();
@@ -433,6 +441,10 @@ fn json_object_literal(args: &[&sqlparser::ast::Expr]) -> Result<Literal, String
     Ok(Literal::String(bytes_to_latin1_string(&bytes)))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) fn literal_to_i128_for_integer(
     literal: &Literal,
     type_name: &str,
@@ -791,6 +803,10 @@ fn literal_to_varchar_bytes(value: &Literal) -> Result<Option<Vec<u8>>, String> 
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 fn try_array_map_cast_string_custom_expr(
     func: &sqlparser::ast::Function,
 ) -> Result<Option<Expr>, String> {
@@ -919,6 +935,10 @@ pub(crate) fn function_expr_args(
 }
 
 /// Evaluate arithmetic on `Literal` values without `ManualValue`.
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) fn eval_literal_arithmetic(
     op: ArithmeticOp,
     left: &Literal,
@@ -1293,6 +1313,10 @@ pub(crate) fn compare_literals(
 
 /// Hashable key derived from `Literal` for use in aggregate-table dedup maps.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) enum LiteralKey {
     Null,
     Bool(bool),
@@ -1301,6 +1325,10 @@ pub(crate) enum LiteralKey {
     String(String),
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged SQL planner migration consumers and test helpers."
+)]
 pub(crate) fn literal_to_key(literal: &Literal) -> LiteralKey {
     match literal {
         Literal::Null => LiteralKey::Null,
@@ -1523,6 +1551,10 @@ pub(crate) fn format_decimal128_value(value: i128, scale: i8) -> Result<String, 
     ))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for the staged typed DDL default-literal lowering path."
+)]
 pub(crate) fn default_literal_to_column_default(
     literal: &DefaultLiteral,
     column_type: &SqlType,
@@ -1749,6 +1781,10 @@ pub(crate) fn column_default_to_ast_literal(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained with typed default-literal range validation."
+)]
 fn default_out_of_range(type_name: &str, value: i64) -> String {
     format!("DEFAULT value {value} is out of range for {type_name}")
 }

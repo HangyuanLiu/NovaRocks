@@ -37,6 +37,10 @@ pub mod fragment_context;
 pub mod global_driver_executor;
 pub mod operator;
 pub mod operator_factory;
+#[expect(
+    clippy::module_inception,
+    reason = "The pipeline submodule name is part of the stable execution module layout."
+)]
 pub mod pipeline;
 pub mod scan;
 pub mod schedule;

@@ -197,6 +197,10 @@ pub fn connector_table_materialization_from_metadata(
 }
 
 #[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 pub struct CatalogRuntimeMetadata {
     table: CatalogTable,
 }

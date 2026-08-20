@@ -37,6 +37,10 @@ pub enum ApplyKeySource {
 }
 
 impl ApplyKeySource {
+    #[allow(
+        dead_code,
+        reason = "Apply-key property spelling is retained for DDL serialization paths."
+    )]
     pub(crate) const fn table_property_value(self) -> &'static str {
         match self {
             Self::BaseRowId => "base._row_id",

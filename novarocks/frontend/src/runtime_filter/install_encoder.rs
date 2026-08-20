@@ -22,6 +22,10 @@ pub(crate) struct EncodedRuntimeFilterDeployment {
     contributions: BTreeMap<usize, service::RuntimeFilterContribution>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for target-specific frontend integration and regression coverage."
+)]
 impl EncodedRuntimeFilterDeployment {
     pub(crate) fn contributions(
         &self,
@@ -67,7 +71,7 @@ fn encode_participant(
         query_id: Some(deployment.query_id()),
         deployment_epoch: deployment.deployment_epoch(),
         participant_id: participant.participant_id(),
-        lifecycle: Some(lifecycle.clone()),
+        lifecycle: Some(lifecycle),
         install: Some(participant.install().clone()),
     };
     digest.update(CONTRIBUTION_DIGEST_DOMAIN);

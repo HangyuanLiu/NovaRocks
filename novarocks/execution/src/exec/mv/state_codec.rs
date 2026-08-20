@@ -860,7 +860,6 @@ mod key_tests {
         let forty_two = key_round_trip(ints.clone(), 0);
         let minus_one = key_round_trip(ints, 1);
         assert!(forty_two < minus_one);
-        assert!(42i64 > -1i64);
 
         let strings: ArrayRef = Arc::new(StringArray::from(vec![Some("b"), Some("aa")]));
         let b = key_round_trip(strings.clone(), 0);

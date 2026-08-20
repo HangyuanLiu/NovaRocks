@@ -270,6 +270,10 @@ pub(crate) struct AggregateTopNBoundaryBinding {
     state: AggregateTopNBoundaryState,
 }
 
+#[allow(
+    dead_code,
+    reason = "The boundary accessor is retained for native aggregate runtime-filter wiring."
+)]
 impl AggregateTopNBoundaryBinding {
     pub(crate) fn try_new(
         group_key_ordinal: usize,
@@ -473,10 +477,7 @@ fn require_exact_array_type(
     }
 }
 
-fn utf8_value<'a>(
-    array: &'a ArrayRef,
-    row: usize,
-) -> Result<Option<&'a str>, AggregateTopNBoundaryError> {
+fn utf8_value(array: &ArrayRef, row: usize) -> Result<Option<&str>, AggregateTopNBoundaryError> {
     if array.data_type() == &DataType::Utf8 {
         let strings = array
             .as_any()

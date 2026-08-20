@@ -149,6 +149,10 @@ pub struct NodeExecutionColumn {
 /// The finalized execution output of a single covered node, keyed by the node's
 /// `(fragment_id, node_id)` identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    private_interfaces,
+    reason = "The frontend reads finalized output envelopes, while execution-kind construction stays internal to SQL planning."
+)]
 pub struct NodeExecutionOutput {
     pub fragment_id: FragmentId,
     pub node_id: i32,
@@ -1937,7 +1941,7 @@ pub(in crate::planner::distributed) fn build_write_contract_catalog(
 /// Finalize a provider-neutral connector write output. The output schema and
 /// optional root projection are supplied by SQL; no provider planning type is
 /// visible to this boundary.
-pub(crate) fn finalize_connector_write_output(
+pub(in crate::planner::distributed) fn finalize_connector_write_output(
     fragment: &PlanFragment,
     sink: &ConnectorWritePlanInput,
 ) -> Result<ConnectorWriteOutputContract, WriteContractError> {
@@ -2123,7 +2127,7 @@ mod tests {
         PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanStats, PhysicalSetOpNode,
         PlanSetOpKind, PlannerConfidence,
     };
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
     use novarocks_catalog::schema::ColumnDef;
 
     fn stats() -> PhysicalPlanStats {

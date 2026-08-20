@@ -19,6 +19,10 @@ use std::collections::BTreeSet;
 
 use novarocks_sql::plan_read::FragmentEdgeKind;
 
+#[expect(
+    clippy::type_complexity,
+    reason = "The sealed CTE projection preserves the typed consumer layout at the preparation boundary."
+)]
 pub(super) fn sealed_cte_projection(
     edges: &[novarocks_sql::plan_read::FragmentEdge],
     fragment: &novarocks_sql::plan_read::PlanFragment,

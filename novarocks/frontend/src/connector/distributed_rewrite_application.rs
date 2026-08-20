@@ -127,6 +127,10 @@ impl<S: SealedDistributedRewrite> DistributedRewriteApplicationSession<S> {
 /// Plan exactly once.  The caller captures topology before this function and
 /// retains the returned session through every staged cohort and terminal C1
 /// commit.  No current-generation lookup is available after this point.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen frontend boundary keeps independently validated inputs explicit."
+)]
 pub fn plan_distributed_rewrite_session<S: DistributedRewriteSealing>(
     sealing: &S,
     resolver: &dyn ConnectorDistributedRewriteResolver,

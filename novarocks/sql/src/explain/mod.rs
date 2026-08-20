@@ -291,7 +291,6 @@ fn logical_scan_source_label(source: &ScanSource) -> Option<String> {
             )),
             _ => None,
         },
-        _ => None,
     }
 }
 

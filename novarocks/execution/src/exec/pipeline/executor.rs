@@ -200,6 +200,10 @@ impl RunningPipelineExecution {
 }
 
 /// Execute one plan fragment through pipeline runtime and return the terminal sink outcome.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The public executor is the application boundary for independently-owned fragment services."
+)]
 pub fn execute_native_plan_with_pipeline(
     plan: ExecPlan,
     debug: bool,
@@ -233,6 +237,10 @@ pub fn execute_native_plan_with_pipeline(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Root-sink parallelism is added to the complete fragment execution contract."
+)]
 pub(crate) fn execute_native_plan_with_pipeline_with_root_sink_dop(
     plan: ExecPlan,
     debug: bool,

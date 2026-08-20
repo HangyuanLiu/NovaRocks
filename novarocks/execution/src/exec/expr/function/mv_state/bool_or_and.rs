@@ -135,9 +135,11 @@ fn bool_state_union(a: &[u8], b: &[u8], fn_name: &str) -> Result<Vec<u8>, String
     }
 }
 
+type BoolStateOp = fn(&[u8], &[u8]) -> Result<Vec<u8>, String>;
+
 fn eval_bool_state_union(
     fn_name: &str,
-    op: fn(&[u8], &[u8]) -> Result<Vec<u8>, String>,
+    op: BoolStateOp,
     arena: &ExprArena,
     args: &[ExprId],
     chunk: &Chunk,
@@ -166,7 +168,7 @@ fn eval_bool_state_visible(
 
 fn eval_bool_state_union_arrays(
     fn_name: &str,
-    op: fn(&[u8], &[u8]) -> Result<Vec<u8>, String>,
+    op: BoolStateOp,
     lhs: &ArrayRef,
     rhs: &ArrayRef,
 ) -> Result<ArrayRef, String> {
@@ -317,8 +319,8 @@ mod tests {
                 .unwrap();
         let arr = out.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(arr.value(0), true);
-        assert_eq!(arr.value(1), false);
+        assert!(arr.value(0));
+        assert!(!arr.value(1));
         assert!(arr.is_null(2));
         assert!(arr.is_null(3));
 
@@ -327,8 +329,8 @@ mod tests {
                 .unwrap();
         let arr = out.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(arr.value(0), true);
-        assert_eq!(arr.value(1), false);
+        assert!(arr.value(0));
+        assert!(!arr.value(1));
         assert!(arr.is_null(2));
         assert!(arr.is_null(3));
     }

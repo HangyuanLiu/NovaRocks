@@ -1770,6 +1770,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::type_complexity,
+        reason = "The table-driven validation fixture keeps each field mutator explicit."
+    )]
     fn query_control_config_rejects_zero_values() {
         let cases: [(&str, fn(&mut RuntimeConfig)); 8] = [
             ("query_control_heartbeat_interval_ms", |runtime| {
@@ -1811,6 +1815,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "The fixture states the two related heartbeat facts progressively."
+    )]
     fn query_control_config_rejects_short_heartbeat_timeout() {
         let mut runtime = RuntimeConfig::default();
         runtime.query_control_heartbeat_interval_ms = 1_000;

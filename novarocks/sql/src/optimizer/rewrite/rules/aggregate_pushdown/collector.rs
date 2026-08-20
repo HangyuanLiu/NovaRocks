@@ -366,7 +366,7 @@ mod tests {
     use crate::optimizer::opt_expr::OptExpr;
     use crate::optimizer::rewrite::context::RewriteContext;
     use crate::optimizer::scalar::ScalarArena;
-    use crate::planner::table::{ScanSource, TableDef};
+    use crate::planner::table::TableDef;
 
     use crate::planner::optimizer_bridge::scalar::{intern_typed, materialize};
     use arrow::datatypes::DataType;
@@ -375,6 +375,10 @@ mod tests {
         ScalarArena::new()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for staged SQL planner migration consumers and test helpers."
+    )]
     fn make_ctx(arena: ScalarArena) -> RewriteContext {
         let mut ctx = RewriteContext::for_query(std::iter::empty());
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));

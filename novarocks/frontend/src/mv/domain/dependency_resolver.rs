@@ -47,6 +47,10 @@ pub(crate) fn ensure_no_downstream_dependencies_with_repository(
         .map_err(|e| e.to_string())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 fn iceberg_mv_target_ref_for_scope(
     definition: &StoredMvDefinition,
 ) -> Option<MvDependencyObjectRef> {
@@ -116,6 +120,10 @@ pub(crate) fn resolve_create_mv_dependencies_with_repository(
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn ensure_no_iceberg_mv_targets_in_scope_with_repository(
     repository: &dyn MvRepository,
     scope_catalog: &str,
@@ -134,6 +142,10 @@ pub(crate) fn ensure_no_iceberg_mv_targets_in_scope_with_repository(
 
 /// Loads MV definitions and their upstream dependencies from the repository,
 /// then delegates to the pure scope helper.
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
 pub(crate) fn ensure_no_external_iceberg_dependents_with_repository(
     repository: &dyn MvRepository,
     scope_catalog: &str,

@@ -42,18 +42,34 @@ impl DistributedPlanDraftBuilder {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for distributed-plan fixture mutation in focused tests."
+    )]
     pub(crate) fn fragments_mut(&mut self) -> &mut Vec<PlanFragment> {
         &mut self.draft.fragments
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for distributed-plan fixture inspection in focused tests."
+    )]
     pub(crate) fn fragments(&self) -> &[PlanFragment] {
         &self.draft.fragments
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for distributed-plan fixture mutation in focused tests."
+    )]
     pub(crate) fn edges_mut(&mut self) -> &mut Vec<FragmentEdge> {
         &mut self.draft.edges
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained for runtime-filter fixture construction in focused tests."
+    )]
     pub(crate) fn set_runtime_filter_graph(&mut self, graph: DraftRuntimeFilterGraph) {
         self.draft.runtime_filter_graph = graph;
     }
@@ -79,6 +95,10 @@ pub(crate) fn draft_builder_from_plan(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for distributed-plan fixture mutation in focused tests."
+)]
 pub(crate) fn rebuild_test_plan(
     plan: DistributedPlan,
     runtime_filter_graph: DraftRuntimeFilterGraph,
@@ -91,10 +111,18 @@ pub(crate) fn rebuild_test_plan(
         .expect("rebuilt test distributed plan must pass production minimal seal")
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained for output-catalog fault fixtures in focused tests."
+)]
 pub(crate) fn remove_fragment_output_for_test(plan: &mut DistributedPlan, fragment_id: FragmentId) {
     plan.remove_fragment_output_for_test(fragment_id);
 }
 
+#[allow(
+    unused_macros,
+    reason = "The draft-builder macro is re-exported for distributed planner tests in sibling modules."
+)]
 macro_rules! distributed_plan_draft_builder_for_test {
     (
         $fragments:ident,
@@ -150,8 +178,16 @@ macro_rules! distributed_plan_draft_builder_for_test {
     };
 }
 
+#[allow(
+    unused_imports,
+    reason = "The macro re-export is the stable fixture entrypoint for distributed planner tests."
+)]
 pub(crate) use distributed_plan_draft_builder_for_test;
 
+#[allow(
+    unused_macros,
+    reason = "The sealed-plan macro is re-exported for distributed planner tests in sibling modules."
+)]
 macro_rules! distributed_plan_for_test {
     ($($tokens:tt)*) => {
         $crate::planner::distributed::test_support::distributed_plan_draft_builder_for_test! {
@@ -162,4 +198,8 @@ macro_rules! distributed_plan_for_test {
     };
 }
 
+#[allow(
+    unused_imports,
+    reason = "The macro re-export is the stable sealed-plan fixture entrypoint for distributed planner tests."
+)]
 pub(crate) use distributed_plan_for_test;

@@ -199,6 +199,10 @@ struct CoreMutationAbort {
     kind: MutationStatementKind,
     attempt_id: String,
     execution: Arc<dyn crate::query_execution::dml::mutation_flow::MutationExecution>,
+    #[allow(
+        dead_code,
+        reason = "Preserves the typed abort payload for the staged core mutation adapter."
+    )]
     reason: String,
 }
 

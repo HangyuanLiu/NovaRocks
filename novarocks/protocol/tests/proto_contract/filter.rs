@@ -29,7 +29,7 @@ where
 fn sample_unique_id() -> common::UniqueId {
     common::UniqueId {
         hi: 0x1122_3344_5566_7788,
-        lo: -0x1020_3040_5060_708,
+        lo: -0x0102_0304_0506_0708,
     }
 }
 

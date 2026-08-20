@@ -292,7 +292,7 @@ impl DeleteEngine for DmlExecutionKernel {
 
     fn run_delete(&self, prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String> {
         let _ = prepared;
-        return Err("DELETE requires Frontend native fragment assembly".to_string());
+        Err("DELETE requires Frontend native fragment assembly".to_string())
     }
 
     fn delete_native_encoding<'a>(
@@ -369,6 +369,10 @@ fn delete_write_report_from_result(
 }
 
 struct CorePreparedDelete {
+    #[allow(
+        dead_code,
+        reason = "Retained for staged query-execution DML recovery and connector wiring."
+    )]
     operation: DeleteOperation,
     execution: Arc<dyn PreparedDeleteExecution>,
 }
