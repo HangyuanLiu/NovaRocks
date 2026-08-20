@@ -27,15 +27,19 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use novarocks_spi::state_store::{
-    ChangePage, ChangePollRequest, CommitResolution, StateStore, StateStoreError,
+    ChangePage, ChangePollRequest, CommitResolution, MAX_KEY_BYTES, StateStore, StateStoreError,
     StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StateStoreOpenRequest,
-    StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderId,
-    StateStoreProviderInstance, StateStoreProviderLifecycle, StoreIdentity, TransactionId,
+    StateStoreProviderAccessMode, StateStoreProviderDescriptor, StateStoreProviderFactory,
+    StateStoreProviderId, StateStoreProviderInstance, StateStoreProviderLifecycle, StoreIdentity,
+    TransactionId,
 };
 
 const TEST_PROVIDER_ID: StateStoreProviderId = StateStoreProviderId::new("test-provider");
-const TEST_DESCRIPTOR: StateStoreProviderDescriptor =
-    StateStoreProviderDescriptor::new(TEST_PROVIDER_ID);
+const TEST_DESCRIPTOR: StateStoreProviderDescriptor = StateStoreProviderDescriptor::new(
+    TEST_PROVIDER_ID,
+    StateStoreProviderAccessMode::SharedMultiFrontend,
+    MAX_KEY_BYTES,
+);
 
 fn assert_factory_object_safe(_: Box<dyn StateStoreProviderFactory>) {}
 fn assert_instance_object_safe(_: Box<dyn StateStoreProviderInstance>) {}
@@ -211,8 +215,18 @@ fn provider_id_has_value_order_hash_and_descriptor_identity() {
         hash_of(StateStoreProviderId::new("sqlite"))
     );
 
-    assert_eq!(StateStoreProviderDescriptor::new(sqlite).id, sqlite);
-    assert_ne!(StateStoreProviderDescriptor::new(sqlite).id, mysql);
+    let descriptor = StateStoreProviderDescriptor::new(
+        sqlite,
+        StateStoreProviderAccessMode::ExclusiveSingleFrontend,
+        MAX_KEY_BYTES,
+    );
+    assert_eq!(descriptor.id, sqlite);
+    assert_ne!(descriptor.id, mysql);
+    assert_eq!(
+        descriptor.access_mode,
+        StateStoreProviderAccessMode::ExclusiveSingleFrontend
+    );
+    assert_eq!(descriptor.max_key_bytes, MAX_KEY_BYTES);
 }
 
 fn hash_of(id: StateStoreProviderId) -> u64 {

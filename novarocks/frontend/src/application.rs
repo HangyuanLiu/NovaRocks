@@ -1193,7 +1193,8 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::state_store::{
         FeDeploymentView, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
-        StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
+        StateStoreProviderAccessMode, StateStoreProviderDescriptor, StateStoreProviderFactory,
+        StateStoreProviderInstance,
     };
     use novarocks_state_store::{
         SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHost,
@@ -1207,8 +1208,11 @@ mod tests {
     };
 
     const SECRET_CONFIG_VALUE: &str = "client-secret-must-not-leak";
-    const DESCRIPTOR: StateStoreProviderDescriptor =
-        StateStoreProviderDescriptor::new(SQLITE_STATE_STORE_PROVIDER_ID);
+    const DESCRIPTOR: StateStoreProviderDescriptor = StateStoreProviderDescriptor::new(
+        SQLITE_STATE_STORE_PROVIDER_ID,
+        StateStoreProviderAccessMode::ExclusiveSingleFrontend,
+        novarocks_spi::state_store::MAX_KEY_BYTES,
+    );
 
     struct FailingFactory;
 

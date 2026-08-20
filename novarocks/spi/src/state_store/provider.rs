@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use super::{StateStore, StateStoreError, StateStoreLimits};
+use super::{MAX_KEY_BYTES, StateStore, StateStoreError, StateStoreLimits};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StateStoreProviderId(&'static str);
@@ -89,14 +89,32 @@ impl fmt::Display for StateStoreProviderIdError {
 impl std::error::Error for StateStoreProviderIdError {}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+// Design: ADR-0092 keeps provider deployment capabilities in SPI while runtime ownership stays in Frontend.
 pub struct StateStoreProviderDescriptor {
     pub id: StateStoreProviderId,
+    pub access_mode: StateStoreProviderAccessMode,
+    pub max_key_bytes: usize,
 }
 
 impl StateStoreProviderDescriptor {
-    pub const fn new(id: StateStoreProviderId) -> Self {
-        Self { id }
+    pub const fn new(
+        id: StateStoreProviderId,
+        access_mode: StateStoreProviderAccessMode,
+        max_key_bytes: usize,
+    ) -> Self {
+        assert!(max_key_bytes > 0 && max_key_bytes <= MAX_KEY_BYTES);
+        Self {
+            id,
+            access_mode,
+            max_key_bytes,
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum StateStoreProviderAccessMode {
+    ExclusiveSingleFrontend,
+    SharedMultiFrontend,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -21,9 +21,9 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use novarocks_spi::state_store::{
-    StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
-    StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
-    StateStoreProviderLifecycle,
+    MAX_KEY_BYTES, StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
+    StateStoreProviderAccessMode, StateStoreProviderDescriptor, StateStoreProviderFactory,
+    StateStoreProviderInstance, StateStoreProviderLifecycle,
 };
 
 use super::SqliteStateStore;
@@ -38,7 +38,11 @@ pub(crate) struct SqliteStateStoreProviderFactory {
 impl SqliteStateStoreProviderFactory {
     pub(crate) fn new(path: PathBuf, deployment_owner: String) -> Self {
         Self {
-            descriptor: StateStoreProviderDescriptor::new(SQLITE_STATE_STORE_PROVIDER_ID),
+            descriptor: StateStoreProviderDescriptor::new(
+                SQLITE_STATE_STORE_PROVIDER_ID,
+                StateStoreProviderAccessMode::ExclusiveSingleFrontend,
+                MAX_KEY_BYTES,
+            ),
             path,
             deployment_owner,
         }

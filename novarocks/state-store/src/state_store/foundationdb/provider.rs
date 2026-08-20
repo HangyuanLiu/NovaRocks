@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use novarocks_spi::state_store::{
-    StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
-    StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
-    StateStoreProviderLifecycle,
+    MAX_KEY_BYTES, StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
+    StateStoreProviderAccessMode, StateStoreProviderDescriptor, StateStoreProviderFactory,
+    StateStoreProviderInstance, StateStoreProviderLifecycle,
 };
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -240,7 +240,11 @@ impl FoundationDbStateStoreProviderFactory {
         client: FoundationDbClientConfig,
     ) -> Self {
         Self {
-            descriptor: StateStoreProviderDescriptor::new(FOUNDATIONDB_STATE_STORE_PROVIDER_ID),
+            descriptor: StateStoreProviderDescriptor::new(
+                FOUNDATIONDB_STATE_STORE_PROVIDER_ID,
+                StateStoreProviderAccessMode::SharedMultiFrontend,
+                MAX_KEY_BYTES,
+            ),
             cluster_file,
             keyspace_id,
             client,

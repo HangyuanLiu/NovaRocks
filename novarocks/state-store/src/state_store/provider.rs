@@ -263,8 +263,8 @@ mod tests {
     use crate::state_store::limits::StateStoreLimitOverrides;
     use async_trait::async_trait;
     use novarocks_spi::state_store::{
-        StateStoreError, StateStoreOpenRequest, StateStoreProviderDescriptor,
-        StateStoreProviderInstance,
+        MAX_KEY_BYTES, StateStoreError, StateStoreOpenRequest, StateStoreProviderAccessMode,
+        StateStoreProviderDescriptor, StateStoreProviderInstance,
     };
 
     struct TestFactory {
@@ -378,6 +378,8 @@ mod tests {
                     Ok(Box::new(TestFactory {
                         descriptor: StateStoreProviderDescriptor::new(
                             MYSQL_STATE_STORE_PROVIDER_ID,
+                            StateStoreProviderAccessMode::SharedMultiFrontend,
+                            3_072,
                         ),
                     }))
                 },
@@ -403,6 +405,8 @@ mod tests {
                     Ok(Box::new(TestFactory {
                         descriptor: StateStoreProviderDescriptor::new(
                             SQLITE_STATE_STORE_PROVIDER_ID,
+                            StateStoreProviderAccessMode::ExclusiveSingleFrontend,
+                            MAX_KEY_BYTES,
                         ),
                     }))
                 },

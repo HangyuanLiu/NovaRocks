@@ -24,9 +24,9 @@ use bytes::Bytes;
 use novarocks_spi::state_store::{
     ChangePage, ChangePollRequest, CommitResolution, FeDeploymentView, ReadTransaction, StateStore,
     StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
-    StateStoreOpenRequest, StateStoreProviderDescriptor, StateStoreProviderFactory,
-    StateStoreProviderId, StateStoreProviderInstance, StateStoreProviderLifecycle, StoreIdentity,
-    TransactionId, WriteTransaction,
+    StateStoreOpenRequest, StateStoreProviderAccessMode, StateStoreProviderDescriptor,
+    StateStoreProviderFactory, StateStoreProviderId, StateStoreProviderInstance,
+    StateStoreProviderLifecycle, StoreIdentity, TransactionId, WriteTransaction,
 };
 use novarocks_state_store::{
     SQLITE_STATE_STORE_PROVIDER_ID, StateStoreAppConfig, StateStoreConfig, StateStoreHost,
@@ -80,7 +80,11 @@ impl StateStoreProviderFactory for FakeFactory {
                 false,
             ),
             FakeOpen::MismatchedInstance { cleanup_fails } => (
-                StateStoreProviderDescriptor::new(OTHER_PROVIDER_ID),
+                StateStoreProviderDescriptor::new(
+                    OTHER_PROVIDER_ID,
+                    StateStoreProviderAccessMode::SharedMultiFrontend,
+                    novarocks_spi::state_store::MAX_KEY_BYTES,
+                ),
                 StateStoreProviderLifecycle::Ready,
                 Some(Arc::new(FakeStore) as Arc<dyn StateStore>),
                 cleanup_fails,
@@ -251,7 +255,11 @@ fn fake_registry(mode: FakeOpen) -> (StateStoreProviderRegistry, FakeControls) {
             novarocks_spi::state_store::MAX_KEY_BYTES,
             move |_| {
                 Ok(Box::new(FakeFactory {
-                    descriptor: StateStoreProviderDescriptor::new(SQLITE_STATE_STORE_PROVIDER_ID),
+                    descriptor: StateStoreProviderDescriptor::new(
+                        SQLITE_STATE_STORE_PROVIDER_ID,
+                        StateStoreProviderAccessMode::ExclusiveSingleFrontend,
+                        novarocks_spi::state_store::MAX_KEY_BYTES,
+                    ),
                     mode,
                     events: Arc::clone(&binder_events),
                     open_deadline: Arc::clone(&binder_open_deadline),

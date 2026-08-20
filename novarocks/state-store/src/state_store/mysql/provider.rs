@@ -22,13 +22,14 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use novarocks_spi::state_store::{
     StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
-    StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
-    StateStoreProviderLifecycle,
+    StateStoreProviderAccessMode, StateStoreProviderDescriptor, StateStoreProviderFactory,
+    StateStoreProviderInstance, StateStoreProviderLifecycle,
 };
 use tokio::sync::{mpsc, oneshot};
 
 use super::runtime::MysqlRuntime;
 use crate::state_store::MySqlClientConfig;
+use crate::state_store::limits::MYSQL_MAX_KEY_BYTES;
 use crate::state_store::provider::MYSQL_STATE_STORE_PROVIDER_ID;
 
 trait MysqlProviderRuntime: Send + 'static {
@@ -335,7 +336,11 @@ pub(crate) struct MysqlStateStoreProviderFactory {
 impl MysqlStateStoreProviderFactory {
     pub(crate) fn new(database: String, client: MySqlClientConfig) -> Self {
         Self {
-            descriptor: StateStoreProviderDescriptor::new(MYSQL_STATE_STORE_PROVIDER_ID),
+            descriptor: StateStoreProviderDescriptor::new(
+                MYSQL_STATE_STORE_PROVIDER_ID,
+                StateStoreProviderAccessMode::SharedMultiFrontend,
+                MYSQL_MAX_KEY_BYTES,
+            ),
             database,
             client,
         }
@@ -831,7 +836,11 @@ mod tests {
         let runtime = test_mysql_runtime_with_pool(pool);
         let runtime = spawn_mysql_runtime_owner(runtime);
         let mut instance = MysqlStateStoreProviderInstance {
-            descriptor: StateStoreProviderDescriptor::new(MYSQL_STATE_STORE_PROVIDER_ID),
+            descriptor: StateStoreProviderDescriptor::new(
+                MYSQL_STATE_STORE_PROVIDER_ID,
+                StateStoreProviderAccessMode::SharedMultiFrontend,
+                MYSQL_MAX_KEY_BYTES,
+            ),
             lifecycle: StateStoreProviderLifecycle::Ready,
             state_store: Some(Arc::new(FakeStore)),
             runtime: Some(runtime),
