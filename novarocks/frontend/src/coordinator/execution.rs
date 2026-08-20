@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::common::backend_topology::LiveBackendTarget;
@@ -47,7 +47,7 @@ use novarocks_protocol::lifecycle::{
     QueryExecutionId as ProtocolQueryExecutionId, QueryOptions as ProtocolQueryOptions,
 };
 use novarocks_spi::connector::ConnectorWriteLease;
-use novarocks_types::QueryId;
+use novarocks_types::{LocalQuerySequence, QueryId, QueryIdAttribution, QueryProcessNamespace};
 
 use super::backend_events::BackendQueryActivity;
 use super::query_lifecycle::{
@@ -85,28 +85,64 @@ use novarocks_protocol::{
 };
 
 trait QueryIdSource: Send + Sync + 'static {
-    fn next_query_id(&self) -> QueryId;
+    fn next_query_id(&self) -> Result<QueryId, DistributedQueryError>;
 }
 
 struct UniqueQueryIdSource {
-    next_low: AtomicI64,
+    namespace: QueryProcessNamespace,
+    last_issued_sequence: AtomicU64,
 }
 
 impl Default for UniqueQueryIdSource {
     fn default() -> Self {
+        let (namespace, _) = uuid::Uuid::new_v4().as_u64_pair();
+        Self::new(QueryProcessNamespace::new(namespace))
+    }
+}
+
+impl UniqueQueryIdSource {
+    fn new(namespace: QueryProcessNamespace) -> Self {
         Self {
-            next_low: AtomicI64::new(100),
+            namespace,
+            last_issued_sequence: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(test)]
+    fn with_last_issued_sequence(namespace: QueryProcessNamespace, last_issued: u64) -> Self {
+        Self {
+            namespace,
+            last_issued_sequence: AtomicU64::new(last_issued),
+        }
+    }
+
+    fn namespace(&self) -> QueryProcessNamespace {
+        self.namespace
     }
 }
 
 impl QueryIdSource for UniqueQueryIdSource {
-    fn next_query_id(&self) -> QueryId {
-        let (high, _) = uuid::Uuid::new_v4().as_u64_pair();
-        QueryId::new(
-            high as i64,
-            self.next_low.fetch_add(1_000, Ordering::Relaxed),
+    fn next_query_id(&self) -> Result<QueryId, DistributedQueryError> {
+        let last_issued = self
+            .last_issued_sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current
+                    .checked_add(1)
+                    .filter(|next| *next <= i64::MAX as u64)
+            })
+            .map_err(|_| {
+                DistributedQueryError::new(
+                    DistributedQueryErrorKind::Failed,
+                    "frontend query id local sequence is exhausted",
+                )
+            })?;
+        let sequence = LocalQuerySequence::new(
+            last_issued
+                .checked_add(1)
+                .expect("successful query id allocation increments the sequence"),
         )
+        .expect("successful query id allocation produces a nonzero sequence");
+        Ok(QueryIdAttribution::new(self.namespace, sequence).into_query_id())
     }
 }
 
@@ -119,8 +155,8 @@ struct FixedQueryIdSource(QueryId);
 
 #[cfg(test)]
 impl QueryIdSource for FixedQueryIdSource {
-    fn next_query_id(&self) -> QueryId {
-        self.0
+    fn next_query_id(&self) -> Result<QueryId, DistributedQueryError> {
+        Ok(self.0)
     }
 }
 
@@ -656,6 +692,19 @@ impl FrontendDistributedQueryCoordinator {
         connector_control.set_retirement_sink(Arc::new(GrpcConnectorControlRetirementSink {
             data_runtime: data_runtime.clone(),
         }));
+        let query_id_source = UniqueQueryIdSource::default();
+        let query_namespace = query_id_source.namespace();
+        tracing::info!(
+            query_process_namespace = %query_namespace,
+            "frontend query process namespace initialized"
+        );
+        if cfg!(debug_assertions)
+            && std::env::var_os(novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV).is_some()
+        {
+            eprintln!(
+                "NOVAROCKS_QUERY_PROCESS_NAMESPACE query_process_namespace={query_namespace}"
+            );
+        }
         Ok(Self {
             report_endpoint: Arc::new(FrontendReportEndpointBinding::new(
                 advertised_report_host,
@@ -665,8 +714,8 @@ impl FrontendDistributedQueryCoordinator {
             #[cfg(test)]
             backend_services: None,
             runtime_filter_worker_count,
-            query_ids: Arc::new(UniqueQueryIdSource::default()),
-            registry: Arc::new(FrontendQueryRegistry::default()),
+            query_ids: Arc::new(query_id_source),
+            registry: Arc::new(FrontendQueryRegistry::new(query_namespace)),
             connector_control,
             data_runtime,
             lifecycle_config,
@@ -736,7 +785,9 @@ impl FrontendDistributedQueryCoordinator {
             }),
             runtime_filter_worker_count,
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
-            registry: Arc::new(FrontendQueryRegistry::default()),
+            registry: Arc::new(FrontendQueryRegistry::new(QueryProcessNamespace::new(
+                query_id.high() as u64,
+            ))),
             connector_control: Arc::new(ConnectorControlHost::new()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             lifecycle_config: build_lifecycle_config(test_timeouts)
@@ -779,7 +830,9 @@ impl FrontendDistributedQueryCoordinator {
             }),
             runtime_filter_worker_count,
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
-            registry: Arc::new(FrontendQueryRegistry::default()),
+            registry: Arc::new(FrontendQueryRegistry::new(QueryProcessNamespace::new(
+                query_id.high() as u64,
+            ))),
             connector_control: Arc::new(ConnectorControlHost::new()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             lifecycle_config: build_lifecycle_config(test_timeouts)
@@ -853,7 +906,7 @@ impl FrontendDistributedQueryCoordinator {
         &self,
         request: DistributedQueryRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        let query_id = self.query_ids.next_query_id();
+        let query_id = self.query_ids.next_query_id()?;
         let execution_id = QueryExecutionId::new(
             query_id,
             AttemptId::new(1).expect("the initial query attempt is nonzero"),
@@ -1305,8 +1358,87 @@ fn abort_query_lifecycle(
 
 #[cfg(test)]
 mod tests {
-    use super::FrontendReportEndpointBinding;
+    use super::{FrontendReportEndpointBinding, QueryIdSource, UniqueQueryIdSource};
     use crate::common::backend_topology::CoordinatorReportEndpointSink;
+    use crate::query_execution::contract::DistributedQueryErrorKind;
+    use novarocks_types::QueryProcessNamespace;
+
+    #[test]
+    fn unique_query_id_source_uses_one_namespace_with_continuous_positive_sequences() {
+        let namespace = QueryProcessNamespace::new(0xfedc_ba98_7654_3210);
+        let source = UniqueQueryIdSource::new(namespace);
+
+        let first = source.next_query_id().expect("first allocation");
+        let second = source.next_query_id().expect("second allocation");
+
+        assert_eq!(
+            first
+                .process_attribution()
+                .expect("first attribution")
+                .namespace(),
+            namespace
+        );
+        assert_eq!(
+            first
+                .process_attribution()
+                .expect("first attribution")
+                .sequence()
+                .get(),
+            1
+        );
+        assert_eq!(
+            second
+                .process_attribution()
+                .expect("second attribution")
+                .namespace(),
+            namespace
+        );
+        assert_eq!(
+            second
+                .process_attribution()
+                .expect("second attribution")
+                .sequence()
+                .get(),
+            2
+        );
+    }
+
+    #[test]
+    fn unique_query_id_sources_keep_injected_process_namespaces_distinct() {
+        let first = UniqueQueryIdSource::new(QueryProcessNamespace::new(11));
+        let second = UniqueQueryIdSource::new(QueryProcessNamespace::new(12));
+
+        let first_id = first.next_query_id().expect("first namespace allocation");
+        let second_id = second.next_query_id().expect("second namespace allocation");
+
+        assert_eq!(first_id.low(), second_id.low());
+        assert_ne!(first_id.high(), second_id.high());
+        assert_ne!(first_id, second_id);
+    }
+
+    #[test]
+    fn unique_query_id_source_fails_closed_after_sequence_exhaustion() {
+        let source = UniqueQueryIdSource::with_last_issued_sequence(
+            QueryProcessNamespace::new(13),
+            i64::MAX as u64 - 1,
+        );
+
+        let final_id = source.next_query_id().expect("final sequence allocation");
+        assert_eq!(
+            final_id
+                .process_attribution()
+                .expect("final attribution")
+                .sequence()
+                .get(),
+            i64::MAX as u64
+        );
+        let error = source.next_query_id().expect_err("exhaustion must fail");
+        assert_eq!(error.kind(), DistributedQueryErrorKind::Failed);
+        assert_eq!(
+            error.message(),
+            "frontend query id local sequence is exhausted"
+        );
+    }
 
     #[test]
     fn ephemeral_report_endpoint_is_unavailable_until_the_bound_port_is_published() {

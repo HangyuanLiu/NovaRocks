@@ -923,7 +923,13 @@ fn registry_for(
     Arc<FrontendQueryRegistry>,
     super::super::query_registry::ActiveQueryGuard,
 ) {
-    let registry = Arc::new(FrontendQueryRegistry::default());
+    let registry = Arc::new(FrontendQueryRegistry::new(
+        plan.execution_id()
+            .query_id()
+            .process_attribution()
+            .expect("fixture query id has process attribution")
+            .namespace(),
+    ));
     let guard = registry
         .register(
             plan.execution_id().query_id(),
@@ -2373,7 +2379,12 @@ fn query_cancel_aborts_all_participants() {
     let query_id = execution_id.query_id();
     let (transport, sessions) = RecordingTransport::ready(&plan);
     let dispatcher = Arc::new(RecordingLegacyCancellationDispatcher::default());
-    let registry = Arc::new(FrontendQueryRegistry::default());
+    let registry = Arc::new(FrontendQueryRegistry::new(
+        query_id
+            .process_attribution()
+            .expect("fixture query id has process attribution")
+            .namespace(),
+    ));
     let _query = registry
         .register(query_id, DistributedQueryIntent::Result, dispatcher.clone())
         .expect("register cancellation fixture");

@@ -26,7 +26,7 @@ use crate::query_execution::contract::{
 };
 use crate::query_execution::runtime_filter_terminal_rollup::RuntimeFilterTerminalRollup;
 use novarocks_protocol::lifecycle::{ParticipantTerminalOutcome, QueryExecutionId};
-use novarocks_types::QueryId;
+use novarocks_types::{QueryId, QueryProcessNamespace};
 
 type QueryKey = (i64, i64);
 
@@ -156,8 +156,8 @@ struct BackendTopologyState {
     live_generations: BTreeMap<usize, u64>,
 }
 
-#[derive(Default)]
 pub(crate) struct FrontendQueryRegistry {
+    namespace: QueryProcessNamespace,
     active: Mutex<BTreeMap<QueryKey, ActiveQuery>>,
     retained_terminal_ingress: Mutex<BTreeMap<QueryExecutionId, RetainedTerminalIngress>>,
     latest_retained_execution: Mutex<Option<QueryExecutionId>>,
@@ -187,6 +187,47 @@ impl AttemptBackendOwnershipError {
 }
 
 impl FrontendQueryRegistry {
+    pub(crate) fn new(namespace: QueryProcessNamespace) -> Self {
+        Self {
+            namespace,
+            active: Mutex::new(BTreeMap::new()),
+            retained_terminal_ingress: Mutex::new(BTreeMap::new()),
+            latest_retained_execution: Mutex::new(None),
+            backend_topology: Mutex::new(BackendTopologyState::default()),
+        }
+    }
+
+    fn describe_query_id(&self, query_id: QueryId) -> String {
+        match query_id.process_attribution() {
+            Some(attribution) => attribution.to_string(),
+            None => format!(
+                "raw_query_id={}/{} attribution=unavailable",
+                query_id.high(),
+                query_id.low()
+            ),
+        }
+    }
+
+    fn inactive_query(&self, query_id: QueryId) -> DistributedQueryError {
+        let description = self.describe_query_id(query_id);
+        let message = match query_id.process_attribution() {
+            Some(attribution) if attribution.namespace() == self.namespace => {
+                format!("frontend local query is not active ({description})")
+            }
+            Some(_) => format!(
+                "frontend query belongs to a foreign process and is not active \
+                 (local_namespace={} {description})",
+                self.namespace
+            ),
+            None => format!(
+                "frontend query has no valid process attribution and is not active \
+                 (local_namespace={} {description})",
+                self.namespace
+            ),
+        };
+        DistributedQueryError::new(DistributedQueryErrorKind::Rejected, message)
+    }
+
     pub(crate) fn register(
         self: &Arc<Self>,
         query_id: QueryId,
@@ -208,9 +249,8 @@ impl FrontendQueryRegistry {
             }
             Entry::Occupied(_) => {
                 return Err(contract_violation(format!(
-                    "frontend query {}/{} is already active",
-                    query_id.high(),
-                    query_id.low()
+                    "frontend query is already active ({})",
+                    self.describe_query_id(query_id)
                 )));
             }
         }
@@ -234,7 +274,7 @@ impl FrontendQueryRegistry {
         let mut active = self.active.lock().expect("frontend query registry lock");
         let query = active
             .get_mut(&query_key(query_id))
-            .ok_or_else(|| inactive_query(query_id))?;
+            .ok_or_else(|| self.inactive_query(query_id))?;
         if let Some(message) = &query.first_failure {
             return Err(failed(message.clone()));
         }
@@ -297,9 +337,9 @@ impl FrontendQueryRegistry {
         drop(topology);
 
         let mut active = self.active.lock().expect("frontend query registry lock");
-        let query = active
-            .get_mut(&query_key(query_id))
-            .ok_or_else(|| AttemptBackendOwnershipError::new(inactive_query(query_id), false))?;
+        let query = active.get_mut(&query_key(query_id)).ok_or_else(|| {
+            AttemptBackendOwnershipError::new(self.inactive_query(query_id), false)
+        })?;
         for &(backend_idx, start_epoch) in backend_ownership {
             match query.scheduled_backends.entry(backend_idx) {
                 Entry::Vacant(entry) => {
@@ -330,7 +370,7 @@ impl FrontendQueryRegistry {
             .lock()
             .expect("frontend query registry lock")
             .get(&query_key(query_id))
-            .ok_or_else(|| inactive_query(query_id))?
+            .ok_or_else(|| self.inactive_query(query_id))?
             .active_attempt
             .clone()
             .ok_or_else(|| {
@@ -396,7 +436,7 @@ impl FrontendQueryRegistry {
         let mut active = self.active.lock().expect("frontend query registry lock");
         let query = active
             .get_mut(&query_key(query_id))
-            .ok_or_else(|| inactive_query(query_id))?;
+            .ok_or_else(|| self.inactive_query(query_id))?;
         if !query.scheduled_backends.is_empty() {
             return Err(contract_violation(
                 "frontend query scheduled backend ownership is already registered",
@@ -488,7 +528,7 @@ impl FrontendQueryRegistry {
         {
             return Ok(());
         }
-        Err(inactive_query(query_id))
+        Err(self.inactive_query(query_id))
     }
 
     pub(crate) fn first_failure(&self, query_id: QueryId) -> Option<String> {
@@ -524,7 +564,7 @@ impl FrontendQueryRegistry {
         let mut active = self.active.lock().expect("frontend query registry lock");
         let query = active
             .get_mut(&query_key(query_id))
-            .ok_or_else(|| inactive_query(query_id))?;
+            .ok_or_else(|| self.inactive_query(query_id))?;
         query.record_failure(message);
         Ok(())
     }
@@ -538,7 +578,7 @@ impl FrontendQueryRegistry {
             let mut active = self.active.lock().expect("frontend query registry lock");
             let query = active
                 .get_mut(&query_key(query_id))
-                .ok_or_else(|| inactive_query(query_id))?;
+                .ok_or_else(|| self.inactive_query(query_id))?;
             let message = query.record_failure(message.into());
             (message, request_cancellation(query))
         };
@@ -771,17 +811,6 @@ fn query_key(query_id: QueryId) -> QueryKey {
     (query_id.high(), query_id.low())
 }
 
-fn inactive_query(query_id: QueryId) -> DistributedQueryError {
-    DistributedQueryError::new(
-        DistributedQueryErrorKind::Rejected,
-        format!(
-            "frontend query {}/{} is not active",
-            query_id.high(),
-            query_id.low()
-        ),
-    )
-}
-
 fn contract_violation(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
 }
@@ -908,7 +937,7 @@ mod tests {
 
     #[test]
     fn retained_terminal_ingress_accepts_same_execution_after_active_query_unregistered() {
-        let registry = FrontendQueryRegistry::default();
+        let registry = FrontendQueryRegistry::new(QueryProcessNamespace::new(41));
         let execution_id =
             QueryExecutionId::new(QueryId::new(41, 42), AttemptId::new(1).expect("attempt"))
                 .expect("execution id");
@@ -944,7 +973,7 @@ mod tests {
     #[test]
     fn failure_primary_is_stable_when_reports_arrive_in_different_orders() {
         fn record_in_order(messages: &[&str]) -> (String, Vec<String>) {
-            let registry = Arc::new(FrontendQueryRegistry::default());
+            let registry = Arc::new(FrontendQueryRegistry::new(QueryProcessNamespace::new(71)));
             let query_id = QueryId::new(71, 72);
             registry
                 .active
@@ -987,6 +1016,42 @@ mod tests {
         assert_eq!(
             forward.1,
             vec!["middle failure".to_string(), "zeta failure".to_string()]
+        );
+    }
+
+    #[test]
+    fn inactive_query_diagnosis_distinguishes_local_and_foreign_processes() {
+        let registry = FrontendQueryRegistry::new(QueryProcessNamespace::new(0x11));
+
+        let local = registry.inactive_query(QueryId::new(0x11, 7));
+        assert_eq!(local.kind(), DistributedQueryErrorKind::Rejected);
+        assert!(
+            local
+                .message()
+                .contains("frontend local query is not active")
+        );
+        assert!(
+            local
+                .message()
+                .contains("namespace=0x0000000000000011 sequence=7")
+        );
+
+        let foreign = registry.inactive_query(QueryId::new(0x12, 8));
+        assert_eq!(foreign.kind(), DistributedQueryErrorKind::Rejected);
+        assert!(
+            foreign
+                .message()
+                .contains("frontend query belongs to a foreign process")
+        );
+        assert!(
+            foreign
+                .message()
+                .contains("local_namespace=0x0000000000000011")
+        );
+        assert!(
+            foreign
+                .message()
+                .contains("namespace=0x0000000000000012 sequence=8")
         );
     }
 }

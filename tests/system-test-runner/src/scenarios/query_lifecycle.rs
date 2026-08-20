@@ -2,7 +2,10 @@ use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::{QueryExecutionResourceSnapshot, ServerHandle};
+use novarocks_cluster_harness::{
+    ParticipantTerminalOutcomeKind, QueryExecutionResourceSnapshot,
+    QueryLifecycleStructuredSnapshot, ServerHandle,
+};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::thread;
@@ -11,6 +14,7 @@ use std::time::Duration;
 const REQUIRED_BACKENDS: usize = 3;
 const IO_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const BASELINE_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -36,14 +40,26 @@ impl Scenario for DistributedBaseline {
         let mut connection =
             mysql_actor::connect(context.mysql_user(), context.mysql_port(), connect_timeout)?;
         context.action("connected baseline client through public MySQL protocol");
-        let rows: Vec<i64> = connection
-            .query("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
-            .context("execute distributed baseline query")?;
-        ensure!(
-            rows == vec![1, 2],
-            "distributed baseline query returned unexpected rows: {rows:?}"
-        );
-        context.action("executed distributed baseline query and verified rows [1, 2]");
+
+        let before_first = latest_execution_id(context)?;
+        execute_baseline_query(&mut connection, "first")?;
+        let first = await_terminal_snapshot(context, before_first.as_deref())?;
+
+        let before_second = first.execution_id.clone();
+        execute_baseline_query(&mut connection, "second")?;
+        let second = await_terminal_snapshot(context, before_second.as_deref())?;
+        let before_third = second.execution_id.clone();
+        execute_baseline_query(&mut connection, "third")?;
+        let third = await_terminal_snapshot(context, before_third.as_deref())?;
+        assert_process_attribution(&[&first, &second, &third])?;
+        assert_process_attribution_diagnostics(context, &third)?;
+        context.action(format!(
+            "verified three native terminal snapshots share namespace=0x{:016x}, use consecutive sequence {}, {}, {}, attempt=1, and cover all 3 backend diagnostics",
+            first.process_namespace,
+            first.local_sequence,
+            second.local_sequence,
+            third.local_sequence,
+        ));
 
         await_resource_convergence(context, &baseline, false)
     }
@@ -141,6 +157,119 @@ fn resource_snapshot(context: &mut ScenarioContext) -> Result<QueryExecutionReso
         .handle()
         .query_execution_resource_snapshot()?
         .context("cross-process harness did not expose the query-resource oracle")
+}
+
+fn latest_execution_id(context: &mut ScenarioContext) -> Result<Option<String>> {
+    Ok(context
+        .handle()
+        .query_lifecycle_structured_snapshot()?
+        .and_then(|snapshot| snapshot.execution_id))
+}
+
+fn execute_baseline_query(connection: &mut mysql::Conn, ordinal: &str) -> Result<()> {
+    let rows: Vec<i64> = connection
+        .query(BASELINE_QUERY)
+        .with_context(|| format!("execute {ordinal} distributed baseline query"))?;
+    ensure!(
+        rows == vec![1, 2],
+        "{ordinal} distributed baseline query returned unexpected rows: {rows:?}"
+    );
+    Ok(())
+}
+
+fn await_terminal_snapshot(
+    context: &mut ScenarioContext,
+    before_execution_id: Option<&str>,
+) -> Result<QueryLifecycleStructuredSnapshot> {
+    let deadline = context.deadline();
+    context
+        .handle()
+        .await_query_lifecycle_structured_snapshot_after(before_execution_id, deadline)
+        .context("await a new typed query lifecycle terminal snapshot")
+}
+
+fn assert_process_attribution(snapshots: &[&QueryLifecycleStructuredSnapshot]) -> Result<()> {
+    ensure!(
+        !snapshots.is_empty(),
+        "attribution requires at least one snapshot"
+    );
+    for pair in snapshots.windows(2) {
+        let previous = pair[0];
+        let next = pair[1];
+        ensure!(
+            previous.process_namespace == next.process_namespace,
+            "consecutive baseline queries changed process namespace: previous=0x{:016x}, next=0x{:016x}",
+            previous.process_namespace,
+            next.process_namespace,
+        );
+        ensure!(
+            previous.local_sequence.checked_add(1) == Some(next.local_sequence),
+            "consecutive baseline query sequences are not adjacent: previous={}, next={}",
+            previous.local_sequence,
+            next.local_sequence,
+        );
+    }
+    for (ordinal, snapshot) in snapshots.iter().enumerate() {
+        let ordinal = ordinal + 1;
+        ensure!(
+            snapshot.attempt_id == 1,
+            "baseline query {ordinal} used unexpected attempt id {}",
+            snapshot.attempt_id
+        );
+        ensure!(
+            !snapshot.participant_outcomes.is_empty(),
+            "baseline query {ordinal} terminal snapshot had no participant outcome",
+        );
+        ensure!(
+            snapshot.participant_outcomes.len() <= REQUIRED_BACKENDS,
+            "baseline query {ordinal} terminal snapshot covered {} participants, exceeding the 1FE+{REQUIRED_BACKENDS} topology",
+            snapshot.participant_outcomes.len()
+        );
+        ensure!(
+            snapshot
+                .participant_outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, ParticipantTerminalOutcomeKind::Proof)),
+            "baseline query {ordinal} terminal snapshot contains a non-proof participant outcome: {:?}",
+            snapshot.participant_outcomes
+        );
+    }
+    ensure!(
+        snapshots.len() >= 2,
+        "attribution acceptance requires at least two consecutive queries"
+    );
+    Ok(())
+}
+
+fn assert_process_attribution_diagnostics(
+    context: &mut ScenarioContext,
+    snapshot: &QueryLifecycleStructuredSnapshot,
+) -> Result<()> {
+    let namespace = format!("0x{:016x}", snapshot.process_namespace);
+    let namespace_field = format!("query_process_namespace={namespace}");
+    let startup_message = "NOVAROCKS_QUERY_PROCESS_NAMESPACE";
+    let startup_count = context.handle().fe_log_count(startup_message)?;
+    ensure!(
+        startup_count == 1,
+        "expected exactly one FE process namespace startup publication, found {startup_count}"
+    );
+    ensure!(
+        context
+            .handle()
+            .fe_log_contents()?
+            .contains(&namespace_field),
+        "FE startup diagnostics did not publish {namespace_field}"
+    );
+    for backend in 0..REQUIRED_BACKENDS {
+        context
+            .handle()
+            .assert_be_log(backend, "NOVAROCKS_QUERY_INIT_APPLIED")?;
+        context.handle().assert_be_log(backend, &namespace_field)?;
+    }
+    context.action(format!(
+        "verified one FE startup namespace publication and matching BE lifecycle diagnostics for {namespace}"
+    ));
+    Ok(())
 }
 
 fn await_resource_activity(
