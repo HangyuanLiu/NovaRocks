@@ -629,10 +629,7 @@ impl FrontendQuerySession {
             return Ok(false);
         }
         let assignment = sql[4..].trim();
-        if let Some(catalog) = assignment
-            .strip_prefix("CATALOG ")
-            .or_else(|| assignment.strip_prefix("catalog "))
-        {
+        if let Some(catalog) = strip_prefix_ignore_ascii_case(assignment, "CATALOG ") {
             let catalog =
                 resolve_catalog_name(&self.service.session_catalog_resolver, catalog.trim())?;
             let mut state = self.state.lock().map_err(poisoned_state)?;
@@ -1081,6 +1078,12 @@ impl Drop for FrontendQuerySession {
 struct DatabaseContext {
     catalog: Option<String>,
     database: String,
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = value.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &value[prefix.len()..])
 }
 
 fn resolve_catalog_name(
@@ -2067,6 +2070,22 @@ mod tests {
         assert_eq!(parse_kill_query("KILL QUERY 17").unwrap(), Some(17));
         assert_eq!(parse_kill_query("kill 18").unwrap(), Some(18));
         assert_eq!(parse_kill_query("SELECT 1").unwrap(), None);
+    }
+
+    #[test]
+    fn session_catalog_keyword_is_case_insensitive() {
+        for sql in [
+            "SET CATALOG warehouse",
+            "SET catalog warehouse",
+            "SET Catalog warehouse",
+        ] {
+            let assignment = sql.strip_prefix("SET ").expect("SET statement");
+            assert_eq!(
+                strip_prefix_ignore_ascii_case(assignment, "CATALOG "),
+                Some("warehouse"),
+                "{sql} must select the catalog session branch"
+            );
+        }
     }
 
     #[test]
