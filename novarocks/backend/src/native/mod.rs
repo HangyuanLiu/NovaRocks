@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend-owned native gRPC transport declarations.
+//! Backend-owned native wire adapters pending domain relocation.
 //!
-//! This module owns Backend's generated client and server stubs while
-//! `novarocks-protocol` remains the sole owner of all native protobuf DTOs.
+//! `novarocks-protocol` remains the sole owner of all native protobuf DTOs;
+//! generated Tonic stubs and shared RPC infrastructure live in `crate::rpc`.
 
-pub(crate) mod client;
-pub(crate) mod codec;
 pub(crate) mod connector_binding;
 pub(crate) mod decode;
 pub(crate) mod envelope;
@@ -33,29 +31,11 @@ pub(crate) mod layout;
 pub(crate) mod lifecycle_adapter;
 pub(crate) mod plan_decode;
 pub(crate) mod query_options;
-pub(crate) mod runtime;
 pub(crate) mod runtime_filter;
 pub(crate) mod runtime_filter_adapter;
 pub(crate) mod runtime_filter_install;
 pub(crate) mod runtime_filter_sender;
 pub(crate) mod scan_contract;
-pub(crate) mod service;
 pub(crate) mod sink_assignment;
 pub(crate) mod submission_validation;
 pub(crate) mod type_decode;
-
-pub(crate) mod transport {
-    include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn generated_native_transport_stubs_reference_protocol_dtos() {
-        let generated = include_str!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
-        assert!(generated.contains("nova_rocks_grpc_client"));
-        assert!(generated.contains("nova_rocks_grpc_server"));
-        assert!(generated.contains("::novarocks_protocol::novarocks::HeartbeatRequest"));
-        assert!(generated.contains("::novarocks_protocol::filter::LookupRequest"));
-    }
-}

@@ -18,7 +18,7 @@
 //! Backend role-local async runtime dependencies.
 //!
 //! The server composition root creates this adapter from the role data-plane
-//! runtime and passes clones through every native outbound client.  It keeps
+//! runtime and passes clones through every Backend outbound RPC client. It keeps
 //! the runtime handle and channel cache instance-owned; no Core or process
 //! global runtime participates in Backend transport work.
 

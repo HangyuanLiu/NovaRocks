@@ -1,4 +1,4 @@
-//! Role-neutral native RPC data-plane capability.
+//! Backend RPC data-plane capability.
 //!
 //! This value owns no listener, query lifecycle admission, backend identity, or
 //! report policy. Role-owned gRPC services keep their wire gates and delegate
@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use novarocks_types::UniqueId;
 
+use super::data_plane_handlers;
 use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
-use crate::service::internal_rpc;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, UnavailableExchangeReceiverPort,
 };
@@ -19,25 +19,25 @@ use std::sync::Arc;
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
-pub struct NativeDataPlaneKernel {
+pub struct BackendDataPlane {
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
 }
 
-impl std::fmt::Debug for NativeDataPlaneKernel {
+impl std::fmt::Debug for BackendDataPlane {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("NativeDataPlaneKernel")
+            .debug_struct("BackendDataPlane")
             .finish_non_exhaustive()
     }
 }
 
-impl Default for NativeDataPlaneKernel {
+impl Default for BackendDataPlane {
     fn default() -> Self {
         Self::query_scoped()
     }
 }
 
-impl NativeDataPlaneKernel {
+impl BackendDataPlane {
     pub fn query_scoped() -> Self {
         Self::with_exchange_receiver_port(Arc::new(UnavailableExchangeReceiverPort))
     }
@@ -54,11 +54,11 @@ impl NativeDataPlaneKernel {
         &self,
         request: proto::novarocks::ExchangeRequest,
     ) -> proto::novarocks::ExchangeResponse {
-        internal_rpc::handle_transmit_chunk(self.exchange_receiver_port.as_ref(), request)
+        data_plane_handlers::handle_transmit_chunk(self.exchange_receiver_port.as_ref(), request)
     }
 
     pub fn lookup(&self, request: proto::filter::LookupRequest) -> proto::filter::LookupResponse {
-        internal_rpc::handle_lookup(request)
+        data_plane_handlers::handle_lookup(request)
     }
 
     pub fn fetch_result(

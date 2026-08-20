@@ -14,6 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+//! Synchronous data-plane handlers delegated by the Backend RPC service.
+
 use std::collections::HashMap;
 
 use crate::runtime::lookup::{

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Production native-BE gRPC service and its instance-owned listener.
+//! Production Backend gRPC service and its instance-owned listener.
 //!
 //! The generated service is intentionally owned by `novarocks-backend`.  The
 //! core service remains the compatibility-neutral implementation while the
@@ -29,7 +29,7 @@ use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
 use crate::metrics::handle_metrics;
-use crate::service::native_data_plane::NativeDataPlaneKernel;
+use crate::rpc::data_plane::BackendDataPlane;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
@@ -43,32 +43,33 @@ use tonic::body::boxed;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
 
-use super::ingress::NativeFragmentIngress;
-use super::lifecycle_adapter::{
+use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
+use crate::native::connector_binding;
+use crate::native::ingress::NativeFragmentIngress;
+use crate::native::lifecycle_adapter::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
     handle_stage_fragments, handle_start_prepared_query, status_from_contract_error,
     status_from_lifecycle_error,
 };
-use super::runtime_filter_adapter::{
+use crate::native::runtime_filter_adapter::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,
 };
-use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
 use crate::query_lifecycle::QueryLifecycleIngress;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Backend-owned production Tonic service.  Core contributes only the narrow
-/// data-plane kernel and protocol-neutral lifecycle/report ports.
+/// Backend-owned production Tonic service. Domain owners contribute the narrow
+/// ingress ports while this service composes them with `BackendDataPlane`.
 #[derive(Clone)]
-pub(crate) struct NativeBackendGrpcService {
+pub(crate) struct BackendRpcService {
     native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
     query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     query_control_shutdown: Option<watch::Receiver<bool>>,
-    data_plane: NativeDataPlaneKernel,
+    data_plane: BackendDataPlane,
     runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
 }
 
-impl NativeBackendGrpcService {
+impl BackendRpcService {
     pub(crate) fn new(
         native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
         query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
@@ -79,7 +80,7 @@ impl NativeBackendGrpcService {
             native_fragment_ingress,
             query_lifecycle_ingress,
             query_control_shutdown: None,
-            data_plane: NativeDataPlaneKernel::with_exchange_receiver_port(exchange_receiver_port),
+            data_plane: BackendDataPlane::with_exchange_receiver_port(exchange_receiver_port),
             runtime_filter_ingress,
         }
     }
@@ -91,7 +92,7 @@ impl NativeBackendGrpcService {
 }
 
 #[tonic::async_trait]
-impl NovaRocksGrpc for NativeBackendGrpcService {
+impl NovaRocksGrpc for BackendRpcService {
     type ExchangeStream = std::pin::Pin<
         Box<
             dyn tokio_stream::Stream<Item = Result<proto::ExchangeResponse, tonic::Status>>
@@ -214,10 +215,10 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
         let ingress = Arc::clone(&self.native_fragment_ingress);
         let result = tokio::task::spawn_blocking(move || {
             let (execution_id, declaration) =
-                super::connector_binding::decode_ensure_request(request.into_inner())
+                connector_binding::decode_ensure_request(request.into_inner())
                     .map_err(|error| error.to_string())?;
-            let context = super::connector_binding::install_request_context()
-                .map_err(|error| error.to_string())?;
+            let context =
+                connector_binding::install_request_context().map_err(|error| error.to_string())?;
             ingress
                 .ensure_connector_execution_binding(execution_id, declaration, context)
                 .map_err(|error| error.to_string())
@@ -246,7 +247,7 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
     {
         let ingress = Arc::clone(&self.native_fragment_ingress);
         let result = tokio::task::spawn_blocking(move || {
-            let key = super::connector_binding::decode_retire_request(request.into_inner())
+            let key = connector_binding::decode_retire_request(request.into_inner())
                 .map_err(|error| error.to_string())?;
             ingress
                 .retire_connector_execution_binding(key)
@@ -377,7 +378,7 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
 
 /// A backend application owns exactly one native listener.  Unlike the legacy
 /// core listener, this handle has no global reservation or shutdown state.
-pub(crate) struct NativeGrpcServerHandle {
+pub(crate) struct BackendRpcServerHandle {
     bound_addr: SocketAddr,
     shutdown_tx: Option<watch::Sender<bool>>,
     failure_rx: mpsc::Receiver<String>,
@@ -385,12 +386,8 @@ pub(crate) struct NativeGrpcServerHandle {
     stop_requested: Arc<AtomicBool>,
 }
 
-impl NativeGrpcServerHandle {
-    pub(crate) fn start(
-        host: &str,
-        port: u16,
-        service: NativeBackendGrpcService,
-    ) -> Result<Self, String> {
+impl BackendRpcServerHandle {
+    pub(crate) fn start(host: &str, port: u16, service: BackendRpcService) -> Result<Self, String> {
         let address = (host, port)
             .to_socket_addrs()
             .map_err(|error| format!("resolve native backend gRPC address {host}:{port}: {error}"))?
@@ -432,7 +429,7 @@ impl NativeGrpcServerHandle {
                         let mut shutdown_rx = shutdown_rx;
                         let grpc_path = format!(
                             "/{}/*rest",
-                            <NovaRocksGrpcServer<NativeBackendGrpcService> as NamedService>::NAME
+                            <NovaRocksGrpcServer<BackendRpcService> as NamedService>::NAME
                         );
                         let app = Router::new()
                             .route_service(&grpc_path, AxumGrpcService::new(service))
@@ -506,7 +503,7 @@ impl NativeGrpcServerHandle {
     }
 }
 
-impl Drop for NativeGrpcServerHandle {
+impl Drop for BackendRpcServerHandle {
     fn drop(&mut self) {
         let _ = self.stop();
     }

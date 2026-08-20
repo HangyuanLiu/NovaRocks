@@ -24,6 +24,8 @@ use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_f
 use tonic::Status;
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 
+// Tonic codec guards for the Backend RPC surface.
+
 const PLAN_FIELD: u32 = 1;
 const INSTANCE_PARAMS_FIELD: u32 = 2;
 const STAGE_FRAGMENTS_FIELD: u32 = 5;

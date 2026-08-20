@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend-owned native outbound transport.
+//! Backend-owned outbound RPC transport.
 //!
 //! This is deliberately role-private: it provides only BE-to-BE data-plane
 //! calls and the BE-to-FE terminal fallback.  It shares no transport facade
@@ -35,13 +35,13 @@ use super::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
-pub(crate) struct NativeGrpcClient {
+pub(crate) struct BackendRpcClient {
     runtime: BackendDataRuntime,
     host: String,
     port: u16,
 }
 
-impl NativeGrpcClient {
+impl BackendRpcClient {
     pub(crate) fn new_runtime_endpoint(
         runtime: BackendDataRuntime,
         endpoint: &RuntimeEndpoint,

@@ -22,11 +22,11 @@ use crate::fragment::{
 };
 use crate::metrics::MetricsHttpServer;
 use crate::native::runtime_filter_adapter::BackendRuntimeFilterEnvelopeIngress;
-use crate::native::service::{NativeBackendGrpcService, NativeGrpcServerHandle};
 use crate::query_lifecycle::{
     NativeQueryLifecycleLocalRuntime, QueryControlAttachment, QueryLifecycleIngress,
     QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
 };
+use crate::rpc::server::{BackendRpcServerHandle, BackendRpcService};
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_spi::connector::WriteCommitEvidenceLimits;
 
@@ -95,7 +95,7 @@ impl std::error::Error for BackendApplicationError {}
 
 pub struct BackendApplicationHost {
     ready_marker: String,
-    grpc_server: NativeGrpcServerHandle,
+    grpc_server: BackendRpcServerHandle,
     _native_fragment_service: Arc<NativeFragmentService>,
     _query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
     execution_host: Arc<crate::ConnectorExecutionHost>,
@@ -401,10 +401,10 @@ impl BackendApplicationHost {
 
         let runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress> =
             services.query_lifecycle_registry.clone();
-        let mut grpc_server = NativeGrpcServerHandle::start(
+        let mut grpc_server = BackendRpcServerHandle::start(
             &bind_host,
             grpc_port,
-            NativeBackendGrpcService::new(
+            BackendRpcService::new(
                 native_fragment_service.clone(),
                 services.query_lifecycle_ingress.clone(),
                 runtime_filter_ingress,
@@ -613,7 +613,7 @@ mod tests {
         BackendServerConfig, QueryLifecycleRegistryConfig, combine_primary_and_shutdown,
         compose_backend_application_services,
     };
-    use crate::native::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
+    use crate::rpc::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
@@ -671,7 +671,7 @@ mod tests {
     }
 
     fn test_data_runtime() -> crate::BackendDataRuntime {
-        crate::native::runtime::test_backend_data_runtime()
+        crate::rpc::runtime::test_backend_data_runtime()
     }
 
     fn query_lifecycle_registry_config(

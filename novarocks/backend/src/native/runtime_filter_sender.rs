@@ -32,11 +32,11 @@ use prost::Message;
 use novarocks_protocol::filter::RuntimeFilterEnvelopeResponse;
 
 use crate::BackendDataRuntime;
-use crate::native::client::NativeGrpcClient;
 use crate::native::runtime_filter_adapter::{
     BackendNativeRouteIdentity, BackendNativeRuntimeFilterEnvelope,
     decode_runtime_filter_envelope_response, encode_runtime_filter_envelope,
 };
+use crate::rpc::client::BackendRpcClient;
 use crate::runtime_filter::domain::{BackendAcceptStatus, BackendRemoteRoute};
 use crate::runtime_filter::reliable_transport::{
     ReliableTransportFailOpenReason, ReliableTransportFailureOutcome, ReliableTransportPolicy,
@@ -231,7 +231,7 @@ impl BackendRuntimeFilterEnvelopeUnaryClient for LiveRuntimeFilterEnvelopeUnaryC
         envelope: Arc<BackendNativeRuntimeFilterEnvelope>,
         deadline: Duration,
     ) -> Result<BackendRuntimeFilterUnaryAck, BackendRuntimeFilterUnaryError> {
-        let client = NativeGrpcClient::new_runtime_endpoint(self.runtime.clone(), route.endpoint())
+        let client = BackendRpcClient::new_runtime_endpoint(self.runtime.clone(), route.endpoint())
             .map_err(BackendRuntimeFilterUnaryError::transport)?;
         let response = client
             .transmit_runtime_filter_envelope_async(
@@ -287,7 +287,7 @@ impl GrpcRuntimeFilterEnvelopeSink {
             return Err("runtime filter sink capacities must be nonzero".to_string());
         }
         Ok(Self::new_with_client_and_capacities(
-            crate::native::runtime::test_backend_data_runtime(),
+            crate::rpc::runtime::test_backend_data_runtime(),
             client,
             request_capacity,
             completion_capacity,
@@ -570,7 +570,7 @@ mod tests {
         BackendRuntimeFilterEnvelopeSink, GrpcRuntimeFilterEnvelopeSink,
         decode_runtime_filter_unary_ack,
     };
-    use crate::native::runtime::test_backend_data_runtime;
+    use crate::rpc::runtime::test_backend_data_runtime;
     use crate::runtime_filter::domain::BackendAcceptStatus;
     use novarocks_protocol::filter::{
         RuntimeFilterAcceptStatus, RuntimeFilterContributionRouteIdentity,
