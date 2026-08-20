@@ -205,6 +205,10 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
         Err(self.unexpected("'>'"))
     }
 
+    pub(super) fn has_pending_type_gt(&self) -> bool {
+        self.pending_type_gt.is_some()
+    }
+
     pub(super) fn parse_ident(&mut self) -> Result<Ident, ParseError> {
         let token = self
             .current()

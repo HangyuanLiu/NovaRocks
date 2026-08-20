@@ -22,7 +22,6 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::catalog_application::resolver::resolve_existing_table_target;
-use crate::catalog_application::statement::AddEqualityDeleteStmt;
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::dml::delete::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
@@ -33,24 +32,30 @@ use crate::query_execution::planning::write_sink::{
     admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_parser::ast::{AddEqualityDelete, LiteralKind, ObjectName};
 use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
     ConnectorWriteIntent, ConnectorWriteOperationId,
 };
 use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
-use novarocks_sql::syntax::{Literal, parse_date_string_to_days, parse_datetime_string_to_micros};
+use novarocks_sql::syntax::{
+    Literal as SqlLiteral, ObjectName as SqlObjectName, parse_date_string_to_days,
+    parse_datetime_string_to_micros,
+};
+
+type Literal = SqlLiteral;
 
 pub(crate) fn prepare_equality_delete_statement(
     state: &DmlExecutionKernel,
-    stmt: &AddEqualityDeleteStmt,
+    stmt: &AddEqualityDelete,
     current_catalog: Option<&str>,
     current_database: &str,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedDelete, String> {
-    let target =
-        resolve_existing_table_target(state, &stmt.table, current_catalog, current_database)?;
+    let table = sql_object_name(&stmt.target);
+    let target = resolve_existing_table_target(state, &table, current_catalog, current_database)?;
     if target.backend_name != "iceberg" {
         return Err(format!(
             "ADD EQUALITY DELETE only supports iceberg backends, got `{}`",
@@ -91,11 +96,21 @@ pub(crate) fn prepare_equality_delete_statement(
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
     )?;
 
-    let delete_columns = equality_delete_key_columns(&table_metadata, &stmt.columns, &stmt.rows)?;
-    if stmt.rows.is_empty() {
+    let column_names = stmt
+        .columns
+        .iter()
+        .map(|column| column.value.clone())
+        .collect::<Vec<_>>();
+    let rows = stmt
+        .rows
+        .iter()
+        .map(|row| row.iter().map(lower_literal).collect())
+        .collect::<Result<Vec<Vec<_>>, _>>()?;
+    let delete_columns = equality_delete_key_columns(&table_metadata, &column_names, &rows)?;
+    if rows.is_empty() {
         return Err("ADD EQUALITY DELETE requires at least one row".to_string());
     }
-    let values_query = build_equality_delete_sink_query(&delete_columns, &stmt.rows)?;
+    let values_query = build_equality_delete_sink_query(&delete_columns, &rows)?;
 
     // The durable operation journal records the snapshot this attempt is based
     // on. It is read through the same planning lease rather than a concrete
@@ -118,6 +133,49 @@ pub(crate) fn prepare_equality_delete_statement(
         connector_context,
         planning_lease,
     )
+}
+
+fn sql_object_name(name: &ObjectName) -> SqlObjectName {
+    SqlObjectName {
+        parts: name.parts.iter().map(|part| part.value.clone()).collect(),
+    }
+}
+
+fn lower_literal(expression: &novarocks_parser::ast::Expr) -> Result<Literal, String> {
+    let literal = match expression {
+        novarocks_parser::ast::Expr::Literal(literal) => literal,
+        novarocks_parser::ast::Expr::Unary(unary)
+            if unary.operator == novarocks_parser::ast::UnaryOperator::Minus =>
+        {
+            let novarocks_parser::ast::Expr::Literal(literal) = unary.expression.as_ref() else {
+                return Err("ADD EQUALITY DELETE accepts literal values only".to_string());
+            };
+            let LiteralKind::Number(value) = &literal.kind else {
+                return Err("ADD EQUALITY DELETE accepts numeric negation only".to_string());
+            };
+            return value
+                .parse::<i64>()
+                .map(|value| Literal::Int(-value))
+                .or_else(|_| value.parse::<f64>().map(|value| Literal::Float(-value)))
+                .map_err(|_| {
+                    format!("unsupported ADD EQUALITY DELETE numeric literal `-{value}`")
+                });
+        }
+        _ => return Err("ADD EQUALITY DELETE accepts literal values only".to_string()),
+    };
+    match &literal.kind {
+        LiteralKind::Null => Ok(Literal::Null),
+        LiteralKind::Boolean(value) => Ok(Literal::Bool(*value)),
+        LiteralKind::String(value) => Ok(Literal::String(value.clone())),
+        LiteralKind::Number(value) => value
+            .parse::<i64>()
+            .map(Literal::Int)
+            .or_else(|_| value.parse::<f64>().map(Literal::Float))
+            .map_err(|_| format!("unsupported ADD EQUALITY DELETE numeric literal `{value}`")),
+        LiteralKind::HexString(value) => Err(format!(
+            "unsupported ADD EQUALITY DELETE hexadecimal literal `{value}`"
+        )),
+    }
 }
 
 struct DistributedEqualityDeleteWriteExecutor {

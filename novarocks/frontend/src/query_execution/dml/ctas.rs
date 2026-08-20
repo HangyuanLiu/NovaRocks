@@ -46,6 +46,9 @@ use novarocks_spi::connector::{
 
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
+use novarocks_parser::ast::{
+    CreateTableAsSelect, Literal, LiteralKind, PartitionTransform, TablePartition, TableStatement,
+};
 use novarocks_protocol::lifecycle::QueryOptions;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,6 +58,191 @@ pub struct CtasCommand {
     pub source_sql: String,
     pub partitioning: Vec<ConnectorPartitionTransform>,
     pub properties: BTreeMap<Arc<str>, Arc<str>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CtasAdmissionFailure {
+    pub span: novarocks_parser::Span,
+    pub message: String,
+}
+
+impl CtasCommand {
+    /// Lower one already-admitted CTAS node to the narrow execution request.
+    ///
+    /// The embedded query remains an exact source slice until SQLP-6.  It is
+    /// consumed only by the CTAS query-planning boundary below; this method
+    /// never reparses or canonicalizes the surrounding DDL text.
+    pub fn from_typed(
+        statement: &CreateTableAsSelect,
+        source: &str,
+    ) -> Result<Self, CtasAdmissionFailure> {
+        let TableStatement::Create(table) = &statement.table;
+        if table.temporary || table.external {
+            return Err(unsupported(
+                table.span,
+                "CTAS does not support TEMPORARY or EXTERNAL tables",
+            ));
+        }
+        if table.like.is_some() {
+            return Err(unsupported(
+                table.span,
+                "CTAS does not support CREATE TABLE LIKE",
+            ));
+        }
+        if !table.columns.is_empty() {
+            return Err(unsupported(
+                table.span,
+                "CTAS with explicit column definitions is not supported; use CREATE TABLE then INSERT instead",
+            ));
+        }
+        if let Some(engine) = &table.engine
+            && !engine.value.eq_ignore_ascii_case("iceberg")
+        {
+            return Err(unsupported(
+                engine.span,
+                format!("CTAS does not support ENGINE = {}", engine.value),
+            ));
+        }
+        if let Some(key) = &table.key {
+            return Err(unsupported(key.span, "CTAS does not support table keys"));
+        }
+        if let Some(distribution) = &table.distribution {
+            return Err(unsupported(
+                distribution.span,
+                "CTAS does not support DISTRIBUTED BY",
+            ));
+        }
+        if !table.order_by.is_empty() {
+            return Err(unsupported(table.span, "CTAS does not support ORDER BY"));
+        }
+
+        let partitioning = match &table.partition {
+            None => Vec::new(),
+            Some(TablePartition::Transform(partition)) => partition
+                .expressions
+                .iter()
+                .map(lower_partition_transform)
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(TablePartition::LegacyRange(partition)) => {
+                return Err(unsupported(
+                    partition.span,
+                    "CTAS does not support legacy RANGE partition definitions",
+                ));
+            }
+        };
+        let mut properties: BTreeMap<Arc<str>, Arc<str>> = BTreeMap::new();
+        for property in &table.properties {
+            let key = literal_text(&property.key)?;
+            let value = literal_text(&property.value)?;
+            if key.eq_ignore_ascii_case("format-version") && value != "3" {
+                return Err(unsupported(
+                    property.span,
+                    format!("CTAS only supports format-version=3, got '{value}'"),
+                ));
+            }
+            if (key.eq_ignore_ascii_case("row-lineage")
+                || key.eq_ignore_ascii_case("write.row-lineage"))
+                && !value.eq_ignore_ascii_case("true")
+            {
+                return Err(unsupported(
+                    property.span,
+                    format!("CTAS requires row-lineage=true, got '{value}'"),
+                ));
+            }
+            properties.insert(Arc::from(key), Arc::from(value));
+        }
+        if let Some(comment) = &table.comment {
+            properties.insert(Arc::from("comment"), Arc::from(literal_text(comment)?));
+        }
+        properties.retain(|key, _| {
+            !key.eq_ignore_ascii_case("format-version")
+                && !key.eq_ignore_ascii_case("write.row-lineage")
+        });
+        properties.insert(Arc::from("format-version"), Arc::from("3"));
+        properties.insert(Arc::from("write.row-lineage"), Arc::from("true"));
+
+        let query = source
+            .get(statement.query.span.start()..statement.query.span.end())
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .ok_or_else(|| unsupported(statement.query.span, "CTAS source span is invalid"))?;
+        Ok(Self {
+            target_parts: table
+                .name
+                .parts
+                .iter()
+                .map(|part| part.value.clone())
+                .collect(),
+            if_not_exists: table.if_not_exists,
+            source_sql: query.to_owned(),
+            partitioning,
+            properties,
+        })
+    }
+}
+
+fn unsupported(span: novarocks_parser::Span, message: impl Into<String>) -> CtasAdmissionFailure {
+    CtasAdmissionFailure {
+        span,
+        message: message.into(),
+    }
+}
+
+fn literal_text(literal: &Literal) -> Result<String, CtasAdmissionFailure> {
+    match &literal.kind {
+        LiteralKind::Null => Err(unsupported(
+            literal.span,
+            "CTAS properties do not support NULL literals",
+        )),
+        LiteralKind::Boolean(value) => Ok(value.to_string()),
+        LiteralKind::Number(value) | LiteralKind::String(value) | LiteralKind::HexString(value) => {
+            Ok(value.clone())
+        }
+    }
+}
+
+fn lower_partition_transform(
+    transform: &PartitionTransform,
+) -> Result<ConnectorPartitionTransform, CtasAdmissionFailure> {
+    let as_arc = |column: &novarocks_parser::ast::Ident| Arc::from(column.value.as_str());
+    match transform {
+        PartitionTransform::Identity { column, .. } => Ok(ConnectorPartitionTransform::Identity {
+            column: as_arc(column),
+        }),
+        PartitionTransform::Year { column, .. } => Ok(ConnectorPartitionTransform::Year {
+            column: as_arc(column),
+        }),
+        PartitionTransform::Month { column, .. } => Ok(ConnectorPartitionTransform::Month {
+            column: as_arc(column),
+        }),
+        PartitionTransform::Day { column, .. } => Ok(ConnectorPartitionTransform::Day {
+            column: as_arc(column),
+        }),
+        PartitionTransform::Hour { column, .. } => Ok(ConnectorPartitionTransform::Hour {
+            column: as_arc(column),
+        }),
+        PartitionTransform::Bucket {
+            buckets,
+            column: column_name,
+            span,
+        } => Ok(ConnectorPartitionTransform::Bucket {
+            column: as_arc(column_name),
+            num_buckets: u32::try_from(*buckets)
+                .map_err(|_| unsupported(*span, "CTAS bucket count exceeds u32"))?,
+        }),
+        PartitionTransform::Truncate {
+            width,
+            column: column_name,
+            span,
+        } => Ok(ConnectorPartitionTransform::Truncate {
+            column: as_arc(column_name),
+            width: u32::try_from(*width)
+                .map_err(|_| unsupported(*span, "CTAS truncate width exceeds u32"))?,
+        }),
+        PartitionTransform::Void { column, .. } => Ok(ConnectorPartitionTransform::Void {
+            column: as_arc(column),
+        }),
+    }
 }
 
 pub enum CtasTargetPreflightOutcome {
@@ -226,13 +414,13 @@ pub enum CtasWriteOutcome {
 /// One-to-one core capability consumed by the frontend CTAS application
 /// owner. It is intentionally not a generic connector DML facade.
 pub trait CtasEngine: Send + Sync {
-    fn classify_ctas(&self, sql: &str) -> Result<Option<CtasCommand>, String>;
-
     /// Resolve the exact target and retain the current fenced-publication
     /// generation before source preparation. Unsupported catalogs fail here;
     /// Core never falls back to ordinary staged create.
     fn preflight_ctas_target(
         &self,
+        statement: &CreateTableAsSelect,
+        source: &str,
         command: &CtasCommand,
         current_catalog: Option<&str>,
         current_database: &str,
@@ -1291,76 +1479,10 @@ fn write_commit_unknown(
 }
 
 impl CtasEngine for DmlExecutionKernel {
-    fn classify_ctas(&self, sql: &str) -> Result<Option<CtasCommand>, String> {
-        use novarocks_sql::syntax::{
-            CreateTableKind, StarRocksDialect, looks_like_create_table,
-            parse_create_table_statement,
-        };
-        use sqlparser::keywords::Keyword;
-        use sqlparser::tokenizer::Token;
-
-        // Classification must stay inert for ordinary CREATE TABLE. Its
-        // established DDL parser accepts nested complex types such as
-        // ARRAY<STRUCT<...>>, while sqlparser tokenizes the closing `>>` as a
-        // shift token before the StarRocks create-table adapter can split it.
-        // Only invoke that adapter after a token-level scan proves that this
-        // statement has a top-level AS clause and therefore belongs to CTAS.
-        let mut classifier = sqlparser::parser::Parser::new(&StarRocksDialect)
-            .try_with_sql(sql)
-            .map_err(|error| error.to_string())?;
-        if !looks_like_create_table(&classifier) {
-            return Ok(None);
-        }
-        let mut depth = 0_u32;
-        let is_ctas = loop {
-            match classifier.next_token().token {
-                Token::LParen => depth = depth.saturating_add(1),
-                Token::RParen => depth = depth.saturating_sub(1),
-                Token::Word(word) if depth == 0 && word.keyword == Keyword::AS => break true,
-                Token::EOF | Token::SemiColon => break false,
-                _ => {}
-            }
-        };
-        if !is_ctas {
-            return Ok(None);
-        }
-
-        let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
-            .try_with_sql(sql)
-            .map_err(|error| error.to_string())?;
-        let statement = parse_create_table_statement(&mut parser)?;
-        let Some(source) = statement.as_select else {
-            return Ok(None);
-        };
-        let CreateTableKind::Iceberg {
-            partition_fields,
-            properties,
-            ..
-        } = statement.kind;
-        let mut normalized_properties: BTreeMap<Arc<str>, Arc<str>> = properties
-            .into_iter()
-            .filter(|(key, _)| {
-                !key.eq_ignore_ascii_case("format-version")
-                    && !key.eq_ignore_ascii_case("write.row-lineage")
-            })
-            .map(|(key, value)| (Arc::from(key), Arc::from(value)))
-            .collect();
-        normalized_properties.insert(Arc::from("format-version"), Arc::from("3"));
-        normalized_properties.insert(Arc::from("write.row-lineage"), Arc::from("true"));
-        Ok(Some(CtasCommand {
-            target_parts: statement.name.parts,
-            if_not_exists: statement.if_not_exists,
-            source_sql: source.to_string(),
-            partitioning: partition_fields
-                .iter()
-                .map(crate::catalog_application::statement::connector_partition_transform)
-                .collect(),
-            properties: normalized_properties,
-        }))
-    }
-
     fn preflight_ctas_target(
         &self,
+        _statement: &CreateTableAsSelect,
+        _source: &str,
         command: &CtasCommand,
         current_catalog: Option<&str>,
         current_database: &str,
@@ -2177,6 +2299,7 @@ mod tests {
     use crate::common::backend_topology::LiveBackendTarget;
     use crate::common::query_cancellation::QueryCancellationSource;
     use bytes::Bytes;
+    use novarocks_parser::ast::{DmlStatement, Statement};
     use novarocks_spi::connector::*;
     use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::ClusterRole;
@@ -2278,15 +2401,15 @@ mod tests {
     }
 
     #[test]
-    fn classifier_preserves_ifne_partitioning_and_properties() {
-        let state = test_dml_kernel();
-        let command = CtasEngine::classify_ctas(
-            &state,
-            "CREATE TABLE IF NOT EXISTS ice.sales.dst PARTITION BY (region) \
-             TBLPROPERTIES('owner'='dml3') AS SELECT 1 AS region",
-        )
-        .expect("classify CTAS")
-        .expect("CTAS command");
+    fn typed_ctas_lowering_preserves_ifne_partitioning_and_properties() {
+        let source = "CREATE TABLE IF NOT EXISTS ice.sales.dst PARTITION BY (region) \
+             TBLPROPERTIES('owner'='dml3') AS SELECT 1 AS region";
+        let parsed = novarocks_parser::parse(source).expect("parse CTAS");
+        let statement = match parsed.as_slice() {
+            [Statement::Dml(DmlStatement::CreateTableAsSelect(statement))] => statement,
+            other => panic!("expected CTAS, got {other:?}"),
+        };
+        let command = CtasCommand::from_typed(statement, source).expect("lower typed CTAS");
 
         assert_eq!(command.target_parts, ["ice", "sales", "dst"]);
         assert!(command.if_not_exists);
@@ -2310,17 +2433,19 @@ mod tests {
     }
 
     #[test]
-    fn classifier_leaves_nested_complex_type_create_table_to_ddl() {
-        let state = test_dml_kernel();
-        let command = CtasEngine::classify_ctas(
-            &state,
-            "CREATE TABLE ice.sales.nested (\
+    fn typed_ctas_lowering_rejects_explicit_columns() {
+        let source = "CREATE TABLE ice.sales.nested (\
                  items ARRAY<STRUCT<id INT, labels ARRAY<STRING>>>\
-             ) COMMENT 'AS SELECT is text, not a CTAS clause'",
-        )
-        .expect("ordinary CREATE TABLE classification is inert");
+             ) AS SELECT 1 AS item";
+        let parsed = novarocks_parser::parse(source).expect("parse CTAS");
+        let statement = match parsed.as_slice() {
+            [Statement::Dml(DmlStatement::CreateTableAsSelect(statement))] => statement,
+            other => panic!("expected CTAS, got {other:?}"),
+        };
 
-        assert!(command.is_none());
+        let error =
+            CtasCommand::from_typed(statement, source).expect_err("explicit columns reject");
+        assert!(error.message.contains("explicit column definitions"));
     }
 
     #[test]

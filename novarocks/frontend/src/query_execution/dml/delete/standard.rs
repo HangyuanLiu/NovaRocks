@@ -20,7 +20,7 @@
 //! Distributed position-delete path:
 //! 1. Resolve + load the iceberg table.
 //! 2. Run pre-lowering validators and choose the Iceberg write mode.
-//! 3. Translate the sqlparser WHERE into an iceberg [`Predicate`]. Phase 1
+//! 3. Validate the parser-owned WHERE before constructing the generated sink query. Phase 1
 //!    supports comparison operators (`= != < <= > >=`), `IN (...)`, and
 //!    `AND` / `OR` against primitive columns (int / long / string / bool / timestamp).
 //!    Other expressions are rejected with an explicit error.
@@ -31,10 +31,6 @@
 //!    finalization lifecycle.
 
 use std::sync::{Arc, Mutex};
-
-use arrow::datatypes::{DataType, TimeUnit};
-use chrono::NaiveDateTime;
-use sqlparser::ast as sqlast;
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::catalog_application::resolver::{TargetBackend, resolve_existing_table_target};
@@ -47,37 +43,45 @@ use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
     admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
+use arrow::datatypes::{DataType, TimeUnit};
+use chrono::NaiveDateTime;
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_parser::ast::{
+    BinaryOperator, Delete, Expr, FunctionCall, IsPredicate, LiteralKind,
+    ObjectName as ParserObjectName, UnaryOperator,
+};
 use novarocks_spi::connector::ConnectorRowMutationStrategy;
 use novarocks_spi::connector::ConnectorWriteOperationId;
 use novarocks_sql::planning::dml::{DmlWriteSinkMode, IcebergRefSuffix, split_ref_suffix};
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
-use novarocks_sql::syntax::{DeleteStmt, ObjectName};
+use novarocks_sql::syntax::ObjectName as SqlObjectName;
 
 pub(crate) fn prepare_delete_statement(
     state: &DmlExecutionKernel,
-    stmt: &DeleteStmt,
+    stmt: &Delete,
+    source: &str,
     current_catalog: Option<&str>,
     current_database: &str,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedDelete, String> {
     // Detect branch/tag suffix in the target table name.
-    let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
+    let target_name = sql_object_name(&stmt.target);
+    let (stripped_parts, ref_suffix) = split_ref_suffix(&target_name.parts);
     let effective_name;
-    let table_name: &ObjectName = match ref_suffix {
+    let table_name: &SqlObjectName = match ref_suffix {
         Some(IcebergRefSuffix::Tag(ref tag_name)) => {
             return Err(format!(
                 "iceberg ref: tag '{tag_name}' is read-only; use a branch as DML target"
             ));
         }
         Some(IcebergRefSuffix::Branch(_)) => {
-            effective_name = ObjectName {
+            effective_name = SqlObjectName {
                 parts: stripped_parts,
             };
             &effective_name
         }
-        None => &stmt.table,
+        None => &target_name,
     };
     let target_ref = match &ref_suffix {
         Some(IcebergRefSuffix::Branch(b)) => b.clone(),
@@ -120,7 +124,13 @@ pub(crate) fn prepare_delete_statement(
     //    The distributed SELECT planner owns scan pruning and existing delete
     //    visibility from this point onward. Column types come from the provider,
     //    so this check never decodes an Iceberg schema itself.
-    validate_where(&stmt.where_clause, &target_binding.dml_target_columns())?;
+    let where_clause = stmt.selection.as_ref().ok_or_else(|| {
+        "DELETE requires a WHERE clause; for full table replacement use \
+         INSERT OVERWRITE t SELECT * FROM t WHERE FALSE"
+            .to_string()
+    })?;
+    validate_where(where_clause, &target_binding.dml_target_columns())?;
+    let where_sql = source_slice(source, where_clause.span())?;
 
     // 4. Ask the provider to plan the row mutation. The physical strategy, the
     //    branch/format admission gates and the base version the frontend
@@ -161,7 +171,7 @@ pub(crate) fn prepare_delete_statement(
         connector_operation_id,
         &write_lease,
         &target_ref,
-        &stmt.where_clause,
+        where_sql,
         execution.clone(),
         connector_context,
         planning_lease,
@@ -291,7 +301,7 @@ fn prepare_delete_write(
     connector_operation_id: ConnectorWriteOperationId,
     write_lease: &novarocks_spi::connector::ConnectorWriteLease,
     target_ref: &str,
-    where_clause: &sqlast::Expr,
+    where_sql: &str,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -330,7 +340,7 @@ fn prepare_delete_write(
     )?;
     let delete_query = build_delete_position_sink_query(
         target,
-        where_clause,
+        where_sql,
         &write_input_columns(&preparation),
         target_ref,
     )?;
@@ -372,7 +382,7 @@ fn prepare_delete_write(
 
 fn build_delete_position_sink_query(
     target: &TargetBackend,
-    where_clause: &sqlast::Expr,
+    where_clause: &str,
     sink_columns: &[ColumnDef],
     target_ref: &str,
 ) -> Result<sqlparser::ast::Query, String> {
@@ -434,6 +444,18 @@ fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn sql_object_name(name: &ParserObjectName) -> SqlObjectName {
+    SqlObjectName {
+        parts: name.parts.iter().map(|part| part.value.clone()).collect(),
+    }
+}
+
+fn source_slice(source: &str, span: novarocks_parser::Span) -> Result<&str, String> {
+    source
+        .get(span.start()..span.end())
+        .ok_or_else(|| "DELETE predicate span was outside the admitted source".to_string())
+}
+
 /// Check that a DELETE `WHERE` clause is inside the subset this engine supports.
 ///
 /// Nothing is produced: the distributed SELECT planner owns the actual filtering
@@ -443,47 +465,53 @@ fn sql_string_literal(value: &str) -> String {
 /// Phase 1 supports the following node shapes; everything else is rejected
 /// with an explicit error pointing at the unsupported construct so the caller
 /// can rewrite the WHERE clause.
-fn validate_where(expr: &sqlast::Expr, columns: &[ColumnDef]) -> Result<(), String> {
+fn validate_where(expr: &Expr, columns: &[ColumnDef]) -> Result<(), String> {
     match expr {
-        sqlast::Expr::BinaryOp { left, op, right } => match op {
-            sqlast::BinaryOperator::And | sqlast::BinaryOperator::Or => {
-                validate_where(left, columns)?;
-                validate_where(right, columns)
+        Expr::Binary(binary) => match binary.operator {
+            BinaryOperator::And | BinaryOperator::Or => {
+                validate_where(&binary.left, columns)?;
+                validate_where(&binary.right, columns)
             }
-            sqlast::BinaryOperator::Eq
-            | sqlast::BinaryOperator::NotEq
-            | sqlast::BinaryOperator::Lt
-            | sqlast::BinaryOperator::LtEq
-            | sqlast::BinaryOperator::Gt
-            | sqlast::BinaryOperator::GtEq => {
+            BinaryOperator::Equal
+            | BinaryOperator::NotEqual
+            | BinaryOperator::LessThan
+            | BinaryOperator::LessThanOrEqual
+            | BinaryOperator::GreaterThan
+            | BinaryOperator::GreaterThanOrEqual => {
                 // Detect scalar_fn(col) <op> literal pattern first.
                 // Function-call predicates cannot be pushed into Iceberg column
                 // statistics (the function obscures the underlying column value),
                 // so we return AlwaysTrue here to scan all files and leave
                 // correctness to the per-row evaluator in evaluate_where_at_row.
-                if extract_scalar_fn_comparison(left, right).is_some()
-                    || extract_variant_get_comparison(left, right).is_some()
+                if extract_scalar_fn_comparison(&binary.left, &binary.right).is_some()
+                    || extract_variant_get_comparison(&binary.left, &binary.right).is_some()
                 {
                     return Ok(());
                 }
-                let (col_name, value_expr, _flipped) = extract_comparison(left, right)?;
+                let (col_name, value_expr, _flipped) =
+                    extract_comparison(&binary.left, &binary.right)?;
                 validate_literal_for_column(value_expr, columns, &col_name)
             }
             other => Err(format!(
                 "phase 1 DELETE WHERE does not support binary operator `{other:?}`"
             )),
         },
-        sqlast::Expr::InList { expr, list, .. } => {
-            let col_name = expr_to_column_name(expr)?;
-            for literal in list {
+        Expr::InList(in_list) => {
+            let col_name = expr_to_column_name(&in_list.expr)?;
+            for literal in &in_list.list {
                 validate_literal_for_column(literal, columns, &col_name)?;
             }
             Ok(())
         }
-        sqlast::Expr::IsNull(inner) | sqlast::Expr::IsNotNull(inner) => {
-            expr_to_column_name(inner).map(|_| ())
+        Expr::IsPredicate(predicate)
+            if matches!(
+                predicate.predicate,
+                IsPredicate::Null | IsPredicate::NotNull
+            ) =>
+        {
+            expr_to_column_name(&predicate.expr).map(|_| ())
         }
-        sqlast::Expr::Nested(inner) => validate_where(inner, columns),
+        Expr::Nested(nested) => validate_where(&nested.expression, columns),
         other => Err(format!(
             "phase 1 DELETE WHERE supports comparison / IN / IS NULL / AND / OR \
              over primitive columns; rewrite this clause and retry. Unsupported: {other:?}"
@@ -495,9 +523,9 @@ fn validate_where(expr: &sqlast::Expr, columns: &[ColumnDef]) -> Result<(), Stri
 /// Returns `(column_name, literal_expr, flipped)` where `flipped = true`
 /// indicates the original was `<literal> <op> <column>`.
 fn extract_comparison<'a>(
-    left: &'a sqlast::Expr,
-    right: &'a sqlast::Expr,
-) -> Result<(String, &'a sqlast::Expr, bool), String> {
+    left: &'a Expr,
+    right: &'a Expr,
+) -> Result<(String, &'a Expr, bool), String> {
     if let Ok(name) = expr_to_column_name(left) {
         return Ok((name, right, false));
     }
@@ -521,9 +549,9 @@ fn extract_comparison<'a>(
 ///
 /// `flipped = true` means the original was `literal <op> fn(col)`.
 fn extract_scalar_fn_comparison<'a>(
-    left: &'a sqlast::Expr,
-    right: &'a sqlast::Expr,
-) -> Option<(String, String, &'a sqlast::Expr, bool)> {
+    left: &'a Expr,
+    right: &'a Expr,
+) -> Option<(String, String, &'a Expr, bool)> {
     if let Some((fn_name, col_name)) = expr_as_supported_scalar_fn_on_col(left) {
         if is_literal_expr(right) {
             return Some((fn_name, col_name, right, false));
@@ -545,9 +573,9 @@ fn extract_scalar_fn_comparison<'a>(
 /// accept this shape and avoid unsafe file pruning, so callers treat it as
 /// `AlwaysTrue`.
 fn extract_variant_get_comparison<'a>(
-    left: &'a sqlast::Expr,
-    right: &'a sqlast::Expr,
-) -> Option<(String, &'a sqlast::Expr, bool)> {
+    left: &'a Expr,
+    right: &'a Expr,
+) -> Option<(String, &'a Expr, bool)> {
     if let Some(col_name) = expr_as_variant_get_on_col(left) {
         if is_literal_expr(right) {
             return Some((col_name, right, false));
@@ -561,11 +589,18 @@ fn extract_variant_get_comparison<'a>(
     None
 }
 
-fn expr_as_variant_get_on_col(expr: &sqlast::Expr) -> Option<String> {
-    let sqlast::Expr::Function(func) = expr else {
+fn expr_as_variant_get_on_col(expr: &Expr) -> Option<String> {
+    let Expr::FunctionCall(func) = expr else {
         return None;
     };
-    let name = func.name.to_string().to_ascii_lowercase();
+    let name = func
+        .name
+        .parts
+        .iter()
+        .map(|ident| ident.value.as_str())
+        .collect::<Vec<_>>()
+        .join(".")
+        .to_ascii_lowercase();
     if !matches!(name.as_str(), "variant_get" | "try_variant_get") {
         return None;
     }
@@ -582,11 +617,18 @@ fn expr_as_variant_get_on_col(expr: &sqlast::Expr) -> Option<String> {
 /// Return `(fn_name_lowercase, col_name_lowercase)` when `expr` is a
 /// single-argument function call over a bare column reference and the function
 /// name is in the deterministic set we support for row-level evaluation.
-fn expr_as_supported_scalar_fn_on_col(expr: &sqlast::Expr) -> Option<(String, String)> {
-    let sqlast::Expr::Function(func) = expr else {
+fn expr_as_supported_scalar_fn_on_col(expr: &Expr) -> Option<(String, String)> {
+    let Expr::FunctionCall(func) = expr else {
         return None;
     };
-    let name = func.name.to_string().to_ascii_lowercase();
+    let name = func
+        .name
+        .parts
+        .iter()
+        .map(|ident| ident.value.as_str())
+        .collect::<Vec<_>>()
+        .join(".")
+        .to_ascii_lowercase();
     if !is_supported_scalar_fn(&name) {
         return None;
     }
@@ -598,21 +640,13 @@ fn expr_as_supported_scalar_fn_on_col(expr: &sqlast::Expr) -> Option<(String, St
     Some((name, col_name))
 }
 
-fn function_expr_args(func: &sqlast::Function) -> Option<Vec<&sqlast::Expr>> {
-    match &func.args {
-        sqlast::FunctionArguments::List(list) => list
-            .args
-            .iter()
-            .map(|arg| {
-                if let sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) = arg {
-                    Some(e)
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        _ => None,
-    }
+fn function_expr_args(func: &FunctionCall) -> Option<Vec<&Expr>> {
+    (func.quantifier == novarocks_parser::ast::FunctionQuantifier::None
+        && func.order_by.is_empty()
+        && func.separator.is_none()
+        && func.filter.is_none()
+        && func.over.is_none())
+    .then(|| func.arguments.iter().collect())
 }
 
 /// The set of deterministic, single-argument scalar functions that the phase-1
@@ -628,26 +662,26 @@ fn is_supported_scalar_fn(name: &str) -> bool {
 
 /// Returns `true` when `expr` is a value literal (or a nested/negated literal)
 /// that `literal_to_datum` can parse.
-fn is_literal_expr(expr: &sqlast::Expr) -> bool {
+fn is_literal_expr(expr: &Expr) -> bool {
     match expr {
-        sqlast::Expr::Value(_) => true,
-        sqlast::Expr::UnaryOp {
-            op: sqlast::UnaryOperator::Minus,
-            expr: inner,
-        } => matches!(inner.as_ref(), sqlast::Expr::Value(_)),
-        sqlast::Expr::Nested(inner) => is_literal_expr(inner),
+        Expr::Literal(_) => true,
+        Expr::Unary(unary) if unary.operator == UnaryOperator::Minus => {
+            matches!(unary.expression.as_ref(), Expr::Literal(_))
+        }
+        Expr::Nested(nested) => is_literal_expr(&nested.expression),
         _ => false,
     }
 }
 
-fn expr_to_column_name(expr: &sqlast::Expr) -> Result<String, String> {
+fn expr_to_column_name(expr: &Expr) -> Result<String, String> {
     match expr {
-        sqlast::Expr::Identifier(ident) => Ok(ident.value.to_lowercase()),
-        sqlast::Expr::CompoundIdentifier(parts) => {
+        Expr::Identifier(ident) => Ok(ident.value.to_lowercase()),
+        Expr::CompoundIdentifier(parts) => {
             // a.b.c → take the last part (the column name); table-qualified
             // refs work because the Predicate is bound against the
             // single-table schema via TableScan.with_filter.
             parts
+                .parts
                 .last()
                 .map(|p| p.value.to_lowercase())
                 .ok_or_else(|| "compound identifier has no parts".to_string())
@@ -665,7 +699,7 @@ fn expr_to_column_name(expr: &sqlast::Expr) -> Result<String, String> {
 /// clause is inside the supported subset. Actual filtering belongs to the
 /// distributed SELECT planner.
 fn validate_literal_for_column(
-    expr: &sqlast::Expr,
+    expr: &Expr,
     columns: &[ColumnDef],
     column_name: &str,
 ) -> Result<(), String> {
@@ -685,18 +719,17 @@ fn validate_literal_for_column(
         other => other,
     };
     let lit_value = match expr {
-        sqlast::Expr::Value(v) => v,
-        sqlast::Expr::UnaryOp {
-            op: sqlast::UnaryOperator::Minus,
-            expr: inner,
-        } => match inner.as_ref() {
-            sqlast::Expr::Value(v) => v,
-            other => {
-                return Err(format!(
-                    "phase 1 DELETE WHERE expects a literal value, got -{other:?}"
-                ));
+        Expr::Literal(literal) => literal,
+        Expr::Unary(unary) if unary.operator == UnaryOperator::Minus => {
+            match unary.expression.as_ref() {
+                Expr::Literal(literal) => literal,
+                other => {
+                    return Err(format!(
+                        "phase 1 DELETE WHERE expects a literal value, got -{other:?}"
+                    ));
+                }
             }
-        },
+        }
         other => {
             return Err(format!(
                 "phase 1 DELETE WHERE expects a literal value, got {other:?}"
@@ -705,16 +738,12 @@ fn validate_literal_for_column(
     };
     let negate = matches!(
         expr,
-        sqlast::Expr::UnaryOp {
-            op: sqlast::UnaryOperator::Minus,
-            ..
-        }
+        Expr::Unary(unary) if unary.operator == UnaryOperator::Minus
     );
-    let lit_str = match &lit_value.value {
-        sqlast::Value::Number(s, _) => s.clone(),
-        sqlast::Value::SingleQuotedString(s) | sqlast::Value::DoubleQuotedString(s) => s.clone(),
-        sqlast::Value::Boolean(b) => b.to_string(),
-        sqlast::Value::Null => {
+    let lit_str = match &lit_value.kind {
+        LiteralKind::Number(s) | LiteralKind::String(s) => s.clone(),
+        LiteralKind::Boolean(b) => b.to_string(),
+        LiteralKind::Null => {
             return Err(format!(
                 "phase 1 DELETE WHERE does not support NULL literals; use IS NULL/IS NOT NULL instead \
                  (column `{column_name}`)"
@@ -769,37 +798,34 @@ fn validate_literal_for_column(
 }
 
 /// Extract the string value from a SQL literal expression (`'...'` or `"..."`).
-fn extract_string_literal(expr: &sqlast::Expr) -> Option<&str> {
+fn extract_string_literal(expr: &Expr) -> Option<&str> {
     match expr {
-        sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => match value {
-            sqlast::Value::SingleQuotedString(s) | sqlast::Value::DoubleQuotedString(s) => {
-                Some(s.as_str())
-            }
+        Expr::Literal(literal) => match &literal.kind {
+            LiteralKind::String(value) => Some(value.as_str()),
             _ => None,
         },
-        sqlast::Expr::Nested(inner) => extract_string_literal(inner),
+        Expr::Nested(nested) => extract_string_literal(&nested.expression),
         _ => None,
     }
 }
 
 /// Extract the integer value from a SQL literal expression (`123` or `-123`).
-fn extract_integer_literal(expr: &sqlast::Expr) -> Option<i64> {
+fn extract_integer_literal(expr: &Expr) -> Option<i64> {
     match expr {
-        sqlast::Expr::Value(sqlast::ValueWithSpan {
-            value: sqlast::Value::Number(s, _),
-            ..
-        }) => s.parse::<i64>().ok(),
-        sqlast::Expr::UnaryOp {
-            op: sqlast::UnaryOperator::Minus,
-            expr: inner,
-        } => match inner.as_ref() {
-            sqlast::Expr::Value(sqlast::ValueWithSpan {
-                value: sqlast::Value::Number(s, _),
-                ..
-            }) => s.parse::<i64>().ok().map(|n| -n),
+        Expr::Literal(literal) => match &literal.kind {
+            LiteralKind::Number(value) => value.parse::<i64>().ok(),
             _ => None,
         },
-        sqlast::Expr::Nested(inner) => extract_integer_literal(inner),
+        Expr::Unary(unary) if unary.operator == UnaryOperator::Minus => {
+            match unary.expression.as_ref() {
+                Expr::Literal(literal) => match &literal.kind {
+                    LiteralKind::Number(value) => value.parse::<i64>().ok().map(|n| -n),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        Expr::Nested(nested) => extract_integer_literal(&nested.expression),
         _ => None,
     }
 }
@@ -807,7 +833,8 @@ fn extract_integer_literal(expr: &sqlast::Expr) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
-    use sqlparser::ast as sqlast;
+    use novarocks_parser::Span;
+    use novarocks_parser::ast::{DmlStatement, Expr, Literal, LiteralKind, Statement};
 
     fn column(name: &str, data_type: DataType) -> novarocks_catalog::schema::ColumnDef {
         novarocks_catalog::schema::ColumnDef {
@@ -819,16 +846,13 @@ mod tests {
         }
     }
 
-    fn where_expr(sql: &str) -> sqlast::Expr {
-        let statement =
-            novarocks_sql::planning::dml::parse_raw_statement(sql).expect("parse query");
-        let sqlast::Statement::Query(query) = statement else {
-            panic!("expected query");
+    fn where_expr(sql: &str) -> Expr {
+        let statements = novarocks_parser::parse(&format!("DELETE FROM orders WHERE {sql}"))
+            .expect("parse DELETE");
+        let Statement::Dml(DmlStatement::Delete(delete)) = &statements[0] else {
+            panic!("expected DELETE");
         };
-        let sqlast::SetExpr::Select(select) = query.body.as_ref() else {
-            panic!("expected select");
-        };
-        select.selection.clone().expect("where clause")
+        delete.selection.clone().expect("where clause")
     }
 
     /// Variant columns reach row DML as LargeBinary, which is what keeps them
@@ -852,8 +876,7 @@ mod tests {
 
     #[test]
     fn delete_validate_accepts_variant_get_predicate_for_pipeline_filtering() {
-        let where_clause =
-            where_expr("SELECT 1 FROM orders WHERE try_variant_get(v, '$.a', 'bigint') = 2");
+        let where_clause = where_expr("try_variant_get(v, '$.a', 'bigint') = 2");
         super::validate_where(&where_clause, &columns_with_variant())
             .expect("variant_get predicate should be delegated to the query pipeline");
     }
@@ -862,7 +885,7 @@ mod tests {
     fn delete_validate_rejects_a_direct_comparison_against_a_variant_column() {
         // Without the write-target type a variant column would look like a
         // string here and the comparison would be wrongly accepted.
-        let where_clause = where_expr("SELECT 1 FROM orders WHERE v = 'x'");
+        let where_clause = where_expr("v = 'x'");
         let error = super::validate_where(&where_clause, &columns_with_variant())
             .expect_err("a bare variant comparison is not supported");
         assert!(error.contains("LargeBinary"), "{error}");
@@ -881,10 +904,10 @@ mod tests {
             column("_pos", DataType::Int64),
             column("region", DataType::Utf8),
         ];
-        let where_clause = where_expr("SELECT 1 FROM orders WHERE region = 'east' AND amount = 10");
+        let where_clause = "region = 'east' AND amount = 10";
 
         let query =
-            super::build_delete_position_sink_query(&target, &where_clause, &sink_columns, "main")
+            super::build_delete_position_sink_query(&target, where_clause, &sink_columns, "main")
                 .expect("rewrite query");
         let rendered = query.to_string();
 
@@ -907,10 +930,10 @@ mod tests {
             column("_file", DataType::Utf8),
             column("_pos", DataType::Int64),
         ];
-        let where_clause = where_expr("SELECT 1 FROM orders WHERE id = 1");
+        let where_clause = "id = 1";
 
         let query =
-            super::build_delete_position_sink_query(&target, &where_clause, &sink_columns, "dev")
+            super::build_delete_position_sink_query(&target, where_clause, &sink_columns, "dev")
                 .expect("rewrite query");
 
         let rendered = query.to_string();
@@ -923,9 +946,9 @@ mod tests {
     #[test]
     fn delete_validate_accepts_datetime_literals_with_and_without_subseconds() {
         for literal in ["2020-01-01 00:00:00", "2020-01-01 00:00:00.5"] {
-            let expr = sqlast::Expr::Value(sqlast::ValueWithSpan {
-                value: sqlast::Value::SingleQuotedString(literal.to_string()),
-                span: sqlparser::tokenizer::Span::empty(),
+            let expr = Expr::Literal(Literal {
+                kind: LiteralKind::String(literal.to_string()),
+                span: Span::new(0, literal.len()),
             });
             super::validate_literal_for_column(&expr, &columns_with_timestamp(), "ts")
                 .unwrap_or_else(|error| panic!("`{literal}` must be accepted: {error}"));
@@ -934,9 +957,9 @@ mod tests {
 
     #[test]
     fn delete_validate_rejects_a_malformed_datetime_literal() {
-        let expr = sqlast::Expr::Value(sqlast::ValueWithSpan {
-            value: sqlast::Value::SingleQuotedString("2020-01-01T00:00:00".to_string()),
-            span: sqlparser::tokenizer::Span::empty(),
+        let expr = Expr::Literal(Literal {
+            kind: LiteralKind::String("2020-01-01T00:00:00".to_string()),
+            span: Span::new(0, 21),
         });
         let error = super::validate_literal_for_column(&expr, &columns_with_timestamp(), "ts")
             .expect_err("ISO-8601 `T` separator is not the accepted DATETIME form");

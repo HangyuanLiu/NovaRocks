@@ -55,6 +55,7 @@ pub struct CreateTableAsSelect {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Insert {
     pub overwrite: bool,
+    pub has_into: bool,
     pub target: ObjectName,
     pub columns: Vec<Ident>,
     pub partitions: Option<InsertPartitions>,
@@ -184,7 +185,11 @@ pub(crate) fn write_sql(statement: &DmlStatement, output: &mut String) {
             if v.partitions.as_ref().is_some_and(|p| p.dynamic) {
                 output.push_str(" PARTITIONS");
             }
-            output.push_str(" INTO ");
+            if v.has_into {
+                output.push_str(" INTO ");
+            } else {
+                output.push(' ');
+            }
             name(&v.target, output);
             ident_list(&v.columns, output);
             if let Some(p) = &v.partitions {

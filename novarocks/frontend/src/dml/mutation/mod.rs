@@ -24,12 +24,12 @@ use crate::common::admitted_query_context::RequestContext;
 use crate::query_execution::dml::mutation::{
     MutationAbort, MutationCommit, MutationEngine, MutationNativeFragmentEncoder,
     MutationStageOutcome, MutationStatementKind, PrepareMutationRequest, PreparedMutation,
-    parse_merge_statement, parse_update_statement,
 };
+use novarocks_parser::ast::{DmlStatement, MergeClause, MutationSource};
 use novarocks_protocol::lifecycle::QueryOptions;
 
 use crate::dml::coordination::DmlExternalFenceProposal;
-use crate::dml::error::DmlError;
+use crate::dml::error::{AdmitError, DmlError};
 use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};
 use crate::dml::runner::{
     ActiveWriteTransactionRunner, CoordinatedWriteReport, WriteExecutor, preparing_request,
@@ -151,67 +151,27 @@ fn write_transaction_spec(prepared: &PreparedMutation, subkind: &str) -> WriteTr
 }
 
 impl DmlService {
-    pub fn try_execute_update(
+    /// Executes an UPDATE or MERGE already classified by SQLP-5's typed AST.
+    /// The statement family comes from the variant, never from `source` text.
+    pub fn try_execute_typed_mutation(
         &self,
         engine: &dyn MutationEngine,
-        sql: &str,
+        statement: &DmlStatement,
+        source: &str,
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
-    ) -> Result<Option<()>, DmlError> {
-        self.try_execute_mutation(
-            engine,
-            sql,
-            context,
-            query_options,
-            MutationStatementKind::Update,
-            "UPDATE",
-        )
-    }
-
-    pub fn try_execute_merge(
-        &self,
-        engine: &dyn MutationEngine,
-        sql: &str,
-        context: &RequestContext,
-        query_options: Option<&QueryOptions>,
-    ) -> Result<Option<()>, DmlError> {
-        self.try_execute_mutation(
-            engine,
-            sql,
-            context,
-            query_options,
-            MutationStatementKind::Merge,
-            "MERGE",
-        )
-    }
-
-    fn try_execute_mutation(
-        &self,
-        engine: &dyn MutationEngine,
-        sql: &str,
-        context: &RequestContext,
-        query_options: Option<&QueryOptions>,
-        kind: MutationStatementKind,
-        subkind: &str,
-    ) -> Result<Option<()>, DmlError> {
-        let recognized = match kind {
-            MutationStatementKind::Update => parse_update_statement(sql),
-            MutationStatementKind::Merge => parse_merge_statement(sql),
-        }
-        .map_err(DmlError::executor)?;
-        if recognized.is_none() {
-            return Ok(None);
-        }
+    ) -> Result<(), DmlError> {
+        let (_kind, subkind) = admit_mutation(statement, source)?;
 
         let session = context.session();
         let prepared = engine
             .prepare_mutation(PrepareMutationRequest {
-                sql,
+                statement,
+                source,
                 current_catalog: session.current_catalog().map(ToOwned::to_owned),
                 current_database: session.current_database().to_string(),
                 query_options: query_options.cloned(),
                 execution: context.execution().clone(),
-                kind,
             })
             .map_err(DmlError::executor)?;
         // Preparation is deliberately inert. The admitted and claimed intent
@@ -225,7 +185,129 @@ impl DmlService {
         let spec = write_transaction_spec(&prepared, subkind);
         let operation = self.begin_write_operation(preparing_request(&spec))?;
         ActiveWriteTransactionRunner::new(operation, &executor).run(spec)?;
-        Ok(Some(()))
+        Ok(())
+    }
+}
+
+fn admit_mutation(
+    statement: &DmlStatement,
+    source: &str,
+) -> Result<(MutationStatementKind, &'static str), DmlError> {
+    match statement {
+        DmlStatement::Update(statement) => {
+            if statement
+                .alias
+                .as_ref()
+                .is_some_and(|alias| !alias.columns.is_empty())
+                || statement
+                    .assignments
+                    .iter()
+                    .any(|assignment| assignment.target.parts.len() != 1)
+                || matches!(
+                    &statement.source,
+                    Some(MutationSource::Query { lateral: true, .. })
+                )
+                || matches!(
+                    &statement.source,
+                    Some(MutationSource::Query { alias: None, .. })
+                )
+            {
+                return Err(DmlError::admit(
+                    AdmitError::UpdateUnsupportedForm.to_user_error(
+                        source,
+                        statement.span,
+                        "UPDATE form is not supported by the current frontend capability",
+                    ),
+                ));
+            }
+            Ok((MutationStatementKind::Update, "UPDATE"))
+        }
+        DmlStatement::Merge(statement) => {
+            if statement
+                .target_alias
+                .as_ref()
+                .is_some_and(|alias| !alias.columns.is_empty())
+                || matches!(
+                    &statement.source,
+                    MutationSource::Query { lateral: true, .. }
+                        | MutationSource::Query { alias: None, .. }
+                )
+            {
+                return Err(DmlError::admit(
+                    AdmitError::MergeUnsupportedForm.to_user_error(
+                        source,
+                        statement.span,
+                        "MERGE form is not supported by the current frontend capability",
+                    ),
+                ));
+            }
+            let mut matched = false;
+            let mut not_matched = false;
+            for clause in &statement.clauses {
+                match clause {
+                    MergeClause::Matched { action, span, .. } => {
+                        let qualified_assignment = matches!(
+                            action,
+                            novarocks_parser::ast::MergeMatchedAction::Update {
+                                assignments,
+                                ..
+                            } if assignments.iter().any(|assignment| assignment.target.parts.len() != 1)
+                        );
+                        if matched || qualified_assignment {
+                            return Err(DmlError::admit(
+                                AdmitError::MergeUnsupportedForm.to_user_error(
+                                    source,
+                                    *span,
+                                    "MERGE WHEN MATCHED form is not supported",
+                                ),
+                            ));
+                        }
+                        matched = true;
+                    }
+                    MergeClause::NotMatched { action, span, .. } => {
+                        if not_matched
+                            || (!action.columns.is_empty()
+                                && action.columns.len() != action.values.len())
+                        {
+                            return Err(DmlError::admit(
+                                AdmitError::MergeUnsupportedForm.to_user_error(
+                                    source,
+                                    *span,
+                                    "MERGE WHEN NOT MATCHED form is not supported",
+                                ),
+                            ));
+                        }
+                        not_matched = true;
+                    }
+                    MergeClause::NotMatchedBySource { span, .. } => {
+                        return Err(DmlError::admit(
+                            AdmitError::MergeUnsupportedForm.to_user_error(
+                                source,
+                                *span,
+                                "MERGE WHEN NOT MATCHED BY SOURCE is not supported",
+                            ),
+                        ));
+                    }
+                }
+            }
+            if !matched && !not_matched {
+                return Err(DmlError::admit(
+                    AdmitError::MergeUnsupportedForm.to_user_error(
+                        source,
+                        statement.span,
+                        "MERGE requires at least one WHEN clause",
+                    ),
+                ));
+            }
+            Ok((MutationStatementKind::Merge, "MERGE"))
+        }
+        other => Err(DmlError::admit(
+            AdmitError::UpdateUnsupportedForm.to_user_error(
+                source,
+                other.span(),
+                "typed mutation entry requires UPDATE or MERGE",
+            ),
+        )),
     }
 }
 
@@ -272,7 +354,11 @@ mod tests {
             self.events.lock().expect("events").push("prepare");
             Ok(PreparedMutation {
                 operation: crate::query_execution::dml::mutation::MutationOperation {
-                    kind: request.kind,
+                    kind: match request.statement {
+                        DmlStatement::Update(_) => MutationStatementKind::Update,
+                        DmlStatement::Merge(_) => MutationStatementKind::Merge,
+                        _ => panic!("test engine received a non-mutation statement"),
+                    },
                     catalog: "ice".to_string(),
                     namespace: "db".to_string(),
                     table: "t".to_string(),
@@ -313,6 +399,14 @@ mod tests {
         ))
     }
 
+    fn typed_mutation(source: &str) -> DmlStatement {
+        let parsed = novarocks_parser::parse(source).expect("parse mutation test input");
+        let [novarocks_parser::ast::Statement::Dml(statement)] = parsed.as_slice() else {
+            panic!("expected mutation statement: {source}");
+        };
+        statement.clone()
+    }
+
     /// The durable intent is still published before anything reaches the
     /// mutation engine, and the statement subkind is still recorded. What
     /// changed with CP-3B is that staging no longer follows: a route whose
@@ -328,7 +422,13 @@ mod tests {
         };
 
         let error = service
-            .try_execute_update(&engine, "UPDATE t SET k = 1", &context(), None)
+            .try_execute_typed_mutation(
+                &engine,
+                &typed_mutation("UPDATE t SET k = 1"),
+                "UPDATE t SET k = 1",
+                &context(),
+                None,
+            )
             .expect_err("an unfenced UPDATE must not stage");
 
         assert_eq!(*engine.events.lock().unwrap(), ["prepare"]);
@@ -348,8 +448,11 @@ mod tests {
         };
 
         let error = service
-            .try_execute_merge(
+            .try_execute_typed_mutation(
                 &engine,
+                &typed_mutation(
+                    "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET k = s.k",
+                ),
                 "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET k = s.k",
                 &context(),
                 None,

@@ -39,6 +39,7 @@ use novarocks_parser::{
 use sqlparser::ast::Statement as LegacyStatement;
 use std::{
     collections::{BTreeMap, HashSet},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
 };
 
@@ -372,7 +373,23 @@ fn inspect_payload(
     payload_index: usize,
     summary: &mut Summary,
 ) {
-    let typed = parse_typed(&step.sql);
+    let typed = match catch_unwind(AssertUnwindSafe(|| parse_typed(&step.sql))) {
+        Ok(result) => result,
+        Err(_) => {
+            summary.mismatches.push(mismatch(
+                suite,
+                case,
+                step,
+                payload_index,
+                "typed parser panicked while handling an accept payload".to_string(),
+                None,
+                None,
+                None,
+                None,
+            ));
+            return;
+        }
+    };
     match &typed {
         Ok(statements) if classify_typed_ddl_dml(statements).is_some() => {
             inspect_ddl_dml(suite, case, step, payload_index, statements, summary);

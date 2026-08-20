@@ -324,7 +324,7 @@ fn parse_type_name(parser: &mut StatementParser<'_, '_>) -> Result<TypeName, Par
                 let data_type = parse_type_name(parser)?;
                 arguments.push(TypeNameArgument::Type(data_type));
             }
-            if parser.consume_if_symbol(Symbol::Comma) {
+            if !parser.has_pending_type_gt() && parser.consume_if_symbol(Symbol::Comma) {
                 argument_separator_spaces.push(true);
             } else {
                 end = parser.consume_type_gt()?.end();
@@ -685,6 +685,17 @@ mod tests {
         );
         let rendered = Printer::new().statement(&statement);
         assert_eq!(one(&rendered), statement);
+    }
+
+    #[test]
+    fn nested_type_closers_preserve_following_column_separators() {
+        let statement = one(
+            "CREATE TABLE t (a ARRAY<ARRAY<INT>>, b ARRAY<MAP<STRING, INT>>, c ARRAY<STRUCT<f1 INT, f2 STRING>>)",
+        );
+        let Statement::Table(TableStatement::Create(table)) = statement else {
+            panic!("table statement");
+        };
+        assert_eq!(table.columns.len(), 3);
     }
 
     #[test]

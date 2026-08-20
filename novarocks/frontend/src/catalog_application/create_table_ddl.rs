@@ -17,63 +17,6 @@
 
 //! `CREATE TABLE` DDL text handling for catalog DDL execution.
 //!
-//! Ownership: both directions of catalog `CREATE TABLE` text live here —
-//! recognizing `CREATE TABLE ... LIKE ...` on the way in, and rendering
-//! `SHOW CREATE TABLE` output from connector facts on the way out. Neither is
-//! query assembly: they carry no plan, fragment, or execution state, and their
-//! only consumer is the catalog DDL command executor.
-//!
-//! The purest owner for `parse_create_table_like` would be `novarocks-sql`
-//! next to the other statement recognizers, but that crate has no `regex`
-//! dependency today; adding one would create a new dependency edge, so this
-//! keeps the nearest already-legal owner.
-
-use novarocks_sql::syntax::ObjectName;
-
-/// Recognize `CREATE TABLE <target> LIKE <source>` and return both names.
-///
-/// Returns `Ok(None)` when the statement is not a `CREATE TABLE ... LIKE`.
-pub(crate) fn parse_create_table_like(
-    sql: &str,
-) -> Result<Option<(ObjectName, ObjectName)>, String> {
-    let re = regex::Regex::new(
-        r#"(?is)^\s*create\s+table\s+(?P<target>(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)){0,2})\s+like\s+(?P<source>(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)){0,2})\s*$"#,
-    )
-    .map_err(|e| format!("compile CREATE TABLE LIKE regex failed: {e}"))?;
-    let Some(captures) = re.captures(sql) else {
-        return Ok(None);
-    };
-    let target = parse_simple_object_name(captures.name("target").expect("target").as_str())?;
-    let source = parse_simple_object_name(captures.name("source").expect("source").as_str())?;
-    Ok(Some((target, source)))
-}
-
-fn parse_simple_object_name(token: &str) -> Result<ObjectName, String> {
-    let mut parts = Vec::new();
-    let mut cur = String::new();
-    let mut in_backtick = false;
-    for ch in token.chars() {
-        match ch {
-            '`' => in_backtick = !in_backtick,
-            '.' if !in_backtick => {
-                if cur.is_empty() {
-                    return Err(format!("empty object name segment in `{token}`"));
-                }
-                parts.push(cur.clone());
-                cur.clear();
-            }
-            _ => cur.push(ch),
-        }
-    }
-    if !cur.is_empty() {
-        parts.push(cur);
-    }
-    if parts.is_empty() {
-        return Err(format!("empty object name `{token}`"));
-    }
-    Ok(ObjectName { parts })
-}
-
 /// Generate a `CREATE TABLE` DDL string from exact-generation connector facts.
 pub(crate) fn build_iceberg_create_table_ddl(
     catalog: &str,

@@ -24,7 +24,6 @@
 
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorInstanceId};
-use sqlparser::parser::Parser;
 use std::sync::Arc;
 
 use crate::catalog_application::create_table_ddl::build_iceberg_create_table_ddl;
@@ -34,6 +33,7 @@ use crate::catalog_application::statement::{
     CatalogDropContext, CatalogMutationContext, execute_create_database_statement,
     execute_create_table_statement, execute_drop_catalog_statement,
     execute_drop_database_statement, execute_drop_table_statement,
+    execute_typed_create_table_statement,
 };
 use crate::catalog_application::{CatalogApplicationPort, CatalogCreateCommand};
 use crate::mv::domain::repository::MvRepository;
@@ -41,7 +41,6 @@ use crate::runtime::query_result::QueryResultColumn;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_parser::ast::{CatalogStatement, LiteralKind};
 use novarocks_spi::connector::MvStorageObservationPort;
-use novarocks_sql::syntax::{StarRocksDialect, looks_like_create_table};
 
 /// Catalog DDL capability built from catalog-only leaf ports.
 ///
@@ -147,8 +146,47 @@ impl CatalogCommandExecutor {
                 statement.force,
                 connector_context,
             ),
-            CatalogStatement::TruncateTable(_) | CatalogStatement::ShowCreateTable(_) => {
+            CatalogStatement::ShowCreateTable(statement) => execute_show_create_table(
+                self,
+                typed_object_name(&statement.name),
+                current_catalog,
+                current_database,
+                connector_context,
+            ),
+            CatalogStatement::TruncateTable(_) => {
                 Err("catalog statement belongs to a later typed command owner".to_string())
+            }
+        }
+    }
+
+    /// Execute parser-owned table DDL without reparsing the SQL source.
+    pub fn execute_table_typed(
+        &self,
+        statement: &novarocks_parser::ast::TableStatement,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<StatementResult, String> {
+        match statement {
+            novarocks_parser::ast::TableStatement::Create(statement) => {
+                if let Some(source) = &statement.like {
+                    return execute_create_table_like(
+                        self,
+                        typed_object_name(&statement.name),
+                        typed_object_name(source),
+                        statement.if_not_exists,
+                        current_catalog,
+                        current_database,
+                        connector_context,
+                    );
+                }
+                execute_typed_create_table_statement(
+                    self,
+                    statement,
+                    current_catalog,
+                    current_database,
+                    connector_context,
+                )
             }
         }
     }
@@ -207,63 +245,6 @@ impl CatalogCommandExecutor {
                 Err("ADD FILES belongs to the DML lifecycle executor".to_string())
             }
         }
-    }
-
-    /// Execute exactly one catalog-DDL statement.
-    ///
-    /// CTAS belongs to the frontend DML service and is rejected here.  A
-    /// default-catalog database drop belongs to the view/session route, so it
-    /// is also rejected rather than being silently reinterpreted as a provider
-    /// namespace mutation.
-    pub fn try_execute(
-        &self,
-        sql: &str,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<Option<StatementResult>, String> {
-        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
-        if let Some((target, source)) =
-            crate::catalog_application::create_table_ddl::parse_create_table_like(&normalized)?
-        {
-            return execute_create_table_like(
-                self,
-                target,
-                source,
-                current_catalog,
-                current_database,
-                connector_context,
-            )
-            .map(Some);
-        }
-        if crate::catalog_application::statement::looks_like_show_create_table(&normalized) {
-            return execute_show_create_table(
-                self,
-                &normalized,
-                current_catalog,
-                current_database,
-                connector_context,
-            )
-            .map(Some);
-        }
-        let dialect = StarRocksDialect;
-        let mut parser = Parser::new(&dialect)
-            .try_with_sql(&normalized)
-            .map_err(|error| error.to_string())?;
-
-        if looks_like_create_table(&parser) {
-            let statement = novarocks_sql::syntax::parse_create_table_statement(&mut parser)?;
-            require_statement_end(&mut parser)?;
-            return execute_create_table_statement(
-                self,
-                statement,
-                current_catalog,
-                current_database,
-                connector_context,
-            )
-            .map(Some);
-        }
-        Ok(None)
     }
 
     fn execute_create_catalog(
@@ -563,6 +544,7 @@ fn execute_create_table_like(
     executor: &CatalogCommandExecutor,
     target: novarocks_sql::syntax::ObjectName,
     source: novarocks_sql::syntax::ObjectName,
+    if_not_exists: bool,
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -608,8 +590,7 @@ fn execute_create_table_like(
                 properties: Vec::new(),
             },
             legacy_range_partitions: Vec::new(),
-            as_select: None,
-            if_not_exists: false,
+            if_not_exists,
         },
         current_catalog,
         current_database,
@@ -619,7 +600,7 @@ fn execute_create_table_like(
 
 fn execute_show_create_table(
     executor: &CatalogCommandExecutor,
-    sql: &str,
+    table_name: novarocks_sql::syntax::ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -628,7 +609,6 @@ fn execute_show_create_table(
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    let table_name = crate::catalog_application::statement::parse_show_create_table(sql)?;
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
         executor,
         &table_name,
@@ -698,14 +678,6 @@ fn execute_show_create_table(
             chunks: vec![crate::runtime::query_result::record_batch_to_chunk(batch)?],
         },
     ))
-}
-
-fn require_statement_end(parser: &mut Parser<'_>) -> Result<(), String> {
-    if parser.consume_token(&sqlparser::tokenizer::Token::SemiColon) {}
-    if parser.peek_token() != sqlparser::tokenizer::Token::EOF {
-        return Err("catalog command accepts exactly one statement".to_string());
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -123,6 +123,7 @@ pub enum StructuralViolation {
     EmptySelectProjection,
     EmptyUnnestExpressionList,
     MismatchedCaseArms,
+    DuplicateTableColumnName,
 }
 
 /// A source-independent structural AST validation failure.

@@ -68,7 +68,7 @@ fn parse_insert(parser: &mut StatementParser<'_, '_>) -> Result<Insert, ParseErr
     } else {
         None
     };
-    parser.consume_if_word("INTO");
+    let has_into = parser.consume_if_word("INTO");
     parser.consume_if_word("TABLE");
     let target = parser.parse_object_name()?;
     let columns = if parser.current_is_symbol(Symbol::LParen) {
@@ -108,6 +108,7 @@ fn parse_insert(parser: &mut StatementParser<'_, '_>) -> Result<Insert, ParseErr
     let source = parser.parse_raw_query_slice()?;
     Ok(Insert {
         overwrite,
+        has_into,
         target,
         columns,
         partitions,

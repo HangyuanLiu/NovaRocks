@@ -1165,7 +1165,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                     _ => return Err(self.unexpected("type parameter")),
                 };
                 arguments.push(TypeNameArgument::Literal(literal));
-                if !self.current_is_symbol(Symbol::Comma) {
+                if self.pending_type_gt.is_some() || !self.current_is_symbol(Symbol::Comma) {
                     break;
                 }
                 self.advance();

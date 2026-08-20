@@ -24,6 +24,7 @@ pub(crate) mod catalog;
 pub(crate) mod column_id;
 pub mod compiler;
 pub(crate) mod functions;
+pub(crate) mod legacy_mv_ast;
 pub(crate) mod literal;
 pub(crate) mod mv_refresh;
 pub(crate) mod parser;

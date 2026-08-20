@@ -38,6 +38,7 @@ use novarocks_frontend::query_execution::dml::insert::{
     IcebergWriteReport, InsertEngine, InsertOverwriteMode, InsertValue, PrepareIcebergInsert,
     PreparedIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
 };
+use novarocks_parser::ast::{DmlStatement, Statement};
 use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorControlPlanningLease,
     ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
@@ -572,17 +573,23 @@ fn service(journal: Option<Arc<FakeJournal>>) -> TestService {
     service_over(coordination, journal)
 }
 
+fn typed_insert(source: &str) -> novarocks_parser::ast::Insert {
+    let parsed = novarocks_parser::parse(source).expect("parse INSERT test input");
+    let [Statement::Dml(DmlStatement::Insert(statement))] = parsed.as_slice() else {
+        panic!("expected INSERT statement: {source}");
+    };
+    statement.clone()
+}
+
 #[test]
-fn non_insert_returns_none_without_engine_calls() {
+fn typed_insert_does_not_execute_non_insert_sql() {
     let engine = FakeInsertEngine::new(target());
     let (context, _, _) = context();
-    assert_eq!(
-        service(None)
-            .try_execute_insert(&engine, "DELETE FROM t WHERE a = 1", &context, None)
-            .unwrap(),
-        None
-    );
-    assert!(engine.calls().is_empty());
+    let source = "INSERT INTO t VALUES (1, 2)";
+    let error = service(None)
+        .try_execute_insert(&engine, &typed_insert(source), source, &context, None)
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
 }
 
 #[test]
@@ -599,6 +606,7 @@ fn union_all_commits_once_in_source_order() {
     )
     .try_execute_insert(
         &engine,
+        &typed_insert("INSERT INTO t SELECT 1 UNION ALL SELECT 2"),
         "INSERT INTO t SELECT 1 UNION ALL SELECT 2",
         &context,
         None,
@@ -634,6 +642,7 @@ fn tag_target_is_read_only() {
     let error = service(Some(Arc::new(FakeJournal::default())))
         .try_execute_insert(
             &engine,
+            &typed_insert("INSERT INTO t.tag_v1 VALUES (1, 2)"),
             "INSERT INTO t.tag_v1 VALUES (1, 2)",
             &context,
             None,
@@ -654,6 +663,7 @@ fn branch_insert_requires_iceberg_v3() {
     let error = service(Some(Arc::new(FakeJournal::default())))
         .try_execute_insert(
             &engine,
+            &typed_insert("INSERT INTO t.branch_dev VALUES (1, 2)"),
             "INSERT INTO t.branch_dev VALUES (1, 2)",
             &context,
             None,
@@ -679,6 +689,7 @@ fn branch_insert_journals_the_prepared_branch_base_snapshot() {
     )
     .try_execute_insert(
         &engine,
+        &typed_insert("INSERT INTO t.branch_dev VALUES (1, 2)"),
         "INSERT INTO t.branch_dev VALUES (1, 2)",
         &context,
         None,
@@ -708,7 +719,13 @@ fn iceberg_without_journal_fails_before_prepare() {
     let engine = FakeInsertEngine::new(target());
     let (context, _, _) = context();
     let error = service(None)
-        .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
+        .try_execute_insert(
+            &engine,
+            &typed_insert("INSERT INTO t VALUES (1, 2)"),
+            "INSERT INTO t VALUES (1, 2)",
+            &context,
+            None,
+        )
         .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
     assert!(error.to_string().contains("state store is required"));
@@ -729,7 +746,13 @@ fn iceberg_append_empty_records_known_empty_terminal_fact() {
         coordination,
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
     )
-    .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
+    .try_execute_insert(
+        &engine,
+        &typed_insert("INSERT INTO t VALUES (1, 2)"),
+        "INSERT INTO t VALUES (1, 2)",
+        &context,
+        None,
+    )
     .unwrap();
     assert_eq!(journal.states(), vec![OperationState::Finalized]);
     assert!(!engine.calls().contains(&Call::Commit));
@@ -747,7 +770,13 @@ fn iceberg_overwrite_empty_commits_and_finalizes() {
         coordination,
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
     )
-    .try_execute_insert(&engine, "INSERT OVERWRITE t VALUES (1, 2)", &context, None)
+    .try_execute_insert(
+        &engine,
+        &typed_insert("INSERT OVERWRITE t VALUES (1, 2)"),
+        "INSERT OVERWRITE t VALUES (1, 2)",
+        &context,
+        None,
+    )
     .unwrap();
     assert_eq!(journal.states(), vec![OperationState::Finalized]);
     assert!(engine.calls().contains(&Call::Commit));
@@ -765,7 +794,13 @@ fn iceberg_commit_unknown_is_persisted_without_retry() {
         coordination,
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
     )
-    .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
+    .try_execute_insert(
+        &engine,
+        &typed_insert("INSERT INTO t VALUES (1, 2)"),
+        "INSERT INTO t VALUES (1, 2)",
+        &context,
+        None,
+    )
     .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::Commit);
     assert_eq!(journal.states(), vec![OperationState::CommitUnknown]);
@@ -789,6 +824,7 @@ fn admitted_context_reaches_insert_select_and_iceberg_write() {
     service(Some(Arc::new(FakeJournal::default())))
         .try_execute_insert(
             &iceberg,
+            &typed_insert("INSERT INTO t SELECT a FROM src"),
             "INSERT INTO t SELECT a FROM src",
             &write_context,
             None,
@@ -819,7 +855,13 @@ fn writer_abort_is_recorded_without_commit() {
         coordination,
         Some(Arc::clone(&journal) as Arc<dyn OperationJournal>),
     )
-    .try_execute_insert(&engine, "INSERT INTO t VALUES (1, 2)", &context, None)
+    .try_execute_insert(
+        &engine,
+        &typed_insert("INSERT INTO t VALUES (1, 2)"),
+        "INSERT INTO t VALUES (1, 2)",
+        &context,
+        None,
+    )
     .unwrap_err();
     assert!(error.to_string().contains("writer aborted"));
     assert!(!engine.calls().contains(&Call::Commit));
