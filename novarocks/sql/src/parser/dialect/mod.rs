@@ -15,15 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod create_table;
-
-use sqlparser::ast as sqlast;
-use sqlparser::keywords::Keyword;
-use sqlparser::parser::Parser;
-use sqlparser::tokenizer::Token;
-
 use crate::parser::ast::ObjectName;
 use novarocks_catalog::schema::SqlType;
+use sqlparser::ast as sqlast;
 
 /// Custom StarRocks dialect for sqlparser.
 #[derive(Debug)]
@@ -73,17 +67,6 @@ impl sqlparser::dialect::Dialect for StarRocksDialect {
     /// as `'e\\f'` end up storing 4 bytes instead of 3.
     fn supports_string_literal_backslash_escape(&self) -> bool {
         true
-    }
-}
-
-/// Peek at a token by offset and check if it matches a word (case-insensitive).
-pub(crate) fn peek_word_eq(parser: &Parser<'_>, offset: usize, word: &str) -> bool {
-    // sqlparser 0.61 uses const-generic peek_tokens_ref<N>().
-    // We use peek_nth_token_ref for arbitrary offsets.
-    let token = parser.peek_nth_token_ref(offset);
-    match &token.token {
-        Token::Word(w) => w.value.eq_ignore_ascii_case(word),
-        _ => false,
     }
 }
 
@@ -267,17 +250,6 @@ fn parse_custom_decimal_modifiers(modifiers: &[String]) -> (u8, i8) {
 }
 
 // ---------------------------------------------------------------------------
-// Token-level lookahead helpers (moved from sqlparser_backend)
-// ---------------------------------------------------------------------------
-
-pub(crate) fn looks_like_create_table(parser: &Parser<'_>) -> bool {
-    parser.peek_keyword(Keyword::CREATE)
-        && (peek_word_eq(parser, 1, "TABLE")
-            || (peek_word_eq(parser, 1, "TEMPORARY") && peek_word_eq(parser, 2, "TABLE"))
-            || (peek_word_eq(parser, 1, "EXTERNAL") && peek_word_eq(parser, 2, "TABLE")))
-}
-
-// ---------------------------------------------------------------------------
 // SQL normalization utilities (moved from sqlparser_backend)
 // ---------------------------------------------------------------------------
 
@@ -291,12 +263,11 @@ pub fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
     let sql = rewrite_version_as_of_string(&sql)?;
     let sql = rewrite_iceberg_metadata_suffix(&sql)?;
     let sql = rewrite_starrocks_meta_table_suffix(&sql);
-    let sql = rewrite_overwrite_partitions(&sql)?;
     let sql = rewrite_inline_null_treatment(&sql);
     let sql = strip_join_hints(&sql);
     let sql = rewrite_cross_join_with_on(&sql);
     let sql = rewrite_interval_value_parens(&sql);
-    Ok(rewrite_create_table_nested_generic_closers(&sql))
+    Ok(sql)
 }
 
 /// Repair the SQL emitted by sqlparser when a table has both an alias and a
@@ -1792,6 +1763,7 @@ fn rewrite_version_as_of_string(sql: &str) -> Result<String, String> {
 /// INSERT OVERWRITE PARTITIONS t.branch_dev VALUES (1)
 ///     → INSERT OVERWRITE __nr_op_dyn.t.branch_dev VALUES (1)
 /// ```
+#[cfg(any())]
 fn rewrite_overwrite_partitions(sql: &str) -> Result<String, String> {
     // Fast path: no PARTITIONS keyword at all.
     let sql_lower = sql.to_ascii_lowercase();
@@ -2714,6 +2686,7 @@ fn rewrite_legacy_map_literal_body(sql: &str, open_idx: usize) -> Result<(String
     Err("unterminated legacy MAP literal in SQL".to_string())
 }
 
+#[cfg(any())]
 fn rewrite_create_table_nested_generic_closers(sql: &str) -> String {
     let trimmed = sql.trim_start();
     let lower = trimmed.to_ascii_lowercase();
@@ -3091,16 +3064,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_for_raw_parse_splits_nested_generic_closers_in_create_table() {
-        let normalized = super::normalize_for_raw_parse(
-            "CREATE TABLE t (c1 ARRAY<ARRAY<INT>>, c2 ARRAY<STRUCT<f1 INT>>) DUPLICATE KEY(c1) DISTRIBUTED BY HASH(c1) BUCKETS 1 PROPERTIES (\"replication_num\" = \"1\")",
-        )
-        .expect("normalize should succeed");
-        assert!(normalized.contains("ARRAY<ARRAY<INT> >"));
-        assert!(normalized.contains("ARRAY<STRUCT<f1 INT> >"));
-    }
-
-    #[test]
     fn normalize_for_raw_parse_preserves_utf8_text() {
         let normalized = super::normalize_for_raw_parse("SELECT '王武程咬金', '中国'")
             .expect("normalize should succeed");
@@ -3358,74 +3321,6 @@ mod tests {
         let input = "SELECT c[_META_] FROM t0";
         let got = super::normalize_for_raw_parse(input).expect("normalize");
         assert_eq!(got, input);
-    }
-
-    // ----- rewrite_overwrite_partitions tests -----
-
-    #[test]
-    fn rewrite_overwrite_partitions_injects_marker_no_table_keyword() {
-        let normalized =
-            super::rewrite_overwrite_partitions("INSERT OVERWRITE PARTITIONS t VALUES (1)")
-                .expect("rewrite should succeed");
-        assert_eq!(normalized, "INSERT OVERWRITE __nr_op_dyn.t VALUES (1)");
-    }
-
-    #[test]
-    fn rewrite_overwrite_partitions_injects_marker_with_table_keyword() {
-        let normalized = super::rewrite_overwrite_partitions(
-            "INSERT OVERWRITE PARTITIONS TABLE t SELECT * FROM s",
-        )
-        .expect("rewrite should succeed");
-        assert_eq!(
-            normalized,
-            "INSERT OVERWRITE TABLE __nr_op_dyn.t SELECT * FROM s"
-        );
-    }
-
-    #[test]
-    fn rewrite_overwrite_partitions_injects_marker_multi_part_name() {
-        let normalized =
-            super::rewrite_overwrite_partitions("INSERT OVERWRITE PARTITIONS x.y.z SELECT 1")
-                .expect("rewrite should succeed");
-        assert_eq!(normalized, "INSERT OVERWRITE __nr_op_dyn.x.y.z SELECT 1");
-    }
-
-    #[test]
-    fn rewrite_overwrite_partitions_injects_marker_with_branch_suffix() {
-        let normalized = super::rewrite_overwrite_partitions(
-            "INSERT OVERWRITE PARTITIONS t.branch_dev VALUES (1)",
-        )
-        .expect("rewrite should succeed");
-        assert_eq!(
-            normalized,
-            "INSERT OVERWRITE __nr_op_dyn.t.branch_dev VALUES (1)"
-        );
-    }
-
-    #[test]
-    fn rewrite_overwrite_partitions_case_insensitive() {
-        let normalized =
-            super::rewrite_overwrite_partitions("insert overwrite partitions t values (1)")
-                .expect("rewrite should succeed");
-        assert_eq!(normalized, "insert overwrite __nr_op_dyn.t values (1)");
-    }
-
-    #[test]
-    fn rewrite_overwrite_partitions_passes_through_plain_overwrite() {
-        let sql = "INSERT OVERWRITE TABLE t VALUES (1)";
-        assert_eq!(super::rewrite_overwrite_partitions(sql).unwrap(), sql);
-    }
-
-    #[test]
-    fn rewrite_overwrite_partitions_passes_through_unrelated_sql() {
-        let sql = "SELECT 'INSERT OVERWRITE PARTITIONS' AS s";
-        assert_eq!(super::rewrite_overwrite_partitions(sql).unwrap(), sql);
-    }
-
-    #[test]
-    fn rewrite_overwrite_partitions_does_not_rewrite_in_double_quoted_literal() {
-        let sql = r#"SELECT "INSERT OVERWRITE PARTITIONS t" AS s"#;
-        assert_eq!(super::rewrite_overwrite_partitions(sql).unwrap(), sql);
     }
 
     #[test]

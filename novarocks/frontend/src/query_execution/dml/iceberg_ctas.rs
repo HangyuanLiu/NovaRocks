@@ -239,29 +239,32 @@ mod tests {
 
     #[test]
     fn parse_create_table_if_not_exists_sets_flag() {
-        use novarocks_sql::syntax::{StarRocksDialect, parse_create_table_statement};
+        use novarocks_parser::ast::{DmlStatement, Statement, TableStatement};
 
-        let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
-            .try_with_sql("CREATE TABLE IF NOT EXISTS t AS SELECT 1 AS x")
-            .expect("parser init");
-        let stmt = parse_create_table_statement(&mut parser).expect("parse");
+        let parsed = novarocks_parser::parse("CREATE TABLE IF NOT EXISTS t AS SELECT 1 AS x")
+            .expect("parse");
+        let [Statement::Dml(DmlStatement::CreateTableAsSelect(stmt))] = parsed.as_slice() else {
+            panic!("expected CTAS");
+        };
+        let TableStatement::Create(table) = &stmt.table;
         assert!(
-            stmt.if_not_exists,
+            table.if_not_exists,
             "IF NOT EXISTS must set the if_not_exists field to true"
         );
-        assert!(stmt.as_select.is_some());
+        assert_eq!(stmt.query.text, "SELECT 1 AS x");
     }
 
     #[test]
     fn parse_create_table_without_if_not_exists_flag_is_false() {
-        use novarocks_sql::syntax::{StarRocksDialect, parse_create_table_statement};
+        use novarocks_parser::ast::{DmlStatement, Statement, TableStatement};
 
-        let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
-            .try_with_sql("CREATE TABLE t AS SELECT 1 AS x")
-            .expect("parser init");
-        let stmt = parse_create_table_statement(&mut parser).expect("parse");
+        let parsed = novarocks_parser::parse("CREATE TABLE t AS SELECT 1 AS x").expect("parse");
+        let [Statement::Dml(DmlStatement::CreateTableAsSelect(stmt))] = parsed.as_slice() else {
+            panic!("expected CTAS");
+        };
+        let TableStatement::Create(table) = &stmt.table;
         assert!(
-            !stmt.if_not_exists,
+            !table.if_not_exists,
             "without IF NOT EXISTS the flag should be false"
         );
     }

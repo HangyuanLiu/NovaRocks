@@ -40,9 +40,7 @@ use novarocks_sql::planning::dml::{
     dml_change_stream_optimizer_settings, split_ref_suffix,
 };
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
-use novarocks_sql::syntax::{
-    MergeMatchedAction, MergeNotMatchedAction, MergeStmt, ObjectName, UpdateStmt,
-};
+use novarocks_sql::syntax::ObjectName;
 
 fn write_commit_has_files(write_commit: &crate::query_execution::write::WriteCommitInput) -> bool {
     write_commit
@@ -500,8 +498,68 @@ pub(crate) enum MutationStagedWrite {
     },
 }
 
+/// Frontend-local mutation input lowered from SQLP-5's typed AST.  Expression
+/// and derived-query text are exact slices of the admitted SQL source; they
+/// are never rebuilt through the canonical printer.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedUpdateStatement {
+    pub(crate) table: ObjectName,
+    pub(crate) alias: Option<String>,
+    pub(crate) assignments: Vec<PreparedMutationAssignment>,
+    pub(crate) source: Option<PreparedMutationSource>,
+    pub(crate) where_sql: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedMergeStatement {
+    pub(crate) table: ObjectName,
+    pub(crate) target_alias: Option<String>,
+    pub(crate) source: PreparedMutationSource,
+    pub(crate) on_sql: String,
+    pub(crate) matched: Option<PreparedMergeClause<PreparedMergeMatchedAction>>,
+    pub(crate) not_matched: Option<PreparedMergeClause<PreparedMergeNotMatchedAction>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedMutationAssignment {
+    pub(crate) column: String,
+    pub(crate) value_sql: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PreparedMutationSource {
+    Table {
+        name: ObjectName,
+        alias: Option<String>,
+    },
+    Query {
+        query_text: String,
+        alias: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedMergeClause<A> {
+    pub(crate) predicate_sql: Option<String>,
+    pub(crate) action: A,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PreparedMergeMatchedAction {
+    Update {
+        assignments: Vec<PreparedMutationAssignment>,
+    },
+    Delete,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedMergeNotMatchedAction {
+    pub(crate) columns: Vec<String>,
+    pub(crate) values_sql: Vec<String>,
+}
+
 pub(crate) struct PreparedUpdateMutation {
-    pub(crate) stmt: UpdateStmt,
+    pub(crate) stmt: PreparedUpdateStatement,
     pub(crate) current_catalog: Option<String>,
     pub(crate) target: crate::catalog_application::resolver::TargetBackend,
     pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
@@ -548,7 +606,7 @@ pub(crate) struct PreparedMorUpdateWriteTarget {
 }
 
 pub(crate) struct PreparedMergeMutation {
-    pub(crate) stmt: MergeStmt,
+    pub(crate) stmt: PreparedMergeStatement,
     pub(crate) current_catalog: Option<String>,
     pub(crate) target: crate::catalog_application::resolver::TargetBackend,
     pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
@@ -727,7 +785,7 @@ fn cow_target_columns(
 
 pub(crate) fn prepare_update_mutation(
     state: &DmlExecutionKernel,
-    stmt: &UpdateStmt,
+    stmt: &PreparedUpdateStatement,
     current_catalog: Option<&str>,
     current_database: &str,
     execution: &QueryExecutionContext,
@@ -888,7 +946,7 @@ pub(crate) fn prepare_update_mutation(
 /// for every later read or writer admission.
 pub(crate) fn prepare_merge_mutation(
     state: &DmlExecutionKernel,
-    stmt: &MergeStmt,
+    stmt: &PreparedMergeStatement,
     current_catalog: Option<&str>,
     current_database: &str,
     execution: &QueryExecutionContext,
@@ -950,11 +1008,11 @@ pub(crate) fn prepare_merge_mutation(
     let effect_set = DmlRowMutationEffectSet::Merge {
         matched_update: matches!(
             stmt.matched.as_ref().map(|clause| &clause.action),
-            Some(MergeMatchedAction::Update { .. })
+            Some(PreparedMergeMatchedAction::Update { .. })
         ),
         matched_delete: matches!(
             stmt.matched.as_ref().map(|clause| &clause.action),
-            Some(MergeMatchedAction::Delete)
+            Some(PreparedMergeMatchedAction::Delete)
         ),
         not_matched_insert: stmt.not_matched.is_some(),
     };
@@ -999,7 +1057,7 @@ pub(crate) fn prepare_merge_mutation(
         })
         .collect::<Result<Vec<_>, _>>()?;
     if let Some(clause) = stmt.matched.as_ref()
-        && let MergeMatchedAction::Update { assignments } = &clause.action
+        && let PreparedMergeMatchedAction::Update { assignments } = &clause.action
     {
         validate_update_assignments(assignments, &target_columns, &partition_source_columns)?;
     }
@@ -1346,7 +1404,7 @@ pub(crate) fn stage_prepared_update_mutation(
 fn materialize_update_matches(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
-    stmt: &UpdateStmt,
+    stmt: &PreparedUpdateStatement,
     current_catalog: Option<&str>,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -1361,20 +1419,20 @@ fn materialize_update_matches(
     let assignments_sql = stmt
         .assignments
         .iter()
-        .map(|assignment| (assignment.column.as_str(), assignment.value.to_string()))
+        .map(|assignment| (assignment.column.as_str(), assignment.value_sql.as_str()))
         .collect::<Vec<_>>();
     let assignments_sql = assignments_sql
         .iter()
-        .map(|(column, expr)| (*column, expr.as_str()))
+        .map(|(column, expr)| (*column, *expr))
         .collect::<Vec<_>>();
-    let where_sql = stmt.where_clause.as_ref().map(|expr| expr.to_string());
+    let where_sql = stmt.where_sql.as_deref();
     let source_sql = mutation_source_to_sql(state, &stmt.source, current_catalog, target)?;
     let match_sql = build_update_match_query_sql(
         &target_sql,
         target_alias,
         source_sql.as_deref(),
         &assignments_sql,
-        where_sql.as_deref(),
+        where_sql,
     );
     execute_update_match_query(
         state,
@@ -1388,7 +1446,7 @@ fn materialize_update_matches(
 
 fn mutation_source_to_sql(
     state: &DmlExecutionKernel,
-    source: &Option<novarocks_sql::syntax::MutationSource>,
+    source: &Option<PreparedMutationSource>,
     current_catalog: Option<&str>,
     target: &crate::catalog_application::resolver::TargetBackend,
 ) -> Result<Option<String>, String> {
@@ -1402,13 +1460,12 @@ fn mutation_source_to_sql(
 
 fn mutation_source_relation_to_sql(
     state: &DmlExecutionKernel,
-    source: &novarocks_sql::syntax::MutationSource,
+    source: &PreparedMutationSource,
     current_catalog: Option<&str>,
     target: &crate::catalog_application::resolver::TargetBackend,
 ) -> Result<String, String> {
-    use novarocks_sql::syntax::MutationSource;
     match source {
-        MutationSource::Table { name, alias } => {
+        PreparedMutationSource::Table { name, alias } => {
             // The match SELECT runs with `current_database = target.namespace`
             // and `current_catalog = Some(target.catalog)`. Resolve the source
             // against the user's surface name to get its concrete (catalog,
@@ -1434,11 +1491,11 @@ fn mutation_source_relation_to_sql(
             }
             Ok(sql)
         }
-        MutationSource::Query { query, alias } => {
+        PreparedMutationSource::Query { query_text, alias } => {
             let alias = alias
                 .as_deref()
                 .ok_or_else(|| "MERGE/UPDATE subquery source requires an alias".to_string())?;
-            Ok(format!("({query}) AS {alias}"))
+            Ok(format!("({query_text}) AS {alias}"))
         }
     }
 }
@@ -1447,7 +1504,7 @@ fn mutation_source_relation_to_sql(
 fn build_update_mor_change_stream_write_plan(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
-    stmt: &UpdateStmt,
+    stmt: &PreparedUpdateStatement,
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     target_ref: &str,
@@ -1459,7 +1516,7 @@ fn build_update_mor_change_stream_write_plan(
 ) -> Result<crate::query_execution::compiler::PlannedIcebergChangeStreamWrite, String> {
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
     let source_sql = mutation_source_to_sql(state, &stmt.source, current_catalog, target)?;
-    let where_sql = stmt.where_clause.as_ref().map(|expr| expr.to_string());
+    let where_sql = stmt.where_sql.as_deref();
     let assignments_sql = update_assignment_projection_sql(&stmt.assignments, target_columns)?;
     let assignments_sql_refs = assignments_sql
         .iter()
@@ -1471,7 +1528,7 @@ fn build_update_mor_change_stream_write_plan(
         target_alias,
         source_sql.as_deref(),
         &assignments_sql_refs,
-        where_sql.as_deref(),
+        where_sql,
     );
     let mut query = parse_generated_query(&match_sql, "MOR UPDATE change-stream producer")?;
     if crate::query_execution::planning::time_travel::has_time_travel_refs(&query) {
@@ -1505,7 +1562,7 @@ fn build_update_mor_change_stream_write_plan(
 }
 
 fn update_assignment_projection_sql(
-    assignments: &[novarocks_sql::syntax::UpdateAssignment],
+    assignments: &[PreparedMutationAssignment],
     target_columns: &[novarocks_catalog::schema::ColumnDef],
 ) -> Result<Vec<(String, String)>, String> {
     assignments
@@ -1523,7 +1580,7 @@ fn update_assignment_projection_sql(
             Ok((
                 target_column.name.clone(),
                 crate::query_execution::dml::iceberg_writer::target_cast_expr_sql(
-                    &format!("({})", assignment.value),
+                    &format!("({})", assignment.value_sql),
                     target_column,
                 )?,
             ))
@@ -3099,7 +3156,7 @@ fn required_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a ArrayRe
 }
 
 fn validate_update_assignments(
-    assignments: &[novarocks_sql::syntax::UpdateAssignment],
+    assignments: &[PreparedMutationAssignment],
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     partition_columns: &[String],
 ) -> Result<(), String> {
@@ -3191,7 +3248,7 @@ fn build_update_match_query_sql(
 
 fn build_exact_cow_update_selection_query(
     target: &crate::catalog_application::resolver::TargetBackend,
-    stmt: &UpdateStmt,
+    stmt: &PreparedUpdateStatement,
     source_sql: Option<&str>,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
 ) -> Result<sqlparser::ast::Query, String> {
@@ -3203,7 +3260,7 @@ fn build_exact_cow_update_selection_query(
         .map(|assignment| {
             (
                 assignment.column.to_ascii_lowercase(),
-                assignment.value.to_string(),
+                assignment.value_sql.clone(),
             )
         })
         .collect::<HashMap<_, _>>();
@@ -3242,9 +3299,9 @@ fn build_exact_cow_update_selection_query(
         sql.push_str(" CROSS JOIN ");
         sql.push_str(source);
     }
-    if let Some(predicate) = &stmt.where_clause {
+    if let Some(predicate) = &stmt.where_sql {
         sql.push_str(" WHERE ");
-        sql.push_str(&predicate.to_string());
+        sql.push_str(predicate);
     }
     parse_generated_query(&sql, "exact COW UPDATE selection")
 }
@@ -3286,11 +3343,11 @@ pub(crate) fn stage_prepared_merge_mutation(
     } = prepared;
     let has_matched_update = matches!(
         stmt.matched.as_ref().map(|clause| &clause.action),
-        Some(MergeMatchedAction::Update { .. })
+        Some(PreparedMergeMatchedAction::Update { .. })
     );
     let has_matched_delete = matches!(
         stmt.matched.as_ref().map(|clause| &clause.action),
-        Some(MergeMatchedAction::Delete)
+        Some(PreparedMergeMatchedAction::Delete)
     );
     let has_not_matched_insert = stmt.not_matched.is_some();
     if table_write_mode == novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead
@@ -3498,7 +3555,7 @@ impl std::ops::Deref for MergeInsertColumns {
 }
 
 fn resolve_merge_insert_columns(
-    action: &MergeNotMatchedAction,
+    action: &PreparedMergeNotMatchedAction,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
 ) -> Result<MergeInsertColumns, String> {
     let target_names_lower: Vec<String> = target_columns
@@ -3512,10 +3569,10 @@ fn resolve_merge_insert_columns(
     // schema returned from `iceberg_table_columns`, so we don't have to
     // filter them here.
     if action.columns.is_empty() {
-        if action.values.len() != target_columns.len() {
+        if action.values_sql.len() != target_columns.len() {
             return Err(format!(
                 "MERGE WHEN NOT MATCHED INSERT VALUES count {} does not match target column count {}",
-                action.values.len(),
+                action.values_sql.len(),
                 target_columns.len()
             ));
         }
@@ -3673,7 +3730,7 @@ impl MergeMatchRows {
 fn materialize_merge_match(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
-    stmt: &MergeStmt,
+    stmt: &PreparedMergeStatement,
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     insert_columns: Option<&[MergeInsertColumn]>,
@@ -3694,8 +3751,8 @@ fn materialize_merge_match(
     // When the source carries no alias, inject `__nr_s` so the projection /
     // ON predicate can reference source columns deterministically.
     let source_sql = match &stmt.source {
-        novarocks_sql::syntax::MutationSource::Table { alias, .. }
-        | novarocks_sql::syntax::MutationSource::Query { alias, .. } => {
+        PreparedMutationSource::Table { alias, .. }
+        | PreparedMutationSource::Query { alias, .. } => {
             if alias.is_some() {
                 source_table_sql
             } else {
@@ -3704,20 +3761,18 @@ fn materialize_merge_match(
         }
     };
 
-    let on_sql = stmt.on.to_string();
+    let on_sql = stmt.on_sql.as_str();
     let matched_predicate_sql = stmt
         .matched
         .as_ref()
-        .and_then(|c| c.predicate.as_ref())
-        .map(|expr| expr.to_string());
+        .and_then(|c| c.predicate_sql.as_deref());
     let not_matched_predicate_sql = stmt
         .not_matched
         .as_ref()
-        .and_then(|c| c.predicate.as_ref())
-        .map(|expr| expr.to_string());
+        .and_then(|c| c.predicate_sql.as_deref());
 
     let matched_assignments_sql = match stmt.matched.as_ref().map(|c| &c.action) {
-        Some(MergeMatchedAction::Update { assignments }) => assignments
+        Some(PreparedMergeMatchedAction::Update { assignments }) => assignments
             .iter()
             .map(|a| {
                 let target_column = target_columns
@@ -3732,7 +3787,7 @@ fn materialize_merge_match(
                 Ok((
                     target_column.name.clone(),
                     crate::query_execution::dml::iceberg_writer::target_cast_expr_sql(
-                        &format!("({})", a.value),
+                        &format!("({})", a.value_sql),
                         target_column,
                     )?,
                 ))
@@ -3760,7 +3815,7 @@ fn materialize_merge_match(
                         Ok((
                             col.name.clone(),
                             crate::query_execution::dml::iceberg_writer::target_cast_expr_sql(
-                                &format!("({})", action.values[idx]),
+                                &format!("({})", action.values_sql[idx]),
                                 target_column,
                             )?,
                         ))
@@ -3785,8 +3840,8 @@ fn materialize_merge_match(
         &matched_assignments_sql_borrow,
         &insert_values_sql_borrow,
         stmt.matched.as_ref().map(|clause| match clause.action {
-            MergeMatchedAction::Update { .. } => MERGE_ACTION_MATCHED_UPDATE,
-            MergeMatchedAction::Delete => MERGE_ACTION_MATCHED_DELETE,
+            PreparedMergeMatchedAction::Update { .. } => MERGE_ACTION_MATCHED_UPDATE,
+            PreparedMergeMatchedAction::Delete => MERGE_ACTION_MATCHED_DELETE,
         }),
         stmt.not_matched.is_some(),
     );
@@ -3805,7 +3860,7 @@ fn materialize_merge_match(
 fn build_exact_cow_merge_selection_query(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
-    stmt: &MergeStmt,
+    stmt: &PreparedMergeStatement,
     current_catalog: Option<&str>,
     insert_columns: Option<&[MergeInsertColumn]>,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
@@ -3824,22 +3879,20 @@ fn build_exact_cow_merge_selection_query(
     let matched_predicate = stmt
         .matched
         .as_ref()
-        .and_then(|clause| clause.predicate.as_ref())
-        .map(ToString::to_string)
+        .and_then(|clause| clause.predicate_sql.clone())
         .unwrap_or_else(|| "TRUE".to_string());
     let insert_predicate = stmt
         .not_matched
         .as_ref()
-        .and_then(|clause| clause.predicate.as_ref())
-        .map(ToString::to_string)
+        .and_then(|clause| clause.predicate_sql.clone())
         .unwrap_or_else(|| "TRUE".to_string());
     let assignments = match stmt.matched.as_ref().map(|clause| &clause.action) {
-        Some(MergeMatchedAction::Update { assignments }) => assignments
+        Some(PreparedMergeMatchedAction::Update { assignments }) => assignments
             .iter()
             .map(|assignment| {
                 (
                     assignment.column.to_ascii_lowercase(),
-                    assignment.value.to_string(),
+                    assignment.value_sql.clone(),
                 )
             })
             .collect::<HashMap<_, _>>(),
@@ -3852,7 +3905,7 @@ fn build_exact_cow_merge_selection_query(
                 column.value_index.map(|index| {
                     (
                         column.name.to_ascii_lowercase(),
-                        clause.action.values[index].to_string(),
+                        clause.action.values_sql[index].clone(),
                     )
                 })
             })
@@ -3905,8 +3958,8 @@ fn build_exact_cow_merge_selection_query(
     let source_table_sql =
         mutation_source_relation_to_sql(state, &stmt.source, current_catalog, target)?;
     let source_sql = match &stmt.source {
-        novarocks_sql::syntax::MutationSource::Table { alias, .. }
-        | novarocks_sql::syntax::MutationSource::Query { alias, .. } => {
+        PreparedMutationSource::Table { alias, .. }
+        | PreparedMutationSource::Query { alias, .. } => {
             if alias.is_some() {
                 source_table_sql
             } else {
@@ -3920,7 +3973,7 @@ fn build_exact_cow_merge_selection_query(
     let mut admitted_actions = Vec::new();
     if matches!(
         stmt.matched.as_ref().map(|clause| &clause.action),
-        Some(MergeMatchedAction::Update { .. })
+        Some(PreparedMergeMatchedAction::Update { .. })
     ) {
         admitted_actions.push(format!("({matched} AND ({matched_predicate}))"));
     }
@@ -3939,7 +3992,7 @@ fn build_exact_cow_merge_selection_query(
             sql_identifier(&target.namespace),
             sql_identifier(&target.table),
             sql_identifier(target_alias),
-            stmt.on,
+            stmt.on_sql,
             admitted_actions.join(" OR "),
         ),
         "exact COW MERGE selection",
@@ -3950,7 +4003,7 @@ fn build_exact_cow_merge_selection_query(
 fn build_merge_mor_change_stream_write_plan(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
-    stmt: &MergeStmt,
+    stmt: &PreparedMergeStatement,
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     insert_columns: Option<&[MergeInsertColumn]>,
@@ -3969,8 +4022,8 @@ fn build_merge_mor_change_stream_write_plan(
     let source_table_sql =
         mutation_source_relation_to_sql(state, &stmt.source, current_catalog, target)?;
     let source_sql = match &stmt.source {
-        novarocks_sql::syntax::MutationSource::Table { alias, .. }
-        | novarocks_sql::syntax::MutationSource::Query { alias, .. } => {
+        PreparedMutationSource::Table { alias, .. }
+        | PreparedMutationSource::Query { alias, .. } => {
             if alias.is_some() {
                 source_table_sql
             } else {
@@ -3980,7 +4033,7 @@ fn build_merge_mor_change_stream_write_plan(
     };
 
     let matched_assignments_sql = match stmt.matched.as_ref().map(|c| &c.action) {
-        Some(MergeMatchedAction::Update { assignments }) => assignments
+        Some(PreparedMergeMatchedAction::Update { assignments }) => assignments
             .iter()
             .map(|a| {
                 let target_column = target_columns
@@ -3995,7 +4048,7 @@ fn build_merge_mor_change_stream_write_plan(
                 Ok((
                     target_column.name.clone(),
                     crate::query_execution::dml::iceberg_writer::target_cast_expr_sql(
-                        &format!("({})", a.value),
+                        &format!("({})", a.value_sql),
                         target_column,
                     )?,
                 ))
@@ -4023,7 +4076,7 @@ fn build_merge_mor_change_stream_write_plan(
                         Ok((
                             col.name.clone(),
                             crate::query_execution::dml::iceberg_writer::target_cast_expr_sql(
-                                &format!("({})", action.values[idx]),
+                                &format!("({})", action.values_sql[idx]),
                                 target_column,
                             )?,
                         ))
@@ -4038,8 +4091,8 @@ fn build_merge_mor_change_stream_write_plan(
         .collect::<Vec<_>>();
 
     let matched_action = stmt.matched.as_ref().map(|clause| match clause.action {
-        MergeMatchedAction::Update { .. } => MERGE_ACTION_MATCHED_UPDATE,
-        MergeMatchedAction::Delete => MERGE_ACTION_MATCHED_DELETE,
+        PreparedMergeMatchedAction::Update { .. } => MERGE_ACTION_MATCHED_UPDATE,
+        PreparedMergeMatchedAction::Delete => MERGE_ACTION_MATCHED_DELETE,
     });
     let has_matched_update = matched_action == Some(MERGE_ACTION_MATCHED_UPDATE);
     let has_matched_delete = matched_action == Some(MERGE_ACTION_MATCHED_DELETE);
@@ -4047,19 +4100,17 @@ fn build_merge_mor_change_stream_write_plan(
     let matched_predicate_sql = stmt
         .matched
         .as_ref()
-        .and_then(|c| c.predicate.as_ref())
-        .map(|expr| expr.to_string());
+        .and_then(|c| c.predicate_sql.as_deref());
     let not_matched_predicate_sql = stmt
         .not_matched
         .as_ref()
-        .and_then(|c| c.predicate.as_ref())
-        .map(|expr| expr.to_string());
+        .and_then(|c| c.predicate_sql.as_deref());
 
     let match_sql = build_merge_match_query_sql(
         &target_sql,
         &target_alias,
         &source_sql,
-        &stmt.on.to_string(),
+        &stmt.on_sql,
         matched_predicate_sql.as_deref(),
         not_matched_predicate_sql.as_deref(),
         target_columns,
@@ -4230,7 +4281,7 @@ fn build_merge_match_query_sql(
 fn build_merge_unmatched_insert_query(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
-    stmt: &MergeStmt,
+    stmt: &PreparedMergeStatement,
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     insert_columns: &MergeInsertColumns,
@@ -4242,8 +4293,8 @@ fn build_merge_unmatched_insert_query(
     let source_table_sql =
         mutation_source_relation_to_sql(state, &stmt.source, current_catalog, target)?;
     let source_sql = match &stmt.source {
-        novarocks_sql::syntax::MutationSource::Table { alias, .. }
-        | novarocks_sql::syntax::MutationSource::Query { alias, .. } => {
+        PreparedMutationSource::Table { alias, .. }
+        | PreparedMutationSource::Query { alias, .. } => {
             if alias.is_some() {
                 source_table_sql
             } else {
@@ -4266,7 +4317,7 @@ fn build_merge_unmatched_insert_query(
                 ));
             }
             let raw_expr = match insert_column.value_index {
-                Some(idx) => format!("({})", not_matched.action.values[idx]),
+                Some(idx) => format!("({})", not_matched.action.values_sql[idx]),
                 None => "NULL".to_string(),
             };
             let expr = crate::query_execution::dml::iceberg_writer::target_cast_expr_sql(
@@ -4288,7 +4339,7 @@ fn build_merge_unmatched_insert_query(
             novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL
         )
     )];
-    if let Some(predicate) = not_matched.predicate.as_ref() {
+    if let Some(predicate) = not_matched.predicate_sql.as_deref() {
         predicates.push(format!("({predicate})"));
     }
     let sql = format!(
@@ -4296,7 +4347,7 @@ fn build_merge_unmatched_insert_query(
         select_items.join(", "),
         source_sql,
         target_sql,
-        stmt.on,
+        stmt.on_sql,
         predicates.join(" AND ")
     );
     parse_generated_query(&sql, "MERGE unmatched INSERT sink")
@@ -5072,11 +5123,9 @@ mod tests {
     #[test]
     fn reject_reserved_update_columns() {
         let err = validate_update_assignments(
-            &[novarocks_sql::syntax::UpdateAssignment {
+            &[PreparedMutationAssignment {
                 column: "_row_id".to_string(),
-                value: sqlparser::ast::Expr::Value(
-                    sqlparser::ast::Value::Number("1".to_string(), false).into(),
-                ),
+                value_sql: "1".to_string(),
             }],
             &[col("id"), col("v")],
             &[],
@@ -5088,11 +5137,9 @@ mod tests {
     #[test]
     fn reject_partition_column_update() {
         let err = validate_update_assignments(
-            &[novarocks_sql::syntax::UpdateAssignment {
+            &[PreparedMutationAssignment {
                 column: "id".to_string(),
-                value: sqlparser::ast::Expr::Value(
-                    sqlparser::ast::Value::Number("1".to_string(), false).into(),
-                ),
+                value_sql: "1".to_string(),
             }],
             &[col("id"), col("v")],
             &["id".to_string()],
@@ -5124,9 +5171,9 @@ mod tests {
 
     #[test]
     fn update_assignment_projection_casts_to_target_type() {
-        let assignments = vec![novarocks_sql::syntax::UpdateAssignment {
+        let assignments = vec![PreparedMutationAssignment {
             column: "v".to_string(),
-            value: sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("src_v")),
+            value_sql: "src_v".to_string(),
         }];
         let projected = update_assignment_projection_sql(
             &assignments,
@@ -5148,9 +5195,9 @@ mod tests {
 
     #[test]
     fn update_change_stream_match_query_uses_casted_assignment_projection() {
-        let assignments = vec![novarocks_sql::syntax::UpdateAssignment {
+        let assignments = vec![PreparedMutationAssignment {
             column: "v".to_string(),
-            value: sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("src_v")),
+            value_sql: "src_v".to_string(),
         }];
         let projected = update_assignment_projection_sql(
             &assignments,
@@ -5215,15 +5262,25 @@ mod tests {
 
     #[test]
     fn merge_unmatched_insert_query_uses_distributed_append_shape() {
-        let raw = novarocks_sql::planning::dml::parse_raw_statement(
-            "MERGE INTO t AS t \
-             USING (SELECT 3 AS id, 4 AS v) AS s \
-             ON t.id = s.id \
-             WHEN NOT MATCHED AND s.id > 0 THEN INSERT (id) VALUES (s.id)",
-        )
-        .expect("parse MERGE");
-        let stmt = crate::catalog_application::statement::convert_sqlparser_merge_to_custom(&raw)
-            .expect("convert MERGE");
+        let stmt = PreparedMergeStatement {
+            table: ObjectName {
+                parts: vec!["t".to_string()],
+            },
+            target_alias: Some("t".to_string()),
+            source: PreparedMutationSource::Query {
+                query_text: "SELECT 3 AS id, 4 AS v".to_string(),
+                alias: Some("s".to_string()),
+            },
+            on_sql: "t.id = s.id".to_string(),
+            matched: None,
+            not_matched: Some(PreparedMergeClause {
+                predicate_sql: Some("s.id > 0".to_string()),
+                action: PreparedMergeNotMatchedAction {
+                    columns: vec!["id".to_string()],
+                    values_sql: vec!["s.id".to_string()],
+                },
+            }),
+        };
         let target_columns = vec![col("id"), col("v")];
         let insert_columns = resolve_merge_insert_columns(
             &stmt.not_matched.as_ref().expect("not matched").action,

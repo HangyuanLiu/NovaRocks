@@ -22,9 +22,8 @@
 //! AND-only, no OR/functions/subqueries/joins; non-DUP tables require
 //! key columns; floating-point columns reject `=`.
 
-use sqlparser::ast as sqlast;
-
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_parser::ast::{BinaryOperator, Expr, IsPredicate, LiteralKind, UnaryOperator};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmpOp {
@@ -102,7 +101,7 @@ impl KeysType {
 }
 
 pub fn translate_to_delete_predicate(
-    where_expr: &sqlast::Expr,
+    where_expr: &Expr,
     schema: &[ColumnDef],
     keys: &[String],
     keys_type: KeysType,
@@ -115,26 +114,21 @@ pub fn translate_to_delete_predicate(
     Ok(terms)
 }
 
-fn flatten_and(expr: &sqlast::Expr) -> Result<Vec<&sqlast::Expr>, String> {
+fn flatten_and(expr: &Expr) -> Result<Vec<&Expr>, String> {
     let mut out = Vec::new();
-    fn walk<'a>(e: &'a sqlast::Expr, out: &mut Vec<&'a sqlast::Expr>) -> Result<(), String> {
+    fn walk<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) -> Result<(), String> {
         match e {
-            sqlast::Expr::BinaryOp {
-                op: sqlast::BinaryOperator::And,
-                left,
-                right,
-            } => {
-                walk(left, out)?;
-                walk(right, out)?;
+            Expr::Binary(expression) if expression.operator == BinaryOperator::And => {
+                walk(&expression.left, out)?;
+                walk(&expression.right, out)?;
                 Ok(())
             }
-            sqlast::Expr::BinaryOp {
-                op: sqlast::BinaryOperator::Or,
-                ..
-            } => Err("DELETE on this table model does not support OR; \
+            Expr::Binary(expression) if expression.operator == BinaryOperator::Or => {
+                Err("DELETE on this table model does not support OR; \
                  use only AND of comparisons / IN / IS NULL"
-                .to_string()),
-            sqlast::Expr::Nested(inner) => walk(inner, out),
+                    .to_string())
+            }
+            Expr::Nested(expression) => walk(&expression.expression, out),
             _ => {
                 out.push(e);
                 Ok(())
@@ -146,28 +140,29 @@ fn flatten_and(expr: &sqlast::Expr) -> Result<Vec<&sqlast::Expr>, String> {
 }
 
 fn translate_atom(
-    atom: &sqlast::Expr,
+    atom: &Expr,
     schema: &[ColumnDef],
     keys: &[String],
     keys_type: KeysType,
     out: &mut DeletePredicateTerms,
 ) -> Result<(), String> {
     match atom {
-        sqlast::Expr::BinaryOp { left, op, right } => {
-            let cmp = match op {
-                sqlast::BinaryOperator::Eq => CmpOp::Eq,
-                sqlast::BinaryOperator::NotEq => CmpOp::Ne,
-                sqlast::BinaryOperator::Lt => CmpOp::Lt,
-                sqlast::BinaryOperator::LtEq => CmpOp::Le,
-                sqlast::BinaryOperator::Gt => CmpOp::Gt,
-                sqlast::BinaryOperator::GtEq => CmpOp::Ge,
+        Expr::Binary(expression) => {
+            let cmp = match expression.operator {
+                BinaryOperator::Equal => CmpOp::Eq,
+                BinaryOperator::NotEqual => CmpOp::Ne,
+                BinaryOperator::LessThan => CmpOp::Lt,
+                BinaryOperator::LessThanOrEqual => CmpOp::Le,
+                BinaryOperator::GreaterThan => CmpOp::Gt,
+                BinaryOperator::GreaterThanOrEqual => CmpOp::Ge,
                 other => {
                     return Err(format!(
                         "DELETE WHERE supports comparison / IN / IS NULL only; got {other:?}"
                     ));
                 }
             };
-            let (col_name, lit_expr, swapped) = extract_col_lit(left, right)?;
+            let (col_name, lit_expr, swapped) =
+                extract_col_lit(&expression.left, &expression.right)?;
             let cmp = if swapped { cmp.flipped() } else { cmp };
             let column = column_or_err(schema, &col_name)?;
             check_keys(&col_name, &column, keys, keys_type)?;
@@ -185,27 +180,24 @@ fn translate_atom(
             });
             Ok(())
         }
-        sqlast::Expr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let col_name = expr_to_col_name(expr)?;
+        Expr::InList(expression) => {
+            let col_name = expr_to_col_name(&expression.expr)?;
             let column = column_or_err(schema, &col_name)?;
             check_keys(&col_name, &column, keys, keys_type)?;
-            let values = list
+            let values = expression
+                .list
                 .iter()
                 .map(|e| serialize_literal(e, &column.data_type, &col_name))
                 .collect::<Result<Vec<_>, _>>()?;
             out.in_list.push(InTerm {
                 column: col_name,
-                is_not_in: *negated,
+                is_not_in: expression.negated,
                 values,
             });
             Ok(())
         }
-        sqlast::Expr::IsNull(inner) => {
-            let col_name = expr_to_col_name(inner)?;
+        Expr::IsPredicate(expression) if expression.predicate == IsPredicate::Null => {
+            let col_name = expr_to_col_name(&expression.expr)?;
             let column = column_or_err(schema, &col_name)?;
             check_keys(&col_name, &column, keys, keys_type)?;
             out.is_null.push(IsNullTerm {
@@ -214,8 +206,8 @@ fn translate_atom(
             });
             Ok(())
         }
-        sqlast::Expr::IsNotNull(inner) => {
-            let col_name = expr_to_col_name(inner)?;
+        Expr::IsPredicate(expression) if expression.predicate == IsPredicate::NotNull => {
+            let col_name = expr_to_col_name(&expression.expr)?;
             let column = column_or_err(schema, &col_name)?;
             check_keys(&col_name, &column, keys, keys_type)?;
             out.is_null.push(IsNullTerm {
@@ -224,7 +216,9 @@ fn translate_atom(
             });
             Ok(())
         }
-        sqlast::Expr::Nested(inner) => translate_atom(inner, schema, keys, keys_type, out),
+        Expr::Nested(expression) => {
+            translate_atom(&expression.expression, schema, keys, keys_type, out)
+        }
         other => Err(format!(
             "DELETE WHERE atom must be col-op-lit / IN / IS NULL; got {other:?}"
         )),
@@ -232,9 +226,9 @@ fn translate_atom(
 }
 
 fn extract_col_lit<'a>(
-    left: &'a sqlast::Expr,
-    right: &'a sqlast::Expr,
-) -> Result<(String, &'a sqlast::Expr, bool /* swapped */), String> {
+    left: &'a Expr,
+    right: &'a Expr,
+) -> Result<(String, &'a Expr, bool /* swapped */), String> {
     if let Ok(name) = expr_to_col_name(left) {
         return Ok((name, right, false));
     }
@@ -244,10 +238,11 @@ fn extract_col_lit<'a>(
     Err("DELETE WHERE comparison must have exactly one column and one literal side".to_string())
 }
 
-fn expr_to_col_name(e: &sqlast::Expr) -> Result<String, String> {
+fn expr_to_col_name(e: &Expr) -> Result<String, String> {
     match e {
-        sqlast::Expr::Identifier(id) => Ok(id.value.to_lowercase()),
-        sqlast::Expr::CompoundIdentifier(parts) => parts
+        Expr::Identifier(id) => Ok(id.value.to_lowercase()),
+        Expr::CompoundIdentifier(parts) => parts
+            .parts
             .last()
             .map(|p| p.value.to_lowercase())
             .ok_or_else(|| "empty compound identifier".to_string()),
@@ -294,19 +289,17 @@ fn is_float_type(ty: &arrow::datatypes::DataType) -> bool {
 ///  - FLOAT/DOUBLE: pass through canonical f64 (only reachable via `<` / `<=` / `>` / `>=`).
 ///  - UTF8/VARCHAR: pass through verbatim.
 fn serialize_literal(
-    lit_expr: &sqlast::Expr,
+    lit_expr: &Expr,
     column_type: &arrow::datatypes::DataType,
     column_name: &str,
 ) -> Result<String, String> {
     use arrow::datatypes::{DataType, TimeUnit};
-    use sqlparser::ast::{Expr, Value, ValueWithSpan};
-
     let (raw, was_negated): (String, bool) = match lit_expr {
-        Expr::Value(ValueWithSpan { value, .. }) => match value {
-            Value::Number(s, _) => (s.clone(), false),
-            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => (s.clone(), false),
-            Value::Boolean(b) => return Ok(if *b { "1".into() } else { "0".into() }),
-            Value::Null => {
+        Expr::Literal(literal) => match &literal.kind {
+            LiteralKind::Number(s) => (s.clone(), false),
+            LiteralKind::String(s) => (s.clone(), false),
+            LiteralKind::Boolean(b) => return Ok(if *b { "1".into() } else { "0".into() }),
+            LiteralKind::Null => {
                 return Err(format!(
                     "NULL literal in DELETE WHERE for column '{column_name}'; \
                      use IS NULL / IS NOT NULL"
@@ -318,20 +311,21 @@ fn serialize_literal(
                 ));
             }
         },
-        Expr::UnaryOp {
-            op: sqlast::UnaryOperator::Minus,
-            expr,
-        } => match expr.as_ref() {
-            Expr::Value(ValueWithSpan {
-                value: Value::Number(s, _),
-                ..
-            }) => (s.clone(), true),
-            _ => {
-                return Err(format!(
-                    "unsupported negated literal for column '{column_name}'"
-                ));
+        Expr::Unary(expression) if expression.operator == UnaryOperator::Minus => {
+            match expression.expression.as_ref() {
+                Expr::Literal(literal) if matches!(&literal.kind, LiteralKind::Number(_)) => {
+                    let LiteralKind::Number(s) = &literal.kind else {
+                        unreachable!()
+                    };
+                    (s.clone(), true)
+                }
+                _ => {
+                    return Err(format!(
+                        "unsupported negated literal for column '{column_name}'"
+                    ));
+                }
             }
-        },
+        }
         other => {
             return Err(format!(
                 "literal value expected for column '{column_name}', got {other:?}"
@@ -466,8 +460,7 @@ fn split_datetime_fraction(raw: &str, column_name: &str) -> Result<(String, Stri
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
-    use sqlparser::dialect::MySqlDialect;
-    use sqlparser::parser::Parser;
+    use novarocks_parser::ast::{DmlStatement, Statement};
 
     fn dup_schema_int_str() -> Vec<ColumnDef> {
         vec![
@@ -488,16 +481,13 @@ mod tests {
         ]
     }
 
-    fn parse_where(sql: &str) -> sqlast::Expr {
-        let stmt = Parser::parse_sql(&MySqlDialect {}, &format!("DELETE FROM t WHERE {sql}"))
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("at least one statement");
-        match stmt {
-            sqlast::Statement::Delete(d) => d.selection.expect("WHERE clause"),
-            other => panic!("unexpected stmt {other:?}"),
-        }
+    fn parse_where(sql: &str) -> Expr {
+        let statements =
+            novarocks_parser::parse(&format!("DELETE FROM t WHERE {sql}")).expect("parse");
+        let Statement::Dml(DmlStatement::Delete(delete)) = &statements[0] else {
+            panic!("expected DELETE");
+        };
+        delete.selection.clone().expect("WHERE clause")
     }
 
     #[test]

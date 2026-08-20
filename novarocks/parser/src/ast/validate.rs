@@ -26,8 +26,8 @@ use std::collections::HashSet;
 use crate::{StructuralViolation, ValidateError};
 
 use super::{
-    Cte, Expr, GroupBy, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
-    Values, WindowFrame, WindowFrameBound, WindowSpec,
+    Cte, Expr, GroupBy, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableStatement,
+    TableWithJoins, Values, WindowFrame, WindowFrameBound, WindowSpec,
 };
 
 /// Validates every statement in a public parser result.
@@ -43,6 +43,7 @@ pub fn validate_statement(statement: &Statement) -> Result<(), ValidateError> {
     match statement {
         Statement::Query(query) => validate_query(query),
         Statement::ExplainQuery(explain) => validate_query(&explain.query),
+        Statement::Table(TableStatement::Create(table)) => validate_create_table(table),
         Statement::Backend(_)
         | Statement::Statistics(_)
         | Statement::Catalog(_)
@@ -50,8 +51,22 @@ pub fn validate_statement(statement: &Statement) -> Result<(), ValidateError> {
         | Statement::Maintenance(_)
         | Statement::MaterializedView(_)
         | Statement::View(_)
+        | Statement::Dml(_)
         | Statement::RawQuery(_) => Ok(()),
     }
+}
+
+fn validate_create_table(table: &super::CreateTable) -> Result<(), ValidateError> {
+    let mut names = HashSet::with_capacity(table.columns.len());
+    for column in &table.columns {
+        if !names.insert(identifier_key(&column.name.value, column.name.quoted)) {
+            return Err(ValidateError::invalid_structure(
+                StructuralViolation::DuplicateTableColumnName,
+                column.name.span,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_query(query: &Query) -> Result<(), ValidateError> {

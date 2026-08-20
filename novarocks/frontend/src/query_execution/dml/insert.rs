@@ -35,30 +35,28 @@ use crate::query_execution::dml::external_write_fence::{
 };
 use crate::query_execution::dml::iceberg_writer;
 use crate::query_execution::kernels::DmlExecutionKernel;
+use novarocks_parser::ast::{Insert, RawQuerySlice};
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_sql::planning::dml::parse_raw_statement;
 use novarocks_sql::syntax::{Literal, ObjectName};
 
 pub use crate::query_execution::dml::iceberg_writer::PreparedIcebergWriteNativeEncoding;
 
-/// Parse one statement through NovaRocks' StarRocks normalizer and return its
-/// raw INSERT AST.
+/// Convert the SQLP-5-owned trailing query payload into the existing SQLP-6
+/// query IR at the execution boundary.
 ///
-/// This is intentionally only a recognition primitive. Target resolution,
-/// custom command conversion, dispatch, and execution belong to the frontend
-/// DML application service.
-pub fn parse_insert_statement(sql: &str) -> Result<Option<sqlparser::ast::Insert>, String> {
-    let sql = sql.trim_start();
-    let keyword_end = sql
-        .char_indices()
-        .find_map(|(index, ch)| (!ch.is_ascii_alphabetic()).then_some(index))
-        .unwrap_or(sql.len());
-    if !sql[..keyword_end].eq_ignore_ascii_case("insert") {
-        return Ok(None);
-    }
-    match parse_raw_statement(sql)? {
-        sqlparser::ast::Statement::Insert(insert) => Ok(Some(insert)),
-        _ => Ok(None),
+/// The surrounding INSERT family, target, columns, and overwrite semantics
+/// have already been decided by the typed AST. This function must not be used
+/// to re-classify a statement or make capability decisions.
+pub fn parse_insert_source_query(
+    source: &RawQuerySlice,
+) -> Result<Box<sqlparser::ast::Query>, String> {
+    match parse_raw_statement(&source.text)? {
+        sqlparser::ast::Statement::Query(query) => Ok(query),
+        statement => Err(format!(
+            "INSERT source must be a query, found {}",
+            statement
+        )),
     }
 }
 
@@ -72,7 +70,10 @@ pub fn encode_insert_variant_json(json_text: &str) -> Result<Vec<u8>, String> {
 
 /// One admitted INSERT statement at the frontend route boundary.
 pub struct InsertRequest<'a> {
-    pub statement: &'a sqlparser::ast::Insert,
+    /// SQLP-5 owns INSERT family and capability facts. `source` below may
+    /// only be sliced through spans carried by this statement.
+    pub statement: &'a Insert,
+    pub source: &'a str,
     pub context: &'a RequestContext,
     pub query_options: Option<&'a QueryOptions>,
 }
@@ -650,54 +651,28 @@ mod tests {
         accepts_object_safe_engine(None);
     }
 
-    #[test]
-    fn parse_insert_statement_returns_insert_ast() {
-        let statement = parse_insert_statement("INSERT INTO db.t VALUES (1)")
-            .expect("INSERT should parse")
-            .expect("INSERT should be recognized");
-        assert!(!statement.overwrite);
-    }
-
-    #[test]
-    fn parse_insert_statement_returns_none_for_non_insert() {
-        assert!(
-            parse_insert_statement("SELECT 1")
-                .expect("SELECT should parse")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn parse_insert_statement_does_not_parse_core_only_commands() {
-        for sql in [
-            "CREATE EXTERNAL CATALOG ice PROPERTIES (\"type\"=\"iceberg\")",
-            "ADD BACKEND '127.0.0.1:19170'",
-        ] {
-            assert!(
-                parse_insert_statement(sql)
-                    .unwrap_or_else(|error| panic!("`{sql}` must bypass INSERT parsing: {error}"))
-                    .is_none(),
-                "`{sql}` must remain owned by the core command route"
-            );
+    fn raw_query_slice(text: &str) -> RawQuerySlice {
+        RawQuerySlice {
+            text: text.to_owned(),
+            span: novarocks_parser::Span::new(0, text.len()),
         }
     }
 
     #[test]
-    fn parse_insert_statement_preserves_dynamic_overwrite_marker_semantics() {
-        let statement = parse_insert_statement("INSERT OVERWRITE PARTITIONS TABLE db.t VALUES (1)")
-            .expect("dynamic overwrite should parse")
-            .expect("dynamic overwrite should be recognized");
-        assert!(statement.overwrite);
-        let sqlparser::ast::TableObject::TableName(name) = statement.table else {
-            panic!("expected table-name INSERT target");
-        };
-        assert_eq!(
-            name.0[0]
-                .as_ident()
-                .expect("dynamic overwrite marker should be an identifier")
-                .value,
-            "__nr_op_dyn"
-        );
+    fn parse_insert_source_query_forms_sqlp6_query_ir() {
+        let query = parse_insert_source_query(&raw_query_slice("VALUES (1)"))
+            .expect("VALUES source should form a query IR");
+        assert!(matches!(
+            query.body.as_ref(),
+            sqlparser::ast::SetExpr::Values(_)
+        ));
+    }
+
+    #[test]
+    fn parse_insert_source_query_rejects_non_query_payload() {
+        let error = parse_insert_source_query(&raw_query_slice("DELETE FROM db.t"))
+            .expect_err("non-query payload must fail at the D8 execution boundary");
+        assert!(error.contains("INSERT source must be a query"), "{error}");
     }
 
     #[test]

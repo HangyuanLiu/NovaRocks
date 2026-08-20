@@ -19,15 +19,30 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 use novarocks_catalog::schema::{ColumnDef, ColumnDefault};
-use novarocks_frontend::dml::{InsertCommandSource, convert_insert_command, reorder_insert_rows};
+use novarocks_frontend::dml::{
+    InsertCommand, InsertCommandSource, convert_insert_command, reorder_insert_rows,
+};
 use novarocks_frontend::query_execution::dml::insert::{
-    InsertOverwriteMode, InsertValue, parse_insert_statement,
+    InsertOverwriteMode, InsertValue, parse_insert_source_query,
 };
 
-fn parse_insert(sql: &str) -> sqlparser::ast::Insert {
-    parse_insert_statement(sql)
-        .expect("statement should parse")
-        .expect("statement should be INSERT")
+fn parse_insert(sql: &str) -> novarocks_parser::ast::Insert {
+    let statements = novarocks_parser::parse(sql).expect("statement should parse");
+    let [
+        novarocks_parser::ast::Statement::Dml(novarocks_parser::ast::DmlStatement::Insert(
+            statement,
+        )),
+    ] = statements.as_slice()
+    else {
+        panic!("statement should be SQLP-5 INSERT");
+    };
+    statement.clone()
+}
+
+fn convert_insert(sql: &str) -> Result<InsertCommand, String> {
+    let statement = parse_insert(sql);
+    let source_query = parse_insert_source_query(&statement.source)?;
+    convert_insert_command(&statement, &source_query)
 }
 
 fn column(
@@ -48,8 +63,7 @@ fn column(
 #[test]
 fn values_become_literal_rows() {
     let command =
-        convert_insert_command(&parse_insert("INSERT INTO db.t VALUES (1, 'a'), (2, NULL)"))
-            .expect("convert command");
+        convert_insert("INSERT INTO db.t VALUES (1, 'a'), (2, NULL)").expect("convert command");
     assert_eq!(command.target.parts, vec!["db", "t"]);
     assert_eq!(
         command.source,
@@ -62,8 +76,7 @@ fn values_become_literal_rows() {
 
 #[test]
 fn select_without_from_becomes_literal_row() {
-    let command = convert_insert_command(&parse_insert("INSERT INTO t SELECT 40 + 2, 'x'"))
-        .expect("convert command");
+    let command = convert_insert("INSERT INTO t SELECT 40 + 2, 'x'").expect("convert command");
     assert_eq!(
         command.source,
         InsertCommandSource::SelectLiteralRow(vec![
@@ -75,33 +88,27 @@ fn select_without_from_becomes_literal_row() {
 
 #[test]
 fn select_with_from_uses_query_pipeline() {
-    let command = convert_insert_command(&parse_insert("INSERT INTO t SELECT id FROM src"))
-        .expect("convert command");
+    let command = convert_insert("INSERT INTO t SELECT id FROM src").expect("convert command");
     assert!(matches!(command.source, InsertCommandSource::FromQuery(_)));
 }
 
 #[test]
 fn non_constant_projection_uses_query_pipeline() {
-    let command = convert_insert_command(&parse_insert("INSERT INTO t SELECT value + 1"))
-        .expect("convert command");
+    let command = convert_insert("INSERT INTO t SELECT value + 1").expect("convert command");
     assert!(matches!(command.source, InsertCommandSource::FromQuery(_)));
 }
 
 #[test]
 fn non_literal_values_function_uses_query_pipeline() {
-    let command = convert_insert_command(&parse_insert(
-        "INSERT INTO t VALUES (to_bitmap(11), hll_hash(5))",
-    ))
-    .expect("convert command");
+    let command = convert_insert("INSERT INTO t VALUES (to_bitmap(11), hll_hash(5))")
+        .expect("convert command");
     assert!(matches!(command.source, InsertCommandSource::FromQuery(_)));
 }
 
 #[test]
 fn parse_json_values_fold_to_packed_variant_literal() {
-    let command = convert_insert_command(&parse_insert(
-        r#"INSERT INTO t VALUES (1, parse_json('{"a":1}'))"#,
-    ))
-    .expect("convert command");
+    let command = convert_insert(r#"INSERT INTO t VALUES (1, parse_json('{"a":1}'))"#)
+        .expect("convert command");
     let InsertCommandSource::Values(rows) = command.source else {
         panic!("constant parse_json must stay on the literal VALUES path");
     };
@@ -121,10 +128,8 @@ fn parse_json_values_fold_to_packed_variant_literal() {
 
 #[test]
 fn union_all_flattens_in_source_order() {
-    let command = convert_insert_command(&parse_insert(
-        "INSERT INTO t SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3",
-    ))
-    .expect("convert command");
+    let command = convert_insert("INSERT INTO t SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
+        .expect("convert command");
     let InsertCommandSource::Values(rows) = command.source else {
         panic!("expected UNION ALL literals to normalize into one VALUES source");
     };
@@ -140,17 +145,14 @@ fn union_all_flattens_in_source_order() {
 
 #[test]
 fn union_distinct_is_rejected() {
-    let error =
-        convert_insert_command(&parse_insert("INSERT INTO t SELECT 1 UNION SELECT 2")).unwrap_err();
+    let error = convert_insert("INSERT INTO t SELECT 1 UNION SELECT 2").unwrap_err();
     assert!(error.contains("requires UNION ALL"), "{error}");
 }
 
 #[test]
-fn dynamic_overwrite_marker_is_removed() {
-    let command = convert_insert_command(&parse_insert(
-        "INSERT OVERWRITE PARTITIONS TABLE db.t VALUES (1)",
-    ))
-    .expect("convert dynamic overwrite");
+fn typed_dynamic_overwrite_uses_partition_field() {
+    let command = convert_insert("INSERT OVERWRITE PARTITIONS TABLE db.t VALUES (1)")
+        .expect("convert dynamic overwrite");
     assert_eq!(command.target.parts, vec!["db", "t"]);
     assert_eq!(
         command.overwrite_mode,
@@ -159,20 +161,17 @@ fn dynamic_overwrite_marker_is_removed() {
 }
 
 #[test]
-fn unsupported_insert_target_is_rejected() {
-    let mut statement = parse_insert("INSERT INTO t SELECT remote('localhost')");
-    let source = statement.source.as_ref().expect("INSERT source");
-    let sqlparser::ast::SetExpr::Select(select) = source.body.as_ref() else {
-        panic!("expected SELECT source");
-    };
-    let sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Function(function)) =
-        &select.projection[0]
-    else {
-        panic!("expected function projection");
-    };
-    statement.table = sqlparser::ast::TableObject::TableFunction(function.clone());
-    let error = convert_insert_command(&statement).unwrap_err();
-    assert!(error.contains("unsupported INSERT target"), "{error}");
+fn typed_insert_target_preserves_object_name_components() {
+    let statement = parse_insert("INSERT INTO db.t SELECT remote('localhost')");
+    assert_eq!(
+        statement
+            .target
+            .parts
+            .iter()
+            .map(|part| part.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["db", "t"]
+    );
 }
 
 #[test]

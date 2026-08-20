@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::parser::ast::RefreshMaterializedViewStmt;
+use crate::legacy_mv_ast::RefreshMaterializedViewStmt;
 
 pub(crate) mod aggregate_shape;
 pub mod first_refresh;

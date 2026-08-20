@@ -6,20 +6,19 @@
 //! syntax surface.
 
 pub use super::parser::{normalize_for_raw_parse, parse_normalized_sql_raw};
+pub use crate::legacy_mv_ast::{
+    AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
+    DropMaterializedViewStmt, MaterializedViewDistribution, MaterializedViewRefreshPolicy,
+    RefreshMaterializedViewStmt, ShowMaterializedViewsStmt,
+};
 pub use crate::parser::ast::{
-    AlterIcebergPartitionSpecStmt, AlterMaterializedViewAction, AlterMaterializedViewStmt,
-    ColumnAggregation, CreateMaterializedViewStmt, CreateTableKind, CreateTableStmt,
-    DefaultLiteral, DeleteStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr, Literal,
-    MaterializedViewDistribution, MaterializedViewRefreshPolicy, MergeMatchedAction,
-    MergeNotMatchedAction, MergeStmt, MergeWhenClause, MutationSource, ObjectName,
-    RefreshMaterializedViewStmt, ShowMaterializedViewsStmt, TableColumnDef, TableKeyDesc,
-    TableKeyKind, UpdateAssignment, UpdateStmt,
+    AlterIcebergPartitionSpecStmt, ColumnAggregation, CreateTableKind, CreateTableStmt,
+    DefaultLiteral, IcebergPartitionFieldExpr, Literal, ObjectName, TableColumnDef, TableKeyDesc,
+    TableKeyKind,
 };
 pub use crate::parser::dialect::StarRocksDialect;
 
 pub use crate::parser::dialect::substitute_user_variables;
-
-use sqlparser::parser::Parser;
 
 pub fn parse_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
     crate::parser::parse_sql_raw(sql)
@@ -148,37 +147,6 @@ pub fn parse_datetime_string_to_micros(value: &str) -> Result<i64, String> {
 
 pub fn sqlparser_expr_to_literal(expr: &sqlparser::ast::Expr) -> Result<Literal, String> {
     crate::literal::sqlparser_expr_to_literal(expr)
-}
-
-pub fn peek_word_eq(parser: &Parser<'_>, offset: usize, word: &str) -> bool {
-    crate::parser::dialect::peek_word_eq(parser, offset, word)
-}
-
-pub fn looks_like_create_table(parser: &Parser<'_>) -> bool {
-    crate::parser::dialect::looks_like_create_table(parser)
-}
-
-pub fn parse_create_table_statement(parser: &mut Parser<'_>) -> Result<CreateTableStmt, String> {
-    crate::parser::dialect::create_table::parse_create_table_statement(parser)
-}
-
-pub fn parse_sql_type_definition(
-    parser: &mut Parser<'_>,
-) -> Result<novarocks_catalog::schema::SqlType, String> {
-    crate::parser::dialect::create_table::parse_sql_type_definition(parser)
-}
-
-pub fn parse_default_literal(
-    parser: &mut Parser<'_>,
-    data_type: &novarocks_catalog::schema::SqlType,
-) -> Result<DefaultLiteral, String> {
-    crate::parser::dialect::create_table::parse_default_literal(parser, data_type)
-}
-
-pub fn parse_partition_field_expr(
-    parser: &mut Parser<'_>,
-) -> Result<IcebergPartitionFieldExpr, String> {
-    crate::parser::dialect::create_table::parse_partition_field_expr(parser)
 }
 
 #[cfg(test)]

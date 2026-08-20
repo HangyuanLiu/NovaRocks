@@ -1917,12 +1917,10 @@ mod tests {
     }
 
     impl CtasEngine for RecoveryDriveEngine {
-        fn classify_ctas(&self, _sql: &str) -> Result<Option<CtasCommand>, String> {
-            unreachable!("recovery never classifies SQL")
-        }
-
         fn preflight_ctas_target(
             &self,
+            _statement: &novarocks_parser::ast::CreateTableAsSelect,
+            _source: &str,
             _command: &CtasCommand,
             _current_catalog: Option<&str>,
             _current_database: &str,

@@ -24,11 +24,11 @@ mod shaping;
 use crate::common::admitted_query_context::RequestContext;
 use crate::query_execution::dml::insert::{
     IcebergInsertSource, InsertEngine, InsertOverwriteMode, InsertTargetName, InsertValue,
-    PrepareIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
+    PrepareIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget, parse_insert_source_query,
 };
 use novarocks_protocol::lifecycle::QueryOptions;
 
-use crate::dml::error::DmlError;
+use crate::dml::error::{AdmitError, DmlError};
 use crate::dml::runner::{ActiveWriteTransactionRunner, preparing_request};
 use crate::dml::service::DmlService;
 use crate::statistics::{
@@ -48,25 +48,28 @@ enum InsertTargetRef {
 }
 
 impl DmlService {
-    /// Recognize and execute one INSERT through the frontend application owner.
+    /// Execute one SQLP-5 typed INSERT through the frontend application owner.
     ///
-    /// `Ok(None)` means the SQL is not an INSERT and may be delegated to the
-    /// remaining core command kernel.
+    /// Statement-family routing is complete before this boundary. `source`
+    /// exists solely for diagnostic locations derived from AST spans; it must
+    /// not be reparsed or sliced to classify an INSERT form. The one D8
+    /// exception is `statement.source.text`, which becomes SQLP-6 query IR at
+    /// the execution boundary through [`parse_insert_source_query`].
     pub fn try_execute_insert(
         &self,
         engine: &dyn InsertEngine,
-        sql: &str,
+        statement: &novarocks_parser::ast::Insert,
+        source: &str,
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
-    ) -> Result<Option<()>, DmlError> {
-        let Some(statement) = crate::query_execution::dml::insert::parse_insert_statement(sql)
-            .map_err(DmlError::executor)?
-        else {
-            return Ok(None);
-        };
-        let mut command = convert_insert_command(&statement).map_err(DmlError::executor)?;
+    ) -> Result<(), DmlError> {
+        let source_query = parse_insert_source_query(&statement.source)
+            .map_err(|error| insert_admit_error(source, statement.source.span, error))?;
+        let mut command = convert_insert_command(statement, &source_query)
+            .map_err(|error| insert_admit_error(source, statement.span, error))?;
         let statistics_source = statistics_source(&command.source);
-        let (target, target_ref) = split_target_ref(&command.target).map_err(DmlError::executor)?;
+        let (target, target_ref) = split_target_ref(&command.target)
+            .map_err(|error| insert_admit_error(source, statement.target.span, error))?;
         command.target = target.clone();
 
         let session = context.session();
@@ -79,7 +82,8 @@ impl DmlService {
                 execution: context.execution().clone(),
             })
             .map_err(DmlError::executor)?;
-        validate_target(&target_ref).map_err(DmlError::executor)?;
+        validate_target(&target_ref)
+            .map_err(|error| insert_admit_error(source, statement.target.span, error))?;
         self.execute_iceberg_source(
             engine,
             &resolved,
@@ -108,7 +112,7 @@ impl DmlService {
                 self.local_statistics_columns(&resolved.namespace, &resolved.table)?,
             )
             .map_err(DmlError::executor)?;
-        Ok(Some(()))
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -166,6 +170,10 @@ impl DmlService {
             .run(spec)
             .map(|_| ())
     }
+}
+
+fn insert_admit_error(source: &str, span: novarocks_parser::Span, message: String) -> DmlError {
+    DmlError::admit(AdmitError::InsertUnsupportedForm.to_user_error(source, span, message))
 }
 
 fn split_target_ref(

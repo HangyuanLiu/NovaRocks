@@ -57,6 +57,14 @@ pub trait Visit {
         walk_view_statement(self, statement);
     }
 
+    fn visit_table_statement(&mut self, statement: &TableStatement) {
+        walk_table_statement(self, statement);
+    }
+
+    fn visit_dml_statement(&mut self, statement: &DmlStatement) {
+        walk_dml_statement(self, statement);
+    }
+
     fn visit_raw_query_slice(&mut self, query: &RawQuerySlice) {
         let _ = query;
     }
@@ -121,6 +129,8 @@ pub fn walk_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Statement)
             visitor.visit_materialized_view_statement(statement)
         }
         Statement::View(statement) => visitor.visit_view_statement(statement),
+        Statement::Table(statement) => visitor.visit_table_statement(statement),
+        Statement::Dml(statement) => visitor.visit_dml_statement(statement),
         Statement::Query(query) => visitor.visit_query(query),
         Statement::ExplainQuery(query) => visitor.visit_explain_query(query),
         Statement::RawQuery(query) => visitor.visit_raw_query_slice(query),
@@ -164,6 +174,14 @@ pub fn walk_materialized_view_statement<V: Visit + ?Sized>(
 
 pub fn walk_view_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &ViewStatement) {
     super::view::walk(visitor, statement);
+}
+
+pub fn walk_table_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &TableStatement) {
+    super::table::walk(visitor, statement);
+}
+
+pub fn walk_dml_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &DmlStatement) {
+    super::dml::walk(visitor, statement);
 }
 
 pub fn walk_ident<V: Visit + ?Sized>(_: &mut V, _: &Ident) {}
@@ -651,6 +669,14 @@ pub trait Fold {
         fold_view_statement(self, statement)
     }
 
+    fn fold_table_statement(&mut self, statement: TableStatement) -> TableStatement {
+        fold_table_statement(self, statement)
+    }
+
+    fn fold_dml_statement(&mut self, statement: DmlStatement) -> DmlStatement {
+        fold_dml_statement(self, statement)
+    }
+
     fn fold_raw_query_slice(&mut self, query: RawQuerySlice) -> RawQuerySlice {
         query
     }
@@ -725,6 +751,8 @@ pub fn fold_statement<F: Fold + ?Sized>(folder: &mut F, statement: Statement) ->
             Statement::MaterializedView(folder.fold_materialized_view_statement(statement))
         }
         Statement::View(statement) => Statement::View(folder.fold_view_statement(statement)),
+        Statement::Table(statement) => Statement::Table(folder.fold_table_statement(statement)),
+        Statement::Dml(statement) => Statement::Dml(folder.fold_dml_statement(statement)),
         Statement::Query(query) => Statement::Query(folder.fold_query(query)),
         Statement::ExplainQuery(query) => Statement::ExplainQuery(folder.fold_explain_query(query)),
         Statement::RawQuery(query) => Statement::RawQuery(folder.fold_raw_query_slice(query)),
@@ -782,6 +810,20 @@ pub fn fold_view_statement<F: Fold + ?Sized>(
     statement: ViewStatement,
 ) -> ViewStatement {
     super::view::fold(folder, statement)
+}
+
+pub fn fold_table_statement<F: Fold + ?Sized>(
+    folder: &mut F,
+    statement: TableStatement,
+) -> TableStatement {
+    super::table::fold(folder, statement)
+}
+
+pub fn fold_dml_statement<F: Fold + ?Sized>(
+    folder: &mut F,
+    statement: DmlStatement,
+) -> DmlStatement {
+    super::dml::fold(folder, statement)
 }
 
 pub fn fold_ident<F: Fold + ?Sized>(_: &mut F, ident: Ident) -> Ident {

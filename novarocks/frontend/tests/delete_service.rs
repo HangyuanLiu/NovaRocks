@@ -32,9 +32,10 @@ use novarocks_frontend::dml::{
     OperationJournal, OperationKind, OperationState, StoredOperation,
 };
 use novarocks_frontend::query_execution::dml::delete::{
-    DeleteCommit, DeleteEngine, DeleteOperation, DeletePrepared, DeleteStatementKind,
-    DeleteWriteReport, PrepareDeleteRequest, PreparedDelete,
+    DeleteCommit, DeleteEngine, DeleteOperation, DeletePrepared, DeleteStatement,
+    DeleteStatementKind, DeleteWriteReport, PrepareDeleteRequest, PreparedDelete,
 };
+use novarocks_parser::ast::{DmlStatement, Statement};
 use novarocks_spi::connector::{
     ConnectorWriteReceipt, ExternalMutationEffect, ExternalMutationFinalization,
     ExternalMutationOutcome,
@@ -43,6 +44,22 @@ use novarocks_types::ClusterRole;
 use uuid::Uuid;
 
 mod common;
+
+fn typed_delete(source: &str) -> novarocks_parser::ast::Delete {
+    let parsed = novarocks_parser::parse(source).expect("parse DELETE test input");
+    let [Statement::Dml(DmlStatement::Delete(statement))] = parsed.as_slice() else {
+        panic!("expected DELETE statement: {source}");
+    };
+    statement.clone()
+}
+
+fn typed_equality_delete(source: &str) -> novarocks_parser::ast::AddEqualityDelete {
+    let parsed = novarocks_parser::parse(source).expect("parse equality DELETE test input");
+    let [Statement::Dml(DmlStatement::AddEqualityDelete(statement))] = parsed.as_slice() else {
+        panic!("expected equality DELETE statement: {source}");
+    };
+    statement.clone()
+}
 
 #[derive(Clone, Copy)]
 enum WriteBehavior {
@@ -107,7 +124,7 @@ impl DeleteEngine for FakeDeleteEngine {
 
     fn prepare_delete(&self, request: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String> {
         self.prepare_calls.lock().unwrap().push((
-            request.kind,
+            request.kind(),
             request.execution.topology().revision(),
             request.execution.deadline(),
         ));
@@ -296,24 +313,18 @@ fn context() -> (RequestContext, QueryCancellationSource, Instant) {
 }
 
 #[test]
-fn non_delete_skips_engine_and_journal() {
-    let engine = FakeDeleteEngine::new(WriteBehavior::NoOp);
-    let (context, _, _) = context();
-    assert_eq!(
-        DmlService::compose(None, Arc::new(FrontendStatisticsService::new()))
-            .try_execute_delete(&engine, "SELECT 1", &context, None)
-            .unwrap(),
-        None,
-    );
-    assert!(engine.prepare_calls.lock().unwrap().is_empty());
-}
-
-#[test]
 fn delete_requires_journal_before_prepare() {
     let engine = FakeDeleteEngine::new(WriteBehavior::NoOp);
     let (context, _, _) = context();
+    let source = "DELETE FROM orders WHERE id = 1";
     let error = DmlService::compose(None, Arc::new(FrontendStatisticsService::new()))
-        .try_execute_delete(&engine, "DELETE FROM orders WHERE id = 1", &context, None)
+        .execute_delete(
+            &engine,
+            DeleteStatement::Predicate(&typed_delete(source)),
+            source,
+            &context,
+            None,
+        )
         .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
     assert!(engine.prepare_calls.lock().unwrap().is_empty());
@@ -331,12 +342,16 @@ fn delete_uses_admitted_context_and_records_noop_as_known_empty() {
         coordination.handle(),
     );
     let (context, _, deadline) = context();
-    assert_eq!(
-        service
-            .try_execute_delete(&engine, "DELETE FROM orders WHERE id = 1", &context, None)
-            .unwrap(),
-        Some(()),
-    );
+    let source = "DELETE FROM orders WHERE id = 1";
+    service
+        .execute_delete(
+            &engine,
+            DeleteStatement::Predicate(&typed_delete(source)),
+            source,
+            &context,
+            None,
+        )
+        .unwrap();
     assert_eq!(
         engine.prepare_calls.lock().unwrap().as_slice(),
         &[(DeleteStatementKind::Predicate, 91, Some(deadline))],
@@ -358,10 +373,12 @@ fn equality_delete_commits_and_finalizes_row_delta() {
         coordination.handle(),
     );
     let (context, _, _) = context();
+    let source = "ALTER TABLE orders ADD EQUALITY DELETE (id) VALUES (2)";
     service
-        .try_execute_delete(
+        .execute_delete(
             &engine,
-            "ALTER TABLE orders ADD EQUALITY DELETE (id) VALUES (2)",
+            DeleteStatement::Equality(&typed_equality_delete(source)),
+            source,
             &context,
             None,
         )
@@ -391,8 +408,15 @@ fn aborted_delete_does_not_commit() {
         coordination.handle(),
     );
     let (context, _, _) = context();
+    let source = "DELETE FROM orders WHERE id = 1";
     let error = service
-        .try_execute_delete(&engine, "DELETE FROM orders WHERE id = 1", &context, None)
+        .execute_delete(
+            &engine,
+            DeleteStatement::Predicate(&typed_delete(source)),
+            source,
+            &context,
+            None,
+        )
         .unwrap_err();
     assert!(error.to_string().contains("writer aborted"));
     assert_eq!(

@@ -47,7 +47,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::dml::coordination::ActiveDmlOperation;
-use crate::dml::error::{DmlError, DmlErrorKind};
+use crate::dml::error::{AdmitError, DmlError, DmlErrorKind};
 use crate::dml::model::{
     CTAS_CREATE_POLICY_FAIL_IF_EXISTS, CTAS_CREATE_POLICY_NO_OP_IF_EXISTS,
     CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord, DML_CTAS_FACT_ENCODED_LIMIT,
@@ -85,20 +85,22 @@ struct DurableCtasFailureV1<'a> {
 }
 
 impl DmlService {
-    /// Recognize and execute CTAS through the frontend durable saga owner.
-    ///
-    /// `Ok(None)` is reserved for non-CTAS SQL. Once classified, the core
-    /// fallback is never called, including on failures.
+    /// Execute an already-admitted CTAS through the frontend durable saga owner.
     pub fn try_execute_ctas(
         &self,
         engine: &dyn CtasEngine,
-        sql: &str,
+        statement: &novarocks_parser::ast::CreateTableAsSelect,
+        source: &str,
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
-    ) -> Result<Option<()>, DmlError> {
-        let Some(command) = engine.classify_ctas(sql).map_err(DmlError::executor)? else {
-            return Ok(None);
-        };
+    ) -> Result<(), DmlError> {
+        let command = CtasCommand::from_typed(statement, source).map_err(|error| {
+            DmlError::admit(AdmitError::CreateTableUnsupportedForm.to_user_error(
+                source,
+                error.span,
+                error.message,
+            ))
+        })?;
         let session = context.session();
         let operation_id = DmlOperationId::new_v7();
         let prepare_operation_id = Uuid::now_v7();
@@ -151,6 +153,8 @@ impl DmlService {
 
         let result = execute_ctas_operation(
             engine,
+            statement,
+            source,
             context,
             query_options,
             command,
@@ -159,12 +163,14 @@ impl DmlService {
             &mut active,
         );
         let _ = active.release();
-        result.map(|()| Some(()))
+        result
     }
 }
 
 fn execute_ctas_operation(
     engine: &dyn CtasEngine,
+    statement: &novarocks_parser::ast::CreateTableAsSelect,
+    source: &str,
     context: &RequestContext,
     query_options: Option<&QueryOptions>,
     command: CtasCommand,
@@ -175,6 +181,8 @@ fn execute_ctas_operation(
     let session = context.session();
     active.check_before_dispatch()?;
     let preflight = match engine.preflight_ctas_target(
+        statement,
+        source,
         &command,
         session.current_catalog(),
         session.current_database(),

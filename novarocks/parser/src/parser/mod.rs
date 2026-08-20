@@ -23,6 +23,7 @@
 mod backend;
 mod catalog;
 mod command;
+mod dml;
 mod expr;
 mod iceberg;
 mod maintenance;
@@ -31,6 +32,7 @@ mod pratt;
 mod query;
 mod show_backends;
 mod statistics;
+mod table;
 mod view;
 
 use crate::{
@@ -98,6 +100,8 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
             backend::parse,
             statistics::parse,
             catalog::parse,
+            table::parse,
+            dml::parse,
             iceberg::parse,
             maintenance::parse,
             materialized_view::parse,
@@ -199,6 +203,10 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
             return Ok(first);
         }
         Err(self.unexpected("'>'"))
+    }
+
+    pub(super) fn has_pending_type_gt(&self) -> bool {
+        self.pending_type_gt.is_some()
     }
 
     pub(super) fn parse_ident(&mut self) -> Result<Ident, ParseError> {
@@ -437,7 +445,7 @@ fn unquote_string(source: &str) -> String {
 mod tests {
     use crate::{
         ParserError, Span,
-        ast::{BackendStatement, ShowBackends, Statement},
+        ast::{BackendStatement, DmlStatement, ShowBackends, Statement},
         lex,
         printer::print_statements,
     };
@@ -484,16 +492,11 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_statement_is_typed_and_trailing_token_is_rejected() {
-        let unsupported =
-            parse("INSERT INTO t VALUES (1)").expect_err("INSERT is not owned in SQLP-4");
-        assert_eq!(
-            unsupported
-                .to_user_error("INSERT INTO t VALUES (1)")
-                .code()
-                .as_str(),
-            "sql.parse.unsupported_statement"
-        );
+    fn owned_dml_and_trailing_token_are_distinguished() {
+        assert!(matches!(
+            parse("INSERT INTO t VALUES (1)"),
+            Ok(statements) if matches!(statements.as_slice(), [Statement::Dml(DmlStatement::Insert(_))])
+        ));
 
         let trailing = parse("SHOW BACKENDS unexpected").expect_err("trailing token must fail");
         assert_eq!(
@@ -561,6 +564,8 @@ mod tests {
                 Statement::Maintenance(_) => "MAINTENANCE",
                 Statement::MaterializedView(_) => "MATERIALIZED VIEW",
                 Statement::View(_) => "VIEW",
+                Statement::Table(_) => "TABLE",
+                Statement::Dml(_) => "DML",
                 Statement::Query(_) => "QUERY",
                 Statement::ExplainQuery(_) => "EXPLAIN QUERY",
                 Statement::RawQuery(_) => "RAW QUERY",

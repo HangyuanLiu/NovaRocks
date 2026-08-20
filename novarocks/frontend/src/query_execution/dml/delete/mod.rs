@@ -27,6 +27,16 @@ use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_protocol::lifecycle::QueryOptions;
 
+/// One parser-owned DELETE variant admitted by the typed statement router.
+///
+/// The source is retained separately in [`PrepareDeleteRequest`] and may only
+/// be sliced through the selected AST node's [`novarocks_parser::Span`].
+#[derive(Clone, Copy, Debug)]
+pub enum DeleteStatement<'a> {
+    Predicate(&'a novarocks_parser::ast::Delete),
+    Equality(&'a novarocks_parser::ast::AddEqualityDelete),
+}
+
 /// DELETE statements recognized by the frontend command router.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeleteStatementKind {
@@ -34,40 +44,31 @@ pub enum DeleteStatementKind {
     Equality,
 }
 
-/// Recognize a standard SQL DELETE without executing it.
-pub fn parse_delete_statement(sql: &str) -> Result<Option<sqlparser::ast::Delete>, String> {
-    let sql = sql.trim_start();
-    let keyword_end = sql
-        .char_indices()
-        .find_map(|(index, ch)| (!ch.is_ascii_alphabetic()).then_some(index))
-        .unwrap_or(sql.len());
-    if !sql[..keyword_end].eq_ignore_ascii_case("delete") {
-        return Ok(None);
-    }
-    match novarocks_sql::planning::dml::parse_raw_statement(sql)? {
-        sqlparser::ast::Statement::Delete(delete) => Ok(Some(delete)),
-        _ => Ok(None),
+impl DeleteStatement<'_> {
+    pub const fn kind(self) -> DeleteStatementKind {
+        match self {
+            Self::Predicate(_) => DeleteStatementKind::Predicate,
+            Self::Equality(_) => DeleteStatementKind::Equality,
+        }
     }
 }
 
-/// Recognize the NovaRocks equality-delete ALTER TABLE extension.
-pub fn parse_equality_delete_statement(sql: &str) -> Result<Option<()>, String> {
-    if !crate::catalog_application::statement::looks_like_add_equality_delete(sql) {
-        return Ok(None);
-    }
-    crate::catalog_application::statement::parse_add_equality_delete_sql(sql)?;
-    Ok(Some(()))
-}
-
-/// One admitted frontend DELETE request. The raw SQL stays inside the narrow
-/// reverse port so the frontend never handles core-private DELETE AST payloads.
+/// One admitted frontend DELETE request. `source` is retained only for exact
+/// slices selected by a parser-owned AST span; it must not be reparsed or used
+/// to rediscover the statement family.
 pub struct PrepareDeleteRequest<'a> {
-    pub sql: &'a str,
+    pub statement: DeleteStatement<'a>,
+    pub source: &'a str,
     pub current_catalog: Option<String>,
     pub current_database: String,
     pub query_options: Option<QueryOptions>,
     pub execution: QueryExecutionContext,
-    pub kind: DeleteStatementKind,
+}
+
+impl PrepareDeleteRequest<'_> {
+    pub const fn kind(&self) -> DeleteStatementKind {
+        self.statement.kind()
+    }
 }
 
 pub trait DeletePrepared: Send + Sync {
@@ -268,38 +269,24 @@ impl DeleteEngine for DmlExecutionKernel {
             request.query_options.as_ref(),
             &request.execution,
         )?;
-        match request.kind {
-            DeleteStatementKind::Predicate => {
-                let delete = parse_delete_statement(request.sql)?.ok_or_else(|| {
-                    "DELETE request did not contain a DELETE statement".to_string()
-                })?;
-                let statement =
-                    crate::catalog_application::statement::convert_sqlparser_delete_to_custom(
-                        &delete,
-                    )?;
-                standard::prepare_delete_statement(
-                    self,
-                    &statement,
-                    request.current_catalog.as_deref(),
-                    &request.current_database,
-                    &request.execution,
-                    &connector_context,
-                )
-            }
-            DeleteStatementKind::Equality => {
-                let statement =
-                    crate::catalog_application::statement::parse_add_equality_delete_sql(
-                        request.sql,
-                    )?;
-                equality::prepare_equality_delete_statement(
-                    self,
-                    &statement,
-                    request.current_catalog.as_deref(),
-                    &request.current_database,
-                    &request.execution,
-                    &connector_context,
-                )
-            }
+        match request.statement {
+            DeleteStatement::Predicate(statement) => standard::prepare_delete_statement(
+                self,
+                statement,
+                request.source,
+                request.current_catalog.as_deref(),
+                &request.current_database,
+                &request.execution,
+                &connector_context,
+            ),
+            DeleteStatement::Equality(statement) => equality::prepare_equality_delete_statement(
+                self,
+                statement,
+                request.current_catalog.as_deref(),
+                &request.current_database,
+                &request.execution,
+                &connector_context,
+            ),
         }
     }
 
@@ -420,4 +407,24 @@ fn downcast_prepared(prepared: &dyn DeletePrepared) -> Result<&CorePreparedDelet
         .as_any()
         .downcast_ref::<CorePreparedDelete>()
         .ok_or_else(|| "foreign DELETE prepared handle".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_parser::ast::{DmlStatement, Statement};
+
+    #[test]
+    fn typed_variant_determines_delete_kind() {
+        let statements =
+            novarocks_parser::parse("DELETE FROM t WHERE id = 1").expect("parse DELETE");
+        let Statement::Dml(DmlStatement::Delete(delete)) = &statements[0] else {
+            panic!("expected DELETE");
+        };
+
+        assert_eq!(
+            DeleteStatement::Predicate(delete).kind(),
+            DeleteStatementKind::Predicate
+        );
+    }
 }

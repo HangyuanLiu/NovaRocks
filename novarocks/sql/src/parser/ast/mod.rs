@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -27,10 +26,6 @@ pub struct CreateTableStmt {
     pub name: ObjectName,
     pub kind: CreateTableKind,
     pub legacy_range_partitions: Vec<LegacyRangePartition>,
-    /// Present when the SQL was `CREATE TABLE ... AS <select>`. Schema and
-    /// (optionally) partition spec are inferred from the query at engine
-    /// time. `None` for plain `CREATE TABLE` (the existing path).
-    pub as_select: Option<Box<sqlparser::ast::Query>>,
     /// Set to `true` when the SQL was `CREATE TABLE IF NOT EXISTS ...`.
     /// For CTAS, the engine skips table creation and data write when the
     /// target table already exists.
@@ -75,161 +70,6 @@ pub enum AlterIcebergPartitionSpecStmt {
         table: ObjectName,
         field: IcebergPartitionFieldExpr,
     },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MaterializedViewDistribution {
-    pub hash_columns: Vec<String>,
-    pub bucket_count: Option<u32>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MaterializedViewRefreshPolicy {
-    Manual,
-    AsyncOnChange,
-    AsyncInterval { interval_ms: i64 },
-}
-
-impl Default for MaterializedViewRefreshPolicy {
-    fn default() -> Self {
-        Self::Manual
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct CreateMaterializedViewStmt {
-    pub name: ObjectName,
-    pub if_not_exists: bool,
-    /// Iceberg-style MV partition spec. Semantic validation ensures source
-    /// columns reference visible MV outputs before the target table is created.
-    pub partition_by: Option<Vec<IcebergPartitionFieldExpr>>,
-    pub distribution: Option<MaterializedViewDistribution>,
-    pub refresh_policy: MaterializedViewRefreshPolicy,
-    /// Raw SQL text of the SELECT body after `AS`. Produced by re-serializing
-    /// the parsed `sqlparser::ast::Query`; used for storage and for
-    /// re-parsing on every REFRESH in Phase 1.
-    pub select_sql: String,
-    pub select_query: sqlparser::ast::Query,
-    /// Key-value pairs from `PROPERTIES(...)`, retained for later semantic
-    /// interpretation (e.g. `storage_engine`). Empty when the clause is
-    /// absent.
-    pub properties: Vec<(String, String)>,
-    /// Columns named in `PRIMARY KEY (col, ...)`. `None` when the clause is
-    /// absent. The clause is the IVM Phase-2 opt-in marker; columns must
-    /// reference the iceberg base table and satisfy the constraints checked
-    /// by `mv_ddl::validate_ivm_primary_key`.
-    pub primary_key: Option<Vec<String>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DropMaterializedViewStmt {
-    pub name: ObjectName,
-    pub if_exists: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AlterMaterializedViewAction {
-    SetRefresh(MaterializedViewRefreshPolicy),
-    SetProperties(Vec<(String, String)>),
-    PauseRefresh,
-    ResumeRefresh,
-    Repartition(Vec<IcebergPartitionFieldExpr>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AlterMaterializedViewStmt {
-    pub name: ObjectName,
-    pub action: AlterMaterializedViewAction,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RefreshMaterializedViewStmt {
-    pub name: ObjectName,
-    /// `true` when `REFRESH MATERIALIZED VIEW <name> FULL` was parsed.
-    /// Full rebuild drops the existing target, deletes the MV definition, then
-    /// re-runs `create_iceberg_mv` to regenerate the A11 schema contract.
-    pub full: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShowMaterializedViewsStmt {
-    pub database: Option<String>,
-}
-
-/// `DELETE FROM <table> WHERE <predicate>`. Phase 1 only supports iceberg
-/// backends; the engine layer rejects other backends. WHERE is required;
-/// `DELETE FROM <table>` (no filter) is rejected — the spec recommends
-/// `INSERT OVERWRITE t SELECT * FROM t WHERE FALSE` for the truncate use case.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DeleteStmt {
-    pub table: ObjectName,
-    pub where_clause: sqlparser::ast::Expr,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct UpdateStmt {
-    pub table: ObjectName,
-    pub alias: Option<String>,
-    pub assignments: Vec<UpdateAssignment>,
-    pub source: Option<MutationSource>,
-    pub where_clause: Option<sqlparser::ast::Expr>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct UpdateAssignment {
-    pub column: String,
-    pub value: sqlparser::ast::Expr,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum MutationSource {
-    Table {
-        name: ObjectName,
-        alias: Option<String>,
-    },
-    Query {
-        query: Box<sqlparser::ast::Query>,
-        alias: Option<String>,
-    },
-}
-
-/// `MERGE INTO <target> USING <source> ON <pred> WHEN ...`. The first
-/// implementation supports at most one `WHEN MATCHED` clause and at most one
-/// `WHEN NOT MATCHED` clause; each clause may carry an optional `AND`
-/// predicate. `WHEN NOT MATCHED BY SOURCE` and lateral source subqueries are
-/// rejected at conversion time.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MergeStmt {
-    pub table: ObjectName,
-    pub target_alias: Option<String>,
-    pub source: MutationSource,
-    pub on: sqlparser::ast::Expr,
-    pub matched: Option<MergeWhenClause<MergeMatchedAction>>,
-    pub not_matched: Option<MergeWhenClause<MergeNotMatchedAction>>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct MergeWhenClause<A> {
-    /// Optional `AND <expr>` predicate refining the clause.
-    pub predicate: Option<sqlparser::ast::Expr>,
-    pub action: A,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum MergeMatchedAction {
-    Update { assignments: Vec<UpdateAssignment> },
-    Delete,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct MergeNotMatchedAction {
-    /// Target columns named in `INSERT (a, b, c)`. Empty when omitted (callers
-    /// must align the values with the target schema in column order).
-    pub columns: Vec<String>,
-    /// Per-column value expressions from the `VALUES (...)` clause. The
-    /// element count must match `columns` (or the target schema when
-    /// `columns` is empty).
-    pub values: Vec<sqlparser::ast::Expr>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

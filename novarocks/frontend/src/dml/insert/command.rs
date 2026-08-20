@@ -16,11 +16,10 @@
 // under the License.
 
 use crate::query_execution::dml::insert::{InsertOverwriteMode, InsertTargetName, InsertValue};
+use novarocks_parser::ast::Insert;
 use sqlparser::ast as sqlast;
 
-const DYNAMIC_OVERWRITE_MARKER: &str = "__nr_op_dyn";
-
-/// Frontend application command produced from one normalized sqlparser INSERT.
+/// Frontend application command produced from one SQLP-5 typed INSERT.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InsertCommand {
     pub target: InsertTargetName,
@@ -37,33 +36,31 @@ pub enum InsertCommandSource {
     FromQuery(Box<sqlast::Query>),
 }
 
-/// Convert a normalized sqlparser INSERT into the frontend-owned command.
-pub fn convert_insert_command(insert: &sqlast::Insert) -> Result<InsertCommand, String> {
-    let sqlast::TableObject::TableName(name) = &insert.table else {
-        return Err(format!("unsupported INSERT target: {}", insert.table));
-    };
-    let mut target_parts = name
-        .0
+/// Convert the typed statement plus already-lowered trailing query payload
+/// into the frontend-owned execution command.
+///
+/// Parsing `source_query` is deliberately outside this converter: SQLP-5
+/// determines the statement family and all INSERT capability facts before the
+/// SQLP-6 query IR is formed at the execution boundary.
+pub fn convert_insert_command(
+    insert: &Insert,
+    source_query: &sqlast::Query,
+) -> Result<InsertCommand, String> {
+    let target_parts = insert
+        .target
+        .parts
         .iter()
-        .map(|part| {
-            part.as_ident()
-                .map(|ident| ident.value.clone())
-                .ok_or_else(|| format!("unsupported INSERT target component: {part}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|part| part.value.clone())
+        .collect::<Vec<_>>();
 
-    let overwrite_mode = if target_parts
-        .first()
-        .is_some_and(|part| part == DYNAMIC_OVERWRITE_MARKER)
+    let overwrite_mode = if insert
+        .partitions
+        .as_ref()
+        .is_some_and(|partitions| partitions.dynamic)
     {
         if !insert.overwrite {
-            return Err(
-                "internal: __nr_op_dyn marker present without INSERT OVERWRITE \
-                 (parser/normalizer mismatch)"
-                    .to_string(),
-            );
+            return Err("dynamic INSERT partitions require INSERT OVERWRITE".to_string());
         }
-        target_parts.remove(0);
         InsertOverwriteMode::DynamicPartitions
     } else if insert.overwrite {
         InsertOverwriteMode::FullTable
@@ -74,12 +71,8 @@ pub fn convert_insert_command(insert: &sqlast::Insert) -> Result<InsertCommand, 
         return Err("INSERT target is empty after overwrite normalization".to_string());
     }
 
-    let source_query = insert
-        .source
-        .as_ref()
-        .ok_or_else(|| "INSERT requires a source".to_string())?;
     let source = if should_route_insert_via_from_query(source_query) {
-        InsertCommandSource::FromQuery(source_query.clone())
+        InsertCommandSource::FromQuery(Box::new(source_query.clone()))
     } else {
         convert_set_expr_to_source(source_query.body.as_ref())?
     };

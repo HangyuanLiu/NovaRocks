@@ -23,13 +23,13 @@ use std::sync::Arc;
 
 use crate::common::admitted_query_context::RequestContext;
 use crate::query_execution::dml::delete::{
-    DeleteCommit, DeleteEngine, DeleteStatementKind, DeleteWriteReport, PrepareDeleteRequest,
-    PreparedDelete, parse_delete_statement, parse_equality_delete_statement,
+    DeleteCommit, DeleteEngine, DeleteStatement, DeleteWriteReport, PrepareDeleteRequest,
+    PreparedDelete,
 };
 use novarocks_protocol::lifecycle::QueryOptions;
 
 use crate::dml::coordination::DmlExternalFenceProposal;
-use crate::dml::error::DmlError;
+use crate::dml::error::{AdmitError, DmlError};
 use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};
 use crate::dml::runner::{
     ActiveWriteTransactionRunner, CoordinatedWriteReport, WriteExecutor, preparing_request,
@@ -141,37 +141,36 @@ fn write_transaction_spec(prepared: &PreparedDelete) -> WriteTransactionSpec {
 }
 
 impl DmlService {
-    pub fn try_execute_delete(
+    /// Executes a parser-owned DELETE variant. `source` is carried only for
+    /// AST-span slices during preparation; it is never reparsed here.
+    pub fn execute_delete(
         &self,
         engine: &dyn DeleteEngine,
-        sql: &str,
+        statement: DeleteStatement<'_>,
+        source: &str,
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
-    ) -> Result<Option<()>, DmlError> {
-        let kind = if parse_delete_statement(sql)
-            .map_err(DmlError::executor)?
-            .is_some()
+    ) -> Result<(), DmlError> {
+        if let DeleteStatement::Predicate(delete) = statement
+            && delete.selection.is_none()
         {
-            DeleteStatementKind::Predicate
-        } else if parse_equality_delete_statement(sql)
-            .map_err(DmlError::executor)?
-            .is_some()
-        {
-            DeleteStatementKind::Equality
-        } else {
-            return Ok(None);
-        };
+            return Err(DmlError::admit(AdmitError::DeleteRequiresWhere.to_user_error(
+                source,
+                delete.span,
+                "DELETE requires a WHERE clause; for full table replacement use INSERT OVERWRITE t SELECT * FROM t WHERE FALSE",
+            )));
+        }
 
         self.require_journal()?;
         let session = context.session();
         let prepared = engine
             .prepare_delete(PrepareDeleteRequest {
-                sql,
+                statement,
+                source,
                 current_catalog: session.current_catalog().map(ToOwned::to_owned),
                 current_database: session.current_database().to_string(),
                 query_options: query_options.cloned(),
                 execution: context.execution().clone(),
-                kind,
             })
             .map_err(DmlError::executor)?;
         let executor = DeleteWriteExecutor {
@@ -181,6 +180,6 @@ impl DmlService {
         let spec = write_transaction_spec(&prepared);
         let operation = self.begin_write_operation(preparing_request(&spec))?;
         ActiveWriteTransactionRunner::new(operation, &executor).run(spec)?;
-        Ok(Some(()))
+        Ok(())
     }
 }

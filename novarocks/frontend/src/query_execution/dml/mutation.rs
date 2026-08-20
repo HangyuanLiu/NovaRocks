@@ -26,6 +26,10 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::common::admitted_query_context::QueryExecutionContext;
+use novarocks_parser::Span;
+use novarocks_parser::ast::{
+    DmlStatement, MergeClause, MergeMatchedAction, MutationSource, ObjectName as ParsedObjectName,
+};
 use novarocks_protocol::lifecycle::QueryOptions;
 
 const PREPARED: u8 = 0;
@@ -40,47 +44,15 @@ pub enum MutationStatementKind {
     Merge,
 }
 
-/// Recognize a standard SQL UPDATE without exposing the core-private AST.
-pub fn parse_update_statement(sql: &str) -> Result<Option<()>, String> {
-    let sql = sql.trim_start();
-    let keyword_end = sql
-        .char_indices()
-        .find_map(|(index, ch)| (!ch.is_ascii_alphabetic()).then_some(index))
-        .unwrap_or(sql.len());
-    if !sql[..keyword_end].eq_ignore_ascii_case("update") {
-        return Ok(None);
-    }
-    match novarocks_sql::planning::dml::parse_raw_statement(sql)? {
-        sqlparser::ast::Statement::Update { .. } => Ok(Some(())),
-        _ => Ok(None),
-    }
-}
-
-/// Recognize a NovaRocks MERGE statement without exposing its custom AST.
-pub fn parse_merge_statement(sql: &str) -> Result<Option<()>, String> {
-    let sql = sql.trim_start();
-    let keyword_end = sql
-        .char_indices()
-        .find_map(|(index, ch)| (!ch.is_ascii_alphabetic()).then_some(index))
-        .unwrap_or(sql.len());
-    if !sql[..keyword_end].eq_ignore_ascii_case("merge") {
-        return Ok(None);
-    }
-    match novarocks_sql::planning::dml::parse_raw_statement(sql)? {
-        sqlparser::ast::Statement::Merge(_) => Ok(Some(())),
-        _ => Ok(None),
-    }
-}
-
-/// One admitted frontend mutation request. Raw SQL remains inside the reverse
-/// port so frontend never needs custom ASTs or catalog objects.
+/// One admitted frontend mutation request. The typed statement establishes the
+/// command family; `source` may only be read through spans carried by it.
 pub struct PrepareMutationRequest<'a> {
-    pub sql: &'a str,
+    pub statement: &'a DmlStatement,
+    pub source: &'a str,
     pub current_catalog: Option<String>,
     pub current_database: String,
     pub query_options: Option<QueryOptions>,
     pub execution: QueryExecutionContext,
-    pub kind: MutationStatementKind,
 }
 
 pub trait MutationPrepared: Send + Sync {
@@ -262,6 +234,219 @@ fn commit_handle(commit: &dyn MutationCommit) -> Result<&CoreMutationCommit, Str
         .ok_or_else(|| "mutation engine received a foreign commit handle".to_string())
 }
 
+fn source_slice<'a>(source: &'a str, span: Span, context: &str) -> Result<&'a str, String> {
+    source
+        .get(span.start()..span.end())
+        .ok_or_else(|| format!("{context} span is outside the admitted SQL source"))
+}
+
+fn lower_object_name(name: &ParsedObjectName) -> novarocks_sql::syntax::ObjectName {
+    novarocks_sql::syntax::ObjectName {
+        parts: name.parts.iter().map(|part| part.value.clone()).collect(),
+    }
+}
+
+fn lower_alias(
+    alias: &Option<novarocks_parser::ast::TableAlias>,
+) -> Result<Option<String>, String> {
+    alias
+        .as_ref()
+        .map(|alias| {
+            if alias.columns.is_empty() {
+                Ok(alias.name.value.clone())
+            } else {
+                Err("mutation aliases with column lists are not supported".to_string())
+            }
+        })
+        .transpose()
+}
+
+fn lower_mutation_source(
+    source: &MutationSource,
+    sql: &str,
+) -> Result<crate::query_execution::dml::mutation_flow::PreparedMutationSource, String> {
+    use crate::query_execution::dml::mutation_flow::PreparedMutationSource;
+
+    match source {
+        MutationSource::Table { name, alias, .. } => Ok(PreparedMutationSource::Table {
+            name: lower_object_name(name),
+            alias: lower_alias(alias)?,
+        }),
+        MutationSource::Query {
+            lateral,
+            query,
+            alias,
+            ..
+        } => {
+            if *lateral {
+                return Err("lateral mutation sources are not supported".to_string());
+            }
+            Ok(PreparedMutationSource::Query {
+                query_text: source_slice(sql, query.span, "derived mutation query")?.to_string(),
+                alias: lower_alias(alias)?,
+            })
+        }
+    }
+}
+
+fn lower_update_statement(
+    statement: &novarocks_parser::ast::Update,
+    source: &str,
+) -> Result<crate::query_execution::dml::mutation_flow::PreparedUpdateStatement, String> {
+    use crate::query_execution::dml::mutation_flow::{
+        PreparedMutationAssignment, PreparedUpdateStatement,
+    };
+
+    let assignments = statement
+        .assignments
+        .iter()
+        .map(|assignment| {
+            if assignment.target.parts.len() != 1 {
+                return Err("only single-column UPDATE assignments are supported".to_string());
+            }
+            Ok(PreparedMutationAssignment {
+                column: assignment.target.parts[0].value.clone(),
+                value_sql: source_slice(source, assignment.value.span(), "UPDATE assignment")?
+                    .to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if assignments.is_empty() {
+        return Err("UPDATE requires at least one assignment".to_string());
+    }
+    Ok(PreparedUpdateStatement {
+        table: lower_object_name(&statement.target),
+        alias: lower_alias(&statement.alias)?,
+        assignments,
+        source: statement
+            .source
+            .as_ref()
+            .map(|mutation_source| lower_mutation_source(mutation_source, source))
+            .transpose()?,
+        where_sql: statement
+            .selection
+            .as_ref()
+            .map(|predicate| source_slice(source, predicate.span(), "UPDATE WHERE"))
+            .transpose()?
+            .map(str::to_string),
+    })
+}
+
+fn lower_merge_statement(
+    statement: &novarocks_parser::ast::Merge,
+    source: &str,
+) -> Result<crate::query_execution::dml::mutation_flow::PreparedMergeStatement, String> {
+    use crate::query_execution::dml::mutation_flow::{
+        PreparedMergeClause, PreparedMergeMatchedAction, PreparedMergeNotMatchedAction,
+        PreparedMergeStatement, PreparedMutationAssignment,
+    };
+
+    let mut matched = None;
+    let mut not_matched = None;
+    for clause in &statement.clauses {
+        match clause {
+            MergeClause::Matched {
+                predicate, action, ..
+            } => {
+                if matched.is_some() {
+                    return Err("MERGE supports at most one WHEN MATCHED clause".to_string());
+                }
+                let action = match action {
+                    MergeMatchedAction::Update { assignments, .. } => {
+                        if assignments.is_empty() {
+                            return Err(
+                                "MERGE WHEN MATCHED UPDATE requires at least one assignment"
+                                    .to_string(),
+                            );
+                        }
+                        PreparedMergeMatchedAction::Update {
+                            assignments: assignments
+                                .iter()
+                                .map(|assignment| {
+                                    if assignment.target.parts.len() != 1 {
+                                        return Err(
+                                            "only single-column MERGE UPDATE assignments are supported"
+                                                .to_string(),
+                                        );
+                                    }
+                                    Ok(PreparedMutationAssignment {
+                                        column: assignment.target.parts[0].value.clone(),
+                                        value_sql: source_slice(
+                                            source,
+                                            assignment.value.span(),
+                                            "MERGE assignment",
+                                        )?
+                                        .to_string(),
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?,
+                        }
+                    }
+                    MergeMatchedAction::Delete { .. } => PreparedMergeMatchedAction::Delete,
+                };
+                matched = Some(PreparedMergeClause {
+                    predicate_sql: predicate
+                        .as_ref()
+                        .map(|predicate| source_slice(source, predicate.span(), "MERGE predicate"))
+                        .transpose()?
+                        .map(str::to_string),
+                    action,
+                });
+            }
+            MergeClause::NotMatched {
+                predicate, action, ..
+            } => {
+                if not_matched.is_some() {
+                    return Err("MERGE supports at most one WHEN NOT MATCHED clause".to_string());
+                }
+                if !action.columns.is_empty() && action.columns.len() != action.values.len() {
+                    return Err(format!(
+                        "MERGE INSERT column count {} does not match VALUES count {}",
+                        action.columns.len(),
+                        action.values.len()
+                    ));
+                }
+                not_matched = Some(PreparedMergeClause {
+                    predicate_sql: predicate
+                        .as_ref()
+                        .map(|predicate| source_slice(source, predicate.span(), "MERGE predicate"))
+                        .transpose()?
+                        .map(str::to_string),
+                    action: PreparedMergeNotMatchedAction {
+                        columns: action
+                            .columns
+                            .iter()
+                            .map(|column| column.value.clone())
+                            .collect(),
+                        values_sql: action
+                            .values
+                            .iter()
+                            .map(|value| source_slice(source, value.span(), "MERGE INSERT value"))
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                    },
+                });
+            }
+            MergeClause::NotMatchedBySource { .. } => {
+                return Err("MERGE WHEN NOT MATCHED BY SOURCE is not supported".to_string());
+            }
+        }
+    }
+    if matched.is_none() && not_matched.is_none() {
+        return Err("MERGE requires at least one WHEN clause".to_string());
+    }
+    Ok(PreparedMergeStatement {
+        table: lower_object_name(&statement.target),
+        target_alias: lower_alias(&statement.target_alias)?,
+        source: lower_mutation_source(&statement.source, source)?,
+        on_sql: source_slice(source, statement.on.span(), "MERGE ON")?.to_string(),
+        matched,
+        not_matched,
+    })
+}
+
 fn abort_handle(abort: &dyn MutationAbort) -> Result<&CoreMutationAbort, String> {
     abort
         .as_any()
@@ -301,17 +486,13 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
         &self,
         request: PrepareMutationRequest<'_>,
     ) -> Result<PreparedMutation, String> {
-        let raw = novarocks_sql::planning::dml::parse_raw_statement(request.sql)?;
         let connector_context = crate::connector::connector_request_context_for_execution(
             request.query_options.as_ref(),
             &request.execution,
         )?;
-        let (kernel, target, base_snapshot_id) = match request.kind {
-            MutationStatementKind::Update => {
-                let stmt =
-                    crate::catalog_application::statement::convert_sqlparser_update_to_custom(
-                        &raw,
-                    )?;
+        let (kind, kernel, _target, base_snapshot_id) = match request.statement {
+            DmlStatement::Update(statement) => {
+                let stmt = lower_update_statement(statement, request.source)?;
                 let prepared = crate::query_execution::dml::mutation_flow::prepare_update_mutation(
                     self,
                     &stmt,
@@ -325,14 +506,14 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                 // re-reading a table handle here.
                 let base_snapshot_id = prepared.admitted_base_snapshot_id;
                 (
+                    MutationStatementKind::Update,
                     PreparedKernel::Update(prepared),
                     stmt.table,
                     base_snapshot_id,
                 )
             }
-            MutationStatementKind::Merge => {
-                let stmt =
-                    crate::catalog_application::statement::convert_sqlparser_merge_to_custom(&raw)?;
+            DmlStatement::Merge(statement) => {
+                let stmt = lower_merge_statement(statement, request.source)?;
                 let prepared = crate::query_execution::dml::mutation_flow::prepare_merge_mutation(
                     self,
                     &stmt,
@@ -343,10 +524,16 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                 )?;
                 let base_snapshot_id = prepared.admitted_base_snapshot_id;
                 (
+                    MutationStatementKind::Merge,
                     PreparedKernel::Merge(prepared),
                     stmt.table,
                     base_snapshot_id,
                 )
+            }
+            _ => {
+                return Err(
+                    "mutation engine received a non-UPDATE/MERGE typed statement".to_string(),
+                );
             }
         };
         let (catalog, namespace, table, target_ref) = match &kernel {
@@ -364,7 +551,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
             ),
         };
         let operation = MutationOperation {
-            kind: request.kind,
+            kind,
             catalog,
             namespace,
             table,
@@ -557,10 +744,11 @@ mod tests {
 
     use super::{
         CoreMutationAbort, CoreMutationPrepared, MutationAbort, MutationEngine, MutationOperation,
-        MutationStatementKind, STAGED, parse_merge_statement, parse_update_statement,
+        MutationStatementKind, STAGED,
     };
     use crate::query_execution::dml::mutation_flow::MutationExecution;
     use crate::query_execution::outcome::QueryExecutionResult;
+    use novarocks_parser::ast::DmlStatement;
     use novarocks_spi::connector::{ConnectorWriteAbortOutcome, ExternalMutationFinalization};
 
     fn test_dml_kernel() -> crate::query_execution::kernels::DmlExecutionKernel {
@@ -648,22 +836,60 @@ mod tests {
     }
 
     #[test]
-    fn recognition_is_statement_specific() {
-        assert!(
-            parse_update_statement("UPDATE t SET k = 1")
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            parse_update_statement("MERGE INTO t USING s ON t.k = s.k")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            parse_merge_statement("UPDATE t SET k = 1")
-                .unwrap()
-                .is_none()
-        );
+    fn typed_mutation_family_is_statement_specific() {
+        let update = novarocks_parser::parse("UPDATE t SET k = 1").expect("parse UPDATE");
+        let merge =
+            novarocks_parser::parse("MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE")
+                .expect("parse MERGE");
+        assert!(matches!(
+            update.as_slice(),
+            [novarocks_parser::ast::Statement::Dml(DmlStatement::Update(
+                _
+            ))]
+        ));
+        assert!(matches!(
+            merge.as_slice(),
+            [novarocks_parser::ast::Statement::Dml(DmlStatement::Merge(
+                _
+            ))]
+        ));
+    }
+
+    #[test]
+    fn typed_update_keeps_predicates_and_assignments_as_original_source_slices() {
+        let source = "UPDATE t SET v = (a + b) * c WHERE (id = 1 OR id = 2)";
+        let statements = novarocks_parser::parse(source).expect("parse UPDATE");
+        let [novarocks_parser::ast::Statement::Dml(DmlStatement::Update(statement))] =
+            statements.as_slice()
+        else {
+            panic!("expected typed UPDATE");
+        };
+        let lowered = super::lower_update_statement(statement, source).expect("lower UPDATE");
+        assert_eq!(lowered.assignments[0].value_sql, "(a + b) * c");
+        assert_eq!(lowered.where_sql.as_deref(), Some("(id = 1 OR id = 2)"));
+    }
+
+    #[test]
+    fn typed_merge_keeps_derived_query_as_original_query_span() {
+        let source = "MERGE INTO t USING (SELECT a + 1 AS id FROM s) src ON t.id = src.id WHEN MATCHED THEN DELETE";
+        let statements = novarocks_parser::parse(source).expect("parse MERGE");
+        let [novarocks_parser::ast::Statement::Dml(DmlStatement::Merge(statement))] =
+            statements.as_slice()
+        else {
+            panic!("expected typed MERGE");
+        };
+        let lowered = super::lower_merge_statement(statement, source).expect("lower MERGE");
+        match lowered.source {
+            crate::query_execution::dml::mutation_flow::PreparedMutationSource::Query {
+                query_text,
+                alias,
+            } => {
+                assert_eq!(query_text, "SELECT a + 1 AS id FROM s");
+                assert_eq!(alias.as_deref(), Some("src"));
+            }
+            other => panic!("expected derived source, got {other:?}"),
+        }
+        assert_eq!(lowered.on_sql, "t.id = src.id");
     }
 
     #[test]

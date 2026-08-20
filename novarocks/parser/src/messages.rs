@@ -51,6 +51,9 @@ pub(crate) fn invalid_structure(violation: StructuralViolation) -> String {
         StructuralViolation::MismatchedCaseArms => {
             "invalid SQL structure: mismatched CASE condition and result arms".to_owned()
         }
+        StructuralViolation::DuplicateTableColumnName => {
+            "invalid SQL structure: duplicate CREATE TABLE column name".to_owned()
+        }
     }
 }
 

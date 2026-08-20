@@ -17,9 +17,92 @@
 
 use std::fmt;
 
+use novarocks_parser::Span;
 use novarocks_spi::connector::ConnectorWriteReceipt;
+use novarocks_user_error::{
+    ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserError,
+};
 
 use crate::dml::model::{DmlOperationId, StatementNextAction};
+
+const ADMIT_DELETE_REQUIRES_WHERE: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.delete_requires_where"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+const ADMIT_DELETE_UNSUPPORTED_FORM: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.delete_unsupported_form"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+const ADMIT_UPDATE_UNSUPPORTED_FORM: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.update_unsupported_form"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+const ADMIT_MERGE_UNSUPPORTED_FORM: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.merge_unsupported_form"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+const ADMIT_INSERT_UNSUPPORTED_FORM: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.insert_unsupported_form"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+const ADMIT_CREATE_TABLE_UNSUPPORTED_FORM: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.create_table_unsupported_form"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+
+/// DML capability descriptors, exported only for the independent manifest tool.
+pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
+    ADMIT_DELETE_REQUIRES_WHERE,
+    ADMIT_DELETE_UNSUPPORTED_FORM,
+    ADMIT_UPDATE_UNSUPPORTED_FORM,
+    ADMIT_MERGE_UNSUPPORTED_FORM,
+    ADMIT_INSERT_UNSUPPORTED_FORM,
+    ADMIT_CREATE_TABLE_UNSUPPORTED_FORM,
+];
+
+/// Capability failures are owned by the frontend DML application, never by the parser.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmitError {
+    DeleteRequiresWhere,
+    DeleteUnsupportedForm,
+    UpdateUnsupportedForm,
+    MergeUnsupportedForm,
+    InsertUnsupportedForm,
+    CreateTableUnsupportedForm,
+}
+
+impl AdmitError {
+    const fn descriptor(self) -> ErrorCodeDescriptor {
+        match self {
+            Self::DeleteRequiresWhere => ADMIT_DELETE_REQUIRES_WHERE,
+            Self::DeleteUnsupportedForm => ADMIT_DELETE_UNSUPPORTED_FORM,
+            Self::UpdateUnsupportedForm => ADMIT_UPDATE_UNSUPPORTED_FORM,
+            Self::MergeUnsupportedForm => ADMIT_MERGE_UNSUPPORTED_FORM,
+            Self::InsertUnsupportedForm => ADMIT_INSERT_UNSUPPORTED_FORM,
+            Self::CreateTableUnsupportedForm => ADMIT_CREATE_TABLE_UNSUPPORTED_FORM,
+        }
+    }
+
+    pub(crate) fn to_user_error(
+        self,
+        source: &str,
+        span: Span,
+        message: impl Into<String>,
+    ) -> UserError {
+        UserError::from_descriptor(
+            self.descriptor(),
+            message,
+            Some(span.to_user_error_location(source)),
+            RetryClass::Never,
+        )
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DmlErrorKind {
@@ -42,6 +125,7 @@ pub struct DmlError {
     operation_id: Option<DmlOperationId>,
     next_action: Option<StatementNextAction>,
     committed_receipt: Option<Box<ConnectorWriteReceipt>>,
+    user_error: Option<UserError>,
 }
 
 impl DmlError {
@@ -52,6 +136,7 @@ impl DmlError {
             operation_id: None,
             next_action: None,
             committed_receipt: None,
+            user_error: None,
         }
     }
 
@@ -96,6 +181,7 @@ impl DmlError {
             operation_id: Some(operation_id),
             next_action: Some(StatementNextAction::RetryFinalize),
             committed_receipt: committed_receipt.map(Box::new),
+            user_error: None,
         }
     }
 
@@ -112,6 +198,7 @@ impl DmlError {
             operation_id: Some(operation_id),
             next_action: Some(StatementNextAction::ManualInspect),
             committed_receipt: Some(Box::new(committed_receipt)),
+            user_error: None,
         }
     }
 
@@ -127,12 +214,25 @@ impl DmlError {
             operation_id: Some(operation_id),
             next_action: Some(StatementNextAction::ManualInspect),
             committed_receipt: None,
+            user_error: None,
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn admission(error: impl fmt::Display) -> Self {
         Self::new(DmlErrorKind::Admission, error)
+    }
+
+    /// Carries an admission error across DML boundaries without losing its code or location.
+    pub(crate) fn admit(error: UserError) -> Self {
+        Self {
+            kind: DmlErrorKind::Admission,
+            message: error.to_string(),
+            operation_id: None,
+            next_action: None,
+            committed_receipt: None,
+            user_error: Some(error),
+        }
     }
 
     pub(crate) fn coordination_contended(error: impl fmt::Display) -> Self {
@@ -162,6 +262,10 @@ impl DmlError {
     pub fn committed_receipt(&self) -> Option<&ConnectorWriteReceipt> {
         self.committed_receipt.as_deref()
     }
+
+    pub fn user_error(&self) -> Option<&UserError> {
+        self.user_error.as_ref()
+    }
 }
 
 impl fmt::Display for DmlError {
@@ -184,7 +288,24 @@ impl std::error::Error for DmlError {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+
+    #[test]
+    fn admit_descriptor_registry_is_unique_and_frontend_owned() {
+        let codes = ERROR_CODE_DESCRIPTORS
+            .iter()
+            .map(|descriptor| descriptor.code)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(codes.len(), ERROR_CODE_DESCRIPTORS.len());
+        assert!(
+            ERROR_CODE_DESCRIPTORS
+                .iter()
+                .all(|descriptor| descriptor.phase == ErrorPhase::Admit)
+        );
+    }
 
     #[test]
     fn display_includes_kind_and_message() {
@@ -204,5 +325,21 @@ mod tests {
                 "JournalUnavailable: boom (operation {operation_id}) (next action ManualInspect)"
             )
         );
+    }
+
+    #[test]
+    fn admit_error_preserves_the_typed_user_error() {
+        let error = AdmitError::DeleteRequiresWhere.to_user_error(
+            "DELETE FROM t",
+            Span::new(0, 6),
+            "DELETE requires a WHERE clause",
+        );
+        let dml_error = DmlError::admit(error.clone());
+
+        assert_eq!(dml_error.kind(), DmlErrorKind::Admission);
+        assert_eq!(dml_error.user_error(), Some(&error));
+        assert_eq!(error.code().as_str(), "sql.admit.delete_requires_where");
+        assert_eq!(error.phase(), ErrorPhase::Admit);
+        assert_eq!(error.location().map(|location| location.column()), Some(1));
     }
 }

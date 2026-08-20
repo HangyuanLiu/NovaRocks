@@ -44,6 +44,12 @@ use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
+use novarocks_parser::ast::{
+    ColumnDefinition as TypedColumnDefinition, CreateTable as TypedCreateTable,
+    LiteralKind as TypedLiteralKind, PartitionTransform as TypedPartitionTransform,
+    TableKey as TypedTableKey, TableKeyKind as TypedTableKeyKind, TablePartition,
+};
+#[cfg(any())]
 use novarocks_sql::syntax::sqlparser_expr_to_literal;
 
 /// Exact dependencies needed by catalog-drop statements.
@@ -67,7 +73,8 @@ pub trait CatalogDropContext:
 /// - `WHERE` is mandatory. `DELETE FROM t` (no filter) is rejected — the
 ///   spec recommends `INSERT OVERWRITE t SELECT * FROM t WHERE FALSE` instead.
 /// - `LIMIT` and `ORDER BY` are rejected.
-pub fn convert_sqlparser_delete_to_custom(
+#[cfg(any())]
+fn convert_sqlparser_delete_to_custom(
     delete: &sqlparser::ast::Delete,
 ) -> Result<novarocks_sql::syntax::DeleteStmt, String> {
     use sqlparser::ast as sqlast;
@@ -115,7 +122,8 @@ pub fn convert_sqlparser_delete_to_custom(
     })
 }
 
-pub fn convert_sqlparser_update_to_custom(
+#[cfg(any())]
+fn convert_sqlparser_update_to_custom(
     statement: &sqlparser::ast::Statement,
 ) -> Result<novarocks_sql::syntax::UpdateStmt, String> {
     use novarocks_sql::syntax::{UpdateAssignment, UpdateStmt};
@@ -220,7 +228,8 @@ pub fn convert_sqlparser_update_to_custom(
     })
 }
 
-pub fn convert_sqlparser_merge_to_custom(
+#[cfg(any())]
+fn convert_sqlparser_merge_to_custom(
     statement: &sqlparser::ast::Statement,
 ) -> Result<novarocks_sql::syntax::MergeStmt, String> {
     use novarocks_sql::syntax::{
@@ -511,6 +520,7 @@ pub fn convert_sqlparser_merge_to_custom(
     })
 }
 
+#[cfg(any())]
 fn convert_update_from_source(
     from: &Option<sqlparser::ast::UpdateTableFromKind>,
 ) -> Result<Option<novarocks_sql::syntax::MutationSource>, String> {
@@ -588,6 +598,7 @@ fn convert_update_from_source(
     }
 }
 
+#[cfg(any())]
 fn reject_update_table_modifiers(
     args: &Option<sqlparser::ast::TableFunctionArgs>,
     with_hints: &[sqlparser::ast::Expr],
@@ -626,6 +637,7 @@ fn reject_update_table_modifiers(
     Ok(())
 }
 
+#[cfg(any())]
 fn update_alias_name(
     alias: &Option<sqlparser::ast::TableAlias>,
     context: &str,
@@ -691,9 +703,6 @@ pub(crate) fn execute_create_table_statement(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let legacy_range_partitions = stmt.legacy_range_partitions.clone();
-    if stmt.as_select.is_some() {
-        return Err("CTAS must be routed by frontend DML service".to_string());
-    }
     match stmt.kind {
         CreateTableKind::Iceberg {
             columns,
@@ -797,6 +806,218 @@ pub(crate) fn execute_create_table_statement(
             let _ = legacy_range_partitions;
             Ok(StatementResult::Ok)
         }
+    }
+}
+
+/// Execute parser-owned `CREATE TABLE` syntax without a source-text round trip.
+///
+/// SQLP-5 keeps the legacy catalog DTO only as the connector request carrier;
+/// statement-family recognition and all source locations remain parser-owned.
+pub(crate) fn execute_typed_create_table_statement(
+    context: &impl CatalogMutationContext,
+    statement: &TypedCreateTable,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    if statement.temporary || statement.external {
+        return Err("CREATE TABLE does not support TEMPORARY or EXTERNAL tables".to_string());
+    }
+    if let Some(engine) = &statement.engine
+        && !engine.value.eq_ignore_ascii_case("iceberg")
+    {
+        return Err(format!(
+            "CREATE TABLE does not support ENGINE = {}",
+            engine.value
+        ));
+    }
+    if statement.like.is_some() {
+        return Err("CREATE TABLE LIKE must use the typed LIKE executor".to_string());
+    }
+    if !statement.order_by.is_empty() {
+        return Err("CREATE TABLE does not support ORDER BY".to_string());
+    }
+    let partition_fields = match &statement.partition {
+        None => Vec::new(),
+        Some(TablePartition::Transform(partition)) => partition
+            .expressions
+            .iter()
+            .map(lower_typed_table_partition_transform)
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(TablePartition::LegacyRange(_)) => {
+            return Err(
+                "CREATE TABLE does not support legacy RANGE partition definitions".to_string(),
+            );
+        }
+    };
+    let properties = statement
+        .properties
+        .iter()
+        .map(|property| {
+            Ok((
+                typed_literal_text(&property.key)?,
+                typed_literal_text(&property.value)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    execute_create_table_statement(
+        context,
+        novarocks_sql::syntax::CreateTableStmt {
+            name: novarocks_sql::syntax::ObjectName {
+                parts: statement
+                    .name
+                    .parts
+                    .iter()
+                    .map(|part| part.value.clone())
+                    .collect(),
+            },
+            kind: CreateTableKind::Iceberg {
+                columns: statement
+                    .columns
+                    .iter()
+                    .map(lower_typed_table_column)
+                    .collect::<Result<Vec<_>, _>>()?,
+                key_desc: statement
+                    .key
+                    .as_ref()
+                    .map(lower_typed_table_key)
+                    .transpose()?,
+                bucket_count: statement
+                    .distribution
+                    .as_ref()
+                    .and_then(|value| value.buckets)
+                    .map(|value| {
+                        u32::try_from(value)
+                            .map_err(|_| "distribution bucket count exceeds u32".to_string())
+                    })
+                    .transpose()?,
+                distribution_columns: statement
+                    .distribution
+                    .as_ref()
+                    .map(|value| {
+                        value
+                            .columns
+                            .iter()
+                            .map(|column| column.value.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                partition_fields,
+                properties,
+            },
+            legacy_range_partitions: Vec::new(),
+            if_not_exists: statement.if_not_exists,
+        },
+        current_catalog,
+        current_database,
+        connector_context,
+    )
+}
+
+fn lower_typed_table_column(
+    column: &TypedColumnDefinition,
+) -> Result<novarocks_sql::syntax::TableColumnDef, String> {
+    let data_type = lower_typed_sql_type(&column.data_type)?;
+    Ok(novarocks_sql::syntax::TableColumnDef {
+        name: column.name.value.clone(),
+        nullable: column.nullable.unwrap_or(true),
+        aggregation: column
+            .aggregation
+            .as_ref()
+            .map(|value| match value.value.to_ascii_lowercase().as_str() {
+                "sum" => Ok(novarocks_sql::syntax::ColumnAggregation::Sum),
+                "min" => Ok(novarocks_sql::syntax::ColumnAggregation::Min),
+                "max" => Ok(novarocks_sql::syntax::ColumnAggregation::Max),
+                "replace" => Ok(novarocks_sql::syntax::ColumnAggregation::Replace),
+                "replace_if_not_null" => {
+                    Ok(novarocks_sql::syntax::ColumnAggregation::ReplaceIfNotNull)
+                }
+                "bitmap_union" => Ok(novarocks_sql::syntax::ColumnAggregation::BitmapUnion),
+                "hll_union" => Ok(novarocks_sql::syntax::ColumnAggregation::HllUnion),
+                other => Err(format!("unsupported column aggregation `{other}`")),
+            })
+            .transpose()?,
+        default: column
+            .default
+            .as_ref()
+            .map(|value| lower_typed_default_literal(value, &data_type))
+            .transpose()?,
+        data_type,
+    })
+}
+
+fn lower_typed_table_key(
+    key: &TypedTableKey,
+) -> Result<novarocks_sql::syntax::TableKeyDesc, String> {
+    Ok(novarocks_sql::syntax::TableKeyDesc {
+        kind: match key.kind {
+            TypedTableKeyKind::Duplicate => novarocks_sql::syntax::TableKeyKind::Duplicate,
+            TypedTableKeyKind::Unique => novarocks_sql::syntax::TableKeyKind::Unique,
+            TypedTableKeyKind::Aggregate => novarocks_sql::syntax::TableKeyKind::Aggregate,
+            TypedTableKeyKind::Primary => novarocks_sql::syntax::TableKeyKind::Primary,
+        },
+        columns: key
+            .columns
+            .iter()
+            .map(|column| column.value.clone())
+            .collect(),
+    })
+}
+
+fn lower_typed_table_partition_transform(
+    transform: &TypedPartitionTransform,
+) -> Result<novarocks_sql::syntax::IcebergPartitionFieldExpr, String> {
+    use novarocks_sql::syntax::IcebergPartitionFieldExpr;
+    let column = |value: &novarocks_parser::ast::Ident| value.value.clone();
+    Ok(match transform {
+        TypedPartitionTransform::Identity { column: value, .. } => {
+            IcebergPartitionFieldExpr::Identity {
+                column: column(value),
+            }
+        }
+        TypedPartitionTransform::Year { column: value, .. } => IcebergPartitionFieldExpr::Year {
+            column: column(value),
+        },
+        TypedPartitionTransform::Month { column: value, .. } => IcebergPartitionFieldExpr::Month {
+            column: column(value),
+        },
+        TypedPartitionTransform::Day { column: value, .. } => IcebergPartitionFieldExpr::Day {
+            column: column(value),
+        },
+        TypedPartitionTransform::Hour { column: value, .. } => IcebergPartitionFieldExpr::Hour {
+            column: column(value),
+        },
+        TypedPartitionTransform::Void { column: value, .. } => IcebergPartitionFieldExpr::Void {
+            column: column(value),
+        },
+        TypedPartitionTransform::Bucket {
+            buckets,
+            column: value,
+            ..
+        } => IcebergPartitionFieldExpr::Bucket {
+            column: column(value),
+            num_buckets: u32::try_from(*buckets)
+                .map_err(|_| "partition bucket count exceeds u32".to_string())?,
+        },
+        TypedPartitionTransform::Truncate {
+            width,
+            column: value,
+            ..
+        } => IcebergPartitionFieldExpr::Truncate {
+            column: column(value),
+            width: u32::try_from(*width)
+                .map_err(|_| "partition truncate width exceeds u32".to_string())?,
+        },
+    })
+}
+
+fn typed_literal_text(literal: &novarocks_parser::ast::Literal) -> Result<String, String> {
+    match &literal.kind {
+        TypedLiteralKind::Null => Err("table properties do not support NULL values".to_string()),
+        TypedLiteralKind::Boolean(value) => Ok(value.to_string()),
+        TypedLiteralKind::Number(value)
+        | TypedLiteralKind::String(value)
+        | TypedLiteralKind::HexString(value) => Ok(value.clone()),
     }
 }
 
@@ -2187,47 +2408,6 @@ fn default_out_of_range(type_name: &str, value: i64) -> String {
     format!("DEFAULT value {value} out of range for {type_name}")
 }
 
-/// Detect `SHOW CREATE TABLE <name>` statements so the server layer can
-/// route them to the engine instead of treating them as session noops.
-pub(crate) fn looks_like_show_create_table(sql: &str) -> bool {
-    let lower = sql.trim_start().to_ascii_lowercase();
-    // Match "SHOW CREATE TABLE ..." quickly without full parsing.
-    if !lower.starts_with("show") {
-        return false;
-    }
-    let rest = lower["show".len()..].trim_start();
-    if !rest.starts_with("create") {
-        return false;
-    }
-    let rest2 = rest["create".len()..].trim_start();
-    rest2.starts_with("table")
-}
-
-/// Parse `SHOW CREATE TABLE <catalog>.<db>.<table>` and return the parsed
-/// `ObjectName`.  Returns `Err` if parsing fails.
-pub(crate) fn parse_show_create_table(
-    sql: &str,
-) -> Result<novarocks_sql::syntax::ObjectName, String> {
-    use sqlparser::keywords::Keyword;
-    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
-    let mut parser = Parser::new(&StarRocksDialect)
-        .try_with_sql(&normalized)
-        .map_err(|e| format!("parse SHOW CREATE TABLE: {e}"))?;
-    parser
-        .expect_keyword(Keyword::SHOW)
-        .map_err(|e| format!("parse SHOW CREATE TABLE: {e}"))?;
-    parser
-        .expect_keyword(Keyword::CREATE)
-        .map_err(|e| format!("parse SHOW CREATE TABLE: {e}"))?;
-    parser
-        .expect_keyword(Keyword::TABLE)
-        .map_err(|e| format!("parse SHOW CREATE TABLE: {e}"))?;
-    let obj = parser
-        .parse_object_name(false)
-        .map_err(|e| format!("parse SHOW CREATE TABLE table name: {e}"))?;
-    novarocks_sql::syntax::convert_object_name(obj)
-}
-
 pub fn looks_like_show_alter_table_optimize(sql: &str) -> bool {
     let Ok(normalized) = novarocks_sql::syntax::normalize_for_raw_parse(sql) else {
         return false;
@@ -2272,13 +2452,15 @@ fn expect_parser_eof(parser: &Parser<'_>) -> Result<(), String> {
 }
 
 /// Check if SQL looks like ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES ...
-pub fn looks_like_add_equality_delete(sql: &str) -> bool {
+#[cfg(any())]
+fn looks_like_add_equality_delete(sql: &str) -> bool {
     let upper = sql.trim().to_ascii_uppercase();
     upper.starts_with("ALTER TABLE") && upper.contains("ADD EQUALITY DELETE")
 }
 
 /// Parse: ALTER TABLE [catalog.db.]table ADD EQUALITY DELETE (k1, k2) VALUES (...)
-pub fn parse_add_equality_delete_sql(sql: &str) -> Result<AddEqualityDeleteStmt, String> {
+#[cfg(any())]
+fn parse_add_equality_delete_sql(sql: &str) -> Result<AddEqualityDeleteStmt, String> {
     const ALTER_TABLE: &str = "ALTER TABLE";
     const ADD_EQ_DELETE: &str = "ADD EQUALITY DELETE";
     const VALUES: &str = "VALUES";
@@ -2383,107 +2565,6 @@ mod drop_table_if_exists_tests {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_sql::syntax::Literal;
-
-    #[test]
-    fn convert_update_from_table_source() {
-        let stmt = novarocks_sql::syntax::parse_sql_raw(
-            "update ice.db1.t as t set v = s.v from staging.src as s where t.id = s.id",
-        )
-        .expect("parse");
-        let sqlparser::ast::Statement::Update(_) = &stmt else {
-            panic!("expected update statement: {stmt:?}");
-        };
-        let update = super::convert_sqlparser_update_to_custom(&stmt).expect("convert");
-        assert_eq!(update.table.parts, vec!["ice", "db1", "t"]);
-        assert_eq!(update.alias.as_deref(), Some("t"));
-        assert_eq!(update.assignments.len(), 1);
-        assert_eq!(update.assignments[0].column, "v");
-        let Some(novarocks_sql::syntax::MutationSource::Table { name, alias }) = &update.source
-        else {
-            panic!("expected table source: {:?}", update.source);
-        };
-        assert_eq!(name.parts, vec!["staging", "src"]);
-        assert_eq!(alias.as_deref(), Some("s"));
-        assert!(update.where_clause.is_some());
-    }
-
-    #[test]
-    fn convert_update_rejects_multi_column_assignment() {
-        let stmt = novarocks_sql::syntax::parse_sql_raw(
-            "update ice.db1.t set (v1, v2) = (1, 2) where id = 1",
-        )
-        .expect("parse");
-        let err = super::convert_sqlparser_update_to_custom(&stmt).expect_err("must fail");
-        assert!(err.contains("single-column UPDATE assignments"), "{err}");
-    }
-
-    #[test]
-    fn convert_update_rejects_target_join() {
-        let stmt = novarocks_sql::syntax::parse_sql_raw(
-            "update ice.db1.t as t join staging.src as s on t.id = s.id set v = s.v",
-        )
-        .expect("parse");
-        let err = super::convert_sqlparser_update_to_custom(&stmt).expect_err("must fail");
-        assert!(
-            err.contains("UPDATE target joins are not supported"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn convert_update_rejects_conflict_clause() {
-        let stmt = novarocks_sql::syntax::parse_sql_raw("update or ignore ice.db1.t set v = 1")
-            .expect("parse");
-        let err = super::convert_sqlparser_update_to_custom(&stmt).expect_err("must fail");
-        assert!(
-            err.contains("UPDATE conflict clauses are not supported"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn convert_update_rejects_target_alias_column_list() {
-        let stmt = novarocks_sql::syntax::parse_sql_raw("update ice.db1.t as t(c) set v = 1")
-            .expect("parse");
-        let err = super::convert_sqlparser_update_to_custom(&stmt).expect_err("must fail");
-        assert!(
-            err.contains("UPDATE target alias column lists are not supported"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn convert_update_rejects_source_alias_column_list() {
-        let stmt = novarocks_sql::syntax::parse_sql_raw(
-            "update ice.db1.t set v = s.v from staging.src as s(id)",
-        )
-        .expect("parse");
-        let err = super::convert_sqlparser_update_to_custom(&stmt).expect_err("must fail");
-        assert!(
-            err.contains("UPDATE ... FROM source alias column lists are not supported"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn parse_add_equality_delete_values_statement() {
-        let stmt = super::parse_add_equality_delete_sql(
-            "ALTER TABLE ice.db.orders ADD EQUALITY DELETE (id, category) VALUES (2, 'B'), (4, 'A')",
-        )
-        .expect("parse");
-
-        assert_eq!(stmt.table.parts, vec!["ice", "db", "orders"]);
-        assert_eq!(stmt.columns, vec!["id", "category"]);
-        assert_eq!(
-            stmt.rows,
-            vec![
-                vec![Literal::Int(2), Literal::String("B".to_string())],
-                vec![Literal::Int(4), Literal::String("A".to_string())],
-            ]
-        );
-    }
-
     #[test]
     fn looks_like_show_alter_table_optimize_detects_only_live_show_route() {
         assert!(super::looks_like_show_alter_table_optimize(
