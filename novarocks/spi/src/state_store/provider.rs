@@ -89,7 +89,7 @@ impl fmt::Display for StateStoreProviderIdError {
 impl std::error::Error for StateStoreProviderIdError {}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-// Design: ADR-0092 keeps provider deployment capabilities in SPI while runtime ownership stays in Frontend.
+// Design: ADR-0093 keeps provider deployment capabilities in SPI while runtime ownership stays in Frontend.
 pub struct StateStoreProviderDescriptor {
     pub id: StateStoreProviderId,
     pub access_mode: StateStoreProviderAccessMode,

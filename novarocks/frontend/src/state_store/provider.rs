@@ -36,7 +36,7 @@ pub struct StateStoreHostInput {
 
 /// A provider factory builder supplied by the concrete composition root.
 ///
-/// Design: ADR-0092 keeps this registry in Frontend while Server owns concrete
+/// Design: ADR-0093 keeps this registry in Frontend while Server owns concrete
 /// provider selection and leaf crates own native construction.
 pub type StateStoreProviderBinder = Arc<
     dyn Fn(&StateStoreHostInput) -> Result<Box<dyn StateStoreProviderFactory>, StateStoreHostError>
