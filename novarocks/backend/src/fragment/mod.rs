@@ -16,8 +16,10 @@
 // under the License.
 
 pub(crate) mod control;
+pub(crate) mod decode;
 mod event_io;
 mod failure_injection;
+pub(crate) mod ingress;
 mod io;
 mod lookup_io;
 mod result_io;

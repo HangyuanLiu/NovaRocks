@@ -1,10 +1,10 @@
+// Design: ADR-0091 (docs/adr/ADR-0091-backend-domain-owned-module-layout.md)
 mod application;
 mod config;
 pub mod connector;
 mod exchange_receiver;
 mod fragment;
 mod metrics;
-pub(crate) mod native;
 mod query_lifecycle;
 pub(crate) mod rpc;
 mod runtime;

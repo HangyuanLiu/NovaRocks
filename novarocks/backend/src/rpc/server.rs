@@ -44,17 +44,17 @@ use tonic::codegen::Service;
 use tonic::server::NamedService;
 
 use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
-use crate::native::connector_binding;
-use crate::native::ingress::NativeFragmentIngress;
-use crate::native::lifecycle_adapter::{
+use crate::connector::binding_decode;
+use crate::fragment::ingress::NativeFragmentIngress;
+use crate::query_lifecycle::QueryLifecycleIngress;
+use crate::query_lifecycle::rpc::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
     handle_stage_fragments, handle_start_prepared_query, status_from_contract_error,
     status_from_lifecycle_error,
 };
-use crate::native::runtime_filter_adapter::{
+use crate::runtime_filter::rpc::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,
 };
-use crate::query_lifecycle::QueryLifecycleIngress;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -215,10 +215,10 @@ impl NovaRocksGrpc for BackendRpcService {
         let ingress = Arc::clone(&self.native_fragment_ingress);
         let result = tokio::task::spawn_blocking(move || {
             let (execution_id, declaration) =
-                connector_binding::decode_ensure_request(request.into_inner())
+                binding_decode::decode_ensure_request(request.into_inner())
                     .map_err(|error| error.to_string())?;
             let context =
-                connector_binding::install_request_context().map_err(|error| error.to_string())?;
+                binding_decode::install_request_context().map_err(|error| error.to_string())?;
             ingress
                 .ensure_connector_execution_binding(execution_id, declaration, context)
                 .map_err(|error| error.to_string())
@@ -247,7 +247,7 @@ impl NovaRocksGrpc for BackendRpcService {
     {
         let ingress = Arc::clone(&self.native_fragment_ingress);
         let result = tokio::task::spawn_blocking(move || {
-            let key = connector_binding::decode_retire_request(request.into_inner())
+            let key = binding_decode::decode_retire_request(request.into_inner())
                 .map_err(|error| error.to_string())?;
             ingress
                 .retire_connector_execution_binding(key)

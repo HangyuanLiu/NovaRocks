@@ -51,8 +51,8 @@ use super::failure_injection::{
     FRAGMENT_EXECUTOR_FAILURE_MESSAGE, claim_configured_fragment_failure_trigger,
 };
 use crate::ConnectorExecutionHost;
-use crate::native::decode::NativeFragmentRequest;
-use crate::native::ingress::{
+use crate::fragment::decode::request::NativeFragmentRequest;
+use crate::fragment::ingress::{
     NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
 };
 use crate::query_lifecycle::{QueryLifecycleRegistry, stage::StartGate};
@@ -824,7 +824,7 @@ mod tests {
     use crate::fragment::failure_injection::{
         FRAGMENT_EXECUTOR_FAILURE_MESSAGE, start_with_fragment_failure_trigger,
     };
-    use crate::native::ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
+    use crate::fragment::ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
     use crate::query_lifecycle::{QueryControlAttachment, stage::StartGate};
 
     use super::{

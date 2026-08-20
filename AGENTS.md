@@ -130,7 +130,11 @@ SQL client
 
 - `novarocks/backend/src/**`
   BE application composition, native gRPC services, query lifecycle registry,
-  and connector execution host.
+  and connector execution host. `rpc/**` owns generated stubs, codec, client,
+  listener composition, data-plane handlers, and the role-local data runtime;
+  `fragment/{ingress.rs,decode/**}`, `query_lifecycle/rpc.rs`,
+  `runtime_filter/{rpc.rs,install_decode.rs,transport.rs}`, and
+  `connector/binding_decode.rs` own their respective wire adapters.
 
 - `novarocks/core/src/**`
   Carrier-neutral execution, query lifecycle contracts, and native runtime

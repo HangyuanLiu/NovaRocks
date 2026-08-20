@@ -51,21 +51,21 @@ use super::domain::{
 };
 use super::observation::{RuntimeFilterObservationEmitter, RuntimeFilterObservationSnapshot};
 use crate::BackendDataRuntime;
-use crate::native::runtime_filter_adapter::{
+use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
+use crate::runtime_filter::artifact_query::BackendRuntimeFilterArtifactQuery;
+use crate::runtime_filter::codec::{artifact as artifact_codec, producer as producer_codec};
+use crate::runtime_filter::install_decode::DecodedRuntimeFilterContribution;
+use crate::runtime_filter::rpc::{
     BackendNativeContributionRouteIdentity, BackendNativeDeliveryRouteIdentity,
     BackendNativeProducerInstanceRouteIdentity, BackendNativeRouteIdentity,
     BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
 };
-use crate::native::runtime_filter_install::DecodedRuntimeFilterContribution;
-use crate::native::runtime_filter_sender::{
+use crate::runtime_filter::transport::{
     BackendNativeRuntimeFilterTransportEnvelope, BackendRuntimeFilterEnvelopeSink,
     BackendRuntimeFilterRetryPolicy, BackendRuntimeFilterSinkCompletion,
     BackendRuntimeFilterSinkSubmitOutcome, BackendRuntimeFilterTransportFailureReason,
     GrpcRuntimeFilterEnvelopeSink,
 };
-use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
-use crate::runtime_filter::artifact_query::BackendRuntimeFilterArtifactQuery;
-use crate::runtime_filter::codec::{artifact as artifact_codec, producer as producer_codec};
 
 const QUERY_UNAVAILABLE_REJECTION: &str = "runtime filter ingress rejected [query-unavailable]: runtime filter query is not active or in delivery grace";
 const ACK_UNSUPPORTED_REJECTION: &str = "runtime filter ingress rejected [ack-unsupported]: runtime filter ack ingress is not supported";
@@ -1208,8 +1208,7 @@ impl BackendParticipantOutbound {
             route.edge_id(),
         );
         let bytes =
-            crate::native::runtime_filter_adapter::encode_runtime_filter_envelope(&envelope)
-                .encoded_len();
+            crate::runtime_filter::rpc::encode_runtime_filter_envelope(&envelope).encoded_len();
         let route_identity = *envelope.route_identity();
         let Ok(envelope) = BackendNativeRuntimeFilterTransportEnvelope::new(
             Arc::new(envelope),
@@ -1711,9 +1710,6 @@ mod tests {
     use novarocks_types::QueryId;
 
     use super::*;
-    use crate::native::runtime_filter_sender::{
-        BackendRuntimeFilterSinkCompletion, BackendRuntimeFilterSinkSubmitOutcome,
-    };
     use crate::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile};
     use crate::runtime_filter::domain::{
         BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall, BackendCoverage,
@@ -1724,6 +1720,9 @@ mod tests {
         BackendRoutingShard,
     };
     use crate::runtime_filter::test_support::BackendRuntimeFilterFixture;
+    use crate::runtime_filter::transport::{
+        BackendRuntimeFilterSinkCompletion, BackendRuntimeFilterSinkSubmitOutcome,
+    };
 
     struct ForwardingSink {
         target: Arc<RuntimeFilterParticipant>,

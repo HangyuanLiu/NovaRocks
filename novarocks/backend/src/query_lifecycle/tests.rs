@@ -49,8 +49,8 @@ use super::{
     QueryControlAttachment, QueryLifecycleError, QueryLifecycleErrorCode,
     QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
 };
-use crate::native::runtime_filter_install::DecodedRuntimeFilterContribution;
 use crate::rpc::runtime::test_backend_data_runtime;
+use crate::runtime_filter::install_decode::DecodedRuntimeFilterContribution;
 use crate::runtime_filter::participant::{
     BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipantFactory,
 };

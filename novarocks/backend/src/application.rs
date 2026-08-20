@@ -21,12 +21,12 @@ use crate::fragment::{
     native_result_writer,
 };
 use crate::metrics::MetricsHttpServer;
-use crate::native::runtime_filter_adapter::BackendRuntimeFilterEnvelopeIngress;
 use crate::query_lifecycle::{
     NativeQueryLifecycleLocalRuntime, QueryControlAttachment, QueryLifecycleIngress,
     QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
 };
 use crate::rpc::server::{BackendRpcServerHandle, BackendRpcService};
+use crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_spi::connector::WriteCommitEvidenceLimits;
 
