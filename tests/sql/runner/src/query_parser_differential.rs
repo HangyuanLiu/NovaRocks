@@ -59,6 +59,10 @@ pub struct Summary {
     pub statement_payloads: usize,
     pub accept_query: usize,
     pub typed_only_explain: usize,
+    ddl_dml_typed: BTreeMap<DdlDmlClass, usize>,
+    ddl_dml_printer: BTreeMap<DdlDmlClass, usize>,
+    row_dml_semantic: BTreeMap<DdlDmlClass, usize>,
+    row_dml_legacy_unavailable: BTreeMap<DdlDmlClass, usize>,
     pub reject_excluded: usize,
     pub non_query: usize,
     pub mismatches: Vec<Mismatch>,
@@ -74,11 +78,27 @@ impl Summary {
             eprintln!("{mismatch}");
         }
         println!(
-            "SQLP-4 query parser differential: scanned={} statement-payloads={} accept-query={} typed-only-explain={} reject-excluded={} non-query={} mismatches={}",
+            "SQLP-5 DDL/DML parser differential: scanned={} statement-payloads={} accept-query={} typed-only-explain={} ddl-dml-typed={} ddl-dml-printer={} row-dml-semantic={} row-dml-legacy-unavailable={} semantic-not-applicable={{table-ddl={},ctas={},add-equality-delete={}}} reject-excluded={} non-query={} mismatches={}",
             self.scanned,
             self.statement_payloads,
             self.accept_query,
             self.typed_only_explain,
+            display_class_counts(&self.ddl_dml_typed),
+            display_class_counts(&self.ddl_dml_printer),
+            display_class_counts(&self.row_dml_semantic),
+            display_class_counts(&self.row_dml_legacy_unavailable),
+            self.ddl_dml_typed
+                .get(&DdlDmlClass::TableDdl)
+                .copied()
+                .unwrap_or_default(),
+            self.ddl_dml_typed
+                .get(&DdlDmlClass::Ctas)
+                .copied()
+                .unwrap_or_default(),
+            self.ddl_dml_typed
+                .get(&DdlDmlClass::AddEqualityDelete)
+                .copied()
+                .unwrap_or_default(),
             self.reject_excluded,
             self.non_query,
             self.mismatches.len(),
@@ -179,6 +199,39 @@ impl std::fmt::Display for Mismatch {
 enum QueryClass {
     Query,
     ExplainQuery,
+}
+
+/// SQLP-5's typed statement kinds.  The differential deliberately reports
+/// these separately: all of them require typed parse and printer checks, but
+/// only the row-DML subset can be compared through the retiring sqlparser
+/// production path.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DdlDmlClass {
+    TableDdl,
+    Ctas,
+    Insert,
+    Delete,
+    Update,
+    Merge,
+    AddEqualityDelete,
+}
+
+impl DdlDmlClass {
+    const fn is_row_dml(self) -> bool {
+        matches!(self, Self::Insert | Self::Delete | Self::Update | Self::Merge)
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::TableDdl => "table-ddl",
+            Self::Ctas => "ctas",
+            Self::Insert => "insert",
+            Self::Delete => "delete",
+            Self::Update => "update",
+            Self::Merge => "merge",
+            Self::AddEqualityDelete => "add-equality-delete",
+        }
+    }
 }
 
 /// Runs the selected corpus with no server, object-store, or connection work.
@@ -319,6 +372,29 @@ fn inspect_payload(
     payload_index: usize,
     summary: &mut Summary,
 ) {
+    let typed = parse_typed(&step.sql);
+    match &typed {
+        Ok(statements) if classify_typed_ddl_dml(statements).is_some() => {
+            inspect_ddl_dml(suite, case, step, payload_index, statements, summary);
+            return;
+        }
+        Err(error) if ddl_dml_candidate(&step.sql) => {
+            summary.mismatches.push(mismatch(
+                suite,
+                case,
+                step,
+                payload_index,
+                format!("typed parser rejected a DDL/DML candidate: {error}"),
+                None,
+                None,
+                None,
+                None,
+            ));
+            return;
+        }
+        _ => {}
+    }
+
     let legacy_original = match novarocks_sql::syntax::parse_sql_raw(&step.sql) {
         Ok(statement) => statement,
         Err(error) if is_typed_only_explain(&step.sql) => {
@@ -350,7 +426,7 @@ fn inspect_payload(
     };
     summary.accept_query += 1;
 
-    let typed_original = match parse_typed(&step.sql) {
+    let typed_original = match typed {
         Ok(statements) => statements,
         Err(error) => {
             summary.mismatches.push(mismatch!(
@@ -468,6 +544,137 @@ fn inspect_payload(
             Some(&typed_original),
         ));
     }
+}
+
+/// Runs SQLP-5's three DDL/DML differential layers.  The first two layers are
+/// mandatory for every typed DDL/DML payload.  The third layer is intentionally
+/// limited to the legacy parser's representable row-DML subset; CREATE TABLE,
+/// CTAS, and ADD EQUALITY DELETE are reported as not applicable rather than as
+/// a misleading pass.
+fn inspect_ddl_dml(
+    suite: &str,
+    case: &SqlCase,
+    step: &SqlStep,
+    payload_index: usize,
+    typed_original: &[TypedStatement],
+    summary: &mut Summary,
+) {
+    let class = classify_typed_ddl_dml(typed_original)
+        .expect("DDL/DML inspection is entered only for one typed SQLP-5 statement");
+    *summary.ddl_dml_typed.entry(class).or_default() += 1;
+
+    let canonical_sql = print_statements(typed_original);
+    let typed_canonical = match parse_typed(&canonical_sql) {
+        Ok(statements) => statements,
+        Err(error) => {
+            summary.mismatches.push(mismatch(
+                suite,
+                case,
+                step,
+                payload_index,
+                format!("canonical typed DDL/DML SQL did not reparse: {error}"),
+                Some(canonical_sql),
+                None,
+                None,
+                Some(typed_original),
+            ));
+            return;
+        }
+    };
+    if classify_typed_ddl_dml(&typed_canonical) != Some(class) {
+        summary.mismatches.push(mismatch(
+            suite,
+            case,
+            step,
+            payload_index,
+            "canonical typed SQL changed the DDL/DML statement classification".to_owned(),
+            Some(canonical_sql),
+            None,
+            None,
+            Some(typed_original),
+        ));
+        return;
+    }
+    if !typed_ddl_dml_syntax_eq(typed_original, &typed_canonical) {
+        let mut diagnostic = mismatch(
+            suite,
+            case,
+            step,
+            payload_index,
+            "typed DDL/DML parse-print-parse is not span-insensitively equivalent".to_owned(),
+            Some(canonical_sql),
+            None,
+            None,
+            Some(typed_original),
+        );
+        diagnostic.typed_canonical = Some(debug_typed_ast(&typed_canonical));
+        diagnostic.first_typed_difference = first_debug_difference(
+            diagnostic.typed_original.as_deref(),
+            diagnostic.typed_canonical.as_deref(),
+        );
+        summary.mismatches.push(diagnostic);
+        return;
+    }
+    *summary.ddl_dml_printer.entry(class).or_default() += 1;
+
+    if !class.is_row_dml() {
+        return;
+    }
+
+    let legacy_original = match novarocks_sql::planning::dml::parse_raw_statement(&step.sql) {
+        Ok(statement) if legacy_matches_row_dml(&statement, class) => statement,
+        Ok(_) | Err(_) => {
+            *summary.row_dml_legacy_unavailable.entry(class).or_default() += 1;
+            return;
+        }
+    };
+    let legacy_canonical = match novarocks_sql::planning::dml::parse_raw_statement(&canonical_sql)
+    {
+        Ok(statement) if legacy_matches_row_dml(&statement, class) => statement,
+        Ok(statement) => {
+            summary.mismatches.push(mismatch(
+                suite,
+                case,
+                step,
+                payload_index,
+                "canonical typed SQL changed the legacy row-DML classification".to_owned(),
+                Some(canonical_sql),
+                Some(&legacy_original),
+                Some(&statement),
+                Some(typed_original),
+            ));
+            return;
+        }
+        Err(error) => {
+            summary.mismatches.push(mismatch(
+                suite,
+                case,
+                step,
+                payload_index,
+                format!("legacy parser rejected canonical typed row DML: {error}"),
+                Some(canonical_sql),
+                Some(&legacy_original),
+                None,
+                Some(typed_original),
+            ));
+            return;
+        }
+    };
+    if !legacy_semantically_eq(&legacy_original, &legacy_canonical) {
+        summary.mismatches.push(mismatch(
+            suite,
+            case,
+            step,
+            payload_index,
+            "legacy row-DML AST semantic equality differs after canonical typed SQL".to_owned(),
+            Some(canonical_sql),
+            Some(&legacy_original),
+            Some(&legacy_canonical),
+            Some(typed_original),
+        ));
+        return;
+    }
+    *summary.row_dml_semantic.entry(class).or_default() += 1;
 }
 
 fn inspect_typed_only_explain(
@@ -588,6 +795,70 @@ fn classify_legacy_query(statement: &LegacyStatement) -> Option<QueryClass> {
     }
 }
 
+fn classify_typed_ddl_dml(statements: &[TypedStatement]) -> Option<DdlDmlClass> {
+    match statements {
+        [TypedStatement::Table(_)] => Some(DdlDmlClass::TableDdl),
+        [TypedStatement::Dml(novarocks_parser::ast::DmlStatement::CreateTableAsSelect(_))] => {
+            Some(DdlDmlClass::Ctas)
+        }
+        [TypedStatement::Dml(novarocks_parser::ast::DmlStatement::Insert(_))] => {
+            Some(DdlDmlClass::Insert)
+        }
+        [TypedStatement::Dml(novarocks_parser::ast::DmlStatement::Delete(_))] => {
+            Some(DdlDmlClass::Delete)
+        }
+        [TypedStatement::Dml(novarocks_parser::ast::DmlStatement::Update(_))] => {
+            Some(DdlDmlClass::Update)
+        }
+        [TypedStatement::Dml(novarocks_parser::ast::DmlStatement::Merge(_))] => {
+            Some(DdlDmlClass::Merge)
+        }
+        [TypedStatement::Dml(novarocks_parser::ast::DmlStatement::AddEqualityDelete(_))] => {
+            Some(DdlDmlClass::AddEqualityDelete)
+        }
+        _ => None,
+    }
+}
+
+fn legacy_matches_row_dml(statement: &LegacyStatement, expected: DdlDmlClass) -> bool {
+    matches!(
+        (expected, statement),
+        (DdlDmlClass::Insert, LegacyStatement::Insert(_))
+            | (DdlDmlClass::Delete, LegacyStatement::Delete(_))
+            | (DdlDmlClass::Update, LegacyStatement::Update { .. })
+            | (DdlDmlClass::Merge, LegacyStatement::Merge(_))
+    )
+}
+
+/// Detects only SQLP-5's top-level DDL/DML family when typed parsing fails.
+/// Successful parsing remains authoritative, so this guard exists solely to
+/// turn a newly missing grammar production into an actionable mismatch instead
+/// of silently counting it as a non-query command.
+fn ddl_dml_candidate(sql: &str) -> bool {
+    // INSERT/DELETE/UPDATE/MERGE are intentionally contextual words in the
+    // lexer, so failure classification must preserve source spelling rather
+    // than looking only for `TokenKind::Keyword` variants.
+    let upper = sql.trim_start().to_ascii_uppercase();
+    let mut words = upper.split_whitespace();
+    match words.next() {
+        Some("INSERT" | "DELETE" | "UPDATE" | "MERGE") => true,
+        Some("CREATE") => words.any(|word| word.trim_matches(|c: char| !c.is_ascii_alphabetic()) == "TABLE"),
+        Some("ALTER") => upper.contains("ADD EQUALITY DELETE"),
+        _ => false,
+    }
+}
+
+fn display_class_counts(counts: &BTreeMap<DdlDmlClass, usize>) -> String {
+    if counts.is_empty() {
+        return "none".to_owned();
+    }
+    counts
+        .iter()
+        .map(|(class, count)| format!("{}={count}", class.label()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// The raw production parser cannot parse every NovaRocks command family. For
 /// those parse failures we still need an explicit corpus class, not a hidden
 /// case allowlist: only a grammar-shaped top-level Query is a mismatch. This
@@ -685,6 +956,41 @@ fn typed_statements_syntax_eq(left: &[TypedStatement], right: &[TypedStatement])
         }
         _ => false,
     }
+}
+
+/// SQLP-5 AST nodes currently derive `Eq`, which includes every `Span`.  The
+/// runner is intentionally the only file owned by T3, so it compares the
+/// deterministic debug tree after removing only span carriers rather than
+/// adding a second production equality API here.  This retains all parser
+/// syntax fields while making a printer round trip independent of offsets.
+fn typed_ddl_dml_syntax_eq(left: &[TypedStatement], right: &[TypedStatement]) -> bool {
+    normalized_typed_ddl_dml_ast(left) == normalized_typed_ddl_dml_ast(right)
+}
+
+fn mismatch(
+    suite: &str,
+    case: &SqlCase,
+    step: &SqlStep,
+    payload: usize,
+    reason: String,
+    canonical_sql: Option<String>,
+    legacy_original: Option<&LegacyStatement>,
+    legacy_canonical: Option<&LegacyStatement>,
+    typed_original: Option<&[TypedStatement]>,
+) -> Mismatch {
+    build_mismatch(
+        MismatchLocation {
+            suite,
+            case,
+            step,
+            payload,
+        },
+        reason,
+        canonical_sql,
+        legacy_original,
+        legacy_canonical,
+        typed_original,
+    )
 }
 
 fn build_mismatch(
@@ -812,6 +1118,10 @@ fn debug_typed_ast(statements: &[TypedStatement]) -> String {
     format!("{statements:#?}")
 }
 
+fn normalized_typed_ddl_dml_ast(statements: &[TypedStatement]) -> String {
+    strip_debug_blocks(&debug_typed_ast(statements), "span: Span {")
+}
+
 fn first_debug_difference(left: Option<&str>, right: Option<&str>) -> Option<String> {
     let (left, right) = (left?, right?);
     let mut left_lines = left.lines();
@@ -887,7 +1197,8 @@ mod tests {
 
         let non_query = run_fixture("CREATE TABLE t (a INT);");
         assert_eq!(non_query.scanned, 1);
-        assert_eq!(non_query.non_query, 1);
+        assert_eq!(non_query.non_query, 0);
+        assert_eq!(non_query.ddl_dml_typed.get(&DdlDmlClass::TableDdl), Some(&1));
         assert!(non_query.mismatches.is_empty());
 
         let legacy_rejected_command =
@@ -895,6 +1206,50 @@ mod tests {
         assert_eq!(legacy_rejected_command.scanned, 1);
         assert_eq!(legacy_rejected_command.non_query, 1);
         assert!(legacy_rejected_command.mismatches.is_empty());
+    }
+
+    #[test]
+    fn inventories_ddl_dml_at_each_applicable_oracle_layer() {
+        let summary = run_fixture(
+            "CREATE TABLE t (a INT);\n\
+             CREATE TABLE ctas AS SELECT 1;\n\
+             INSERT INTO t VALUES (1);\n\
+             DELETE FROM t WHERE a = 1;\n\
+             UPDATE t SET a = 2 WHERE a = 1;\n\
+             MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN DELETE;\n\
+             ALTER TABLE t ADD EQUALITY DELETE (a) VALUES (1);",
+        );
+
+        assert_eq!(summary.statement_payloads, 7);
+        assert_eq!(summary.ddl_dml_typed.get(&DdlDmlClass::TableDdl), Some(&1));
+        assert_eq!(summary.ddl_dml_typed.get(&DdlDmlClass::Ctas), Some(&1));
+        assert_eq!(summary.ddl_dml_typed.get(&DdlDmlClass::Insert), Some(&1));
+        assert_eq!(summary.ddl_dml_typed.get(&DdlDmlClass::Delete), Some(&1));
+        assert_eq!(summary.ddl_dml_typed.get(&DdlDmlClass::Update), Some(&1));
+        assert_eq!(summary.ddl_dml_typed.get(&DdlDmlClass::Merge), Some(&1));
+        assert_eq!(
+            summary.ddl_dml_typed.get(&DdlDmlClass::AddEqualityDelete),
+            Some(&1)
+        );
+        assert_eq!(summary.ddl_dml_typed, summary.ddl_dml_printer);
+        assert_eq!(
+            summary.row_dml_semantic.get(&DdlDmlClass::Insert),
+            Some(&1)
+        );
+        assert_eq!(
+            summary.row_dml_semantic.get(&DdlDmlClass::Delete),
+            Some(&1)
+        );
+        assert_eq!(
+            summary.row_dml_semantic.get(&DdlDmlClass::Update),
+            Some(&1)
+        );
+        assert_eq!(
+            summary.row_dml_semantic.get(&DdlDmlClass::Merge),
+            Some(&1)
+        );
+        assert!(summary.row_dml_legacy_unavailable.is_empty());
+        assert!(summary.mismatches.is_empty(), "{summary:#?}");
     }
 
     #[test]
