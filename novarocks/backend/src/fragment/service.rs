@@ -51,8 +51,8 @@ use super::failure_injection::{
     FRAGMENT_EXECUTOR_FAILURE_MESSAGE, claim_configured_fragment_failure_trigger,
 };
 use crate::ConnectorExecutionHost;
-use crate::native::decode::NativeFragmentRequest;
-use crate::native::ingress::{
+use crate::fragment::decode::request::NativeFragmentRequest;
+use crate::fragment::ingress::{
     NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
 };
 use crate::query_lifecycle::{QueryLifecycleRegistry, stage::StartGate};
@@ -221,10 +221,10 @@ impl NativeFragmentService {
         let lifecycle = test_lifecycle_registry(Arc::clone(&controls));
         let mut service = Self::new_with_controls(
             crate::fragment::grpc_exchange_transmitter(
-                crate::native::runtime::test_backend_data_runtime(),
+                crate::rpc::runtime::test_backend_data_runtime(),
             ),
             crate::fragment::grpc_fragment_lookup_client(
-                crate::native::runtime::test_backend_data_runtime(),
+                crate::rpc::runtime::test_backend_data_runtime(),
             ),
             crate::fragment::native_result_writer(),
             controls,
@@ -824,7 +824,7 @@ mod tests {
     use crate::fragment::failure_injection::{
         FRAGMENT_EXECUTOR_FAILURE_MESSAGE, start_with_fragment_failure_trigger,
     };
-    use crate::native::ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
+    use crate::fragment::ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
     use crate::query_lifecycle::{QueryControlAttachment, stage::StartGate};
 
     use super::{
@@ -1256,10 +1256,10 @@ mod tests {
         let _service_guard = SERVICE_TEST_LOCK.lock().expect("service test lock");
         let service = NativeFragmentService::new(
             crate::fragment::grpc_exchange_transmitter(
-                crate::native::runtime::test_backend_data_runtime(),
+                crate::rpc::runtime::test_backend_data_runtime(),
             ),
             crate::fragment::grpc_fragment_lookup_client(
-                crate::native::runtime::test_backend_data_runtime(),
+                crate::rpc::runtime::test_backend_data_runtime(),
             ),
             crate::fragment::native_result_writer(),
             test_lifecycle_registry(Arc::new(FragmentControlRegistry::default())),

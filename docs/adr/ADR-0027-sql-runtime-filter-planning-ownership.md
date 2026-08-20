@@ -12,7 +12,7 @@ code-anchors:
   - "novarocks/core/src/sql/planner/runtime_filter/mod.rs (SQL-private planning closure)"
   - "novarocks/core/src/query_execution/preparation/runtime_filter_view.rs (sealed borrow-only handoff)"
   - "novarocks/frontend/src/runtime_filter/compiler.rs (Frontend deployment projection)"
-  - "novarocks/backend/src/native/runtime_filter_install.rs (Backend semantic install decode)"
+  - "novarocks/backend/src/runtime_filter/install_decode.rs (Backend semantic install decode)"
 ---
 
 ## 问题

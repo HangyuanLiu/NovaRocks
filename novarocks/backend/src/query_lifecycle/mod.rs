@@ -19,6 +19,7 @@ mod contract;
 mod entry;
 mod local_runtime;
 mod registry;
+pub(crate) mod rpc;
 pub(crate) mod stage;
 
 pub(crate) use contract::{

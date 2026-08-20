@@ -6,7 +6,7 @@ use novarocks_execution::runtime::fragment::io::{
 };
 
 use crate::BackendDataRuntime;
-use crate::native::client::NativeGrpcClient;
+use crate::rpc::client::BackendRpcClient;
 use crate::runtime::backend_id;
 
 pub(crate) fn grpc_fragment_lookup_client(
@@ -56,7 +56,7 @@ impl FragmentLookupClient for GrpcFragmentLookupClient {
             )
         })?;
         let request = remote_request(&request)?;
-        let response = NativeGrpcClient::new_host_port(
+        let response = BackendRpcClient::new_host_port(
             self.runtime.clone(),
             endpoint.host().to_string(),
             port,

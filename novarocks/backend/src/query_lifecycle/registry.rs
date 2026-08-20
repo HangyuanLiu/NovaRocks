@@ -52,19 +52,19 @@ use crate::metrics::{
     publish_backend_query_execution_resource, publish_backend_query_lifecycle_metrics,
     publish_backend_query_lifecycle_terminal_limits,
 };
-use crate::native::client::NativeGrpcClient;
-use crate::native::runtime_filter_adapter::{
-    BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
-};
-use crate::native::runtime_filter_install::decode_runtime_filter_contribution;
+use crate::rpc::client::BackendRpcClient;
 use crate::runtime::profile_codec::encode_runtime_profile_tree;
 use crate::runtime::sink_commit::SinkCommitReportSnapshot;
+use crate::runtime_filter::install_decode::decode_runtime_filter_contribution;
 use crate::runtime_filter::observation::{
     RuntimeFilterChannelTerminal, RuntimeFilterConsumerOutcome, RuntimeFilterObservationSnapshot,
 };
 use crate::runtime_filter::participant::{
     BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipant,
     RuntimeFilterParticipantFactory,
+};
+use crate::runtime_filter::rpc::{
+    BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
 };
 
 const CONTROL_EVENT_BUFFER_CAPACITY: usize = 16;
@@ -867,7 +867,7 @@ impl QueryTerminalFallbackTransport for GrpcQueryTerminalFallbackTransport {
         outcome: ParticipantTerminalOutcome,
         timeout: Duration,
     ) -> Result<QueryTerminalReportAck, QueryTerminalFallbackTransportError> {
-        let client = NativeGrpcClient::new_host_port(
+        let client = BackendRpcClient::new_host_port(
             self.runtime.clone(),
             endpoint.host().to_string(),
             endpoint.port(),
@@ -1119,7 +1119,7 @@ impl QueryLifecycleRegistry {
             clock,
             metrics,
             Arc::new(GrpcQueryTerminalFallbackTransport {
-                runtime: crate::native::runtime::test_backend_data_runtime(),
+                runtime: crate::rpc::runtime::test_backend_data_runtime(),
             }),
         )
     }
@@ -1135,7 +1135,7 @@ impl QueryLifecycleRegistry {
         terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
     ) -> Arc<Self> {
         Self::new_with_backend_identity(
-            crate::native::runtime::test_backend_data_runtime(),
+            crate::rpc::runtime::test_backend_data_runtime(),
             Some(local_backend_id),
             local_start_epoch,
             local_runtime,
@@ -1176,7 +1176,7 @@ impl QueryLifecycleRegistry {
         config: QueryLifecycleRegistryConfig,
     ) -> Arc<Self> {
         Self::new_unbound_with_runtime(
-            crate::native::runtime::test_backend_data_runtime(),
+            crate::rpc::runtime::test_backend_data_runtime(),
             local_start_epoch,
             local_runtime,
             config,

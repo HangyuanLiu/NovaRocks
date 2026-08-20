@@ -177,6 +177,14 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 
 - ADR-0026 — 为何退役 StarRocks-compatible backend runtime role，并把 StarRocks 限定为外部 Connector（active）
 
+### backend-architecture
+
+领域哲学：Backend 的目录应表达真实 owner，而不是已退役的协议分类。领域 adapter 紧邻其状态、验证和 execution host；
+跨领域的 RPC 基础设施仅保留 generated surface、codec、transport、data-plane 与 composition，不能成为第二业务 authority。
+目录不是 crate 边界，跨 crate 隔离仍由依赖图强制；物理归位不改变既有 wire 或 execution contract。
+
+- ADR-0091 — Backend 模块为何按领域 owner 归位，并保留窄 RPC 基础设施（active）
+
 ### cluster-membership
 
 领域哲学：backend membership 的 durable desired state 与 heartbeat/live/generation 等运行期 observation 必须分离。

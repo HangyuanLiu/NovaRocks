@@ -17,4 +17,4 @@
 
 //! Backend-owned validation entry point for decoded participant installs.
 
-pub(crate) use crate::native::runtime_filter_install::validate_participant_install;
+pub(crate) use crate::runtime_filter::install_decode::validate_participant_install;
