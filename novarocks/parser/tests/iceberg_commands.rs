@@ -16,7 +16,7 @@
 // under the License.
 
 use novarocks_parser::{
-    ast::{Ident, Literal, Statement, Visit},
+    ast::{DmlStatement, Ident, Literal, Statement, Visit},
     parse,
     printer::print_statement,
 };
@@ -106,13 +106,12 @@ fn malformed_owned_iceberg_commands_are_typed_errors() {
 }
 
 #[test]
-fn equality_delete_remains_outside_the_iceberg_grammar_scope() {
+fn equality_delete_is_owned_by_the_dml_grammar() {
     let sql = "ALTER TABLE t ADD EQUALITY DELETE (id) VALUES (1)";
-    let error = parse(sql).expect_err("outside T4 scope");
-    assert_eq!(
-        error.to_user_error(sql).code().as_str(),
-        "sql.parse.unexpected_token"
-    );
+    assert!(matches!(
+        statement(sql),
+        Statement::Dml(DmlStatement::AddEqualityDelete(_))
+    ));
 }
 
 #[test]
