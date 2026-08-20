@@ -25,7 +25,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use novarocks_parser::ERROR_CODE_DESCRIPTORS;
+use novarocks_frontend::DML_ERROR_CODE_DESCRIPTORS;
+use novarocks_parser::ERROR_CODE_DESCRIPTORS as PARSER_ERROR_CODE_DESCRIPTORS;
 use novarocks_user_error::{ErrorCodeDescriptor, ErrorCodeStatus, ErrorPhase};
 
 const SCHEMA_VERSION: u32 = 1;
@@ -66,7 +67,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
 }
 
 fn normalized_descriptors() -> Result<Vec<ErrorCodeDescriptor>, String> {
-    let mut descriptors = ERROR_CODE_DESCRIPTORS.to_vec();
+    let mut descriptors = PARSER_ERROR_CODE_DESCRIPTORS.to_vec();
+    descriptors.extend_from_slice(DML_ERROR_CODE_DESCRIPTORS);
     descriptors.sort_by_key(|descriptor| descriptor.code);
 
     let mut codes = HashSet::new();
