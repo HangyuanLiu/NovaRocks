@@ -34,8 +34,8 @@ use crate::planner::payload::{AggregateCall, PlanFilterNode, PlanProjectNode, Pl
 use crate::planner::table::{
     ScanSource, SqlMvTargetLocatorScan, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
 };
-use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::ConnectorTableObjectId;
+use novarocks_types::schema::ColumnDef;
 
 #[allow(
     dead_code,

@@ -137,7 +137,7 @@ mod tests {
     use crate::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
     use crate::optimizer::rewrite::trace::RewriteTraceEvent;
     use crate::planner::table::TableDef;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     struct RenameScanRule;
 

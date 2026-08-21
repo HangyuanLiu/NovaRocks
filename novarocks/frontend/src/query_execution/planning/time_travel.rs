@@ -23,7 +23,6 @@ use crate::catalog_application::resolver::{CatalogAdmission, resolve_table_targe
 use crate::query_execution::kernels::{
     DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
 };
-use novarocks_catalog::schema::ColumnDef;
 use novarocks_parser::ast::{
     Ident, ObjectName as ParserObjectName, Query, SetExpr, TableAlias, TableFactor, TableWithJoins,
 };
@@ -36,6 +35,7 @@ use novarocks_sql::planning::catalog::{
     resolve_time_travel_snapshot_binding,
 };
 use novarocks_sql::syntax::ObjectName;
+use novarocks_types::schema::ColumnDef;
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
@@ -723,28 +723,28 @@ mod tests {
         let mut table_facts = test_delta_table_facts(
             vec![],
             vec![
-                novarocks_catalog::schema::ColumnDef {
+                novarocks_types::schema::ColumnDef {
                     name: "_file".to_string(),
                     data_type: arrow::datatypes::DataType::Utf8,
                     nullable: false,
                     write_default: None,
                     logical_type: None,
                 },
-                novarocks_catalog::schema::ColumnDef {
+                novarocks_types::schema::ColumnDef {
                     name: "_pos".to_string(),
                     data_type: arrow::datatypes::DataType::Int64,
                     nullable: false,
                     write_default: None,
                     logical_type: None,
                 },
-                novarocks_catalog::schema::ColumnDef {
+                novarocks_types::schema::ColumnDef {
                     name: "_row_id".to_string(),
                     data_type: arrow::datatypes::DataType::Int64,
                     nullable: false,
                     write_default: None,
                     logical_type: None,
                 },
-                novarocks_catalog::schema::ColumnDef {
+                novarocks_types::schema::ColumnDef {
                     name: "_last_updated_sequence_number".to_string(),
                     data_type: arrow::datatypes::DataType::Int64,
                     nullable: false,

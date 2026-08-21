@@ -18,11 +18,11 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
-use novarocks_catalog::schema::{ColumnDef, ColumnDefault};
 use novarocks_frontend::dml::{
     InsertCommand, InsertCommandSource, convert_insert_command, reorder_insert_rows,
 };
 use novarocks_frontend::query_execution::dml::insert::{InsertOverwriteMode, InsertValue};
+use novarocks_types::schema::{ColumnDef, ColumnDefault};
 
 fn parse_insert(sql: &str) -> novarocks_parser::ast::Insert {
     let statements = novarocks_parser::parse(sql).expect("statement should parse");

@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod iceberg_ref;
-pub use iceberg_ref::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
-use novarocks_catalog::schema::SqlType;
+use novarocks_types::schema::SqlType;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateTableStmt {

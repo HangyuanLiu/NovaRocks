@@ -22,8 +22,8 @@
 //! outside catalog DDL, while every recognized statement either executes or
 //! returns its parser/admission error.
 
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorInstanceId};
+use novarocks_types::naming::normalize_identifier;
 use std::sync::Arc;
 
 use crate::catalog_application::create_table_ddl::build_iceberg_create_table_ddl;

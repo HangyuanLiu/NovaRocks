@@ -25,9 +25,9 @@ use crate::mv::domain::schema_validation::{
     ContractDecision, JoinContractDecision, validate_join_schema_contract, validate_schema_contract,
 };
 use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
-use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
+use novarocks_types::naming::TableIdentity;
 
 /// Validates the persisted aggregate metadata before any refresh planning or
 /// query assembly derives an aggregate refresh path.

@@ -30,12 +30,12 @@ use crate::mv::domain::persistence::definition::{
 use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target};
 use crate::mv::domain::repository::MvRepository;
 use crate::runtime::statement_result::StatementResult;
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_parser::ast::Visit;
 use novarocks_sql::syntax::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
     DropMaterializedViewStmt, MaterializedViewRefreshPolicy, ShowMaterializedViewsStmt,
 };
+use novarocks_types::naming::normalize_identifier;
 
 fn default_mv_storage_engine() -> &'static str {
     "iceberg"
@@ -405,7 +405,7 @@ pub fn list_mvs_with_backend(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn normalize_incremental_mv_base_ref(
-    base_ref: &novarocks_catalog::identifier::TableIdentity,
+    base_ref: &novarocks_types::naming::TableIdentity,
 ) -> Result<(String, String, String), String> {
     Ok((
         normalize_identifier(&base_ref.catalog)?,
@@ -420,7 +420,7 @@ fn normalize_incremental_mv_base_ref(
 )]
 pub(crate) fn validate_incremental_mv_base_ref(
     query: &novarocks_parser::ast::Query,
-    base_ref: &novarocks_catalog::identifier::TableIdentity,
+    base_ref: &novarocks_types::naming::TableIdentity,
 ) -> Result<(String, String, String), String> {
     let refs = query_three_part_table_refs(query);
     if refs.len() != 1 {
@@ -550,8 +550,8 @@ mod tests {
         query.clone()
     }
 
-    fn base_ref() -> novarocks_catalog::identifier::TableIdentity {
-        novarocks_catalog::identifier::TableIdentity {
+    fn base_ref() -> novarocks_types::naming::TableIdentity {
+        novarocks_types::naming::TableIdentity {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "t".to_string(),

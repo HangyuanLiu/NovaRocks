@@ -17,7 +17,7 @@
 
 //! Persisted Iceberg MV definition lookup and SQL identity helpers.
 
-use novarocks_catalog::identifier::TableIdentity;
+use novarocks_types::naming::TableIdentity;
 use sha2::{Digest, Sha256};
 
 use crate::mv::domain::model::MvTarget;
@@ -73,9 +73,9 @@ pub fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<TableIdentity>, S
                 ));
             };
             Ok(TableIdentity {
-                catalog: novarocks_catalog::identifier::normalize_identifier(catalog)?,
-                namespace: novarocks_catalog::identifier::normalize_identifier(namespace)?,
-                table: novarocks_catalog::identifier::normalize_identifier(table)?,
+                catalog: novarocks_types::naming::normalize_identifier(catalog)?,
+                namespace: novarocks_types::naming::normalize_identifier(namespace)?,
+                table: novarocks_types::naming::normalize_identifier(table)?,
             })
         })
         .collect()

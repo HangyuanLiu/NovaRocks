@@ -569,7 +569,7 @@ pub fn build_table_statistics(files: &[SqlManifestFileStatistics]) -> Option<Tab
 #[cfg(test)]
 pub fn build_table_statistics_with_columns(
     files: &[SqlManifestFileStatistics],
-    columns: &[novarocks_catalog::schema::ColumnDef],
+    columns: &[novarocks_types::schema::ColumnDef],
 ) -> Option<TableStatistics> {
     build_table_statistics_with_ndv(files, columns, &HashMap::new(), &HashMap::new())
 }
@@ -591,7 +591,7 @@ pub fn build_table_statistics_with_columns(
 #[cfg(test)]
 pub fn build_table_statistics_with_ndv(
     files: &[SqlManifestFileStatistics],
-    columns: &[novarocks_catalog::schema::ColumnDef],
+    columns: &[novarocks_types::schema::ColumnDef],
     ndv_by_name: &HashMap<String, f64>,
     _name_to_field_id: &HashMap<String, i32>,
 ) -> Option<TableStatistics> {
@@ -710,7 +710,7 @@ pub fn build_table_statistics_with_ndv(
 #[cfg(test)]
 pub(crate) fn build_base_table_statistics_with_ndv(
     files: &[SqlManifestFileStatistics],
-    columns: &[novarocks_catalog::schema::ColumnDef],
+    columns: &[novarocks_types::schema::ColumnDef],
     ndv_by_name: &HashMap<String, f64>,
     name_to_field_id: &HashMap<String, i32>,
 ) -> crate::optimizer::stats_input::BaseTableStatistics {
@@ -1439,7 +1439,7 @@ mod tests {
 
     #[test]
     fn build_table_statistics_decodes_int_min_max_without_using_value_count_as_ndv() {
-        use novarocks_catalog::schema::ColumnDef;
+        use novarocks_types::schema::ColumnDef;
 
         let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
@@ -1485,7 +1485,7 @@ mod tests {
 
     #[test]
     fn build_table_statistics_skips_string_bounds() {
-        use novarocks_catalog::schema::ColumnDef;
+        use novarocks_types::schema::ColumnDef;
 
         let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
@@ -1561,7 +1561,7 @@ mod tests {
 
     #[test]
     fn build_table_statistics_with_ndv_overrides_value_count_heuristic() {
-        use novarocks_catalog::schema::ColumnDef;
+        use novarocks_types::schema::ColumnDef;
 
         let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
@@ -1623,7 +1623,7 @@ mod tests {
 
     #[test]
     fn build_table_statistics_with_ndv_clamps_to_non_null_count() {
-        use novarocks_catalog::schema::ColumnDef;
+        use novarocks_types::schema::ColumnDef;
 
         let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
@@ -1707,7 +1707,7 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_keeps_puffin_ndv_without_manifest_column_stats() {
-        use novarocks_catalog::schema::ColumnDef;
+        use novarocks_types::schema::ColumnDef;
 
         let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
@@ -1758,7 +1758,7 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_marks_heuristic_ndv_missing() {
-        use novarocks_catalog::schema::ColumnDef;
+        use novarocks_types::schema::ColumnDef;
 
         let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
@@ -1830,7 +1830,7 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_marks_missing_manifest_fields_missing() {
-        use novarocks_catalog::schema::ColumnDef;
+        use novarocks_types::schema::ColumnDef;
 
         let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
@@ -1896,7 +1896,7 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_treats_non_finite_float_bounds_as_missing() {
-        use novarocks_catalog::schema::ColumnDef;
+        use novarocks_types::schema::ColumnDef;
 
         let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
@@ -1985,7 +1985,7 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_preserves_puffin_ndv() {
-        use novarocks_catalog::schema::ColumnDef;
+        use novarocks_types::schema::ColumnDef;
 
         let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
@@ -2033,7 +2033,7 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_preserves_zero_puffin_ndv() {
-        use novarocks_catalog::schema::ColumnDef;
+        use novarocks_types::schema::ColumnDef;
 
         let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),

@@ -41,7 +41,7 @@ mod tests {
     use crate::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
     };
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn add_column(
         factory: &Rc<RefCell<ColumnRefFactory>>,

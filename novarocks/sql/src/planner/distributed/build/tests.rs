@@ -54,7 +54,7 @@ use crate::planner::runtime_filter::graph::{
     RuntimeFilterGraph, RuntimeFilterGraphData,
 };
 use crate::planner::table::TableDef;
-use novarocks_catalog::schema::ColumnDef;
+use novarocks_types::schema::ColumnDef;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ActivationNeutralGraphStructure {

@@ -103,7 +103,7 @@ impl ConnectorWriteTargetBinding {
     /// overrides are all bounded neutral planning facts. Keeping this
     /// projection here avoids loading or decoding a concrete provider table in
     /// statement planning.
-    pub fn dml_target_columns(&self) -> Vec<novarocks_catalog::schema::ColumnDef> {
+    pub fn dml_target_columns(&self) -> Vec<novarocks_types::schema::ColumnDef> {
         self.metadata
             .schema
             .fields()
@@ -120,7 +120,7 @@ impl ConnectorWriteTargetBinding {
                 ) {
                     return None;
                 }
-                Some(novarocks_catalog::schema::ColumnDef {
+                Some(novarocks_types::schema::ColumnDef {
                     name: field.name().to_string(),
                     data_type: fact
                         .and_then(|fact| fact.write_target_type())

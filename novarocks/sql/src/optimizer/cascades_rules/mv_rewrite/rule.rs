@@ -678,7 +678,7 @@ mod tests {
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
     };
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
     use std::num::{NonZeroU32, NonZeroU64};
 
     // --- fixture helpers --------------------------------------------------

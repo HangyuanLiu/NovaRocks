@@ -427,8 +427,8 @@ pub struct SqlPlanScanNodeRead {
 #[derive(Clone, Debug)]
 pub struct SqlTableDefRead {
     pub name: String,
-    pub columns: Vec<novarocks_catalog::schema::ColumnDef>,
-    pub iceberg_row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub columns: Vec<novarocks_types::schema::ColumnDef>,
+    pub iceberg_row_lineage_metadata_columns: Vec<novarocks_types::schema::ColumnDef>,
     pub source: SqlScanSourceRead,
 }
 

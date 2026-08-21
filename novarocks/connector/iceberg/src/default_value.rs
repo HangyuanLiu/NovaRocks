@@ -26,8 +26,8 @@ use crate::iceberg::spec::{
 use std::sync::Arc;
 
 use bytes::Bytes;
-use novarocks_catalog::schema::{ColumnDefault, validate_column_default};
 use novarocks_spi::connector::ConnectorColumnDefault;
+use novarocks_types::schema::{ColumnDefault, validate_column_default};
 
 pub fn iceberg_literal_to_column_default(
     literal: &IcebergLiteral,
@@ -724,7 +724,7 @@ mod tests {
     use crate::iceberg::spec::{
         ListType, MapType, NestedField, PrimitiveType, Struct, StructType, Type,
     };
-    use novarocks_catalog::schema::ColumnDefault;
+    use novarocks_types::schema::ColumnDefault;
 
     fn assert_iceberg_default_round_trip(
         literal: IcebergLiteral,

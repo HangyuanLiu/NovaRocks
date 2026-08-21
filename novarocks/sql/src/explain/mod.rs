@@ -662,7 +662,7 @@ mod tests {
     use crate::planner::table::{
         ScanSource, SqlMvTargetLocatorScan, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
     };
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn empty_values_for_test() -> LogicalPlanNode {
         LogicalPlanNode::new(

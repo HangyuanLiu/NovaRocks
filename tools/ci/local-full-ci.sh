@@ -449,16 +449,6 @@ run_cargo_gates() {
     --profile "$NOVA_CI_CARGO_PROFILE" -- --test-threads=1
 }
 
-run_query_parser_differential_stage() {
-  run_fail_fast_stage "query parser differential" "query-parser-differential.log" \
-    env NO_PROXY=127.0.0.1,localhost \
-    cargo run --manifest-path tests/sql/runner/Cargo.toml \
-      --profile "$NOVA_CI_CARGO_PROFILE" -- \
-      --config "$NOVAROCKS_SQL_TEST_CONFIG" \
-      --suite all \
-      --query-parser-differential
-}
-
 run_system_scenarios_stage() {
   if [ "$SKIP_SYSTEM_SCENARIOS" = "true" ]; then
     ci_record_stage "system scenarios" "SKIP" "0" ""
@@ -1139,7 +1129,6 @@ main() {
 
   prepare_runtime
   run_cargo_gates
-  run_query_parser_differential_stage
   # System Scenarios run before the SQL suites so a topology, readiness,
   # restart, fault or cleanup break surfaces before the much longer SQL tier.
   # The stage needs no Docker fixture: every registered scenario builds its

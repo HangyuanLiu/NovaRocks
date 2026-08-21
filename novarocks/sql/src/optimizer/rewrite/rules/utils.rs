@@ -855,7 +855,7 @@ mod column_id_helper_tests {
     use crate::planner::payload::*;
     use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     // -----------------------------------------------------------------------
     // collect_column_id_refs tests

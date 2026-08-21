@@ -49,7 +49,7 @@ use crate::planner::table::sql_mv_target_state_scan;
 use crate::planner::table::{
     SqlMvTargetStatePartitionConstraint, SqlMvTargetStateRowFilter, TableDef,
 };
-use novarocks_catalog::schema::ColumnDef;
+use novarocks_types::schema::ColumnDef;
 
 pub(crate) struct RewriteAggregateStateRule;
 
@@ -234,7 +234,7 @@ pub(crate) fn build_aggregate_state_merge(
     reason = "Target-state scan facts are independently validated planner inputs; grouping them would hide their distinct contracts."
 )]
 fn target_state_old_scan(
-    target: &novarocks_catalog::identifier::TableIdentity,
+    target: &novarocks_types::naming::TableIdentity,
     target_columns: Vec<ColumnDef>,
     group_key_names: &[String],
     aggregate_state_names: &[String],
@@ -2109,7 +2109,7 @@ mod tests {
     use crate::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::planner::payload::{AggregateCall, PlanScanNode};
     use crate::planner::table::{ScanSource, TableDef};
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     #[test]
     fn signed_state_function_maps_supported_aggregates() {

@@ -460,7 +460,7 @@ mod tests {
     use crate::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
     use crate::planner::table::TableDef;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     #[test]
     fn matches_root_delta_over_aggregate_over_source_union() {

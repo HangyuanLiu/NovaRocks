@@ -3157,17 +3157,17 @@ fn json_semantic_group_by_type_name(expr: &TypedExpr) -> Option<String> {
 fn is_json_in_subquery_operand(expr: &TypedExpr, scope: &AnalyzerScope) -> bool {
     matches!(
         scope.logical_type_of_expr(expr),
-        Some(novarocks_catalog::schema::SqlType::Json)
+        Some(novarocks_types::schema::SqlType::Json)
     ) || matches!(
         json_semantic_group_by_type_name(expr).as_deref(),
         Some("json")
     )
 }
 
-fn is_bitmap_or_hll_type(sql_type: &novarocks_catalog::schema::SqlType) -> bool {
+fn is_bitmap_or_hll_type(sql_type: &novarocks_types::schema::SqlType) -> bool {
     matches!(
         sql_type,
-        novarocks_catalog::schema::SqlType::Bitmap | novarocks_catalog::schema::SqlType::Hll
+        novarocks_types::schema::SqlType::Bitmap | novarocks_types::schema::SqlType::Hll
     )
 }
 
@@ -4905,7 +4905,7 @@ mod tests {
             }
             let planner = crate::planner::table::TableDef {
                 name: table.to_string(),
-                columns: vec![novarocks_catalog::schema::ColumnDef {
+                columns: vec![novarocks_types::schema::ColumnDef {
                     name: "offset".to_string(),
                     data_type: DataType::Int64,
                     nullable: false,

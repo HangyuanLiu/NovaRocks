@@ -23,7 +23,6 @@ use std::time::{Duration, Instant};
 use arrow::datatypes::DataType;
 use bytes::Bytes;
 use common::coordination_fixture::JournalInspect;
-use novarocks_catalog::schema::ColumnDef;
 use novarocks_frontend::FrontendStatisticsService;
 use novarocks_frontend::common::admitted_query_context::{RequestAdmission, RequestContext};
 use novarocks_frontend::common::backend_topology::BackendTopologySnapshot;
@@ -51,6 +50,7 @@ use novarocks_spi::connector::{
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use novarocks_types::ClusterRole;
+use novarocks_types::schema::ColumnDef;
 use uuid::Uuid;
 
 mod common;

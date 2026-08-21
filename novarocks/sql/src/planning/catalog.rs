@@ -24,13 +24,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::planner::table::TableDef;
-use novarocks_catalog::identifier::TableIdentity;
-use novarocks_catalog::memory::MemoryCatalogEntry;
-use novarocks_catalog::table::CatalogTable;
 use novarocks_parser::ast::{Query, TableVersion};
 #[cfg(test)]
 use novarocks_parser::ast::{SetExpr, Statement, TableFactor};
+use novarocks_types::naming::TableIdentity;
+use novarocks_types::schema::{CatalogTable, ColumnDef};
 
+pub use crate::catalog::memory::PlannerMemoryCatalog;
 pub use crate::catalog::{
     IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable, TableLookupMode,
 };
@@ -251,8 +251,8 @@ pub struct ConnectorReadTableFacts {
     pub catalog: String,
     pub namespace: String,
     pub table: String,
-    pub columns: Vec<novarocks_catalog::schema::ColumnDef>,
-    pub iceberg_row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub columns: Vec<ColumnDef>,
+    pub iceberg_row_lineage_metadata_columns: Vec<ColumnDef>,
     pub schema: arrow::datatypes::SchemaRef,
     pub binding: crate::binding::SqlTableBindingId,
     pub selector: novarocks_spi::connector::ConnectorReadSelector,
@@ -421,7 +421,7 @@ impl SqlCatalogIdentityFacts {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqlCatalogStatisticsFacts {
     label: String,
-    columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    columns: Vec<ColumnDef>,
 }
 
 impl SqlCatalogStatisticsFacts {
@@ -429,7 +429,7 @@ impl SqlCatalogStatisticsFacts {
         &self.label
     }
 
-    pub fn columns(&self) -> &[novarocks_catalog::schema::ColumnDef] {
+    pub fn columns(&self) -> &[ColumnDef] {
         &self.columns
     }
 }
@@ -567,8 +567,8 @@ pub fn resolved_metadata_table(
     namespace: &str,
     table: &str,
     metadata_table_type: MetadataTableKind,
-    columns: Vec<novarocks_catalog::schema::ColumnDef>,
-    iceberg_row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    columns: Vec<ColumnDef>,
+    iceberg_row_lineage_metadata_columns: Vec<ColumnDef>,
     binding: crate::binding::SqlTableBindingId,
 ) -> crate::catalog::ResolvedAnalyzerTable {
     use crate::planner::table::{
@@ -603,7 +603,7 @@ pub fn resolve_local_catalog_table(
     database: &str,
     table: &str,
 ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
-    let planner = catalog.get(database, table)?.0;
+    let planner = catalog.get(database, table)?;
     Ok(crate::catalog::ResolvedAnalyzerTable::from_planner(
         Some("default_catalog"),
         database,
@@ -613,9 +613,7 @@ pub fn resolve_local_catalog_table(
 
 /// Read the neutral catalog schema carried by an opaque analyzer
 /// materialization. This never exposes the SQL planner table or scan graph.
-pub fn catalog_table(
-    materialization: &crate::catalog::ResolvedAnalyzerTable,
-) -> novarocks_catalog::table::CatalogTable {
+pub fn catalog_table(materialization: &crate::catalog::ResolvedAnalyzerTable) -> CatalogTable {
     materialization.catalog.clone()
 }
 
@@ -625,10 +623,9 @@ pub fn local_catalog_table(
     catalog: &PlannerMemoryCatalog,
     database: &str,
     table: &str,
-) -> Result<novarocks_catalog::table::CatalogTable, String> {
-    Ok(catalog
-        .get(database, table)?
-        .to_catalog_table("default_catalog", database))
+) -> Result<CatalogTable, String> {
+    let planner = catalog.get(database, table)?;
+    Ok(local_catalog_table_from_planner(database, planner))
 }
 
 /// Return the request-local binding token carried by an opaque analyzer
@@ -657,43 +654,13 @@ pub fn frozen_input_snapshot_id(
     }
 }
 
-/// Opaque local-catalog entry.  Only SQL may inspect the enclosed planner
-/// definition; application code can hold the catalog and request neutral facts
-/// through this module.
-impl MemoryCatalogEntry for TableDef {
-    fn table_name(&self) -> &str {
-        &self.name
-    }
-
-    fn to_catalog_table(&self, _catalog: &str, database: &str) -> CatalogTable {
-        CatalogTable {
-            identity: TableIdentity::new("default_catalog", database, &self.name),
-            columns: self.columns.clone(),
-            hidden_columns: self.iceberg_row_lineage_metadata_columns.clone(),
-        }
+fn local_catalog_table_from_planner(database: &str, planner: TableDef) -> CatalogTable {
+    CatalogTable {
+        identity: TableIdentity::new("default_catalog", database, &planner.name),
+        columns: planner.columns,
+        hidden_columns: planner.iceberg_row_lineage_metadata_columns,
     }
 }
-
-#[derive(Clone, Debug)]
-pub struct SqlLocalCatalogEntry(TableDef);
-
-impl MemoryCatalogEntry for SqlLocalCatalogEntry {
-    fn table_name(&self) -> &str {
-        &self.0.name
-    }
-
-    fn to_catalog_table(
-        &self,
-        catalog: &str,
-        database: &str,
-    ) -> novarocks_catalog::table::CatalogTable {
-        self.0.to_catalog_table(catalog, database)
-    }
-}
-
-/// The local catalog is a neutral in-memory catalog whose planner entries are
-/// opaque outside SQL.
-pub type PlannerMemoryCatalog = novarocks_catalog::memory::MemoryCatalog<SqlLocalCatalogEntry>;
 
 /// Register one closed connector-read relation for an application behavior
 /// test. The fixture keeps the `TableDef` and scan-source construction inside
@@ -704,18 +671,18 @@ pub fn register_test_connector_read_table(
     catalog: &mut PlannerMemoryCatalog,
     database: &str,
     table: &str,
-    columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    columns: Vec<ColumnDef>,
 ) -> Result<(), String> {
     catalog.register(
         database,
-        SqlLocalCatalogEntry(TableDef {
+        TableDef {
             name: table.to_string(),
             columns,
             iceberg_row_lineage_metadata_columns: Vec::new(),
             source: crate::planner::table::test_sql_scan_source(
                 crate::planner::table::SqlScanKind::ConnectorRead,
             ),
-        }),
+        },
     )
 }
 
@@ -729,8 +696,8 @@ pub struct SqlTestDeltaTableFacts(TableDef);
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn test_delta_table_facts(
-    columns: Vec<novarocks_catalog::schema::ColumnDef>,
-    iceberg_row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    columns: Vec<ColumnDef>,
+    iceberg_row_lineage_metadata_columns: Vec<ColumnDef>,
 ) -> SqlTestDeltaTableFacts {
     SqlTestDeltaTableFacts(TableDef {
         name: "test_delta_table".to_string(),
@@ -747,20 +714,17 @@ pub fn test_delta_table_facts(
 #[cfg(any(test, feature = "test-support"))]
 impl SqlTestDeltaTableFacts {
     #[doc(hidden)]
-    pub fn columns(&self) -> &[novarocks_catalog::schema::ColumnDef] {
+    pub fn columns(&self) -> &[ColumnDef] {
         &self.0.columns
     }
 
     #[doc(hidden)]
-    pub fn iceberg_row_lineage_metadata_columns(&self) -> &[novarocks_catalog::schema::ColumnDef] {
+    pub fn iceberg_row_lineage_metadata_columns(&self) -> &[ColumnDef] {
         &self.0.iceberg_row_lineage_metadata_columns
     }
 
     #[doc(hidden)]
-    pub fn push_iceberg_row_lineage_metadata_column(
-        &mut self,
-        column: novarocks_catalog::schema::ColumnDef,
-    ) {
+    pub fn push_iceberg_row_lineage_metadata_column(&mut self, column: ColumnDef) {
         self.0.iceberg_row_lineage_metadata_columns.push(column);
     }
 }
@@ -816,7 +780,7 @@ mod tests {
             catalog: "ice".to_string(),
             namespace: "analytics".to_string(),
             table: "orders".to_string(),
-            columns: vec![novarocks_catalog::schema::ColumnDef {
+            columns: vec![ColumnDef {
                 name: "order_id".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
@@ -889,7 +853,7 @@ mod tests {
             &mut catalog,
             "analytics",
             "orders",
-            vec![novarocks_catalog::schema::ColumnDef {
+            vec![ColumnDef {
                 name: "order_id".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,

@@ -17,11 +17,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::{
     ConnectorChangeWindowAdmission, ConnectorChangeWindowFullRebuildReason,
     ConnectorChangeWindowReplaceFailure, ConnectorTableObjectId,
 };
+use novarocks_types::naming::TableIdentity;
 
 pub struct NonJoinBaseChange<'a> {
     pub base_ref: &'a TableIdentity,

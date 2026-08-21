@@ -528,7 +528,7 @@ mod tests {
     use crate::planner::table::{
         SqlMvTargetStatePartitionConstraint, SqlMvTargetStateRowFilter, SqlTableIdentity, TableDef,
     };
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn output_column(id: u32, name: &str, data_type: DataType, is_internal: bool) -> OutputColumn {
         OutputColumn {

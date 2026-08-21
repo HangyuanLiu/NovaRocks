@@ -23,7 +23,6 @@ use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::repository::MvRepository;
 use crate::runtime::statement_result::StatementResult;
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_parser::Span;
 use novarocks_parser::ast::{
     CallStatement, Literal, LiteralKind, MaterializedViewAlterAction as TypedAlterAction,
@@ -39,6 +38,7 @@ use novarocks_sql::syntax::{
     MaterializedViewDistribution as SyntaxMaterializedViewDistribution,
     MaterializedViewRefreshPolicy, RefreshMaterializedViewStmt, ShowMaterializedViewsStmt,
 };
+use novarocks_types::naming::normalize_identifier;
 
 use super::FrontendMvService;
 use crate::mv::domain::refresh::resolve_refresh_mv_target;

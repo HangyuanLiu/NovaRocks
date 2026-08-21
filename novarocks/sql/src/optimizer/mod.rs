@@ -996,7 +996,7 @@ mod is_known_rule_name_tests {
     use crate::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
     };
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
     use std::num::{NonZeroU32, NonZeroU64};
 
     use crate::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarNode};
@@ -1475,7 +1475,7 @@ mod is_known_rule_name_tests {
         use crate::optimizer::property::DistributionSpec;
         use crate::planner::logical::LogicalPlanKind;
         use crate::planner::table::TableDef;
-        use novarocks_catalog::schema::ColumnDef;
+        use novarocks_types::schema::ColumnDef;
 
         struct MinimalCatalog;
         impl MinimalCatalog {
@@ -1569,7 +1569,7 @@ mod is_known_rule_name_tests {
         use crate::optimizer::operator::Operator;
         use crate::optimizer::optimized_tree::OptimizedOperatorNode;
         use crate::planner::table::TableDef;
-        use novarocks_catalog::schema::ColumnDef;
+        use novarocks_types::schema::ColumnDef;
 
         struct RankingCatalog;
         impl RankingCatalog {
@@ -1705,7 +1705,7 @@ mod is_known_rule_name_tests {
         use crate::catalog::PlannerTableProvider;
         use crate::column_id::ColumnRefFactory;
         use crate::planner::table::TableDef;
-        use novarocks_catalog::schema::ColumnDef;
+        use novarocks_types::schema::ColumnDef;
 
         // Minimal catalog providing t1(k1, k2) and t2(k1, k2) — the same
         // shape the planner and analyzer test modules use.

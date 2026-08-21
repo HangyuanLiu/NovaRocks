@@ -312,7 +312,7 @@ mod tests {
     use crate::planner::table::{
         SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
     };
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
     use std::num::{NonZeroU32, NonZeroU64};
 
     fn scan_source(table: &str, kind: SqlScanKind) -> ScanSource {

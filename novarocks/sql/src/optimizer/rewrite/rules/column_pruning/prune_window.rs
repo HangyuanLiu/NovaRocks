@@ -202,7 +202,7 @@ mod tests {
     use crate::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
     use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
     use std::collections::HashSet;
 
     fn ctx() -> RewriteContext {

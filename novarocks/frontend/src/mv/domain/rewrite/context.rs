@@ -32,7 +32,6 @@ use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::persistence::schema as mv_schema;
 use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
 use mv_schema::MvSchemaContract;
-use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::compiler::{
@@ -52,6 +51,7 @@ use novarocks_sql::planning::mv::{
     extract_aggregate_sql_calls,
 };
 use novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout;
+use novarocks_types::naming::TableIdentity;
 
 /// Read-only metadata that drives Iceberg MV refresh rewrite.
 ///
@@ -549,11 +549,11 @@ fn aggregate_function_kind(
 
 fn sql_target_columns(
     target_schema: &arrow::datatypes::Schema,
-) -> Vec<novarocks_catalog::schema::ColumnDef> {
+) -> Vec<novarocks_types::schema::ColumnDef> {
     target_schema
         .fields()
         .iter()
-        .map(|field| novarocks_catalog::schema::ColumnDef {
+        .map(|field| novarocks_types::schema::ColumnDef {
             name: field.name().clone(),
             data_type: field.data_type().clone(),
             nullable: field.is_nullable(),
@@ -1005,10 +1005,10 @@ pub(crate) mod tests_support {
         MvSchemaContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,
         TargetContract, TargetVisibleColumn,
     };
-    use novarocks_catalog::identifier::TableIdentity;
     use novarocks_sql::planning::mv::{
         MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME, SqlMvApplyKeySourceFacts,
     };
+    use novarocks_types::naming::TableIdentity;
 
     use super::*;
 
@@ -1356,10 +1356,10 @@ mod tests {
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         BranchIdColumnContract, BranchUnionContract, MvPartitionContract,
     };
-    use novarocks_catalog::identifier::TableIdentity;
     use novarocks_sql::{
         binding::SqlTableBindingAllocator, planning::mv::SqlMvApplyKeySourceFacts,
     };
+    use novarocks_types::naming::TableIdentity;
 
     const BRANCH_ID_COLUMN_NAME: &str = "__branch_id__";
 

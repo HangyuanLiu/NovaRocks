@@ -50,7 +50,7 @@ use crate::planner::table::{
 use crate::planner::vocabulary::{
     BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
-use novarocks_catalog::schema::ColumnDef;
+use novarocks_types::schema::ColumnDef;
 
 pub(crate) struct InjectTargetLocatorJoinRule {
     checked_root: AtomicBool,

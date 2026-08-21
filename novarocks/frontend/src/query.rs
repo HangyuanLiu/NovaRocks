@@ -56,10 +56,9 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use novarocks_catalog::identifier::normalize_identifier;
-use novarocks_catalog::memory::DEFAULT_DATABASE;
 use novarocks_parser::ast::{self, Fold, Statement as ParsedStatement};
 use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_types::naming::{DEFAULT_DATABASE, normalize_identifier};
 use novarocks_types::{ClusterRole, EngineErrorCode};
 use novarocks_user_error::UserError;
 use tokio::task;
@@ -1631,7 +1630,7 @@ mod tests {
         MutationEngine, MutationPrepared, MutationStageOutcome, PrepareMutationRequest,
         PreparedMutation,
     };
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn default_query_options() -> QueryOptions {
         QueryOptions::parse(novarocks_protocol::novarocks::QueryOptions::default())

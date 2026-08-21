@@ -29,8 +29,8 @@ use crate::statistics_jobs::application::{
     StatisticsApplicationCommand, StatisticsApplicationPort, StatisticsApplicationResult,
     StatisticsColumnIntent, StatisticsTableTarget,
 };
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_parser::ast::{AnalyzeMode, StatisticsStatement};
+use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone)]
 pub struct StatisticsCommandExecutor {

@@ -25,12 +25,12 @@ use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
 
-use novarocks_catalog::identifier::normalize_identifier;
-use novarocks_catalog::schema::ColumnDef;
 use novarocks_sql::syntax::{
     AggregateLiteralKey, ColumnAggregation, Literal, TableKeyDesc, TableKeyKind,
     aggregate_literal_key, compare_aggregate_literals, literal_from_batch,
 };
+use novarocks_types::naming::normalize_identifier;
+use novarocks_types::schema::ColumnDef;
 
 #[allow(
     dead_code,

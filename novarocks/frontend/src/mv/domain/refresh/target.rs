@@ -23,10 +23,10 @@ use crate::mv::domain::refresh::target_binding::{
     MvTargetBinding, load_mv_target_binding_with_ports,
 };
 use crate::mv::domain::repository::MvTarget;
-use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
 use novarocks_parser::ast::ObjectName;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
+use novarocks_types::naming::{TableIdentity, normalize_identifier};
 
 /// A normalized Iceberg MV target identity.  Refresh planning and the domain
 /// persistence paths share this value without acquiring query assembly state.

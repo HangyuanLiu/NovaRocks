@@ -23,12 +23,12 @@ use crate::common::persisted_query_definition::PersistedQueryDefinition;
 use crate::state_store::metrics::StateStoreMetrics;
 use crate::state_store::{OperationId, RunFailure, run_side_effect_free};
 use bytes::Bytes;
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_parser::ast::Statement;
 use novarocks_spi::state_store::{
     Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore,
     StateStoreLimits, Value, WriteTransaction,
 };
+use novarocks_types::naming::normalize_identifier;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::runtime::Handle;

@@ -21,8 +21,8 @@ use crate::mv::domain::model::{AffectedTargetPartitions, MvStorageEngine, MvTarg
 use crate::mv::domain::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision, decide_refresh,
 };
-use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::ConnectorTableObjectId;
+use novarocks_types::naming::TableIdentity;
 
 pub(crate) struct RefreshPlanningInput<'a> {
     pub(crate) snapshot_policy: BaseSnapshotPolicy,
@@ -97,8 +97,8 @@ mod tests {
     use crate::mv::domain::refresh::snapshot::{
         BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
     };
-    use novarocks_catalog::identifier::TableIdentity;
     use novarocks_spi::connector::ConnectorTableObjectId;
+    use novarocks_types::naming::TableIdentity;
 
     fn object_id(value: &str) -> ConnectorTableObjectId {
         ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(value.as_bytes()))

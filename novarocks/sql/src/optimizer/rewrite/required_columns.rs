@@ -1003,7 +1003,7 @@ mod tests {
     use crate::optimizer::scalar::{ScalarArena, SortKey};
     use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -2567,7 +2567,7 @@ mod tests {
                 database: "db".to_string(),
                 table: crate::planner::table::TableDef {
                     name: "t".to_string(),
-                    columns: vec![novarocks_catalog::schema::ColumnDef {
+                    columns: vec![novarocks_types::schema::ColumnDef {
                         name: "a".to_string(),
                         data_type: arrow::datatypes::DataType::Int32,
                         nullable: false,

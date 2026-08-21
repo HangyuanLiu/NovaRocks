@@ -54,7 +54,7 @@ fn write_commit_has_files(write_commit: &crate::query_execution::write::WriteCom
     reason = "Retained for staged query-execution DML recovery and connector wiring."
 )]
 fn row_lineage_input_request(
-    columns: &[novarocks_catalog::schema::ColumnDef],
+    columns: &[novarocks_types::schema::ColumnDef],
 ) -> novarocks_spi::connector::ConnectorWriteInputRequest {
     use novarocks_spi::connector::{ConnectorWriteFieldRequest, ConnectorWriteInputRequest};
 
@@ -115,7 +115,7 @@ fn deletion_vector_input_request() -> novarocks_spi::connector::ConnectorWriteIn
     reason = "Retained for staged query-execution DML recovery and connector wiring."
 )]
 fn data_input_request(
-    columns: &[novarocks_catalog::schema::ColumnDef],
+    columns: &[novarocks_types::schema::ColumnDef],
 ) -> novarocks_spi::connector::ConnectorWriteInputRequest {
     use novarocks_spi::connector::{ConnectorWriteFieldRequest, ConnectorWriteInputRequest};
 
@@ -582,7 +582,7 @@ pub(crate) struct PreparedUpdateMutation {
     pub(crate) stmt: PreparedUpdateStatement,
     pub(crate) current_catalog: Option<String>,
     pub(crate) target: crate::catalog_application::resolver::TargetBackend,
-    pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub(crate) target_columns: Vec<novarocks_types::schema::ColumnDef>,
     pub(crate) target_ref: String,
     /// Exact Provider schema that belongs to the opaque preparation table.
     /// COW match materialization scans this schema through the retained lease;
@@ -629,7 +629,7 @@ pub(crate) struct PreparedMergeMutation {
     pub(crate) stmt: PreparedMergeStatement,
     pub(crate) current_catalog: Option<String>,
     pub(crate) target: crate::catalog_application::resolver::TargetBackend,
-    pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub(crate) target_columns: Vec<novarocks_types::schema::ColumnDef>,
     pub(crate) target_ref: String,
     /// See [`PreparedUpdateMutation::match_target_schema`].
     pub(crate) match_target_schema: arrow::datatypes::SchemaRef,
@@ -788,12 +788,12 @@ fn cow_selection_from_query_result(
 
 fn cow_target_columns(
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
-) -> Vec<novarocks_catalog::schema::ColumnDef> {
+) -> Vec<novarocks_types::schema::ColumnDef> {
     preparation
         .match_contract()
         .after_fields()
         .iter()
-        .map(|field| novarocks_catalog::schema::ColumnDef {
+        .map(|field| novarocks_types::schema::ColumnDef {
             name: field.field().name().to_string(),
             data_type: field.field().data_type().clone(),
             nullable: field.field().is_nullable(),
@@ -1530,7 +1530,7 @@ fn build_update_mor_change_stream_write_plan(
     target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &PreparedUpdateStatement,
     current_catalog: Option<&str>,
-    target_columns: &[novarocks_catalog::schema::ColumnDef],
+    target_columns: &[novarocks_types::schema::ColumnDef],
     target_ref: &str,
     new_sequence_number: i64,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
@@ -1587,7 +1587,7 @@ fn build_update_mor_change_stream_write_plan(
 
 fn update_assignment_projection_sql(
     assignments: &[PreparedMutationAssignment],
-    target_columns: &[novarocks_catalog::schema::ColumnDef],
+    target_columns: &[novarocks_types::schema::ColumnDef],
 ) -> Result<Vec<(String, String)>, String> {
     assignments
         .iter()
@@ -2142,7 +2142,7 @@ fn selection_value_sql(
         .get(field_ordinal as usize)
         .ok_or_else(|| "COW selection field ordinal is out of bounds".to_string())?;
     let literal = novarocks_sql::syntax::literal_from_batch(array, view.row_index())?;
-    let column = novarocks_catalog::schema::ColumnDef {
+    let column = novarocks_types::schema::ColumnDef {
         name: field.name().to_string(),
         data_type: field.data_type().clone(),
         nullable: field.is_nullable(),
@@ -2192,7 +2192,7 @@ fn build_cow_append_query(
             let field = fields
                 .get(&input.token())
                 .ok_or_else(|| "COW append route token has no signed field".to_string())?;
-            let column = novarocks_catalog::schema::ColumnDef {
+            let column = novarocks_types::schema::ColumnDef {
                 name: field.name().to_string(),
                 data_type: field.data_type().clone(),
                 nullable: field.is_nullable(),
@@ -2321,7 +2321,7 @@ fn build_cow_rewrite_query(
         } else {
             scan_value
         };
-        let column = novarocks_catalog::schema::ColumnDef {
+        let column = novarocks_types::schema::ColumnDef {
             name: field.name().to_string(),
             data_type: field.data_type().clone(),
             nullable: field.is_nullable(),
@@ -3227,7 +3227,7 @@ fn required_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a ArrayRe
 
 fn validate_update_assignments(
     assignments: &[PreparedMutationAssignment],
-    target_columns: &[novarocks_catalog::schema::ColumnDef],
+    target_columns: &[novarocks_types::schema::ColumnDef],
     partition_columns: &[String],
 ) -> Result<(), String> {
     let target_names = target_columns
@@ -3625,7 +3625,7 @@ impl std::ops::Deref for MergeInsertColumns {
 
 fn resolve_merge_insert_columns(
     action: &PreparedMergeNotMatchedAction,
-    target_columns: &[novarocks_catalog::schema::ColumnDef],
+    target_columns: &[novarocks_types::schema::ColumnDef],
 ) -> Result<MergeInsertColumns, String> {
     let target_names_lower: Vec<String> = target_columns
         .iter()
@@ -3734,7 +3734,7 @@ impl MergeMatchRows {
     )]
     fn unmatched_insert_batch(
         &self,
-        target_columns: &[novarocks_catalog::schema::ColumnDef],
+        target_columns: &[novarocks_types::schema::ColumnDef],
         insert_columns: &MergeInsertColumns,
     ) -> Result<RecordBatch, String> {
         let target_arrow_schema = arrow::datatypes::Schema::new(
@@ -3829,7 +3829,7 @@ fn materialize_merge_match(
     target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &PreparedMergeStatement,
     current_catalog: Option<&str>,
-    target_columns: &[novarocks_catalog::schema::ColumnDef],
+    target_columns: &[novarocks_types::schema::ColumnDef],
     insert_columns: Option<&[MergeInsertColumn]>,
     _target_ref: &str,
     _match_target_schema: &arrow::datatypes::SchemaRef,
@@ -4102,7 +4102,7 @@ fn build_merge_mor_change_stream_write_plan(
     target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &PreparedMergeStatement,
     current_catalog: Option<&str>,
-    target_columns: &[novarocks_catalog::schema::ColumnDef],
+    target_columns: &[novarocks_types::schema::ColumnDef],
     insert_columns: Option<&[MergeInsertColumn]>,
     target_ref: &str,
     new_sequence_number: i64,
@@ -4291,7 +4291,7 @@ fn build_merge_match_query_sql(
     on_sql: &str,
     matched_predicate_sql: Option<&str>,
     not_matched_predicate_sql: Option<&str>,
-    target_columns: &[novarocks_catalog::schema::ColumnDef],
+    target_columns: &[novarocks_types::schema::ColumnDef],
     matched_assignments_sql: &[(&str, &str)],
     insert_values_sql: &[(&str, &str)],
     matched_action: Option<i32>,
@@ -4392,7 +4392,7 @@ fn build_merge_unmatched_insert_query(
     target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &PreparedMergeStatement,
     current_catalog: Option<&str>,
-    target_columns: &[novarocks_catalog::schema::ColumnDef],
+    target_columns: &[novarocks_types::schema::ColumnDef],
     insert_columns: &MergeInsertColumns,
 ) -> Result<novarocks_parser::ast::Query, String> {
     let target_alias = stmt
@@ -4466,7 +4466,7 @@ fn build_merge_unmatched_insert_query(
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn test_dml_kernel() -> DmlExecutionKernel {
         let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =

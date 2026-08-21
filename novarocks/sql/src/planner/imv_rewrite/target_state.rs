@@ -19,7 +19,7 @@ use crate::binding::SqlTableBindingId;
 use crate::planner::table::{
     ScanSource, SqlMvTargetStateScan, SqlScanKind, SqlScanSource, SqlTableIdentity,
 };
-use novarocks_catalog::schema::ColumnDef;
+use novarocks_types::schema::ColumnDef;
 
 #[expect(
     clippy::too_many_arguments,

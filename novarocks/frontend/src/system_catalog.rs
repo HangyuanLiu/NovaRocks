@@ -28,7 +28,7 @@ use crate::catalog_application::system_catalog::{
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks_catalog::schema::ColumnDef;
+use novarocks_types::schema::ColumnDef;
 
 const INFORMATION_SCHEMA_DB: &str = "information_schema";
 

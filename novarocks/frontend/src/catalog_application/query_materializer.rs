@@ -917,12 +917,9 @@ mod tests {
                 .is_none(),
             "analysis-only overlays do not manufacture a provider read handle"
         );
+        let local = service.local().read().expect("catalog read");
         assert!(
-            service
-                .local()
-                .read()
-                .expect("catalog read")
-                .get("db", "__nr_cow_orders")
+            novarocks_sql::planning::catalog::local_catalog_table(&local, "db", "__nr_cow_orders")
                 .is_err()
         );
     }

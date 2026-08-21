@@ -23,7 +23,7 @@ use arrow::datatypes::DataType;
 
 use crate::analysis::LambdaParam;
 use crate::column_id::{ColumnId, ColumnRefFactory};
-use novarocks_catalog::schema::ColumnDef;
+use novarocks_types::schema::ColumnDef;
 
 /// Tracks column names and types visible at the current query level.
 /// Similar to `ExprScope` in `resolve.rs` but without physical binding
@@ -58,8 +58,8 @@ pub(super) struct AnalyzerScope {
     /// consults this side-table to reject or special-case semantics that
     /// depend on the original StarRocks logical type. Keyed by lower-cased
     /// (qualifier, column) and the unqualified column name.
-    qualified_logical_types: HashMap<(String, String), novarocks_catalog::schema::SqlType>,
-    unqualified_logical_types: HashMap<String, novarocks_catalog::schema::SqlType>,
+    qualified_logical_types: HashMap<(String, String), novarocks_types::schema::SqlType>,
+    unqualified_logical_types: HashMap<String, novarocks_types::schema::SqlType>,
 }
 
 impl AnalyzerScope {
@@ -89,7 +89,7 @@ impl AnalyzerScope {
         &self,
         qualifier: Option<&str>,
         name: &str,
-    ) -> Option<novarocks_catalog::schema::SqlType> {
+    ) -> Option<novarocks_types::schema::SqlType> {
         let name_lower = name.to_lowercase();
         if let Some(q) = qualifier
             && let Some(t) = self
@@ -108,7 +108,7 @@ impl AnalyzerScope {
     pub(super) fn logical_type_of_expr(
         &self,
         expr: &crate::analysis::TypedExpr,
-    ) -> Option<novarocks_catalog::schema::SqlType> {
+    ) -> Option<novarocks_types::schema::SqlType> {
         if let crate::analysis::ExprKind::ColumnRef {
             qualifier, column, ..
         } = &expr.kind
@@ -369,7 +369,7 @@ impl AnalyzerScope {
     pub(super) fn add_iceberg_metadata_columns(
         &mut self,
         qualifier: &str,
-        columns: &[novarocks_catalog::schema::ColumnDef],
+        columns: &[novarocks_types::schema::ColumnDef],
     ) -> Vec<crate::column_id::ColumnId> {
         let q_lower = qualifier.to_lowercase();
         let mut ids = Vec::with_capacity(columns.len());
@@ -401,7 +401,7 @@ impl AnalyzerScope {
     pub(super) fn add_iceberg_metadata_columns_with_ids(
         &mut self,
         qualifier: &str,
-        columns: &[novarocks_catalog::schema::ColumnDef],
+        columns: &[novarocks_types::schema::ColumnDef],
         column_ids: &[crate::column_id::ColumnId],
     ) {
         assert_eq!(
@@ -771,7 +771,7 @@ fn reserved_name_error(name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn test_factory() -> Rc<RefCell<ColumnRefFactory>> {
         Rc::new(RefCell::new(ColumnRefFactory::new()))

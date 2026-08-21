@@ -20,8 +20,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
+use novarocks_types::naming::TableIdentity;
 
 use crate::catalog_application::query_bindings::{
     MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,

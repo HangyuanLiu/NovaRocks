@@ -490,7 +490,7 @@ fn resolved_external_view(
 }
 
 fn view_type_name(data_type: &arrow::datatypes::DataType) -> Result<TypeName, String> {
-    use novarocks_catalog::schema::SqlType;
+    use novarocks_types::schema::SqlType;
 
     fn span() -> Span {
         Span::new(0, 0)

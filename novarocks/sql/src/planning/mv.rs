@@ -265,7 +265,7 @@ mod refresh_property_facade_tests {
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
     };
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn parse_query(sql: &str) -> Query {
         let statements = novarocks_parser::parse(sql).expect("parse query");
@@ -588,7 +588,7 @@ mod refresh_property_facade_tests {
         assert_eq!(apply_key.name, MV_HIDDEN_APPLY_KEY_COLUMN_NAME);
         assert_eq!(
             apply_key.data_type,
-            novarocks_catalog::schema::SqlType::BigInt
+            novarocks_types::schema::SqlType::BigInt
         );
         assert!(!apply_key.nullable);
 
@@ -1146,7 +1146,7 @@ impl SqlMvAggregateCallFacts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqlMvInternalTargetColumnFacts {
     pub name: String,
-    pub data_type: novarocks_catalog::schema::SqlType,
+    pub data_type: novarocks_types::schema::SqlType,
     pub nullable: bool,
 }
 
@@ -1160,7 +1160,7 @@ pub enum SqlMvInternalTargetColumn {
 pub fn mv_internal_target_column(
     kind: SqlMvInternalTargetColumn,
 ) -> SqlMvInternalTargetColumnFacts {
-    use novarocks_catalog::schema::SqlType;
+    use novarocks_types::schema::SqlType;
 
     match kind {
         SqlMvInternalTargetColumn::ApplyKey => SqlMvInternalTargetColumnFacts {
@@ -1551,7 +1551,7 @@ pub fn strip_catalog_from_three_part_names(query: &mut novarocks_parser::ast::Qu
 /// value to its execution contract; it never receives an analyzer tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqlImvRefreshContractFacts {
-    pub base_refs: Vec<novarocks_catalog::identifier::TableIdentity>,
+    pub base_refs: Vec<novarocks_types::naming::TableIdentity>,
     pub apply_key: SqlImvApplyKeyFacts,
     pub aggregate: Option<SqlImvAggregateFacts>,
     pub join: Option<SqlImvJoinFacts>,
@@ -4445,7 +4445,7 @@ use crate::analysis::{
     SetOpKind, SortItem, TypedExpr,
 };
 use crate::planner::table::ScanSource;
-use novarocks_catalog::identifier::TableIdentity;
+use novarocks_types::naming::TableIdentity;
 
 /// The row-identity contract synthesized for a refresh fragment. This describes
 /// *what a single output row is identified by* so the apply path can compute a

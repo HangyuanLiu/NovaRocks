@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
 
-use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_types::naming::normalize_identifier;
 
 use crate::catalog_cache::IcebergDataFilesCache;
 use crate::catalog_config::IcebergCatalogConfiguration;

@@ -24,13 +24,13 @@ use novarocks_spi::connector::{
 };
 
 use crate::catalog_application::query_bindings::QueryScanMaterialization;
-use novarocks_catalog::schema::ColumnDef;
 use novarocks_protocol::lifecycle::ScanRangeParams;
 use novarocks_sql::plan_read::ColumnId;
 use novarocks_sql::plan_read::FragmentId;
 use novarocks_sql::plan_read::OutputColumn;
 use novarocks_sql::plan_read::PlanScanNode;
 use novarocks_sql::plan_read::TypedExpr;
+use novarocks_types::schema::ColumnDef;
 
 pub(crate) trait ScanBindingResolver: Send + Sync {
     fn resolve_scan(
@@ -459,7 +459,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use novarocks_catalog::schema::SqlType;
+    use novarocks_types::schema::SqlType;
 
     #[test]
     fn resolver_trait_object_is_send_and_sync() {

@@ -161,7 +161,7 @@ mod tests {
     use crate::optimizer::scalar::{self, ScalarArena, ScalarNode};
     use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::rc::Rc;

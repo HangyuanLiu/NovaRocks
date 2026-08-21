@@ -48,7 +48,6 @@ FORBIDDEN_PROVIDER_CLOSURE = {
 ALLOWED_PROVIDER_INTERNAL = {
     "novarocks-fs",
     "novarocks-spi",
-    "novarocks-catalog",
     "novarocks-types",
 }
 

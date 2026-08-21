@@ -290,7 +290,7 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Arc<crate::mv::domain::rewrite::context::IcebergMvRewriteContext>, String> {
     let target_identity =
-        novarocks_catalog::identifier::TableIdentity {
+        novarocks_types::naming::TableIdentity {
             catalog: facts.mv_definition.target_catalog.clone().ok_or_else(|| {
                 "MV first-refresh logical artifact target has no connector catalog".to_string()
             })?,

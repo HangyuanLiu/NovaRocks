@@ -30,7 +30,7 @@ use crate::mv::domain::persistence::definition::StoredMvRefreshPolicy;
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::persistence::dependency::stored_definition_dependency_ref;
 use crate::mv::domain::repository::MvRepository;
-use novarocks_catalog::identifier::TableIdentity;
+use novarocks_types::naming::TableIdentity;
 
 #[derive(Debug)]
 pub(crate) struct ResolvedCreateMvDependencies {

@@ -52,7 +52,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
     use super::arrow_schema_to_table_column_defs;
-    use novarocks_catalog::schema::SqlType;
+    use novarocks_types::schema::SqlType;
 
     // ---------- basic scalar types ----------
 

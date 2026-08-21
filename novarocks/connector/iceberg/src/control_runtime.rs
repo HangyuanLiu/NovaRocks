@@ -24,8 +24,8 @@
 
 use std::sync::Arc;
 
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::ConnectorErrorKind;
+use novarocks_types::naming::normalize_identifier;
 
 use crate::catalog_control::IcebergCatalogControlState;
 use crate::iceberg::{NamespaceIdent, TableIdent};

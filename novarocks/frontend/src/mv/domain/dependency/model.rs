@@ -17,7 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use novarocks_catalog::identifier::TableIdentity;
+use novarocks_types::naming::TableIdentity;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

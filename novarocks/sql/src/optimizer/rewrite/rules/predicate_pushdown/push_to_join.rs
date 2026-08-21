@@ -753,7 +753,7 @@ mod tests {
     use crate::optimizer::rewrite::context::RewriteContext;
     use crate::planner::optimizer_bridge::scalar::{intern_typed, materialize};
     use crate::planner::table::TableDef;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn col_id(id: u32) -> ColumnId {
         ColumnId::new_for_test(id)

@@ -41,8 +41,6 @@ use novarocks_spi::{
 };
 mod common;
 use common::state_store_fixture as state_store_test;
-use sqlparser::ast::{DataType, Query, Statement};
-use sqlparser::parser::Parser;
 use state_store_test::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,

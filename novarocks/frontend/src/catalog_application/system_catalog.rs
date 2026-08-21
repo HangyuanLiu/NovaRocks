@@ -20,7 +20,7 @@
 //! them through this trait so it never names the frontend registry/provider.
 
 use arrow::record_batch::RecordBatch;
-use novarocks_catalog::schema::ColumnDef;
+use novarocks_types::schema::ColumnDef;
 
 /// Inputs the core rewriter gathers from the live engine state and hands to the
 /// system catalog. Kept minimal to what the only current provider (`schemata`)

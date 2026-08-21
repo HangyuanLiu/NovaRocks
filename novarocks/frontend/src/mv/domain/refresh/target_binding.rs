@@ -42,7 +42,7 @@ use novarocks_spi::connector::{
     ConnectorTablePlanningFacts, ConnectorTableResolution,
 };
 
-use novarocks_catalog::identifier::TableIdentity;
+use novarocks_types::naming::TableIdentity;
 
 use crate::mv::domain::persistence::schema::MvPartitionContract;
 use crate::mv::domain::storage_observation::MvRefreshTargetObservation;

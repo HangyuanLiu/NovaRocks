@@ -26,7 +26,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bytes::Bytes;
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::{
     CONNECTOR_CTAS_STAGED_PUBLICATION_CONTRACT_VERSION, ConnectorCtasAbortDisposition,
     ConnectorCtasAbortRequest, ConnectorCtasAbortResult, ConnectorCtasActionId,
@@ -41,6 +40,7 @@ use novarocks_spi::connector::{
     ConnectorMutationOperationId, ConnectorStagedTableHandle, ConnectorStagedWritePlanningBinding,
     ConnectorStagedWritePlanningRequest, ConnectorWriteOperationCompletion, CreatePolicy,
 };
+use novarocks_types::naming::normalize_identifier;
 use sha2::{Digest, Sha256};
 
 use super::staged_create::{IcebergStagedCreateAdapter, RestStagedTableCreate};

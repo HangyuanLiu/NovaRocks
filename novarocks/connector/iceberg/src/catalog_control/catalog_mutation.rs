@@ -22,7 +22,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::{
     ConnectorCatalogMutation, ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
@@ -36,6 +35,7 @@ use novarocks_spi::connector::{
     CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
+use novarocks_types::naming::normalize_identifier;
 
 use crate::catalog_config::IcebergCatalogKind;
 use crate::commit::{RefActionOutcome, execute_ref_action, lower_ref_action};

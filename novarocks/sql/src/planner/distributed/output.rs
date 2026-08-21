@@ -2128,7 +2128,7 @@ mod tests {
         PlanSetOpKind, PlannerConfidence,
     };
     use crate::planner::table::TableDef;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn stats() -> PhysicalPlanStats {
         PhysicalPlanStats {

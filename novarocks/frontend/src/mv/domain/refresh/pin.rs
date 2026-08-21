@@ -36,8 +36,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
-use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::ConnectorTableObjectId;
+use novarocks_types::naming::TableIdentity;
 
 /// Per-refresh snapshot pin: each base table is pinned to the
 /// `current_snapshot_id` it had at refresh entry time.

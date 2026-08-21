@@ -17,27 +17,26 @@
 
 use std::collections::HashMap;
 
-use crate::identifier::normalize_identifier;
-use crate::table::CatalogTable;
+use novarocks_types::naming::{DEFAULT_DATABASE, normalize_identifier};
 
-pub const DEFAULT_DATABASE: &str = "default";
+use crate::planner::table::TableDef;
 
-pub trait MemoryCatalogEntry: Clone {
-    fn table_name(&self) -> &str;
-    fn to_catalog_table(&self, catalog: &str, database: &str) -> CatalogTable;
-}
+const DEFAULT_CATALOG: &str = "default_catalog";
 
 #[derive(Clone, Debug)]
-struct DatabaseDef<T> {
-    tables: HashMap<String, T>,
+struct DatabaseDef {
+    tables: HashMap<String, TableDef>,
 }
 
+/// SQL-owned local catalog. Its planner entries remain private to this crate;
+/// application code receives only catalog-visible materializations through
+/// `planning::catalog`.
 #[derive(Clone, Debug)]
-pub struct MemoryCatalog<T: MemoryCatalogEntry> {
-    databases: HashMap<String, DatabaseDef<T>>,
+pub struct PlannerMemoryCatalog {
+    databases: HashMap<String, DatabaseDef>,
 }
 
-impl<T: MemoryCatalogEntry> Default for MemoryCatalog<T> {
+impl Default for PlannerMemoryCatalog {
     fn default() -> Self {
         let mut databases = HashMap::new();
         databases.insert(
@@ -50,7 +49,7 @@ impl<T: MemoryCatalogEntry> Default for MemoryCatalog<T> {
     }
 }
 
-impl<T: MemoryCatalogEntry> MemoryCatalog<T> {
+impl PlannerMemoryCatalog {
     pub fn create_database(&mut self, database_name: &str) -> Result<(), String> {
         let key = normalize_identifier(database_name)?;
         if self.databases.contains_key(&key) {
@@ -84,13 +83,14 @@ impl<T: MemoryCatalogEntry> MemoryCatalog<T> {
             .unwrap_or_default()
     }
 
-    pub fn register(&mut self, database_name: &str, table: T) -> Result<(), String> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn register(&mut self, database_name: &str, table: TableDef) -> Result<(), String> {
         let db_key = normalize_identifier(database_name)?;
         let database = self
             .databases
             .get_mut(&db_key)
             .ok_or_else(|| format!("unknown database: {database_name}"))?;
-        let table_key = normalize_identifier(table.table_name())?;
+        let table_key = normalize_identifier(&table.name)?;
         database.tables.insert(table_key, table);
         Ok(())
     }
@@ -120,7 +120,7 @@ impl<T: MemoryCatalogEntry> MemoryCatalog<T> {
         Ok(())
     }
 
-    pub fn get(&self, database_name: &str, table_name: &str) -> Result<T, String> {
+    pub(crate) fn get(&self, database_name: &str, table_name: &str) -> Result<TableDef, String> {
         let db_key = normalize_identifier(database_name)?;
         let table_key = normalize_identifier(table_name)?;
         self.databases
@@ -133,44 +133,62 @@ impl<T: MemoryCatalogEntry> MemoryCatalog<T> {
     }
 }
 
+impl crate::catalog::PlannerTableProvider for PlannerMemoryCatalog {
+    fn resolve_table_for_analysis(
+        &self,
+        _catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+        Ok(crate::catalog::ResolvedAnalyzerTable::from_planner(
+            Some(DEFAULT_CATALOG),
+            database,
+            self.get(database, table)?,
+        ))
+    }
+
+    fn iceberg_metadata_provider(
+        &self,
+    ) -> Option<&dyn crate::catalog::IcebergMetadataTableProvider> {
+        Some(self)
+    }
+}
+
+impl crate::catalog::IcebergMetadataTableProvider for PlannerMemoryCatalog {
+    fn get_iceberg_metadata_table(
+        &self,
+        _catalog: Option<&str>,
+        database: &str,
+        table: &str,
+        _metadata_table_type: crate::planner::table::SqlMetadataTableKind,
+    ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+        Ok(crate::catalog::ResolvedAnalyzerTable::from_planner(
+            Some(DEFAULT_CATALOG),
+            database,
+            self.get(database, table)?,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_DATABASE, MemoryCatalog, MemoryCatalogEntry};
-    use crate::identifier::TableIdentity;
-    use crate::table::CatalogTable;
+    use super::PlannerMemoryCatalog;
+    use novarocks_types::naming::DEFAULT_DATABASE;
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct TestEntry {
-        name: String,
-        revision: u64,
-    }
-
-    impl TestEntry {
-        fn new(name: &str, revision: u64) -> Self {
-            Self {
-                name: name.to_string(),
-                revision,
-            }
-        }
-    }
-
-    impl MemoryCatalogEntry for TestEntry {
-        fn table_name(&self) -> &str {
-            &self.name
-        }
-
-        fn to_catalog_table(&self, catalog: &str, database: &str) -> CatalogTable {
-            CatalogTable {
-                identity: TableIdentity::new(catalog, database, &self.name),
-                columns: vec![],
-                hidden_columns: vec![],
-            }
+    fn test_table(name: &str) -> crate::planner::table::TableDef {
+        crate::planner::table::TableDef {
+            name: name.to_string(),
+            columns: vec![],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: crate::planner::table::test_sql_scan_source(
+                crate::planner::table::SqlScanKind::ConnectorRead,
+            ),
         }
     }
 
     #[test]
     fn creates_lists_and_drops_databases_with_normalized_names() {
-        let mut catalog = MemoryCatalog::<TestEntry>::default();
+        let mut catalog = PlannerMemoryCatalog::default();
 
         assert!(
             catalog
@@ -208,17 +226,18 @@ mod tests {
 
     #[test]
     fn registers_overwrites_lists_gets_and_drops_tables() {
-        let mut catalog = MemoryCatalog::<TestEntry>::default();
+        let mut catalog = PlannerMemoryCatalog::default();
         catalog.create_database("Sales").expect("create database");
 
         catalog
-            .register("SALES", TestEntry::new("  `Orders_2026`  ", 1))
+            .register("SALES", test_table("  `Orders_2026`  "))
             .expect("register normalized table");
         assert_eq!(
             catalog
                 .get("sales", "orders_2026")
-                .expect("registered table"),
-            TestEntry::new("  `Orders_2026`  ", 1)
+                .expect("registered table")
+                .name,
+            "  `Orders_2026`  "
         );
         assert_eq!(
             catalog.table_names_in_database("`Sales`"),
@@ -226,11 +245,14 @@ mod tests {
         );
 
         catalog
-            .register("sales", TestEntry::new("ORDERS_2026", 2))
+            .register("sales", test_table("ORDERS_2026"))
             .expect("overwrite table");
         assert_eq!(
-            catalog.get("SALES", "Orders_2026").expect("replacement"),
-            TestEntry::new("ORDERS_2026", 2)
+            catalog
+                .get("SALES", "Orders_2026")
+                .expect("replacement")
+                .name,
+            "ORDERS_2026"
         );
 
         catalog
@@ -241,26 +263,26 @@ mod tests {
 
     #[test]
     fn preserves_exact_unknown_database_and_table_errors() {
-        let mut catalog = MemoryCatalog::<TestEntry>::default();
+        let mut catalog = PlannerMemoryCatalog::default();
 
         assert_eq!(
-            catalog.register("MissingDb", TestEntry::new("t", 1)),
+            catalog.register("MissingDb", test_table("t")),
             Err("unknown database: MissingDb".to_string())
         );
-        assert_eq!(
+        assert!(matches!(
             catalog.get("MissingDb", "t"),
-            Err("unknown database: MissingDb".to_string())
-        );
+            Err(error) if error == "unknown database: MissingDb"
+        ));
         assert_eq!(
             catalog.drop_table("MissingDb", "t"),
             Err("unknown database: MissingDb".to_string())
         );
 
         catalog.create_database("db").expect("create database");
-        assert_eq!(
+        assert!(matches!(
             catalog.get("db", "MissingTable"),
-            Err("unknown table: MissingTable".to_string())
-        );
+            Err(error) if error == "unknown table: MissingTable"
+        ));
         assert_eq!(
             catalog.drop_table("db", "MissingTable"),
             Err("unknown table: MissingTable".to_string())

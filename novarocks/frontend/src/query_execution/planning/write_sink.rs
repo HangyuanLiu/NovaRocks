@@ -23,7 +23,7 @@
 //! tokens.
 
 use arrow::datatypes::{Schema, SchemaRef};
-use novarocks_catalog::schema::ColumnDef;
+use novarocks_types::schema::ColumnDef;
 use std::sync::Arc;
 
 use crate::catalog_application::query_bindings::{

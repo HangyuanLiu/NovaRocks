@@ -245,7 +245,7 @@ mod tests {
     use crate::planner::logical::*;
     use crate::planner::payload::*;
     use crate::planner::table::{SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef};
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
     use std::cell::RefCell;
     use std::rc::Rc;
 

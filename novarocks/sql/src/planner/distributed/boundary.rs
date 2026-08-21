@@ -482,11 +482,11 @@ mod tests {
     };
     use crate::planner::payload::PlanValuesNode;
     use crate::planner::physical::{PhysicalPlanStats, PlannerConfidence};
-    use novarocks_catalog::schema::ColumnDef;
     use novarocks_spi::connector::{
         ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteCohortId,
         ConnectorWriteFieldToken, ConnectorWriteRouteId,
     };
+    use novarocks_types::schema::ColumnDef;
 
     use super::build_boundary_catalog;
     use super::{BoundaryContract, BoundaryError, BoundaryKind, ExecutionColumnIdAllocator};

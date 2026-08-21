@@ -250,6 +250,18 @@ SQL client
 
 ### 4.7 Connectors / Catalog Backends / Filesystem
 
+- `novarocks/types/src/{naming,schema}.rs`
+  Neutral catalog naming and schema vocabulary. It contains no catalog runtime
+  or provider authority.
+
+- `novarocks/sql/src/catalog/memory.rs`
+  SQL-owned local `PlannerMemoryCatalog`; it stores private planner facts and
+  materializes only SQL catalog-visible values.
+
+- `novarocks/frontend/src/catalog_application/query_catalog/**`
+  Frontend-owned query catalog registry, schema cache, and service composition.
+  Connector admission and local-catalog snapshots remain application-owned.
+
 - `novarocks/connector/starrocks/**`
   Read-only StarRocks external Connector. It owns RPC remote reads for every
   topology and shared-data-only direct reads; it does not depend on Core,

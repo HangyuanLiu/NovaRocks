@@ -109,7 +109,6 @@ use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
 use crate::mv::domain::storage_observation::MvTargetCreationObservation;
 use crate::runtime::statement_result::StatementResult;
 use mv_schema::MvPartitionContract;
-use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
 use novarocks_parser::{Span, ast};
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorInstanceId};
@@ -130,6 +129,7 @@ use novarocks_sql::syntax::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr,
     MaterializedViewRefreshPolicy, ObjectName, RefreshMaterializedViewStmt, TableColumnDef,
 };
+use novarocks_types::naming::{TableIdentity, normalize_identifier};
 
 /// The explicit Core ports a refresh preparation may read while deriving its
 /// immutable write artifact.  This deliberately names the individual
@@ -5861,7 +5861,7 @@ fn resolve_drop_target(
     })?;
     let (namespace, table) = resolve_mv_name(name, current_database)?;
     Ok(IcebergMvTarget {
-        catalog: novarocks_catalog::identifier::normalize_identifier(catalog)?,
+        catalog: novarocks_types::naming::normalize_identifier(catalog)?,
         namespace,
         table,
     })

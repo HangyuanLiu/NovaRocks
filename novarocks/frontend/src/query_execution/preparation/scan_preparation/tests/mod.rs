@@ -208,7 +208,7 @@ fn fixture_query_table_bindings(
                             .schema
                             .fields()
                             .iter()
-                            .map(|field| novarocks_catalog::schema::ColumnDef {
+                            .map(|field| novarocks_types::schema::ColumnDef {
                                 name: field.name().to_string(),
                                 data_type: field.data_type().clone(),
                                 nullable: field.is_nullable(),

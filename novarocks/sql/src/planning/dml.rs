@@ -37,7 +37,7 @@ pub enum DmlStatisticsEvidence {
     Available {
         binding: crate::binding::SqlTableBindingId,
         label: String,
-        columns: Vec<novarocks_catalog::schema::ColumnDef>,
+        columns: Vec<novarocks_types::schema::ColumnDef>,
         evidence: novarocks_spi::connector::StatisticsEvidence,
     },
     Missing {
@@ -153,7 +153,7 @@ fn match_failure(
 /// fallback. What it must never do is claim to be exact.
 fn evidence_to_base_statistics(
     evidence: &novarocks_spi::connector::StatisticsEvidence,
-    columns: &[novarocks_catalog::schema::ColumnDef],
+    columns: &[novarocks_types::schema::ColumnDef],
 ) -> crate::optimizer::stats_input::BaseTableStatistics {
     use crate::optimizer::statistics::Confidence;
     use crate::optimizer::stats_input::{
@@ -364,7 +364,7 @@ impl From<DmlWriteSinkMode> for crate::planner::distributed::write::contract::Sq
 #[derive(Clone, Debug, PartialEq)]
 pub struct DmlWriteTargetField {
     pub token: novarocks_spi::connector::ConnectorWriteFieldToken,
-    pub column: novarocks_catalog::schema::ColumnDef,
+    pub column: novarocks_types::schema::ColumnDef,
     pub is_hidden: bool,
 }
 
@@ -390,7 +390,7 @@ impl DmlWritePlanInput {
     pub fn try_new(
         mode: DmlWriteSinkMode,
         target: DmlWriteTarget,
-        input_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+        input_columns: Vec<novarocks_types::schema::ColumnDef>,
         input: crate::plan_read::ConnectorWriteInputBinding,
     ) -> Result<Self, String> {
         use crate::planner::distributed::write::contract::{
@@ -583,11 +583,11 @@ pub struct DmlChangeStreamRouteField {
 #[derive(Clone, Debug)]
 pub enum DmlChangeStreamKind {
     Update {
-        target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+        target_columns: Vec<novarocks_types::schema::ColumnDef>,
         new_sequence_number: i64,
     },
     Merge {
-        target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+        target_columns: Vec<novarocks_types::schema::ColumnDef>,
         new_sequence_number: i64,
         matched_update: bool,
         matched_delete: bool,
@@ -827,7 +827,7 @@ fn bind_route_layout(
 
 fn build_update_change_event_expand(
     optimized_tree: crate::optimizer::OptimizedOperatorNode,
-    target_columns: &[novarocks_catalog::schema::ColumnDef],
+    target_columns: &[novarocks_types::schema::ColumnDef],
     new_sequence_number: i64,
 ) -> Result<crate::optimizer::OptimizedOperatorNode, String> {
     let mut arena = clone_scalar_arena(&optimized_tree, "MOR UPDATE")?;
@@ -902,7 +902,7 @@ fn build_update_change_event_expand(
 #[allow(clippy::too_many_arguments)]
 fn build_merge_change_event_expand(
     optimized_tree: crate::optimizer::OptimizedOperatorNode,
-    target_columns: &[novarocks_catalog::schema::ColumnDef],
+    target_columns: &[novarocks_types::schema::ColumnDef],
     new_sequence_number: i64,
     matched_update: bool,
     matched_delete: bool,
@@ -1073,7 +1073,7 @@ type ChangeOutputs = (
 
 fn allocate_change_outputs(
     node: &crate::optimizer::OptimizedOperatorNode,
-    target_columns: &[novarocks_catalog::schema::ColumnDef],
+    target_columns: &[novarocks_types::schema::ColumnDef],
 ) -> ChangeOutputs {
     let mut next = max_physical_column_id(node) + 1;
     let mut allocate =
@@ -1280,7 +1280,7 @@ fn max_physical_column_id(node: &crate::optimizer::OptimizedOperatorNode) -> u32
 #[derive(Clone, Debug)]
 pub struct StatisticsConnectorScan {
     pub binding: crate::binding::SqlTableBindingId,
-    pub columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub columns: Vec<novarocks_types::schema::ColumnDef>,
 }
 
 /// Build the SQL-owned physical and distributed statistics program from a
@@ -1390,8 +1390,8 @@ mod tests {
         ))
     }
 
-    fn column(name: &str) -> novarocks_catalog::schema::ColumnDef {
-        novarocks_catalog::schema::ColumnDef {
+    fn column(name: &str) -> novarocks_types::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
             name: name.to_string(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: true,

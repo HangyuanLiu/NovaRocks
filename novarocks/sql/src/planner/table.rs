@@ -19,7 +19,7 @@ use crate::binding::SqlTableBindingId;
 #[cfg(any(test, feature = "test-support"))]
 use crate::binding::SqlTableBindingScopeId;
 use arrow::datatypes::Schema;
-use novarocks_catalog::schema::ColumnDef;
+use novarocks_types::schema::ColumnDef;
 
 /// Immutable version selector attached to a query-local table binding.
 ///

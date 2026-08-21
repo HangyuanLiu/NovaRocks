@@ -60,7 +60,7 @@ pub fn literal_from_batch(
 
 /// Convert an admitted SQL type to its Arrow value representation.
 pub fn sql_type_to_arrow_type(
-    sql_type: &novarocks_catalog::schema::SqlType,
+    sql_type: &novarocks_types::schema::SqlType,
 ) -> Result<arrow::datatypes::DataType, String> {
     crate::literal::sql_type_to_arrow_type(sql_type)
 }
@@ -71,7 +71,7 @@ pub fn sql_type_to_arrow_type(
 /// declared table schema from a produced Arrow schema (CTAS and view columns).
 pub fn arrow_data_type_to_sql_type(
     data_type: &arrow::datatypes::DataType,
-) -> Result<novarocks_catalog::schema::SqlType, String> {
+) -> Result<novarocks_types::schema::SqlType, String> {
     crate::literal::arrow_data_type_to_sql_type(data_type)
 }
 
@@ -122,8 +122,8 @@ pub fn compare_aggregate_literals(
 }
 
 pub fn column_default_to_literal(
-    value: &novarocks_catalog::schema::ColumnDefault,
-    data_type: &novarocks_catalog::schema::SqlType,
+    value: &novarocks_types::schema::ColumnDefault,
+    data_type: &novarocks_types::schema::SqlType,
 ) -> Result<Literal, String> {
     crate::literal::column_default_to_ast_literal(value, data_type)
 }
@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn syntax_value_helpers_keep_sql_type_conversion_and_metadata_tolerant_shape_equality() {
         use arrow::datatypes::DataType;
-        use novarocks_catalog::schema::SqlType;
+        use novarocks_types::schema::SqlType;
 
         assert_eq!(
             sql_type_to_arrow_type(&SqlType::BigInt).expect("SQL type conversion"),

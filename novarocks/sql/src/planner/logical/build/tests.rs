@@ -29,7 +29,7 @@ use crate::planner::table::{
     ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
 };
 use arrow::datatypes::DataType;
-use novarocks_catalog::schema::ColumnDef;
+use novarocks_types::schema::ColumnDef;
 use std::num::{NonZeroU32, NonZeroU64};
 
 fn sqlx2_data_source(catalog: &str, namespace: &str, table: &str) -> ScanSource {

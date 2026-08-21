@@ -32,7 +32,6 @@ base64 = "0.22"
 bytes = "1"
 chrono = "0.4"
 hex = "0.4"
-novarocks-catalog = { path = "../catalog" }
 novarocks-parser = { path = "../parser" }
 novarocks-spi = { path = "../spi" }
 novarocks-types = { path = "../types" }

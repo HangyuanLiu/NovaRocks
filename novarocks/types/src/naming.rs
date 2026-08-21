@@ -20,6 +20,8 @@
 //! This module owns string-only catalog naming rules. Parser and session
 //! adapters pass already-separated name parts and current context explicitly.
 
+pub const DEFAULT_DATABASE: &str = "default";
+
 #[derive(Clone, Debug)]
 pub struct LocalTableIdentity {
     pub database: String,

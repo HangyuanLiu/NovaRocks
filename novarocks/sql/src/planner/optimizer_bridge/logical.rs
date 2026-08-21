@@ -590,7 +590,7 @@ mod tests {
     use crate::planner::physical::PhysicalPlanKind;
     use crate::planner::table::{ScanSource, SqlScanKind, TableDef};
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
     use std::sync::Arc;
 
     fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {

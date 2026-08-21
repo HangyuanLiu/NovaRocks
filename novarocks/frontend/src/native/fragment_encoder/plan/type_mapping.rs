@@ -18,7 +18,6 @@
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
 use super::super::expr::encode_expr;
-use novarocks_catalog::schema::SqlType;
 use novarocks_protocol::{common, plan};
 use novarocks_spi::connector::ConnectorRowMutationEffect;
 use novarocks_sql::plan_read::{
@@ -26,6 +25,7 @@ use novarocks_sql::plan_read::{
     PartitionKind, PlanSetOpKind, RedistributeMode, SqlTopNType, TopNPhase,
 };
 use novarocks_types::logical::{LogicalType, logical_type_of_field};
+use novarocks_types::schema::SqlType;
 
 pub(super) fn encode_sql_type(src: &SqlType) -> Result<common::TypeDesc, String> {
     use common::type_desc::Kind;

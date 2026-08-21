@@ -302,7 +302,7 @@ impl MvRefreshPublishedFacts {
 pub(crate) struct MvFirstRefreshLogicalContext {
     pub(crate) mv_definition: crate::mv::domain::persistence::definition::StoredMvDefinition,
     pub(crate) canonical_select_query: novarocks_parser::ast::Query,
-    pub(crate) base_refs: Vec<novarocks_catalog::identifier::TableIdentity>,
+    pub(crate) base_refs: Vec<novarocks_types::naming::TableIdentity>,
     pub(crate) pin: SqlMvSnapshotPin,
     pub(crate) previous_snapshot_ids: BTreeMap<String, i64>,
     pub(crate) previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,

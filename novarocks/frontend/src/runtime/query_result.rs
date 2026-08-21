@@ -27,8 +27,8 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use novarocks_catalog::schema::SqlType;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
+use novarocks_types::schema::SqlType;
 
 #[derive(Clone, Debug)]
 pub struct QueryResultColumn {

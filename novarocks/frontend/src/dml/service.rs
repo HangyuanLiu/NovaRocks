@@ -556,7 +556,7 @@ mod tests {
     use crate::dml::journal::testing::InMemoryOperationJournal;
     use crate::dml::model::{OperationKind, OperationState, OperationTarget, WriteTransactionSpec};
     use crate::dml::runner::{CoordinatedWriteReport, WriteExecutor};
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     struct OkExecutor;
 

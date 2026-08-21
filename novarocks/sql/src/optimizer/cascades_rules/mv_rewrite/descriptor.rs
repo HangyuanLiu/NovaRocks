@@ -1064,7 +1064,7 @@ mod tests {
     use crate::planner::payload::{AggregateCall, PlanFilterNode, PlanScanNode, PlanSortNode};
     use crate::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn col(id: u32, name: &str) -> OutputColumn {
         OutputColumn {

@@ -24,7 +24,6 @@ futures = "0.3"
 hex = "0.4"
 libc = "0.2"
 novarocks-fs = { path = "../fs" }
-novarocks-catalog = { path = "../catalog" }
 novarocks-execution = { path = "../execution" }
 novarocks-failpoint = { path = "../failpoint" }
 novarocks-protocol = { path = "../protocol" }

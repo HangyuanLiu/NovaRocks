@@ -16,9 +16,9 @@
 // under the License.
 
 use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
-use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
+use novarocks_types::naming::TableIdentity;
 #[cfg(test)]
 use std::sync::Arc;
 
