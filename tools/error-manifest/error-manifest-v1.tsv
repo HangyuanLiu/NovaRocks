@@ -7,6 +7,16 @@ sql.admit.delete_unsupported_form	Admit
 sql.admit.insert_unsupported_form	Admit
 sql.admit.merge_unsupported_form	Admit
 sql.admit.update_unsupported_form	Admit
+sql.analyze.internal	Analyze
+sql.analyze.invalid_argument	Analyze
+sql.analyze.invalid_literal	Analyze
+sql.analyze.invalid_query_shape	Analyze
+sql.analyze.type_mismatch	Analyze
+sql.analyze.unknown_column	Analyze
+sql.analyze.unknown_function	Analyze
+sql.analyze.unknown_table	Analyze
+sql.analyze.unsupported_expression	Analyze
+sql.analyze.unsupported_query_shape	Analyze
 sql.lex.unexpected_character	Lex
 sql.lex.unterminated_comment	Lex
 sql.lex.unterminated_quoted_identifier	Lex

@@ -35,6 +35,7 @@ hex = "0.4"
 novarocks-parser = { path = "../parser" }
 novarocks-spi = { path = "../spi" }
 novarocks-types = { path = "../types" }
+novarocks-user-error = { path = "../user-error" }
 md-5 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
