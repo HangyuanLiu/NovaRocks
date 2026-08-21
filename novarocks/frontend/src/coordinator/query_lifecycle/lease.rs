@@ -59,6 +59,37 @@ enum SupervisorFailureKind {
     LocalFailure,
 }
 
+#[derive(Clone)]
+struct TerminalConvergenceDecision {
+    source: QueryLifecycleConvergenceErrorSource,
+    message: String,
+}
+
+enum TerminalConvergenceFailure {
+    BackendAttestation(String),
+    FrontendLiveness(String),
+    NoOutcome(String),
+}
+
+impl TerminalConvergenceFailure {
+    fn into_decision(self) -> TerminalConvergenceDecision {
+        match self {
+            Self::BackendAttestation(message) => TerminalConvergenceDecision {
+                source: QueryLifecycleConvergenceErrorSource::BackendAttestation,
+                message,
+            },
+            Self::FrontendLiveness(message) => TerminalConvergenceDecision {
+                source: QueryLifecycleConvergenceErrorSource::FrontendLiveness,
+                message,
+            },
+            Self::NoOutcome(message) => TerminalConvergenceDecision {
+                source: QueryLifecycleConvergenceErrorSource::NoOutcome,
+                message,
+            },
+        }
+    }
+}
+
 struct AbortCleanupFailure {
     target: QueryLifecycleTarget,
     digest: ParticipantManifestDigest,
@@ -308,7 +339,7 @@ pub(super) struct AttemptControl {
     // retention interval.
     retain_terminal_ingress: AtomicBool,
     primary_error: Mutex<Option<String>>,
-    convergence_error_source: Mutex<Option<QueryLifecycleConvergenceErrorSource>>,
+    terminal_decision: Mutex<Option<TerminalConvergenceDecision>>,
     stop: (Mutex<bool>, Condvar),
     terminal: (Mutex<TerminalState>, Condvar),
     observations: Mutex<FragmentObservationState>,
@@ -338,7 +369,7 @@ impl AttemptControl {
             state: AtomicU8::new(ACTIVE),
             retain_terminal_ingress: AtomicBool::new(false),
             primary_error: Mutex::new(None),
-            convergence_error_source: Mutex::new(None),
+            terminal_decision: Mutex::new(None),
             stop: (Mutex::new(false), Condvar::new()),
             terminal: (Mutex::new(TerminalState::default()), Condvar::new()),
             observations: Mutex::new(FragmentObservationState::default()),
@@ -614,13 +645,6 @@ impl AttemptControl {
             return Err(contract_violation(
                 "query terminal outcome execution id differs from active lifecycle attempt",
             ));
-        }
-        if outcome.negative_attestation().is_some() {
-            *self
-                .convergence_error_source
-                .lock()
-                .expect("query lifecycle convergence source") =
-                Some(QueryLifecycleConvergenceErrorSource::BackendAttestation);
         }
         let backend_idx = self.terminal_outcome_backend_idx(&outcome)?;
         self.store_terminal_outcome_at(backend_idx, outcome)
@@ -1119,11 +1143,18 @@ impl AttemptControl {
             .remove(&backend_idx);
     }
 
-    fn wait_for_all_outcomes(&self, timeout: Duration) -> Result<QueryTerminalSet, String> {
-        let expected = self.admitted_len().map_err(|error| error.to_string())?;
+    fn wait_for_all_outcomes(
+        &self,
+        timeout: Duration,
+    ) -> Result<QueryTerminalSet, TerminalConvergenceFailure> {
+        let expected = self
+            .admitted_len()
+            .map_err(|error| TerminalConvergenceFailure::FrontendLiveness(error.to_string()))?;
         let result = self.wait_terminal_event(timeout, |terminal| {
             if let Some(error) = &terminal.reader_failure {
-                return Some(Err(error.clone()));
+                return Some(Err(TerminalConvergenceFailure::FrontendLiveness(
+                    error.clone(),
+                )));
             }
             if terminal.outcomes.len() != expected {
                 return None;
@@ -1133,29 +1164,29 @@ impl AttemptControl {
                 .values()
                 .map(|outcome| match outcome.snapshot() {
                     Some(snapshot) => Ok(snapshot),
-                    None => Err(format!(
+                    None => Err(TerminalConvergenceFailure::BackendAttestation(format!(
                         "query lifecycle participant returned negative attestation: {:?}",
                         outcome
                             .negative_attestation()
                             .expect("validated terminal outcome is proof or attestation")
                             .reason()
-                    )),
+                    ))),
                 })
                 .collect::<Result<Vec<_>, _>>();
             Some(snapshots.and_then(|snapshots| {
-                QueryTerminalSet::from_protocol_snapshots(snapshots)
-                    .map_err(|error| error.to_string())
+                QueryTerminalSet::from_protocol_snapshots(snapshots).map_err(|error| {
+                    TerminalConvergenceFailure::BackendAttestation(error.to_string())
+                })
             }))
         });
-        result.unwrap_or_else(|| Err(self.no_outcome_error()))
+        result.unwrap_or_else(|| {
+            Err(TerminalConvergenceFailure::NoOutcome(
+                self.no_outcome_error(),
+            ))
+        })
     }
 
     fn no_outcome_error(&self) -> String {
-        *self
-            .convergence_error_source
-            .lock()
-            .expect("query lifecycle convergence source") =
-            Some(QueryLifecycleConvergenceErrorSource::NoOutcome);
         let admitted = self
             .admitted
             .lock()
@@ -1187,11 +1218,11 @@ impl AttemptControl {
         }
     }
 
-    fn wait_terminal_event<T>(
+    fn wait_terminal_event<T, E>(
         &self,
         timeout: Duration,
-        condition: impl Fn(&TerminalState) -> Option<Result<T, String>>,
-    ) -> Option<Result<T, String>> {
+        condition: impl Fn(&TerminalState) -> Option<Result<T, E>>,
+    ) -> Option<Result<T, E>> {
         let deadline = Instant::now().checked_add(timeout)?;
         let mut terminal = self.terminal.0.lock().expect("query terminal state");
         loop {
@@ -1234,11 +1265,6 @@ impl AttemptControl {
     }
 
     fn supervisor_failed(&self, reason: String, kind: SupervisorFailureKind) {
-        *self
-            .convergence_error_source
-            .lock()
-            .expect("query lifecycle convergence source") =
-            Some(QueryLifecycleConvergenceErrorSource::FrontendLiveness);
         match kind {
             SupervisorFailureKind::HeartbeatTimeout => self.metrics.heartbeat_timeout(),
             SupervisorFailureKind::CoordinatorLost => self.metrics.coordinator_lost(),
@@ -1255,6 +1281,23 @@ impl AttemptControl {
             });
         } else {
             let _ = self.abort_preserving(reason);
+        }
+    }
+
+    /// Freezes the classification that the terminal finalizer returned to SQL.
+    ///
+    /// Stream-close and heartbeat callbacks are observations, not a terminal
+    /// decision: a live backend may deliberately suppress delivery and still
+    /// require `NoOutcome`. Only the finalizer knows whether convergence ended
+    /// in an attestation, a reader/liveness failure, or a bounded timeout.
+    fn commit_terminal_decision(&self, decision: TerminalConvergenceDecision) {
+        let mut committed = self
+            .terminal_decision
+            .lock()
+            .expect("query lifecycle terminal decision");
+        debug_assert!(committed.is_none(), "terminal decision is immutable");
+        if committed.is_none() {
+            *committed = Some(decision);
         }
     }
 
@@ -1304,40 +1347,47 @@ impl AttemptControl {
         });
         self.metrics.attempt_terminated();
         if errors.is_empty() {
-            let terminal_set = match self
-                .wait_for_all_outcomes(self.config.terminal_snapshot_timeout())
-            {
-                Ok(terminal_set) => terminal_set,
-                Err(error) => {
-                    self.metrics.terminal_finalize_failure();
-                    // A terminal convergence failure is itself immutable
-                    // query evidence (attestation, liveness, or NoOutcome).
-                    // Keep this attempt reachable after its active binding is
-                    // dropped so the runner can read the same structured
-                    // outcome that determined the SQL failure.
-                    self.retain_terminal_ingress.store(true, Ordering::Release);
-                    self.state.store(ABORTED, Ordering::Release);
-                    let primary = format!("query lifecycle terminal finalization failed: {error}");
-                    let cleanup = self.abort_targets(true, &primary);
-                    let message = if cleanup.is_empty() {
-                        primary
-                    } else {
-                        format!(
-                            "{primary}; query lifecycle rollback failed: {}",
-                            cleanup
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                                .join("; ")
-                        )
-                    };
-                    *self
-                        .primary_error
-                        .lock()
-                        .expect("query lifecycle primary error") = Some(message.clone());
-                    return Err(failed(message));
-                }
-            };
+            let terminal_set =
+                match self.wait_for_all_outcomes(self.config.terminal_snapshot_timeout()) {
+                    Ok(terminal_set) => terminal_set,
+                    Err(failure) => {
+                        self.metrics.terminal_finalize_failure();
+                        // A terminal convergence failure is itself immutable
+                        // query evidence (attestation, liveness, or NoOutcome).
+                        // Keep this attempt reachable after its active binding is
+                        // dropped so the runner can read the same structured
+                        // outcome that determined the SQL failure.
+                        self.retain_terminal_ingress.store(true, Ordering::Release);
+                        self.state.store(ABORTED, Ordering::Release);
+                        let decision = failure.into_decision();
+                        let primary = format!(
+                            "query lifecycle terminal finalization failed: {}",
+                            decision.message
+                        );
+                        let cleanup = self.abort_targets(true, &primary);
+                        let message = if cleanup.is_empty() {
+                            primary
+                        } else {
+                            format!(
+                                "{primary}; query lifecycle rollback failed: {}",
+                                cleanup
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
+                            )
+                        };
+                        self.commit_terminal_decision(TerminalConvergenceDecision {
+                            source: decision.source,
+                            message: message.clone(),
+                        });
+                        *self
+                            .primary_error
+                            .lock()
+                            .expect("query lifecycle primary error") = Some(message.clone());
+                        return Err(failed(message));
+                    }
+                };
             self.state.store(FINALIZED, Ordering::Release);
             tracing::info!(
                 query_id_high = self.execution_id.query_id().high(),
@@ -1406,10 +1456,9 @@ fn control_event_reader(control: Weak<AttemptControl>, session: ActiveSession) {
                 if matches!(error.kind(), QueryLifecycleTransportErrorKind::StreamClosed)
                     && control.state.load(Ordering::Acquire) == FINALIZING =>
             {
-                // The unary fallback may still win, but the supervisor must
-                // keep checking the same generation-fenced owner. A later
-                // heartbeat failure becomes a liveness fact instead of a
-                // generic terminal timeout.
+                // The unary fallback may still win, so retain this as an
+                // observation while the finalizer classifies the eventual
+                // terminal result.
                 control.record_backend_stream_closed(session.target.backend_idx());
                 return;
             }
@@ -1594,10 +1643,10 @@ impl AttemptControl {
         self.terminal.1.notify_all();
         // A terminal reader may close after another participant's immutable
         // outcome has already put this attempt into Finalizing. Wake the
-        // generation-fenced heartbeat owner in that narrow state so an
-        // actually dead missing participant is classified as FE liveness
-        // before NoOutcome. Earlier stream closes remain on their ordinary
-        // protocol paths and must not perturb stage/start recovery.
+        // heartbeat owner in that narrow state to continue liveness
+        // observation; the finalizer alone commits the public classification.
+        // Earlier stream closes remain on their ordinary protocol paths and
+        // must not perturb stage/start recovery.
         if self.state.load(Ordering::Acquire) == FINALIZING && !terminal.outcomes.is_empty() {
             self.stop.1.notify_all();
         }
@@ -1782,7 +1831,26 @@ impl ActiveQueryAttemptControl for AttemptControl {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        if outcomes.is_empty() && self.state.load(Ordering::Acquire) == ACTIVE {
+        let decision = self
+            .terminal_decision
+            .lock()
+            .expect("query lifecycle terminal decision")
+            .clone();
+        // A negative attestation is already an immutable participant outcome,
+        // so its source is observable before finalization commits the complete
+        // decision. NoOutcome and liveness remain finalizer-owned because
+        // neither has an equivalent immutable participant record.
+        let error_source = decision
+            .as_ref()
+            .map(|decision| decision.source)
+            .or_else(|| {
+                outcomes
+                    .iter()
+                    .any(|outcome| outcome.negative_attestation().is_some())
+                    .then_some(QueryLifecycleConvergenceErrorSource::BackendAttestation)
+            });
+        if outcomes.is_empty() && self.state.load(Ordering::Acquire) == ACTIVE && decision.is_none()
+        {
             return None;
         }
         let runtime_filter = match self.terminal_set() {
@@ -1804,15 +1872,13 @@ impl ActiveQueryAttemptControl for AttemptControl {
         };
         Some(QueryLifecycleConvergenceSnapshot {
             execution_id: self.execution_id,
-            error_source: *self
-                .convergence_error_source
-                .lock()
-                .expect("query lifecycle convergence source"),
-            primary_error: self
-                .primary_error
-                .lock()
-                .expect("query lifecycle primary error")
-                .clone(),
+            error_source,
+            primary_error: decision.map(|decision| decision.message).or_else(|| {
+                self.primary_error
+                    .lock()
+                    .expect("query lifecycle primary error")
+                    .clone()
+            }),
             participant_outcomes: outcomes,
             runtime_filter,
             metrics: self.metrics.snapshot(),
