@@ -24,9 +24,9 @@
 -- inert session no-ops. This case freezes that contract: each statement must
 -- succeed, and none of them may disturb the session that follows.
 --
--- The no-op decision itself lives in the frontend session
--- (`apply_session_set`), but the contract worth protecting is the
--- user-observable one: a client that sends these can still query.
+-- The contract worth protecting is user-observable: typed session statements
+-- preserve their independent scopes, accepted compatibility forms, catalog
+-- context, and user-variable values while the connection remains usable.
 
 -- query 1
 -- @skip_result_check=true
@@ -62,3 +62,53 @@ USE default;
 
 -- query 9
 SELECT 1;
+
+-- query 10
+-- Scope is per assignment rather than inherited by the following assignment.
+-- @skip_result_check=true
+SET SESSION query_timeout = 60, LOCAL pipeline_dop = 1, @@session.query_timeout = 0;
+
+-- query 11
+-- @skip_result_check=true
+SET CATALOG default_catalog;
+
+-- query 12
+-- @skip_result_check=true
+SET catalog = default_catalog;
+
+-- query 13
+-- Client transaction setup remains an accepted no-op.
+-- @skip_result_check=true
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- query 14
+-- `USE` continues to resolve against the catalog selected above.
+-- @skip_result_check=true
+USE default;
+
+-- query 15
+-- @skip_result_check=true
+SET @session_expression = 1 + 2;
+
+-- query 16
+SELECT @session_expression;
+
+-- query 17
+-- @skip_result_check=true
+SET @session_query = (SELECT 4);
+
+-- query 18
+SELECT @session_query;
+
+-- query 19
+SELECT 1;
+
+-- query 20
+-- An unknown GLOBAL variable is tolerated without leaking its scope to the
+-- following independently-scoped, recognized assignment.
+-- @skip_result_check=true
+SET GLOBAL sqlp9_unknown_scope_probe=1, query_timeout=1;
+
+-- query 21
+-- @skip_result_check=true
+SET query_timeout = 0;
