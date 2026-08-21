@@ -1,5 +1,5 @@
 ---
-id: ADR-0090
+id: ADR-0100
 title: "Constant folding reuses execution kernels through an injected compiler port"
 domain: [sql-compiler]
 status: active

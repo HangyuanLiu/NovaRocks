@@ -1,5 +1,5 @@
 ---
-id: ADR-0085
+id: ADR-0098
 title: "Native Protocol Error Contract Ownership"
 domain: [distributed-query-lifecycle, crate-boundary]
 status: active

@@ -29,7 +29,7 @@ binding decode。后四类工作分别已有 `fragment`、`query_lifecycle`、`r
 同一个协议名目录下，使目录无法表达新增代码应由谁拥有，也把同一领域拆成两个物理入口。
 
 `BackendDataRuntime` 只是 Server 注入的 Tokio `Handle` 与 Backend-local Tonic channel cache，不创建进程 runtime、也不拥有
-query execution；其 composition 结论由 ADR-0087 固定。native DTO 的 schema、字段路径与验证错误由 Protocol 拥有（ADR-0085）。
+query execution；其 composition 结论由 ADR-0087 固定。native DTO 的 schema、字段路径与验证错误由 Protocol 拥有（ADR-0098）。
 因此目录调整不能借机转移 Protocol、Server、lifecycle、runtime-filter 或 Connector 的既有 authority，更不能改变 wire、
 取消、重试、去重、背压或资源关闭语义。
 

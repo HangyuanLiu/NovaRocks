@@ -421,7 +421,7 @@ mod tests {
     /// rather than merely tidy. If this test ever fails, someone has started
     /// treating the gate as cluster-wide, and the lease would look redundant.
     ///
-    /// Design: ADR-0074 (docs/adr/ADR-0074-mv-refresh-ownership-fencing.md)
+    /// Design: ADR-0096 (docs/adr/ADR-0096-mv-refresh-ownership-fencing.md)
     #[test]
     fn separate_gates_do_not_arbitrate_between_frontends() {
         let target = CanonicalMvTarget::from_parts(Some("ice"), "sales", "daily");

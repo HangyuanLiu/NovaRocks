@@ -1,5 +1,5 @@
 ---
-id: ADR-0085
+id: ADR-0097
 title: "Durable base object identities remain opaque"
 domain: [provider-spi]
 status: active

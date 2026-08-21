@@ -3154,7 +3154,7 @@ fn provenance_base_from_staged_fact(
     })
 }
 
-// Design: ADR-0085 (docs/adr/ADR-0085-durable-base-object-identities-remain-opaque.md)
+// Design: ADR-0097 (docs/adr/ADR-0097-durable-base-object-identities-remain-opaque.md)
 fn iceberg_uuid_from_object_id(object_id: &ConnectorTableObjectId) -> Result<String, String> {
     let uuid = std::str::from_utf8(object_id.as_bytes())
         .map_err(|error| format!("Iceberg base object ID is not UTF-8: {error}"))?;
