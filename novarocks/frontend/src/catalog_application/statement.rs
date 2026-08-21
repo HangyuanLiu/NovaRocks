@@ -253,16 +253,7 @@ pub(crate) fn execute_typed_create_table_statement(
             );
         }
     };
-    let properties = statement
-        .properties
-        .iter()
-        .map(|property| {
-            Ok((
-                typed_literal_text(&property.key)?,
-                typed_literal_text(&property.value)?,
-            ))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let properties = lower_typed_table_properties(statement)?;
     execute_create_table_statement(
         context,
         novarocks_sql::syntax::CreateTableStmt {
@@ -421,6 +412,25 @@ fn typed_literal_text(literal: &novarocks_parser::ast::Literal) -> Result<String
         | TypedLiteralKind::String(value)
         | TypedLiteralKind::HexString(value) => Ok(value.clone()),
     }
+}
+
+fn lower_typed_table_properties(
+    statement: &TypedCreateTable,
+) -> Result<Vec<(String, String)>, String> {
+    let mut properties = statement
+        .properties
+        .iter()
+        .map(|property| {
+            Ok((
+                typed_literal_text(&property.key)?,
+                typed_literal_text(&property.value)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if let Some(comment) = &statement.comment {
+        properties.push(("comment".to_string(), typed_literal_text(comment)?));
+    }
+    Ok(properties)
 }
 
 fn mutation_instance_id(catalog: &str) -> Result<ConnectorInstanceId, String> {
@@ -1858,6 +1868,47 @@ mod tests {
             panic!("expected typed Iceberg ALTER TABLE statement");
         };
         statement.action
+    }
+
+    fn typed_create_table(sql: &str) -> novarocks_parser::ast::CreateTable {
+        let mut statements = novarocks_parser::parse(sql).expect("parse typed CREATE TABLE");
+        let novarocks_parser::ast::Statement::Table(novarocks_parser::ast::TableStatement::Create(
+            statement,
+        )) = statements.remove(0)
+        else {
+            panic!("expected typed CREATE TABLE statement");
+        };
+        statement
+    }
+
+    #[test]
+    fn lower_typed_table_properties_materializes_table_comment() {
+        let table = typed_create_table(
+            "CREATE TABLE ice.db.orders (id INT) PROPERTIES ('format-version' = '2') COMMENT 'order table'",
+        );
+
+        assert_eq!(
+            super::lower_typed_table_properties(&table).expect("lower table properties"),
+            vec![
+                ("format-version".to_string(), "2".to_string()),
+                ("comment".to_string(), "order table".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn lower_typed_table_properties_preserves_comment_property_duplicate() {
+        let table = typed_create_table(
+            "CREATE TABLE ice.db.orders (id INT) PROPERTIES ('comment' = 'property comment') COMMENT 'table comment'",
+        );
+
+        assert_eq!(
+            super::lower_typed_table_properties(&table).expect("lower table properties"),
+            vec![
+                ("comment".to_string(), "property comment".to_string()),
+                ("comment".to_string(), "table comment".to_string()),
+            ]
+        );
     }
 
     fn typed_schema_change(sql: &str) -> novarocks_parser::ast::IcebergSchemaChange {

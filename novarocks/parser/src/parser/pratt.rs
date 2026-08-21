@@ -77,11 +77,6 @@ struct PrefixBinding {
 // SQLP-4 extends this table without changing the Pratt loop below.
 const INFIX_BINDINGS: &[InfixBinding] = &[
     InfixBinding {
-        token: TokenPattern::Symbol(Symbol::FatArrow),
-        operator: BinaryOperator::NamedArgument,
-        precedence: 1,
-    },
-    InfixBinding {
         token: TokenPattern::Keyword(Keyword::Or),
         operator: BinaryOperator::Or,
         precedence: OR_PRECEDENCE,
@@ -225,6 +220,8 @@ pub(super) struct PrattParser<'source, 'tokens> {
     tokens: &'tokens [Token],
     position: usize,
     pending_type_gt: Option<Span>,
+    allow_table_function_named_arguments: bool,
+    function_call_depth: usize,
 }
 
 impl<'source, 'tokens> PrattParser<'source, 'tokens> {
@@ -234,7 +231,14 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             tokens,
             position: 0,
             pending_type_gt: None,
+            allow_table_function_named_arguments: false,
+            function_call_depth: 0,
         }
+    }
+
+    fn with_table_function_named_arguments(mut self) -> Self {
+        self.allow_table_function_named_arguments = true;
+        self
     }
 
     /// `expression ::= prefix-expression { infix-operator prefix-expression }`
@@ -243,6 +247,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         self.skip_trivia();
         if self.is_end() {
             Ok(expression)
+        } else if self.current_is_symbol(Symbol::FatArrow) {
+            Err(self.unexpected("syntax error"))
         } else {
             Err(self.unexpected("end of expression"))
         }
@@ -785,12 +791,6 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 self.parse_identifier_or_function_call(span)
             }
             Some(Token {
-                kind: TokenKind::Keyword(_),
-                span,
-            }) if self.peek_nontrivia_is_symbol(1, Symbol::FatArrow) => {
-                self.parse_identifier_or_function_call(span)
-            }
-            Some(Token {
                 kind: TokenKind::Symbol(Symbol::LParen),
                 span,
             }) if self.parenthesized_query_follows() => self.parse_scalar_subquery(span),
@@ -1321,6 +1321,9 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         } else {
             FunctionQuantifier::None
         };
+        let allow_named_arguments =
+            self.allow_table_function_named_arguments && self.function_call_depth == 0;
+        self.function_call_depth += 1;
         let mut null_treatment = None;
         if !self.current_is_symbol(Symbol::RParen)
             && !self.current_is_keyword(Keyword::Order)
@@ -1336,6 +1339,8 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                         quote_style: None,
                         span: star,
                     }));
+                } else if allow_named_arguments && self.table_function_named_argument_ahead() {
+                    arguments.push(self.parse_table_function_named_argument()?);
                 } else {
                     arguments.push(self.parse_binding_power(0)?);
                 }
@@ -1478,6 +1483,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             },
             |window| window.span.end(),
         );
+        self.function_call_depth -= 1;
         Ok(Expr::FunctionCall(FunctionCall {
             name,
             arguments,
@@ -1489,6 +1495,32 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             over,
             substring_from_syntax: false,
             span: Span::new(span.start(), span_end),
+        }))
+    }
+
+    fn table_function_named_argument_ahead(&self) -> bool {
+        matches!(
+            self.current().map(|token| &token.kind),
+            Some(TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::Keyword(_))
+        ) && self.peek_nontrivia_is_symbol(1, Symbol::FatArrow)
+    }
+
+    fn parse_table_function_named_argument(&mut self) -> Result<Expr, ParseError> {
+        let start = self.current_span().start();
+        let name = self.parse_identifier(self.current_span());
+        self.skip_trivia();
+        if !self.current_is_symbol(Symbol::FatArrow) {
+            return Err(self.unexpected("'=>' after table function argument name"));
+        }
+        self.advance();
+        self.skip_trivia();
+        let value = self.parse_binding_power(0)?;
+        let span = Span::new(start, value.span().end());
+        Ok(Expr::Binary(BinaryExpr {
+            left: Box::new(Expr::Identifier(name)),
+            operator: BinaryOperator::NamedArgument,
+            right: Box::new(value),
+            span,
         }))
     }
 
@@ -1966,6 +1998,17 @@ pub(super) fn parse_window_spec(source: &str, tokens: &[Token]) -> Result<Window
     }
 }
 
+/// Parses a table-function expression, allowing named arguments only in the
+/// outer table-function call. Nested expressions keep the ordinary grammar.
+pub(super) fn parse_table_function_expression(
+    source: &str,
+    tokens: &[Token],
+) -> Result<Expr, ParseError> {
+    PrattParser::new(source, tokens)
+        .with_table_function_named_arguments()
+        .parse()
+}
+
 fn unescape_string(text: &str, quote: char) -> String {
     let mut value = String::with_capacity(text.len());
     let mut characters = text.chars();
@@ -2111,5 +2154,21 @@ mod tests {
         );
         let reparsed = crate::parse(&canonical).expect("canonical SQL should reparse");
         assert_eq!(Printer::new().statements(&reparsed), canonical);
+    }
+
+    #[test]
+    fn fat_arrow_is_rejected_in_ordinary_expressions() {
+        for source in ["s.s_1 => t.i_1", "argument => 5"] {
+            let tokens = lex(source).expect("fat-arrow source should lex");
+            let error = parse_expression(source, &tokens)
+                .expect_err("fat arrow must not parse as an expression operator");
+            assert!(matches!(
+                error,
+                crate::ParseError::UnexpectedToken {
+                    expected: "syntax error",
+                    ..
+                }
+            ));
+        }
     }
 }
