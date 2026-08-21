@@ -2017,12 +2017,16 @@ fn frontend_query_lifecycle_finalize_keeps_heartbeats_until_all_participants_dra
 fn frontend_query_lifecycle_finalization_reports_stable_no_outcome_participants() {
     let plan = query_init_plan(None);
     let (transport, sessions) = RecordingTransport::ready(&plan);
+    let execution_id = plan.execution_id();
     let (registry, _query) = registry_for(&plan);
     let finalize_config = config()
         .with_terminal_timeouts(Duration::from_millis(20), Duration::from_millis(20))
         .expect("terminal timeouts");
-    let barrier =
-        FrontendQueryLifecycleBarrier::new(Arc::new(transport), registry, finalize_config);
+    let barrier = FrontendQueryLifecycleBarrier::new(
+        Arc::new(transport),
+        Arc::clone(&registry),
+        finalize_config,
+    );
     let lease = barrier
         .initialize_all(plan)
         .expect("all participants ready");
@@ -2049,6 +2053,14 @@ fn frontend_query_lifecycle_finalization_reports_stable_no_outcome_participants(
             && message.find("backend=1") < message.find("backend=2"),
         "missing participants must be stable-sorted: {message}"
     );
+    let snapshot = registry
+        .retained_convergence_snapshot(execution_id)
+        .expect("finalization failure must retain its committed decision");
+    assert_eq!(
+        snapshot.error_source,
+        Some(QueryLifecycleConvergenceErrorSource::NoOutcome)
+    );
+    assert_eq!(snapshot.primary_error.as_deref(), Some(message));
 }
 
 #[test]
