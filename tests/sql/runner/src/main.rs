@@ -2193,14 +2193,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
 
                 for attempt in 0..retry_count {
                     let (ok, execution, err_msg) = if shell::is_shell_step(&step.sql) {
-                        let cmd = step
-                            .sql
-                            .trim_start()
-                            .strip_prefix("shell:")
-                            .unwrap_or("")
-                            .trim();
-                        let exec = shell::execute_shell_command(cmd);
-                        (true, Some(exec), String::new())
+                        shell::execute_shell_step(&step.sql)
                     } else {
                         execute_target_query_with_fault(
                             &step.meta,
@@ -2547,14 +2540,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 for attempt in 0..retry_count {
                     let (ok, execution, err_msg) = if ctx.record_from == RecordFrom::Target {
                         if shell::is_shell_step(&step.sql) {
-                            let cmd = step
-                                .sql
-                                .trim_start()
-                                .strip_prefix("shell:")
-                                .unwrap_or("")
-                                .trim();
-                            let exec = shell::execute_shell_command(cmd);
-                            (true, Some(exec), String::new())
+                            shell::execute_shell_step(&step.sql)
                         } else {
                             execute_target_query_with_fault(
                                 &step.meta,
@@ -2567,14 +2553,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             )
                         }
                     } else if shell::is_shell_step(&step.sql) {
-                        let cmd = step
-                            .sql
-                            .trim_start()
-                            .strip_prefix("shell:")
-                            .unwrap_or("")
-                            .trim();
-                        let exec = shell::execute_shell_command(cmd);
-                        (true, Some(exec), String::new())
+                        shell::execute_shell_step(&step.sql)
                     } else {
                         reference_session
                             .as_mut()
@@ -2772,14 +2751,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             Mode::Diff => {
                 if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
                     let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        let cmd = step
-                            .sql
-                            .trim_start()
-                            .strip_prefix("shell:")
-                            .unwrap_or("")
-                            .trim();
-                        let exec = shell::execute_shell_command(cmd);
-                        (true, Some(exec), String::new())
+                        shell::execute_shell_step(&step.sql)
                     } else {
                         execute_target_query_with_fault(
                             &step.meta,
@@ -2792,14 +2764,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         )
                     };
                     let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
-                        let cmd = step
-                            .sql
-                            .trim_start()
-                            .strip_prefix("shell:")
-                            .unwrap_or("")
-                            .trim();
-                        let exec = shell::execute_shell_command(cmd);
-                        (true, Some(exec), String::new())
+                        shell::execute_shell_step(&step.sql)
                     } else {
                         reference_session
                             .as_mut()
@@ -2837,14 +2802,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     // required to emit NovaRocks-owned descriptors, so Diff
                     // validates this branch against the target only.
                     let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        let cmd = step
-                            .sql
-                            .trim_start()
-                            .strip_prefix("shell:")
-                            .unwrap_or("")
-                            .trim();
-                        let exec = shell::execute_shell_command(cmd);
-                        (true, Some(exec), String::new())
+                        shell::execute_shell_step(&step.sql)
                     } else {
                         execute_target_query_with_fault(
                             &step.meta,
@@ -2877,14 +2835,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 } else if let Some(expected_error) = step.meta.expect_error.as_deref() {
                     let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        let cmd = step
-                            .sql
-                            .trim_start()
-                            .strip_prefix("shell:")
-                            .unwrap_or("")
-                            .trim();
-                        let exec = shell::execute_shell_command(cmd);
-                        (true, Some(exec), String::new())
+                        shell::execute_shell_step(&step.sql)
                     } else {
                         execute_target_query_with_fault(
                             &step.meta,
@@ -2897,14 +2848,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         )
                     };
                     let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
-                        let cmd = step
-                            .sql
-                            .trim_start()
-                            .strip_prefix("shell:")
-                            .unwrap_or("")
-                            .trim();
-                        let exec = shell::execute_shell_command(cmd);
-                        (true, Some(exec), String::new())
+                        shell::execute_shell_step(&step.sql)
                     } else {
                         reference_session
                             .as_mut()
@@ -2933,14 +2877,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 } else {
                     let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        let cmd = step
-                            .sql
-                            .trim_start()
-                            .strip_prefix("shell:")
-                            .unwrap_or("")
-                            .trim();
-                        let exec = shell::execute_shell_command(cmd);
-                        (true, Some(exec), String::new())
+                        shell::execute_shell_step(&step.sql)
                     } else {
                         execute_target_query_with_fault(
                             &step.meta,
@@ -2964,14 +2901,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             unreachable!("checked above");
                         };
                         let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
-                            let cmd = step
-                                .sql
-                                .trim_start()
-                                .strip_prefix("shell:")
-                                .unwrap_or("")
-                                .trim();
-                            let exec = shell::execute_shell_command(cmd);
-                            (true, Some(exec), String::new())
+                            shell::execute_shell_step(&step.sql)
                         } else {
                             reference_session
                                 .as_mut()
