@@ -28,7 +28,7 @@ use novarocks_parser::{
     ast::{
         BinaryOperator, Expr, Fold, GroupBy, Ident, JoinConstraint, JoinOperator, LiteralKind,
         Query, Select, SelectHintValue, SelectItem, SetExpr, SetOperation, SetOperator,
-        SetQuantifier, TableAlias, TableFactor, TableWithJoins,
+        SetQuantifier, TableAlias, TableFactor, TableWithJoins, Visit,
     },
 };
 
@@ -395,42 +395,178 @@ fn synthetic_ident(value: String, span: Span) -> Ident {
     }
 }
 
-fn set_expr_references_table(expr: &SetExpr, target: &str) -> bool {
-    match expr {
-        SetExpr::Select(select) => select.from.iter().any(|table| {
-            factor_references_table(&table.relation, target)
-                || table
-                    .joins
-                    .iter()
-                    .any(|join| factor_references_table(&join.relation, target))
-        }),
-        SetExpr::Query(query) => set_expr_references_table(query.body.as_ref(), target),
-        SetExpr::SetOperation(operation) => {
-            set_expr_references_table(operation.left.as_ref(), target)
-                || set_expr_references_table(operation.right.as_ref(), target)
+struct TableReferenceVisitor<'a> {
+    target: &'a str,
+    found: bool,
+}
+
+impl Visit for TableReferenceVisitor<'_> {
+    fn visit_query(&mut self, query: &Query) {
+        scan_query_for_table_reference(self, query);
+    }
+
+    fn visit_table_factor(&mut self, factor: &TableFactor) {
+        if let TableFactor::Table { name, .. } = factor
+            && name.parts.len() == 1
+            && name.parts[0].value.eq_ignore_ascii_case(self.target)
+        {
+            self.found = true;
         }
-        SetExpr::Values(_) => false,
+        novarocks_parser::ast::walk_table_factor(self, factor);
     }
 }
 
-fn factor_references_table(factor: &TableFactor, target: &str) -> bool {
-    match factor {
-        TableFactor::Table { name, .. } => {
-            name.parts.len() == 1 && name.parts[0].value.eq_ignore_ascii_case(target)
+fn set_expr_references_table(expr: &SetExpr, target: &str) -> bool {
+    let mut visitor = TableReferenceVisitor {
+        target,
+        found: false,
+    };
+    scan_set_expr_for_table_reference(&mut visitor, expr);
+    visitor.found
+}
+
+fn scan_query_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, query: &Query) {
+    let mut outer_target_visible = true;
+    if let Some(with) = &query.with {
+        for cte in &with.ctes {
+            if outer_target_visible {
+                if cte.name.value.eq_ignore_ascii_case(visitor.target) {
+                    // A same-name nested CTE owns its definition and every
+                    // following reference in this WITH scope. It must not be
+                    // attributed to the enclosing recursive CTE anchor.
+                    outer_target_visible = false;
+                } else {
+                    scan_query_for_table_reference(visitor, cte.query.as_ref());
+                }
+            }
         }
-        TableFactor::Derived { subquery, .. } => {
-            set_expr_references_table(subquery.body.as_ref(), target)
+    }
+    if !outer_target_visible {
+        return;
+    }
+    scan_set_expr_for_table_reference(visitor, query.body.as_ref());
+    for order in &query.order_by {
+        visitor.visit_expr(&order.expr);
+    }
+    if let Some(limit) = &query.limit {
+        visitor.visit_expr(limit);
+    }
+    if let Some(offset) = &query.offset {
+        visitor.visit_expr(&offset.value);
+    }
+    if let Some(fetch) = &query.fetch
+        && let Some(quantity) = &fetch.quantity
+    {
+        visitor.visit_expr(quantity);
+    }
+}
+
+fn scan_set_expr_for_table_reference(visitor: &mut TableReferenceVisitor<'_>, expr: &SetExpr) {
+    match expr {
+        SetExpr::Select(select) => {
+            for hint in &select.hints {
+                match &hint.value {
+                    SelectHintValue::Bare => {}
+                    SelectHintValue::Call { arguments } => {
+                        for argument in arguments {
+                            visitor.visit_expr(argument);
+                        }
+                    }
+                    SelectHintValue::Assignment { value } => visitor.visit_expr(value),
+                }
+            }
+            if let novarocks_parser::ast::SelectQuantifier::Distinct { on, .. } = &select.quantifier
+            {
+                for expression in on {
+                    visitor.visit_expr(expression);
+                }
+            }
+            for item in &select.projection {
+                match item {
+                    SelectItem::UnnamedExpr(expression)
+                    | SelectItem::ExprWithAlias {
+                        expr: expression, ..
+                    } => visitor.visit_expr(expression),
+                    SelectItem::Wildcard { options, .. }
+                    | SelectItem::QualifiedWildcard { options, .. } => {
+                        for replacement in &options.replace {
+                            visitor.visit_expr(&replacement.expr);
+                        }
+                    }
+                }
+            }
+            for table in &select.from {
+                visitor.visit_table_factor(&table.relation);
+                for join in &table.joins {
+                    visitor.visit_table_factor(&join.relation);
+                    if let JoinConstraint::On(expression) = &join.constraint {
+                        visitor.visit_expr(expression);
+                    }
+                }
+            }
+            if let Some(selection) = &select.selection {
+                visitor.visit_expr(selection);
+            }
+            match &select.group_by {
+                GroupBy::None => {}
+                GroupBy::Expressions { expressions, .. }
+                | GroupBy::Rollup { expressions, .. }
+                | GroupBy::Cube { expressions, .. } => {
+                    for expression in expressions {
+                        visitor.visit_expr(expression);
+                    }
+                }
+                GroupBy::GroupingSets { sets, .. } => {
+                    for set in sets {
+                        for expression in set {
+                            visitor.visit_expr(expression);
+                        }
+                    }
+                }
+            }
+            for expression in [&select.having, &select.qualify].into_iter().flatten() {
+                visitor.visit_expr(expression);
+            }
+            for window in &select.windows {
+                for expression in &window.specification.partition_by {
+                    visitor.visit_expr(expression);
+                }
+                for order in &window.specification.order_by {
+                    visitor.visit_expr(&order.expr);
+                }
+                if let Some(frame) = &window.specification.window_frame {
+                    scan_window_frame_bound_for_table_reference(visitor, &frame.start_bound);
+                    if let Some(end_bound) = &frame.end_bound {
+                        scan_window_frame_bound_for_table_reference(visitor, end_bound);
+                    }
+                }
+            }
         }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            factor_references_table(&table_with_joins.relation, target)
-                || table_with_joins
-                    .joins
-                    .iter()
-                    .any(|join| factor_references_table(&join.relation, target))
+        SetExpr::Values(values) => {
+            for row in &values.rows {
+                for expression in row {
+                    visitor.visit_expr(expression);
+                }
+            }
         }
-        TableFactor::TableFunction { .. } | TableFactor::Unnest { .. } => false,
+        SetExpr::Query(query) => scan_query_for_table_reference(visitor, query),
+        SetExpr::SetOperation(operation) => {
+            scan_set_expr_for_table_reference(visitor, operation.left.as_ref());
+            scan_set_expr_for_table_reference(visitor, operation.right.as_ref());
+        }
+    }
+}
+
+fn scan_window_frame_bound_for_table_reference(
+    visitor: &mut TableReferenceVisitor<'_>,
+    bound: &novarocks_parser::ast::WindowFrameBound,
+) {
+    match bound {
+        novarocks_parser::ast::WindowFrameBound::Preceding(Some(expression), _)
+        | novarocks_parser::ast::WindowFrameBound::Following(Some(expression), _) => {
+            visitor.visit_expr(expression)
+        }
+        _ => {}
     }
 }
 
@@ -440,57 +576,78 @@ fn substitute_table_with_derived(
     replacement: &Query,
     aliases: &[Ident],
 ) {
-    match expr {
-        SetExpr::Select(select) => {
-            for table in &mut select.from {
-                substitute_factor(&mut table.relation, target, replacement, aliases);
-                for join in &mut table.joins {
-                    substitute_factor(&mut join.relation, target, replacement, aliases);
+    struct RecursiveTableSubstituter<'a> {
+        target: &'a str,
+        replacement: &'a Query,
+        aliases: &'a [Ident],
+    }
+
+    impl Fold for RecursiveTableSubstituter<'_> {
+        fn fold_query(&mut self, mut query: Query) -> Query {
+            if let Some(with) = query.with.as_mut() {
+                for cte in &mut with.ctes {
+                    if cte.name.value.eq_ignore_ascii_case(self.target) {
+                        // CTE scope begins at its own declaration. Earlier
+                        // sibling CTEs can still reference the outer recursive
+                        // source, while this declaration, later siblings, and
+                        // the query body resolve the same name locally.
+                        return query;
+                    }
+                    cte.query = Box::new(self.fold_query(*cte.query.clone()));
                 }
             }
+            novarocks_parser::ast::fold_query(self, query)
         }
-        SetExpr::Query(query) => {
-            substitute_table_with_derived(query.body.as_mut(), target, replacement, aliases)
-        }
-        SetExpr::SetOperation(operation) => {
-            substitute_table_with_derived(operation.left.as_mut(), target, replacement, aliases);
-            substitute_table_with_derived(operation.right.as_mut(), target, replacement, aliases);
-        }
-        SetExpr::Values(_) => {}
-    }
-}
 
-fn substitute_factor(
-    factor: &mut TableFactor,
-    target: &str,
-    replacement: &Query,
-    aliases: &[Ident],
-) {
-    let TableFactor::Table {
-        name, alias, span, ..
-    } = factor
-    else {
-        return;
-    };
-    if name.parts.len() != 1 || !name.parts[0].value.eq_ignore_ascii_case(target) {
-        return;
+        fn fold_table_factor(&mut self, factor: TableFactor) -> TableFactor {
+            let factor = novarocks_parser::ast::fold_table_factor(self, factor);
+            let is_target = matches!(
+                &factor,
+                TableFactor::Table { name, .. }
+                    if name.parts.len() == 1
+                        && name.parts[0].value.eq_ignore_ascii_case(self.target)
+            );
+            if !is_target {
+                return factor;
+            }
+            let TableFactor::Table { alias, span, .. } = factor else {
+                unreachable!("target factor must be a table");
+            };
+            let alias = alias
+                .as_ref()
+                .map(|alias| alias.name.clone())
+                .unwrap_or_else(|| synthetic_ident(self.target.to_owned(), span));
+            TableFactor::Derived {
+                lateral: false,
+                subquery: Box::new(self.replacement.clone()),
+                hints: Vec::new(),
+                alias: Some(TableAlias {
+                    name: alias,
+                    columns: self.aliases.to_vec(),
+                    explicit_as: false,
+                    span,
+                }),
+                span,
+            }
+        }
     }
-    let alias = alias
-        .as_ref()
-        .map(|alias| alias.name.clone())
-        .unwrap_or_else(|| synthetic_ident(target.to_owned(), *span));
-    *factor = TableFactor::Derived {
-        lateral: false,
-        subquery: Box::new(replacement.clone()),
-        hints: Vec::new(),
-        alias: Some(TableAlias {
-            name: alias,
-            columns: aliases.to_vec(),
-            explicit_as: false,
-            span: *span,
-        }),
-        span: *span,
+
+    let template = Query {
+        with: None,
+        body: Box::new(expr.clone()),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        limit_comma_offset: false,
+        fetch: None,
+        span: expr.span(),
     };
+    let mut substituter = RecursiveTableSubstituter {
+        target,
+        replacement,
+        aliases,
+    };
+    *expr = *substituter.fold_query(template).body;
 }
 
 fn normalize_cross_joins(query: &mut Query) {
@@ -719,6 +876,56 @@ mod tests {
         let query =
             parse_query("WITH RECURSIVE n AS (SELECT * FROM n UNION ALL SELECT 1) SELECT * FROM n");
         assert_eq!(preanalyze(query), Err("unknown table: n".to_owned()));
+    }
+
+    #[test]
+    fn recursive_anchor_nested_predicate_self_reference_fails_before_catalog_lookup() {
+        let query = parse_query(
+            "WITH RECURSIVE n AS (SELECT 1 WHERE 1 IN (SELECT 1 FROM n) UNION ALL SELECT 2) SELECT * FROM n",
+        );
+        assert_eq!(preanalyze(query), Err("unknown table: n".to_owned()));
+    }
+
+    #[test]
+    fn recursive_anchor_nested_with_cte_body_self_reference_fails_before_catalog_lookup() {
+        let query = parse_query(
+            "WITH RECURSIVE n AS (SELECT 1 WHERE EXISTS (WITH x AS (SELECT * FROM n) SELECT 1 FROM x) UNION ALL SELECT 2) SELECT * FROM n",
+        );
+        assert_eq!(preanalyze(query), Err("unknown table: n".to_owned()));
+    }
+
+    #[test]
+    fn recursive_anchor_nested_same_name_with_shadows_outer_cte() {
+        let query = parse_query(
+            "WITH RECURSIVE n AS (SELECT 1 WHERE EXISTS (WITH n AS (SELECT 1) SELECT 1 FROM n) UNION ALL SELECT 2) SELECT * FROM n",
+        );
+        assert!(preanalyze(query).is_ok());
+    }
+
+    #[test]
+    fn unrolls_outer_recursive_reference_before_nested_same_name_cte() {
+        let query = parse_query(
+            "WITH RECURSIVE n AS (SELECT 1 AS x UNION ALL SELECT x + 1 FROM n WHERE EXISTS (WITH x AS (SELECT * FROM n), n AS (SELECT 1) SELECT 1 FROM x)) SELECT x FROM n",
+        );
+        let query = preanalyze(query).expect("recursive CTE should unroll");
+        let with = query.with.expect("WITH must remain");
+        assert!(!set_expr_references_table(
+            with.ctes[0].query.body.as_ref(),
+            "n"
+        ));
+    }
+
+    #[test]
+    fn unrolls_recursive_cte_reference_inside_predicate_subquery() {
+        let query = parse_query(
+            "WITH RECURSIVE n AS (SELECT 1 AS x UNION ALL SELECT x + 1 FROM n WHERE EXISTS (SELECT 1 FROM n)) SELECT x FROM n",
+        );
+        let query = preanalyze(query).expect("recursive CTE should unroll");
+        let with = query.with.expect("WITH must remain");
+        assert!(!set_expr_references_table(
+            with.ctes[0].query.body.as_ref(),
+            "n"
+        ));
     }
 
     #[test]

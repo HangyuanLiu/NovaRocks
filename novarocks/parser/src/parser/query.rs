@@ -32,7 +32,7 @@ use crate::{
 
 use super::{
     StatementParser,
-    pratt::{PrattParser, parse_window_spec},
+    pratt::{PrattParser, parse_table_function_expression, parse_window_spec},
 };
 
 pub(super) fn parse(
@@ -808,7 +808,7 @@ fn parse_table_factor(
     if parser.current_is_word("TABLE") {
         let start = parser.consume_word("TABLE")?.start();
         parser.consume_symbol(Symbol::LParen)?;
-        let expr = parse_expression_until(parser, &[], &[Symbol::RParen])?;
+        let expr = parse_table_function_expression_until(parser, &[], &[Symbol::RParen])?;
         let end = parser.consume_symbol(Symbol::RParen)?.end();
         hints.extend(parse_table_hints(parser)?);
         let alias = parse_optional_table_alias(parser)?;
@@ -827,7 +827,7 @@ fn parse_table_factor(
     let start = name.span.start();
     if parser.current_is_symbol(Symbol::LParen) {
         let end = table_function_end(parser)?;
-        let expr = parse_expression_range(parser, function_start, end)?;
+        let expr = parse_table_function_expression_range(parser, function_start, end)?;
         parser.position = end;
         parser.skip_trivia();
         hints.extend(parse_table_hints(parser)?);
@@ -1373,6 +1373,36 @@ fn parse_expression_range(
         .map_or_else(|| parser.current_span(), |token| token.span);
     expression_tokens.push(Token::new(TokenKind::End, boundary));
     PrattParser::new(parser.source, &expression_tokens).parse()
+}
+
+fn parse_table_function_expression_until(
+    parser: &mut StatementParser<'_, '_>,
+    words: &[&str],
+    symbols: &[Symbol],
+) -> Result<Expr, crate::ParseError> {
+    let begin = parser.position;
+    let end = expression_end(parser, words, symbols);
+    if end == begin {
+        return Err(parser.unexpected("table function expression"));
+    }
+    let expression = parse_table_function_expression_range(parser, begin, end)?;
+    parser.position = end;
+    parser.skip_trivia();
+    Ok(expression)
+}
+
+fn parse_table_function_expression_range(
+    parser: &StatementParser<'_, '_>,
+    begin: usize,
+    end: usize,
+) -> Result<Expr, crate::ParseError> {
+    let mut expression_tokens: Vec<Token> = parser.tokens[begin..end].to_vec();
+    let boundary = parser
+        .tokens
+        .get(end)
+        .map_or_else(|| parser.current_span(), |token| token.span);
+    expression_tokens.push(Token::new(TokenKind::End, boundary));
+    parse_table_function_expression(parser.source, &expression_tokens)
 }
 
 fn token_is_word(parser: &StatementParser<'_, '_>, token: &Token, word: &str) -> bool {

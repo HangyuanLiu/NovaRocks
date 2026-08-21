@@ -487,7 +487,10 @@ fn format_cast_type(data_type: &ast::TypeName) -> String {
             let scale = numeric_type_argument(data_type, 1).unwrap_or(0);
             format!("{}({precision},{scale})", decimal_kind(precision))
         }
+        "tinyint" => "TINYINT".to_string(),
+        "smallint" => "SMALLINT".to_string(),
         "largeint" => "LARGEINT".to_string(),
+        "bigint" => "BIGINT".to_string(),
         "string" => "VARCHAR(65533)".to_string(),
         "binary" | "varbinary" => "VARBINARY".to_string(),
         "int" | "integer" => "INT".to_string(),
@@ -546,11 +549,61 @@ fn format_struct_type_argument(argument: &ast::TypeNameArgument) -> String {
             format!(
                 "{} {}",
                 field.name.value,
-                format_cast_type(&field.data_type)
+                format_struct_field_cast_type(&field.data_type)
             )
         }
-        ast::TypeNameArgument::Type(data_type) => format_cast_type(data_type),
+        ast::TypeNameArgument::Type(data_type) => format_struct_field_cast_type(data_type),
         ast::TypeNameArgument::Literal(literal) => format_literal_display_name(literal),
+    }
+}
+
+/// StarRocks keeps MySQL display widths for scalar types below a STRUCT
+/// field, unlike top-level CAST targets.  This must recurse through nested
+/// collection types so `struct<field array<int>>` does not inherit the
+/// top-level `ARRAY<INT>` spelling.
+fn format_struct_field_cast_type(data_type: &ast::TypeName) -> String {
+    let name = data_type
+        .name
+        .parts
+        .last()
+        .map(|part| part.value.to_ascii_lowercase())
+        .unwrap_or_default();
+    match name.as_str() {
+        "tinyint" => "tinyint(4)".to_string(),
+        "smallint" => "smallint(6)".to_string(),
+        "int" | "integer" => "int(11)".to_string(),
+        "bigint" => "bigint(20)".to_string(),
+        "string" => "varchar(65533)".to_string(),
+        "binary" | "varbinary" => "varbinary".to_string(),
+        "array" => format!(
+            "array<{}>",
+            data_type
+                .arguments
+                .first()
+                .and_then(type_name_argument_as_type)
+                .map(format_struct_field_cast_type)
+                .unwrap_or_default()
+        ),
+        "map" => format!(
+            "map<{}>",
+            data_type
+                .arguments
+                .iter()
+                .filter_map(type_name_argument_as_type)
+                .map(format_struct_field_cast_type)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        "struct" => format!(
+            "struct<{}>",
+            data_type
+                .arguments
+                .iter()
+                .map(format_struct_type_argument)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => format_cast_type(data_type),
     }
 }
 
@@ -1107,6 +1160,29 @@ mod tests {
         assert_eq!(
             expr_display_name(&expr),
             "CAST((percentile_approx_weighted(c13.a, c1, 0.5)) AS INT)"
+        );
+    }
+
+    #[test]
+    fn expr_display_name_canonicalizes_top_level_integer_cast_types() {
+        let int_expr = parse_select_expr("SELECT CAST(NULL AS INT)");
+        let tinyint_expr = parse_select_expr("SELECT CAST(NULL AS TINYINT)");
+
+        assert_eq!(expr_display_name(&int_expr), "CAST(NULL AS INT)");
+        assert_eq!(expr_display_name(&tinyint_expr), "CAST(NULL AS TINYINT)");
+    }
+
+    #[test]
+    fn expr_display_name_preserves_struct_field_integer_widths_recursively() {
+        let expr = parse_select_expr(
+            "SELECT CAST(parse_json('[1,2,3]') AS \
+             STRUCT<col1 INT, col2 ARRAY<INT>, col3 STRUCT<nested TINYINT>>)",
+        );
+
+        assert_eq!(
+            expr_display_name(&expr),
+            "CAST((parse_json('[1,2,3]')) AS struct<col1 int(11), col2 array<int(11)>, \
+             col3 struct<nested tinyint(4)>>)"
         );
     }
 }

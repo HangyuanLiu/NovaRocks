@@ -18,7 +18,7 @@
 //! syntax can round-trip without making it a frontend execution route.
 
 use novarocks_parser::{
-    ast::{SelectHintValue, SetExpr, Statement, SyntaxEq, TableFactor},
+    ast::{BinaryOperator, Expr, SelectHintValue, SetExpr, Statement, SyntaxEq, TableFactor},
     parse,
     printer::Printer,
 };
@@ -91,6 +91,31 @@ fn source_significant_query_forms_are_retained_by_the_typed_ast() {
         Printer::new().statements(&statements),
         "SELECT t.id AS value FROM source AS t INNER JOIN LATERAL UNNEST(t.items) AS u(item) ON TRUE LEFT OUTER JOIN target AS r ON r.id = t.id"
     );
+}
+
+#[test]
+fn table_function_named_arguments_are_typed_locally() {
+    let statements = parse("SELECT * FROM TABLE(generate_series(end => 5, start => 2))")
+        .expect("table-function named arguments should parse");
+    let Statement::Query(query) = &statements[0] else {
+        panic!("expected query statement");
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("expected SELECT query body");
+    };
+    let TableFactor::TableFunction {
+        expr: Expr::FunctionCall(call),
+        ..
+    } = &select.from[0].relation
+    else {
+        panic!("expected table function call");
+    };
+    assert!(call.arguments.iter().all(|argument| {
+        matches!(
+            argument,
+            Expr::Binary(binary) if binary.operator == BinaryOperator::NamedArgument
+        )
+    }));
 }
 
 #[test]
