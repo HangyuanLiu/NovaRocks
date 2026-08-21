@@ -859,7 +859,10 @@ pub fn walk_session_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Se
                     SetValue::Query(value) => visitor.visit_query(value),
                     SetValue::Words(words) => {
                         for word in words {
-                            visitor.visit_ident(word);
+                            match word {
+                                SetWord::Ident(word) => visitor.visit_ident(word),
+                                SetWord::Literal(word) => visitor.visit_literal(word),
+                            }
                         }
                     }
                 }
@@ -894,7 +897,12 @@ pub fn fold_session_statement<F: Fold + ?Sized>(
                     SetValue::Words(words) => SetValue::Words(
                         words
                             .into_iter()
-                            .map(|word| folder.fold_ident(word))
+                            .map(|word| match word {
+                                SetWord::Ident(word) => SetWord::Ident(folder.fold_ident(word)),
+                                SetWord::Literal(word) => {
+                                    SetWord::Literal(folder.fold_literal(word))
+                                }
+                            })
                             .collect(),
                     ),
                 };

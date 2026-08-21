@@ -89,7 +89,23 @@ impl SetTarget {
 pub enum SetValue {
     Expression(Expr),
     Query(Box<Query>),
-    Words(Vec<Ident>),
+    Words(Vec<SetWord>),
+}
+
+/// One keyword, identifier, or literal in a special `SET` form.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SetWord {
+    Ident(Ident),
+    Literal(Literal),
+}
+
+impl SetWord {
+    pub const fn span(&self) -> Span {
+        match self {
+            Self::Ident(word) => word.span,
+            Self::Literal(word) => word.span,
+        }
+    }
 }
 
 impl SetValue {
@@ -99,8 +115,8 @@ impl SetValue {
             Self::Query(query) => query.span,
             Self::Words(words) => match words.first() {
                 Some(first) => Span::new(
-                    first.span.start(),
-                    words.last().expect("non-empty").span.end(),
+                    first.span().start(),
+                    words.last().expect("non-empty").span().end(),
                 ),
                 None => Span::new(0, 0),
             },

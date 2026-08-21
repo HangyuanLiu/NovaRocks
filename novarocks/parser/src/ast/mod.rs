@@ -87,7 +87,7 @@ pub use relation::{
 };
 pub use session::{
     KillKind, KillStatement, SessionStatement, SetAssignment, SetScope, SetStatement, SetTarget,
-    SetValue, UseStatement,
+    SetValue, SetWord, UseStatement,
 };
 pub use statistics::{
     AnalyzeMode, AnalyzeTable, CancelAnalyze, DropHistogram, DropMultipleColumnsStats, DropStats,

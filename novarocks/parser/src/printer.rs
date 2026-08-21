@@ -137,7 +137,7 @@ impl Printer {
                             self.write_query(value);
                             self.output.push(')');
                         }
-                        SetValue::Words(words) => self.write_ident_list(words),
+                        SetValue::Words(words) => self.write_set_words(words),
                     }
                 }
             }
@@ -1396,6 +1396,18 @@ impl Printer {
                 self.output.push_str(separator);
             }
             self.write_ident(ident);
+        }
+    }
+
+    fn write_set_words(&mut self, words: &[SetWord]) {
+        for (index, word) in words.iter().enumerate() {
+            if index != 0 {
+                self.output.push(' ');
+            }
+            match word {
+                SetWord::Ident(word) => self.write_ident(word),
+                SetWord::Literal(word) => self.write_literal(word),
+            }
         }
     }
 }
