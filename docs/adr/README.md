@@ -305,3 +305,4 @@ NotFound；Connector 不让通用 field lookup 遮蔽 table-format invariant；F
 statement family。边界层只能传递或编码 owner 的事实，测试只能验证既定契约，不能成为第二错误 authority。
 
 - ADR-0088 — SQL、Iceberg 与 MV 的错误为何必须在各自 owner 内、跨域 fallback 前收敛（active）
+- ADR-0095 — SQL analyze 错误为何以 typed code/span 穿过 Frontend、由 MySQL 边界映射（active）

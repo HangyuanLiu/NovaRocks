@@ -768,6 +768,20 @@ pub(super) fn infer_scalar_return_type_with_catalog(
     name: &str,
     arg_types: &[DataType],
 ) -> DataType {
+    legacy_scalar_return_type_with_catalog(function_catalog, name, arg_types)
+        // This compatibility helper is retained for staged non-analysis
+        // consumers. SQL analysis checks the Option-returning function below
+        // before it accepts an arbitrary scalar function name.
+        .unwrap_or(DataType::Utf8)
+}
+
+/// Return the legacy scalar type only when the name is known by either the
+/// signature registry or the deliberately limited legacy matcher.
+pub(super) fn legacy_scalar_return_type_with_catalog(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    name: &str,
+    arg_types: &[DataType],
+) -> Option<DataType> {
     // Step B: the central signature registry is the single source of
     // truth for nearly all scalar built-ins (~250 names) including the
     // `coalesce`/`if`/`ifnull` cast-match family. If the registry knows
@@ -778,9 +792,9 @@ pub(super) fn infer_scalar_return_type_with_catalog(
     // whose permissive type fallbacks haven't been formalised as
     // signatures yet.
     if let Ok(resolved) = function_catalog.resolve_scalar_signature(name, arg_types) {
-        return resolved.return_type;
+        return Some(resolved.return_type);
     }
-    match name {
+    Some(match name {
         // String functions
         "upper"
         | "lower"
@@ -1158,9 +1172,8 @@ pub(super) fn infer_scalar_return_type_with_catalog(
             _ => DataType::Null,
         },
 
-        // Default for unknown functions -> Utf8 (permissive)
-        _ => DataType::Utf8,
-    }
+        _ => return None,
+    })
 }
 
 fn infer_array_generate_return_type(arg_types: &[DataType]) -> DataType {

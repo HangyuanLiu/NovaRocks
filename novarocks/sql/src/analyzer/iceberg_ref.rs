@@ -25,6 +25,8 @@ use std::fmt;
 
 use novarocks_parser::ast::{Expr, LiteralKind, TableVersion, TableVersionKind};
 
+use crate::analyze_error::AnalyzeError;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IcebergRefKind {
     Branch,
@@ -182,17 +184,23 @@ pub fn resolve_read_binding(
     version: &TableVersion,
     metadata: &SqlIcebergRefMetadata,
     fully_qualified_name: &str,
-) -> Result<IcebergRefBinding, String> {
+) -> Result<IcebergRefBinding, AnalyzeError> {
     match version.kind {
         TableVersionKind::ForVersionAsOf => match &version.value {
             Expr::Literal(literal) => match &literal.kind {
                 LiteralKind::Number(n) => {
                     let snapshot_id: i64 = n.parse().map_err(|_| {
-                        format!("iceberg time travel: invalid snapshot id '{n}' for {fully_qualified_name}")
+                        AnalyzeError::invalid_literal(
+                            format!("iceberg time travel: invalid snapshot id '{n}' for {fully_qualified_name}"),
+                            literal.span,
+                        )
                     })?;
                     if !metadata.has_snapshot(snapshot_id) {
-                        return Err(format!(
-                            "iceberg time travel: snapshot {snapshot_id} not found in {fully_qualified_name}"
+                        return Err(AnalyzeError::invalid_argument(
+                            format!(
+                                "iceberg time travel: snapshot {snapshot_id} not found in {fully_qualified_name}"
+                            ),
+                            literal.span,
                         ));
                     }
                     Ok(IcebergRefBinding {
@@ -203,8 +211,11 @@ pub fn resolve_read_binding(
                 }
                 LiteralKind::String(s) => {
                     let entry = metadata.named_ref(s).ok_or_else(|| {
-                        format!(
-                            "iceberg time travel: ref '{s}' not found in {fully_qualified_name}"
+                        AnalyzeError::invalid_argument(
+                            format!(
+                                "iceberg time travel: ref '{s}' not found in {fully_qualified_name}"
+                            ),
+                            literal.span,
                         )
                     })?;
                     Ok(IcebergRefBinding {
@@ -213,18 +224,24 @@ pub fn resolve_read_binding(
                         ref_kind: Some(entry.kind.clone()),
                     })
                 }
-                other => Err(format!(
-                    "iceberg time travel: phase 1 only accepts literal snapshot id or ref name for VERSION AS OF; got value: {other:?}"
+                other => Err(AnalyzeError::invalid_literal(
+                    format!(
+                        "iceberg time travel: phase 1 only accepts literal snapshot id or ref name for VERSION AS OF; got value: {other:?}"
+                    ),
+                    literal.span,
                 )),
             },
-            other => Err(format!(
-                "iceberg time travel: phase 1 only accepts literal snapshot id or ref name for VERSION AS OF; got expression: {other:?}"
+            other => Err(AnalyzeError::invalid_argument(
+                format!(
+                    "iceberg time travel: phase 1 only accepts literal snapshot id or ref name for VERSION AS OF; got expression: {other:?}"
+                ),
+                other.span(),
             )),
         },
 
         TableVersionKind::ForSystemTimeAsOf => {
             let ts_ms = resolve_timestamp_expr(&version.value, fully_qualified_name)?;
-            find_snapshot_at_or_before(metadata, ts_ms, fully_qualified_name)
+            find_snapshot_at_or_before(metadata, ts_ms, fully_qualified_name, version.value.span())
         }
     }
 }
@@ -232,27 +249,40 @@ pub fn resolve_read_binding(
 /// Parse a timestamp literal expression into epoch milliseconds.
 /// Phase 1: only accepts integer literals (epoch ms) or single-quoted strings
 /// parseable as RFC 3339 or `%Y-%m-%d %H:%M:%S`.
-fn resolve_timestamp_expr(expr: &Expr, fully_qualified_name: &str) -> Result<i64, String> {
+fn resolve_timestamp_expr(expr: &Expr, fully_qualified_name: &str) -> Result<i64, AnalyzeError> {
     match expr {
         Expr::Literal(literal) => match &literal.kind {
             LiteralKind::Number(n) => n.parse::<i64>().map_err(|_| {
-                format!(
-                    "iceberg time travel: invalid epoch-ms value '{n}' for {fully_qualified_name}"
+                AnalyzeError::invalid_literal(
+                    format!(
+                        "iceberg time travel: invalid epoch-ms value '{n}' for {fully_qualified_name}"
+                    ),
+                    literal.span,
                 )
             }),
-            LiteralKind::String(s) => parse_timestamp_string(s, fully_qualified_name),
-            other => Err(format!(
-                "iceberg time travel: phase 1 only accepts literal timestamp; got value: {other:?}"
+            LiteralKind::String(s) => parse_timestamp_string(s, fully_qualified_name, literal.span),
+            other => Err(AnalyzeError::invalid_literal(
+                format!(
+                    "iceberg time travel: phase 1 only accepts literal timestamp; got value: {other:?}"
+                ),
+                literal.span,
             )),
         },
-        other => Err(format!(
-            "iceberg time travel: phase 1 only accepts literal timestamp; got expression: {other:?}"
+        other => Err(AnalyzeError::invalid_argument(
+            format!(
+                "iceberg time travel: phase 1 only accepts literal timestamp; got expression: {other:?}"
+            ),
+            other.span(),
         )),
     }
 }
 
 /// Parse a timestamp string as RFC 3339 or `%Y-%m-%d %H:%M:%S` (UTC assumed).
-fn parse_timestamp_string(s: &str, fully_qualified_name: &str) -> Result<i64, String> {
+fn parse_timestamp_string(
+    s: &str,
+    fully_qualified_name: &str,
+    span: novarocks_parser::Span,
+) -> Result<i64, AnalyzeError> {
     use chrono::{DateTime, NaiveDateTime, Utc};
 
     // Try RFC 3339 / ISO 8601 first
@@ -263,8 +293,11 @@ fn parse_timestamp_string(s: &str, fully_qualified_name: &str) -> Result<i64, St
     if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
         return Ok(ndt.and_utc().timestamp_millis());
     }
-    Err(format!(
-        "iceberg time travel: cannot parse timestamp '{s}' for {fully_qualified_name}; expected RFC 3339 or 'YYYY-MM-DD HH:MM:SS'"
+    Err(AnalyzeError::invalid_literal(
+        format!(
+            "iceberg time travel: cannot parse timestamp '{s}' for {fully_qualified_name}; expected RFC 3339 or 'YYYY-MM-DD HH:MM:SS'"
+        ),
+        span,
     ))
 }
 
@@ -273,15 +306,19 @@ fn find_snapshot_at_or_before(
     metadata: &SqlIcebergRefMetadata,
     ts_ms: i64,
     fully_qualified_name: &str,
-) -> Result<IcebergRefBinding, String> {
+    span: novarocks_parser::Span,
+) -> Result<IcebergRefBinding, AnalyzeError> {
     match metadata.snapshot_at_or_before(ts_ms) {
         Some(snapshot_id) => Ok(IcebergRefBinding {
             snapshot_id,
             ref_name: None,
             ref_kind: None,
         }),
-        None => Err(format!(
-            "iceberg time travel: no snapshot at or before timestamp {ts_ms} in {fully_qualified_name}"
+        None => Err(AnalyzeError::invalid_argument(
+            format!(
+                "iceberg time travel: no snapshot at or before timestamp {ts_ms} in {fully_qualified_name}"
+            ),
+            span,
         )),
     }
 }
@@ -488,7 +525,7 @@ mod tests {
         let version = version(TableVersionKind::ForVersionAsOf, val_str("nope"));
         let err = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap_err();
         assert!(
-            err.contains("ref 'nope' not found"),
+            err.message().contains("ref 'nope' not found"),
             "unexpected error: {err}"
         );
     }
@@ -499,7 +536,7 @@ mod tests {
         let version = version(TableVersionKind::ForVersionAsOf, val_num("99999"));
         let err = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap_err();
         assert!(
-            err.contains("snapshot 99999 not found"),
+            err.message().contains("snapshot 99999 not found"),
             "unexpected error: {err}"
         );
     }
@@ -527,7 +564,7 @@ mod tests {
         );
         let err = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap_err();
         assert!(
-            err.contains("no snapshot at or before"),
+            err.message().contains("no snapshot at or before"),
             "unexpected error: {err}"
         );
     }
@@ -559,7 +596,8 @@ mod tests {
         );
         let err = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap_err();
         assert!(
-            err.contains("phase 1 only accepts literal timestamp"),
+            err.message()
+                .contains("phase 1 only accepts literal timestamp"),
             "unexpected error: {err}"
         );
     }

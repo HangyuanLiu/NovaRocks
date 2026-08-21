@@ -20,8 +20,10 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use arrow::datatypes::DataType;
+use novarocks_parser::Span;
 
 use crate::analysis::LambdaParam;
+use crate::analyze_error::AnalyzeError;
 use crate::column_id::{ColumnId, ColumnRefFactory};
 use novarocks_types::schema::ColumnDef;
 
@@ -360,6 +362,19 @@ impl AnalyzerScope {
         }
         Err(reserved_name_error(name)
             .unwrap_or_else(|| format!("Column '{}' cannot be resolved.", name)))
+    }
+
+    /// Resolve a source-level column reference.  The scope itself owns no AST
+    /// nodes, so callers supply the parser span from the identifier that
+    /// initiated lookup rather than fabricating a location here.
+    pub(super) fn resolve_at(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+        span: Span,
+    ) -> Result<(ColumnId, DataType, bool), AnalyzeError> {
+        self.resolve(qualifier, name)
+            .map_err(|message| AnalyzeError::unknown_column(message, span))
     }
 
     /// Register Iceberg V3 row-lineage reserved pseudo-columns. Unlike
@@ -793,6 +808,19 @@ mod tests {
         scope.add_table(Some("t"), &[col("id", DataType::Int64, false)]);
         let err = scope.resolve(None, "_row_id").expect_err("must fail");
         assert!(err.contains("only available on Iceberg V3 row-lineage tables"));
+    }
+
+    #[test]
+    fn source_level_lookup_preserves_unknown_column_code_and_span() {
+        let scope = AnalyzerScope::new(test_factory());
+        let span = Span::new(7, 14);
+        let error = scope
+            .resolve_at(None, "missing", span)
+            .expect_err("must fail");
+
+        assert_eq!(error.code().as_str(), "sql.analyze.unknown_column");
+        assert_eq!(error.span(), Some(span));
+        assert_eq!(error.message(), "Column 'missing' cannot be resolved.");
     }
 
     #[test]

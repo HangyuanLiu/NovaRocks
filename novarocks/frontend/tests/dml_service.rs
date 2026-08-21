@@ -21,7 +21,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use novarocks_frontend::StateStoreHost;
 use novarocks_frontend::dml::{
-    CoordinatedWriteReport, DmlErrorKind, DmlService, OperationKind, OperationState,
+    CoordinatedWriteReport, DmlError, DmlErrorKind, DmlService, OperationKind, OperationState,
     OperationTarget, StateStoreOperationJournal, WriteExecutor, WriteTransactionSpec,
 };
 use novarocks_spi::connector::{
@@ -42,7 +42,7 @@ impl WriteExecutor for FakeExecutor {
     fn run_coordinated_write(
         &self,
         _spec: &WriteTransactionSpec,
-    ) -> Result<CoordinatedWriteReport<()>, String> {
+    ) -> Result<CoordinatedWriteReport<()>, DmlError> {
         Ok(CoordinatedWriteReport::CommitRequired(()))
     }
 
@@ -80,7 +80,7 @@ impl WriteExecutor for KnownCommittedCommitErrorExecutor {
     fn run_coordinated_write(
         &self,
         _spec: &WriteTransactionSpec,
-    ) -> Result<CoordinatedWriteReport<()>, String> {
+    ) -> Result<CoordinatedWriteReport<()>, DmlError> {
         Ok(CoordinatedWriteReport::CommitRequired(()))
     }
 
@@ -114,13 +114,13 @@ fn receipt(bytes: &'static [u8]) -> ConnectorWriteReceipt {
 }
 
 async fn open_journal(
-    _path: &std::path::Path,
+    path: &std::path::Path,
 ) -> (
     StateStoreHost,
     Arc<dyn StateStore>,
     StateStoreOperationJournal,
 ) {
-    let host = state_store_fixture::open("dml-service-test").await;
+    let host = state_store_fixture::open(format!("dml-service-test-{}", path.display())).await;
     let store = host.state_store().expect("StateStore exposure");
     let journal =
         StateStoreOperationJournal::open(Arc::clone(&store), tokio::runtime::Handle::current())

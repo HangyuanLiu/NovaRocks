@@ -90,6 +90,7 @@ impl DmlService {
             &resolved,
             &command.columns,
             &command.source,
+            source,
             command.overwrite_mode,
             &target_ref,
             context,
@@ -127,6 +128,7 @@ impl DmlService {
         target: &ResolvedInsertTarget,
         insert_columns: &[String],
         source: &InsertCommandSource,
+        sql_source: &str,
         overwrite_mode: InsertOverwriteMode,
         target_ref: &InsertTargetRef,
         context: &RequestContext,
@@ -157,6 +159,7 @@ impl DmlService {
             .prepare_iceberg_write(PrepareIcebergInsert {
                 target: target.clone(),
                 insert_columns: prepared_insert_columns,
+                sql_source: sql_source.to_string(),
                 source,
                 overwrite_mode,
                 target_ref: match target_ref {

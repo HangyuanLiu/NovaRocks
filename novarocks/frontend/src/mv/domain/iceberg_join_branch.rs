@@ -660,7 +660,7 @@ fn replace_branch_cte_queries(
                 cte.name.value
             ));
         }
-        cte.query = Box::new(branch_query);
+        *cte.query = branch_query;
     }
     Ok(())
 }

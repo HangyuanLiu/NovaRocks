@@ -2362,7 +2362,8 @@ fn build_candidate(
         current_database,
         factory.clone(),
         functions,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let mut returned = returned;
     let mv_logical = crate::planner::plan_query(resolved, ctes, &mut returned)?;
     let mut mv_scalars = crate::optimizer::scalar::ScalarArena::new();

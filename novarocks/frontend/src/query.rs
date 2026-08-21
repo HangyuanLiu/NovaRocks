@@ -64,7 +64,7 @@ use novarocks_user_error::UserError;
 use tokio::task;
 
 use crate::dml::DmlService;
-use crate::query::compiler::FrontendQueryCompiler;
+use crate::query::compiler::{FrontendQueryCompiler, FrontendQueryCompilerError};
 use crate::statistics::command::StatisticsCommandExecutor;
 use crate::view::command::ViewCommandExecutor;
 
@@ -780,7 +780,7 @@ impl FrontendQuerySession {
                 };
                 Some(
                     substitute_session_user_variables(statement.clone(), &assignments)
-                        .map_err(classify_engine_error)?,
+                        .map_err(|error| internal_error(error.to_string()))?,
                 )
             }
             crate::query_execution::statement_admission::StatementAdmission::LegacyFrontier => None,
@@ -870,8 +870,18 @@ impl FrontendQuerySession {
                 ) {
                     compiler
                         .prepare_statement(&statement, &context, Some(query_options))
-                        .and_then(|operation| execute_prepared_query(operation, &query_execution))
-                        .map_err(RoutedExecutionError::Engine)
+                        .and_then(|operation| {
+                            execute_prepared_query(operation, &query_execution)
+                                .map_err(FrontendQueryCompilerError::Engine)
+                        })
+                        .map_err(|error| match error {
+                            FrontendQueryCompilerError::Engine(error) => {
+                                RoutedExecutionError::Engine(error)
+                            }
+                            FrontendQueryCompilerError::Analyze(error) => {
+                                RoutedExecutionError::User(error.to_user_error(Some(&sql)))
+                            }
+                        })
                 } else if let ParsedStatement::Dml(statement) = &statement {
                     execute_typed_dml_statement(
                         dml.as_ref(),
@@ -973,7 +983,7 @@ impl FrontendQuerySession {
             ),
             StatementFinishOutcome::Completed | StatementFinishOutcome::Stale => {
                 result.map_err(|error| match error {
-                    RoutedExecutionError::Engine(error) => classify_engine_error(error),
+                    RoutedExecutionError::Engine(error) => internal_error(error),
                     RoutedExecutionError::User(error) => QueryServiceError::from_user_error(error),
                 })
             }
@@ -1149,7 +1159,8 @@ fn resolve_catalog_name(
     resolver: &SessionCatalogResolver,
     catalog: &str,
 ) -> Result<Option<String>, QueryServiceError> {
-    let normalized = normalize_identifier(catalog).map_err(classify_engine_error)?;
+    let normalized =
+        normalize_identifier(catalog).map_err(|error| internal_error(error.to_string()))?;
     if normalized == DEFAULT_CATALOG {
         return Ok(None);
     }
@@ -1181,12 +1192,13 @@ fn resolve_database_context(
         .collect::<Vec<_>>();
     match parts.as_slice() {
         [database] => {
-            let database = normalize_identifier(database).map_err(classify_engine_error)?;
+            let database = normalize_identifier(database)
+                .map_err(|error| internal_error(error.to_string()))?;
             match current_catalog {
                 Some(catalog)
                     if resolver
                         .iceberg_namespace_exists(catalog, &database)
-                        .map_err(classify_engine_error)? =>
+                        .map_err(|error| internal_error(error.to_string()))? =>
                 {
                     Ok(DatabaseContext {
                         catalog: Some(catalog.to_string()),
@@ -1199,7 +1211,7 @@ fn resolve_database_context(
                 )),
                 None if resolver
                     .database_exists(&database)
-                    .map_err(classify_engine_error)? =>
+                    .map_err(|error| internal_error(error.to_string()))? =>
                 {
                     Ok(DatabaseContext {
                         catalog: None,
@@ -1214,12 +1226,13 @@ fn resolve_database_context(
         }
         [catalog, database] => {
             let catalog = resolve_catalog_name(resolver, catalog)?;
-            let database = normalize_identifier(database).map_err(classify_engine_error)?;
+            let database = normalize_identifier(database)
+                .map_err(|error| internal_error(error.to_string()))?;
             match catalog {
                 Some(catalog)
                     if resolver
                         .iceberg_namespace_exists(&catalog, &database)
-                        .map_err(classify_engine_error)? =>
+                        .map_err(|error| internal_error(error.to_string()))? =>
                 {
                     Ok(DatabaseContext {
                         catalog: Some(catalog),
@@ -1228,7 +1241,7 @@ fn resolve_database_context(
                 }
                 None if resolver
                     .database_exists(&database)
-                    .map_err(classify_engine_error)? =>
+                    .map_err(|error| internal_error(error.to_string()))? =>
                 {
                     Ok(DatabaseContext {
                         catalog: None,
@@ -1570,24 +1583,6 @@ fn internal_error(message: impl Into<String>) -> QueryServiceError {
     QueryServiceError::new(QueryServiceErrorKind::Internal, message)
 }
 
-fn classify_engine_error(error: impl ToString) -> QueryServiceError {
-    let message = error.to_string();
-    let lower = message.to_ascii_lowercase();
-    let kind = if lower.contains("unknown database") || lower.contains("unknown catalog") {
-        QueryServiceErrorKind::BadDatabase
-    } else if lower.contains("unsupported") {
-        QueryServiceErrorKind::Unsupported
-    } else if lower.contains("expected")
-        || lower.contains("unterminated")
-        || lower.contains("invalid")
-    {
-        QueryServiceErrorKind::Parse
-    } else {
-        QueryServiceErrorKind::Internal
-    };
-    QueryServiceError::new(kind, message)
-}
-
 fn cancellation_error(reason: QueryCancellationReason) -> QueryServiceError {
     let (kind, message) = match reason {
         QueryCancellationReason::DeadlineExceeded { timeout_ms } => (
@@ -1665,7 +1660,7 @@ mod tests {
         fn stage_mutation(
             &self,
             _prepared: &dyn MutationPrepared,
-        ) -> Result<MutationStageOutcome, String> {
+        ) -> Result<MutationStageOutcome, crate::dml::error::DmlExecutionError> {
             unreachable!("rejected mutation must not stage")
         }
 
@@ -1701,6 +1696,7 @@ mod tests {
                     base_snapshot_id: None,
                 },
                 handle: Arc::new(TestDeletePrepared),
+                sql_source: request.source.to_string(),
             })
         }
 

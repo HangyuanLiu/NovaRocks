@@ -112,16 +112,6 @@ enum CommitStatePhase {
 }
 
 impl CommitStatePhase {
-    #[cfg(test)]
-    const ALL: [Self; 6] = [
-        Self::Reservation,
-        Self::DataCommit,
-        Self::Versionstamp,
-        Self::PreDispatchTombstone,
-        Self::Terminalization,
-        Self::Resolve,
-    ];
-
     const fn as_str(self) -> &'static str {
         match self {
             Self::Reservation => "reservation",

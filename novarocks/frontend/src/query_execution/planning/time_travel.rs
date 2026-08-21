@@ -27,6 +27,7 @@ use novarocks_parser::ast::{
     Ident, ObjectName as ParserObjectName, Query, SetExpr, TableAlias, TableFactor, TableWithJoins,
 };
 use novarocks_spi::connector::{ConnectorReadReferenceFacts, ConnectorReadReferenceKind};
+use novarocks_sql::analyze_error::AnalyzeError;
 #[cfg(test)]
 use novarocks_sql::planning::catalog::SqlTestDeltaTableFacts;
 use novarocks_sql::planning::catalog::{
@@ -36,6 +37,26 @@ use novarocks_sql::planning::catalog::{
 };
 use novarocks_sql::syntax::ObjectName;
 use novarocks_types::schema::ColumnDef;
+
+/// Keeps SQL analysis facts distinct from catalog and connector failures until
+/// the frontend still has the original statement source for user rendering.
+#[derive(Debug)]
+pub(crate) enum TimeTravelRewriteError {
+    Engine(String),
+    Analyze(AnalyzeError),
+}
+
+impl From<String> for TimeTravelRewriteError {
+    fn from(error: String) -> Self {
+        Self::Engine(error)
+    }
+}
+
+impl From<AnalyzeError> for TimeTravelRewriteError {
+    fn from(error: AnalyzeError) -> Self {
+        Self::Analyze(error)
+    }
+}
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
@@ -132,14 +153,13 @@ pub fn has_time_travel_refs(query: &Query) -> bool {
 }
 
 fn has_time_travel_in_query(query: &Query) -> bool {
-    if let Some(with) = &query.with {
-        if with
+    if let Some(with) = &query.with
+        && with
             .ctes
             .iter()
             .any(|cte| has_time_travel_in_query(cte.query.as_ref()))
-        {
-            return true;
-        }
+    {
+        return true;
     }
     has_time_travel_in_set_expr(query.body.as_ref())
 }
@@ -231,7 +251,7 @@ pub(crate) fn rewrite_time_travel_refs(
     current_database: &str,
     query: &mut Query,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), String> {
+) -> Result<(), TimeTravelRewriteError> {
     // Walk CTEs
     if let Some(with) = &mut query.with {
         for cte in &mut with.ctes {
@@ -259,7 +279,7 @@ fn rewrite_time_travel_in_query(
     current_database: &str,
     query: &mut Query,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), String> {
+) -> Result<(), TimeTravelRewriteError> {
     if let Some(with) = &mut query.with {
         for cte in &mut with.ctes {
             rewrite_time_travel_in_query(
@@ -286,7 +306,7 @@ fn rewrite_time_travel_in_set_expr(
     current_database: &str,
     expr: &mut SetExpr,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), String> {
+) -> Result<(), TimeTravelRewriteError> {
     match expr {
         SetExpr::Select(select) => {
             for tw in &mut select.from {
@@ -342,7 +362,7 @@ fn rewrite_time_travel_in_factor(
     current_database: &str,
     factor: &mut TableFactor,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), String> {
+) -> Result<(), TimeTravelRewriteError> {
     match factor {
         TableFactor::Table {
             name,
@@ -360,7 +380,9 @@ fn rewrite_time_travel_in_factor(
                 .collect();
 
             if parts.is_empty() {
-                return Err("iceberg time travel: table name has no identifier parts".to_string());
+                return Err("iceberg time travel: table name has no identifier parts"
+                    .to_string()
+                    .into());
             }
 
             // Reject the combination of branch/tag suffix with FOR VERSION/TIMESTAMP AS OF.
@@ -373,7 +395,8 @@ fn rewrite_time_travel_in_factor(
                             "iceberg ref: branch suffix '.{}_{}' conflicts with FOR VERSION AS OF clause",
                             prefix.trim_end_matches('_'),
                             ref_name,
-                        ));
+                        )
+                        .into());
                     }
                 }
             }
@@ -391,7 +414,8 @@ fn rewrite_time_travel_in_factor(
                         .last()
                         .expect("checked nonempty table name")
                         .as_str()
-                ));
+                )
+                .into());
             }
 
             let fqn = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
@@ -487,7 +511,7 @@ fn rewrite_time_travel_in_table_with_joins(
     current_database: &str,
     table: &mut TableWithJoins,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), String> {
+) -> Result<(), TimeTravelRewriteError> {
     rewrite_time_travel_in_factor(
         resolver,
         current_catalog,

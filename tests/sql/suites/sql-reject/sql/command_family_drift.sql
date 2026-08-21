@@ -76,7 +76,7 @@ CREATE CATALOG reject_catalog PROPERTIES ('type');
 DROP CATALOG;
 
 -- @expect_error_tier=drift
--- @expect_error=[sql.parse.unexpected_token] expected identifier
+-- @expect_error=[sql.parse.unexpected_token] expected PRIMARY KEY clause requires at least one column
 CREATE MATERIALIZED VIEW reject_mv
 DISTRIBUTED BY HASH(k1) BUCKETS 1
 PRIMARY KEY ()

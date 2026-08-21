@@ -19,6 +19,10 @@
     feature = "mysql-state-store-provider",
     feature = "state-store-test-hooks"
 ))]
+#![allow(
+    clippy::await_holding_lock,
+    reason = "tests serialize shared MySQL fixture environment mutations across await points"
+)]
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};

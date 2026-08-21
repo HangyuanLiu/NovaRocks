@@ -67,19 +67,24 @@ impl WriteExecutor for IcebergInsertWriteExecutor<'_> {
     fn run_coordinated_write(
         &self,
         _spec: &WriteTransactionSpec,
-    ) -> Result<CoordinatedWriteReport<Self::CommitHandle>, String> {
+    ) -> Result<CoordinatedWriteReport<Self::CommitHandle>, crate::dml::error::DmlError> {
         let encoding = self
             .engine
-            .iceberg_write_native_encoding(self.prepared.handle.as_ref())?;
-        let input = encoding.input()?;
+            .iceberg_write_native_encoding(self.prepared.handle.as_ref())
+            .map_err(|error| error.into_dml_error(Some(&self.prepared.sql_source)))?;
+        let input = encoding
+            .input()
+            .map_err(crate::dml::error::DmlError::executor)?;
         let native_bundle =
-            crate::native::fragment_encoder::encode_native_fragment_bundle(input.encoding_view())?;
+            crate::native::fragment_encoder::encode_native_fragment_bundle(input.encoding_view())
+                .map_err(crate::dml::error::DmlError::executor)?;
         drop(encoding);
         Ok(
-            match self.engine.run_iceberg_write_with_native_bundle(
-                self.prepared.handle.as_ref(),
-                native_bundle,
-            )? {
+            match self
+                .engine
+                .run_iceberg_write_with_native_bundle(self.prepared.handle.as_ref(), native_bundle)
+                .map_err(crate::dml::error::DmlError::executor)?
+            {
                 IcebergWriteReport::Aborted {
                     reason,
                     has_staged_files: _,

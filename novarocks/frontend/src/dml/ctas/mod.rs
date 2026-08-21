@@ -191,6 +191,7 @@ fn execute_ctas_operation(
     active: &mut ActiveDmlOperation,
 ) -> Result<(), DmlError> {
     let session = context.session();
+    let statement_source = source;
     active.check_before_dispatch()?;
     let preflight = match engine.preflight_ctas_target(
         statement,
@@ -221,7 +222,9 @@ fn execute_ctas_operation(
             return Ok(());
         }
         Ok(CtasTargetPreflightOutcome::Ready(preflight)) => preflight,
-        Err(failure) => return finish_source_failure(active, active.stored.clone(), failure),
+        Err(failure) => {
+            return finish_source_failure(active, active.stored.clone(), source, failure);
+        }
     };
     validate_preflight_facts(&active.stored, &preflight.facts)?;
 
@@ -259,7 +262,7 @@ fn execute_ctas_operation(
     ) {
         Ok(action) => action,
         Err(failure) => {
-            return finish_source_failure(active, active.stored.clone(), failure);
+            return finish_source_failure(active, active.stored.clone(), source, failure);
         }
     };
     let mut recovery = new_recovery_record(
@@ -327,7 +330,9 @@ fn execute_ctas_operation(
         },
     ) {
         Ok(source) => source,
-        Err(failure) => return finish_source_failure(active, active.stored.clone(), failure),
+        Err(failure) => {
+            return finish_source_failure(active, active.stored.clone(), source, failure);
+        }
     };
     validate_source_facts(
         &active.stored,
@@ -363,6 +368,7 @@ fn execute_ctas_operation(
                 active,
                 recovery,
                 FactSlot::Prepare,
+                Some(statement_source),
                 failure,
             );
         }
@@ -506,6 +512,7 @@ fn execute_foreground_write(
                     let failure = CtasFailure {
                         kind: CtasFailureKind::Internal,
                         message,
+                        user_error: None,
                     };
                     return abort_foreground(
                         engine,
@@ -1368,6 +1375,7 @@ fn finish_local_catalog_preparation_failure(
     active: &mut ActiveDmlOperation,
     mut recovery: DmlCtasRecoveryRecord,
     slot: FactSlot,
+    source: Option<&str>,
     failure: CtasFailure,
 ) -> Result<(), DmlError> {
     recovery.cleanup_retention = DmlCtasCleanupRetention::NotRequired;
@@ -1386,7 +1394,7 @@ fn finish_local_catalog_preparation_failure(
         OperationPayload::CtasSaga(saga),
         None,
     )?;
-    Err(source_failure_error(active.operation_id(), failure))
+    Err(source_failure_error(active.operation_id(), source, failure))
 }
 
 #[allow(
@@ -1546,6 +1554,7 @@ fn connector_failure_fact(failure: &ConnectorCtasFailure) -> DurableExternalFact
             mutation_failure(failure.failure().clone()).kind
         },
         message: format!("{conflict}{}", failure.failure().message()),
+        user_error: None,
     };
     DurableExternalFact {
         outcome: match failure {
@@ -1642,7 +1651,14 @@ fn validate_target_facts_v2(
     }
 }
 
-fn source_failure_error(operation_id: DmlOperationId, failure: CtasFailure) -> DmlError {
+fn source_failure_error(
+    operation_id: DmlOperationId,
+    source: Option<&str>,
+    failure: CtasFailure,
+) -> DmlError {
+    if let Some(error) = failure.user_error(source) {
+        return DmlError::admit(error);
+    }
     operation_error(
         DmlErrorKind::Executor,
         operation_id,
@@ -1658,6 +1674,7 @@ fn source_failure_error(operation_id: DmlOperationId, failure: CtasFailure) -> D
 fn finish_source_failure(
     active: &mut ActiveDmlOperation,
     stored: StoredOperation,
+    source: &str,
     failure: CtasFailure,
 ) -> Result<(), DmlError> {
     let mut record = ctas_record(&stored)?;
@@ -1673,7 +1690,11 @@ fn finish_source_failure(
         OperationPayload::CtasSaga(record),
         None,
     )?;
-    Err(source_failure_error(active.operation_id(), failure))
+    Err(source_failure_error(
+        active.operation_id(),
+        Some(source),
+        failure,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -1937,6 +1958,7 @@ fn mutation_failure(failure: ConnectorMutationFailure) -> CtasFailure {
     CtasFailure {
         kind,
         message: failure.message().to_string(),
+        user_error: None,
     }
 }
 
@@ -1998,7 +2020,30 @@ mod tests {
         DmlExternalFenceGeneration, validate_ctas_recovery, validate_ctas_recovery_transition,
     };
     use crate::query_execution::dml::ctas::CtasTargetPreflightFacts;
+    use novarocks_parser::Span;
     use novarocks_spi::connector::ConnectorMutationFailureKind;
+    use novarocks_sql::analyze_error::AnalyzeError;
+
+    #[test]
+    fn source_analysis_failure_renders_the_original_source_location() {
+        let analyze = AnalyzeError::unknown_table("unknown table db.missing", Span::new(12, 22));
+        let failure = CtasFailure {
+            kind: CtasFailureKind::InvalidRequest,
+            message: analyze.message().to_string(),
+            user_error: Some(crate::query_execution::dml::ctas::CtasUserError::Analyze(
+                analyze,
+            )),
+        };
+
+        let error = source_failure_error(
+            DmlOperationId::new_v7(),
+            Some("CREATE TABLE copied AS SELECT * FROM db.missing"),
+            failure,
+        );
+        let user_error = error.user_error().expect("typed analyze error");
+        assert_eq!(user_error.code().as_str(), "sql.analyze.unknown_table");
+        assert!(user_error.location().is_some());
+    }
 
     fn confirmed_recovery() -> DmlCtasRecoveryRecord {
         let action_id = ConnectorCtasActionId::try_from_bytes(*Uuid::now_v7().as_bytes()).unwrap();

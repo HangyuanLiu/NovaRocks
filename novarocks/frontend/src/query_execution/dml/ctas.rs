@@ -43,6 +43,7 @@ use novarocks_spi::connector::{
     ConnectorWriteOperationId, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
     CreatePolicy, ExternalMutationEvidence,
 };
+use novarocks_user_error::UserError;
 
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
@@ -291,6 +292,30 @@ pub enum CtasFailureKind {
 pub struct CtasFailure {
     pub kind: CtasFailureKind,
     pub message: String,
+    pub(crate) user_error: Option<CtasUserError>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CtasUserError {
+    Analyze(novarocks_sql::analyze_error::AnalyzeError),
+}
+
+impl CtasFailure {
+    /// Retains the typed failure until the CTAS statement boundary can render
+    /// its parser-owned span against the original SQL source.
+    fn analyze(error: novarocks_sql::analyze_error::AnalyzeError) -> Self {
+        Self {
+            kind: CtasFailureKind::InvalidRequest,
+            message: error.message().to_string(),
+            user_error: Some(CtasUserError::Analyze(error)),
+        }
+    }
+
+    pub(crate) fn user_error(&self, source: Option<&str>) -> Option<UserError> {
+        match self.user_error.as_ref()? {
+            CtasUserError::Analyze(error) => Some(error.to_user_error(source)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -558,7 +583,7 @@ fn plan_query_for_ctas_source(
     query: &Query,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PlannedCtasSourceQuery, String> {
+) -> Result<PlannedCtasSourceQuery, CtasFailure> {
     let mut query = query.clone();
     if crate::query_execution::planning::time_travel::has_time_travel_refs(&query) {
         crate::query_execution::planning::time_travel::rewrite_time_travel_refs(
@@ -567,7 +592,15 @@ fn plan_query_for_ctas_source(
             current_database,
             &mut query,
             connector_context,
-        )?;
+        )
+        .map_err(|error| match error {
+            crate::query_execution::planning::time_travel::TimeTravelRewriteError::Engine(
+                error,
+            ) => internal_failure(error),
+            crate::query_execution::planning::time_travel::TimeTravelRewriteError::Analyze(
+                error,
+            ) => CtasFailure::analyze(error),
+        })?;
     }
     let catalog_service_snapshot =
         crate::catalog_application::query_catalog::catalog_service_snapshot(state);
@@ -584,7 +617,7 @@ fn plan_query_for_ctas_source(
     let catalog_snapshot =
         novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
-        .ok_or_else(|| "CTAS requires a frozen non-empty backend topology".to_string())?;
+        .ok_or_else(|| internal_failure("CTAS requires a frozen non-empty backend topology"))?;
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlCompileIntent::IcebergWrite {
@@ -608,18 +641,23 @@ fn plan_query_for_ctas_source(
         ),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
-        .map_err(|error| error.to_string())?
+        .map_err(|error| match error {
+            novarocks_sql::compiler::SqlCompileError::Analyze(error) => CtasFailure::analyze(error),
+            error => internal_failure(error.to_string()),
+        })?
         .into_pending()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| internal_failure(error.to_string()))?;
     let statistics =
         crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
             state,
             Arc::clone(&table_bindings),
             connector_context,
-        )?;
+        )
+        .map_err(internal_failure)?;
     let source = novarocks_sql::planning::dml::compile_ctas_source(
         novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics),
-    )?;
+    )
+    .map_err(internal_failure)?;
     Ok(PlannedCtasSourceQuery {
         source,
         table_bindings,
@@ -734,6 +772,7 @@ impl CoreCtasCatalogAction {
                 local_ctas_failure(CtasFailure {
                     kind: CtasFailureKind::InvalidRequest,
                     message: "prepared CTAS catalog action has already been dispatched".into(),
+                    user_error: None,
                 })
             })
     }
@@ -1134,6 +1173,7 @@ pub(crate) fn mutation_failure(failure: ConnectorMutationFailure) -> CtasFailure
     CtasFailure {
         kind,
         message: failure.message().to_string(),
+        user_error: None,
     }
 }
 
@@ -1154,6 +1194,7 @@ fn connector_failure(error: novarocks_spi::connector::ConnectorError) -> CtasFai
     CtasFailure {
         kind,
         message: error.to_string(),
+        user_error: None,
     }
 }
 
@@ -1161,6 +1202,7 @@ fn internal_failure(message: impl Into<String>) -> CtasFailure {
     CtasFailure {
         kind: CtasFailureKind::Internal,
         message: message.into(),
+        user_error: None,
     }
 }
 
@@ -1301,6 +1343,7 @@ fn validate_fence_for_preflight(
         return Err(CtasFailure {
             kind: CtasFailureKind::InvalidRequest,
             message: "CTAS publication fence names a foreign preflight target".to_string(),
+            user_error: None,
         });
     }
     Ok(())
@@ -1320,6 +1363,7 @@ fn derive_ctas_foreground_leases(
             kind: CtasFailureKind::Internal,
             message: "CTAS fenced publication and writer leases do not share one exact generation"
                 .to_string(),
+            user_error: None,
         });
     }
     Ok((lease, write_lease))
@@ -1340,6 +1384,7 @@ fn historical_ctas_recovery(
                 kind: CtasFailureKind::Unsupported,
                 message: "current connector generation has no historical CTAS recovery capability"
                     .to_string(),
+                user_error: None,
             })
         })
 }
@@ -1356,6 +1401,7 @@ fn require_established_fence(
         return Err(CtasFailure {
             kind: CtasFailureKind::InvalidRequest,
             message: "CTAS action requires the latest established publication fence".to_string(),
+            user_error: None,
         });
     }
     Ok(())
@@ -1492,6 +1538,7 @@ fn write_commit_unknown(
         failure: CtasFailure {
             kind: CtasFailureKind::Unavailable,
             message: failure_message,
+            user_error: None,
         },
         evidence,
         established_fence: session.established_external_fence().ok().flatten(),
@@ -1541,6 +1588,7 @@ impl CtasEngine for DmlExecutionKernel {
             true => Err(CtasFailure {
                 kind: CtasFailureKind::AlreadyExists,
                 message: format!("table {}.{} already exists", target.namespace, target.table),
+                user_error: None,
             }),
             false => {
                 let binding = planning.binding();
@@ -1587,6 +1635,7 @@ impl CtasEngine for DmlExecutionKernel {
             return Err(CtasFailure {
                 kind: CtasFailureKind::InvalidRequest,
                 message: "CTAS source target does not match its exact preflight".to_string(),
+                user_error: None,
             });
         }
         let connector_context = crate::connector::connector_request_context_for_execution(
@@ -1601,13 +1650,13 @@ impl CtasEngine for DmlExecutionKernel {
             &request.command.source,
             &request.execution,
             &connector_context,
-        )
-        .map_err(internal_failure)?;
+        )?;
         let source_columns = planned.source.output_columns();
         if source_columns.is_empty() {
             return Err(CtasFailure {
                 kind: CtasFailureKind::InvalidRequest,
                 message: "CTAS source has no output columns".to_string(),
+                user_error: None,
             });
         }
         let output_schema = Arc::new(arrow::datatypes::Schema::new(
@@ -1715,6 +1764,7 @@ impl CtasEngine for DmlExecutionKernel {
             return Err(local_ctas_failure(CtasFailure {
                 kind: CtasFailureKind::InvalidRequest,
                 message: "CTAS catalog action is not an advance-fence action".to_string(),
+                user_error: None,
             }));
         };
         action.begin_dispatch()?;
@@ -1753,6 +1803,7 @@ impl CtasEngine for DmlExecutionKernel {
             return Err(CtasFailure {
                 kind: CtasFailureKind::InvalidRequest,
                 message: "CTAS source target preparation has already been attempted".to_string(),
+                user_error: None,
             });
         }
         validate_fence_for_preflight(&source.preflight, &fence)?;
@@ -1798,6 +1849,7 @@ impl CtasEngine for DmlExecutionKernel {
             return Err(local_ctas_failure(CtasFailure {
                 kind: CtasFailureKind::InvalidRequest,
                 message: "CTAS catalog action is not a stage action".to_string(),
+                user_error: None,
             }));
         };
         action.begin_dispatch()?;
@@ -2054,6 +2106,7 @@ impl CtasEngine for DmlExecutionKernel {
                     kind: CtasFailureKind::InvalidRequest,
                     message: "CTAS writer has no prior CommitUnknown decision to reconcile"
                         .to_string(),
+                    user_error: None,
                 },
             };
         };
@@ -2063,6 +2116,7 @@ impl CtasEngine for DmlExecutionKernel {
                     kind: CtasFailureKind::InvalidRequest,
                     message: "CTAS writer reconcile evidence does not match the exact unresolved operation"
                         .to_string(),
+                    user_error: None,
                 },
                 evidence: stored_evidence,
                 established_fence: None,
@@ -2102,6 +2156,7 @@ impl CtasEngine for DmlExecutionKernel {
                     failure: CtasFailure {
                         kind: CtasFailureKind::Unavailable,
                         message: format!("CTAS writer is still incomplete: {error}"),
+                        user_error: None,
                     },
                     evidence: stored_evidence,
                     established_fence: session.established_external_fence().ok().flatten(),
@@ -2159,6 +2214,7 @@ impl CtasEngine for DmlExecutionKernel {
             return Err(local_ctas_failure(CtasFailure {
                 kind: CtasFailureKind::InvalidRequest,
                 message: "CTAS catalog action is not a publish action".to_string(),
+                user_error: None,
             }));
         };
         action.begin_dispatch()?;
@@ -2169,6 +2225,7 @@ impl CtasEngine for DmlExecutionKernel {
             return Err(local_ctas_failure(CtasFailure {
                 kind: CtasFailureKind::InvalidRequest,
                 message: format!("CTAS publish is forbidden in {:?} state", *state),
+                user_error: None,
             }));
         }
         match lease.publish(request.clone()) {
@@ -2223,6 +2280,7 @@ impl CtasEngine for DmlExecutionKernel {
             return Err(local_ctas_failure(CtasFailure {
                 kind: CtasFailureKind::InvalidRequest,
                 message: "CTAS catalog action is not an abort action".to_string(),
+                user_error: None,
             }));
         };
         action.begin_dispatch()?;
@@ -2236,6 +2294,7 @@ impl CtasEngine for DmlExecutionKernel {
             return Err(local_ctas_failure(CtasFailure {
                 kind: CtasFailureKind::InvalidRequest,
                 message: format!("CTAS staged cleanup is forbidden in {:?} state", *state),
+                user_error: None,
             }));
         }
         match lease.abort(request.clone()) {
@@ -2872,6 +2931,7 @@ mod tests {
             Err(local_ctas_failure(CtasFailure {
                 kind: CtasFailureKind::Unavailable,
                 message: "historical fixture".to_string(),
+                user_error: None,
             }))
         }
 
@@ -2884,6 +2944,7 @@ mod tests {
             Err(local_ctas_failure(CtasFailure {
                 kind: CtasFailureKind::Unavailable,
                 message: "historical fixture".to_string(),
+                user_error: None,
             }))
         }
 
@@ -2895,6 +2956,7 @@ mod tests {
             Err(local_ctas_failure(CtasFailure {
                 kind: CtasFailureKind::Unavailable,
                 message: "historical fixture".to_string(),
+                user_error: None,
             }))
         }
     }

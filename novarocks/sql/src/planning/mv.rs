@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::analyze_error::AnalyzeError;
 pub use crate::mv_refresh::{
     AggregateFunctionKind, FULL_REFRESH_DISABLED_MESSAGE, MvRefreshFinalizeFacts,
     MvRefreshStatement, SqlMvTarget, VisibleAggregateOutput, first_refresh,
@@ -47,11 +48,15 @@ pub const MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME: &str =
 /// `COUNT(*)` has a typed empty-argument representation in the analyzer. All
 /// other supported IMV aggregates require one expression argument, so their
 /// syntactic star must produce the same contract error as an empty call.
-pub fn validate_imv_aggregate_star_arguments(query: &Query) -> Result<(), String> {
+///
+/// This validation runs before generic analysis resolves `*` as a
+/// column. This is a direct parser-AST rejection, so it preserves the
+/// function-call span and uses the analyze-domain argument category.
+pub fn validate_imv_aggregate_star_arguments(query: &Query) -> Result<(), AnalyzeError> {
     validate_imv_aggregate_star_set_expr(query.body.as_ref())
 }
 
-fn validate_imv_aggregate_star_set_expr(expr: &SetExpr) -> Result<(), String> {
+fn validate_imv_aggregate_star_set_expr(expr: &SetExpr) -> Result<(), AnalyzeError> {
     match expr {
         SetExpr::Select(select) => {
             for item in &select.projection {
@@ -72,7 +77,7 @@ fn validate_imv_aggregate_star_set_expr(expr: &SetExpr) -> Result<(), String> {
     }
 }
 
-fn validate_imv_aggregate_star_expr(expr: &Expr) -> Result<(), String> {
+fn validate_imv_aggregate_star_expr(expr: &Expr) -> Result<(), AnalyzeError> {
     let Expr::FunctionCall(function) = expr else {
         return Ok(());
     };
@@ -90,8 +95,11 @@ fn validate_imv_aggregate_star_expr(expr: &Expr) -> Result<(), String> {
         name.as_str(),
         "sum" | "avg" | "min" | "max" | "bool_or" | "boolor_agg" | "bool_and" | "booland_agg"
     ) {
-        return Err(format!(
-            "Iceberg IMV refresh contract requires exactly one argument for aggregate function `{name}`"
+        return Err(AnalyzeError::invalid_argument(
+            format!(
+                "Iceberg IMV refresh contract requires exactly one argument for aggregate function `{name}`"
+            ),
+            function.span,
         ));
     }
     Ok(())
@@ -722,15 +730,22 @@ impl SqlResolvedMvRefreshInput {
             )
             .map(sql_mv_projection_lineage_facts)
         };
-        match scope {
+        // This facade remains a legacy String boundary owned by MV refresh.
+        // The lineage builder itself keeps its source-less `AnalyzeError`, so
+        // a future MV-refresh owner cut can preserve it without reconstructing
+        // a category from message text.
+        let result: Result<SqlMvProjectionLineageFacts, AnalyzeError> = match scope {
             SqlMvLineageScope::WholeQuery => build(&self.0),
-            SqlMvLineageScope::FirstUnionBranch => {
-                build(first_union_branch_resolved_query(&self.0)?)
-            }
-            SqlMvLineageScope::WholeQueryOrFirstUnionBranch => {
-                build(&self.0).or_else(|_| build(first_union_branch_resolved_query(&self.0)?))
-            }
-        }
+            SqlMvLineageScope::FirstUnionBranch => first_union_branch_resolved_query(&self.0)
+                .map_err(AnalyzeError::internal)
+                .and_then(build),
+            SqlMvLineageScope::WholeQueryOrFirstUnionBranch => build(&self.0).or_else(|_| {
+                first_union_branch_resolved_query(&self.0)
+                    .map_err(AnalyzeError::internal)
+                    .and_then(build)
+            }),
+        };
+        result.map_err(|error| error.to_string())
     }
 
     /// Derive qualified join lineage from opaque analysis and application-owned
@@ -768,7 +783,10 @@ impl SqlResolvedMvRefreshInput {
                     &right_schema_facts,
                 ),
             ],
-        )?;
+        )
+        // See `projection_schema_lineage_facts`: this is the pre-existing
+        // legacy MV-refresh boundary, not an error classifier.
+        .map_err(|error| error.to_string())?;
         Ok(sql_mv_join_lineage_facts(
             lineage,
             &aliases.left_table,
@@ -3273,7 +3291,12 @@ mod tests {
         ] {
             let error = validate_imv_aggregate_star_arguments(&parse_query(sql))
                 .expect_err("non-COUNT aggregate star must fail at the IMV boundary");
-            assert_eq!(error, expected);
+            assert_eq!(error.message(), expected);
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::InvalidArgument
+            );
+            assert_eq!(error.span(), Some(Span::new(10, 16)));
         }
 
         validate_imv_aggregate_star_arguments(&parse_query(

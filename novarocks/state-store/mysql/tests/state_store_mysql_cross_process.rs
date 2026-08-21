@@ -955,7 +955,7 @@ fn protocol_stdout_summary(bytes: &[u8], truncated: bool) -> String {
             let code = value.get("code").and_then(safe_protocol_token);
             Some((id, event.to_owned(), code.map(str::to_owned)))
         })
-        .last();
+        .next_back();
     let mut summary = format!("bytes={} truncated={truncated}", bytes.len());
     if let Some((id, event, code)) = metadata {
         summary.push_str(&format!(" last_id={id} last_event={event}"));

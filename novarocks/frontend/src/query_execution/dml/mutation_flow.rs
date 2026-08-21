@@ -359,7 +359,10 @@ fn compile_dml_change_stream_write(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     preparations: &ActivatedDmlChangeStreamPreparations,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-) -> Result<crate::query_execution::compiler::PlannedIcebergChangeStreamWrite, String> {
+) -> Result<
+    crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
+    crate::dml::error::DmlExecutionError,
+> {
     use novarocks_spi::connector::ConnectorWriteInputShape;
 
     let catalog_service_snapshot =
@@ -444,7 +447,7 @@ fn compile_dml_change_stream_write(
         ),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
-        .map_err(|error| error.to_string())?
+        .map_err(crate::dml::error::DmlExecutionError::from_compile)?
         .into_pending()
         .map_err(|error| error.to_string())?;
     let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
@@ -462,12 +465,14 @@ fn compile_dml_change_stream_write(
             routes,
             pre_expand_keyed_assert,
         })?;
-    crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(
-        state.connector_control().as_ref(),
-        execution,
-        sealed,
-        table_bindings.as_ref(),
-        connector_context,
+    Ok(
+        crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(
+            state.connector_control().as_ref(),
+            execution,
+            sealed,
+            table_bindings.as_ref(),
+            connector_context,
+        )?,
     )
 }
 
@@ -1207,7 +1212,7 @@ pub(crate) fn stage_prepared_update_mutation(
     state: &DmlExecutionKernel,
     prepared: PreparedUpdateMutation,
     native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
-) -> Result<MutationStagedWrite, String> {
+) -> Result<MutationStagedWrite, crate::dml::error::DmlExecutionError> {
     let PreparedUpdateMutation {
         stmt,
         current_catalog,
@@ -1283,9 +1288,12 @@ pub(crate) fn stage_prepared_update_mutation(
             )?;
             let result = match execution_handle.run_stage(native_encoder) {
                 Ok(result) => result,
-                Err(reason) => {
+                Err(error @ crate::dml::error::DmlExecutionError::Analyze(_)) => {
+                    return Err(error);
+                }
+                Err(error) => {
                     return Ok(MutationStagedWrite::AbortRequired {
-                        reason,
+                        reason: error.to_string(),
                         execution: execution_handle,
                     });
                 }
@@ -1303,9 +1311,9 @@ pub(crate) fn stage_prepared_update_mutation(
         }
         other @ (novarocks_spi::connector::ConnectorRowMutationStrategy::PositionDelete
         | novarocks_spi::connector::ConnectorRowMutationStrategy::DeletionVector
-        | novarocks_spi::connector::ConnectorRowMutationStrategy::EqualityDelete) => Err(format!(
-            "UPDATE cannot be served by row-mutation strategy {other:?}"
-        )),
+        | novarocks_spi::connector::ConnectorRowMutationStrategy::EqualityDelete) => {
+            Err(format!("UPDATE cannot be served by row-mutation strategy {other:?}").into())
+        }
         novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead => {
             let PreparedMorUpdateWriteTarget {
                 preparations,
@@ -1365,7 +1373,7 @@ pub(crate) fn stage_prepared_update_mutation(
                             execution: execution_handle,
                         });
                     }
-                    return Err(reason);
+                    return Err(reason.into());
                 }
             };
             if let Some(completion) = result.connector_completion.as_ref() {
@@ -1537,7 +1545,10 @@ fn build_update_mor_change_stream_write_plan(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     preparations: &ActivatedDmlChangeStreamPreparations,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-) -> Result<crate::query_execution::compiler::PlannedIcebergChangeStreamWrite, String> {
+) -> Result<
+    crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
+    crate::dml::error::DmlExecutionError,
+> {
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
     let source_sql = mutation_source_to_sql(state, &stmt.source, current_catalog, target)?;
     let where_sql = stmt.where_sql.as_deref();
@@ -2402,7 +2413,7 @@ impl DistributedCowUpdateExecutor {
     fn run_stage(
         &self,
         native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
-    ) -> Result<QueryExecutionResult, String> {
+    ) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
         let write = self
             .write
             .lock()
@@ -2457,7 +2468,7 @@ fn run_cow_cohort_writes(
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
-) -> Result<QueryExecutionResult, String> {
+) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
     let planning_lease = write.planning_lease;
     let mut final_result = None;
     for plan in write.cohorts {
@@ -2478,11 +2489,13 @@ fn run_cow_cohort_writes(
             native_encoder,
         )?;
         if result.connector_completion.is_none() {
-            return Err("COW cohort completed without a connector completion".to_string());
+            return Err("COW cohort completed without a connector completion"
+                .to_string()
+                .into());
         }
         final_result = Some(result);
     }
-    final_result.ok_or_else(|| "COW operation has no provider-sealed cohorts".to_string())
+    Ok(final_result.ok_or_else(|| "COW operation has no provider-sealed cohorts".to_string())?)
 }
 
 #[expect(
@@ -2498,7 +2511,7 @@ fn run_one_cow_cohort(
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
-) -> Result<QueryExecutionResult, String> {
+) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let target_binding = admit_prepared_frozen_connector_write_target(
         table_bindings.as_ref(),
@@ -2515,7 +2528,11 @@ fn run_one_cow_cohort(
         novarocks_spi::connector::ConnectorWriteInputShape::RowLineage { .. } => {
             DmlWriteSinkMode::RowLineageData
         }
-        _ => return Err("COW recipe returned an unsupported writer input shape".to_string()),
+        _ => {
+            return Err("COW recipe returned an unsupported writer input shape"
+                .to_string()
+                .into());
+        }
     };
     let sink = dml_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),
@@ -2542,7 +2559,7 @@ fn run_one_cow_cohort(
                     frozen.identity,
                     frozen.read,
                 );
-            crate::query_execution::compiler::prepare_query_as_iceberg_write_in_operation_with_query_local_overlays(
+    crate::query_execution::compiler::prepare_query_as_iceberg_write_in_operation_with_query_local_overlays(
                 state,
                 Some(&target.catalog),
                 &target.namespace,
@@ -2575,7 +2592,7 @@ fn run_one_cow_cohort(
     let native_bundle = native_encoder.encode(assembly.encoding())?;
     let result = assembly.finish(native_bundle)?;
     if let Some(abort) = &result.write_abort {
-        return Err(format!("COW cohort aborted: {}", abort.reason));
+        return Err(format!("COW cohort aborted: {}", abort.reason).into());
     }
     let staging = result
         .connector_completion
@@ -2584,7 +2601,9 @@ fn run_one_cow_cohort(
         .staging_summary()
         .map_err(|error| format!("COW cohort staging summary is invalid: {error}"))?;
     if staging.input_rows() == 0 || staging.artifact_count() == 0 {
-        return Err("COW cohort produced no staged rows or artifacts".to_string());
+        return Err("COW cohort produced no staged rows or artifacts"
+            .to_string()
+            .into());
     }
     Ok(result)
 }
@@ -2940,7 +2959,7 @@ fn execute_exact_cow_match_query(
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, crate::dml::error::DmlExecutionError> {
     let identity = novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::new(
         target.catalog.clone(),
         target.namespace.clone(),
@@ -3006,7 +3025,7 @@ fn execute_exact_cow_match_query(
         ),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
-        .map_err(|error| error.to_string())?
+        .map_err(crate::dml::error::DmlExecutionError::from_compile)?
         .into_pending()
         .map_err(|error| error.to_string())?;
     let statistics =
@@ -3046,12 +3065,12 @@ fn execute_exact_cow_match_query(
         execution,
     )
     .map_err(|error| error.to_string())?;
-    state
+    Ok(state
         .query_execution()
         .execute(request)
         .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_result)
         .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?)
 }
 
 #[cfg(test)]
@@ -3393,7 +3412,7 @@ pub(crate) fn stage_prepared_merge_mutation(
     state: &DmlExecutionKernel,
     prepared: PreparedMergeMutation,
     native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
-) -> Result<MutationStagedWrite, String> {
+) -> Result<MutationStagedWrite, crate::dml::error::DmlExecutionError> {
     let PreparedMergeMutation {
         stmt,
         current_catalog,
@@ -3481,7 +3500,7 @@ pub(crate) fn stage_prepared_merge_mutation(
                         execution: execution_handle,
                     });
                 }
-                return Err(reason);
+                return Err(reason.into());
             }
         };
         if let Some(completion) = result.connector_completion.as_ref() {
@@ -3586,9 +3605,12 @@ pub(crate) fn stage_prepared_merge_mutation(
     )?;
     let result = match execution_handle.run_stage(native_encoder) {
         Ok(result) => result,
-        Err(reason) => {
+        Err(error @ crate::dml::error::DmlExecutionError::Analyze(_)) => {
+            return Err(error);
+        }
+        Err(error) => {
             return Ok(MutationStagedWrite::AbortRequired {
-                reason,
+                reason: error.to_string(),
                 execution: execution_handle,
             });
         }
@@ -4110,7 +4132,10 @@ fn build_merge_mor_change_stream_write_plan(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     preparations: &ActivatedDmlChangeStreamPreparations,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-) -> Result<crate::query_execution::compiler::PlannedIcebergChangeStreamWrite, String> {
+) -> Result<
+    crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
+    crate::dml::error::DmlExecutionError,
+> {
     let target_alias = stmt
         .target_alias
         .clone()

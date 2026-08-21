@@ -518,10 +518,10 @@ impl FoundationDbNetworkLifecycle {
     }
 
     fn reap_finished_thread(thread: &mut Option<JoinHandle<Result<(), StateStoreError>>>) {
-        if thread.as_ref().is_some_and(JoinHandle::is_finished) {
-            if let Some(handle) = thread.take() {
-                let _ = handle.join();
-            }
+        if thread.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(handle) = thread.take()
+        {
+            let _ = handle.join();
         }
     }
 
@@ -859,6 +859,11 @@ fn mark_process_network_failed(pid: u32, error: StateStoreError) {
 
 #[cfg(all(test, feature = "foundationdb-provider"))]
 mod tests {
+    #![allow(
+        clippy::await_holding_lock,
+        reason = "tests serialize process-global FoundationDB lifecycle state across await points"
+    )]
+
     use super::*;
     use std::process::Command;
     use std::sync::mpsc;

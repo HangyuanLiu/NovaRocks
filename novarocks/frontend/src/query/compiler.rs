@@ -37,18 +37,51 @@ use crate::query_execution::kernels::{
 };
 use crate::query_execution::planning::sql_cancellation_observation;
 use crate::query_execution::planning::time_travel::{
-    has_time_travel_refs, rewrite_time_travel_refs,
+    TimeTravelRewriteError, has_time_travel_refs, rewrite_time_travel_refs,
 };
 use crate::query_execution::post_compile::{PostCompileIntent, prepare_compiled_distributed_query};
 use crate::view::ViewRequestContext;
 use novarocks_parser::ast::{ExplainFormat, ExplainQuery, Query, Statement};
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_spi::connector::MvStorageObservationPort;
+use novarocks_sql::analyze_error::AnalyzeError;
 use novarocks_sql::compiler::{
-    ExplainLevel, SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent, SqlCompiler,
-    SqlOptimizeRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+    ExplainLevel, SqlAnalyzeRequest, SqlCompileControl, SqlCompileError, SqlCompileIntent,
+    SqlCompiler, SqlOptimizeRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
     builtin_sql_function_catalog,
 };
+
+/// Preserves SQL analyze-domain facts until the session still has the original
+/// SQL source required to render a user location.
+#[derive(Debug)]
+pub(crate) enum FrontendQueryCompilerError {
+    Engine(String),
+    Analyze(AnalyzeError),
+}
+
+impl FrontendQueryCompilerError {
+    fn from_compile(error: SqlCompileError) -> Self {
+        match error {
+            SqlCompileError::Analyze(error) => Self::Analyze(error),
+            error => Self::Engine(error.to_string()),
+        }
+    }
+}
+
+impl From<String> for FrontendQueryCompilerError {
+    fn from(error: String) -> Self {
+        Self::Engine(error)
+    }
+}
+
+impl From<TimeTravelRewriteError> for FrontendQueryCompilerError {
+    fn from(error: TimeTravelRewriteError) -> Self {
+        match error {
+            TimeTravelRewriteError::Engine(error) => Self::Engine(error),
+            TimeTravelRewriteError::Analyze(error) => Self::Analyze(error),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct FrontendQueryCompiler {
@@ -81,7 +114,7 @@ impl FrontendQueryCompiler {
         statement: &Statement,
         context: &RequestContext,
         query_options: Option<QueryOptions>,
-    ) -> Result<PreparedQueryOperation, String> {
+    ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
         let connector_context = connector_request_context_for_query(
             query_options.as_ref(),
             context.execution().cancellation().clone(),
@@ -132,23 +165,25 @@ impl FrontendQueryCompiler {
                         }
                     },
                 )?)
-                .map_err(|error| error.to_string())?;
+                .map_err(FrontendQueryCompilerError::from_compile)?;
                 let output = if force_logical_explain {
                     analyzed
                         .into_complete()
-                        .map_err(|error| error.to_string())?
+                        .map_err(FrontendQueryCompilerError::from_compile)?
                 } else {
-                    let analyzed = analyzed.into_pending().map_err(|error| error.to_string())?;
+                    let analyzed = analyzed
+                        .into_pending()
+                        .map_err(FrontendQueryCompilerError::from_compile)?;
                     let statistics =
                         query_statistics_snapshot(&self.query, &materializer, &connector_context)?;
                     SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
-                        .map_err(|error| error.to_string())?
+                        .map_err(FrontendQueryCompilerError::from_compile)?
                 };
-                PreparedQueryOperation::explain_lines(
+                Ok(PreparedQueryOperation::explain_lines(
                     output
                         .into_explain_lines(level, force_logical_explain)
-                        .map_err(|error| error.to_string())?,
-                )
+                        .map_err(FrontendQueryCompilerError::from_compile)?,
+                )?)
             }
             Statement::ExplainQuery(explain) => self.prepare_explain_analyze(
                 explain.query.as_ref(),
@@ -161,12 +196,12 @@ impl FrontendQueryCompiler {
             Statement::Query(query) => {
                 if let Some(result) = information_schema::try_query_materialized_views(
                     self.system_tables.mv_repository().as_ref(),
-                    &query,
+                    query,
                 )? {
                     return Ok(PreparedQueryOperation::immediate(result));
                 }
                 let query = self.prepare_query(
-                    &query,
+                    query,
                     current_catalog,
                     current_database,
                     &connector_context,
@@ -183,7 +218,9 @@ impl FrontendQueryCompiler {
                     PostCompileIntent::Result,
                 )
             }
-            _ => Err("query compiler only supports SELECT and EXPLAIN statements".to_string()),
+            _ => Err(FrontendQueryCompilerError::Engine(
+                "query compiler only supports SELECT and EXPLAIN statements".to_string(),
+            )),
         }
     }
 
@@ -199,7 +236,7 @@ impl FrontendQueryCompiler {
         intent: SqlCompileIntent,
         allow_mv_rewrite_candidates: bool,
         completion_intent: PostCompileIntent,
-    ) -> Result<PreparedQueryOperation, String> {
+    ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
         let catalog_service = query_catalog_service_snapshot(&self.query);
         let materializer = build_catalog_service_provider(
             current_catalog,
@@ -228,15 +265,15 @@ impl FrontendQueryCompiler {
             mv_definitions.as_ref(),
             intent,
         )?)
-        .map_err(|error| error.to_string())?
+        .map_err(FrontendQueryCompilerError::from_compile)?
         .into_pending()
-        .map_err(|error| error.to_string())?;
+        .map_err(FrontendQueryCompilerError::from_compile)?;
         let statistics = query_statistics_snapshot(&self.query, &materializer, &connector_context)?;
         let distributed_plan =
             SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
-                .map_err(|error| error.to_string())?
+                .map_err(FrontendQueryCompilerError::from_compile)?
                 .into_distributed_plan()
-                .map_err(|error| error.to_string())?;
+                .map_err(FrontendQueryCompilerError::from_compile)?;
         let (assembly, completion) = prepare_compiled_distributed_query(
             distributed_plan,
             &self.query,
@@ -247,7 +284,7 @@ impl FrontendQueryCompiler {
             completion_intent,
         )?;
         let native_bundle = encode_native_fragment_bundle(assembly.encoding().encoding_view())?;
-        assembly.into_operation(native_bundle, completion)
+        Ok(assembly.into_operation(native_bundle, completion)?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -291,7 +328,7 @@ impl FrontendQueryCompiler {
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<Query, String> {
+    ) -> Result<Query, FrontendQueryCompilerError> {
         let mut prepared = self.prepare_explain_query(
             query,
             current_catalog,
@@ -313,7 +350,7 @@ impl FrontendQueryCompiler {
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<Query, String> {
+    ) -> Result<Query, FrontendQueryCompilerError> {
         let mut prepared = query.clone();
         self.view.view_service().rewrite_query(
             &self.view,
@@ -344,7 +381,7 @@ impl FrontendQueryCompiler {
         query_options: Option<QueryOptions>,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &QueryExecutionContext,
-    ) -> Result<PreparedQueryOperation, String> {
+    ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
         let query = self.prepare_explain_query(
             query,
             current_catalog,

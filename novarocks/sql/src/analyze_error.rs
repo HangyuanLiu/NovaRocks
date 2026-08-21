@@ -16,6 +16,7 @@
 // under the License.
 
 //! SQL analyze-domain user errors and their stable descriptors.
+// Design: ADR-0095 (docs/adr/ADR-0095-typed-sql-analyze-errors-and-wire-mapping.md)
 
 use std::fmt;
 

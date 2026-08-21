@@ -16,6 +16,7 @@
 // under the License.
 
 mod encoding;
+mod error_mapping;
 pub mod session;
 
 use std::future::Future;
@@ -43,6 +44,7 @@ use tracing::{info, warn};
 use novarocks_version as version;
 
 use self::encoding::write_query_result;
+use self::error_mapping::error_kind_for_code;
 use self::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
     QuerySessionOpenRequest,
@@ -431,10 +433,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
             Ok(session) => session,
             Err(error) => {
                 return writer
-                    .error(
-                        map_query_service_error(error.kind()),
-                        error.message().as_bytes(),
-                    )
+                    .error(mysql_error_kind(&error), error.message().as_bytes())
                     .await;
             }
         };
@@ -442,10 +441,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
             Ok(()) => writer.ok().await,
             Err(error) => {
                 writer
-                    .error(
-                        map_query_service_error(error.kind()),
-                        error.message().as_bytes(),
-                    )
+                    .error(mysql_error_kind(&error), error.message().as_bytes())
                     .await
             }
         }
@@ -460,10 +456,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
             Ok(session) => session,
             Err(error) => {
                 return results
-                    .error(
-                        map_query_service_error(error.kind()),
-                        error.message().as_bytes(),
-                    )
+                    .error(mysql_error_kind(&error), error.message().as_bytes())
                     .await;
             }
         };
@@ -472,10 +465,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
             Ok(StatementResult::Ok) => results.completed(OkResponse::default()).await,
             Err(error) => {
                 results
-                    .error(
-                        map_query_service_error(error.kind()),
-                        error.message().as_bytes(),
-                    )
+                    .error(mysql_error_kind(&error), error.message().as_bytes())
                     .await
             }
         }
@@ -497,6 +487,13 @@ fn map_query_service_error(kind: QueryServiceErrorKind) -> ErrorKind {
     }
 }
 
+fn mysql_error_kind(error: &QueryServiceError) -> ErrorKind {
+    error
+        .user_error()
+        .and_then(|user_error| error_kind_for_code(user_error.code()))
+        .unwrap_or_else(|| map_query_service_error(error.kind()))
+}
+
 #[cfg(test)]
 #[test]
 fn query_service_error_mapping_keeps_wire_concerns_in_frontend() {
@@ -512,6 +509,25 @@ fn query_service_error_mapping_keeps_wire_concerns_in_frontend() {
         map_query_service_error(QueryServiceErrorKind::Unavailable),
         ErrorKind::ER_UNKNOWN_ERROR
     );
+}
+
+#[cfg(test)]
+#[test]
+fn user_error_code_overrides_the_legacy_session_error_kind() {
+    use novarocks_user_error::{ErrorCodeDescriptor, ErrorCodeStatus, ErrorPhase, RetryClass};
+
+    let user_error = novarocks_user_error::UserError::from_descriptor(
+        ErrorCodeDescriptor {
+            code: novarocks_user_error::ErrorCodeId::new("sql.analyze.unknown_table"),
+            phase: ErrorPhase::Analyze,
+            status: ErrorCodeStatus::Active,
+        },
+        "unknown table",
+        None,
+        RetryClass::Never,
+    );
+    let error = QueryServiceError::from_user_error(user_error);
+    assert_eq!(mysql_error_kind(&error), ErrorKind::ER_NO_SUCH_TABLE);
 }
 
 #[cfg(unix)]

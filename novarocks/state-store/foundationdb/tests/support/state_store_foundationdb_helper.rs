@@ -692,38 +692,6 @@ fn helper_open_failure_error(open_error: String, shutdown_error: Option<String>)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn open_failure_error_preserves_primary_error_and_appends_shutdown_failure() {
-        assert_eq!(
-            helper_open_failure_error("open failed".to_owned(), None),
-            "open failed"
-        );
-        assert_eq!(
-            helper_open_failure_error("open failed".to_owned(), Some("shutdown failed".to_owned())),
-            "open failed; FoundationDB runtime shutdown after helper open failure also failed: shutdown failed"
-        );
-    }
-
-    #[test]
-    fn failed_shutdown_restores_runtime_owner_for_retry() {
-        let mut slot = None;
-
-        let error = restore_runtime_after_shutdown(
-            &mut slot,
-            7_u8,
-            Err("injected shutdown failure".to_owned()),
-        )
-        .expect_err("shutdown failure must surface");
-
-        assert_eq!(error, "injected shutdown failure");
-        assert_eq!(slot, Some(7));
-    }
-}
-
 async fn run() -> Result<(), String> {
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
@@ -770,5 +738,37 @@ async fn main() {
     if let Err(error) = run().await {
         eprintln!("state-store-foundationdb-helper: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_failure_error_preserves_primary_error_and_appends_shutdown_failure() {
+        assert_eq!(
+            helper_open_failure_error("open failed".to_owned(), None),
+            "open failed"
+        );
+        assert_eq!(
+            helper_open_failure_error("open failed".to_owned(), Some("shutdown failed".to_owned())),
+            "open failed; FoundationDB runtime shutdown after helper open failure also failed: shutdown failed"
+        );
+    }
+
+    #[test]
+    fn failed_shutdown_restores_runtime_owner_for_retry() {
+        let mut slot = None;
+
+        let error = restore_runtime_after_shutdown(
+            &mut slot,
+            7_u8,
+            Err("injected shutdown failure".to_owned()),
+        )
+        .expect_err("shutdown failure must surface");
+
+        assert_eq!(error, "injected shutdown failure");
+        assert_eq!(slot, Some(7));
     }
 }
