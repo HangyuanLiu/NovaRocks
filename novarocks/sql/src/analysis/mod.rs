@@ -24,6 +24,7 @@ pub(crate) mod cte;
 pub(crate) mod expr_display;
 
 use arrow::datatypes::DataType;
+use novarocks_parser::ast::{Expr as SqlExpr, Query as SqlQuery};
 
 use crate::column_id::ColumnId;
 pub use crate::common::LiteralValue;
@@ -138,7 +139,7 @@ pub(crate) enum Relation {
     /// A base table scan.
     Scan(ScanRelation),
     /// An Iceberg metadata table scan: `t$snapshots`, `t$history`, etc.
-    /// Produced by `resolve_from` after `__nr_meta_<type>__` suffix detection.
+    /// Produced by `resolve_from` after typed metadata suffix detection.
     IcebergMetadataScan(IcebergMetadataScanRelation),
     /// IVM-A1 plan-time delta scan: `__nr_ivm_delta('cat.ns.tbl', from, to)`.
     /// Produced by the analyzer when it recognizes the `__nr_ivm_delta`
@@ -518,10 +519,10 @@ pub(crate) struct ApplyPredicateSpec {
 pub(crate) struct SubqueryInfo {
     pub id: usize,
     pub kind: SubqueryKind,
-    pub subquery: Box<sqlparser::ast::Query>,
+    pub subquery: Box<SqlQuery>,
     /// The resolved data type of the subquery result (scalar).
     #[allow(dead_code)]
     pub data_type: DataType,
     /// For IN subquery: the left-hand expression from the outer query.
-    pub in_expr: Option<Box<sqlparser::ast::Expr>>,
+    pub in_expr: Option<Box<SqlExpr>>,
 }

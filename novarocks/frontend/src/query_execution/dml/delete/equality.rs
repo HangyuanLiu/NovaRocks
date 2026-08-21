@@ -32,7 +32,7 @@ use crate::query_execution::planning::write_sink::{
     admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use novarocks_catalog::schema::ColumnDef;
-use novarocks_parser::ast::{AddEqualityDelete, LiteralKind, ObjectName};
+use novarocks_parser::ast::{AddEqualityDelete, LiteralKind, ObjectName, Query, Statement};
 use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
     ConnectorWriteIntent, ConnectorWriteOperationId,
@@ -181,7 +181,7 @@ fn lower_literal(expression: &novarocks_parser::ast::Expr) -> Result<Literal, St
 struct DistributedEqualityDeleteWriteExecutor {
     state: DmlExecutionKernel,
     target: crate::catalog_application::resolver::TargetBackend,
-    delete_query: sqlparser::ast::Query,
+    delete_query: Query,
     sql_write_input: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<QueryTableBindingStore>,
     execution: QueryExecutionContext,
@@ -290,7 +290,7 @@ fn prepare_equality_delete_distributed_write(
     target: &crate::catalog_application::resolver::TargetBackend,
     current_snapshot_id: Option<i64>,
     delete_columns: &[Field],
-    values_query: sqlparser::ast::Query,
+    values_query: Query,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -366,7 +366,7 @@ fn prepare_equality_delete_distributed_write(
 fn build_equality_delete_sink_query(
     delete_columns: &[Field],
     rows: &[Vec<Literal>],
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<Query, String> {
     if delete_columns.is_empty() {
         return Err("ADD EQUALITY DELETE requires at least one equality column".to_string());
     }
@@ -443,10 +443,19 @@ fn equality_delete_target_columns(delete_columns: &[Field]) -> Vec<ColumnDef> {
         .collect()
 }
 
-fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Query, String> {
-    match novarocks_sql::planning::dml::parse_raw_statement(sql)? {
-        sqlparser::ast::Statement::Query(query) => Ok(*query),
-        other => Err(format!("{context}: generated non-query statement: {other}")),
+fn parse_generated_query(sql: &str, context: &str) -> Result<Query, String> {
+    let statements = novarocks_parser::parse(sql)
+        .map_err(|error| format!("{context}: native SQL parser rejection: {error}"))?;
+    match statements.as_slice() {
+        [Statement::Query(query)] => Ok(query.clone()),
+        [other] => Err(format!(
+            "{context}: generated non-query statement: {}",
+            novarocks_parser::printer::print_statement(other)
+        )),
+        _ => Err(format!(
+            "{context}: generated {} statements, expected exactly one query",
+            statements.len()
+        )),
     }
 }
 
@@ -1069,7 +1078,7 @@ mod tests {
             super::equality_delete_key_columns(&table, &columns, &rows).expect("columns");
 
         let query = super::build_equality_delete_sink_query(&delete_columns, &rows).expect("query");
-        let sql = query.to_string();
+        let sql = novarocks_parser::printer::print_query(&query);
 
         assert!(sql.contains("VALUES"));
         assert!(sql.contains("CAST"));

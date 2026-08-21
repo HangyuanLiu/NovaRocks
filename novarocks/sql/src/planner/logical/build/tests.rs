@@ -231,16 +231,11 @@ fn parse_analyze_and_plan(sql: &str) -> Result<LogicalPlanNode, String> {
 fn parse_analyze_query(
     sql: &str,
 ) -> Result<(ResolvedQuery, CTERegistry, ColumnRefFactory), String> {
-    let dialect = crate::parser::dialect::StarRocksDialect;
-    let mut ast = sqlparser::parser::Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
-    let stmt = ast
-        .pop()
-        .ok_or_else(|| "expected a statement".to_string())?;
-    let query = match stmt {
-        sqlparser::ast::Statement::Query(q) => q,
-        _ => return Err("expected query".into()),
+    let statements = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
+    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+        return Err("expected query".into());
     };
-    crate::analyzer::analyze(&query, &TestCatalog, "default")
+    crate::analyzer::analyze(query, &TestCatalog, "default")
 }
 
 fn parse_analyze_query_apply(

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Semantic analyzer: converts `sqlparser::ast::Query` into `ResolvedQuery`.
+//! Semantic analyzer: converts typed parser `Query` values into `ResolvedQuery`.
 //!
 //! This module performs name resolution, type inference, and scope management
 //! without producing any physical plan concepts (tuple_id, slot_id, etc.).
@@ -25,6 +25,11 @@ mod helpers;
 mod literal_coercion;
 #[cfg(test)]
 mod load_op_column;
+#[allow(
+    dead_code,
+    reason = "The T4 typed-query contract flip wires this staged pre-analysis module."
+)]
+pub(crate) mod query_prepass;
 mod resolve_expr;
 mod resolve_from;
 mod scope;
@@ -36,7 +41,7 @@ pub mod iceberg_ref;
 pub(crate) mod mv_lineage;
 
 use arrow::datatypes::DataType;
-use sqlparser::ast as sqlast;
+use novarocks_parser::ast;
 
 use crate::catalog::PlannerTableProvider;
 use crate::column_id::ColumnId;
@@ -53,8 +58,8 @@ use scope::AnalyzerScope;
 
 #[derive(Clone, Debug)]
 struct RepeatGroupBySpec {
-    grouping_sets: Vec<Vec<sqlast::Expr>>,
-    all_group_by_exprs: Vec<sqlast::Expr>,
+    grouping_sets: Vec<Vec<ast::Expr>>,
+    all_group_by_exprs: Vec<ast::Expr>,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,7 +69,7 @@ struct RepeatGroupBySpec {
 /// Analyze a parsed SQL query and produce a fully resolved query IR,
 /// along with a registry of all non-recursive CTE definitions.
 pub(crate) fn analyze(
-    query: &sqlast::Query,
+    query: &ast::Query,
     catalog: &dyn PlannerTableProvider,
     current_database: &str,
 ) -> Result<
@@ -88,7 +93,7 @@ pub(crate) fn analyze(
 /// snapshot, so existing application callers retain their behaviour while
 /// SQLX-1 can inject a request-scoped catalog.
 pub(crate) fn analyze_with_function_catalog(
-    query: &sqlast::Query,
+    query: &ast::Query,
     catalog: &dyn PlannerTableProvider,
     current_database: &str,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
@@ -118,7 +123,7 @@ pub(crate) fn analyze_with_function_catalog(
     reason = "Retained for staged SQL planner migration consumers and test helpers."
 )]
 pub(crate) fn analyze_with_factory(
-    query: &sqlast::Query,
+    query: &ast::Query,
     catalog: &dyn PlannerTableProvider,
     current_database: &str,
     factory: crate::column_id::ColumnRefFactory,
@@ -142,7 +147,7 @@ pub(crate) fn analyze_with_factory(
 /// Like [`analyze_with_factory`], but uses the immutable function catalog
 /// supplied by one compiler request.
 pub(crate) fn analyze_with_factory_and_function_catalog(
-    query: &sqlast::Query,
+    query: &ast::Query,
     catalog: &dyn PlannerTableProvider,
     current_database: &str,
     factory: crate::column_id::ColumnRefFactory,
@@ -155,6 +160,7 @@ pub(crate) fn analyze_with_factory_and_function_catalog(
     ),
     String,
 > {
+    let query = query_prepass::preanalyze(query.clone())?;
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
     let ctx = AnalyzerContext {
         catalog,
@@ -168,7 +174,7 @@ pub(crate) fn analyze_with_factory_and_function_catalog(
         collected_subqueries: std::cell::RefCell::new(Vec::new()),
         cte_registry: std::cell::RefCell::new(crate::analysis::cte::CTERegistry::new()),
     };
-    let resolved = ctx.analyze_query(query)?;
+    let resolved = ctx.analyze_query(&query)?;
     let registry = ctx.cte_registry.into_inner();
     let col_factory = std::rc::Rc::try_unwrap(factory)
         .map(|cell| cell.into_inner())
@@ -242,14 +248,14 @@ impl<'a> AnalyzerContext<'a> {
 
     fn build_with_clause_context(
         &self,
-        with_clause: &sqlast::With,
+        with_clause: &ast::With,
     ) -> Result<(AnalyzerContext<'a>, Vec<crate::analysis::cte::CteId>), String> {
         let mut pending_ctes = self.pending_ctes.clone();
         pending_ctes.extend(
             with_clause
-                .cte_tables
+                .ctes
                 .iter()
-                .map(|cte| cte.alias.name.value.to_lowercase()),
+                .map(|cte| cte.name.value.to_lowercase()),
         );
 
         let mut child_ctx = AnalyzerContext {
@@ -264,18 +270,17 @@ impl<'a> AnalyzerContext<'a> {
             collected_subqueries: std::cell::RefCell::new(Vec::new()),
             cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
         };
-        let mut local_cte_ids = Vec::with_capacity(with_clause.cte_tables.len());
+        let mut local_cte_ids = Vec::with_capacity(with_clause.ctes.len());
 
-        for cte in &with_clause.cte_tables {
-            let name = cte.alias.name.value.to_lowercase();
+        for cte in &with_clause.ctes {
+            let name = cte.name.value.to_lowercase();
             pending_ctes.remove(&name);
             child_ctx.pending_ctes = pending_ctes.clone();
 
             let col_aliases: Vec<String> = cte
-                .alias
                 .columns
                 .iter()
-                .map(|ident| ident.name.value.clone())
+                .map(|ident| ident.value.clone())
                 .collect();
 
             let mut resolved_cte = child_ctx.analyze_query(&cte.query)?;
@@ -302,7 +307,7 @@ impl<'a> AnalyzerContext<'a> {
     }
 
     /// Top-level query analysis.
-    fn analyze_query(&self, query: &sqlast::Query) -> Result<ResolvedQuery, String> {
+    fn analyze_query(&self, query: &ast::Query) -> Result<ResolvedQuery, String> {
         let (maybe_child_ctx, local_cte_ids) = if let Some(ref with_clause) = query.with {
             let (child_ctx, local_cte_ids) = self.build_with_clause_context(with_clause)?;
             (Some(child_ctx), local_cte_ids)
@@ -341,10 +346,10 @@ impl<'a> AnalyzerContext<'a> {
     /// Analyze a SetExpr and return (QueryBody, output_columns).
     fn analyze_set_expr(
         &self,
-        set_expr: &sqlast::SetExpr,
+        set_expr: &ast::SetExpr,
     ) -> Result<(QueryBody, Vec<OutputColumn>), String> {
         match set_expr {
-            sqlast::SetExpr::Select(s) => {
+            ast::SetExpr::Select(s) => {
                 // Check if GROUP BY contains ROLLUP/CUBE/GROUPING SETS.
                 if let Some(repeat_spec) = self.extract_repeat_from_group_by(s) {
                     return self.resolve_repeat_group_by(s, &repeat_spec);
@@ -352,14 +357,9 @@ impl<'a> AnalyzerContext<'a> {
                 let (sel, cols) = self.analyze_select(s)?;
                 Ok((QueryBody::Select(sel), cols))
             }
-            sqlast::SetExpr::SetOperation {
-                op,
-                set_quantifier,
-                left,
-                right,
-            } => {
-                let left_query = self.analyze_set_operand(left)?;
-                let right_query = self.analyze_set_operand(right)?;
+            ast::SetExpr::SetOperation(operation) => {
+                let left_query = self.analyze_set_operand(&operation.left)?;
+                let right_query = self.analyze_set_operand(&operation.right)?;
                 let left_cols = left_query.output_columns.clone();
                 let right_cols = right_query.output_columns.clone();
 
@@ -391,15 +391,12 @@ impl<'a> AnalyzerContext<'a> {
                     });
                 }
 
-                let kind = match op {
-                    sqlast::SetOperator::Union => SetOpKind::Union,
-                    sqlast::SetOperator::Intersect => SetOpKind::Intersect,
-                    sqlast::SetOperator::Except | sqlast::SetOperator::Minus => SetOpKind::Except,
+                let kind = match operation.operator {
+                    ast::SetOperator::Union => SetOpKind::Union,
+                    ast::SetOperator::Intersect => SetOpKind::Intersect,
+                    ast::SetOperator::Except => SetOpKind::Except,
                 };
-                let all = matches!(
-                    set_quantifier,
-                    sqlast::SetQuantifier::All | sqlast::SetQuantifier::AllByName
-                );
+                let all = matches!(operation.quantifier, ast::SetQuantifier::All);
 
                 Ok((
                     QueryBody::SetOperation(ResolvedSetOp {
@@ -411,22 +408,21 @@ impl<'a> AnalyzerContext<'a> {
                     output_cols,
                 ))
             }
-            sqlast::SetExpr::Values(values) => {
+            ast::SetExpr::Values(values) => {
                 let (resolved_values, cols) = self.analyze_values(values)?;
                 Ok((QueryBody::Values(resolved_values), cols))
             }
-            sqlast::SetExpr::Query(q) => {
+            ast::SetExpr::Query(q) => {
                 let resolved = self.analyze_query(q)?;
                 let cols = resolved.output_columns.clone();
                 Ok((resolved.body, cols))
             }
-            other => Err(format!("unsupported set expression: {other}")),
         }
     }
 
-    fn analyze_set_operand(&self, set_expr: &sqlast::SetExpr) -> Result<ResolvedQuery, String> {
+    fn analyze_set_operand(&self, set_expr: &ast::SetExpr) -> Result<ResolvedQuery, String> {
         match set_expr {
-            sqlast::SetExpr::Query(q) => self.analyze_query(q),
+            ast::SetExpr::Query(q) => self.analyze_query(q),
             _ => {
                 let (body, output_columns) = self.analyze_set_expr(set_expr)?;
                 Ok(ResolvedQuery {
@@ -444,7 +440,7 @@ impl<'a> AnalyzerContext<'a> {
     /// Analyze a VALUES clause.
     fn analyze_values(
         &self,
-        values: &sqlast::Values,
+        values: &ast::Values,
     ) -> Result<(ResolvedValues, Vec<OutputColumn>), String> {
         let scope = self.new_scope(); // VALUES has no table scope
         let mut resolved_rows = Vec::with_capacity(values.rows.len());
@@ -492,7 +488,7 @@ impl<'a> AnalyzerContext<'a> {
     /// Analyze a SELECT statement.
     fn analyze_select(
         &self,
-        select: &sqlast::Select,
+        select: &ast::Select,
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>), String> {
         // --- FROM clause ---
         let (from, scope) = if select.from.is_empty() {
@@ -537,15 +533,21 @@ impl<'a> AnalyzerContext<'a> {
 
         // --- GROUP BY (with SELECT alias fallback) ---
         let group_by_exprs = match &select.group_by {
-            sqlast::GroupByExpr::Expressions(exprs, _) => exprs.clone(),
-            sqlast::GroupByExpr::All(_) => {
-                return Err("GROUP BY ALL is not supported".into());
+            ast::GroupBy::None => Vec::new(),
+            ast::GroupBy::Expressions { expressions, .. } => expressions.clone(),
+            ast::GroupBy::Rollup { .. }
+            | ast::GroupBy::Cube { .. }
+            | ast::GroupBy::GroupingSets { .. } => {
+                return Err(
+                    "internal error: repeat GROUP BY must be expanded before select analysis"
+                        .into(),
+                );
             }
         };
         let mut group_by = Vec::with_capacity(group_by_exprs.len());
         for gb_expr in &group_by_exprs {
-            if let sqlast::Expr::Value(sqlast::ValueWithSpan {
-                value: sqlast::Value::Number(n, _),
+            if let ast::Expr::Literal(ast::Literal {
+                kind: ast::LiteralKind::Number(n),
                 ..
             }) = gb_expr
             {
@@ -563,8 +565,8 @@ impl<'a> AnalyzerContext<'a> {
                     .get(pos - 1)
                     .ok_or_else(|| format!("GROUP BY position {pos} is out of range"))?;
                 let select_expr = match select_item {
-                    sqlast::SelectItem::UnnamedExpr(expr)
-                    | sqlast::SelectItem::ExprWithAlias { expr, .. } => expr,
+                    ast::SelectItem::UnnamedExpr(expr)
+                    | ast::SelectItem::ExprWithAlias { expr, .. } => expr,
                     _ => {
                         return Err(format!(
                             "GROUP BY position {pos} must reference a select expression"
@@ -656,7 +658,7 @@ impl<'a> AnalyzerContext<'a> {
         };
 
         // --- DISTINCT ---
-        let distinct = matches!(select.distinct, Some(sqlast::Distinct::Distinct));
+        let distinct = matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. });
 
         let mut resolved_select = ResolvedSelect {
             from,
@@ -1088,265 +1090,38 @@ impl<'a> AnalyzerContext<'a> {
 
     /// Check if a SELECT's GROUP BY clause contains ROLLUP/CUBE/GROUPING SETS.
     /// Returns the explicit grouping-set levels plus the full GROUP BY key list.
-    fn extract_repeat_from_group_by(&self, select: &sqlast::Select) -> Option<RepeatGroupBySpec> {
-        let (exprs, modifiers) = match &select.group_by {
-            sqlast::GroupByExpr::Expressions(exprs, modifiers) => (exprs.as_slice(), modifiers),
-            sqlast::GroupByExpr::All(modifiers) => (&[][..], modifiers),
-        };
-
-        for expr in exprs {
-            match expr {
-                sqlast::Expr::Rollup(groups) => {
-                    return Some(RepeatGroupBySpec {
-                        grouping_sets: rollup_grouping_sets(groups),
-                        all_group_by_exprs: flatten_grouping_groups(groups),
-                    });
-                }
-                sqlast::Expr::Cube(groups) => {
-                    return Some(RepeatGroupBySpec {
-                        grouping_sets: cube_grouping_sets(groups),
-                        all_group_by_exprs: flatten_grouping_groups(groups),
-                    });
-                }
-                sqlast::Expr::GroupingSets(sets) => {
-                    return Some(RepeatGroupBySpec {
-                        grouping_sets: sets.clone(),
-                        all_group_by_exprs: unique_exprs_in_order(
-                            sets.iter().flat_map(|set| set.iter().cloned()),
-                        ),
-                    });
-                }
-                sqlast::Expr::Function(func) => {
-                    let func_name = func.name.to_string().to_lowercase();
-                    let sqlast::FunctionArguments::List(arg_list) = &func.args else {
-                        continue;
-                    };
-                    let groups: Vec<Vec<sqlast::Expr>> = arg_list
-                        .args
-                        .iter()
-                        .filter_map(|arg| match arg {
-                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
-                                Some(vec![e.clone()])
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    if groups.is_empty() {
-                        continue;
-                    }
-                    match func_name.as_str() {
-                        "rollup" => {
-                            return Some(RepeatGroupBySpec {
-                                grouping_sets: rollup_grouping_sets(&groups),
-                                all_group_by_exprs: flatten_grouping_groups(&groups),
-                            });
-                        }
-                        "cube" => {
-                            return Some(RepeatGroupBySpec {
-                                grouping_sets: cube_grouping_sets(&groups),
-                                all_group_by_exprs: flatten_grouping_groups(&groups),
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
+    fn extract_repeat_from_group_by(&self, select: &ast::Select) -> Option<RepeatGroupBySpec> {
+        match &select.group_by {
+            ast::GroupBy::Rollup { expressions, .. } => {
+                let groups = expressions
+                    .iter()
+                    .cloned()
+                    .map(|expr| vec![expr])
+                    .collect::<Vec<_>>();
+                Some(RepeatGroupBySpec {
+                    grouping_sets: rollup_grouping_sets(&groups),
+                    all_group_by_exprs: flatten_grouping_groups(&groups),
+                })
             }
+            ast::GroupBy::Cube { expressions, .. } => {
+                let groups = expressions
+                    .iter()
+                    .cloned()
+                    .map(|expr| vec![expr])
+                    .collect::<Vec<_>>();
+                Some(RepeatGroupBySpec {
+                    grouping_sets: cube_grouping_sets(&groups),
+                    all_group_by_exprs: flatten_grouping_groups(&groups),
+                })
+            }
+            ast::GroupBy::GroupingSets { sets, .. } => Some(RepeatGroupBySpec {
+                grouping_sets: sets.clone(),
+                all_group_by_exprs: unique_exprs_in_order(
+                    sets.iter().flat_map(|set| set.iter().cloned()),
+                ),
+            }),
+            ast::GroupBy::None | ast::GroupBy::Expressions { .. } => None,
         }
-
-        if exprs.is_empty() {
-            for modifier in modifiers {
-                match modifier {
-                    sqlast::GroupByWithModifier::Rollup => {
-                        return Some(RepeatGroupBySpec {
-                            grouping_sets: rollup_grouping_sets(&[]),
-                            all_group_by_exprs: vec![],
-                        });
-                    }
-                    sqlast::GroupByWithModifier::Cube => {
-                        return Some(RepeatGroupBySpec {
-                            grouping_sets: cube_grouping_sets(&[]),
-                            all_group_by_exprs: vec![],
-                        });
-                    }
-                    sqlast::GroupByWithModifier::GroupingSets(sqlast::Expr::GroupingSets(sets)) => {
-                        return Some(RepeatGroupBySpec {
-                            grouping_sets: sets.clone(),
-                            all_group_by_exprs: unique_exprs_in_order(
-                                sets.iter().flat_map(|set| set.iter().cloned()),
-                            ),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        } else {
-            let singleton_groups: Vec<Vec<sqlast::Expr>> =
-                exprs.iter().cloned().map(|expr| vec![expr]).collect();
-            for modifier in modifiers {
-                match modifier {
-                    sqlast::GroupByWithModifier::Rollup => {
-                        return Some(RepeatGroupBySpec {
-                            grouping_sets: rollup_grouping_sets(&singleton_groups),
-                            all_group_by_exprs: exprs.to_vec(),
-                        });
-                    }
-                    sqlast::GroupByWithModifier::Cube => {
-                        return Some(RepeatGroupBySpec {
-                            grouping_sets: cube_grouping_sets(&singleton_groups),
-                            all_group_by_exprs: exprs.to_vec(),
-                        });
-                    }
-                    sqlast::GroupByWithModifier::GroupingSets(sqlast::Expr::GroupingSets(sets)) => {
-                        return Some(RepeatGroupBySpec {
-                            grouping_sets: sets.clone(),
-                            all_group_by_exprs: unique_exprs_in_order(
-                                sets.iter().flat_map(|set| set.iter().cloned()),
-                            ),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        }
-        None
-    }
-
-    /// Expand `GROUP BY ROLLUP(a, b, ...)` into a UNION ALL of GROUP BY variants.
-    ///
-    /// `ROLLUP(a, b)` expands to:
-    ///   SELECT a, b, agg(...) ... GROUP BY a, b
-    ///   UNION ALL
-    ///   SELECT a, NULL, agg(...) ... GROUP BY a
-    ///   UNION ALL
-    ///   SELECT NULL, NULL, agg(...) ... (no GROUP BY, full aggregation)
-    ///
-    /// NOTE: This method is superseded by `resolve_rollup` which produces a
-    /// single-pass RepeatInfo instead. Kept temporarily for reference and will
-    /// be removed in a later cleanup pass.
-    #[allow(dead_code)]
-    fn expand_rollup(
-        &self,
-        select: &sqlast::Select,
-        rollup_groups: &[Vec<sqlast::Expr>],
-    ) -> Result<(QueryBody, Vec<OutputColumn>), String> {
-        // Flatten the rollup groups: each inner Vec is a "composite key"
-        // (usually single element). For ROLLUP(a, b), groups = [[a], [b]].
-        let n = rollup_groups.len();
-
-        // Build n+1 levels: level i has the first (n-i) groups.
-        // Level 0: all groups (a, b)  →  GROUP BY a, b
-        // Level 1: first (n-1) groups (a) → GROUP BY a, select b as NULL
-        // Level n: no groups → select a as NULL, b as NULL
-        let mut bodies: Vec<(QueryBody, Vec<OutputColumn>)> = Vec::new();
-
-        for level in 0..=n {
-            let active_count = n - level; // number of active rollup groups
-
-            // Build a modified GROUP BY expressions list:
-            // - Keep first `active_count` groups as real GROUP BY keys
-            // - The remaining groups are NULLed out in the projection
-            let mut modified_gb_exprs: Vec<sqlast::Expr> = Vec::new();
-            for group in rollup_groups.iter().take(active_count) {
-                for expr in group {
-                    modified_gb_exprs.push(expr.clone());
-                }
-            }
-
-            // Build the set of NULLed column names (from inactive rollup groups)
-            let mut nulled_exprs: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            for group in rollup_groups.iter().skip(active_count) {
-                for expr in group {
-                    nulled_exprs.insert(format!("{expr}").to_lowercase());
-                }
-            }
-
-            // Build modified SELECT with the adjusted GROUP BY
-            // We need to reconstruct the AST Select with modified group_by and projection
-            let mut modified_select = select.clone();
-
-            // Replace GROUP BY with the active keys only
-            modified_select.group_by = sqlast::GroupByExpr::Expressions(modified_gb_exprs, vec![]);
-
-            // Modify projection: replace NULLed columns with NULL literals,
-            // and replace GROUPING(col) calls with literal 0 or 1.
-            let mut modified_projection = Vec::new();
-            for item in &select.projection {
-                let (expr_part, alias_part) = match item {
-                    sqlast::SelectItem::ExprWithAlias { expr, alias } => {
-                        (expr, Some(alias.clone()))
-                    }
-                    sqlast::SelectItem::UnnamedExpr(expr) => (expr, None),
-                    other => {
-                        modified_projection.push(other.clone());
-                        continue;
-                    }
-                };
-
-                // Check if this projection item is one of the rollup keys
-                // that should be NULLed at this level
-                let expr_str = format!("{expr_part}").to_lowercase();
-                if nulled_exprs.contains(&expr_str) {
-                    let null_expr = sqlast::Expr::Value(sqlast::Value::Null.into());
-                    if let Some(alias) = alias_part {
-                        modified_projection.push(sqlast::SelectItem::ExprWithAlias {
-                            expr: null_expr,
-                            alias,
-                        });
-                    } else {
-                        // Preserve the original name by adding an alias
-                        let name = expr_display_name(expr_part);
-                        modified_projection.push(sqlast::SelectItem::ExprWithAlias {
-                            expr: null_expr,
-                            alias: sqlast::Ident::new(name),
-                        });
-                    }
-                } else {
-                    // Replace GROUPING(col) calls with 0 or 1
-                    let rewritten = replace_grouping_calls(expr_part, &nulled_exprs);
-                    if let Some(alias) = alias_part {
-                        modified_projection.push(sqlast::SelectItem::ExprWithAlias {
-                            expr: rewritten,
-                            alias,
-                        });
-                    } else {
-                        modified_projection.push(sqlast::SelectItem::UnnamedExpr(rewritten));
-                    }
-                }
-            }
-            modified_select.projection = modified_projection;
-
-            let (sel, cols) = self.analyze_select(&modified_select)?;
-            bodies.push((QueryBody::Select(sel), cols));
-        }
-
-        // Build UNION ALL chain from right to left
-        let (mut result_body, result_cols) = bodies.remove(0);
-        for (body, cols) in bodies {
-            result_body = QueryBody::SetOperation(ResolvedSetOp {
-                kind: SetOpKind::Union,
-                all: true,
-                left: Box::new(ResolvedQuery {
-                    body: result_body,
-                    order_by: vec![],
-                    limit: None,
-                    offset: None,
-                    output_columns: result_cols.clone(),
-                    local_cte_ids: vec![],
-                }),
-                right: Box::new(ResolvedQuery {
-                    body,
-                    order_by: vec![],
-                    limit: None,
-                    offset: None,
-                    output_columns: cols,
-                    local_cte_ids: vec![],
-                }),
-            });
-        }
-
-        Ok((result_body, result_cols))
     }
 
     /// Resolve `GROUP BY ROLLUP/CUBE/GROUPING SETS` into a single SELECT with
@@ -1357,7 +1132,7 @@ impl<'a> AnalyzerContext<'a> {
     /// bitmaps so the Repeat operator can replay the grouping-set semantics.
     fn resolve_repeat_group_by(
         &self,
-        select: &sqlast::Select,
+        select: &ast::Select,
         repeat_spec: &RepeatGroupBySpec,
     ) -> Result<(QueryBody, Vec<OutputColumn>), String> {
         use crate::analysis::RepeatInfo;
@@ -1365,7 +1140,7 @@ impl<'a> AnalyzerContext<'a> {
         let all_rollup_columns: Vec<String> = repeat_spec
             .all_group_by_exprs
             .iter()
-            .map(|expr| format!("{expr}").to_lowercase())
+            .map(expr_syntax_key)
             .collect();
 
         // StarRocks uses the last grouping argument as the least-significant
@@ -1376,10 +1151,7 @@ impl<'a> AnalyzerContext<'a> {
         let mut grouping_ids: Vec<u64> = Vec::with_capacity(repeat_spec.grouping_sets.len());
 
         for grouping_set in &repeat_spec.grouping_sets {
-            let non_null_cols: Vec<String> = grouping_set
-                .iter()
-                .map(|expr| format!("{expr}").to_lowercase())
-                .collect();
+            let non_null_cols: Vec<String> = grouping_set.iter().map(expr_syntax_key).collect();
             let active_cols: std::collections::HashSet<String> =
                 non_null_cols.iter().cloned().collect();
             repeat_column_ref_list.push(non_null_cols);
@@ -1401,28 +1173,29 @@ impl<'a> AnalyzerContext<'a> {
         let mut grouping_fn_args: Vec<(String, Vec<String>)> = Vec::new();
         let mut next_marker: i64 = -9000;
 
-        let replace_grouping_with_marker = |expr: &sqlast::Expr,
-                                            args: &mut Vec<(String, Vec<String>)>,
-                                            marker: &mut i64|
-         -> sqlast::Expr {
-            replace_grouping_calls_with_markers(expr, args, marker)
-        };
+        let replace_grouping_with_marker =
+            |expr: &ast::Expr,
+             args: &mut Vec<(String, Vec<String>)>,
+             marker: &mut i64|
+             -> ast::Expr { replace_grouping_calls_with_markers(expr, args, marker) };
 
         let mut modified_projection = Vec::new();
         for item in &select.projection {
             match item {
-                sqlast::SelectItem::ExprWithAlias { expr, alias } => {
+                ast::SelectItem::ExprWithAlias { expr, alias, .. } => {
                     let rewritten =
                         replace_grouping_with_marker(expr, &mut grouping_fn_args, &mut next_marker);
-                    modified_projection.push(sqlast::SelectItem::ExprWithAlias {
+                    modified_projection.push(ast::SelectItem::ExprWithAlias {
                         expr: rewritten,
                         alias: alias.clone(),
+                        explicit_as: true,
+                        span: item.span(),
                     });
                 }
-                sqlast::SelectItem::UnnamedExpr(expr) => {
+                ast::SelectItem::UnnamedExpr(expr) => {
                     let rewritten =
                         replace_grouping_with_marker(expr, &mut grouping_fn_args, &mut next_marker);
-                    modified_projection.push(sqlast::SelectItem::UnnamedExpr(rewritten));
+                    modified_projection.push(ast::SelectItem::UnnamedExpr(rewritten));
                 }
                 other => modified_projection.push(other.clone()),
             }
@@ -1430,8 +1203,10 @@ impl<'a> AnalyzerContext<'a> {
 
         // Build modified SELECT with the union of all grouping keys in GROUP BY.
         let mut modified_select = select.clone();
-        modified_select.group_by =
-            sqlast::GroupByExpr::Expressions(repeat_spec.all_group_by_exprs.clone(), vec![]);
+        modified_select.group_by = ast::GroupBy::Expressions {
+            expressions: repeat_spec.all_group_by_exprs.clone(),
+            span: select.span,
+        };
         modified_select.projection = modified_projection;
 
         // Replace GROUPING() in HAVING too.
@@ -1530,7 +1305,7 @@ impl<'a> AnalyzerContext<'a> {
     /// Analyze the SELECT projection list.
     fn analyze_projection(
         &self,
-        items: &[sqlast::SelectItem],
+        items: &[ast::SelectItem],
         scope: &AnalyzerScope,
     ) -> Result<(Vec<ProjectItem>, Vec<OutputColumn>), String> {
         let mut projection: Vec<ProjectItem> = Vec::new();
@@ -1545,7 +1320,7 @@ impl<'a> AnalyzerContext<'a> {
 
         for item in items {
             match item {
-                sqlast::SelectItem::UnnamedExpr(expr) => {
+                ast::SelectItem::UnnamedExpr(expr) => {
                     let typed = self.analyze_expr(expr, &effective_scope)?;
                     let typed =
                         self.substitute_select_aliases_for_select(typed, &projection, scope);
@@ -1577,7 +1352,7 @@ impl<'a> AnalyzerContext<'a> {
                         output_column_id: column_id,
                     });
                 }
-                sqlast::SelectItem::ExprWithAlias { expr, alias } => {
+                ast::SelectItem::ExprWithAlias { expr, alias, .. } => {
                     let typed = self.analyze_expr(expr, &effective_scope)?;
                     let typed =
                         self.substitute_select_aliases_for_select(typed, &projection, scope);
@@ -1619,7 +1394,7 @@ impl<'a> AnalyzerContext<'a> {
                         output_column_id: column_id,
                     });
                 }
-                sqlast::SelectItem::Wildcard(_) => {
+                ast::SelectItem::Wildcard { .. } => {
                     for (qualifier, col_name, col_id, data_type, nullable) in scope.iter_columns() {
                         // FULL OUTER USING columns are exposed as a synthetic
                         // `COALESCE(left.col, right.col)` expression. SELECT *
@@ -1653,13 +1428,12 @@ impl<'a> AnalyzerContext<'a> {
                         });
                     }
                 }
-                sqlast::SelectItem::QualifiedWildcard(kind, _) => {
-                    let qualifier_str = match kind {
-                        sqlast::SelectItemQualifiedWildcardKind::ObjectName(obj_name) => {
-                            obj_name.to_string()
-                        }
-                        _ => return Err("unsupported qualified wildcard expression".into()),
-                    };
+                ast::SelectItem::QualifiedWildcard { prefix, .. } => {
+                    let qualifier_str = prefix
+                        .iter()
+                        .map(|ident| ident.value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
                     // Tables are registered under their alias (or bare table
                     // name) in scope, but users can address them with the
                     // multi-part name they typed (e.g. `db.t0.*`). Fall back
@@ -1722,7 +1496,7 @@ impl<'a> AnalyzerContext<'a> {
     /// inside correlated subqueries.
     fn analyze_projection_with_wildcard_scope(
         &self,
-        items: &[sqlast::SelectItem],
+        items: &[ast::SelectItem],
         expr_scope: &AnalyzerScope,
         wildcard_scope: &AnalyzerScope,
     ) -> Result<(Vec<ProjectItem>, Vec<OutputColumn>), String> {
@@ -1731,7 +1505,7 @@ impl<'a> AnalyzerContext<'a> {
 
         for item in items {
             match item {
-                sqlast::SelectItem::Wildcard(_) => {
+                ast::SelectItem::Wildcard { .. } => {
                     for (qualifier, col_name, col_id, data_type, nullable) in
                         wildcard_scope.iter_columns()
                     {
@@ -1924,21 +1698,14 @@ impl<'a> AnalyzerContext<'a> {
     /// Analyze ORDER BY clause.
     fn analyze_order_by(
         &self,
-        query: &sqlast::Query,
+        query: &ast::Query,
         body_output: &[OutputColumn],
         body: &QueryBody,
     ) -> Result<Vec<SortItem>, String> {
-        let order_by_exprs = match &query.order_by {
-            Some(sqlast::OrderBy {
-                kind: sqlast::OrderByKind::Expressions(exprs),
-                ..
-            }) => exprs,
-            Some(sqlast::OrderBy {
-                kind: sqlast::OrderByKind::All(_),
-                ..
-            }) => return Err("ORDER BY ALL is not supported".into()),
-            None => return Ok(vec![]),
-        };
+        let order_by_exprs = &query.order_by;
+        if order_by_exprs.is_empty() {
+            return Ok(vec![]);
+        }
 
         // Build a projection scope from body output columns for ORDER BY resolution.
         let mut projection_scope = self.new_scope();
@@ -1990,8 +1757,8 @@ impl<'a> AnalyzerContext<'a> {
             // Try resolving against the projection scope first, then fall back
             // to a numeric literal reference (ORDER BY 1, 2, ...)
             let typed = match &ob.expr {
-                sqlast::Expr::Value(sqlast::ValueWithSpan {
-                    value: sqlast::Value::Number(n, _),
+                ast::Expr::Literal(ast::Literal {
+                    kind: ast::LiteralKind::Number(n),
                     ..
                 }) => {
                     // Positional reference: ORDER BY 1
@@ -2020,13 +1787,13 @@ impl<'a> AnalyzerContext<'a> {
                     // a SELECT list expression. If so, resolve as a reference to
                     // the output alias. This handles ORDER BY count(x) matching
                     // SELECT count(x) as alias.
-                    let ob_text = format!("{}", ob.expr).to_lowercase();
+                    let ob_text = expr_syntax_key(&ob.expr);
                     let mut matched_alias = None;
                     // Match ORDER BY expression text against SELECT item
                     // expressions (not aliases). This handles ORDER BY
                     // count(distinct x) matching SELECT count(distinct x) as y.
                     if let QueryBody::Select(sel) = body
-                        && let sqlast::SetExpr::Select(ast_sel) = query.body.as_ref()
+                        && let ast::SetExpr::Select(ast_sel) = query.body.as_ref()
                     {
                         // Bare-identifier ORDER BY (`ORDER BY k1`) must prefer
                         // the projection's output alias over the SELECT item's
@@ -2039,7 +1806,7 @@ impl<'a> AnalyzerContext<'a> {
                         // for plain identifiers; AST-text matching is still
                         // useful for `ORDER BY a.c` echoing `SELECT a.c`,
                         // where preserving qualifiers matters.
-                        let ob_is_bare_ident = matches!(ob.expr, sqlast::Expr::Identifier(_));
+                        let ob_is_bare_ident = matches!(ob.expr, ast::Expr::Identifier(_));
                         for (ast_item, ir_item) in
                             ast_sel.projection.iter().zip(sel.projection.iter())
                         {
@@ -2061,10 +1828,8 @@ impl<'a> AnalyzerContext<'a> {
                                 break;
                             }
                             let ast_expr_text = match ast_item {
-                                sqlast::SelectItem::ExprWithAlias { expr, .. }
-                                | sqlast::SelectItem::UnnamedExpr(expr) => {
-                                    format!("{expr}").to_lowercase()
-                                }
+                                ast::SelectItem::ExprWithAlias { expr, .. }
+                                | ast::SelectItem::UnnamedExpr(expr) => expr_syntax_key(expr),
                                 _ => continue,
                             };
                             // Exact AST match means the user wrote the
@@ -2174,8 +1939,8 @@ impl<'a> AnalyzerContext<'a> {
                 return Err("subquery is not supported in ORDER BY".to_string());
             }
 
-            let asc = ob.options.asc.unwrap_or(true);
-            let nulls_first = ob.options.nulls_first.unwrap_or(asc);
+            let asc = ob.asc.unwrap_or(true);
+            let nulls_first = ob.nulls_first.unwrap_or(asc);
 
             sort_items.push(SortItem {
                 expr: typed,
@@ -2475,1030 +2240,70 @@ fn select_item_output_column_id(
     }
 }
 
-/// Replace GROUPING(col) function calls in a sqlparser AST expression with
-/// integer literal 0 (column is active) or 1 (column is NULLed) based on the
-/// current ROLLUP expansion level.
-fn replace_grouping_calls(
-    expr: &sqlast::Expr,
-    nulled_exprs: &std::collections::HashSet<String>,
-) -> sqlast::Expr {
-    // Replace references to NULLed columns with NULL (needed for window
-    // PARTITION BY / ORDER BY expressions that reference rollup keys).
-    let expr_str = format!("{expr}").to_lowercase();
-    if nulled_exprs.contains(&expr_str) {
-        return sqlast::Expr::Value(sqlast::Value::Null.into());
-    }
-    match expr {
-        sqlast::Expr::Function(func) => {
-            let name = func.name.to_string().to_lowercase();
-            if name == "grouping"
-                && let sqlast::FunctionArguments::List(ref list) = func.args
-            {
-                // Extract the argument column name
-                if let Some(sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(arg_expr))) =
-                    list.args.first()
-                {
-                    let arg_str = format!("{arg_expr}").to_lowercase();
-                    let value = if nulled_exprs.contains(&arg_str) {
-                        1i64
-                    } else {
-                        0i64
-                    };
-                    return sqlast::Expr::Value(
-                        sqlast::Value::Number(value.to_string(), false).into(),
-                    );
-                }
-            }
-            // Not a GROUPING() call — recurse into arguments
-            let new_args = match &func.args {
-                sqlast::FunctionArguments::List(list) => {
-                    let new_list_args: Vec<_> = list
-                        .args
-                        .iter()
-                        .map(|arg| match arg {
-                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
-                                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
-                                    replace_grouping_calls(e, nulled_exprs),
-                                ))
-                            }
-                            other => other.clone(),
-                        })
-                        .collect();
-                    sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
-                        args: new_list_args,
-                        ..list.clone()
-                    })
-                }
-                other => other.clone(),
-            };
-            let mut new_func = func.clone();
-            new_func.args = new_args;
-            // Recurse into OVER clause for window functions
-            if let Some(ref window) = func.over {
-                new_func.over = Some(replace_grouping_in_window(window, nulled_exprs));
-            }
-            sqlast::Expr::Function(new_func)
-        }
-        sqlast::Expr::BinaryOp { left, op, right } => sqlast::Expr::BinaryOp {
-            left: Box::new(replace_grouping_calls(left, nulled_exprs)),
-            op: op.clone(),
-            right: Box::new(replace_grouping_calls(right, nulled_exprs)),
-        },
-        sqlast::Expr::UnaryOp { op, expr: inner } => sqlast::Expr::UnaryOp {
-            op: *op,
-            expr: Box::new(replace_grouping_calls(inner, nulled_exprs)),
-        },
-        sqlast::Expr::Nested(inner) => {
-            sqlast::Expr::Nested(Box::new(replace_grouping_calls(inner, nulled_exprs)))
-        }
-        sqlast::Expr::Case {
-            case_token,
-            end_token,
-            operand,
-            conditions,
-            else_result,
-        } => sqlast::Expr::Case {
-            case_token: case_token.clone(),
-            end_token: end_token.clone(),
-            operand: operand
-                .as_ref()
-                .map(|o| Box::new(replace_grouping_calls(o, nulled_exprs))),
-            conditions: conditions
-                .iter()
-                .map(|cw| sqlast::CaseWhen {
-                    condition: replace_grouping_calls(&cw.condition, nulled_exprs),
-                    result: replace_grouping_calls(&cw.result, nulled_exprs),
-                })
-                .collect(),
-            else_result: else_result
-                .as_ref()
-                .map(|e| Box::new(replace_grouping_calls(e, nulled_exprs))),
-        },
-        other => other.clone(),
-    }
+fn expr_syntax_key(expr: &ast::Expr) -> String {
+    novarocks_parser::printer::print_expr(expr).to_lowercase()
 }
 
-/// Recurse into window specifications to replace GROUPING() calls in PARTITION BY / ORDER BY.
-fn replace_grouping_in_window(
-    window: &sqlast::WindowType,
-    nulled_exprs: &std::collections::HashSet<String>,
-) -> sqlast::WindowType {
-    match window {
-        sqlast::WindowType::WindowSpec(spec) => {
-            let partition_by = spec
-                .partition_by
-                .iter()
-                .map(|e| replace_grouping_calls(e, nulled_exprs))
-                .collect();
-            let order_by = spec
-                .order_by
-                .iter()
-                .map(|ob| sqlast::OrderByExpr {
-                    expr: replace_grouping_calls(&ob.expr, nulled_exprs),
-                    ..ob.clone()
-                })
-                .collect();
-            sqlast::WindowType::WindowSpec(sqlast::WindowSpec {
-                partition_by,
-                order_by,
-                ..spec.clone()
-            })
-        }
-        other => other.clone(),
-    }
+struct GroupingMarkerFolder<'a> {
+    args: &'a mut Vec<(String, Vec<String>)>,
+    next_marker: &'a mut i64,
 }
 
-/// Replace GROUPING/GROUPING_ID calls in an AST expression with unique marker
-/// literals (-9000, -9001, ...). Each call is recorded in `args` as
-/// (virtual_name, [column_args]) for the RepeatInfo.
-fn replace_grouping_markers_in_function_arg_expr(
-    arg_expr: &sqlast::FunctionArgExpr,
-    args: &mut Vec<(String, Vec<String>)>,
-    next_marker: &mut i64,
-) -> sqlast::FunctionArgExpr {
-    match arg_expr {
-        sqlast::FunctionArgExpr::Expr(expr) => sqlast::FunctionArgExpr::Expr(
-            replace_grouping_calls_with_markers(expr, args, next_marker),
-        ),
-        other => other.clone(),
-    }
-}
-
-fn replace_grouping_markers_in_function_arg(
-    arg: &sqlast::FunctionArg,
-    args: &mut Vec<(String, Vec<String>)>,
-    next_marker: &mut i64,
-) -> sqlast::FunctionArg {
-    match arg {
-        sqlast::FunctionArg::Named {
-            name,
-            arg,
-            operator,
-        } => sqlast::FunctionArg::Named {
-            name: name.clone(),
-            arg: replace_grouping_markers_in_function_arg_expr(arg, args, next_marker),
-            operator: operator.clone(),
-        },
-        sqlast::FunctionArg::ExprNamed {
-            name,
-            arg,
-            operator,
-        } => sqlast::FunctionArg::ExprNamed {
-            name: replace_grouping_calls_with_markers(name, args, next_marker),
-            arg: replace_grouping_markers_in_function_arg_expr(arg, args, next_marker),
-            operator: operator.clone(),
-        },
-        sqlast::FunctionArg::Unnamed(arg) => sqlast::FunctionArg::Unnamed(
-            replace_grouping_markers_in_function_arg_expr(arg, args, next_marker),
-        ),
-    }
-}
-
-fn replace_grouping_markers_in_order_by_expr(
-    order_by: &sqlast::OrderByExpr,
-    args: &mut Vec<(String, Vec<String>)>,
-    next_marker: &mut i64,
-) -> sqlast::OrderByExpr {
-    sqlast::OrderByExpr {
-        expr: replace_grouping_calls_with_markers(&order_by.expr, args, next_marker),
-        with_fill: order_by
-            .with_fill
-            .as_ref()
-            .map(|with_fill| sqlast::WithFill {
-                from: with_fill
-                    .from
-                    .as_ref()
-                    .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker)),
-                to: with_fill
-                    .to
-                    .as_ref()
-                    .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker)),
-                step: with_fill
-                    .step
-                    .as_ref()
-                    .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker)),
-            }),
-        ..order_by.clone()
-    }
-}
-
-fn replace_grouping_markers_in_function_argument_clause(
-    clause: &sqlast::FunctionArgumentClause,
-    args: &mut Vec<(String, Vec<String>)>,
-    next_marker: &mut i64,
-) -> sqlast::FunctionArgumentClause {
-    match clause {
-        sqlast::FunctionArgumentClause::OrderBy(order_by) => {
-            sqlast::FunctionArgumentClause::OrderBy(
-                order_by
-                    .iter()
-                    .map(|item| replace_grouping_markers_in_order_by_expr(item, args, next_marker))
-                    .collect(),
+impl ast::Fold for GroupingMarkerFolder<'_> {
+    fn fold_expr(&mut self, expr: ast::Expr) -> ast::Expr {
+        let span = expr.span();
+        let expr = ast::fold_expr(self, expr);
+        let ast::Expr::FunctionCall(function) = &expr else {
+            return expr;
+        };
+        if function.name.parts.len() != 1
+            || !matches!(
+                function.name.parts[0].value.to_ascii_lowercase().as_str(),
+                "grouping" | "grouping_id"
             )
+        {
+            return expr;
         }
-        sqlast::FunctionArgumentClause::Limit(expr) => sqlast::FunctionArgumentClause::Limit(
-            replace_grouping_calls_with_markers(expr, args, next_marker),
-        ),
-        sqlast::FunctionArgumentClause::Having(bound) => {
-            sqlast::FunctionArgumentClause::Having(sqlast::HavingBound(
-                bound.0,
-                replace_grouping_calls_with_markers(&bound.1, args, next_marker),
-            ))
-        }
-        other => other.clone(),
+
+        let index = self.args.len();
+        let columns = function.arguments.iter().map(expr_syntax_key).collect();
+        self.args.push((format!("__grouping_fn_{index}"), columns));
+        let marker = *self.next_marker;
+        *self.next_marker -= 1;
+        ast::Expr::Literal(ast::Literal {
+            kind: ast::LiteralKind::Number(marker.to_string()),
+            span,
+        })
     }
 }
 
-fn replace_grouping_markers_in_function_arguments(
-    arguments: &sqlast::FunctionArguments,
-    args: &mut Vec<(String, Vec<String>)>,
-    next_marker: &mut i64,
-) -> sqlast::FunctionArguments {
-    match arguments {
-        sqlast::FunctionArguments::List(list) => {
-            sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
-                args: list
-                    .args
-                    .iter()
-                    .map(|arg| replace_grouping_markers_in_function_arg(arg, args, next_marker))
-                    .collect(),
-                clauses: list
-                    .clauses
-                    .iter()
-                    .map(|clause| {
-                        replace_grouping_markers_in_function_argument_clause(
-                            clause,
-                            args,
-                            next_marker,
-                        )
-                    })
-                    .collect(),
-                ..list.clone()
-            })
-        }
-        sqlast::FunctionArguments::Subquery(_) | sqlast::FunctionArguments::None => {
-            arguments.clone()
-        }
-    }
-}
-
-fn replace_grouping_markers_in_subscript(
-    subscript: &sqlast::Subscript,
-    args: &mut Vec<(String, Vec<String>)>,
-    next_marker: &mut i64,
-) -> sqlast::Subscript {
-    match subscript {
-        sqlast::Subscript::Index { index } => sqlast::Subscript::Index {
-            index: replace_grouping_calls_with_markers(index, args, next_marker),
-        },
-        sqlast::Subscript::Slice {
-            lower_bound,
-            upper_bound,
-            stride,
-        } => sqlast::Subscript::Slice {
-            lower_bound: lower_bound
-                .as_ref()
-                .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker)),
-            upper_bound: upper_bound
-                .as_ref()
-                .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker)),
-            stride: stride
-                .as_ref()
-                .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker)),
-        },
-    }
-}
-
-fn replace_grouping_markers_in_access_expr(
-    access_expr: &sqlast::AccessExpr,
-    args: &mut Vec<(String, Vec<String>)>,
-    next_marker: &mut i64,
-) -> sqlast::AccessExpr {
-    match access_expr {
-        sqlast::AccessExpr::Dot(expr) => {
-            sqlast::AccessExpr::Dot(replace_grouping_calls_with_markers(expr, args, next_marker))
-        }
-        sqlast::AccessExpr::Subscript(subscript) => sqlast::AccessExpr::Subscript(
-            replace_grouping_markers_in_subscript(subscript, args, next_marker),
-        ),
-    }
-}
-
-fn replace_grouping_markers_in_json_path(
-    path: &sqlast::JsonPath,
-    args: &mut Vec<(String, Vec<String>)>,
-    next_marker: &mut i64,
-) -> sqlast::JsonPath {
-    sqlast::JsonPath {
-        path: path
-            .path
-            .iter()
-            .map(|elem| match elem {
-                sqlast::JsonPathElem::Bracket { key } => sqlast::JsonPathElem::Bracket {
-                    key: replace_grouping_calls_with_markers(key, args, next_marker),
-                },
-                other => other.clone(),
-            })
-            .collect(),
-    }
-}
-
+/// Replace GROUPING/GROUPING_ID calls with negative literal markers. The
+/// typed analyzer turns those markers into synthetic output columns after the
+/// grouping set expansion is complete.
 fn replace_grouping_calls_with_markers(
-    expr: &sqlast::Expr,
+    expr: &ast::Expr,
     args: &mut Vec<(String, Vec<String>)>,
     next_marker: &mut i64,
-) -> sqlast::Expr {
-    match expr {
-        sqlast::Expr::CompoundFieldAccess { root, access_chain } => {
-            sqlast::Expr::CompoundFieldAccess {
-                root: Box::new(replace_grouping_calls_with_markers(root, args, next_marker)),
-                access_chain: access_chain
-                    .iter()
-                    .map(|access| {
-                        replace_grouping_markers_in_access_expr(access, args, next_marker)
-                    })
-                    .collect(),
-            }
-        }
-        sqlast::Expr::JsonAccess { value, path } => sqlast::Expr::JsonAccess {
-            value: Box::new(replace_grouping_calls_with_markers(
-                value,
-                args,
-                next_marker,
-            )),
-            path: replace_grouping_markers_in_json_path(path, args, next_marker),
-        },
-        sqlast::Expr::IsFalse(inner) => sqlast::Expr::IsFalse(Box::new(
-            replace_grouping_calls_with_markers(inner, args, next_marker),
-        )),
-        sqlast::Expr::IsNotFalse(inner) => sqlast::Expr::IsNotFalse(Box::new(
-            replace_grouping_calls_with_markers(inner, args, next_marker),
-        )),
-        sqlast::Expr::IsTrue(inner) => sqlast::Expr::IsTrue(Box::new(
-            replace_grouping_calls_with_markers(inner, args, next_marker),
-        )),
-        sqlast::Expr::IsNotTrue(inner) => sqlast::Expr::IsNotTrue(Box::new(
-            replace_grouping_calls_with_markers(inner, args, next_marker),
-        )),
-        sqlast::Expr::IsNull(inner) => sqlast::Expr::IsNull(Box::new(
-            replace_grouping_calls_with_markers(inner, args, next_marker),
-        )),
-        sqlast::Expr::IsNotNull(inner) => sqlast::Expr::IsNotNull(Box::new(
-            replace_grouping_calls_with_markers(inner, args, next_marker),
-        )),
-        sqlast::Expr::IsUnknown(inner) => sqlast::Expr::IsUnknown(Box::new(
-            replace_grouping_calls_with_markers(inner, args, next_marker),
-        )),
-        sqlast::Expr::IsNotUnknown(inner) => sqlast::Expr::IsNotUnknown(Box::new(
-            replace_grouping_calls_with_markers(inner, args, next_marker),
-        )),
-        sqlast::Expr::IsDistinctFrom(left, right) => sqlast::Expr::IsDistinctFrom(
-            Box::new(replace_grouping_calls_with_markers(left, args, next_marker)),
-            Box::new(replace_grouping_calls_with_markers(
-                right,
-                args,
-                next_marker,
-            )),
-        ),
-        sqlast::Expr::IsNotDistinctFrom(left, right) => sqlast::Expr::IsNotDistinctFrom(
-            Box::new(replace_grouping_calls_with_markers(left, args, next_marker)),
-            Box::new(replace_grouping_calls_with_markers(
-                right,
-                args,
-                next_marker,
-            )),
-        ),
-        sqlast::Expr::IsNormalized {
-            expr: inner,
-            form,
-            negated,
-        } => sqlast::Expr::IsNormalized {
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            form: *form,
-            negated: *negated,
-        },
-        sqlast::Expr::InList {
-            expr: inner,
-            list,
-            negated,
-        } => sqlast::Expr::InList {
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            list: list
-                .iter()
-                .map(|item| replace_grouping_calls_with_markers(item, args, next_marker))
-                .collect(),
-            negated: *negated,
-        },
-        sqlast::Expr::InSubquery {
-            expr: inner,
-            subquery,
-            negated,
-        } => sqlast::Expr::InSubquery {
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            subquery: subquery.clone(),
-            negated: *negated,
-        },
-        sqlast::Expr::InUnnest {
-            expr: inner,
-            array_expr,
-            negated,
-        } => sqlast::Expr::InUnnest {
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            array_expr: Box::new(replace_grouping_calls_with_markers(
-                array_expr,
-                args,
-                next_marker,
-            )),
-            negated: *negated,
-        },
-        sqlast::Expr::Between {
-            expr: inner,
-            negated,
-            low,
-            high,
-        } => sqlast::Expr::Between {
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            negated: *negated,
-            low: Box::new(replace_grouping_calls_with_markers(low, args, next_marker)),
-            high: Box::new(replace_grouping_calls_with_markers(high, args, next_marker)),
-        },
-        sqlast::Expr::Function(func) => {
-            let name = func.name.to_string().to_lowercase();
-            if matches!(name.as_str(), "grouping" | "grouping_id")
-                && let sqlast::FunctionArguments::List(ref list) = func.args
-            {
-                let arg_cols: Vec<String> = list
-                    .args
-                    .iter()
-                    .filter_map(|a| match a {
-                        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
-                            Some(format!("{e}").to_lowercase())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                let idx = args.len();
-                let virtual_name = format!("__grouping_fn_{idx}");
-                args.push((virtual_name, arg_cols));
-                let marker = *next_marker;
-                *next_marker -= 1;
-                return sqlast::Expr::Value(
-                    sqlast::Value::Number(marker.to_string(), false).into(),
-                );
-            }
-            let mut new_func = func.clone();
-            new_func.parameters =
-                replace_grouping_markers_in_function_arguments(&func.parameters, args, next_marker);
-            new_func.args =
-                replace_grouping_markers_in_function_arguments(&func.args, args, next_marker);
-            new_func.filter = func.filter.as_ref().map(|filter| {
-                Box::new(replace_grouping_calls_with_markers(
-                    filter,
-                    args,
-                    next_marker,
-                ))
-            });
-            new_func.over = func
-                .over
-                .as_ref()
-                .map(|window| replace_grouping_markers_in_window(window, args, next_marker));
-            new_func.within_group = func
-                .within_group
-                .iter()
-                .map(|item| replace_grouping_markers_in_order_by_expr(item, args, next_marker))
-                .collect();
-            sqlast::Expr::Function(new_func)
-        }
-        sqlast::Expr::BinaryOp { left, op, right } => sqlast::Expr::BinaryOp {
-            left: Box::new(replace_grouping_calls_with_markers(left, args, next_marker)),
-            op: op.clone(),
-            right: Box::new(replace_grouping_calls_with_markers(
-                right,
-                args,
-                next_marker,
-            )),
-        },
-        sqlast::Expr::UnaryOp { op, expr: inner } => sqlast::Expr::UnaryOp {
-            op: *op,
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-        },
-        sqlast::Expr::Like {
-            negated,
-            any,
-            expr: inner,
-            pattern,
-            escape_char,
-        } => sqlast::Expr::Like {
-            negated: *negated,
-            any: *any,
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            pattern: Box::new(replace_grouping_calls_with_markers(
-                pattern,
-                args,
-                next_marker,
-            )),
-            escape_char: escape_char.clone(),
-        },
-        sqlast::Expr::ILike {
-            negated,
-            any,
-            expr: inner,
-            pattern,
-            escape_char,
-        } => sqlast::Expr::ILike {
-            negated: *negated,
-            any: *any,
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            pattern: Box::new(replace_grouping_calls_with_markers(
-                pattern,
-                args,
-                next_marker,
-            )),
-            escape_char: escape_char.clone(),
-        },
-        sqlast::Expr::SimilarTo {
-            negated,
-            expr: inner,
-            pattern,
-            escape_char,
-        } => sqlast::Expr::SimilarTo {
-            negated: *negated,
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            pattern: Box::new(replace_grouping_calls_with_markers(
-                pattern,
-                args,
-                next_marker,
-            )),
-            escape_char: escape_char.clone(),
-        },
-        sqlast::Expr::RLike {
-            negated,
-            expr: inner,
-            pattern,
-            regexp,
-        } => sqlast::Expr::RLike {
-            negated: *negated,
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            pattern: Box::new(replace_grouping_calls_with_markers(
-                pattern,
-                args,
-                next_marker,
-            )),
-            regexp: *regexp,
-        },
-        sqlast::Expr::AnyOp {
-            left,
-            compare_op,
-            right,
-            is_some,
-        } => sqlast::Expr::AnyOp {
-            left: Box::new(replace_grouping_calls_with_markers(left, args, next_marker)),
-            compare_op: compare_op.clone(),
-            right: Box::new(replace_grouping_calls_with_markers(
-                right,
-                args,
-                next_marker,
-            )),
-            is_some: *is_some,
-        },
-        sqlast::Expr::AllOp {
-            left,
-            compare_op,
-            right,
-        } => sqlast::Expr::AllOp {
-            left: Box::new(replace_grouping_calls_with_markers(left, args, next_marker)),
-            compare_op: compare_op.clone(),
-            right: Box::new(replace_grouping_calls_with_markers(
-                right,
-                args,
-                next_marker,
-            )),
-        },
-        sqlast::Expr::Convert {
-            is_try,
-            expr: inner,
-            data_type,
-            charset,
-            target_before_value,
-            styles,
-        } => sqlast::Expr::Convert {
-            is_try: *is_try,
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            data_type: data_type.clone(),
-            charset: charset.clone(),
-            target_before_value: *target_before_value,
-            styles: styles
-                .iter()
-                .map(|style| replace_grouping_calls_with_markers(style, args, next_marker))
-                .collect(),
-        },
-        sqlast::Expr::Cast {
-            kind,
-            expr: inner,
-            data_type,
-            array,
-            format,
-        } => sqlast::Expr::Cast {
-            kind: kind.clone(),
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            data_type: data_type.clone(),
-            array: *array,
-            format: format.clone(),
-        },
-        sqlast::Expr::AtTimeZone {
-            timestamp,
-            time_zone,
-        } => sqlast::Expr::AtTimeZone {
-            timestamp: Box::new(replace_grouping_calls_with_markers(
-                timestamp,
-                args,
-                next_marker,
-            )),
-            time_zone: Box::new(replace_grouping_calls_with_markers(
-                time_zone,
-                args,
-                next_marker,
-            )),
-        },
-        sqlast::Expr::Extract {
-            field,
-            syntax,
-            expr: inner,
-        } => sqlast::Expr::Extract {
-            field: field.clone(),
-            syntax: syntax.clone(),
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-        },
-        sqlast::Expr::Ceil { expr: inner, field } => sqlast::Expr::Ceil {
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            field: field.clone(),
-        },
-        sqlast::Expr::Floor { expr: inner, field } => sqlast::Expr::Floor {
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            field: field.clone(),
-        },
-        sqlast::Expr::Position { expr: inner, r#in } => sqlast::Expr::Position {
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            r#in: Box::new(replace_grouping_calls_with_markers(r#in, args, next_marker)),
-        },
-        sqlast::Expr::Substring {
-            expr: inner,
-            substring_from,
-            substring_for,
-            special,
-            shorthand,
-        } => sqlast::Expr::Substring {
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            substring_from: substring_from
-                .as_ref()
-                .map(|expr| Box::new(replace_grouping_calls_with_markers(expr, args, next_marker))),
-            substring_for: substring_for
-                .as_ref()
-                .map(|expr| Box::new(replace_grouping_calls_with_markers(expr, args, next_marker))),
-            special: *special,
-            shorthand: *shorthand,
-        },
-        sqlast::Expr::Trim {
-            expr: inner,
-            trim_where,
-            trim_what,
-            trim_characters,
-        } => sqlast::Expr::Trim {
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            trim_where: *trim_where,
-            trim_what: trim_what
-                .as_ref()
-                .map(|expr| Box::new(replace_grouping_calls_with_markers(expr, args, next_marker))),
-            trim_characters: trim_characters.as_ref().map(|exprs| {
-                exprs
-                    .iter()
-                    .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker))
-                    .collect()
-            }),
-        },
-        sqlast::Expr::Overlay {
-            expr: inner,
-            overlay_what,
-            overlay_from,
-            overlay_for,
-        } => sqlast::Expr::Overlay {
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            overlay_what: Box::new(replace_grouping_calls_with_markers(
-                overlay_what,
-                args,
-                next_marker,
-            )),
-            overlay_from: Box::new(replace_grouping_calls_with_markers(
-                overlay_from,
-                args,
-                next_marker,
-            )),
-            overlay_for: overlay_for
-                .as_ref()
-                .map(|expr| Box::new(replace_grouping_calls_with_markers(expr, args, next_marker))),
-        },
-        sqlast::Expr::Collate {
-            expr: inner,
-            collation,
-        } => sqlast::Expr::Collate {
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            collation: collation.clone(),
-        },
-        sqlast::Expr::Nested(inner) => sqlast::Expr::Nested(Box::new(
-            replace_grouping_calls_with_markers(inner, args, next_marker),
-        )),
-        sqlast::Expr::Prefixed { prefix, value } => sqlast::Expr::Prefixed {
-            prefix: prefix.clone(),
-            value: Box::new(replace_grouping_calls_with_markers(
-                value,
-                args,
-                next_marker,
-            )),
-        },
-        sqlast::Expr::Case {
-            case_token,
-            end_token,
-            operand,
-            conditions,
-            else_result,
-        } => sqlast::Expr::Case {
-            case_token: case_token.clone(),
-            end_token: end_token.clone(),
-            operand: operand
-                .as_ref()
-                .map(|o| Box::new(replace_grouping_calls_with_markers(o, args, next_marker))),
-            conditions: conditions
-                .iter()
-                .map(|cw| sqlast::CaseWhen {
-                    condition: replace_grouping_calls_with_markers(
-                        &cw.condition,
-                        args,
-                        next_marker,
-                    ),
-                    result: replace_grouping_calls_with_markers(&cw.result, args, next_marker),
-                })
-                .collect(),
-            else_result: else_result
-                .as_ref()
-                .map(|e| Box::new(replace_grouping_calls_with_markers(e, args, next_marker))),
-        },
-        sqlast::Expr::GroupingSets(groups) => sqlast::Expr::GroupingSets(
-            groups
-                .iter()
-                .map(|group| {
-                    group
-                        .iter()
-                        .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker))
-                        .collect()
-                })
-                .collect(),
-        ),
-        sqlast::Expr::Cube(groups) => sqlast::Expr::Cube(
-            groups
-                .iter()
-                .map(|group| {
-                    group
-                        .iter()
-                        .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker))
-                        .collect()
-                })
-                .collect(),
-        ),
-        sqlast::Expr::Rollup(groups) => sqlast::Expr::Rollup(
-            groups
-                .iter()
-                .map(|group| {
-                    group
-                        .iter()
-                        .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker))
-                        .collect()
-                })
-                .collect(),
-        ),
-        sqlast::Expr::Tuple(exprs) => sqlast::Expr::Tuple(
-            exprs
-                .iter()
-                .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker))
-                .collect(),
-        ),
-        sqlast::Expr::Struct { values, fields } => sqlast::Expr::Struct {
-            values: values
-                .iter()
-                .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker))
-                .collect(),
-            fields: fields.clone(),
-        },
-        sqlast::Expr::Named { expr: inner, name } => sqlast::Expr::Named {
-            expr: Box::new(replace_grouping_calls_with_markers(
-                inner,
-                args,
-                next_marker,
-            )),
-            name: name.clone(),
-        },
-        sqlast::Expr::Dictionary(fields) => sqlast::Expr::Dictionary(
-            fields
-                .iter()
-                .map(|field| sqlast::DictionaryField {
-                    key: field.key.clone(),
-                    value: Box::new(replace_grouping_calls_with_markers(
-                        &field.value,
-                        args,
-                        next_marker,
-                    )),
-                })
-                .collect(),
-        ),
-        sqlast::Expr::Map(map) => sqlast::Expr::Map(sqlast::Map {
-            entries: map
-                .entries
-                .iter()
-                .map(|entry| sqlast::MapEntry {
-                    key: Box::new(replace_grouping_calls_with_markers(
-                        &entry.key,
-                        args,
-                        next_marker,
-                    )),
-                    value: Box::new(replace_grouping_calls_with_markers(
-                        &entry.value,
-                        args,
-                        next_marker,
-                    )),
-                })
-                .collect(),
-        }),
-        sqlast::Expr::Array(array) => sqlast::Expr::Array(sqlast::Array {
-            elem: array
-                .elem
-                .iter()
-                .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker))
-                .collect(),
-            named: array.named,
-        }),
-        sqlast::Expr::Interval(interval) => sqlast::Expr::Interval(sqlast::Interval {
-            value: Box::new(replace_grouping_calls_with_markers(
-                &interval.value,
-                args,
-                next_marker,
-            )),
-            leading_field: interval.leading_field.clone(),
-            leading_precision: interval.leading_precision,
-            last_field: interval.last_field.clone(),
-            fractional_seconds_precision: interval.fractional_seconds_precision,
-        }),
-        sqlast::Expr::OuterJoin(inner) => sqlast::Expr::OuterJoin(Box::new(
-            replace_grouping_calls_with_markers(inner, args, next_marker),
-        )),
-        sqlast::Expr::Prior(inner) => sqlast::Expr::Prior(Box::new(
-            replace_grouping_calls_with_markers(inner, args, next_marker),
-        )),
-        sqlast::Expr::Lambda(lambda) => sqlast::Expr::Lambda(sqlast::LambdaFunction {
-            params: lambda.params.clone(),
-            body: Box::new(replace_grouping_calls_with_markers(
-                &lambda.body,
-                args,
-                next_marker,
-            )),
-            syntax: lambda.syntax,
-        }),
-        sqlast::Expr::MemberOf(member_of) => sqlast::Expr::MemberOf(sqlast::MemberOf {
-            value: Box::new(replace_grouping_calls_with_markers(
-                &member_of.value,
-                args,
-                next_marker,
-            )),
-            array: Box::new(replace_grouping_calls_with_markers(
-                &member_of.array,
-                args,
-                next_marker,
-            )),
-        }),
-        other => other.clone(),
-    }
+) -> ast::Expr {
+    let mut folder = GroupingMarkerFolder { args, next_marker };
+    ast::Fold::fold_expr(&mut folder, expr.clone())
 }
 
-fn replace_grouping_markers_in_window(
-    window: &sqlast::WindowType,
-    args: &mut Vec<(String, Vec<String>)>,
-    next_marker: &mut i64,
-) -> sqlast::WindowType {
-    match window {
-        sqlast::WindowType::WindowSpec(spec) => {
-            let partition_by = spec
-                .partition_by
-                .iter()
-                .map(|e| replace_grouping_calls_with_markers(e, args, next_marker))
-                .collect();
-            let order_by = spec
-                .order_by
-                .iter()
-                .map(|ob| replace_grouping_markers_in_order_by_expr(ob, args, next_marker))
-                .collect();
-            sqlast::WindowType::WindowSpec(sqlast::WindowSpec {
-                partition_by,
-                order_by,
-                ..spec.clone()
-            })
-        }
-        other => other.clone(),
-    }
-}
-
-fn flatten_grouping_groups(groups: &[Vec<sqlast::Expr>]) -> Vec<sqlast::Expr> {
+fn flatten_grouping_groups(groups: &[Vec<ast::Expr>]) -> Vec<ast::Expr> {
     groups
         .iter()
         .flat_map(|group| group.iter().cloned())
         .collect()
 }
 
-fn unique_exprs_in_order<I>(exprs: I) -> Vec<sqlast::Expr>
+fn unique_exprs_in_order<I>(exprs: I) -> Vec<ast::Expr>
 where
-    I: IntoIterator<Item = sqlast::Expr>,
+    I: IntoIterator<Item = ast::Expr>,
 {
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
     for expr in exprs {
-        let key = format!("{expr}").to_lowercase();
+        let key = expr_syntax_key(&expr);
         if seen.insert(key) {
             result.push(expr);
         }
@@ -3506,7 +2311,7 @@ where
     result
 }
 
-fn rollup_grouping_sets(groups: &[Vec<sqlast::Expr>]) -> Vec<Vec<sqlast::Expr>> {
+fn rollup_grouping_sets(groups: &[Vec<ast::Expr>]) -> Vec<Vec<ast::Expr>> {
     let mut grouping_sets = Vec::with_capacity(groups.len() + 1);
     for active_count in (0..=groups.len()).rev() {
         let grouping_set = groups
@@ -3519,7 +2324,7 @@ fn rollup_grouping_sets(groups: &[Vec<sqlast::Expr>]) -> Vec<Vec<sqlast::Expr>> 
     grouping_sets
 }
 
-fn cube_grouping_sets(groups: &[Vec<sqlast::Expr>]) -> Vec<Vec<sqlast::Expr>> {
+fn cube_grouping_sets(groups: &[Vec<ast::Expr>]) -> Vec<Vec<ast::Expr>> {
     let group_count = groups.len();
     let total = 1usize.checked_shl(group_count as u32).unwrap_or(0);
     let mut grouping_sets = Vec::with_capacity(total);
@@ -4587,15 +3392,16 @@ mod tests {
         }
     }
 
-    fn parse_and_analyze(sql: &str) -> Result<ResolvedQuery, String> {
-        let dialect = sqlparser::dialect::GenericDialect {};
-        let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql)
-            .map_err(|e| format!("parse error: {e}"))?;
-        let stmt = stmts.into_iter().next().ok_or("empty SQL")?;
-        let query = match stmt {
-            sqlparser::ast::Statement::Query(q) => q,
-            _ => return Err("expected a query".into()),
+    fn parse_native_query(sql: &str) -> Result<ast::Query, String> {
+        let mut statements = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_mut_slice() else {
+            return Err("expected exactly one query".to_string());
         };
+        Ok(query.clone())
+    }
+
+    fn parse_and_analyze(sql: &str) -> Result<ResolvedQuery, String> {
+        let query = parse_native_query(sql)?;
         let (resolved, _registry, _factory) = analyze(&query, &TestCatalog, "default")?;
         Ok(resolved)
     }
@@ -4603,26 +3409,13 @@ mod tests {
     fn parse_and_analyze_with_registry(
         sql: &str,
     ) -> Result<(ResolvedQuery, crate::analysis::cte::CTERegistry), String> {
-        let dialect = crate::parser::dialect::StarRocksDialect;
-        let mut ast =
-            sqlparser::parser::Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
-        let stmt = ast
-            .pop()
-            .ok_or_else(|| "expected a statement".to_string())?;
-        let query = match stmt {
-            sqlparser::ast::Statement::Query(q) => q,
-            _ => return Err("expected a query".into()),
-        };
+        let query = parse_native_query(sql)?;
         let (resolved, registry, _factory) = analyze(&query, &TestCatalog, "default")?;
         Ok((resolved, registry))
     }
 
     fn parse_raw_and_analyze(sql: &str) -> Result<ResolvedQuery, String> {
-        let stmt = crate::parser::parse_sql_raw(sql)?;
-        let query = match stmt {
-            sqlparser::ast::Statement::Query(q) => q,
-            _ => return Err("expected a query".into()),
-        };
+        let query = parse_native_query(sql)?;
         let (resolved, _registry, _factory) = analyze(&query, &TestCatalog, "default")?;
         Ok(resolved)
     }
@@ -6792,10 +5585,7 @@ mod tests {
 
     #[test]
     fn analyzer_passes_three_part_catalog_to_catalog_provider() {
-        let stmt = crate::parser::parse_sql_raw("SELECT id FROM ice.db.orders").expect("parse");
-        let sqlparser::ast::Statement::Query(query) = stmt else {
-            panic!("expected query");
-        };
+        let query = parse_native_query("SELECT id FROM ice.db.orders").expect("parse");
 
         let (resolved, _, _) =
             analyze(&query, &CatalogAwareTestCatalog, "default").expect("analyze");
@@ -6812,10 +5602,7 @@ mod tests {
 
     #[test]
     fn analyzer_passes_uppercase_three_part_catalog_to_catalog_provider() {
-        let stmt = crate::parser::parse_sql_raw("SELECT id FROM ICE.DB.ORDERS").expect("parse");
-        let sqlparser::ast::Statement::Query(query) = stmt else {
-            panic!("expected query");
-        };
+        let query = parse_native_query("SELECT id FROM ICE.DB.ORDERS").expect("parse");
 
         let (resolved, _, _) =
             analyze(&query, &CatalogAwareTestCatalog, "default").expect("analyze");
@@ -6868,12 +5655,8 @@ mod tests {
         }
 
         let catalog = MetadataModeCatalog(std::cell::Cell::new(false));
-        let stmt =
-            crate::parser::parse_sql_raw("SELECT record_count FROM ice.db.orders$partitions")
-                .expect("parse");
-        let sqlparser::ast::Statement::Query(query) = stmt else {
-            panic!("expected query");
-        };
+        let query =
+            parse_native_query("SELECT record_count FROM ice.db.orders$partitions").expect("parse");
 
         let _ = analyze(&query, &catalog, "default").expect("analyze");
         assert!(
@@ -6923,12 +5706,8 @@ mod tests {
         }
 
         let catalog = LowercaseMetadataModeCatalog(std::cell::Cell::new(false));
-        let stmt =
-            crate::parser::parse_sql_raw("SELECT record_count FROM ICE.DB.ORDERS$partitions")
-                .expect("parse");
-        let sqlparser::ast::Statement::Query(query) = stmt else {
-            panic!("expected query");
-        };
+        let query =
+            parse_native_query("SELECT record_count FROM ICE.DB.ORDERS$partitions").expect("parse");
 
         let _ = analyze(&query, &catalog, "default").expect("analyze");
         assert!(
@@ -6941,8 +5720,7 @@ mod tests {
     fn analyzer_resolves_t_dollar_snapshots_to_metadata_scan() {
         use crate::planner::table::SqlMetadataTableKind;
 
-        // The parser rewrites `orders$snapshots` -> `orders.__nr_meta_snapshots__`
-        // so we go through `parse_raw_and_analyze` to exercise the full pipeline.
+        // Metadata table syntax is carried by the typed table-factor metadata field.
         let resolved = parse_raw_and_analyze("SELECT snapshot_id FROM orders$snapshots")
             .expect("analyze should succeed");
         let QueryBody::Select(sel) = &resolved.body else {
@@ -6970,8 +5748,8 @@ mod tests {
 
     #[test]
     fn analyzer_rejects_branch_combined_with_metadata_suffix() {
-        // `orders.branch_dev$snapshots` -> `orders.branch_dev.__nr_meta_snapshots__`
-        // after parser rewrite. The base_parts ends in `branch_dev`, which is
+        // The typed metadata suffix leaves `branch_dev` as the base name,
+        // which is
         // illegal in combination with a metadata-table suffix.
         let err = parse_raw_and_analyze("SELECT * FROM orders.branch_dev$snapshots")
             .expect_err("must fail");
@@ -7225,11 +6003,7 @@ mod tests {
         }
         assert_eq!(factory.peek_next_id(), 4);
 
-        let stmt = crate::parser::parse_sql_raw("SELECT 1 + 1 AS x").expect("parse");
-        let query = match stmt {
-            sqlparser::ast::Statement::Query(q) => q,
-            _ => panic!("not a query"),
-        };
+        let query = parse_native_query("SELECT 1 + 1 AS x").expect("parse");
         let (_resolved, _ctes, out_factory) =
             analyze_with_factory(&query, &TestCatalog, "db", factory).expect("analyze");
         // The analysis must have allocated its ids on top of the seeded ones.
@@ -7245,14 +6019,7 @@ mod tests {
         "SELECT k1 FROM t1 WHERE k1 = (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1)";
 
     fn parse_and_analyze_for_apply_specs(sql: &str) -> Result<ResolvedQuery, String> {
-        let dialect = sqlparser::dialect::GenericDialect {};
-        let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql)
-            .map_err(|e| format!("parse error: {e}"))?;
-        let stmt = stmts.into_iter().next().ok_or("empty SQL")?;
-        let query = match stmt {
-            sqlparser::ast::Statement::Query(q) => q,
-            _ => return Err("expected a query".into()),
-        };
+        let query = parse_native_query(sql)?;
         let (resolved, _cte, _factory) = analyze(&query, &TestCatalog, "default")?;
         Ok(resolved)
     }
@@ -7263,12 +6030,7 @@ mod tests {
     fn current_route_records_where_scalar_subquery_apply_spec() {
         use crate::analysis::{ApplyClause, QueryBody};
 
-        let dialect = sqlparser::dialect::GenericDialect {};
-        let stmts = sqlparser::parser::Parser::parse_sql(&dialect, CORRELATED_SCALAR_SQL).unwrap();
-        let query = match stmts.into_iter().next().unwrap() {
-            sqlparser::ast::Statement::Query(q) => q,
-            _ => panic!("expected query"),
-        };
+        let query = parse_native_query(CORRELATED_SCALAR_SQL).expect("parse correlated query");
         let (resolved, _cte, _factory) =
             analyze(&query, &TestCatalog, "default").expect("analyze with apply framework");
 

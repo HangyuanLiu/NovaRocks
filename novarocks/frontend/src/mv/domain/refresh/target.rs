@@ -24,9 +24,9 @@ use crate::mv::domain::refresh::target_binding::{
 };
 use crate::mv::domain::repository::MvTarget;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
+use novarocks_parser::ast::ObjectName;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
-use novarocks_sql::syntax::ObjectName;
 
 /// A normalized Iceberg MV target identity.  Refresh planning and the domain
 /// persistence paths share this value without acquiring query assembly state.
@@ -57,7 +57,10 @@ pub fn resolve_refresh_target(
         "REFRESH MATERIALIZED VIEW for an Iceberg MV requires current Iceberg catalog context"
             .to_string()
     })?;
-    let (namespace, table) = resolve_mv_name(name, current_database)?;
+    let semantic_name = novarocks_sql::syntax::ObjectName {
+        parts: name.parts.iter().map(|part| part.value.clone()).collect(),
+    };
+    let (namespace, table) = resolve_mv_name(&semantic_name, current_database)?;
     Ok(IcebergMvTarget {
         catalog: normalize_identifier(catalog)?,
         namespace,

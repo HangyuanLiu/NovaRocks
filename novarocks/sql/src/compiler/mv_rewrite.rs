@@ -24,6 +24,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use novarocks_parser::ast::Query;
 use novarocks_spi::connector::ConnectorTableObjectId;
 
 use crate::binding::SqlTableBindingId;
@@ -2071,7 +2072,7 @@ impl SqlMvRewriteBaseTableFacts {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlMvRewriteDefinitionFacts {
     mv_id: i64,
-    select_sql: String,
+    select_query: Query,
     base_table_refs: Vec<String>,
     storage_engine: String,
     target_catalog: Option<String>,
@@ -2086,7 +2087,7 @@ impl SqlMvRewriteDefinitionFacts {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         mv_id: i64,
-        select_sql: String,
+        select_query: Query,
         base_table_refs: Vec<String>,
         storage_engine: String,
         target_catalog: Option<String>,
@@ -2104,7 +2105,7 @@ impl SqlMvRewriteDefinitionFacts {
         }
         Ok(Self {
             mv_id,
-            select_sql,
+            select_query,
             base_table_refs,
             storage_engine,
             target_catalog,
@@ -2119,7 +2120,7 @@ impl SqlMvRewriteDefinitionFacts {
     fn into_definition(self) -> MvRewriteDefinition {
         MvRewriteDefinition {
             mv_id: self.mv_id,
-            select_sql: self.select_sql,
+            select_query: self.select_query,
             base_table_refs: self.base_table_refs,
             storage_engine: self.storage_engine,
             target_catalog: self.target_catalog,
@@ -2151,7 +2152,7 @@ enum MvRewriteBaseTableState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MvRewriteDefinition {
     pub(crate) mv_id: i64,
-    pub(crate) select_sql: String,
+    pub(crate) select_query: Query,
     pub(crate) base_table_refs: Vec<String>,
     pub(crate) storage_engine: String,
     pub(crate) target_catalog: Option<String>,
@@ -2352,7 +2353,7 @@ fn build_candidate(
         return Ok(None);
     }
 
-    let select = parse_select_query(&definition.select_sql)?;
+    let select = definition.select_query.clone();
     let (resolved, ctes, returned) = crate::analyzer::analyze_with_factory_and_function_catalog(
         &select,
         analyzer_catalog,
@@ -2406,17 +2407,6 @@ fn build_candidate(
         target_table,
         factory_after_analysis: returned,
     }))
-}
-
-fn parse_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
-    let normalized = crate::parser::dialect::normalize_for_raw_parse(sql)
-        .map_err(|error| format!("stored MV SELECT normalize error: {error}"))?;
-    let statement = crate::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|error| format!("stored MV SQL parse error: {error}"))?;
-    let sqlparser::ast::Statement::Query(query) = statement else {
-        return Err("stored MV SQL must be a SELECT query".to_string());
-    };
-    Ok(*query)
 }
 
 fn definition_is_fresh(definition: &MvRewriteDefinition) -> Result<bool, String> {
@@ -2477,6 +2467,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    fn test_query(sql: &str) -> Query {
+        let statements = novarocks_parser::parse(sql).expect("parse query");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("fixture must be a query");
+        };
+        query.clone()
+    }
 
     struct CandidateCatalog {
         resolutions: AtomicUsize,
@@ -2551,7 +2549,7 @@ mod tests {
         MvRewriteDefinitionIndex::try_new(vec![
             SqlMvRewriteDefinitionFacts::try_new(
                 1,
-                "select k from iceberg.db.base".to_string(),
+                test_query("select k from iceberg.db.base"),
                 vec!["iceberg.db.base".to_string()],
                 "iceberg".to_string(),
                 Some("iceberg".to_string()),
@@ -2570,7 +2568,7 @@ mod tests {
     }
 
     fn main_candidate_query(catalog: &CandidateCatalog) -> (LogicalPlanNode, ColumnRefFactory) {
-        let query = parse_select_query("select k from iceberg.db.base").expect("main query");
+        let query = test_query("select k from iceberg.db.base");
         let (resolved, ctes, mut factory) = crate::analyzer::analyze_with_function_catalog(
             &query,
             catalog,
@@ -2586,7 +2584,7 @@ mod tests {
     fn frozen_definition(state: SqlMvRewriteBaseTableFacts) -> MvRewriteDefinition {
         SqlMvRewriteDefinitionFacts::try_new(
             1,
-            "select 1".to_string(),
+            test_query("select 1"),
             vec!["iceberg.db.base".to_string()],
             "iceberg".to_string(),
             Some("iceberg".to_string()),
@@ -2608,7 +2606,7 @@ mod tests {
         let index = MvRewriteDefinitionIndex::try_new(vec![
             SqlMvRewriteDefinitionFacts::try_new(
                 7,
-                "select 1".to_string(),
+                test_query("select 1"),
                 Vec::new(),
                 "iceberg".to_string(),
                 None,
@@ -2621,7 +2619,7 @@ mod tests {
             .expect("valid first frozen definition"),
             SqlMvRewriteDefinitionFacts::try_new(
                 3,
-                "select 2".to_string(),
+                test_query("select 2"),
                 Vec::new(),
                 "iceberg".to_string(),
                 None,
@@ -2765,7 +2763,7 @@ mod tests {
     fn frozen_mv_rewrite_facts_reject_empty_unavailable_observation() {
         let invalid = SqlMvRewriteDefinitionFacts::try_new(
             1,
-            "select 1".to_string(),
+            test_query("select 1"),
             Vec::new(),
             "iceberg".to_string(),
             None,

@@ -1,9 +1,9 @@
 -- query 1
-typeof(CAST(1 AS TINYINT))
+typeof(CAST(1 AS tinyint))
 tinyint
 
 -- query 2
-typeof(CAST(1 AS SMALLINT))
+typeof(CAST(1 AS smallint))
 smallint
 
 -- query 3
@@ -11,7 +11,7 @@ typeof(CAST(1 AS INT))
 int
 
 -- query 4
-typeof(CAST(1 AS BIGINT))
+typeof(CAST(1 AS bigint))
 bigint
 
 -- query 5
@@ -23,19 +23,19 @@ typeof(CAST(1 AS DECIMAL128(19,2)))
 decimal128(19, 2)
 
 -- query 7
-typeof(CAST(1 AS DOUBLE))
+typeof(CAST(1 AS double))
 double
 
 -- query 8
-typeof(CAST(1 AS FLOAT))
+typeof(CAST(1 AS float))
 float
 
 -- query 9
-typeof(CAST(1 AS BOOLEAN))
+typeof(CAST(1 AS boolean))
 boolean
 
 -- query 10
-typeof(CAST(1 AS CHAR))
+typeof(CAST(1 AS char))
 char
 
 -- query 11
@@ -43,7 +43,7 @@ typeof(CAST(1 AS VARCHAR(65533)))
 varchar
 
 -- query 12
-typeof(CAST(1 AS VARCHAR))
+typeof(CAST(1 AS varchar))
 varchar
 
 -- query 13
@@ -51,11 +51,11 @@ typeof(CAST('s' AS VARBINARY))
 varbinary
 
 -- query 14
-typeof(CAST('2023-03-07' AS DATE))
+typeof(CAST('2023-03-07' AS date))
 date
 
 -- query 15
-typeof(CAST('2023-03-07 11:22:33' AS DATETIME))
+typeof(CAST('2023-03-07 11:22:33' AS datetime))
 datetime
 
 -- query 16

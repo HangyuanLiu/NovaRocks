@@ -35,8 +35,6 @@ use novarocks_frontend::mv::domain::repository::{
     RebuildMvRepositoryRequest, RecordExternalCommitAndFinalizeRequest, UnavailableMvRepository,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -448,8 +446,8 @@ fn stored_definition() -> StoredMvDefinition {
 }
 
 fn statement() -> MvApplicationStatement {
-    let mut statements = Parser::parse_sql(&GenericDialect {}, "SELECT 1").expect("parse query");
-    let sqlparser::ast::Statement::Query(select_query) = statements.remove(0) else {
+    let mut statements = novarocks_parser::parse("SELECT 1").expect("parse query");
+    let novarocks_parser::ast::Statement::Query(select_query) = statements.remove(0) else {
         panic!("query")
     };
     MvApplicationStatement::Create(MvCreateStatement {
@@ -459,7 +457,7 @@ fn statement() -> MvApplicationStatement {
         distribution: None,
         refresh_policy: MvCreateRefreshPolicy::Manual,
         select_sql: "SELECT 1".to_string(),
-        select_query: *select_query,
+        select_query,
         properties: vec![("storage_engine".to_string(), "iceberg".to_string())],
         primary_key: None,
     })

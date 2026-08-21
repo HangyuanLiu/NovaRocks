@@ -691,9 +691,8 @@ mod tests {
         // Construction is unnecessary for an unsupported family because the
         // parser gate must reject it before any port is read.
         let sql = "SELECT 'CREATE TABLE t AS SELECT 1'";
-        let normalized =
-            novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize query");
-        assert!(normalized.starts_with("SELECT"));
+        let statements = novarocks_parser::parse(sql).expect("parse query");
+        assert!(matches!(statements.as_slice(), [Statement::Query(_)]));
         let _ = std::any::type_name::<CatalogCommandExecutor>();
     }
 

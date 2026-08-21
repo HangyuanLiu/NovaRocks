@@ -288,6 +288,9 @@ pub struct TupleExpr {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArrayExpr {
+    /// Optional element type from StarRocks' `ARRAY<type>[...]` literal
+    /// spelling. Bare `[ ... ]` literals leave this absent for inference.
+    pub element_type: Option<TypeName>,
     pub elements: Vec<Expr>,
     pub span: Span,
 }

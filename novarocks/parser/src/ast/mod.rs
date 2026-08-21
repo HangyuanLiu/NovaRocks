@@ -98,10 +98,11 @@ pub use validate::{validate_statement, validate_statements};
 pub use view::{CreateView, DropView, ShowCreateView, ShowViews, ViewStatement};
 pub use visit::{
     Fold, Visit, fold_binary_expr, fold_expr, fold_function_call, fold_ident, fold_literal,
-    fold_nested_expr, fold_object_name, fold_show_backends, fold_statement, fold_type_name,
-    fold_unary_expr, fold_view_statement, walk_binary_expr, walk_expr, walk_function_call,
-    walk_ident, walk_literal, walk_nested_expr, walk_object_name, walk_show_backends,
-    walk_statement, walk_type_name, walk_unary_expr, walk_view_statement,
+    fold_nested_expr, fold_object_name, fold_query, fold_show_backends, fold_statement,
+    fold_table_factor, fold_type_name, fold_unary_expr, fold_view_statement, walk_binary_expr,
+    walk_expr, walk_function_call, walk_ident, walk_literal, walk_nested_expr, walk_object_name,
+    walk_show_backends, walk_statement, walk_table_factor, walk_type_name, walk_unary_expr,
+    walk_view_statement,
 };
 pub use window::{
     NamedWindow, WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits, WindowSpec,
@@ -123,7 +124,6 @@ pub enum Statement {
     Dml(DmlStatement),
     Query(Query),
     ExplainQuery(ExplainQuery),
-    RawQuery(RawQuerySlice),
 }
 
 impl Statement {
@@ -140,7 +140,6 @@ impl Statement {
             Self::Dml(statement) => statement.span(),
             Self::Query(query) => query.span,
             Self::ExplainQuery(query) => query.span,
-            Self::RawQuery(query) => query.span,
         }
     }
 }
@@ -205,17 +204,6 @@ pub enum LiteralKind {
     HexString(String),
 }
 
-/// An owned source slice used while embedded queries are not yet typed AST.
-///
-/// This transition node is retired by SQLP-6, which replaces it with a typed
-/// `Query` node. Keeping the original text here lets the canonical printer
-/// render it without receiving a separate source arena.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RawQuerySlice {
-    pub text: String,
-    pub span: Span,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,17 +238,12 @@ mod tests {
         let statement = Statement::Backend(BackendStatement::ShowBackends(ShowBackends {
             span: span(11, 24),
         }));
-        let raw_query = RawQuerySlice {
-            text: "SELECT 42".to_owned(),
-            span: span(25, 34),
-        };
 
         assert_eq!(name.span, span(0, 7));
         assert_eq!(type_name.span, span(0, 7));
         assert_eq!(literal.span, span(8, 10));
         assert_eq!(expression.span(), span(8, 10));
         assert_eq!(statement.span(), span(11, 24));
-        assert_eq!(Statement::RawQuery(raw_query).span(), span(25, 34));
     }
 
     #[test]

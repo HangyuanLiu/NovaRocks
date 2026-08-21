@@ -48,7 +48,7 @@ v1	array1	array2	array3	map1	map2	map3	st1
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 16
-CAST((row(1, NULL)) AS struct<a int(11), b array<int(11)>>)
+CAST((row(1, NULL)) AS struct<a INT, b ARRAY<INT>>)
 {"a":1,"b":null}
 
 -- query 17

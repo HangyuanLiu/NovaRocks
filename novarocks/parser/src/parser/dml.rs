@@ -105,7 +105,7 @@ fn parse_insert(parser: &mut StatementParser<'_, '_>) -> Result<Insert, ParseErr
     {
         return Err(parser.unexpected("SELECT, VALUES, WITH, or '('"));
     }
-    let source = parser.parse_raw_query_slice()?;
+    let source = query::parse_query(parser)?;
     Ok(Insert {
         overwrite,
         has_into,

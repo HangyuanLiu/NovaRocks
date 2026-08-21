@@ -173,7 +173,7 @@ impl RefreshSnapshotPin {
 /// function is a no-op in production. It exists for the multi-base future.
 #[allow(dead_code)]
 pub(crate) fn inject_pin_as_for_version_as_of(
-    query: &mut sqlparser::ast::Query,
+    query: &mut novarocks_parser::ast::Query,
     pin: &RefreshSnapshotPin,
     delta_bearing: &HashSet<TableIdentity>,
     current_catalog: Option<&str>,
@@ -188,7 +188,7 @@ pub(crate) fn inject_pin_as_for_version_as_of(
         first_error: None,
     };
     if let Some(with) = &mut query.with {
-        for cte in &mut with.cte_tables {
+        for cte in &mut with.ctes {
             walk_set_expr(cte.query.body.as_mut(), &mut state);
         }
     }
@@ -208,8 +208,8 @@ struct InjectState<'a> {
     first_error: Option<String>,
 }
 
-fn walk_set_expr(expr: &mut sqlparser::ast::SetExpr, state: &mut InjectState<'_>) {
-    use sqlparser::ast::SetExpr;
+fn walk_set_expr(expr: &mut novarocks_parser::ast::SetExpr, state: &mut InjectState<'_>) {
+    use novarocks_parser::ast::SetExpr;
     if state.first_error.is_some() {
         return;
     }
@@ -219,9 +219,9 @@ fn walk_set_expr(expr: &mut sqlparser::ast::SetExpr, state: &mut InjectState<'_>
                 walk_table_with_joins(tw, state);
             }
         }
-        SetExpr::SetOperation { left, right, .. } => {
-            walk_set_expr(left.as_mut(), state);
-            walk_set_expr(right.as_mut(), state);
+        novarocks_parser::ast::SetExpr::SetOperation(operation) => {
+            walk_set_expr(operation.left.as_mut(), state);
+            walk_set_expr(operation.right.as_mut(), state);
         }
         SetExpr::Query(q) => walk_set_expr(q.body.as_mut(), state),
         _ => {}
@@ -229,7 +229,7 @@ fn walk_set_expr(expr: &mut sqlparser::ast::SetExpr, state: &mut InjectState<'_>
 }
 
 fn walk_table_with_joins(
-    table_with_joins: &mut sqlparser::ast::TableWithJoins,
+    table_with_joins: &mut novarocks_parser::ast::TableWithJoins,
     state: &mut InjectState<'_>,
 ) {
     walk_factor(&mut table_with_joins.relation, state);
@@ -238,29 +238,19 @@ fn walk_table_with_joins(
     }
 }
 
-fn walk_factor(factor: &mut sqlparser::ast::TableFactor, state: &mut InjectState<'_>) {
-    use sqlparser::ast::{Expr, ObjectNamePart, TableFactor, TableVersion, Value};
+fn walk_factor(factor: &mut novarocks_parser::ast::TableFactor, state: &mut InjectState<'_>) {
+    use novarocks_parser::ast::{
+        Expr, Literal, LiteralKind, TableFactor, TableVersion, TableVersionKind,
+    };
     if state.first_error.is_some() {
         return;
     }
     match factor {
-        TableFactor::Table {
-            name,
-            version,
-            args,
-            ..
-        } => {
-            // Skip table-valued functions (e.g. __nr_ivm_delta).
-            if args.is_some() {
-                return;
-            }
+        TableFactor::Table { name, version, .. } => {
             let parts: Vec<String> = name
-                .0
+                .parts
                 .iter()
-                .filter_map(|p| match p {
-                    ObjectNamePart::Identifier(i) => Some(i.value.to_ascii_lowercase()),
-                    _ => None,
-                })
+                .map(|ident| ident.value.to_ascii_lowercase())
                 .collect();
             let Some(base_ref) =
                 resolve_table_factor(&parts, state.current_catalog, state.current_database)
@@ -280,9 +270,14 @@ fn walk_factor(factor: &mut sqlparser::ast::TableFactor, state: &mut InjectState
             if state.delta_bearing.contains(&base_ref) {
                 return;
             }
-            *version = Some(TableVersion::VersionAsOf(Expr::Value(
-                Value::Number(pinned.to_string(), false).into(),
-            )));
+            *version = Some(TableVersion {
+                kind: TableVersionKind::ForVersionAsOf,
+                value: Expr::Literal(Literal {
+                    kind: LiteralKind::Number(pinned.to_string()),
+                    span: name.span,
+                }),
+                span: name.span,
+            });
             state.count += 1;
         }
         TableFactor::Derived { subquery, .. } => {
@@ -327,13 +322,14 @@ fn resolve_table_factor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_parser::printer::print_query;
 
-    fn parse_select_for_test(sql: &str) -> sqlparser::ast::Query {
-        let statement = novarocks_sql::syntax::parse_sql_raw(sql).expect("test SQL must parse");
-        let sqlparser::ast::Statement::Query(query) = statement else {
+    fn parse_select_for_test(sql: &str) -> novarocks_parser::ast::Query {
+        let statements = novarocks_parser::parse(sql).expect("test SQL must parse");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
             panic!("test SQL must be a query");
         };
-        *query
+        query.clone()
     }
 
     fn make_pin(entries: &[(&str, i64, &[u8])]) -> RefreshSnapshotPin {
@@ -425,7 +421,7 @@ mod tests {
                 .expect("inject must succeed");
 
         assert_eq!(count, 0);
-        assert_eq!(query.to_string(), "SELECT * FROM ice.db.orders");
+        assert_eq!(print_query(&query), "SELECT * FROM ice.db.orders");
     }
 
     #[test]
@@ -444,8 +440,8 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(
-            query.to_string(),
-            "SELECT * FROM db.orders JOIN ice.db.customers VERSION AS OF 99 ON true"
+            print_query(&query),
+            "SELECT * FROM db.orders JOIN ice.db.customers FOR VERSION AS OF 99 ON TRUE"
         );
     }
 
@@ -463,14 +459,14 @@ mod tests {
 
         assert_eq!(count, 0);
         assert_eq!(
-            query.to_string(),
-            "WITH recent AS (SELECT * FROM local_db.orders) SELECT * FROM recent JOIN other.db.dim ON true"
+            print_query(&query),
+            "WITH recent AS (SELECT * FROM local_db.orders) SELECT * FROM recent JOIN other.db.dim ON TRUE"
         );
     }
 
     #[test]
     fn inject_pin_rejects_existing_for_version_as_of() {
-        let mut query = parse_select_for_test("SELECT * FROM ice.db.orders VERSION AS OF 7");
+        let mut query = parse_select_for_test("SELECT * FROM ice.db.orders FOR VERSION AS OF 7");
         let pin = make_pin(&[("ice.db.orders", 42, b"object-orders")]);
         let delta_bearing = std::collections::HashSet::new();
 
@@ -486,7 +482,7 @@ mod tests {
 
     #[test]
     fn inject_pin_rejects_delta_bearing_base_with_existing_for_version_as_of() {
-        let mut query = parse_select_for_test("SELECT * FROM ice.db.orders VERSION AS OF 7");
+        let mut query = parse_select_for_test("SELECT * FROM ice.db.orders FOR VERSION AS OF 7");
         let pin = make_pin(&[("ice.db.orders", 42, b"object-orders")]);
         let delta_bearing = std::collections::HashSet::from([make_ref("ice", "db", "orders")]);
 
@@ -502,8 +498,9 @@ mod tests {
 
     #[test]
     fn inject_pin_walks_nested_join() {
-        let mut query =
-            parse_select_for_test("SELECT * FROM (ice.db.orders JOIN ice.db.customers ON true)");
+        let mut query = parse_select_for_test(
+            "SELECT * FROM (SELECT * FROM ice.db.orders JOIN ice.db.customers ON TRUE) AS joined",
+        );
         let pin = make_pin(&[
             ("ice.db.orders", 42, b"object-orders"),
             ("ice.db.customers", 99, b"object-customers"),
@@ -516,8 +513,8 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(
-            query.to_string(),
-            "SELECT * FROM (ice.db.orders JOIN ice.db.customers VERSION AS OF 99 ON true)"
+            print_query(&query),
+            "SELECT * FROM (SELECT * FROM ice.db.orders JOIN ice.db.customers FOR VERSION AS OF 99 ON TRUE) AS joined"
         );
     }
 
@@ -533,7 +530,7 @@ mod tests {
 
         assert_eq!(count, 0);
         assert_eq!(
-            query.to_string(),
+            print_query(&query),
             "SELECT * FROM __nr_ivm_delta('ice.db.orders')"
         );
     }

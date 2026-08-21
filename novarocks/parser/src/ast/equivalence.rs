@@ -96,7 +96,9 @@ impl SyntaxEq for StructField {
 
 impl SyntaxEq for ExplainQuery {
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.format == other.format && self.query.syntax_eq(&other.query)
+        self.format == other.format
+            && self.logical == other.logical
+            && self.query.syntax_eq(&other.query)
     }
 }
 
@@ -327,6 +329,7 @@ impl SyntaxEq for TableFactor {
             (
                 Self::Table {
                     name: left_name,
+                    metadata: left_metadata,
                     alias: left_alias,
                     version: left_version,
                     hints: left_hints,
@@ -334,6 +337,7 @@ impl SyntaxEq for TableFactor {
                 },
                 Self::Table {
                     name: right_name,
+                    metadata: right_metadata,
                     alias: right_alias,
                     version: right_version,
                     hints: right_hints,
@@ -341,6 +345,7 @@ impl SyntaxEq for TableFactor {
                 },
             ) => {
                 left_name.syntax_eq(right_name)
+                    && syntax_eq_option(left_metadata, right_metadata)
                     && syntax_eq_option(left_alias, right_alias)
                     && syntax_eq_option(left_version, right_version)
                     && syntax_eq_slice(left_hints, right_hints)
@@ -687,7 +692,11 @@ impl SyntaxEq for TupleExpr {
 
 impl SyntaxEq for ArrayExpr {
     fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_slice(&self.elements, &other.elements)
+        match (&self.element_type, &other.element_type) {
+            (Some(left), Some(right)) if !left.syntax_eq(right) => false,
+            (None, None) | (Some(_), Some(_)) => syntax_eq_slice(&self.elements, &other.elements),
+            _ => false,
+        }
     }
 }
 

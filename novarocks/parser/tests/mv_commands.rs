@@ -34,7 +34,10 @@ fn create_materialized_view_preserves_the_embedded_query_slice() {
     else {
         panic!("expected typed CREATE MATERIALIZED VIEW");
     };
-    assert_eq!(create.query.text, "SELECT order_id FROM orders");
+    assert_eq!(
+        novarocks_parser::printer::print_query(&create.query),
+        "SELECT order_id FROM orders"
+    );
     assert_eq!(
         print_statements(&statements),
         "CREATE MATERIALIZED VIEW IF NOT EXISTS analytics.orders_mv COMMENT 'daily' \
@@ -45,7 +48,7 @@ fn create_materialized_view_preserves_the_embedded_query_slice() {
 }
 
 #[test]
-fn materialized_view_query_slice_excludes_outside_trivia_and_semicolon() {
+fn materialized_view_query_is_typed_and_excludes_outside_trivia_and_semicolon() {
     let source = "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH (id) BUCKETS 1 AS \
         /* outside query */ SELECT id /* inside */ FROM orders  /* trailing */ ;";
     let statements = parse(source).expect("CREATE MATERIALIZED VIEW should parse");
@@ -54,7 +57,10 @@ fn materialized_view_query_slice_excludes_outside_trivia_and_semicolon() {
     else {
         panic!("expected typed CREATE MATERIALIZED VIEW");
     };
-    assert_eq!(create.query.text, "SELECT id /* inside */ FROM orders");
+    assert_eq!(
+        novarocks_parser::printer::print_query(&create.query),
+        "SELECT id FROM orders"
+    );
     assert_eq!(
         create.query.span,
         novarocks_parser::Span::new(
@@ -122,15 +128,10 @@ fn mv_command_family_round_trips_through_the_typed_ast() {
 #[test]
 fn mv_visitor_and_folder_reach_the_query_and_nested_names() {
     struct Count {
-        raw_queries: usize,
         identifiers: usize,
     }
 
     impl Visit for Count {
-        fn visit_raw_query_slice(&mut self, _: &novarocks_parser::ast::RawQuerySlice) {
-            self.raw_queries += 1;
-        }
-
         fn visit_ident(&mut self, _: &novarocks_parser::ast::Ident) {
             self.identifiers += 1;
         }
@@ -157,13 +158,9 @@ fn mv_visitor_and_folder_reach_the_query_and_nested_names() {
     .expect("MV should parse")
     .try_into()
     .expect("one statement");
-    let mut count = Count {
-        raw_queries: 0,
-        identifiers: 0,
-    };
+    let mut count = Count { identifiers: 0 };
     count.visit_statement(&statement);
-    assert_eq!(count.raw_queries, 1);
-    assert!(count.identifiers >= 1);
+    assert!(count.identifiers >= 3);
 
     let renamed = Rename.fold_statement(statement);
     assert_eq!(

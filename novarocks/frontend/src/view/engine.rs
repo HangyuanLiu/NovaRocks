@@ -29,13 +29,17 @@ use crate::catalog_application::query_catalog::CatalogServiceSource;
 use crate::common::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use crate::query_execution::kernels::ViewExecutionKernel;
 use crate::runtime::query_result::QueryResult;
+use novarocks_parser::{
+    Span,
+    ast::{
+        Ident, Literal, LiteralKind, ObjectName, Query, StructField, TypeName, TypeNameArgument,
+    },
+};
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
     ConnectorViewRequest, ConnectorViewSourceFormat, CreateOrReplacePolicy, DropPolicy,
 };
-/// Shared StarRocks SQL syntax contract for view DDL, storage, and rewrite.
-pub use novarocks_sql::syntax::StarRocksDialect as ViewSqlDialect;
 
 #[derive(Clone, Copy)]
 pub struct ViewRequestContext<'a> {
@@ -61,7 +65,7 @@ pub struct ViewTarget {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ViewColumnDefinition {
     pub name: String,
-    pub data_type: sqlparser::ast::DataType,
+    pub data_type: TypeName,
     pub nullable: bool,
 }
 
@@ -102,7 +106,7 @@ pub trait ViewService: Send + Sync {
     fn rewrite_query(
         &self,
         engine: &dyn ViewEngine,
-        query: &mut sqlparser::ast::Query,
+        query: &mut Query,
         context: ViewRequestContext<'_>,
     ) -> Result<(), String>;
 
@@ -144,7 +148,7 @@ pub trait ViewEngine: Send + Sync {
         &self,
         catalog: &str,
         database: &str,
-        query: &sqlparser::ast::Query,
+        query: &Query,
         context: &ConnectorRequestContext,
     ) -> Result<Vec<ViewColumnDefinition>, String>;
 }
@@ -165,7 +169,7 @@ impl ViewService for EmptyViewService {
     fn rewrite_query(
         &self,
         _engine: &dyn ViewEngine,
-        _query: &mut sqlparser::ast::Query,
+        _query: &mut Query,
         _context: ViewRequestContext<'_>,
     ) -> Result<(), String> {
         Ok(())
@@ -266,7 +270,9 @@ where
             .map(|column| {
                 let column = novarocks_sql::syntax::TableColumnDef {
                     name: column.name,
-                    data_type: novarocks_sql::syntax::convert_sql_type(column.data_type)?,
+                    data_type: crate::catalog_application::statement::lower_typed_sql_type(
+                        &column.data_type,
+                    )?,
                     nullable: column.nullable,
                     aggregation: None,
                     default: None,
@@ -418,7 +424,7 @@ where
         &self,
         catalog: &str,
         database: &str,
-        query: &sqlparser::ast::Query,
+        query: &Query,
         context: &ConnectorRequestContext,
     ) -> Result<Vec<ViewColumnDefinition>, String> {
         let catalog_service_snapshot =
@@ -438,7 +444,7 @@ where
                 .map(|column| {
                     Ok(ViewColumnDefinition {
                         name: column.name,
-                        data_type: view_sqlparser_data_type(&column.data_type)?,
+                        data_type: view_type_name(&column.data_type)?,
                         nullable: column.nullable,
                     })
                 })
@@ -483,62 +489,88 @@ fn resolved_external_view(
     })
 }
 
-fn view_sqlparser_data_type(
-    data_type: &arrow::datatypes::DataType,
-) -> Result<sqlparser::ast::DataType, String> {
+fn view_type_name(data_type: &arrow::datatypes::DataType) -> Result<TypeName, String> {
     use novarocks_catalog::schema::SqlType;
-    use sqlparser::ast::{
-        ArrayElemTypeDef, DataType, Ident, ObjectName, ObjectNamePart, StructBracketKind,
-        StructField, TimezoneInfo,
-    };
 
-    fn custom(name: &str, modifiers: Vec<String>) -> DataType {
-        DataType::Custom(
-            ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
-            modifiers,
-        )
+    fn span() -> Span {
+        Span::new(0, 0)
     }
 
-    fn convert(data_type: SqlType) -> DataType {
+    fn ident(value: impl Into<String>) -> Ident {
+        Ident {
+            value: value.into(),
+            quoted: false,
+            quote_style: None,
+            span: span(),
+        }
+    }
+
+    fn type_name(name: &str, arguments: Vec<TypeNameArgument>) -> TypeName {
+        TypeName {
+            name: ObjectName {
+                parts: vec![ident(name)],
+                span: span(),
+            },
+            argument_separator_spaces: vec![true; arguments.len().saturating_sub(1)],
+            arguments,
+            span: span(),
+        }
+    }
+
+    fn number(value: impl Into<String>) -> TypeNameArgument {
+        TypeNameArgument::Literal(Literal {
+            kind: LiteralKind::Number(value.into()),
+            span: span(),
+        })
+    }
+
+    fn convert(data_type: SqlType) -> TypeName {
         match data_type {
-            SqlType::TinyInt => DataType::TinyInt(None),
-            SqlType::SmallInt => DataType::SmallInt(None),
-            SqlType::Int => DataType::Int(None),
-            SqlType::BigInt => DataType::BigInt(None),
-            SqlType::LargeInt => custom("LARGEINT", vec![]),
-            SqlType::Float => DataType::Float(sqlparser::ast::ExactNumberInfo::None),
-            SqlType::Double => DataType::Double(sqlparser::ast::ExactNumberInfo::None),
-            SqlType::Decimal { precision, scale } => {
-                custom("DECIMAL128", vec![precision.to_string(), scale.to_string()])
-            }
-            SqlType::String => DataType::String(None),
-            SqlType::Json => DataType::JSON,
-            SqlType::Binary => DataType::Varbinary(None),
-            SqlType::Bitmap => custom("BITMAP", vec![]),
-            SqlType::Hll => custom("HLL", vec![]),
-            SqlType::Boolean => DataType::Boolean,
-            SqlType::Date => DataType::Date,
-            SqlType::DateTime => DataType::Datetime(None),
-            SqlType::DateTimeNs => custom("DATETIME_NS", vec![]),
-            SqlType::Time => DataType::Time(None, TimezoneInfo::None),
+            SqlType::TinyInt => type_name("TINYINT", vec![]),
+            SqlType::SmallInt => type_name("SMALLINT", vec![]),
+            SqlType::Int => type_name("INT", vec![]),
+            SqlType::BigInt => type_name("BIGINT", vec![]),
+            SqlType::LargeInt => type_name("LARGEINT", vec![]),
+            SqlType::Float => type_name("FLOAT", vec![]),
+            SqlType::Double => type_name("DOUBLE", vec![]),
+            SqlType::Decimal { precision, scale } => type_name(
+                "DECIMAL128",
+                vec![number(precision.to_string()), number(scale.to_string())],
+            ),
+            SqlType::String => type_name("STRING", vec![]),
+            SqlType::Json => type_name("JSON", vec![]),
+            SqlType::Binary => type_name("VARBINARY", vec![]),
+            SqlType::Bitmap => type_name("BITMAP", vec![]),
+            SqlType::Hll => type_name("HLL", vec![]),
+            SqlType::Boolean => type_name("BOOLEAN", vec![]),
+            SqlType::Date => type_name("DATE", vec![]),
+            SqlType::DateTime => type_name("DATETIME", vec![]),
+            SqlType::DateTimeNs => type_name("DATETIME_NS", vec![]),
+            SqlType::Time => type_name("TIME", vec![]),
             SqlType::Array(element) => {
-                DataType::Array(ArrayElemTypeDef::AngleBracket(Box::new(convert(*element))))
+                type_name("ARRAY", vec![TypeNameArgument::Type(convert(*element))])
             }
-            SqlType::Map(key, value) => {
-                DataType::Map(Box::new(convert(*key)), Box::new(convert(*value)))
-            }
-            SqlType::Struct(fields) => DataType::Struct(
+            SqlType::Map(key, value) => type_name(
+                "MAP",
+                vec![
+                    TypeNameArgument::Type(convert(*key)),
+                    TypeNameArgument::Type(convert(*value)),
+                ],
+            ),
+            SqlType::Struct(fields) => type_name(
+                "STRUCT",
                 fields
                     .into_iter()
-                    .map(|(name, field_type)| StructField {
-                        field_name: Some(Ident::new(name)),
-                        field_type: convert(field_type),
-                        options: None,
+                    .map(|(name, field_type)| {
+                        TypeNameArgument::Field(StructField {
+                            name: ident(name),
+                            data_type: convert(field_type),
+                            span: span(),
+                        })
                     })
                     .collect(),
-                StructBracketKind::AngleBrackets,
             ),
-            SqlType::Variant => custom("VARIANT", vec![]),
+            SqlType::Variant => type_name("VARIANT", vec![]),
         }
     }
 
@@ -550,9 +582,7 @@ fn view_sqlparser_data_type(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_sql::syntax::StarRocksDialect;
-    use sqlparser::ast as sqlast;
-    use sqlparser::parser::Parser;
+    use novarocks_parser::printer::Printer;
 
     #[derive(Default)]
     struct FakeViewEngine;
@@ -604,19 +634,19 @@ mod tests {
             &self,
             _catalog: &str,
             _database: &str,
-            _query: &sqlast::Query,
+            _query: &Query,
             _context: &ConnectorRequestContext,
         ) -> Result<Vec<ViewColumnDefinition>, String> {
             unreachable!("empty view service must not access the engine")
         }
     }
 
-    fn parse_query(sql: &str) -> Box<sqlast::Query> {
-        let mut parser = Parser::new(&StarRocksDialect).try_with_sql(sql).unwrap();
-        match parser.parse_statement().unwrap() {
-            sqlast::Statement::Query(q) => q,
-            other => panic!("expected query, got {other:?}"),
-        }
+    fn parse_query(sql: &str) -> Query {
+        let statements = novarocks_parser::parse(sql).expect("parse query");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected query");
+        };
+        query.clone()
     }
 
     #[test]
@@ -640,6 +670,9 @@ mod tests {
         );
         let mut query = parse_query("SELECT * FROM t");
         service.rewrite_query(&engine, &mut query, ctx).unwrap();
-        assert_eq!(query.to_string(), "SELECT * FROM t");
+        assert_eq!(
+            Printer::new().statement(&novarocks_parser::ast::Statement::Query(query)),
+            "SELECT * FROM t"
+        );
     }
 }

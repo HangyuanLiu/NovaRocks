@@ -25,6 +25,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::planner::table::TableDef;
 use novarocks_catalog::memory::MemoryCatalogEntry;
+use novarocks_parser::ast::{Query, TableVersion};
+#[cfg(test)]
+use novarocks_parser::ast::{SetExpr, Statement, TableFactor};
 
 pub use crate::catalog::{
     IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable, TableLookupMode,
@@ -224,7 +227,7 @@ impl SqlTimeTravelSnapshotBindingFacts {
 /// validated snapshot-reference facts.  Unknown requested snapshots and refs
 /// fail closed in SQL before Core creates a synthetic table identity.
 pub fn resolve_time_travel_snapshot_binding(
-    version: &sqlparser::ast::TableVersion,
+    version: &TableVersion,
     metadata: &SqlTimeTravelReferenceMetadataFacts,
     fully_qualified_name: &str,
 ) -> Result<SqlTimeTravelSnapshotBindingFacts, String> {
@@ -757,7 +760,7 @@ pub struct ViewOutputColumn {
 /// Analyze a view query using only the immutable table-provider contract.
 /// Catalog application retains the provider and any connector authority.
 pub fn analyze_view_query(
-    query: &sqlparser::ast::Query,
+    query: &Query,
     provider: &dyn PlannerTableProvider,
     database: &str,
 ) -> Result<Vec<ViewOutputColumn>, String> {
@@ -816,18 +819,21 @@ mod tests {
         .into_resolved_table()
     }
 
-    fn parsed_time_travel_clause(sql: &str) -> sqlparser::ast::TableVersion {
-        let statement = crate::syntax::parse_sql_raw(sql).expect("parse time travel");
-        let sqlparser::ast::Statement::Query(query) = statement else {
+    fn parsed_time_travel_clause(sql: &str) -> TableVersion {
+        let mut statements = novarocks_parser::parse(sql).expect("parse time travel");
+        let [statement] = statements.as_mut_slice() else {
+            panic!("expected exactly one statement");
+        };
+        let Statement::Query(query) = statement else {
             panic!("expected query statement");
         };
-        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        let SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select query");
         };
         let Some(table_with_joins) = select.from.first() else {
             panic!("expected FROM relation");
         };
-        let sqlparser::ast::TableFactor::Table {
+        let TableFactor::Table {
             version: Some(version),
             ..
         } = &table_with_joins.relation
@@ -996,7 +1002,7 @@ mod tests {
         let metadata = time_travel_metadata();
 
         let snapshot = resolve_time_travel_snapshot_binding(
-            &parsed_time_travel_clause("SELECT id FROM t VERSION AS OF 10"),
+            &parsed_time_travel_clause("SELECT id FROM t FOR VERSION AS OF 10"),
             &metadata,
             "ice.analytics.t",
         )
@@ -1063,7 +1069,7 @@ mod tests {
     #[test]
     fn time_travel_binding_rejects_unknown_requested_snapshot() {
         let Err(err) = resolve_time_travel_snapshot_binding(
-            &parsed_time_travel_clause("SELECT id FROM t VERSION AS OF 999"),
+            &parsed_time_travel_clause("SELECT id FROM t FOR VERSION AS OF 999"),
             &time_travel_metadata(),
             "ice.analytics.t",
         ) else {

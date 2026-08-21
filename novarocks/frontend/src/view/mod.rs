@@ -28,11 +28,12 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
-use novarocks_parser::ast::{CreateView, ViewStatement};
+use novarocks_parser::{
+    ast::{CreateView, Query, Statement, ViewStatement},
+    printer,
+};
 use novarocks_spi::state_store::StateStore;
 use novarocks_types::SlotId;
-use sqlparser::ast::{Query, Statement};
-use sqlparser::parser::Parser;
 use tokio::runtime::Handle;
 
 pub(crate) mod command;
@@ -43,8 +44,8 @@ mod rewrite;
 
 pub use engine::{
     CreateExternalViewRequest, EmptyViewService, ExternalViewResolution, ResolvedExternalView,
-    ViewColumnDefinition, ViewEngine, ViewRequestContext, ViewService, ViewSqlDialect,
-    ViewStatementResult, ViewTarget,
+    ViewColumnDefinition, ViewEngine, ViewRequestContext, ViewService, ViewStatementResult,
+    ViewTarget,
 };
 
 use repository::{DatabaseMutation, StoredDatabaseViewsV2, ViewRepository};
@@ -220,7 +221,7 @@ impl FrontendViewService {
             return iceberg::create_external_view(engine, target, create_view, context);
         }
         let key = session_view_key(&create_view.name, context.current_database)?;
-        let definition = query_definition(&create_view.query.text, context)?;
+        let definition = query_definition(&printer::print_query(&create_view.query), context)?;
         self.create_session_view(
             key,
             definition.clone(),
@@ -383,11 +384,10 @@ fn append_record_views(
 }
 
 fn parse_query(sql: &str) -> Result<Box<Query>, String> {
-    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
-    let statements = Parser::parse_sql(&ViewSqlDialect, &normalized)
-        .map_err(|error| format!("query parse failed: {error}"))?;
+    let statements =
+        novarocks_parser::parse(sql).map_err(|error| format!("query parse failed: {error}"))?;
     match statements.as_slice() {
-        [Statement::Query(query)] => Ok(query.clone()),
+        [Statement::Query(query)] => Ok(Box::new(query.clone())),
         _ => Err("view SQL must contain exactly one query statement".to_string()),
     }
 }

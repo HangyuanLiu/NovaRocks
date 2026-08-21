@@ -18,11 +18,12 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::view::{
-    ExternalViewResolution, ResolvedExternalView, ViewEngine, ViewRequestContext, ViewSqlDialect,
-    ViewTarget,
+    ExternalViewResolution, ResolvedExternalView, ViewEngine, ViewRequestContext, ViewTarget,
 };
-use sqlparser::ast as sqlast;
-use sqlparser::parser::Parser;
+use novarocks_parser::{
+    Span,
+    ast::{Ident, ObjectName, Query, SetExpr, Statement, TableAlias, TableFactor},
+};
 
 use super::iceberg::resolve_external_target_parts;
 use super::{DEFAULT_CATALOG, SessionViewKey, StoredView};
@@ -30,7 +31,7 @@ use super::{DEFAULT_CATALOG, SessionViewKey, StoredView};
 type ExternalViewKey = (String, String, String);
 
 pub(super) fn expand_session_views(
-    query: &mut sqlast::Query,
+    query: &mut Query,
     registry: &HashMap<SessionViewKey, StoredView>,
     current_database: &str,
 ) {
@@ -41,7 +42,7 @@ pub(super) fn expand_session_views(
 }
 
 fn expand_session_query(
-    query: &mut sqlast::Query,
+    query: &mut Query,
     registry: &HashMap<SessionViewKey, StoredView>,
     current_database: &str,
     visible_ctes: &HashSet<String>,
@@ -49,8 +50,8 @@ fn expand_session_query(
     let mut body_visible_ctes = visible_ctes.clone();
     if let Some(with_clause) = query.with.as_mut() {
         let recursive = with_clause.recursive;
-        for cte in &mut with_clause.cte_tables {
-            let name = cte.alias.name.value.to_ascii_lowercase();
+        for cte in &mut with_clause.ctes {
+            let name = cte.name.value.to_ascii_lowercase();
             let mut cte_visible_ctes = body_visible_ctes.clone();
             if recursive {
                 cte_visible_ctes.insert(name.clone());
@@ -73,13 +74,13 @@ fn expand_session_query(
 }
 
 fn expand_session_set_expr(
-    expression: &mut sqlast::SetExpr,
+    expression: &mut SetExpr,
     registry: &HashMap<SessionViewKey, StoredView>,
     current_database: &str,
     cte_names: &HashSet<String>,
 ) {
     match expression {
-        sqlast::SetExpr::Select(select) => {
+        SetExpr::Select(select) => {
             for table_with_joins in &mut select.from {
                 expand_session_table_factor(
                     &mut table_with_joins.relation,
@@ -97,25 +98,37 @@ fn expand_session_set_expr(
                 }
             }
         }
-        sqlast::SetExpr::Query(query) => {
+        SetExpr::Query(query) => {
             expand_session_query(query.as_mut(), registry, current_database, cte_names)
         }
-        sqlast::SetExpr::SetOperation { left, right, .. } => {
-            expand_session_set_expr(left.as_mut(), registry, current_database, cte_names);
-            expand_session_set_expr(right.as_mut(), registry, current_database, cte_names);
+        SetExpr::SetOperation(operation) => {
+            expand_session_set_expr(
+                operation.left.as_mut(),
+                registry,
+                current_database,
+                cte_names,
+            );
+            expand_session_set_expr(
+                operation.right.as_mut(),
+                registry,
+                current_database,
+                cte_names,
+            );
         }
         _ => {}
     }
 }
 
 fn expand_session_table_factor(
-    factor: &mut sqlast::TableFactor,
+    factor: &mut TableFactor,
     registry: &HashMap<SessionViewKey, StoredView>,
     current_database: &str,
     cte_names: &HashSet<String>,
 ) {
     match factor {
-        sqlast::TableFactor::Table { name, alias, .. } => {
+        TableFactor::Table {
+            name, alias, span, ..
+        } => {
             let parts = object_name_parts(name);
             if parts.len() == 1 && cte_names.contains(&parts[0].to_ascii_lowercase()) {
                 return;
@@ -141,22 +154,27 @@ fn expand_session_table_factor(
                 &stored.definition.resolution.default_database,
                 &HashSet::new(),
             );
-            let alias = alias.take().unwrap_or_else(|| sqlast::TableAlias {
-                name: sqlast::Ident::new(parts.last().cloned().unwrap_or_else(|| key.view.clone())),
+            let alias = alias.take().unwrap_or_else(|| TableAlias {
+                name: synthetic_ident(
+                    parts.last().cloned().unwrap_or_else(|| key.view.clone()),
+                    *span,
+                ),
                 columns: Vec::new(),
-                explicit: false,
+                explicit_as: false,
+                span: *span,
             });
-            *factor = sqlast::TableFactor::Derived {
+            *factor = TableFactor::Derived {
                 lateral: false,
                 subquery: Box::new(expanded),
+                hints: Vec::new(),
                 alias: Some(alias),
-                sample: None,
+                span: *span,
             };
         }
-        sqlast::TableFactor::Derived { subquery, .. } => {
+        TableFactor::Derived { subquery, .. } => {
             expand_session_query(subquery.as_mut(), registry, current_database, cte_names);
         }
-        sqlast::TableFactor::NestedJoin {
+        TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
             expand_session_table_factor(
@@ -188,7 +206,7 @@ fn session_key(catalog: &str, database: &str, view: &str) -> SessionViewKey {
 
 pub(super) fn expand_external_views(
     engine: &dyn ViewEngine,
-    query: &mut sqlast::Query,
+    query: &mut Query,
     context: ViewRequestContext<'_>,
 ) -> Result<(), String> {
     let mut stack = Vec::new();
@@ -197,7 +215,7 @@ pub(super) fn expand_external_views(
 
 fn expand_external_query(
     engine: &dyn ViewEngine,
-    query: &mut sqlast::Query,
+    query: &mut Query,
     context: ViewRequestContext<'_>,
     visible_ctes: &HashSet<String>,
     stack: &mut Vec<ExternalViewKey>,
@@ -205,8 +223,8 @@ fn expand_external_query(
     let mut body_visible_ctes = visible_ctes.clone();
     if let Some(with_clause) = query.with.as_mut() {
         let recursive = with_clause.recursive;
-        for cte in &mut with_clause.cte_tables {
-            let name = cte.alias.name.value.to_ascii_lowercase();
+        for cte in &mut with_clause.ctes {
+            let name = cte.name.value.to_ascii_lowercase();
             let mut cte_visible_ctes = body_visible_ctes.clone();
             if recursive {
                 cte_visible_ctes.insert(name.clone());
@@ -232,13 +250,13 @@ fn expand_external_query(
 
 fn expand_external_set_expr(
     engine: &dyn ViewEngine,
-    expression: &mut sqlast::SetExpr,
+    expression: &mut SetExpr,
     context: ViewRequestContext<'_>,
     cte_names: &HashSet<String>,
     stack: &mut Vec<ExternalViewKey>,
 ) -> Result<(), String> {
     match expression {
-        sqlast::SetExpr::Select(select) => {
+        SetExpr::Select(select) => {
             for table_with_joins in &mut select.from {
                 expand_external_table_factor(
                     engine,
@@ -259,12 +277,12 @@ fn expand_external_set_expr(
             }
             Ok(())
         }
-        sqlast::SetExpr::Query(query) => {
+        SetExpr::Query(query) => {
             expand_external_query(engine, query.as_mut(), context, cte_names, stack)
         }
-        sqlast::SetExpr::SetOperation { left, right, .. } => {
-            expand_external_set_expr(engine, left.as_mut(), context, cte_names, stack)?;
-            expand_external_set_expr(engine, right.as_mut(), context, cte_names, stack)
+        SetExpr::SetOperation(operation) => {
+            expand_external_set_expr(engine, operation.left.as_mut(), context, cte_names, stack)?;
+            expand_external_set_expr(engine, operation.right.as_mut(), context, cte_names, stack)
         }
         _ => Ok(()),
     }
@@ -272,13 +290,15 @@ fn expand_external_set_expr(
 
 fn expand_external_table_factor(
     engine: &dyn ViewEngine,
-    factor: &mut sqlast::TableFactor,
+    factor: &mut TableFactor,
     context: ViewRequestContext<'_>,
     cte_names: &HashSet<String>,
     stack: &mut Vec<ExternalViewKey>,
 ) -> Result<(), String> {
     match factor {
-        sqlast::TableFactor::Table { name, alias, .. } => {
+        TableFactor::Table {
+            name, alias, span, ..
+        } => {
             let parts = object_name_parts(name);
             if parts.len() == 1 && cte_names.contains(&parts[0].to_ascii_lowercase()) {
                 return Ok(());
@@ -331,23 +351,25 @@ fn expand_external_table_factor(
             )?;
             stack.pop();
 
-            let alias = alias.take().unwrap_or_else(|| sqlast::TableAlias {
-                name: sqlast::Ident::new(parts.last().cloned().unwrap_or_default()),
+            let alias = alias.take().unwrap_or_else(|| TableAlias {
+                name: synthetic_ident(parts.last().cloned().unwrap_or_default(), *span),
                 columns: Vec::new(),
-                explicit: false,
+                explicit_as: false,
+                span: *span,
             });
-            *factor = sqlast::TableFactor::Derived {
+            *factor = TableFactor::Derived {
                 lateral: false,
                 subquery: Box::new(body),
+                hints: Vec::new(),
                 alias: Some(alias),
-                sample: None,
+                span: *span,
             };
             Ok(())
         }
-        sqlast::TableFactor::Derived { subquery, .. } => {
+        TableFactor::Derived { subquery, .. } => {
             expand_external_query(engine, subquery.as_mut(), context, cte_names, stack)
         }
-        sqlast::TableFactor::NestedJoin {
+        TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
             expand_external_table_factor(
@@ -385,22 +407,16 @@ fn external_rewrite_candidate(
 fn parse_external_view_sql(
     view: &ResolvedExternalView,
     key: &ExternalViewKey,
-) -> Result<sqlast::Query, String> {
-    let mut parser = Parser::new(&ViewSqlDialect)
-        .try_with_sql(&novarocks_sql::syntax::normalize_for_raw_parse(
-            &view.definition.raw_query_source,
-        )?)
+) -> Result<Query, String> {
+    let statements = novarocks_parser::parse(&view.definition.raw_query_source)
         .map_err(|error| external_view_parse_error(key, "starrocks", &error.to_string()))?;
-    let statement = parser
-        .parse_statement()
-        .map_err(|error| external_view_parse_error(key, "starrocks", &error.to_string()))?;
-    let sqlast::Statement::Query(query) = statement else {
+    let [Statement::Query(query)] = statements.as_slice() else {
         return Err(format!(
             "iceberg view {}.{}.{} body is not a SELECT query",
             key.0, key.1, key.2
         ));
     };
-    Ok(*query)
+    Ok(query.clone())
 }
 
 fn external_view_parse_error(key: &ExternalViewKey, dialect: &str, error: &str) -> String {
@@ -410,12 +426,12 @@ fn external_view_parse_error(key: &ExternalViewKey, dialect: &str, error: &str) 
     )
 }
 
-fn qualify_view_body_names(query: &mut sqlast::Query, catalog: &str, default_database: &str) {
+fn qualify_view_body_names(query: &mut Query, catalog: &str, default_database: &str) {
     qualify_view_body_query(query, catalog, default_database, &HashSet::new());
 }
 
 fn qualify_view_body_query(
-    query: &mut sqlast::Query,
+    query: &mut Query,
     catalog: &str,
     default_database: &str,
     visible_ctes: &HashSet<String>,
@@ -423,8 +439,8 @@ fn qualify_view_body_query(
     let mut body_visible_ctes = visible_ctes.clone();
     if let Some(with_clause) = query.with.as_mut() {
         let recursive = with_clause.recursive;
-        for cte in &mut with_clause.cte_tables {
-            let name = cte.alias.name.value.to_ascii_lowercase();
+        for cte in &mut with_clause.ctes {
+            let name = cte.name.value.to_ascii_lowercase();
             let mut cte_visible_ctes = body_visible_ctes.clone();
             if recursive {
                 cte_visible_ctes.insert(name.clone());
@@ -447,13 +463,13 @@ fn qualify_view_body_query(
 }
 
 fn qualify_set_expr(
-    expression: &mut sqlast::SetExpr,
+    expression: &mut SetExpr,
     catalog: &str,
     default_database: &str,
     cte_names: &HashSet<String>,
 ) {
     match expression {
-        sqlast::SetExpr::Select(select) => {
+        SetExpr::Select(select) => {
             for table_with_joins in &mut select.from {
                 qualify_table_factor(
                     &mut table_with_joins.relation,
@@ -466,57 +482,60 @@ fn qualify_set_expr(
                 }
             }
         }
-        sqlast::SetExpr::Query(query) => {
+        SetExpr::Query(query) => {
             qualify_view_body_query(query.as_mut(), catalog, default_database, cte_names)
         }
-        sqlast::SetExpr::SetOperation { left, right, .. } => {
-            qualify_set_expr(left.as_mut(), catalog, default_database, cte_names);
-            qualify_set_expr(right.as_mut(), catalog, default_database, cte_names);
+        SetExpr::SetOperation(operation) => {
+            qualify_set_expr(
+                operation.left.as_mut(),
+                catalog,
+                default_database,
+                cte_names,
+            );
+            qualify_set_expr(
+                operation.right.as_mut(),
+                catalog,
+                default_database,
+                cte_names,
+            );
         }
         _ => {}
     }
 }
 
 fn qualify_table_factor(
-    factor: &mut sqlast::TableFactor,
+    factor: &mut TableFactor,
     catalog: &str,
     default_database: &str,
     cte_names: &HashSet<String>,
 ) {
     match factor {
-        sqlast::TableFactor::Table { name, .. } => {
-            let identifier_count = name
-                .0
-                .iter()
-                .filter(|part| matches!(part, sqlast::ObjectNamePart::Identifier(_)))
-                .count();
+        TableFactor::Table { name, .. } => {
+            let identifier_count = name.parts.len();
             match identifier_count {
                 1 => {
-                    if let Some(sqlast::ObjectNamePart::Identifier(table)) = name.0.first()
+                    if let Some(table) = name.parts.first()
                         && cte_names.contains(&table.value.to_ascii_lowercase())
                     {
                         return;
                     }
                     let mut parts = vec![
-                        sqlast::ObjectNamePart::Identifier(sqlast::Ident::new(catalog)),
-                        sqlast::ObjectNamePart::Identifier(sqlast::Ident::new(default_database)),
+                        synthetic_ident(catalog, name.span),
+                        synthetic_ident(default_database, name.span),
                     ];
-                    parts.append(&mut name.0);
-                    name.0 = parts;
+                    parts.append(&mut name.parts);
+                    name.parts = parts;
                 }
                 2 => {
-                    name.0.insert(
-                        0,
-                        sqlast::ObjectNamePart::Identifier(sqlast::Ident::new(catalog)),
-                    );
+                    name.parts.insert(0, synthetic_ident(catalog, name.span));
                 }
                 _ => {}
             }
         }
-        sqlast::TableFactor::Derived { subquery, .. } => {
+        TableFactor::Derived { subquery, .. } => {
             qualify_view_body_query(subquery.as_mut(), catalog, default_database, cte_names);
         }
-        sqlast::TableFactor::NestedJoin {
+        TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
             qualify_table_factor(
@@ -533,12 +552,18 @@ fn qualify_table_factor(
     }
 }
 
-fn object_name_parts(name: &sqlast::ObjectName) -> Vec<String> {
-    name.0
+fn object_name_parts(name: &ObjectName) -> Vec<String> {
+    name.parts
         .iter()
-        .filter_map(|part| match part {
-            sqlast::ObjectNamePart::Identifier(identifier) => Some(identifier.value.clone()),
-            _ => None,
-        })
+        .map(|identifier| identifier.value.clone())
         .collect()
+}
+
+fn synthetic_ident(value: impl Into<String>, span: Span) -> Ident {
+    Ident {
+        value: value.into(),
+        quoted: false,
+        quote_style: None,
+        span,
+    }
 }

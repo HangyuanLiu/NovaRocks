@@ -301,7 +301,7 @@ impl MvRefreshPublishedFacts {
 /// reconstruction stay at this application boundary.
 pub(crate) struct MvFirstRefreshLogicalContext {
     pub(crate) mv_definition: crate::mv::domain::persistence::definition::StoredMvDefinition,
-    pub(crate) canonical_select_query: sqlparser::ast::Query,
+    pub(crate) canonical_select_query: novarocks_parser::ast::Query,
     pub(crate) base_refs: Vec<novarocks_catalog::identifier::TableIdentity>,
     pub(crate) pin: SqlMvSnapshotPin,
     pub(crate) previous_snapshot_ids: BTreeMap<String, i64>,

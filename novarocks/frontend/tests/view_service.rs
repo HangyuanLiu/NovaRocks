@@ -28,9 +28,13 @@ use novarocks_frontend::common::persisted_query_definition::{
 };
 use novarocks_frontend::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
-    ViewEngine, ViewRequestContext, ViewService, ViewSqlDialect, ViewStatementResult, ViewTarget,
+    ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
 };
-use novarocks_parser::ast::Statement as ParsedStatement;
+use novarocks_parser::{
+    Span,
+    ast::{Ident, ObjectName, Query, SetExpr, Statement as ParsedStatement, TypeName},
+    printer::print_query,
+};
 use novarocks_spi::{
     connector::{ConnectorCancellation, ConnectorRequestContext},
     state_store::{FeDeploymentView, StateStore},
@@ -197,15 +201,28 @@ impl ViewEngine for FakeViewEngine {
         self.analyzed_queries
             .lock()
             .unwrap()
-            .push(query.to_string());
+            .push(print_query(query));
         let width = match query.body.as_ref() {
-            sqlparser::ast::SetExpr::Select(select) => select.projection.len(),
+            SetExpr::Select(select) => select.projection.len(),
             _ => 1,
         };
         Ok((0..width)
             .map(|index| ViewColumnDefinition {
                 name: format!("c{}", index + 1),
-                data_type: DataType::BigInt(None),
+                data_type: TypeName {
+                    name: ObjectName {
+                        parts: vec![Ident {
+                            value: "BIGINT".to_owned(),
+                            quoted: false,
+                            quote_style: None,
+                            span: Span::new(0, 0),
+                        }],
+                        span: Span::new(0, 0),
+                    },
+                    arguments: Vec::new(),
+                    argument_separator_spaces: Vec::new(),
+                    span: Span::new(0, 0),
+                },
                 nullable: false,
             })
             .collect())
@@ -266,11 +283,11 @@ impl ViewServiceTestExt for FrontendViewService {
 }
 
 fn parse_query(sql: &str) -> Query {
-    let mut parser = Parser::new(&ViewSqlDialect).try_with_sql(sql).unwrap();
-    let Statement::Query(query) = parser.parse_statement().unwrap() else {
-        panic!("expected query");
+    let statements = novarocks_parser::parse(sql).expect("parse typed query");
+    let [ParsedStatement::Query(query)] = statements.as_slice() else {
+        panic!("expected typed query");
     };
-    *query
+    query.clone()
 }
 
 fn query_result(
@@ -385,7 +402,7 @@ async fn session_view_ddl_show_and_rewrite_preserve_existing_behavior() {
     let mut query = parse_query("SELECT x.a FROM v1 AS x");
     service.rewrite_query(&engine, &mut query, ctx).unwrap();
     assert_eq!(
-        query.to_string(),
+        print_query(&query),
         "SELECT x.a FROM (SELECT * FROM (SELECT 2 AS a) v2) AS x"
     );
 
@@ -394,14 +411,14 @@ async fn session_view_ddl_show_and_rewrite_preserve_existing_behavior() {
         .unwrap();
     let mut replaced = parse_query("SELECT * FROM v1");
     service.rewrite_query(&engine, &mut replaced, ctx).unwrap();
-    assert_eq!(replaced.to_string(), "SELECT * FROM (SELECT 3 AS a) v1");
+    assert_eq!(print_query(&replaced), "SELECT * FROM (SELECT 3 AS a) v1");
 
     service
         .try_handle_statement(&engine, "DROP VIEW v1", ctx)
         .unwrap();
     let mut dropped = parse_query("SELECT * FROM v1");
     service.rewrite_query(&engine, &mut dropped, ctx).unwrap();
-    assert_eq!(dropped.to_string(), "SELECT * FROM v1");
+    assert_eq!(print_query(&dropped), "SELECT * FROM v1");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -422,7 +439,7 @@ async fn default_catalog_one_two_and_three_part_names_share_session_registry() {
     service
         .rewrite_query(&engine, &mut two_part, context(None, "other"))
         .unwrap();
-    assert_eq!(two_part.to_string(), "SELECT * FROM (SELECT 1 AS a) v");
+    assert_eq!(print_query(&two_part), "SELECT * FROM (SELECT 1 AS a) v");
 
     service
         .try_handle_statement(
@@ -439,7 +456,10 @@ async fn default_catalog_one_two_and_three_part_names_share_session_registry() {
             context(Some("default_catalog"), "db"),
         )
         .unwrap();
-    assert_eq!(one_part.to_string(), "SELECT * FROM (SELECT 2 AS a) local");
+    assert_eq!(
+        print_query(&one_part),
+        "SELECT * FROM (SELECT 2 AS a) local"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -462,7 +482,7 @@ async fn session_view_rewrite_uses_its_frozen_creation_database() {
         .rewrite_query(&engine, &mut query, context(None, "other"))
         .unwrap();
     assert_eq!(
-        query.to_string(),
+        print_query(&query),
         "SELECT * FROM (SELECT * FROM default_catalog.caller.base) v"
     );
 }
@@ -501,10 +521,7 @@ async fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
     let created = engine.created.lock().unwrap();
     assert_eq!(created[0].target.catalog, "ice");
     assert_eq!(created[0].target.database, "db");
-    assert_eq!(
-        created[0].definition.raw_query_source,
-        "SELECT /* preserve */ 1,\n  2"
-    );
+    assert_eq!(created[0].definition.raw_query_source, "SELECT 1, 2");
     assert_eq!(
         created[0].definition.resolution.default_catalog, "ice",
         "external view must freeze its creation catalog"
@@ -652,14 +669,14 @@ async fn rewrite_is_session_first_and_preserves_external_resolution_rules() {
     service
         .rewrite_query(&engine, &mut local, context(Some("ice"), "db"))
         .unwrap();
-    assert_eq!(local.to_string(), "SELECT * FROM (SELECT 7 AS a) local");
+    assert_eq!(print_query(&local), "SELECT * FROM (SELECT 7 AS a) local");
 
     let mut nested = parse_query("SELECT * FROM nested");
     service
         .rewrite_query(&engine, &mut nested, context(Some("ice"), "db"))
         .unwrap();
     assert_eq!(
-        nested.to_string(),
+        print_query(&nested),
         "SELECT * FROM (SELECT * FROM (SELECT 1 AS a) base) nested"
     );
 
@@ -668,7 +685,7 @@ async fn rewrite_is_session_first_and_preserves_external_resolution_rules() {
         .rewrite_query(&engine, &mut cte, context(Some("ice"), "db"))
         .unwrap();
     assert_eq!(
-        cte.to_string(),
+        print_query(&cte),
         "WITH nested AS (SELECT 3 AS a) SELECT * FROM nested"
     );
 }
@@ -692,7 +709,7 @@ async fn session_cte_shadows_a_same_named_session_view() {
         .rewrite_query(&engine, &mut query, context(None, "db"))
         .unwrap();
     assert_eq!(
-        query.to_string(),
+        print_query(&query),
         "WITH nested AS (SELECT 3 AS a) SELECT * FROM nested"
     );
 }
@@ -724,11 +741,11 @@ async fn session_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
          ) SELECT * FROM nested",
     ] {
         let mut query = parse_query(sql);
-        let expected = query.to_string();
+        let expected = print_query(&query);
         service
             .rewrite_query(&engine, &mut query, context(None, "db"))
             .unwrap();
-        assert_eq!(query.to_string(), expected, "input: {sql}");
+        assert_eq!(print_query(&query), expected, "input: {sql}");
     }
 }
 
@@ -761,11 +778,11 @@ async fn external_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
          ) SELECT * FROM nested",
     ] {
         let mut query = parse_query(sql);
-        let expected = query.to_string();
+        let expected = print_query(&query);
         service
             .rewrite_query(&engine, &mut query, context(Some("ice"), "db"))
             .unwrap();
-        assert_eq!(query.to_string(), expected, "input: {sql}");
+        assert_eq!(print_query(&query), expected, "input: {sql}");
     }
 }
 
@@ -790,7 +807,7 @@ async fn external_view_qualification_preserves_ctes_inside_nested_queries() {
     service
         .rewrite_query(&engine, &mut query, context(Some("ice"), "db"))
         .unwrap();
-    let rendered = query.to_string();
+    let rendered = print_query(&query);
     assert!(!rendered.contains("ice.db.nested"), "got: {rendered}");
     assert!(rendered.contains("FROM nested"), "got: {rendered}");
 }
@@ -843,8 +860,8 @@ async fn spi5b_rewrite_resolves_table_view_and_admission_failure_with_one_contro
         .rewrite_query(&engine, &mut unchanged, context(Some("ice"), "db"))
         .unwrap();
     assert_eq!(
-        unchanged.to_string(),
-        "SELECT * FROM table_wins JOIN probe_failed ON true"
+        print_query(&unchanged),
+        "SELECT * FROM table_wins JOIN probe_failed ON TRUE"
     );
 
     let mut cycle = parse_query("SELECT * FROM cycle_a");
@@ -920,7 +937,7 @@ async fn configured_service_restores_durable_views_and_never_publishes_failed_re
     service
         .rewrite_query(&engine, &mut unchanged, context(None, "db"))
         .unwrap();
-    assert_eq!(unchanged.to_string(), "SELECT * FROM (SELECT 1 AS a) v");
+    assert_eq!(print_query(&unchanged), "SELECT * FROM (SELECT 1 AS a) v");
     drop(service);
 
     let reopened = FrontendViewService::open(Some(store), tokio::runtime::Handle::current())
@@ -930,7 +947,7 @@ async fn configured_service_restores_durable_views_and_never_publishes_failed_re
     reopened
         .rewrite_query(&engine, &mut restored, context(None, "db"))
         .unwrap();
-    assert_eq!(restored.to_string(), "SELECT * FROM (SELECT 1 AS a) v");
+    assert_eq!(print_query(&restored), "SELECT * FROM (SELECT 1 AS a) v");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -961,7 +978,7 @@ async fn starrocks_view_sql_uses_the_same_parser_before_and_after_restart() {
     reopened
         .rewrite_query(&engine, &mut query, context(None, "db"))
         .unwrap();
-    let rendered = query.to_string();
+    let rendered = print_query(&query);
     assert!(
         rendered.contains("first_value(a IGNORE NULLS) OVER ()"),
         "got: {rendered}"
@@ -980,7 +997,7 @@ async fn starrocks_view_sql_uses_the_same_parser_before_and_after_restart() {
     reopened
         .rewrite_query(&engine, &mut external, context(Some("ice"), "db"))
         .unwrap();
-    let rendered = external.to_string();
+    let rendered = print_query(&external);
     assert!(
         rendered.contains("first_value(a IGNORE NULLS) OVER ()"),
         "got: {rendered}"

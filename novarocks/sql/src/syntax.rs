@@ -1,55 +1,54 @@
 //! Narrow SQL syntax handoff for application admission.
 //!
-//! Frontend and application services may normalize or parse an admitted
-//! statement through this vocabulary. Parser state and implementation modules
-//! stay private; the custom statement carriers below are the only exposed DDL
-//! syntax surface.
+//! Frontend and application services consume typed parser values through this
+//! vocabulary. SQL-owned semantic value carriers stay private to this crate.
 
-pub use super::parser::{normalize_for_raw_parse, parse_normalized_sql_raw};
 pub use crate::legacy_mv_ast::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
     DropMaterializedViewStmt, MaterializedViewDistribution, MaterializedViewRefreshPolicy,
     RefreshMaterializedViewStmt, ShowMaterializedViewsStmt,
 };
-pub use crate::parser::ast::{
+pub use crate::syntax_ast::{
     AlterIcebergPartitionSpecStmt, ColumnAggregation, CreateTableKind, CreateTableStmt,
     DefaultLiteral, IcebergPartitionFieldExpr, Literal, ObjectName, TableColumnDef, TableKeyDesc,
     TableKeyKind,
 };
-pub use crate::parser::dialect::StarRocksDialect;
-
-pub use crate::parser::dialect::substitute_user_variables;
-
-pub fn parse_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
-    crate::parser::parse_sql_raw(sql)
-}
 
 /// Return every three-part table reference in one admitted SELECT statement.
 ///
-/// Raw sqlparser nodes remain inside the SQL crate; callers receive only the
+/// Native typed nodes remain inside the SQL crate; callers receive only the
 /// normalized `(catalog, namespace, table)` facts they need for admission.
 pub fn three_part_table_ref_occurrences(
     sql: &str,
 ) -> Result<Vec<(String, String, String)>, String> {
-    let statement = crate::parser::parse_sql_raw(sql)?;
-    let sqlparser::ast::Statement::Query(query) = statement else {
+    let statements = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
+    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
         return Err("three-part table reference extraction requires a SELECT query".to_string());
     };
-    Ok(crate::parser::query_refs::extract_three_part_table_ref_occurrences(&query))
+    Ok(crate::parser::query_refs::extract_three_part_table_ref_occurrences(query))
 }
 
-pub fn extract_allow_throw_exception_hint(sql: &str) -> bool {
-    crate::parser::set_var_hint::extract_allow_throw_exception(sql)
-}
+pub fn extract_allow_throw_exception_hint(query: &novarocks_parser::ast::Query) -> bool {
+    use novarocks_parser::ast::{BinaryOperator, Expr, LiteralKind, SelectHintValue, SetExpr};
 
-pub fn convert_object_name(name: sqlparser::ast::ObjectName) -> Result<ObjectName, String> {
-    crate::parser::dialect::convert_object_name(name)
-}
-
-pub fn convert_sql_type(
-    data_type: sqlparser::ast::DataType,
-) -> Result<novarocks_catalog::schema::SqlType, String> {
-    crate::parser::dialect::convert_sql_type(data_type)
+    let mut body = query.body.as_ref();
+    while let SetExpr::Query(nested) = body {
+        body = nested.body.as_ref();
+    }
+    let SetExpr::Select(select) = body else {
+        return false;
+    };
+    select.hints.iter().any(|hint| {
+        hint.name.value.eq_ignore_ascii_case("set_var")
+            && matches!(&hint.value, SelectHintValue::Call { arguments } if arguments.iter().any(|argument| {
+                matches!(argument,
+                    Expr::Binary(binary)
+                        if binary.operator == BinaryOperator::Equal
+                            && matches!(binary.left.as_ref(), Expr::Identifier(name) if name.value.eq_ignore_ascii_case("sql_mode"))
+                            && matches!(binary.right.as_ref(), Expr::Literal(literal) if matches!(&literal.kind, LiteralKind::String(value) if value.to_ascii_lowercase().contains("allow_throw_exception")))
+                )
+            }))
+    })
 }
 
 pub fn literal_from_batch(
@@ -145,13 +144,16 @@ pub fn parse_datetime_string_to_micros(value: &str) -> Result<i64, String> {
     crate::literal::parse_datetime_string_to_micros(value)
 }
 
-pub fn sqlparser_expr_to_literal(expr: &sqlparser::ast::Expr) -> Result<Literal, String> {
-    crate::literal::sqlparser_expr_to_literal(expr)
+pub fn expr_to_literal(expr: &novarocks_parser::ast::Expr) -> Result<Literal, String> {
+    crate::literal::expr_to_literal(expr)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{arrow_type_equals_ignoring_metadata, sql_type_to_arrow_type};
+    use super::{
+        arrow_type_equals_ignoring_metadata, extract_allow_throw_exception_hint,
+        sql_type_to_arrow_type,
+    };
 
     #[test]
     fn syntax_value_helpers_keep_sql_type_conversion_and_metadata_tolerant_shape_equality() {
@@ -170,5 +172,16 @@ mod tests {
             &DataType::Utf8,
             &DataType::Int64
         ));
+    }
+
+    #[test]
+    fn allow_throw_exception_uses_typed_set_var_hints() {
+        let mut statements =
+            novarocks_parser::parse("SELECT /*+ SET_VAR(sql_mode = 'ALLOW_THROW_EXCEPTION') */ 1")
+                .expect("typed hint fixture parses");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_mut_slice() else {
+            panic!("expected query");
+        };
+        assert!(extract_allow_throw_exception_hint(query));
     }
 }

@@ -276,7 +276,7 @@ pub fn analyze_mv_select_with_provider(
     current_catalog: Option<&str>,
     provider: &dyn novarocks_sql::planning::catalog::PlannerTableProvider,
     current_database: &str,
-    query: &sqlparser::ast::Query,
+    query: &novarocks_parser::ast::Query,
 ) -> Result<MvAnalysis, String> {
     let prepared =
         prepare_mv_select_for_catalog_provider(query, current_catalog, current_database)?;

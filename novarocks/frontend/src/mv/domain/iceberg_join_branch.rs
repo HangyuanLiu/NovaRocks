@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_parser::{Span, ast};
 use novarocks_sql::planning::mv::MV_JOIN_APPLY_KEY_COLUMN_NAME;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,13 +111,13 @@ pub fn plan_join_delta_branches(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 pub(crate) fn rewrite_join_branch_query(
-    query: &sqlparser::ast::Query,
+    query: &ast::Query,
     plan: &JoinDeltaBranchPlan,
     left_alias: &str,
     right_alias: &str,
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<ast::Query, String> {
     let mut query = query.clone();
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+    let ast::SetExpr::Select(select) = query.body.as_mut() else {
         return Err("join branch rewrite requires SELECT body".to_string());
     };
     let [from] = select.from.as_mut_slice() else {
@@ -142,13 +143,13 @@ pub(crate) fn rewrite_join_branch_query(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 pub(crate) fn rewrite_join_delta_coalesce_query(
-    query: &sqlparser::ast::Query,
+    query: &ast::Query,
     branches: &[JoinDeltaBranchPlan],
     left_alias: &str,
     right_alias: &str,
     left_uuid: &str,
     right_uuid: &str,
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<ast::Query, String> {
     if branches.is_empty() {
         return Err("join delta coalesce rewrite requires at least one branch".to_string());
     }
@@ -174,11 +175,11 @@ pub(crate) fn rewrite_join_delta_coalesce_query(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries(
-    query: &sqlparser::ast::Query,
-    branch_queries: Vec<sqlparser::ast::Query>,
+    query: &ast::Query,
+    branch_queries: Vec<ast::Query>,
     left_uuid: &str,
     right_uuid: &str,
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<ast::Query, String> {
     rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
         query,
         branch_queries,
@@ -193,12 +194,12 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
-    query: &sqlparser::ast::Query,
-    branch_queries: Vec<sqlparser::ast::Query>,
+    query: &ast::Query,
+    branch_queries: Vec<ast::Query>,
     left_uuid: &str,
     right_uuid: &str,
     target_locator_relation: &str,
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<ast::Query, String> {
     if branch_queries.is_empty() {
         return Err("join delta coalesce rewrite requires at least one branch".to_string());
     }
@@ -289,11 +290,11 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 pub(crate) fn rewrite_join_delta_append_only_query(
-    query: &sqlparser::ast::Query,
-    branch_query: sqlparser::ast::Query,
+    query: &ast::Query,
+    branch_query: ast::Query,
     left_uuid: &str,
     right_uuid: &str,
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<ast::Query, String> {
     wrap_join_apply_key_query(
         query,
         branch_query,
@@ -309,17 +310,20 @@ pub(crate) fn rewrite_join_delta_append_only_query(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn wrap_join_apply_key_query(
-    query: &sqlparser::ast::Query,
-    source_query: sqlparser::ast::Query,
+    query: &ast::Query,
+    source_query: ast::Query,
     left_uuid: &str,
     right_uuid: &str,
     source_alias: &str,
     placeholder_name: &str,
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<ast::Query, String> {
     let payload_columns = payload_projection_columns(query)?;
     let mut items = payload_columns
         .iter()
-        .map(|ident| format!("{ident} AS {ident}"))
+        .map(|ident| {
+            let rendered = render_ident(ident);
+            format!("{rendered} AS {rendered}")
+        })
         .collect::<Vec<_>>();
     items.push(format!(
         "join_row_key({}, {}, {}, {}) AS {}",
@@ -340,13 +344,13 @@ fn wrap_join_apply_key_query(
     );
     let mut parsed = parse_query_from_sql(&sql)
         .map_err(|err| format!("join apply-key rewrite generated invalid SQL: {err}; sql={sql}"))?;
-    let sqlparser::ast::SetExpr::Select(select) = parsed.body.as_mut() else {
+    let ast::SetExpr::Select(select) = parsed.body.as_mut() else {
         return Err("join apply-key rewrite generated non-SELECT body".to_string());
     };
     let [from] = select.from.as_mut_slice() else {
         return Err("join apply-key rewrite generated invalid FROM".to_string());
     };
-    let sqlparser::ast::TableFactor::Derived { subquery, .. } = &mut from.relation else {
+    let ast::TableFactor::Derived { subquery, .. } = &mut from.relation else {
         return Err("join apply-key rewrite generated non-derived FROM".to_string());
     };
     **subquery = source_query;
@@ -357,8 +361,8 @@ fn wrap_join_apply_key_query(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-pub(crate) fn is_append_only_join_delta_eligible(query: &sqlparser::ast::Query) -> bool {
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+pub(crate) fn is_append_only_join_delta_eligible(query: &ast::Query) -> bool {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
     let [from] = select.from.as_slice() else {
@@ -368,10 +372,8 @@ pub(crate) fn is_append_only_join_delta_eligible(query: &sqlparser::ast::Query) 
         return false;
     };
     matches!(
-        join.join_operator,
-        sqlparser::ast::JoinOperator::Join(_)
-            | sqlparser::ast::JoinOperator::Inner(_)
-            | sqlparser::ast::JoinOperator::CrossJoin(_)
+        join.operator,
+        ast::JoinOperator::Inner | ast::JoinOperator::InnerExplicit | ast::JoinOperator::Cross
     )
 }
 
@@ -381,7 +383,7 @@ pub(crate) fn is_append_only_join_delta_eligible(query: &sqlparser::ast::Query) 
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 struct BranchRewrite {
-    alias: sqlparser::ast::Ident,
+    alias: ast::Ident,
     is_delta: bool,
 }
 
@@ -389,10 +391,8 @@ struct BranchRewrite {
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn payload_projection_columns(
-    query: &sqlparser::ast::Query,
-) -> Result<Vec<sqlparser::ast::Ident>, String> {
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+fn payload_projection_columns(query: &ast::Query) -> Result<Vec<ast::Ident>, String> {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return Err("join delta coalesce rewrite requires SELECT body".to_string());
     };
     let mut seen = std::collections::BTreeSet::new();
@@ -409,18 +409,14 @@ fn payload_projection_columns(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn payload_projection_column(
-    item: &sqlparser::ast::SelectItem,
-) -> Result<sqlparser::ast::Ident, String> {
+fn payload_projection_column(item: &ast::SelectItem) -> Result<ast::Ident, String> {
     match item {
-        sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => Ok(alias.clone()),
-        sqlparser::ast::SelectItem::UnnamedExpr(expr) => projection_expr_default_name(expr)
-            .ok_or_else(|| {
-                "join delta coalesce rewrite requires aliases for non-column payload expressions"
-                    .to_string()
-            }),
-        sqlparser::ast::SelectItem::Wildcard(_)
-        | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => Err(
+        ast::SelectItem::ExprWithAlias { alias, .. } => Ok(alias.clone()),
+        ast::SelectItem::UnnamedExpr(expr) => projection_expr_default_name(expr).ok_or_else(|| {
+            "join delta coalesce rewrite requires aliases for non-column payload expressions"
+                .to_string()
+        }),
+        ast::SelectItem::Wildcard { .. } | ast::SelectItem::QualifiedWildcard { .. } => Err(
             "join delta coalesce rewrite requires explicit payload projection columns".to_string(),
         ),
     }
@@ -430,11 +426,11 @@ fn payload_projection_column(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn projection_expr_default_name(expr: &sqlparser::ast::Expr) -> Option<sqlparser::ast::Ident> {
+fn projection_expr_default_name(expr: &ast::Expr) -> Option<ast::Ident> {
     match expr {
-        sqlparser::ast::Expr::Identifier(ident) => Some(ident.clone()),
-        sqlparser::ast::Expr::CompoundIdentifier(parts) => parts.last().cloned(),
-        sqlparser::ast::Expr::Nested(inner) => projection_expr_default_name(inner),
+        ast::Expr::Identifier(ident) => Some(ident.clone()),
+        ast::Expr::CompoundIdentifier(parts) => parts.parts.last().cloned(),
+        ast::Expr::Nested(inner) => projection_expr_default_name(&inner.expression),
         _ => None,
     }
 }
@@ -444,7 +440,7 @@ fn projection_expr_default_name(expr: &sqlparser::ast::Expr) -> Option<sqlparser
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn validate_payload_projection_column(
-    ident: &sqlparser::ast::Ident,
+    ident: &ast::Ident,
     seen: &mut std::collections::BTreeSet<String>,
 ) -> Result<(), String> {
     let normalized = ident.value.to_ascii_lowercase();
@@ -500,14 +496,11 @@ fn join_delta_branch_cte_name(index: usize) -> String {
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn change_stream_select_list(
-    payload_columns: &[sqlparser::ast::Ident],
+    payload_columns: &[ast::Ident],
     left_uuid: &str,
     right_uuid: &str,
 ) -> String {
-    let mut items = payload_columns
-        .iter()
-        .map(|ident| ident.to_string())
-        .collect::<Vec<_>>();
+    let mut items = payload_columns.iter().map(render_ident).collect::<Vec<_>>();
     items.push(format!(
         "join_row_key({}, {}, {}, {}) AS {}",
         sql_string_literal(left_uuid),
@@ -524,9 +517,9 @@ fn change_stream_select_list(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn payload_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
+fn payload_coalesced_select_list(payload_columns: &[ast::Ident]) -> String {
     let mut items = vec![MV_JOIN_APPLY_KEY_COLUMN_NAME.to_string()];
-    items.extend(payload_columns.iter().map(|ident| ident.to_string()));
+    items.extend(payload_columns.iter().map(render_ident));
     items.push(format!(
         "SUM({}) AS net",
         novarocks_execution::exec::change_op::CHANGE_OP_COLUMN
@@ -538,9 +531,9 @@ fn payload_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> S
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn payload_group_by_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
+fn payload_group_by_list(payload_columns: &[ast::Ident]) -> String {
     let mut items = vec![MV_JOIN_APPLY_KEY_COLUMN_NAME.to_string()];
-    items.extend(payload_columns.iter().map(|ident| ident.to_string()));
+    items.extend(payload_columns.iter().map(render_ident));
     items.join(", ")
 }
 
@@ -561,10 +554,13 @@ fn key_shape_select_list() -> String {
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn valid_payload_select_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
+fn valid_payload_select_list(payload_columns: &[ast::Ident]) -> String {
     let mut items = payload_columns
         .iter()
-        .map(|ident| format!("pc.{ident} AS {ident}"))
+        .map(|ident| {
+            let rendered = render_ident(ident);
+            format!("pc.{rendered} AS {rendered}")
+        })
         .collect::<Vec<_>>();
     let key = MV_JOIN_APPLY_KEY_COLUMN_NAME;
     items.push(format!("pc.{key} AS {key}"));
@@ -576,10 +572,13 @@ fn valid_payload_select_list(payload_columns: &[sqlparser::ast::Ident]) -> Strin
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn final_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
+fn final_coalesced_select_list(payload_columns: &[ast::Ident]) -> String {
     let mut items = payload_columns
         .iter()
-        .map(|ident| format!("coalesced.{ident} AS {ident}"))
+        .map(|ident| {
+            let rendered = render_ident(ident);
+            format!("coalesced.{rendered} AS {rendered}")
+        })
         .collect::<Vec<_>>();
     let key = MV_JOIN_APPLY_KEY_COLUMN_NAME;
     items.push(format!("coalesced.{key} AS {key}"));
@@ -626,13 +625,12 @@ fn quote_sql_identifier(identifier: &str) -> String {
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn parse_query_from_sql(sql: &str) -> Result<sqlparser::ast::Query, String> {
-    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
-    let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)?;
-    let sqlparser::ast::Statement::Query(query) = stmt else {
+fn parse_query_from_sql(sql: &str) -> Result<ast::Query, String> {
+    let statements = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
+    let [ast::Statement::Query(query)] = statements.as_slice() else {
         return Err("expected generated SQL to parse as query".to_string());
     };
-    Ok(*query)
+    Ok(query.clone())
 }
 
 #[allow(
@@ -640,29 +638,29 @@ fn parse_query_from_sql(sql: &str) -> Result<sqlparser::ast::Query, String> {
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn replace_branch_cte_queries(
-    query: &mut sqlparser::ast::Query,
-    branch_queries: Vec<sqlparser::ast::Query>,
+    query: &mut ast::Query,
+    branch_queries: Vec<ast::Query>,
 ) -> Result<(), String> {
     let branch_count = branch_queries.len();
     let with = query
         .with
         .as_mut()
         .ok_or_else(|| "join delta coalesce rewrite generated query without WITH".to_string())?;
-    if with.cte_tables.len() < branch_count {
+    if with.ctes.len() < branch_count {
         return Err(format!(
             "join delta coalesce rewrite generated {} CTEs for {branch_count} branches",
-            with.cte_tables.len()
+            with.ctes.len()
         ));
     }
-    for (index, (cte, branch_query)) in with.cte_tables.iter_mut().zip(branch_queries).enumerate() {
+    for (index, (cte, branch_query)) in with.ctes.iter_mut().zip(branch_queries).enumerate() {
         let expected = join_delta_branch_cte_name(index);
-        if !cte.alias.name.value.eq_ignore_ascii_case(&expected) {
+        if !cte.name.value.eq_ignore_ascii_case(&expected) {
             return Err(format!(
                 "join delta coalesce rewrite expected CTE `{expected}` at position {index}, found `{}`",
-                cte.alias.name.value
+                cte.name.value
             ));
         }
-        *cte.query = branch_query;
+        cte.query = Box::new(branch_query);
     }
     Ok(())
 }
@@ -672,7 +670,7 @@ fn replace_branch_cte_queries(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn rewrite_branch_factor(
-    factor: &mut sqlparser::ast::TableFactor,
+    factor: &mut ast::TableFactor,
     base: &novarocks_catalog::identifier::TableIdentity,
     side: BranchSide,
     alias: &str,
@@ -681,7 +679,7 @@ fn rewrite_branch_factor(
         BranchSide::Delta(window) => {
             let effective_alias = table_factor_alias(factor)
                 .ok_or_else(|| "join branch delta side must be a table".to_string())?
-                .unwrap_or_else(|| sqlparser::ast::Ident::new(alias));
+                .unwrap_or_else(|| generated_ident(alias));
             *factor =
                 build_nr_ivm_delta_table_factor_for_join(base, window, effective_alias.clone());
             Ok(BranchRewrite {
@@ -690,34 +688,34 @@ fn rewrite_branch_factor(
             })
         }
         BranchSide::Snapshot(snapshot_id) => {
-            let sqlparser::ast::TableFactor::Table {
+            let ast::TableFactor::Table {
                 name,
                 version,
                 alias: factor_alias,
-                args,
                 ..
             } = factor
             else {
                 return Err("join branch snapshot side must be a table".to_string());
             };
-            if args.is_some() {
-                return Err("join branch snapshot side must be a base table".to_string());
-            }
             *name = base_table_object_name(base);
-            *version = Some(sqlparser::ast::TableVersion::VersionAsOf(
-                sqlparser::ast::Expr::Value(
-                    sqlparser::ast::Value::Number(snapshot_id.to_string(), false).into(),
-                ),
-            ));
+            *version = Some(ast::TableVersion {
+                kind: ast::TableVersionKind::ForVersionAsOf,
+                value: ast::Expr::Literal(ast::Literal {
+                    kind: ast::LiteralKind::Number(snapshot_id.to_string()),
+                    span: Span::new(0, 0),
+                }),
+                span: Span::new(0, 0),
+            });
             let effective_alias = factor_alias
                 .as_ref()
                 .map(|alias| alias.name.clone())
-                .unwrap_or_else(|| sqlparser::ast::Ident::new(alias));
+                .unwrap_or_else(|| generated_ident(alias));
             if factor_alias.is_none() {
-                *factor_alias = Some(sqlparser::ast::TableAlias {
-                    explicit: true,
+                *factor_alias = Some(ast::TableAlias {
                     name: effective_alias.clone(),
                     columns: Vec::new(),
+                    explicit_as: true,
+                    span: Span::new(0, 0),
                 });
             }
             Ok(BranchRewrite {
@@ -732,10 +730,8 @@ fn rewrite_branch_factor(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn table_factor_alias(
-    factor: &sqlparser::ast::TableFactor,
-) -> Option<Option<sqlparser::ast::Ident>> {
-    let sqlparser::ast::TableFactor::Table { alias, .. } = factor else {
+fn table_factor_alias(factor: &ast::TableFactor) -> Option<Option<ast::Ident>> {
+    let ast::TableFactor::Table { alias, .. } = factor else {
         return None;
     };
     Some(alias.as_ref().map(|alias| alias.name.clone()))
@@ -745,14 +741,15 @@ fn table_factor_alias(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn base_table_object_name(
-    base: &novarocks_catalog::identifier::TableIdentity,
-) -> sqlparser::ast::ObjectName {
-    sqlparser::ast::ObjectName(vec![
-        sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(&base.catalog)),
-        sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(&base.namespace)),
-        sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(&base.table)),
-    ])
+fn base_table_object_name(base: &novarocks_catalog::identifier::TableIdentity) -> ast::ObjectName {
+    ast::ObjectName {
+        parts: vec![
+            generated_ident(&base.catalog),
+            generated_ident(&base.namespace),
+            generated_ident(&base.table),
+        ],
+        span: Span::new(0, 0),
+    }
 }
 
 #[allow(
@@ -762,44 +759,21 @@ fn base_table_object_name(
 fn build_nr_ivm_delta_table_factor_for_join(
     base: &novarocks_catalog::identifier::TableIdentity,
     window: SnapshotWindow,
-    alias: sqlparser::ast::Ident,
-) -> sqlparser::ast::TableFactor {
-    use sqlparser::ast as sqlast;
-    let make_string_arg = |s: String| -> sqlast::FunctionArg {
-        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(sqlast::Expr::Value(
-            sqlast::Value::SingleQuotedString(s).into(),
-        )))
+    alias: ast::Ident,
+) -> ast::TableFactor {
+    let sql = format!(
+        "SELECT * FROM __nr_ivm_delta({}, {}, {}) AS {}",
+        sql_string_literal(&base.fqn()),
+        window.from,
+        window.to,
+        render_ident(&alias),
+    );
+    let query = parse_query_from_sql(&sql)
+        .expect("generated join delta table function must parse as a native query");
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        unreachable!("generated join delta query must have SELECT body");
     };
-    let make_number_arg = |n: i64| -> sqlast::FunctionArg {
-        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(sqlast::Expr::Value(
-            sqlast::Value::Number(n.to_string(), false).into(),
-        )))
-    };
-    sqlast::TableFactor::Table {
-        name: sqlast::ObjectName(vec![sqlast::ObjectNamePart::Identifier(
-            sqlast::Ident::new("__nr_ivm_delta"),
-        )]),
-        alias: Some(sqlast::TableAlias {
-            explicit: true,
-            name: alias,
-            columns: Vec::new(),
-        }),
-        args: Some(sqlast::TableFunctionArgs {
-            args: vec![
-                make_string_arg(base.fqn()),
-                make_number_arg(window.from),
-                make_number_arg(window.to),
-            ],
-            settings: None,
-        }),
-        with_hints: Vec::new(),
-        version: None,
-        with_ordinality: false,
-        partitions: Vec::new(),
-        json_path: None,
-        sample: None,
-        index_hints: Vec::new(),
-    }
+    select.from[0].relation.clone()
 }
 
 #[allow(
@@ -807,7 +781,7 @@ fn build_nr_ivm_delta_table_factor_for_join(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn append_join_hidden_projection(
-    select: &mut sqlparser::ast::Select,
+    select: &mut ast::Select,
     left_branch: &BranchRewrite,
     right_branch: &BranchRewrite,
 ) -> Result<(), String> {
@@ -835,7 +809,7 @@ fn append_join_hidden_projection(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn change_op_alias(alias: &sqlparser::ast::Ident) -> sqlparser::ast::SelectItem {
+fn change_op_alias(alias: &ast::Ident) -> ast::SelectItem {
     qualified_alias(
         alias,
         novarocks_execution::exec::change_op::CHANGE_OP_COLUMN,
@@ -847,7 +821,7 @@ fn change_op_alias(alias: &sqlparser::ast::Ident) -> sqlparser::ast::SelectItem 
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn row_id_alias(alias: &sqlparser::ast::Ident, output: &str) -> sqlparser::ast::SelectItem {
+fn row_id_alias(alias: &ast::Ident, output: &str) -> ast::SelectItem {
     qualified_alias(alias, "_row_id", output)
 }
 
@@ -855,17 +829,35 @@ fn row_id_alias(alias: &sqlparser::ast::Ident, output: &str) -> sqlparser::ast::
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn qualified_alias(
-    qualifier: &sqlparser::ast::Ident,
-    column: &str,
-    output: &str,
-) -> sqlparser::ast::SelectItem {
-    sqlparser::ast::SelectItem::ExprWithAlias {
-        expr: sqlparser::ast::Expr::CompoundIdentifier(vec![
-            qualifier.clone(),
-            sqlparser::ast::Ident::new(column),
-        ]),
-        alias: sqlparser::ast::Ident::new(output),
+fn qualified_alias(qualifier: &ast::Ident, column: &str, output: &str) -> ast::SelectItem {
+    let sql = format!(
+        "SELECT {}.{} AS {}",
+        render_ident(qualifier),
+        quote_sql_identifier(column),
+        quote_sql_identifier(output),
+    );
+    let query = parse_query_from_sql(&sql)
+        .expect("generated join hidden projection must parse as a native query");
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        unreachable!("generated join hidden projection must have SELECT body");
+    };
+    select.projection[0].clone()
+}
+
+fn generated_ident(value: &str) -> ast::Ident {
+    ast::Ident {
+        value: value.to_string(),
+        quoted: false,
+        quote_style: None,
+        span: Span::new(0, 0),
+    }
+}
+
+fn render_ident(ident: &ast::Ident) -> String {
+    if ident.quoted {
+        quote_sql_identifier(&ident.value)
+    } else {
+        ident.value.clone()
     }
 }
 
@@ -940,11 +932,11 @@ mod tests {
             right: BranchSide::Snapshot(20),
         };
         let rewritten = rewrite_join_branch_query(&query, &plan, "l", "r").expect("rewrite");
-        let rendered = rewritten.to_string();
+        let rendered = novarocks_parser::printer::print_query(&rewritten);
         assert!(rendered.contains("__nr_ivm_delta"), "sql={rendered}");
         assert!(rendered.contains("VERSION AS OF 20"), "sql={rendered}");
         assert!(
-            rendered.contains("l.__change_op AS __change_op"),
+            rendered.contains("l.`__change_op` AS `__change_op`"),
             "sql={rendered}"
         );
         assert!(rendered.contains("__nova_left_row_id"), "sql={rendered}");
@@ -965,10 +957,10 @@ mod tests {
             right: BranchSide::Delta(SnapshotWindow { from: 20, to: 21 }),
         };
         let rewritten = rewrite_join_branch_query(&query, &plan, "l", "r").expect("rewrite");
-        let rendered = rewritten.to_string();
+        let rendered = novarocks_parser::printer::print_query(&rewritten);
         assert!(rendered.contains("VERSION AS OF 11"), "sql={rendered}");
         assert!(
-            rendered.contains("r.__change_op AS __change_op"),
+            rendered.contains("r.`__change_op` AS `__change_op`"),
             "sql={rendered}"
         );
         assert!(rendered.contains("__nr_ivm_delta"), "sql={rendered}");
@@ -993,17 +985,17 @@ mod tests {
         };
         let rewritten = rewrite_join_branch_query(&query, &plan, "fallback_left", "fallback_right")
             .expect("rewrite");
-        let rendered = rewritten.to_string();
+        let rendered = novarocks_parser::printer::print_query(&rewritten);
         assert!(
-            rendered.contains("`Left Alias`.__change_op AS __change_op"),
+            rendered.contains("`Left Alias`.`__change_op` AS `__change_op`"),
             "sql={rendered}"
         );
         assert!(
-            rendered.contains("`Left Alias`._row_id AS __nova_left_row_id"),
+            rendered.contains("`Left Alias`.`_row_id` AS `__nova_left_row_id"),
             "sql={rendered}"
         );
         assert!(
-            rendered.contains("`Right Alias`._row_id AS __nova_right_row_id"),
+            rendered.contains("`Right Alias`.`_row_id` AS `__nova_right_row_id"),
             "sql={rendered}"
         );
         assert!(
@@ -1035,7 +1027,7 @@ mod tests {
             "right-uuid",
         )
         .expect("coalesce rewrite");
-        let rendered = rewritten.to_string();
+        let rendered = novarocks_parser::printer::print_query(&rewritten);
 
         assert_sql_contains(&rendered, "__nr_join_delta_branch_0");
         assert_sql_contains(&rendered, "__nr_join_delta_branch_1");
@@ -1053,7 +1045,7 @@ mod tests {
         assert_sql_contains(&rendered, "__nr_join_delta_key_shape");
         assert_sql_contains(&rendered, "pc.id AS id");
         assert_sql_contains(&rendered, "pc.label AS label");
-        assert_sql_contains(&rendered, "HAVING SUM(__change_op) <> 0");
+        assert_sql_contains(&rendered, "HAVING SUM(__change_op) != 0");
         assert_sql_contains(
             &rendered,
             "assert_true(abs(SUM(__change_op)) <= 1, 'join delta per-payload net change exceeds 1')",
@@ -1071,11 +1063,12 @@ mod tests {
 
     #[test]
     fn join_delta_coalesce_final_select_joins_target_locator_for_delete_positions() {
-        let rendered = rewrite_simple_join_delta_coalesce(
-            "select l.id, r.label from ice.ns.left l join ice.ns.right r on l.id = r.id",
-        )
-        .expect("coalesce rewrite")
-        .to_string();
+        let rendered = novarocks_parser::printer::print_query(
+            &rewrite_simple_join_delta_coalesce(
+                "select l.id, r.label from ice.ns.left l join ice.ns.right r on l.id = r.id",
+            )
+            .expect("coalesce rewrite"),
+        );
 
         assert_sql_contains(&rendered, "LEFT JOIN");
         assert_sql_contains(&rendered, "__nr_join_delta_target_locator");
@@ -1093,11 +1086,12 @@ mod tests {
 
     #[test]
     fn join_delta_coalesce_groups_by_payload_before_key_shape_check() {
-        let rendered = rewrite_simple_join_delta_coalesce(
-            "select l.id, r.label from ice.ns.left l join ice.ns.right r on l.id = r.id",
-        )
-        .expect("coalesce rewrite")
-        .to_string();
+        let rendered = novarocks_parser::printer::print_query(
+            &rewrite_simple_join_delta_coalesce(
+                "select l.id, r.label from ice.ns.left l join ice.ns.right r on l.id = r.id",
+            )
+            .expect("coalesce rewrite"),
+        );
 
         assert_sql_contains(&rendered, "__nr_join_delta_payload_coalesced");
         assert_sql_contains(&rendered, "GROUP BY __nova_join_row_key, id, label");
@@ -1143,7 +1137,7 @@ mod tests {
             "right-uuid",
         )
         .expect("coalesce rewrite");
-        let rendered = rewritten.to_string();
+        let rendered = novarocks_parser::printer::print_query(&rewritten);
 
         assert_sql_contains(&rendered, "__nr_join_delta_branch_0");
         assert_sql_contains(&rendered, "__nr_join_delta_change_stream");
@@ -1154,7 +1148,7 @@ mod tests {
         assert_sql_contains(&rendered, "__nr_join_delta_key_shape");
         assert_sql_contains(&rendered, "pc.id AS id");
         assert_sql_contains(&rendered, "pc.label AS label");
-        assert_sql_contains(&rendered, "HAVING SUM(__change_op) <> 0");
+        assert_sql_contains(&rendered, "HAVING SUM(__change_op) != 0");
         assert_sql_contains(
             &rendered,
             "CAST(CASE WHEN coalesced.net > 0 THEN 1 ELSE -1 END AS TINYINT) AS __change_op",
@@ -1233,11 +1227,12 @@ mod tests {
 
     #[test]
     fn join_delta_coalesce_preserves_quoted_payload_alias() {
-        let rendered = rewrite_simple_join_delta_coalesce(
-            "select l.id as `payload id`, r.label from ice.ns.left l join ice.ns.right r on l.id = r.id",
-        )
-        .expect("coalesce rewrite")
-        .to_string();
+        let rendered = novarocks_parser::printer::print_query(
+            &rewrite_simple_join_delta_coalesce(
+                "select l.id as `payload id`, r.label from ice.ns.left l join ice.ns.right r on l.id = r.id",
+            )
+            .expect("coalesce rewrite"),
+        );
 
         assert_sql_contains(
             &rendered,
@@ -1269,7 +1264,7 @@ mod tests {
             "right-uuid",
         )
         .expect("append-only rewrite");
-        let rendered = wrapped.to_string();
+        let rendered = novarocks_parser::printer::print_query(&wrapped);
 
         assert_sql_contains(&rendered, "join_row_key");
         assert_sql_contains(&rendered, "'left-uuid'");
@@ -1312,11 +1307,11 @@ mod tests {
         )));
     }
 
-    fn simple_join_query() -> sqlparser::ast::Query {
+    fn simple_join_query() -> ast::Query {
         parse_query("select l.id, r.label from ice.ns.left l join ice.ns.right r on l.id = r.id")
     }
 
-    fn rewrite_left_delta_branch_query() -> sqlparser::ast::Query {
+    fn rewrite_left_delta_branch_query() -> ast::Query {
         let query = simple_join_query();
         let left = base("left");
         let right = base("right");
@@ -1329,28 +1324,26 @@ mod tests {
         rewrite_join_branch_query(&query, &plan, "l", "r").expect("branch rewrite")
     }
 
-    fn assert_final_select_excludes_row_id_columns(query: &sqlparser::ast::Query) {
-        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+    fn assert_final_select_excludes_row_id_columns(query: &ast::Query) {
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected SELECT body");
         };
         for item in &select.projection {
             let alias = match item {
-                sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => {
-                    Some(alias.value.as_str())
+                ast::SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.as_str()),
+                ast::SelectItem::UnnamedExpr(ast::Expr::Identifier(ident)) => {
+                    Some(ident.value.as_str())
                 }
-                sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(
-                    ident,
-                )) => Some(ident.value.as_str()),
                 _ => None,
             };
             assert!(
                 alias != Some(JOIN_LEFT_ROW_ID_COLUMN) && alias != Some(JOIN_RIGHT_ROW_ID_COLUMN),
-                "final select must not project row-id column alias: {item}"
+                "final select must not project row-id column alias: {item:?}"
             );
         }
     }
 
-    fn rewrite_simple_join_delta_coalesce(sql: &str) -> Result<sqlparser::ast::Query, String> {
+    fn rewrite_simple_join_delta_coalesce(sql: &str) -> Result<ast::Query, String> {
         let query = parse_query(sql);
         let left = base("left");
         let right = base("right");
@@ -1369,12 +1362,11 @@ mod tests {
         assert!(sql.contains(expected), "expected `{expected}` in sql={sql}");
     }
 
-    fn parse_query(sql: &str) -> sqlparser::ast::Query {
-        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse");
-        let sqlparser::ast::Statement::Query(query) = stmt else {
+    fn parse_query(sql: &str) -> ast::Query {
+        let statements = novarocks_parser::parse(sql).expect("parse");
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
             panic!("expected query");
         };
-        *query
+        query.clone()
     }
 }

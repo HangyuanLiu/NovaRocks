@@ -58,6 +58,8 @@ fn query_forms_parse_and_print_as_typed_syntax() {
         "SELECT * FROM (((SELECT 1 UNION ALL SELECT 2))) AS source",
         "SELECT * FROM (SELECT 1) catalog",
         "EXPLAIN VERBOSE SELECT k1 FROM __nr_ivm_delta('orders', 0, 0)",
+        "EXPLAIN LOGICAL VERBOSE SELECT k1 FROM t",
+        "EXPLAIN LOGICAL COSTS SELECT k1 FROM t",
         "SELECT @@time_zone, @user_name",
         "SELECT 1 AS \"order count\"",
         "SELECT array_sortby((x) -> x.item, x)",
@@ -133,6 +135,61 @@ fn comma_limit_syntax_is_retained_by_the_typed_ast() {
         Printer::new().statements(&statements),
         "SELECT * FROM t LIMIT 2, 10"
     );
+}
+
+#[test]
+fn metadata_table_suffix_is_typed_parse_broad_and_roundtrips() {
+    let source = "SELECT * FROM ice.analytics.orders$future_metadata AS metadata";
+    let statements = parse(source).expect("metadata-table syntax should parse");
+    let Statement::Query(query) = &statements[0] else {
+        panic!("expected query");
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("expected SELECT");
+    };
+    let TableFactor::Table { name, metadata, .. } = &select.from[0].relation else {
+        panic!("expected table relation");
+    };
+    assert_eq!(name.parts.len(), 3);
+    assert_eq!(name.parts[0].value, "ice");
+    assert_eq!(name.parts[1].value, "analytics");
+    assert_eq!(name.parts[2].value, "orders");
+    let metadata = metadata.as_ref().expect("typed metadata suffix");
+    assert_eq!(metadata.value, "future_metadata");
+    assert_eq!(
+        &source[metadata.span.start()..metadata.span.end()],
+        "future_metadata"
+    );
+
+    let canonical = Printer::new().statements(&statements);
+    assert_eq!(canonical, source);
+    let reparsed = parse(&canonical).expect("canonical metadata-table syntax should parse");
+    let Statement::Query(reparsed_query) = &reparsed[0] else {
+        panic!("expected reparsed query");
+    };
+    assert!(query.syntax_eq(reparsed_query));
+}
+
+#[test]
+fn quoted_or_incomplete_dollar_names_remain_regular_table_names() {
+    for source in [
+        "SELECT * FROM `orders$snapshots`",
+        "SELECT * FROM orders$",
+        "SELECT * FROM $orders",
+    ] {
+        let statements = parse(source).expect("regular identifier should parse");
+        let Statement::Query(query) = &statements[0] else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected SELECT");
+        };
+        let TableFactor::Table { metadata, .. } = &select.from[0].relation else {
+            panic!("expected table relation");
+        };
+        assert!(metadata.is_none(), "{source}");
+        assert_eq!(Printer::new().statements(&statements), source);
+    }
 }
 
 #[test]

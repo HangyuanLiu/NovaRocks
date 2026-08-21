@@ -51,22 +51,12 @@ fn is_legacy_frontier(source: &str) -> bool {
     let words = significant_words(source);
     let first = words.first().map(String::as_str);
     match first {
-        Some("SELECT" | "WITH" | "VALUES" | "SET" | "USE") => true,
+        Some("SET" | "USE") => true,
         Some("KILL") => words.get(1).map(String::as_str) != Some("ANALYZE"),
-        Some("EXPLAIN") => explain_targets_query(&words),
         Some("DROP" | "ALTER") => false,
         Some("SHOW") => false,
         _ => false,
     }
-}
-
-fn explain_targets_query(words: &[String]) -> bool {
-    words
-        .iter()
-        .skip(1)
-        .map(String::as_str)
-        .find(|word| !matches!(*word, "ANALYZE" | "VERBOSE" | "COSTS" | "LOGICAL"))
-        .is_some_and(|word| matches!(word, "SELECT" | "WITH" | "VALUES"))
 }
 
 fn significant_words(source: &str) -> Vec<String> {
@@ -85,21 +75,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_frontier_is_bounded_to_unmigrated_families() {
-        for source in [
-            "SELECT 1",
-            "WITH c AS (SELECT 1) SELECT * FROM c",
-            "VALUES (1)",
-            "SET query_timeout = 1",
-            "KILL QUERY 1",
-            "EXPLAIN VERBOSE SELECT 1",
-            "EXPLAIN ANALYZE VALUES (1)",
-        ] {
+    fn legacy_frontier_is_bounded_to_session_families() {
+        for source in ["SET query_timeout = 1", "KILL QUERY 1", "USE db"] {
             assert_eq!(
                 admit_statement(source)
                     .expect("legacy frontier must not parse")
                     .0,
                 StatementAdmission::LegacyFrontier,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_query_and_explain_are_admitted() {
+        for source in [
+            "SELECT 1",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "VALUES (1)",
+            "EXPLAIN VERBOSE SELECT 1",
+            "EXPLAIN ANALYZE VALUES (1)",
+        ] {
+            assert_eq!(
+                admit_statement(source)
+                    .expect("query must be admitted through the typed parser")
+                    .0,
+                StatementAdmission::Parsed,
                 "{source}"
             );
         }
@@ -237,8 +238,8 @@ mod tests {
     }
 
     #[test]
-    fn leading_comment_does_not_change_the_legacy_frontier() {
-        assert!(is_legacy_frontier(
+    fn leading_comment_does_not_route_a_native_query_to_the_legacy_frontier() {
+        assert!(!is_legacy_frontier(
             "/*+ SET_VAR(query_timeout=1) */ SELECT 1"
         ));
     }

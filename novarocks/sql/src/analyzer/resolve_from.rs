@@ -16,20 +16,19 @@
 // under the License.
 
 use arrow::datatypes::DataType;
-use sqlparser::ast as sqlast;
+use novarocks_parser::ast;
+use novarocks_parser::printer::print_expr;
 
 use crate::analysis::*;
 use crate::column_id::ColumnId;
 
-use super::helpers::eval_const_i64;
-use super::iceberg_metadata::split_metadata_suffix;
 use super::scope::AnalyzerScope;
 
 impl<'a> super::AnalyzerContext<'a> {
     /// Analyze a FROM clause (TableWithJoins).
     pub(super) fn analyze_from(
         &self,
-        twj: &sqlast::TableWithJoins,
+        twj: &ast::TableWithJoins,
     ) -> Result<(Relation, AnalyzerScope), String> {
         self.analyze_from_with_outer(twj, None)
     }
@@ -40,7 +39,7 @@ impl<'a> super::AnalyzerContext<'a> {
     /// table-valued functions like `unnest(...)` can reference outer columns.
     pub(super) fn analyze_from_with_outer(
         &self,
-        twj: &sqlast::TableWithJoins,
+        twj: &ast::TableWithJoins,
         outer_scope: Option<&AnalyzerScope>,
     ) -> Result<(Relation, AnalyzerScope), String> {
         let (mut current_rel, mut current_scope) =
@@ -50,17 +49,17 @@ impl<'a> super::AnalyzerContext<'a> {
             let (right_rel, right_scope) =
                 self.analyze_table_factor_with_outer(&join.relation, Some(&current_scope))?;
 
-            let (join_kind, constraint) = super::helpers::parse_join_operator(&join.join_operator)?;
+            let (join_kind, constraint) = parse_join_operator(join.operator, &join.constraint)?;
 
             let condition = match constraint {
-                Some(sqlast::JoinConstraint::On(on_expr)) => {
+                Some(ast::JoinConstraint::On(on_expr)) => {
                     // Build a merged scope for analyzing the ON condition
                     let mut merged = self.new_scope();
                     merged.merge(&current_scope);
                     merged.merge(&right_scope);
                     Some(self.analyze_expr(on_expr, &merged)?)
                 }
-                Some(sqlast::JoinConstraint::Using(columns)) => {
+                Some(ast::JoinConstraint::Using { columns, .. }) => {
                     // Convert USING(col1, col2) to ON left.col1 = right.col1 AND ...
                     //
                     // Each USING column resolves to *different* ColumnIds on
@@ -76,7 +75,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     // child's scope.
                     let mut conds = Vec::new();
                     for col_obj in columns {
-                        let col_name = col_obj.to_string();
+                        let col_name = col_obj.value.clone();
                         let (left_id, left_dt, left_nullable) = current_scope
                             .resolve(None, &col_name)
                             .unwrap_or((crate::column_id::ColumnId::UNSET, DataType::Utf8, true));
@@ -146,10 +145,10 @@ impl<'a> super::AnalyzerContext<'a> {
                         Some(result)
                     }
                 }
-                Some(sqlast::JoinConstraint::Natural) => {
+                Some(ast::JoinConstraint::Natural(_)) => {
                     return Err("NATURAL JOIN is not yet supported".into());
                 }
-                Some(sqlast::JoinConstraint::None) | None => None,
+                Some(ast::JoinConstraint::None) | None => None,
             };
 
             // SEMI / ANTI joins only expose the surviving side's columns to
@@ -164,17 +163,25 @@ impl<'a> super::AnalyzerContext<'a> {
                     // reordering still applies: even though right columns
                     // are not exposed, the surviving USING columns should
                     // sit at the front of the SELECT * column list.
-                    if let Some(sqlast::JoinConstraint::Using(using_cols_ast)) = constraint {
+                    if let Some(ast::JoinConstraint::Using {
+                        columns: using_cols_ast,
+                        ..
+                    }) = constraint
+                    {
                         let using_names: Vec<String> =
-                            using_cols_ast.iter().map(|c| c.to_string()).collect();
+                            using_cols_ast.iter().map(|c| c.value.clone()).collect();
                         current_scope.apply_using_layout(&using_names, false);
                     }
                 }
                 JoinKind::RightSemi | JoinKind::RightAnti => {
                     current_scope = right_scope;
-                    if let Some(sqlast::JoinConstraint::Using(using_cols_ast)) = constraint {
+                    if let Some(ast::JoinConstraint::Using {
+                        columns: using_cols_ast,
+                        ..
+                    }) = constraint
+                    {
                         let using_names: Vec<String> =
-                            using_cols_ast.iter().map(|c| c.to_string()).collect();
+                            using_cols_ast.iter().map(|c| c.value.clone()).collect();
                         current_scope.apply_using_layout(&using_names, false);
                     }
                 }
@@ -185,11 +192,14 @@ impl<'a> super::AnalyzerContext<'a> {
                     // `apply_using_layout` deduplicates `ordered`.
                     let coalesce_quals: Option<Vec<(String, String, String)>> =
                         if matches!(join_kind, JoinKind::FullOuter)
-                            && let Some(sqlast::JoinConstraint::Using(using_cols_ast)) = constraint
+                            && let Some(ast::JoinConstraint::Using {
+                                columns: using_cols_ast,
+                                ..
+                            }) = constraint
                         {
                             let mut out = Vec::new();
                             for c in using_cols_ast {
-                                let name = c.to_string();
+                                let name = c.value.clone();
                                 let name_lower = name.to_lowercase();
                                 let left_q = current_scope
                                     .iter_columns()
@@ -222,9 +232,13 @@ impl<'a> super::AnalyzerContext<'a> {
                     // additionally register a `COALESCE(left.col,
                     // right.col)` computed column so that unqualified
                     // references and `SELECT *` see the merged value.
-                    if let Some(sqlast::JoinConstraint::Using(using_cols_ast)) = constraint {
+                    if let Some(ast::JoinConstraint::Using {
+                        columns: using_cols_ast,
+                        ..
+                    }) = constraint
+                    {
                         let using_names: Vec<String> =
-                            using_cols_ast.iter().map(|c| c.to_string()).collect();
+                            using_cols_ast.iter().map(|c| c.value.clone()).collect();
                         let prefer_right = matches!(join_kind, JoinKind::RightOuter);
                         current_scope.apply_using_layout(&using_names, prefer_right);
                         if let Some(quals) = coalesce_quals {
@@ -247,7 +261,7 @@ impl<'a> super::AnalyzerContext<'a> {
                             // require equality, so the chained value is
                             // still correct.
                             for c in using_cols_ast {
-                                current_scope.clear_computed_column(&c.to_string());
+                                current_scope.clear_computed_column(&c.value);
                             }
                         }
                     }
@@ -266,88 +280,31 @@ impl<'a> super::AnalyzerContext<'a> {
 
     fn analyze_table_factor_with_outer(
         &self,
-        factor: &sqlast::TableFactor,
+        factor: &ast::TableFactor,
         outer_scope: Option<&AnalyzerScope>,
     ) -> Result<(Relation, AnalyzerScope), String> {
         match factor {
-            sqlast::TableFactor::Table {
-                name, alias, args, ..
+            ast::TableFactor::Table {
+                name,
+                metadata,
+                alias,
+                ..
             } => {
-                let parts: Vec<String> = name
-                    .0
-                    .iter()
-                    .filter_map(|part| match part {
-                        sqlast::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
-                        _ => None,
-                    })
-                    .collect();
+                let parts: Vec<String> = name.parts.iter().map(|part| part.value.clone()).collect();
 
-                // IVM-A1 internal table function dispatch:
-                // `FROM __nr_ivm_delta(...)` parses as `TableFactor::Table`
-                // with `args: Some(FunctionArgumentList { ... })`. Route to
-                // the dedicated analyzer before the regular base-table
-                // resolution path runs.
-                if parts.len() == 1
-                    && parts[0].eq_ignore_ascii_case("__nr_ivm_delta")
-                    && let Some(table_function_args) = args
-                {
-                    let function = sqlast::Function {
-                        name: name.clone(),
-                        uses_odbc_syntax: false,
-                        parameters: sqlast::FunctionArguments::None,
-                        args: sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
-                            duplicate_treatment: None,
-                            args: table_function_args.args.clone(),
-                            clauses: Vec::new(),
-                        }),
-                        filter: None,
-                        null_treatment: None,
-                        over: None,
-                        within_group: Vec::new(),
-                    };
-                    return self.analyze_iceberg_delta_table_function(&function, alias.as_ref());
-                }
-
-                // StarRocks dialect allows `FROM t, unnest(arr_expr) [AS u(cols)]`
-                // as an implicit lateral table function. The standard sqlparser
-                // dialect we use does not recognize UNNEST as a keyword, so the
-                // parser produces a TableFactor::Table with name "unnest" and a
-                // populated args list. Detect that here and route to the unnest
-                // analyzer using the outer scope from the preceding comma-join.
-                if parts.len() == 1
-                    && parts[0].eq_ignore_ascii_case("unnest")
-                    && let Some(table_function_args) = args
-                {
-                    let array_exprs = table_function_args
-                        .args
-                        .iter()
-                        .map(|arg| match arg {
-                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(expr)) => {
-                                Ok(expr.clone())
-                            }
-                            other => Err(format!(
-                                "UNNEST expects positional expression args, got {other}"
-                            )),
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    return self.analyze_unnest(
-                        &array_exprs,
-                        alias.as_ref(),
-                        false,
-                        None,
-                        false,
-                        outer_scope,
-                    );
-                }
-
-                // Iceberg metadata-table dispatch: parser pre-rewrites
-                // `<tbl>$<metatype>` into `<tbl>.__nr_meta_<metatype>__` so we
-                // detect the trailing `__nr_meta_*__` segment here, resolve
-                // the base table, and emit a typed `IcebergMetadataScan`.
-                let (base_parts, metadata_suffix) = split_metadata_suffix(&parts);
-                if let Some(metadata_ty) = metadata_suffix {
+                // `$<metatype>` is a parser-owned relation field. Capability
+                // admission stays in analysis, after catalog resolution.
+                if let Some(metadata) = metadata {
+                    let metadata_ty =
+                        crate::planner::table::SqlMetadataTableKind::parse(&metadata.value)
+                            .map_err(|_| {
+                                format!(
+                                    "unsupported iceberg metadata table type: {}",
+                                    metadata.value
+                                )
+                            })?;
                     // Reject branch/tag combo: `t.branch_dev$snapshots` is meaningless.
-                    if let Some(last) = base_parts.last()
+                    if let Some(last) = parts.last()
                         && (last.starts_with("branch_") || last.starts_with("tag_"))
                     {
                         return Err(format!(
@@ -355,7 +312,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         ));
                     }
 
-                    let (catalog_override, db_lower, tbl_lower) = match base_parts.as_slice() {
+                    let (catalog_override, db_lower, tbl_lower) = match parts.as_slice() {
                         [tbl] => (
                             None,
                             self.current_database.to_lowercase(),
@@ -430,7 +387,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         parts[1].clone(),
                         parts[2].clone(),
                     ),
-                    _ => return Err(format!("unsupported table name: {name}")),
+                    _ => return Err(format!("unsupported table name: {name:?}")),
                 };
                 let db_lower = db.to_lowercase();
                 let tbl_lower = tbl.to_lowercase();
@@ -541,7 +498,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
                 Ok((relation, scope))
             }
-            sqlast::TableFactor::Derived {
+            ast::TableFactor::Derived {
                 subquery, alias, ..
             } => {
                 let alias_name = alias
@@ -575,83 +532,36 @@ impl<'a> super::AnalyzerContext<'a> {
 
                 Ok((relation, scope))
             }
-            sqlast::TableFactor::TableFunction { expr, alias } => {
+            ast::TableFactor::TableFunction { expr, alias, .. } => {
                 self.analyze_table_function(expr, alias.as_ref())
             }
-            sqlast::TableFactor::Function {
-                lateral,
-                name,
-                args,
-                alias,
-            } => {
-                let func_name = name
-                    .0
-                    .last()
-                    .map(|p| p.to_string().to_ascii_lowercase())
-                    .unwrap_or_default();
-                if func_name != "unnest" {
-                    return Err(format!("unsupported table function: {func_name}"));
-                }
-                if !*lateral {
-                    return Err("UNNEST is currently supported only in LATERAL JOIN".into());
-                }
-                let array_exprs = args
-                    .iter()
-                    .map(|arg| match arg {
-                        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(expr)) => {
-                            Ok(expr.clone())
-                        }
-                        other => Err(format!(
-                            "UNNEST expects positional expression args, got {other}"
-                        )),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.analyze_unnest(
-                    &array_exprs,
-                    alias.as_ref(),
-                    false,
-                    None,
-                    false,
-                    outer_scope,
-                )
-            }
-            sqlast::TableFactor::UNNEST {
+            ast::TableFactor::Unnest {
                 alias,
                 array_exprs,
                 with_offset,
-                with_offset_alias,
-                with_ordinality,
-            } => self.analyze_unnest(
-                array_exprs,
-                alias.as_ref(),
-                *with_offset,
-                with_offset_alias.as_ref(),
-                *with_ordinality,
-                outer_scope,
-            ),
-            sqlast::TableFactor::NestedJoin {
+                ..
+            } => self.analyze_unnest(array_exprs, alias.as_ref(), *with_offset, outer_scope),
+            ast::TableFactor::NestedJoin {
                 table_with_joins,
                 alias,
+                ..
             } => {
                 if alias.is_some() {
                     return Err("alias on parenthesized JOIN is not yet supported".into());
                 }
                 self.analyze_from(table_with_joins)
             }
-            other => Err(format!("unsupported table factor: {other}")),
         }
     }
 
     fn analyze_unnest(
         &self,
-        array_exprs: &[sqlast::Expr],
-        alias: Option<&sqlast::TableAlias>,
+        array_exprs: &[ast::Expr],
+        alias: Option<&ast::TableAlias>,
         with_offset: bool,
-        with_offset_alias: Option<&sqlast::Ident>,
-        with_ordinality: bool,
         outer_scope: Option<&AnalyzerScope>,
     ) -> Result<(Relation, AnalyzerScope), String> {
-        if with_offset || with_offset_alias.is_some() || with_ordinality {
+        if with_offset {
             return Err("UNNEST WITH OFFSET/ORDINALITY is not yet supported".into());
         }
         if array_exprs.is_empty() {
@@ -665,7 +575,7 @@ impl<'a> super::AnalyzerContext<'a> {
             .map(|a| {
                 a.columns
                     .iter()
-                    .map(|c| c.name.value.clone())
+                    .map(|c| c.value.clone())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -726,66 +636,39 @@ impl<'a> super::AnalyzerContext<'a> {
     /// Analyze a TABLE(...) table function reference.
     fn analyze_table_function(
         &self,
-        expr: &sqlast::Expr,
-        alias: Option<&sqlast::TableAlias>,
+        expr: &ast::Expr,
+        alias: Option<&ast::TableAlias>,
     ) -> Result<(Relation, AnalyzerScope), String> {
-        let sqlast::Expr::Function(function) = expr else {
-            return Err(format!("TABLE() requires a function call, got: {expr}"));
+        let ast::Expr::FunctionCall(function) = expr else {
+            return Err(format!("TABLE() requires a function call, got: {expr:?}"));
         };
         let func_name = function
             .name
-            .0
+            .parts
             .last()
-            .map(|p| p.to_string().to_ascii_lowercase())
+            .map(|part| part.value.to_ascii_lowercase())
             .unwrap_or_default();
         if func_name == "__nr_ivm_delta" {
             // `TABLE(__nr_ivm_delta(...))` (explicit TABLE wrapper) also
-            // routes here in addition to the bare `FROM __nr_ivm_delta(...)`
-            // path handled in TableFactor::Table.
+            // routes here in addition to the bare-call table-function syntax.
             return self.analyze_iceberg_delta_table_function(function, alias);
         }
         if func_name != "generate_series" {
             return Err(format!("unsupported table function: {func_name}"));
         }
 
-        let sqlast::FunctionArguments::List(ref arg_list) = function.args else {
-            return Err("generate_series requires parenthesized arguments".into());
-        };
-
-        // StarRocks allows `name = value` for named function arguments. Our
-        // dialect parses `=` as a binary comparison instead, so reinterpret a
-        // positional `Identifier = expr` here as a named argument before the
-        // mixed-mode check.
-        let normalized_args: Vec<sqlast::FunctionArg> = arg_list
-            .args
-            .iter()
-            .map(|arg| {
-                if let sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
-                    sqlast::Expr::BinaryOp { left, op, right },
-                )) = arg
-                    && matches!(op, sqlast::BinaryOperator::Eq)
-                    && let sqlast::Expr::Identifier(ident) = left.as_ref()
-                {
-                    return sqlast::FunctionArg::Named {
-                        name: ident.clone(),
-                        arg: sqlast::FunctionArgExpr::Expr(right.as_ref().clone()),
-                        operator: sqlast::FunctionArgOperator::Equals,
-                    };
-                }
-                arg.clone()
-            })
-            .collect();
-
         // Detect whether the call uses named args (start=>2, end=>5, ...).
+        // The typed parser represents both `=>` and StarRocks's accepted
+        // `=` spelling as a binary syntax node; their semantic distinction is
+        // local to this function's argument grammar.
+        let arguments = &function.arguments;
         // Mixing named and positional is disallowed; StarRocks's FE rejects
         // the first positional token after a named one as `Unexpected input
         // '<token>'`, which the SQL test suite asserts against verbatim.
-        let any_named = normalized_args
+        let any_named = arguments.iter().any(generate_series_named_arg_is_some);
+        let any_positional = arguments
             .iter()
-            .any(|a| matches!(a, sqlast::FunctionArg::Named { .. }));
-        let any_positional = normalized_args
-            .iter()
-            .any(|a| matches!(a, sqlast::FunctionArg::Unnamed(_)));
+            .any(|arg| !generate_series_named_arg_is_some(arg));
         if any_named && any_positional {
             // Surface the first stray positional token. An
             // `Identifier -> value` expression in a function-arg slot is
@@ -793,21 +676,14 @@ impl<'a> super::AnalyzerContext<'a> {
             // the legacy `No viable statement for input` wording the FE
             // uses. Other stray positional tokens get the canonical
             // `Unexpected input '<token>'` form.
-            if let Some(sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e))) =
-                normalized_args
-                    .iter()
-                    .find(|a| matches!(a, sqlast::FunctionArg::Unnamed(_)))
+            if let Some(arg) = arguments
+                .iter()
+                .find(|arg| !generate_series_named_arg_is_some(arg))
             {
-                if matches!(
-                    e,
-                    sqlast::Expr::BinaryOp {
-                        op: sqlast::BinaryOperator::Arrow,
-                        ..
-                    }
-                ) {
-                    return Err(format!("No viable statement for input near '{e}'."));
+                if matches!(arg, ast::Expr::Lambda(_)) {
+                    return Err("No viable statement for input".to_string());
                 }
-                return Err(format!("Unexpected input '{e}'."));
+                return Err(format!("Unexpected input '{}'.", print_expr(arg)));
             }
             return Err("Unknown table function: generate_series".into());
         }
@@ -816,20 +692,11 @@ impl<'a> super::AnalyzerContext<'a> {
             let mut start_v: Option<Option<i64>> = None;
             let mut end_v: Option<Option<i64>> = None;
             let mut step_v: Option<Option<i64>> = None;
-            for arg in &normalized_args {
-                let sqlast::FunctionArg::Named {
-                    name,
-                    arg: arg_expr,
-                    operator: _,
-                } = arg
-                else {
+            for arg in arguments {
+                let Some((name, expr)) = generate_series_named_arg(arg) else {
                     return Err("Unknown table function: generate_series".into());
                 };
                 let key = name.value.to_ascii_lowercase();
-                let expr = match arg_expr {
-                    sqlast::FunctionArgExpr::Expr(e) => e,
-                    _ => return Err("Unknown table function: generate_series".into()),
-                };
                 let value = if is_null_literal(expr) {
                     None
                 } else {
@@ -859,16 +726,9 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             (start.unwrap(), end.unwrap(), step)
         } else {
-            let values: Vec<i64> = normalized_args
+            let values: Vec<i64> = arguments
                 .iter()
-                .map(|arg| match arg {
-                    sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
-                        eval_const_i64(e)
-                    }
-                    other => Err(format!(
-                        "generate_series expects positional args, got {other}"
-                    )),
-                })
+                .map(eval_const_i64)
                 .collect::<Result<_, _>>()?;
             match values.as_slice() {
                 [s, e] => (*s, *e, 1i64),
@@ -884,7 +744,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
         // Determine output column name from alias or default
         let column_name = alias
-            .and_then(|a| a.columns.first().map(|c| c.name.value.clone()))
+            .and_then(|a| a.columns.first().map(|c| c.value.clone()))
             .unwrap_or_else(|| "generate_series".to_string());
         let alias_name = alias.map(|a| a.name.value.clone());
         let qualifier = alias_name.as_deref().unwrap_or("generate_series");
@@ -911,41 +771,28 @@ impl<'a> super::AnalyzerContext<'a> {
     /// base table.
     fn analyze_iceberg_delta_table_function(
         &self,
-        function: &sqlast::Function,
-        alias: Option<&sqlast::TableAlias>,
+        function: &ast::FunctionCall,
+        alias: Option<&ast::TableAlias>,
     ) -> Result<(Relation, AnalyzerScope), String> {
-        let sqlast::FunctionArguments::List(arg_list) = &function.args else {
-            return Err("__nr_ivm_delta requires three positional arguments: \
-                 (catalog.namespace.table, from_snapshot_id, to_snapshot_id)"
-                .into());
-        };
-        if arg_list.args.len() != 3 {
+        if function.arguments.len() != 3 {
             return Err(format!(
                 "__nr_ivm_delta requires 3 positional arguments \
                  (catalog.namespace.table, from_snapshot_id, to_snapshot_id), got {}",
-                arg_list.args.len()
+                function.arguments.len()
             ));
         }
 
         // Argument 0: three-part identifier as a string literal.
-        let three_part = positional_expr(&arg_list.args[0], "__nr_ivm_delta argument 0")?;
+        let three_part = &function.arguments[0];
         let three_part = match three_part {
-            sqlast::Expr::Value(v) => match &v.value {
-                sqlast::Value::SingleQuotedString(s)
-                | sqlast::Value::DoubleQuotedString(s)
-                | sqlast::Value::TripleSingleQuotedString(s)
-                | sqlast::Value::TripleDoubleQuotedString(s) => s.clone(),
-                _ => {
-                    return Err(format!(
-                        "__nr_ivm_delta argument 0 must be a string literal \
-                         (catalog.namespace.table), got {v}"
-                    ));
-                }
-            },
-            other => {
+            ast::Expr::Literal(ast::Literal {
+                kind: ast::LiteralKind::String(s),
+                ..
+            }) => s.clone(),
+            _ => {
                 return Err(format!(
                     "__nr_ivm_delta argument 0 must be a string literal \
-                     (catalog.namespace.table), got {other}"
+                         (catalog.namespace.table), got {three_part:?}"
                 ));
             }
         };
@@ -961,8 +808,8 @@ impl<'a> super::AnalyzerContext<'a> {
         let table_name = parts[2].to_string();
 
         // Argument 1 / 2: from_snapshot_id, to_snapshot_id (non-negative i64).
-        let from_expr = positional_expr(&arg_list.args[1], "__nr_ivm_delta argument 1")?;
-        let to_expr = positional_expr(&arg_list.args[2], "__nr_ivm_delta argument 2")?;
+        let from_expr = &function.arguments[1];
+        let to_expr = &function.arguments[2];
         let from_snapshot_id = eval_const_i64(from_expr)
             .map_err(|e| format!("__nr_ivm_delta from_snapshot_id: {e}"))?;
         let to_snapshot_id =
@@ -1016,34 +863,91 @@ impl<'a> super::AnalyzerContext<'a> {
     }
 }
 
-/// Extract the underlying expression from a positional `FunctionArg`,
-/// returning a clear error when the caller passed a named argument or
-/// any other unsupported form.
-fn positional_expr<'a>(
-    arg: &'a sqlast::FunctionArg,
-    context: &str,
-) -> Result<&'a sqlast::Expr, String> {
-    match arg {
-        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => Ok(e),
-        sqlast::FunctionArg::Named { .. } => Err(format!(
-            "{context} must be a positional argument, got a named argument"
-        )),
-        other => Err(format!(
-            "{context} must be a positional expression, got {other}"
+fn parse_join_operator(
+    operator: ast::JoinOperator,
+    constraint: &ast::JoinConstraint,
+) -> Result<(JoinKind, Option<&ast::JoinConstraint>), String> {
+    use ast::JoinOperator as Operator;
+
+    let kind = match operator {
+        Operator::Inner | Operator::InnerExplicit => JoinKind::Inner,
+        Operator::LeftOuter | Operator::LeftOuterExplicit => JoinKind::LeftOuter,
+        Operator::RightOuter | Operator::RightOuterExplicit => JoinKind::RightOuter,
+        Operator::FullOuter | Operator::FullOuterExplicit => JoinKind::FullOuter,
+        Operator::Cross => return Ok((JoinKind::Cross, None)),
+        Operator::LeftSemi => JoinKind::LeftSemi,
+        Operator::RightSemi => JoinKind::RightSemi,
+        Operator::LeftAnti => JoinKind::LeftAnti,
+        Operator::RightAnti => JoinKind::RightAnti,
+    };
+    Ok((kind, Some(constraint)))
+}
+
+fn generate_series_named_arg_is_some(expr: &ast::Expr) -> bool {
+    generate_series_named_arg(expr).is_some()
+}
+
+fn generate_series_named_arg(expr: &ast::Expr) -> Option<(&ast::Ident, &ast::Expr)> {
+    let ast::Expr::Binary(binary) = expr else {
+        return None;
+    };
+    if !matches!(
+        binary.operator,
+        ast::BinaryOperator::NamedArgument | ast::BinaryOperator::Equal
+    ) {
+        return None;
+    }
+    let ast::Expr::Identifier(name) = binary.left.as_ref() else {
+        return None;
+    };
+    Some((name, binary.right.as_ref()))
+}
+
+fn eval_const_i64(expr: &ast::Expr) -> Result<i64, String> {
+    match expr {
+        ast::Expr::Literal(ast::Literal {
+            kind: ast::LiteralKind::Number(number),
+            ..
+        }) => number
+            .parse::<i64>()
+            .map_err(|error| format!("cannot parse integer literal `{number}`: {error}")),
+        ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Minus) => {
+            Ok(-eval_const_i64(&unary.expression)?)
+        }
+        ast::Expr::Binary(binary) => {
+            let left = eval_const_i64(&binary.left)?;
+            let right = eval_const_i64(&binary.right)?;
+            match binary.operator {
+                ast::BinaryOperator::Add => Ok(left + right),
+                ast::BinaryOperator::Subtract => Ok(left - right),
+                ast::BinaryOperator::Multiply => Ok(left * right),
+                ast::BinaryOperator::Divide if right != 0 => Ok(left / right),
+                ast::BinaryOperator::Modulo if right != 0 => Ok(left % right),
+                operator => Err(format!(
+                    "unsupported operator in constant expression: {operator:?}"
+                )),
+            }
+        }
+        ast::Expr::Nested(nested) => eval_const_i64(&nested.expression),
+        _ => Err(format!(
+            "expected constant integer expression, got: {expr:?}"
         )),
     }
 }
 
-fn is_null_literal(expr: &sqlast::Expr) -> bool {
+fn is_null_literal(expr: &ast::Expr) -> bool {
     matches!(
         expr,
-        sqlast::Expr::Value(v) if matches!(v.value, sqlast::Value::Null)
+        ast::Expr::Literal(ast::Literal {
+            kind: ast::LiteralKind::Null,
+            ..
+        })
     )
 }
 
 fn derived_table_output_columns(
     columns: &[OutputColumn],
-    alias: Option<&sqlast::TableAlias>,
+    alias: Option<&ast::TableAlias>,
 ) -> Result<Vec<OutputColumn>, String> {
     let Some(alias) = alias else {
         return Ok(columns.to_vec());
@@ -1064,7 +968,7 @@ fn derived_table_output_columns(
         .zip(alias.columns.iter())
         .map(|(col, alias_col)| OutputColumn {
             column_id: col.column_id,
-            name: alias_col.name.value.clone(),
+            name: alias_col.value.clone(),
             data_type: col.data_type.clone(),
             nullable: col.nullable,
             is_internal: false,

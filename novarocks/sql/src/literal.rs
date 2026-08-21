@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! sqlparser AST -> NovaRocks `Expr`/`Literal` conversion, plus literal
+//! Native parser AST -> NovaRocks `Expr`/`Literal` conversion, plus literal
 //! utilities (compare, cast, arithmetic, encoding, and keying) used across
 //! SQL planning and standalone execution.
 //!
 //! All items here are pure functions with no standalone-runtime state. They
-//! translate between sqlparser tokens/expressions and NovaRocks types.
+//! translate between typed SQL expressions and NovaRocks types.
 
 use std::sync::Arc;
 
@@ -28,93 +28,78 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
-use crate::parser::ast::{ArithmeticOp, DefaultLiteral, Expr, Literal};
+use crate::syntax_ast::{
+    ArithmeticOp, ColumnRef, DefaultLiteral, Expr, Literal, ScalarFunctionExpr,
+};
 use novarocks_catalog::schema::{ColumnDefault, SqlType, validate_column_default};
+use novarocks_parser::{ast, printer};
 
 #[allow(
     dead_code,
     reason = "Retained for staged SQL planner migration consumers and test helpers."
 )]
-pub(crate) fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Result<Expr, String> {
-    use sqlparser::ast as sqlast;
+pub(crate) fn expr_to_custom_expr(expr: &ast::Expr) -> Result<Expr, String> {
     match expr {
-        sqlast::Expr::Identifier(ident) => Ok(Expr::Column(crate::parser::ast::ColumnRef {
+        ast::Expr::Identifier(ident) => Ok(Expr::Column(ColumnRef {
             name: ident.value.clone(),
         })),
-        sqlast::Expr::CompoundIdentifier(parts) => {
-            Ok(Expr::Column(crate::parser::ast::ColumnRef {
-                name: parts
-                    .last()
-                    .map(|p| p.value.clone())
-                    .ok_or_else(|| "empty column reference".to_string())?,
-            }))
-        }
-        sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => {
-            let lit = match value {
-                sqlast::Value::Null => Literal::Null,
-                sqlast::Value::Boolean(b) => Literal::Bool(*b),
-                sqlast::Value::Number(n, _) => sql_number_literal(n),
-                sqlast::Value::SingleQuotedString(s) | sqlast::Value::DoubleQuotedString(s) => {
-                    Literal::String(s.clone())
-                }
-                _ => return Err(format!("unsupported value in expression: {value}")),
-            };
-            Ok(Expr::Literal(lit))
-        }
-        sqlast::Expr::BinaryOp { left, op, right } => {
-            let left_expr = sqlparser_expr_to_custom_expr(left)?;
-            let right_expr = sqlparser_expr_to_custom_expr(right)?;
-            match op {
-                sqlast::BinaryOperator::Plus => Ok(Expr::Arithmetic {
+        ast::Expr::CompoundIdentifier(parts) => Ok(Expr::Column(ColumnRef {
+            name: parts
+                .parts
+                .last()
+                .map(|p| p.value.clone())
+                .ok_or_else(|| "empty column reference".to_string())?,
+        })),
+        ast::Expr::Literal(literal) => Ok(Expr::Literal(native_literal_to_literal(literal)?)),
+        ast::Expr::Binary(binary) => {
+            let left_expr = expr_to_custom_expr(&binary.left)?;
+            let right_expr = expr_to_custom_expr(&binary.right)?;
+            match binary.operator {
+                ast::BinaryOperator::Add => Ok(Expr::Arithmetic {
                     left: Box::new(left_expr),
                     op: ArithmeticOp::Add,
                     right: Box::new(right_expr),
                 }),
-                sqlast::BinaryOperator::Minus => Ok(Expr::Arithmetic {
+                ast::BinaryOperator::Subtract => Ok(Expr::Arithmetic {
                     left: Box::new(left_expr),
                     op: ArithmeticOp::Sub,
                     right: Box::new(right_expr),
                 }),
-                sqlast::BinaryOperator::Multiply => Ok(Expr::Arithmetic {
+                ast::BinaryOperator::Multiply => Ok(Expr::Arithmetic {
                     left: Box::new(left_expr),
                     op: ArithmeticOp::Mul,
                     right: Box::new(right_expr),
                 }),
-                sqlast::BinaryOperator::Divide => Ok(Expr::Arithmetic {
+                ast::BinaryOperator::Divide => Ok(Expr::Arithmetic {
                     left: Box::new(left_expr),
                     op: ArithmeticOp::Div,
                     right: Box::new(right_expr),
                 }),
-                sqlast::BinaryOperator::Modulo => Ok(Expr::Arithmetic {
+                ast::BinaryOperator::Modulo => Ok(Expr::Arithmetic {
                     left: Box::new(left_expr),
                     op: ArithmeticOp::Mod,
                     right: Box::new(right_expr),
                 }),
-                other => Err(format!("unsupported operator in expression: {other}")),
+                other => Err(format!("unsupported operator in expression: {other:?}")),
             }
         }
-        sqlast::Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } => {
-            let inner_expr = sqlparser_expr_to_custom_expr(inner)?;
-            let sql_type = crate::parser::dialect::convert_sql_type(data_type.clone())?;
+        ast::Expr::Cast(cast) => {
+            let inner_expr = expr_to_custom_expr(&cast.expr)?;
+            let sql_type = type_name_to_sql_type(&cast.data_type)?;
             Ok(Expr::Cast {
                 expr: Box::new(inner_expr),
                 data_type: sql_type,
             })
         }
-        sqlast::Expr::UnaryOp {
-            op: sqlast::UnaryOperator::Minus,
-            expr: inner,
-        } => Ok(Expr::Literal(negate_literal(sqlparser_expr_to_literal(
-            inner,
-        )?)?)),
-        sqlast::Expr::Nested(inner) => sqlparser_expr_to_custom_expr(inner),
-        sqlast::Expr::Array(sqlast::Array { elem, .. }) => Ok(Expr::Array(
-            elem.iter()
-                .map(sqlparser_expr_to_custom_expr)
+        ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Minus => Ok(
+            Expr::Literal(negate_literal(expr_to_literal(&unary.expression)?)?),
+        ),
+        ast::Expr::Nested(nested) => expr_to_custom_expr(&nested.expression),
+        ast::Expr::Array(array) => Ok(Expr::Array(
+            array
+                .elements
+                .iter()
+                .map(expr_to_custom_expr)
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         // Function calls: try constant-folding via the INSERT-VALUES literal
@@ -122,24 +107,46 @@ pub(crate) fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Resu
         // `to_binary(...)`, etc.). If folding fails (e.g. args reference a
         // column), fall back to a ScalarFunction node that the row-wise
         // evaluator can dispatch on.
-        sqlast::Expr::Function(func) => {
+        ast::Expr::FunctionCall(func) => {
             if let Some(expr) = try_array_map_cast_string_custom_expr(func)? {
                 return Ok(expr);
             }
-            if let Ok(lit) = sqlparser_function_to_literal(func) {
+            if let Ok(lit) = function_to_literal(func) {
                 return Ok(Expr::Literal(lit));
             }
-            let name = func.name.to_string().to_ascii_lowercase();
-            let args = function_expr_args(&func.args)?
+            let name = object_name_lower(&func.name)?;
+            let args = function_expr_args(&func.arguments)?
                 .into_iter()
-                .map(sqlparser_expr_to_custom_expr)
+                .map(expr_to_custom_expr)
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Expr::ScalarFunction(
-                crate::parser::ast::ScalarFunctionExpr { name, args },
-            ))
+            Ok(Expr::ScalarFunction(ScalarFunctionExpr { name, args }))
         }
-        other => Err(format!("unsupported expression: {other}")),
+        other => Err(format!(
+            "unsupported expression: {}",
+            printer::print_expr(other)
+        )),
     }
+}
+
+fn native_literal_to_literal(literal: &ast::Literal) -> Result<Literal, String> {
+    match &literal.kind {
+        ast::LiteralKind::Null => Ok(Literal::Null),
+        ast::LiteralKind::Boolean(value) => Ok(Literal::Bool(*value)),
+        ast::LiteralKind::Number(value) => Ok(sql_number_literal(value)),
+        ast::LiteralKind::String(value) => Ok(Literal::String(value.clone())),
+        ast::LiteralKind::HexString(value) => {
+            let bytes = hex::decode(value)
+                .map_err(|error| format!("invalid hex literal X'{value}': {error}"))?;
+            Ok(Literal::String(bytes_to_latin1_string(&bytes)))
+        }
+    }
+}
+
+fn object_name_lower(name: &ast::ObjectName) -> Result<String, String> {
+    name.parts
+        .last()
+        .map(|part| part.value.to_ascii_lowercase())
+        .ok_or_else(|| "function name cannot be empty".to_string())
 }
 
 pub(crate) fn bytes_to_latin1_string(bytes: &[u8]) -> String {
@@ -213,29 +220,14 @@ pub(crate) fn parse_datetime_string_to_nanos(s: &str) -> Result<i64, String> {
     Err(format!("invalid datetime literal `{s}`"))
 }
 
-/// Convert a sqlparser expression to a Literal (for INSERT VALUES)
-pub(crate) fn sqlparser_expr_to_literal(expr: &sqlparser::ast::Expr) -> Result<Literal, String> {
-    use sqlparser::ast as sqlast;
+/// Convert a native expression to a Literal for INSERT VALUES.
+pub(crate) fn expr_to_literal(expr: &ast::Expr) -> Result<Literal, String> {
     match expr {
-        sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => match value {
-            sqlast::Value::Null => Ok(Literal::Null),
-            sqlast::Value::Number(n, _) => Ok(sql_number_literal(n)),
-            sqlast::Value::SingleQuotedString(s) | sqlast::Value::DoubleQuotedString(s) => {
-                Ok(Literal::String(s.clone()))
-            }
-            sqlast::Value::HexStringLiteral(s) => {
-                let bytes =
-                    hex::decode(s).map_err(|err| format!("invalid hex literal X'{s}': {err}"))?;
-                Ok(Literal::String(bytes_to_latin1_string(&bytes)))
-            }
-            sqlast::Value::Boolean(b) => Ok(Literal::Bool(*b)),
-            _ => Err(format!("unsupported literal in INSERT VALUES: {value}")),
-        },
-        sqlast::Expr::UnaryOp {
-            op: sqlast::UnaryOperator::Minus,
-            expr: inner,
-        } => negate_literal(sqlparser_expr_to_literal(inner)?),
-        sqlast::Expr::Nested(inner) => sqlparser_expr_to_literal(inner),
+        ast::Expr::Literal(literal) => native_literal_to_literal(literal),
+        ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Minus => {
+            negate_literal(expr_to_literal(&unary.expression)?)
+        }
+        ast::Expr::Nested(nested) => expr_to_literal(&nested.expression),
         // Handle CAST(expr AS type): peel the CAST and evaluate the inner literal,
         // EXCEPT for DECIMAL targets. CAST to a DECIMAL type carries an explicit
         // (precision, scale) that the literal fast-path ignores — it always writes
@@ -245,97 +237,182 @@ pub(crate) fn sqlparser_expr_to_literal(expr: &sqlparser::ast::Expr) -> Result<L
         // the INSERT through the full query pipeline instead, where the CAST is
         // evaluated with its declared type and the narrowing to the sink's
         // DECIMAL(p,s) is handled at write time (with rounding).
-        sqlast::Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } => {
-            if cast_data_type_is_decimal(data_type) {
+        ast::Expr::Cast(cast) => {
+            if cast_type_is_decimal(&cast.data_type) {
                 Err(format!(
-                    "CAST to DECIMAL in INSERT SELECT requires pipeline evaluation: {expr}"
+                    "CAST to DECIMAL in INSERT SELECT requires pipeline evaluation: {}",
+                    printer::print_expr(expr)
                 ))
             } else {
-                sqlparser_expr_to_literal(inner)
+                expr_to_literal(&cast.expr)
             }
         }
         // Handle DATE '2024-01-01' typed strings
-        sqlast::Expr::TypedString(typed) => Ok(Literal::String(typed.value.to_string())),
+        ast::Expr::TypedString(typed) => native_literal_to_literal(&typed.value),
         // In MySQL mode, "value" is parsed as an identifier — treat as string literal
-        sqlast::Expr::Identifier(ident) => Ok(Literal::String(ident.value.clone())),
+        ast::Expr::Identifier(ident) => Ok(Literal::String(ident.value.clone())),
         // Handle binary operations like 10000 - 1
-        sqlast::Expr::BinaryOp { left, op, right } => {
-            let l = sqlparser_expr_to_literal(left)?;
-            let r = sqlparser_expr_to_literal(right)?;
-            match (l, op, r) {
-                (Literal::Int(a), sqlast::BinaryOperator::Plus, Literal::Int(b)) => {
+        ast::Expr::Binary(binary) => {
+            let l = expr_to_literal(&binary.left)?;
+            let r = expr_to_literal(&binary.right)?;
+            match (l, binary.operator, r) {
+                (Literal::Int(a), ast::BinaryOperator::Add, Literal::Int(b)) => {
                     Ok(Literal::Int(a + b))
                 }
-                (Literal::Int(a), sqlast::BinaryOperator::Minus, Literal::Int(b)) => {
+                (Literal::Int(a), ast::BinaryOperator::Subtract, Literal::Int(b)) => {
                     Ok(Literal::Int(a - b))
                 }
-                (Literal::Int(a), sqlast::BinaryOperator::Multiply, Literal::Int(b)) => {
+                (Literal::Int(a), ast::BinaryOperator::Multiply, Literal::Int(b)) => {
                     Ok(Literal::Int(a * b))
                 }
-                (Literal::Float(a), sqlast::BinaryOperator::Plus, Literal::Float(b)) => {
+                (Literal::Float(a), ast::BinaryOperator::Add, Literal::Float(b)) => {
                     Ok(Literal::Float(a + b))
                 }
-                (Literal::Float(a), sqlast::BinaryOperator::Minus, Literal::Float(b)) => {
+                (Literal::Float(a), ast::BinaryOperator::Subtract, Literal::Float(b)) => {
                     Ok(Literal::Float(a - b))
                 }
-                _ => Err(format!("unsupported expression in INSERT VALUES: {expr}")),
+                _ => Err(format!(
+                    "unsupported expression in INSERT VALUES: {}",
+                    printer::print_expr(expr)
+                )),
             }
         }
         // Handle array literal [1, 2, 3]
-        sqlast::Expr::Array(sqlast::Array { elem, .. }) => Ok(Literal::Array(
-            elem.iter()
-                .map(sqlparser_expr_to_literal)
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        sqlast::Expr::Function(func) => sqlparser_function_to_literal(func),
-        sqlast::Expr::Tuple(values) => Ok(Literal::Struct(
-            values
+        ast::Expr::Array(array) => Ok(Literal::Array(
+            array
+                .elements
                 .iter()
-                .map(sqlparser_expr_to_literal)
+                .map(expr_to_literal)
                 .collect::<Result<Vec<_>, _>>()?,
         )),
-        sqlast::Expr::Struct { values, .. } => Ok(Literal::Struct(
-            values
+        ast::Expr::FunctionCall(func) => function_to_literal(func),
+        ast::Expr::Tuple(tuple) => Ok(Literal::Struct(
+            tuple
+                .expressions
                 .iter()
-                .map(sqlparser_expr_to_literal)
+                .map(expr_to_literal)
                 .collect::<Result<Vec<_>, _>>()?,
         )),
-        sqlast::Expr::Map(map) => Ok(Literal::Map(
+        ast::Expr::Struct(struct_expr) => Ok(Literal::Struct(
+            struct_expr
+                .fields
+                .iter()
+                .map(|field| expr_to_literal(&field.value))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        ast::Expr::Map(map) => Ok(Literal::Map(
             map.entries
                 .iter()
-                .map(|entry| {
-                    Ok((
-                        sqlparser_expr_to_literal(&entry.key)?,
-                        sqlparser_expr_to_literal(&entry.value)?,
-                    ))
-                })
+                .map(|entry| Ok((expr_to_literal(&entry.key)?, expr_to_literal(&entry.value)?)))
                 .collect::<Result<Vec<_>, String>>()?,
         )),
-        _ => Err(format!("unsupported expression in INSERT VALUES: {expr}")),
+        _ => Err(format!(
+            "unsupported expression in INSERT VALUES: {}",
+            printer::print_expr(expr)
+        )),
     }
 }
 
-/// Returns true if the given sqlparser DataType is a DECIMAL variant (including
-/// StarRocks-style DECIMAL32/DECIMAL64/DECIMAL128 custom names). Used to decide
+/// Returns true if the given native TypeName is a DECIMAL variant (including
+/// StarRocks-style DECIMAL32/DECIMAL64/DECIMAL128 names). Used to decide
 /// whether a CAST-to-DECIMAL expression should be routed through the full query
 /// pipeline rather than being folded into a bare literal.
-fn cast_data_type_is_decimal(data_type: &sqlparser::ast::DataType) -> bool {
-    use sqlparser::ast::DataType as DT;
-    match data_type {
-        DT::Decimal(_) | DT::Dec(_) | DT::Numeric(_) => true,
-        DT::Custom(name, _) => {
-            let lower = name.to_string().to_lowercase();
-            matches!(
-                lower.as_str(),
-                "decimal" | "decimal32" | "decimal64" | "decimal128"
-            )
+fn cast_type_is_decimal(data_type: &ast::TypeName) -> bool {
+    data_type.name.parts.last().is_some_and(|part| {
+        matches!(
+            part.value.to_ascii_lowercase().as_str(),
+            "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128"
+        )
+    })
+}
+
+fn type_name_to_sql_type(data_type: &ast::TypeName) -> Result<SqlType, String> {
+    let name = data_type
+        .name
+        .parts
+        .last()
+        .map(|part| part.value.to_ascii_lowercase())
+        .ok_or_else(|| "CAST target type has no name".to_string())?;
+    match name.as_str() {
+        "tinyint" => Ok(SqlType::TinyInt),
+        "smallint" => Ok(SqlType::SmallInt),
+        "int" | "integer" => Ok(SqlType::Int),
+        "bigint" => Ok(SqlType::BigInt),
+        "largeint" => Ok(SqlType::LargeInt),
+        "float" | "real" => Ok(SqlType::Float),
+        "double" | "double precision" => Ok(SqlType::Double),
+        "boolean" | "bool" => Ok(SqlType::Boolean),
+        "varchar" | "char" | "character" | "string" | "text" => Ok(SqlType::String),
+        "json" | "jsonb" => Ok(SqlType::Json),
+        "varbinary" | "binary" => Ok(SqlType::Binary),
+        "bitmap" => Ok(SqlType::Bitmap),
+        "hll" => Ok(SqlType::Hll),
+        "date" => Ok(SqlType::Date),
+        "datetime" | "timestamp" | "timestamptz" => Ok(SqlType::DateTime),
+        "datetime_ns" | "timestamp_ns" | "timestamptz_ns" => Ok(SqlType::DateTimeNs),
+        "time" => Ok(SqlType::Time),
+        "variant" => Ok(SqlType::Variant),
+        "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
+            let precision = type_numeric_argument(&data_type.arguments, 0)?.unwrap_or(38) as u8;
+            let scale = type_numeric_argument(&data_type.arguments, 1)?.unwrap_or(0) as i8;
+            Ok(SqlType::Decimal { precision, scale })
         }
-        _ => false,
+        "array" => Ok(SqlType::Array(Box::new(type_type_argument(
+            &data_type.arguments,
+            0,
+            "ARRAY",
+        )?))),
+        "map" => Ok(SqlType::Map(
+            Box::new(type_type_argument(&data_type.arguments, 0, "MAP")?),
+            Box::new(type_type_argument(&data_type.arguments, 1, "MAP")?),
+        )),
+        "struct" => data_type
+            .arguments
+            .iter()
+            .enumerate()
+            .map(|(index, argument)| match argument {
+                ast::TypeNameArgument::Field(field) => Ok((
+                    field.name.value.clone(),
+                    type_name_to_sql_type(&field.data_type)?,
+                )),
+                ast::TypeNameArgument::Type(data_type) => {
+                    Ok((format!("f{}", index + 1), type_name_to_sql_type(data_type)?))
+                }
+                ast::TypeNameArgument::Literal(_) => {
+                    Err("STRUCT type field must include a type name".to_string())
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(SqlType::Struct),
+        _ => Err(format!("unsupported SQL type: {name}")),
     }
+}
+
+fn type_numeric_argument(
+    arguments: &[ast::TypeNameArgument],
+    index: usize,
+) -> Result<Option<u64>, String> {
+    let Some(ast::TypeNameArgument::Literal(literal)) = arguments.get(index) else {
+        return Ok(None);
+    };
+    let ast::LiteralKind::Number(value) = &literal.kind else {
+        return Err("numeric type parameter must be an integer literal".to_string());
+    };
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|error| format!("invalid numeric type parameter `{value}`: {error}"))
+}
+
+fn type_type_argument(
+    arguments: &[ast::TypeNameArgument],
+    index: usize,
+    kind: &str,
+) -> Result<SqlType, String> {
+    let Some(ast::TypeNameArgument::Type(data_type)) = arguments.get(index) else {
+        return Err(format!("{kind} type requires a type parameter"));
+    };
+    type_name_to_sql_type(data_type)
 }
 
 pub(crate) fn sql_number_literal(input: &str) -> Literal {
@@ -417,16 +494,16 @@ fn literal_to_json_value(literal: Literal) -> Result<JsonValue, String> {
     })
 }
 
-fn json_object_literal(args: &[&sqlparser::ast::Expr]) -> Result<Literal, String> {
+fn json_object_literal(args: &[&ast::Expr]) -> Result<Literal, String> {
     let mut object = JsonMap::new();
     let mut idx = 0usize;
     while idx < args.len() {
-        let key = sqlparser_expr_to_literal(args[idx])?;
+        let key = expr_to_literal(args[idx])?;
         let Some(key) = literal_to_json_key(key)? else {
             return Ok(Literal::Null);
         };
         let value = if let Some(value_expr) = args.get(idx + 1) {
-            literal_to_json_value(sqlparser_expr_to_literal(value_expr)?)?
+            literal_to_json_value(expr_to_literal(value_expr)?)?
         } else {
             JsonValue::Null
         };
@@ -488,13 +565,9 @@ pub(crate) fn literal_to_i128_for_integer(
     }
 }
 
-pub(crate) fn sqlparser_function_to_literal(
-    func: &sqlparser::ast::Function,
-) -> Result<Literal, String> {
-    use sqlparser::ast as sqlast;
-
-    let args = function_expr_args(&func.args)?;
-    let name = func.name.to_string().to_ascii_lowercase();
+pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, String> {
+    let args = function_expr_args(&func.arguments)?;
+    let name = object_name_lower(&func.name)?;
     if let Some(value) = try_array_map_cast_string_literal(&name, &args)? {
         return Ok(value);
     }
@@ -502,7 +575,7 @@ pub(crate) fn sqlparser_function_to_literal(
         "array_generate" => {
             let values = args
                 .iter()
-                .map(|arg| sqlparser_expr_to_literal(arg))
+                .map(|arg| expr_to_literal(arg))
                 .collect::<Result<Vec<_>, _>>()?;
             eval_array_generate_literal(&values)
         }
@@ -510,8 +583,8 @@ pub(crate) fn sqlparser_function_to_literal(
             if args.len() != 2 {
                 return Err("array_repeat expects 2 arguments".to_string());
             }
-            let value = sqlparser_expr_to_literal(args[0])?;
-            let repeat = match sqlparser_expr_to_literal(args[1])? {
+            let value = expr_to_literal(args[0])?;
+            let repeat = match expr_to_literal(args[1])? {
                 Literal::Int(v) => v,
                 other => return Err(format!("array_repeat expects integer count, got {other:?}")),
             };
@@ -527,8 +600,8 @@ pub(crate) fn sqlparser_function_to_literal(
             if args.len() != 2 {
                 return Err("array_append expects 2 arguments".to_string());
             }
-            let array = sqlparser_expr_to_literal(args[0])?;
-            let value = sqlparser_expr_to_literal(args[1])?;
+            let array = expr_to_literal(args[0])?;
+            let value = expr_to_literal(args[1])?;
             match array {
                 Literal::Null => Ok(Literal::Null),
                 Literal::Array(mut values) => {
@@ -558,30 +631,20 @@ pub(crate) fn sqlparser_function_to_literal(
             // hashes Int64 little-endian bytes, while the runtime path hashes
             // the cast's native (narrower) width. Allowing the unwrap would
             // produce values that disagree with `eval_hll_hash` at runtime.
-            if let sqlast::Expr::Cast { data_type, .. } = args[0] {
-                let narrowing = matches!(
-                    data_type,
-                    sqlast::DataType::TinyInt(_)
-                        | sqlast::DataType::TinyIntUnsigned(_)
-                        | sqlast::DataType::UTinyInt
-                        | sqlast::DataType::SmallInt(_)
-                        | sqlast::DataType::SmallIntUnsigned(_)
-                        | sqlast::DataType::USmallInt
-                        | sqlast::DataType::Int2(_)
-                        | sqlast::DataType::Int2Unsigned(_)
-                        | sqlast::DataType::MediumInt(_)
-                        | sqlast::DataType::MediumIntUnsigned(_)
-                        | sqlast::DataType::Int(_)
-                        | sqlast::DataType::Integer(_)
-                        | sqlast::DataType::IntUnsigned(_)
-                        | sqlast::DataType::IntegerUnsigned(_)
-                        | sqlast::DataType::Int4(_)
-                        | sqlast::DataType::Int4Unsigned(_)
-                        | sqlast::DataType::Int16
-                        | sqlast::DataType::Int32
-                        | sqlast::DataType::Float(_)
-                        | sqlast::DataType::FloatUnsigned(_)
-                );
+            if let ast::Expr::Cast(cast) = args[0] {
+                let narrowing = cast.data_type.name.parts.last().is_some_and(|part| {
+                    matches!(
+                        part.value.to_ascii_lowercase().as_str(),
+                        "tinyint"
+                            | "smallint"
+                            | "int"
+                            | "integer"
+                            | "int2"
+                            | "int4"
+                            | "mediumint"
+                            | "float"
+                    )
+                });
                 if narrowing {
                     return Err(
                         "hll_hash with narrowing CAST argument is not supported in INSERT VALUES; \
@@ -593,7 +656,7 @@ pub(crate) fn sqlparser_function_to_literal(
             use novarocks_types::value::hll::{
                 MURMUR_SEED, encode_hll_empty, encode_hll_single, murmur_hash64a,
             };
-            let arg = sqlparser_expr_to_literal(args[0])?;
+            let arg = expr_to_literal(args[0])?;
             // Mirror the runtime `eval_hll_hash` byte conversion exactly:
             //   - NULL  → encode_hll_empty()
             //   - Int   → Int64 little-endian (analyzer types integer literals as Int64)
@@ -630,12 +693,12 @@ pub(crate) fn sqlparser_function_to_literal(
                 return Err("to_binary expects 1 or 2 arguments".to_string());
             }
 
-            let Literal::String(input) = sqlparser_expr_to_literal(args[0])? else {
+            let Literal::String(input) = expr_to_literal(args[0])? else {
                 return Err("to_binary expects VARCHAR as first argument".to_string());
             };
 
             let format = if args.len() == 2 {
-                let Literal::String(format) = sqlparser_expr_to_literal(args[1])? else {
+                let Literal::String(format) = expr_to_literal(args[1])? else {
                     return Err("to_binary expects VARCHAR format argument".to_string());
                 };
                 format
@@ -665,7 +728,7 @@ pub(crate) fn sqlparser_function_to_literal(
             if args.len() != 1 {
                 return Err("bitmap_from_string expects 1 argument".to_string());
             }
-            let arg = sqlparser_expr_to_literal(args[0])?;
+            let arg = expr_to_literal(args[0])?;
             let text = match arg {
                 Literal::Null => return Ok(Literal::Null),
                 Literal::String(s) => s,
@@ -693,7 +756,7 @@ pub(crate) fn sqlparser_function_to_literal(
                 return Err("to_bitmap expects 1 argument".to_string());
             }
             use novarocks_types::value::bitmap::encode_bitmap_single;
-            let arg = sqlparser_expr_to_literal(args[0])?;
+            let arg = expr_to_literal(args[0])?;
             // Mirror `eval_to_bitmap` runtime semantics for scalar literals:
             //   - NULL or negative integer → NULL
             //   - Int  → encode as u64 (Int64 runtime arm uses i128::from then casts)
@@ -723,7 +786,7 @@ pub(crate) fn sqlparser_function_to_literal(
             use md5::Digest;
             let mut hasher = md5::Md5::new();
             for arg in args {
-                let literal = sqlparser_expr_to_literal(arg)?;
+                let literal = expr_to_literal(arg)?;
                 let Some(bytes) = literal_to_varchar_bytes(&literal)? else {
                     continue;
                 };
@@ -735,7 +798,7 @@ pub(crate) fn sqlparser_function_to_literal(
             if args.len() != 1 {
                 return Err("parse_json expects 1 argument".to_string());
             }
-            let Literal::String(json_text) = sqlparser_expr_to_literal(args[0])? else {
+            let Literal::String(json_text) = expr_to_literal(args[0])? else {
                 return Err("parse_json expects VARCHAR argument".to_string());
             };
             let bytes = novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(
@@ -749,7 +812,7 @@ pub(crate) fn sqlparser_function_to_literal(
         }
         "row" => Ok(Literal::Struct(
             args.into_iter()
-                .map(sqlparser_expr_to_literal)
+                .map(expr_to_literal)
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         "named_struct" => {
@@ -763,7 +826,7 @@ pub(crate) fn sqlparser_function_to_literal(
                 args.into_iter()
                     .skip(1)
                     .step_by(2)
-                    .map(sqlparser_expr_to_literal)
+                    .map(expr_to_literal)
                     .collect::<Result<Vec<_>, _>>()?,
             ))
         }
@@ -776,16 +839,13 @@ pub(crate) fn sqlparser_function_to_literal(
             }
             let mut entries = Vec::with_capacity(args.len() / 2);
             for pair in args.chunks_exact(2) {
-                entries.push((
-                    sqlparser_expr_to_literal(pair[0])?,
-                    sqlparser_expr_to_literal(pair[1])?,
-                ));
+                entries.push((expr_to_literal(pair[0])?, expr_to_literal(pair[1])?));
             }
             Ok(Literal::Map(entries))
         }
         _ => Err(format!(
             "unsupported expression in INSERT VALUES: {}",
-            sqlast::Expr::Function(func.clone())
+            printer::print_expr(&ast::Expr::FunctionCall(func.clone()))
         )),
     }
 }
@@ -807,26 +867,24 @@ fn literal_to_varchar_bytes(value: &Literal) -> Result<Option<Vec<u8>>, String> 
     dead_code,
     reason = "Retained for staged SQL planner migration consumers and test helpers."
 )]
-fn try_array_map_cast_string_custom_expr(
-    func: &sqlparser::ast::Function,
-) -> Result<Option<Expr>, String> {
-    let name = func.name.to_string().to_ascii_lowercase();
+fn try_array_map_cast_string_custom_expr(func: &ast::FunctionCall) -> Result<Option<Expr>, String> {
+    let name = object_name_lower(&func.name)?;
     if name != "array_map" && name != "transform" {
         return Ok(None);
     }
-    let args = function_expr_args(&func.args)?;
+    let args = function_expr_args(&func.arguments)?;
     if !array_map_cast_string_lambda_matches(&args)? {
         return Ok(None);
     }
     Ok(Some(Expr::Cast {
-        expr: Box::new(sqlparser_expr_to_custom_expr(args[1])?),
+        expr: Box::new(expr_to_custom_expr(args[1])?),
         data_type: SqlType::Array(Box::new(SqlType::String)),
     }))
 }
 
 fn try_array_map_cast_string_literal(
     name: &str,
-    args: &[&sqlparser::ast::Expr],
+    args: &[&ast::Expr],
 ) -> Result<Option<Literal>, String> {
     if name != "array_map" && name != "transform" {
         return Ok(None);
@@ -834,7 +892,7 @@ fn try_array_map_cast_string_literal(
     if !array_map_cast_string_lambda_matches(args)? {
         return Ok(None);
     }
-    let array_value = sqlparser_expr_to_literal(args[1])?;
+    let array_value = expr_to_literal(args[1])?;
     match array_value {
         Literal::Null => Ok(Some(Literal::Null)),
         Literal::Array(values) => values
@@ -847,7 +905,7 @@ fn try_array_map_cast_string_literal(
     }
 }
 
-fn array_map_cast_string_lambda_matches(args: &[&sqlparser::ast::Expr]) -> Result<bool, String> {
+fn array_map_cast_string_lambda_matches(args: &[&ast::Expr]) -> Result<bool, String> {
     if args.len() != 2 {
         return Ok(false);
     }
@@ -857,81 +915,40 @@ fn array_map_cast_string_lambda_matches(args: &[&sqlparser::ast::Expr]) -> Resul
     lambda_body_casts_param_to_string(body, &param_name)
 }
 
-fn parse_single_arrow_lambda(
-    expr: &sqlparser::ast::Expr,
-) -> Option<(String, &sqlparser::ast::Expr)> {
-    use sqlparser::ast as sqlast;
+fn parse_single_arrow_lambda(expr: &ast::Expr) -> Option<(String, &ast::Expr)> {
     match expr {
-        sqlast::Expr::Lambda(lambda) => lambda
-            .params
+        ast::Expr::Lambda(lambda) => lambda
+            .parameters
             .first()
             .map(|ident| (ident.value.to_lowercase(), lambda.body.as_ref())),
-        sqlast::Expr::BinaryOp {
-            left,
-            op: sqlast::BinaryOperator::Arrow,
-            right,
-        } => parse_single_lambda_param(left).map(|param| (param, right.as_ref())),
-        sqlast::Expr::Nested(inner) => parse_single_arrow_lambda(inner),
+        ast::Expr::Nested(nested) => parse_single_arrow_lambda(&nested.expression),
         _ => None,
     }
 }
 
-fn parse_single_lambda_param(expr: &sqlparser::ast::Expr) -> Option<String> {
+fn lambda_body_casts_param_to_string(expr: &ast::Expr, param_name: &str) -> Result<bool, String> {
     match expr {
-        sqlparser::ast::Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
-        sqlparser::ast::Expr::Nested(inner) => parse_single_lambda_param(inner),
-        _ => None,
-    }
-}
-
-fn lambda_body_casts_param_to_string(
-    expr: &sqlparser::ast::Expr,
-    param_name: &str,
-) -> Result<bool, String> {
-    use sqlparser::ast as sqlast;
-    match expr {
-        sqlast::Expr::Nested(inner) => lambda_body_casts_param_to_string(inner, param_name),
-        sqlast::Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } if lambda_expr_is_param(inner, param_name) => {
-            let sql_type = crate::parser::dialect::convert_sql_type(data_type.clone())?;
+        ast::Expr::Nested(nested) => {
+            lambda_body_casts_param_to_string(&nested.expression, param_name)
+        }
+        ast::Expr::Cast(cast) if lambda_expr_is_param(&cast.expr, param_name) => {
+            let sql_type = type_name_to_sql_type(&cast.data_type)?;
             Ok(matches!(sql_type, SqlType::String))
         }
         _ => Ok(false),
     }
 }
 
-fn lambda_expr_is_param(expr: &sqlparser::ast::Expr, param_name: &str) -> bool {
+fn lambda_expr_is_param(expr: &ast::Expr, param_name: &str) -> bool {
     match expr {
-        sqlparser::ast::Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(param_name),
-        sqlparser::ast::Expr::Nested(inner) => lambda_expr_is_param(inner, param_name),
+        ast::Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(param_name),
+        ast::Expr::Nested(nested) => lambda_expr_is_param(&nested.expression, param_name),
         _ => false,
     }
 }
 
-pub(crate) fn function_expr_args(
-    args: &sqlparser::ast::FunctionArguments,
-) -> Result<Vec<&sqlparser::ast::Expr>, String> {
-    use sqlparser::ast as sqlast;
-
-    match args {
-        sqlast::FunctionArguments::None => Ok(Vec::new()),
-        sqlast::FunctionArguments::List(list) => list
-            .args
-            .iter()
-            .map(|arg| match arg {
-                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(expr)) => Ok(expr),
-                other => Err(format!(
-                    "unsupported function argument in INSERT VALUES: {other}"
-                )),
-            })
-            .collect(),
-        other => Err(format!(
-            "unsupported function argument form in INSERT VALUES: {other}"
-        )),
-    }
+pub(crate) fn function_expr_args(args: &[ast::Expr]) -> Result<Vec<&ast::Expr>, String> {
+    Ok(args.iter().collect())
 }
 
 /// Evaluate arithmetic on `Literal` values without `ManualValue`.
@@ -1792,14 +1809,22 @@ fn default_out_of_range(type_name: &str, value: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::ast::{Expr, Literal};
-    use crate::parser::dialect::StarRocksDialect;
+    use crate::syntax_ast::{Expr, Literal};
 
-    fn parse_expr(sql: &str) -> sqlparser::ast::Expr {
-        let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
-            .try_with_sql(sql)
-            .expect("build parser");
-        parser.parse_expr().expect("parse expression")
+    fn parse_expr(sql: &str) -> novarocks_parser::ast::Expr {
+        let statements =
+            novarocks_parser::parse(&format!("SELECT {sql}")).expect("parse expression query");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected query");
+        };
+        let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let [novarocks_parser::ast::SelectItem::UnnamedExpr(expr)] = select.projection.as_slice()
+        else {
+            panic!("expected expression projection");
+        };
+        expr.clone()
     }
 
     #[test]
@@ -2231,11 +2256,11 @@ mod tests {
 
     #[test]
     fn scalar_function_falls_back_when_literal_fold_fails() {
-        // `concat` is not a constant-foldable function in `sqlparser_function_to_literal`,
+        // `concat` is not a constant-foldable function in `function_to_literal`,
         // so we expect a ScalarFunction node preserving the nested column ref and the
         // CAST around it.
         let raw = parse_expr("concat('value_', CAST(generate_series AS VARCHAR))");
-        let converted = sqlparser_expr_to_custom_expr(&raw).expect("convert");
+        let converted = expr_to_custom_expr(&raw).expect("convert");
         match converted {
             Expr::ScalarFunction(func) => {
                 assert_eq!(func.name, "concat");
@@ -2255,7 +2280,7 @@ mod tests {
         // `generate_series`; expect nested ScalarFunction(to_binary -> ScalarFunction(concat)).
         let raw =
             parse_expr("to_binary(concat('value_', CAST(generate_series AS VARCHAR)), 'utf8')");
-        let converted = sqlparser_expr_to_custom_expr(&raw).expect("convert");
+        let converted = expr_to_custom_expr(&raw).expect("convert");
         let Expr::ScalarFunction(outer) = converted else {
             panic!("expected outer ScalarFunction");
         };
@@ -2268,18 +2293,17 @@ mod tests {
     #[test]
     fn constant_function_call_folds_to_literal() {
         // `row(100, 100)` and `map(1, 5.5)` should constant-fold through
-        // `sqlparser_function_to_literal` when used as SELECT projections.
-        let row = sqlparser_expr_to_custom_expr(&parse_expr("row(100, 100)")).expect("row");
+        // `function_to_literal` when used as SELECT projections.
+        let row = expr_to_custom_expr(&parse_expr("row(100, 100)")).expect("row");
         assert!(matches!(row, Expr::Literal(Literal::Struct(ref v)) if v.len() == 2));
 
-        let map = sqlparser_expr_to_custom_expr(&parse_expr("map(1, 5.5)")).expect("map");
+        let map = expr_to_custom_expr(&parse_expr("map(1, 5.5)")).expect("map");
         assert!(matches!(map, Expr::Literal(Literal::Map(ref v)) if v.len() == 1));
     }
 
     #[test]
     fn constant_array_repeat_folds_to_array_literal() {
-        let arr =
-            sqlparser_expr_to_custom_expr(&parse_expr("array_repeat('abc', 3)")).expect("array");
+        let arr = expr_to_custom_expr(&parse_expr("array_repeat('abc', 3)")).expect("array");
         assert!(matches!(
             arr,
             Expr::Literal(Literal::Array(ref values))
@@ -2293,7 +2317,7 @@ mod tests {
 
     #[test]
     fn constant_named_struct_folds_values_positionally() {
-        let value = sqlparser_expr_to_custom_expr(&parse_expr("named_struct('A', 1, 'B', 'x')"))
+        let value = expr_to_custom_expr(&parse_expr("named_struct('A', 1, 'B', 'x')"))
             .expect("named_struct");
         assert!(matches!(
             value,
@@ -2304,9 +2328,8 @@ mod tests {
 
     #[test]
     fn constant_array_append_folds_to_array_literal() {
-        let value =
-            sqlparser_expr_to_custom_expr(&parse_expr("array_append(array_generate(3), NULL)"))
-                .expect("array_append");
+        let value = expr_to_custom_expr(&parse_expr("array_append(array_generate(3), NULL)"))
+            .expect("array_append");
         assert!(matches!(
             value,
             Expr::Literal(Literal::Array(ref values))
@@ -2322,8 +2345,7 @@ mod tests {
 
     #[test]
     fn constant_md5sum_casts_scalar_to_varchar() {
-        let value =
-            sqlparser_expr_to_custom_expr(&parse_expr("md5sum(10000)")).expect("md5sum fold");
+        let value = expr_to_custom_expr(&parse_expr("md5sum(10000)")).expect("md5sum fold");
         let Expr::Literal(Literal::String(actual)) = value else {
             panic!("expected folded md5sum string literal");
         };
@@ -2336,7 +2358,7 @@ mod tests {
 
     #[test]
     fn array_literal_lowers_to_array_expr() {
-        let arr = sqlparser_expr_to_custom_expr(&parse_expr("[1, 2, 3]")).expect("array");
+        let arr = expr_to_custom_expr(&parse_expr("[1, 2, 3]")).expect("array");
         let Expr::Array(items) = arr else {
             panic!("expected Expr::Array");
         };
@@ -2347,7 +2369,7 @@ mod tests {
 
     #[test]
     fn array_literal_preserves_column_ref_elements() {
-        let arr = sqlparser_expr_to_custom_expr(&parse_expr("[generate_series]")).expect("array");
+        let arr = expr_to_custom_expr(&parse_expr("[generate_series]")).expect("array");
         let Expr::Array(items) = arr else {
             panic!("expected Expr::Array");
         };
@@ -2356,13 +2378,13 @@ mod tests {
 
     #[test]
     fn parse_json_folds_to_variant_bytes_via_latin1_string() {
-        // sqlparser builds a Function node for `parse_json('{"a":1}')`.
+        // The native parser builds a FunctionCall node for `parse_json('{"a":1}')`.
         let raw = parse_expr(r#"parse_json('{"a":1}')"#);
-        let sqlparser::ast::Expr::Function(ref func) = raw else {
+        let novarocks_parser::ast::Expr::FunctionCall(ref func) = raw else {
             panic!("expected Function node, got {raw:?}");
         };
 
-        let lit = sqlparser_function_to_literal(func).expect("parse_json fold");
+        let lit = function_to_literal(func).expect("parse_json fold");
         let Literal::String(packed) = lit else {
             panic!("expected Literal::String");
         };
@@ -2378,10 +2400,10 @@ mod tests {
     #[test]
     fn parse_json_rejects_invalid_argument_count() {
         let raw = parse_expr(r#"parse_json('{"a":1}', 'extra')"#);
-        let sqlparser::ast::Expr::Function(ref func) = raw else {
+        let novarocks_parser::ast::Expr::FunctionCall(ref func) = raw else {
             panic!("expected Function node");
         };
-        let err = sqlparser_function_to_literal(func).expect_err("must fail");
+        let err = function_to_literal(func).expect_err("must fail");
         assert!(
             err.contains("parse_json expects 1 argument"),
             "unexpected error: {err}"
@@ -2398,11 +2420,10 @@ mod tests {
             ("bitmap_from_string('7, 9, 7')", BTreeSet::from([7, 9])),
         ] {
             let raw = parse_expr(sql);
-            let sqlparser::ast::Expr::Function(ref func) = raw else {
+            let novarocks_parser::ast::Expr::FunctionCall(ref func) = raw else {
                 panic!("expected Function node for `{sql}`");
             };
-            let Literal::String(packed) =
-                sqlparser_function_to_literal(func).expect("bitmap constant fold")
+            let Literal::String(packed) = function_to_literal(func).expect("bitmap constant fold")
             else {
                 panic!("expected packed bitmap literal for `{sql}`");
             };
@@ -2426,11 +2447,10 @@ mod tests {
         for cast_type in ["TINYINT", "SMALLINT", "INT", "INTEGER", "FLOAT"] {
             let sql = format!("hll_hash(CAST(5 AS {cast_type}))");
             let raw = parse_expr(&sql);
-            let sqlparser::ast::Expr::Function(ref func) = raw else {
+            let novarocks_parser::ast::Expr::FunctionCall(ref func) = raw else {
                 panic!("expected Function node for `{sql}`");
             };
-            let err =
-                sqlparser_function_to_literal(func).expect_err(&format!("must reject `{sql}`"));
+            let err = function_to_literal(func).expect_err(&format!("must reject `{sql}`"));
             assert!(
                 err.contains("hll_hash with narrowing CAST"),
                 "unexpected error for `{sql}`: {err}"
@@ -2443,10 +2463,10 @@ mod tests {
         // CAST to BIGINT is the runtime path's native width for integer
         // literals, so it must continue to fold cleanly.
         let raw = parse_expr("hll_hash(CAST(5 AS BIGINT))");
-        let sqlparser::ast::Expr::Function(ref func) = raw else {
+        let novarocks_parser::ast::Expr::FunctionCall(ref func) = raw else {
             panic!("expected Function node");
         };
-        let lit = sqlparser_function_to_literal(func).expect("BIGINT cast must fold");
+        let lit = function_to_literal(func).expect("BIGINT cast must fold");
         assert!(matches!(lit, Literal::String(_)));
     }
 
@@ -2548,7 +2568,7 @@ mod tests {
         ];
         for sql in exprs {
             let expr = parse_expr(sql);
-            let result = sqlparser_expr_to_literal(&expr);
+            let result = expr_to_literal(&expr);
             assert!(
                 result.is_err(),
                 "Expected Err for `{sql}` but got {:?}",
@@ -2563,7 +2583,7 @@ mod tests {
         ];
         for (sql, expected) in non_decimal {
             let expr = parse_expr(sql);
-            let result = sqlparser_expr_to_literal(&expr)
+            let result = expr_to_literal(&expr)
                 .unwrap_or_else(|e| panic!("Expected Ok for `{sql}` but got Err: {e}"));
             assert_eq!(
                 result, *expected,

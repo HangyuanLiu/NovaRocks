@@ -823,9 +823,9 @@ fn prepare_frontend_first_refresh_write(
         // top-level branch UNION has no such body, while the first branch has
         // the validated representative aggregate layout.
         let aggregate_layout_sql = if schema_contract.branch.is_some() {
-            aggregate_query.to_string()
+            novarocks_parser::printer::print_query(&aggregate_query)
         } else {
-            query.to_string()
+            novarocks_parser::printer::print_query(&query)
         };
         let aggregate_layout = build_aggregate_layout_for_refresh_select_sql(
             source,
@@ -865,7 +865,7 @@ fn prepare_frontend_first_refresh_write(
     };
     let physical_sql =
         novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifactBuilder::try_new(
-            query.to_string(),
+            query.clone(),
             sql_pin,
             source_catalog,
             source_database,

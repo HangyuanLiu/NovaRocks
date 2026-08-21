@@ -7,7 +7,7 @@ NULL
 NULL
 
 -- query 4
-CAST((c_d32 * c_d32) AS decimal32)
+CAST((c_d32 * c_d32) AS DECIMAL128(38,0))
 999999980000
 
 -- query 5

@@ -213,23 +213,21 @@ fn sql_mentions_identifier(sql: &str, normalized_identifier: &str) -> bool {
 }
 
 fn sql_projects_target_wildcard(sql: &str, target: &MvDependencyTarget) -> bool {
-    let Ok(normalized) = novarocks_sql::syntax::normalize_for_raw_parse(sql) else {
+    let Ok(statements) = novarocks_parser::parse(sql) else {
         return false;
     };
-    let Ok(sqlparser::ast::Statement::Query(query)) =
-        novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
-    else {
+    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
         return false;
     };
-    query_projects_target_wildcard(&query, target)
+    query_projects_target_wildcard(query, target)
 }
 
 fn query_projects_target_wildcard(
-    query: &sqlparser::ast::Query,
+    query: &novarocks_parser::ast::Query,
     target: &MvDependencyTarget,
 ) -> bool {
     if query.with.as_ref().is_some_and(|with| {
-        with.cte_tables
+        with.ctes
             .iter()
             .any(|cte| query_projects_target_wildcard(&cte.query, target))
     }) {
@@ -239,22 +237,26 @@ fn query_projects_target_wildcard(
 }
 
 fn set_expr_projects_target_wildcard(
-    set_expr: &sqlparser::ast::SetExpr,
+    set_expr: &novarocks_parser::ast::SetExpr,
     target: &MvDependencyTarget,
 ) -> bool {
     match set_expr {
-        sqlparser::ast::SetExpr::Select(select) => select_projects_target_wildcard(select, target),
-        sqlparser::ast::SetExpr::Query(query) => query_projects_target_wildcard(query, target),
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-            set_expr_projects_target_wildcard(left, target)
-                || set_expr_projects_target_wildcard(right, target)
+        novarocks_parser::ast::SetExpr::Select(select) => {
+            select_projects_target_wildcard(select, target)
+        }
+        novarocks_parser::ast::SetExpr::Query(query) => {
+            query_projects_target_wildcard(query, target)
+        }
+        novarocks_parser::ast::SetExpr::SetOperation(operation) => {
+            set_expr_projects_target_wildcard(&operation.left, target)
+                || set_expr_projects_target_wildcard(&operation.right, target)
         }
         _ => false,
     }
 }
 
 fn select_projects_target_wildcard(
-    select: &sqlparser::ast::Select,
+    select: &novarocks_parser::ast::Select,
     target: &MvDependencyTarget,
 ) -> bool {
     let mut qualifiers = HashSet::new();
@@ -266,25 +268,21 @@ fn select_projects_target_wildcard(
         return true;
     }
     select.projection.iter().any(|item| match item {
-        sqlparser::ast::SelectItem::Wildcard(_) => !qualifiers.is_empty(),
-        sqlparser::ast::SelectItem::QualifiedWildcard(kind, _) => match kind {
-            sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => {
-                object_name_qualifier_keys(name)
-                    .into_iter()
-                    .any(|key| qualifiers.contains(&key))
-            }
-            sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr) => {
-                expr_qualifier_keys(expr)
-                    .into_iter()
-                    .any(|key| qualifiers.contains(&key))
-            }
-        },
+        novarocks_parser::ast::SelectItem::Wildcard { .. } => !qualifiers.is_empty(),
+        novarocks_parser::ast::SelectItem::QualifiedWildcard { prefix, .. } => prefix
+            .iter()
+            .map(|ident| normalize_identifier(&ident.value))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|parts| qualifier_keys_from_parts(&parts))
+            .unwrap_or_default()
+            .into_iter()
+            .any(|key| qualifiers.contains(&key)),
         _ => false,
     })
 }
 
 fn collect_target_qualifiers_from_table_with_joins(
-    table: &sqlparser::ast::TableWithJoins,
+    table: &novarocks_parser::ast::TableWithJoins,
     target: &MvDependencyTarget,
     qualifiers: &mut HashSet<String>,
 ) -> bool {
@@ -296,12 +294,12 @@ fn collect_target_qualifiers_from_table_with_joins(
 }
 
 fn collect_target_qualifiers_from_factor(
-    factor: &sqlparser::ast::TableFactor,
+    factor: &novarocks_parser::ast::TableFactor,
     target: &MvDependencyTarget,
     qualifiers: &mut HashSet<String>,
 ) -> bool {
     match factor {
-        sqlparser::ast::TableFactor::Table { name, alias, .. } => {
+        novarocks_parser::ast::TableFactor::Table { name, alias, .. } => {
             if object_name_matches_target(name, target) {
                 qualifiers.extend(object_name_qualifier_keys(name));
                 if let Some(alias) = alias
@@ -312,38 +310,18 @@ fn collect_target_qualifiers_from_factor(
             }
             false
         }
-        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+        novarocks_parser::ast::TableFactor::Derived { subquery, .. } => {
             query_projects_target_wildcard(subquery, target)
         }
-        sqlparser::ast::TableFactor::NestedJoin {
+        novarocks_parser::ast::TableFactor::NestedJoin {
             table_with_joins, ..
         } => collect_target_qualifiers_from_table_with_joins(table_with_joins, target, qualifiers),
-        sqlparser::ast::TableFactor::Pivot { table, .. }
-        | sqlparser::ast::TableFactor::Unpivot { table, .. }
-        | sqlparser::ast::TableFactor::MatchRecognize { table, .. } => {
-            collect_target_qualifiers_from_factor(table, target, qualifiers)
-        }
         _ => false,
     }
 }
 
-fn expr_qualifier_keys(expr: &sqlparser::ast::Expr) -> Vec<String> {
-    match expr {
-        sqlparser::ast::Expr::Identifier(ident) => normalize_identifier(&ident.value)
-            .map(|name| vec![name])
-            .unwrap_or_default(),
-        sqlparser::ast::Expr::CompoundIdentifier(idents) => idents
-            .iter()
-            .map(|ident| normalize_identifier(&ident.value))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|parts| qualifier_keys_from_parts(&parts))
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
 fn object_name_matches_target(
-    name: &sqlparser::ast::ObjectName,
+    name: &novarocks_parser::ast::ObjectName,
     target: &MvDependencyTarget,
 ) -> bool {
     match normalized_object_name_parts(name).as_deref() {
@@ -356,7 +334,7 @@ fn object_name_matches_target(
     }
 }
 
-fn object_name_qualifier_keys(name: &sqlparser::ast::ObjectName) -> Vec<String> {
+fn object_name_qualifier_keys(name: &novarocks_parser::ast::ObjectName) -> Vec<String> {
     normalized_object_name_parts(name)
         .map(|parts| qualifier_keys_from_parts(&parts))
         .unwrap_or_default()
@@ -373,13 +351,10 @@ fn qualifier_keys_from_parts(parts: &[String]) -> Vec<String> {
     keys
 }
 
-fn normalized_object_name_parts(name: &sqlparser::ast::ObjectName) -> Option<Vec<String>> {
-    name.0
+fn normalized_object_name_parts(name: &novarocks_parser::ast::ObjectName) -> Option<Vec<String>> {
+    name.parts
         .iter()
-        .map(|part| match part {
-            sqlparser::ast::ObjectNamePart::Identifier(ident) => normalize_identifier(&ident.value),
-            _ => Err("unsupported object name part".to_string()),
-        })
+        .map(|ident| normalize_identifier(&ident.value))
         .collect::<Result<Vec<_>, _>>()
         .ok()
 }

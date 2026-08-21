@@ -27,6 +27,7 @@ use crate::query_execution::{PreparedImmediateQuery, PreparedQueryCompletion, St
 use crate::runtime::query_result::QueryResult;
 #[cfg(test)]
 use crate::runtime::query_result::build_string_query_result;
+use novarocks_parser::ast::Query;
 use novarocks_protocol::lifecycle::QueryOptions;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
@@ -1002,48 +1003,36 @@ impl TestQueryCompiler {
         query_opts: Option<QueryOptions>,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<TestPreparedQueryOperation, String> {
-        if !is_query_sql(sql) {
-            return Err(
-                "non-query statements must be executed through a typed command capability".into(),
-            );
-        }
-        use sqlparser::ast as sqlast;
         let current_catalog = request_context.session().current_catalog();
         let current_database = request_context.session().current_database();
-        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
-        let (parse_sql, forced_explain_level, force_logical_explain) =
-            if let Some((rewritten, level)) = split_explain_logical_sql(&normalized) {
-                (rewritten, Some(level), true)
-            } else if let Some((rewritten, level)) = split_explain_costs_sql(&normalized) {
-                (rewritten, Some(level), false)
-            } else {
-                (normalized.clone(), None, false)
-            };
-        let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&parse_sql)
-            .map_err(|error| format_parser_error(&error.to_string()))?;
-        match stmt {
-            sqlast::Statement::Explain {
-                statement,
-                verbose,
-                analyze: false,
-                ..
-            } => {
-                let sqlast::Statement::Query(ref query) = *statement else {
-                    return Err("EXPLAIN only supports SELECT queries".to_string());
-                };
+        let statements =
+            novarocks_parser::parse(sql).map_err(|error| format!("sql parser error: {error}"))?;
+        let [statement] = statements.as_slice() else {
+            return Err("query compiler requires exactly one typed query statement".to_string());
+        };
+        let statement = match statement {
+            novarocks_parser::ast::Statement::Query(_)
+            | novarocks_parser::ast::Statement::ExplainQuery(_) => statement.clone(),
+            _ => {
+                return Err(
+                    "non-query statements must be executed through a typed command capability"
+                        .to_string(),
+                );
+            }
+        };
+        match statement {
+            novarocks_parser::ast::Statement::ExplainQuery(explain)
+                if explain.format != novarocks_parser::ast::ExplainFormat::Analyze =>
+            {
+                let (level, force_logical_explain) = crate::query::compiler::explain_mode(&explain);
                 let prepared = prepare_explain_query_with_ports(
                     &self.query,
                     &self.view,
                     current_catalog,
                     current_database,
-                    query,
+                    explain.query.as_ref(),
                     &connector_context,
                 )?;
-                let level = forced_explain_level.unwrap_or(if verbose {
-                    novarocks_sql::compiler::ExplainLevel::Verbose
-                } else {
-                    novarocks_sql::compiler::ExplainLevel::Normal
-                });
                 let catalog_service_snapshot = catalog_service_snapshot(&self.query);
                 let analyzer_provider = build_catalog_service_provider(
                     current_catalog,
@@ -1070,35 +1059,27 @@ impl TestQueryCompiler {
                     PreparedImmediateQuery::new(StatementResult::Query(result)),
                 ))
             }
-            sqlast::Statement::Explain {
-                statement,
-                analyze: true,
-                ..
-            } => {
-                let sqlast::Statement::Query(ref query) = *statement else {
-                    return Err("EXPLAIN ANALYZE only supports SELECT queries".to_string());
-                };
-                self.prepare_explain_analyze(
-                    query,
+            novarocks_parser::ast::Statement::ExplainQuery(explain) => self
+                .prepare_explain_analyze(
+                    explain.query.as_ref(),
                     current_catalog,
                     current_database,
                     query_opts,
                     &connector_context,
                     request_context.execution(),
-                )
-            }
-            sqlast::Statement::Query(ref query) => {
+                ),
+            novarocks_parser::ast::Statement::Query(query) => {
                 if let Some(result) =
                     crate::catalog_application::information_schema::try_query_materialized_views(
                         self.system_tables.mv_repository().as_ref(),
-                        query,
+                        &query,
                     )?
                 {
                     return Ok(TestPreparedQueryOperation::Immediate(
                         PreparedImmediateQuery::new(result),
                     ));
                 }
-                let mut prepared = query.as_ref().clone();
+                let mut prepared = query;
                 self.view.view_service().rewrite_query(
                     &self.view,
                     &mut prepared,
@@ -1157,7 +1138,7 @@ impl TestQueryCompiler {
 
     fn prepare_explain_analyze(
         &self,
-        query: &sqlparser::ast::Query,
+        query: &Query,
         current_catalog: Option<&str>,
         current_database: &str,
         query_opts: Option<QueryOptions>,
@@ -1209,25 +1190,6 @@ impl TestQueryCompiler {
                 connector_static_planning,
             ),
         })
-    }
-}
-
-#[cfg(test)]
-fn is_query_sql(sql: &str) -> bool {
-    let mut words = sql.split_whitespace();
-    match words.next().map(|word| word.to_ascii_lowercase()) {
-        Some(keyword) if matches!(keyword.as_str(), "select" | "with") => true,
-        Some(keyword) if keyword == "explain" => {
-            let mut target = words.next().map(|word| word.to_ascii_lowercase());
-            while matches!(
-                target.as_deref(),
-                Some("analyze" | "verbose" | "costs" | "logical")
-            ) {
-                target = words.next().map(|word| word.to_ascii_lowercase());
-            }
-            matches!(target.as_deref(), Some("select" | "with"))
-        }
-        _ => false,
     }
 }
 
@@ -1322,23 +1284,6 @@ fn standalone_now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for named-partition overwrite SQL normalization coverage."
-)]
-fn rewrite_named_partition_insert_overwrite(sql: &str) -> Result<String, String> {
-    let re = regex::Regex::new(
-        r#"(?is)^\s*insert\s+overwrite\s+(?:table\s+)?(?P<table>(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)){0,2})\s+partition\s*\([^)]*\)\s+(?P<rest>.*)$"#,
-    )
-    .map_err(|e| format!("compile INSERT OVERWRITE partition rewrite regex failed: {e}"))?;
-    let Some(captures) = re.captures(sql) else {
-        return Ok(sql.to_string());
-    };
-    let table = captures.name("table").expect("table capture").as_str();
-    let rest = captures.name("rest").expect("rest capture").as_str();
-    Ok(format!("INSERT OVERWRITE PARTITIONS {table} {rest}"))
 }
 
 #[allow(
@@ -1438,9 +1383,9 @@ fn prepare_explain_query_with_ports(
     view_kernel: &domain::ViewExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
-    query: &sqlparser::ast::Query,
+    query: &Query,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<Query, String> {
     let mut prepared = query.clone();
     view_kernel.view_service().rewrite_query(
         view_kernel,
@@ -1502,7 +1447,7 @@ pub(crate) fn prepare_query_as_iceberg_write(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
-    query: &sqlparser::ast::Query,
+    query: &Query,
     sink: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
@@ -1535,7 +1480,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_context(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
-    query: &sqlparser::ast::Query,
+    query: &Query,
     sink: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
@@ -1566,7 +1511,7 @@ pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_connector_context
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
-    query: &sqlparser::ast::Query,
+    query: &Query,
     sink: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
@@ -1601,7 +1546,7 @@ pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_query_local_overl
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
-    query: &sqlparser::ast::Query,
+    query: &Query,
     sink: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
@@ -1698,7 +1643,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
-    query: &sqlparser::ast::Query,
+    query: &Query,
     sink: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
@@ -2173,7 +2118,7 @@ fn change_stream_write_optimizer_settings() -> novarocks_sql::compiler::SessionO
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 fn prepare_query_with_sql_compiler_kernel_with_ports(
-    query: &sqlparser::ast::Query,
+    query: &Query,
     analyzer_catalog: &crate::catalog_application::query_materializer::CatalogServiceMaterializer<
         '_,
     >,
@@ -2287,7 +2232,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 fn explain_query_with_sql_compiler_kernel_with_ports(
-    query: &sqlparser::ast::Query,
+    query: &Query,
     analyzer_catalog: &crate::catalog_application::query_materializer::CatalogServiceMaterializer<
         '_,
     >,
@@ -2632,73 +2577,6 @@ fn find_matching_paren(sql: &str, open: usize) -> Option<usize> {
     None
 }
 
-/// Wrap a sqlparser error message in the `sql parser error: ...` envelope
-/// and append a StarRocks-style `Unexpected input '<token>'` clause when
-/// the underlying error mentions the offending token (`found: <token>`),
-/// so tests can assert against the StarRocks-FE-style wording.
-#[cfg(test)]
-fn format_parser_error(raw: &str) -> String {
-    let mut out = format!("sql parser error: {raw}");
-    if let Some(start) = raw.find("found: ") {
-        let after = &raw[start + "found: ".len()..];
-        let token = after
-            .split(|c: char| c.is_whitespace() || c == ',')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_matches(|c: char| c == '`' || c == '"');
-        if !token.is_empty() {
-            out.push_str(&format!(" Unexpected input '{token}'."));
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-fn consume_leading_keyword<'a>(sql: &'a str, keyword: &str) -> Option<&'a str> {
-    let trimmed = sql.trim_start();
-    let head = trimmed.as_bytes().get(..keyword.len())?;
-    if !head.eq_ignore_ascii_case(keyword.as_bytes()) {
-        return None;
-    }
-    let rest = &trimmed[keyword.len()..];
-    if rest
-        .chars()
-        .next()
-        .is_some_and(|character| !character.is_ascii_whitespace())
-    {
-        return None;
-    }
-    Some(rest)
-}
-
-#[cfg(test)]
-fn split_explain_costs_sql(sql: &str) -> Option<(String, novarocks_sql::compiler::ExplainLevel)> {
-    let body = consume_leading_keyword(consume_leading_keyword(sql, "EXPLAIN")?, "COSTS")?;
-    Some((
-        format!("EXPLAIN {}", body.trim_start()),
-        novarocks_sql::compiler::ExplainLevel::Costs,
-    ))
-}
-
-#[cfg(test)]
-fn split_explain_logical_sql(sql: &str) -> Option<(String, novarocks_sql::compiler::ExplainLevel)> {
-    let mut body = consume_leading_keyword(consume_leading_keyword(sql, "EXPLAIN")?, "LOGICAL")?;
-    let mut level = novarocks_sql::compiler::ExplainLevel::Normal;
-    for (keyword, candidate) in [
-        ("VERBOSE", novarocks_sql::compiler::ExplainLevel::Verbose),
-        ("COSTS", novarocks_sql::compiler::ExplainLevel::Costs),
-    ] {
-        if let Some(rest) = consume_leading_keyword(body, keyword) {
-            level = candidate;
-            body = rest;
-            break;
-        }
-    }
-
-    Some((format!("EXPLAIN {}", body.trim_start()), level))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2744,26 +2622,5 @@ mod tests {
             super::query_options_for_explain_analyze(Some(options)),
             expected
         );
-    }
-
-    #[test]
-    fn split_explain_logical_sql_rewrites_to_plain_explain() {
-        let (rewritten, level) =
-            super::split_explain_logical_sql(" EXPLAIN LOGICAL SELECT * FROM t")
-                .expect("recognized");
-        assert_eq!(rewritten, "EXPLAIN SELECT * FROM t");
-        assert_eq!(level, novarocks_sql::compiler::ExplainLevel::Normal);
-
-        let (rewritten, level) =
-            super::split_explain_logical_sql("explain logical verbose select k from t")
-                .expect("recognized");
-        assert_eq!(rewritten, "EXPLAIN select k from t");
-        assert_eq!(level, novarocks_sql::compiler::ExplainLevel::Verbose);
-
-        let (rewritten, level) =
-            super::split_explain_logical_sql("EXPLAIN\nLOGICAL\nSELECT k FROM t")
-                .expect("recognized");
-        assert_eq!(rewritten, "EXPLAIN SELECT k FROM t");
-        assert_eq!(level, novarocks_sql::compiler::ExplainLevel::Normal);
     }
 }

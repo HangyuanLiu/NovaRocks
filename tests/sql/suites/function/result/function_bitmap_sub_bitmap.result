@@ -27,11 +27,11 @@ bitmap_to_string(sub_bitmap(bitmap_from_string('1,0,1,2,3,1,5'), 3, 6))
 3,5
 
 -- query 8
-bitmap_to_string(sub_bitmap(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 0, 3))
+bitmap_to_string(sub_bitmap(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)) SEPARATOR ',')), 0, 3))
 1,2,3
 
 -- query 9
-bitmap_to_string(sub_bitmap(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 10, 3))
+bitmap_to_string(sub_bitmap(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)) SEPARATOR ',')), 10, 3))
 11,12,13
 
 -- query 10
@@ -63,11 +63,11 @@ bitmap_to_string(bitmap_subset_limit(bitmap_from_string('1,0,1,2,3,1,5'), 3, 6))
 3,5
 
 -- query 17
-bitmap_to_string(bitmap_subset_limit(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 0, 3))
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)) SEPARATOR ',')), 0, 3))
 1,2,3
 
 -- query 18
-bitmap_to_string(bitmap_subset_limit(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 10, 3))
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)) SEPARATOR ',')), 10, 3))
 10,11,12
 
 -- query 19
@@ -83,11 +83,11 @@ bitmap_to_string(bitmap_subset_limit(bitmap_from_string('1,0,1,2,3,1,5'), 3, -6)
 0,1,2,3
 
 -- query 22
-bitmap_to_string(bitmap_subset_limit(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 0, -3))
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)) SEPARATOR ',')), 0, -3))
 NULL
 
 -- query 23
-bitmap_to_string(bitmap_subset_limit(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 10, -3))
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)) SEPARATOR ',')), 10, -3))
 8,9,10
 
 -- query 24
@@ -119,11 +119,11 @@ bitmap_to_string(bitmap_subset_in_range(bitmap_from_string('1,0,1,2,3,1,5'), 3, 
 3,5
 
 -- query 31
-bitmap_to_string(bitmap_subset_in_range(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 0, 3))
+bitmap_to_string(bitmap_subset_in_range(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)) SEPARATOR ',')), 0, 3))
 1,2
 
 -- query 32
-bitmap_to_string(bitmap_subset_in_range(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 10, 3))
+bitmap_to_string(bitmap_subset_in_range(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)) SEPARATOR ',')), 10, 3))
 NULL
 
 -- query 33
@@ -135,7 +135,7 @@ bitmap_to_string(bitmap_subset_in_range(bitmap_from_string('1,0,1,2,3,1,5'), 3, 
 NULL
 
 -- query 35
-bitmap_to_string(bitmap_subset_in_range(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 3, 0))
+bitmap_to_string(bitmap_subset_in_range(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)) SEPARATOR ',')), 3, 0))
 NULL
 
 -- query 41

@@ -97,16 +97,14 @@ impl Printer {
             Statement::Dml(statement) => crate::ast::dml::write_sql(statement, &mut self.output),
             Statement::Query(query) => self.write_query(query),
             Statement::ExplainQuery(explain) => self.write_explain_query(explain),
-            Statement::RawQuery(query) => self.write_raw_query(query),
         }
-    }
-
-    fn write_raw_query(&mut self, query: &RawQuerySlice) {
-        self.output.push_str(&query.text);
     }
 
     fn write_explain_query(&mut self, explain: &ExplainQuery) {
         self.output.push_str("EXPLAIN");
+        if explain.logical {
+            self.output.push_str(" LOGICAL");
+        }
         match explain.format {
             ExplainFormat::Default => {}
             ExplainFormat::Analyze => self.output.push_str(" ANALYZE"),
@@ -442,12 +440,13 @@ impl Printer {
         match factor {
             TableFactor::Table {
                 name,
+                metadata,
                 alias,
                 version,
                 hints,
                 ..
             } => {
-                self.write_object_name(name);
+                self.write_table_name(name, metadata.as_ref());
                 if let Some(version) = version {
                     self.write_table_version(version);
                 }
@@ -623,6 +622,7 @@ impl Printer {
         match relation {
             TableFactor::Table {
                 name,
+                metadata,
                 alias,
                 version,
                 hints,
@@ -636,7 +636,7 @@ impl Printer {
                     self.write_table_hint(hint);
                     self.output.push(' ');
                 }
-                self.write_object_name(name);
+                self.write_table_name(name, metadata.as_ref());
                 if let Some(version) = version {
                     self.write_table_version(version);
                 }
@@ -653,6 +653,7 @@ impl Printer {
             }
             TableFactor::Table {
                 name,
+                metadata,
                 alias,
                 version,
                 hints,
@@ -662,7 +663,7 @@ impl Printer {
                     self.write_table_hint(hint);
                     self.output.push(' ');
                 }
-                self.write_object_name(name);
+                self.write_table_name(name, metadata.as_ref());
                 if let Some(version) = version {
                     self.write_table_version(version);
                 }
@@ -827,6 +828,14 @@ impl Printer {
         self.write_ident_list_with_separator(&name.parts, ".");
     }
 
+    fn write_table_name(&mut self, name: &ObjectName, metadata: Option<&Ident>) {
+        self.write_object_name(name);
+        if let Some(metadata) = metadata {
+            self.output.push('$');
+            self.write_ident(metadata);
+        }
+    }
+
     fn write_type_name(&mut self, type_name: &TypeName) {
         self.write_object_name(&type_name.name);
         if type_name.arguments.is_empty() {
@@ -870,8 +879,11 @@ impl Printer {
             LiteralKind::Boolean(value) => {
                 self.output.push_str(if *value { "TRUE" } else { "FALSE" })
             }
-            LiteralKind::Number(value) | LiteralKind::HexString(value) => {
-                self.output.push_str(value)
+            LiteralKind::Number(value) => self.output.push_str(value),
+            LiteralKind::HexString(value) => {
+                self.output.push_str("X'");
+                self.output.push_str(value);
+                self.output.push('\'');
             }
             LiteralKind::String(value) => self.write_quoted_string(value),
         }
@@ -1233,6 +1245,11 @@ impl Printer {
         self.output.push(')');
     }
     fn write_array_expr(&mut self, expression: &ArrayExpr) {
+        if let Some(element_type) = &expression.element_type {
+            self.output.push_str("ARRAY<");
+            self.write_type_name(element_type);
+            self.output.push('>');
+        }
         self.output.push('[');
         self.write_expr_list(&expression.elements);
         self.output.push(']');
@@ -1336,6 +1353,13 @@ pub fn print_statements(statements: &[Statement]) -> String {
 /// Renders one expression into canonical SQL.
 pub fn print_expr(expression: &Expr) -> String {
     Printer::new().expression(expression)
+}
+
+/// Renders one typed query without wrapping it in a top-level statement.
+pub fn print_query(query: &Query) -> String {
+    let mut printer = Printer::new();
+    printer.write_query(query);
+    printer.output
 }
 /// Renders an object name into canonical SQL.
 pub fn print_object_name(name: &ObjectName) -> String {
@@ -1562,6 +1586,7 @@ mod tests {
                 from: vec![TableWithJoins {
                     relation: TableFactor::Table {
                         name: object_name("source"),
+                        metadata: None,
                         alias: Some(TableAlias {
                             name: ident("s"),
                             columns: Vec::new(),
@@ -1607,6 +1632,7 @@ mod tests {
         assert_eq!(
             print_statement(&Statement::ExplainQuery(ExplainQuery {
                 format: ExplainFormat::Verbose,
+                logical: false,
                 query: Box::new(query),
                 span: span(),
             })),

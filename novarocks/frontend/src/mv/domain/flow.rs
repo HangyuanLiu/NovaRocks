@@ -31,7 +31,7 @@ use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target
 use crate::mv::domain::repository::MvRepository;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_catalog::identifier::normalize_identifier;
-use novarocks_sql::syntax::three_part_table_ref_occurrences;
+use novarocks_parser::ast::Visit;
 use novarocks_sql::syntax::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
     DropMaterializedViewStmt, MaterializedViewRefreshPolicy, ShowMaterializedViewsStmt,
@@ -152,7 +152,7 @@ fn load_definition_for_alter(
     repository: &dyn MvRepository,
     current_catalog: Option<&str>,
     db: &str,
-    name: &novarocks_sql::syntax::ObjectName,
+    name: &novarocks_parser::ast::ObjectName,
 ) -> Result<StoredMvDefinition, String> {
     let target = resolve_refresh_target(current_catalog, db, name)?;
     let Some(definition) = repository
@@ -419,10 +419,10 @@ fn normalize_incremental_mv_base_ref(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 pub(crate) fn validate_incremental_mv_base_ref(
-    query: &sqlparser::ast::Query,
+    query: &novarocks_parser::ast::Query,
     base_ref: &novarocks_catalog::identifier::TableIdentity,
 ) -> Result<(String, String, String), String> {
-    let refs = three_part_table_ref_occurrences(&query.to_string())?;
+    let refs = query_three_part_table_refs(query);
     if refs.len() != 1 {
         return Err(format!(
             "incremental MV refresh stored SQL must reference exactly one 3-part Iceberg table, got {}",
@@ -452,6 +452,31 @@ pub(crate) fn validate_incremental_mv_base_ref(
         ));
     }
     Ok(expected)
+}
+
+fn query_three_part_table_refs(
+    query: &novarocks_parser::ast::Query,
+) -> Vec<(String, String, String)> {
+    struct Collector(Vec<(String, String, String)>);
+
+    impl novarocks_parser::ast::Visit for Collector {
+        fn visit_table_factor(&mut self, factor: &novarocks_parser::ast::TableFactor) {
+            if let novarocks_parser::ast::TableFactor::Table { name, .. } = factor
+                && let [catalog, namespace, table] = name.parts.as_slice()
+            {
+                self.0.push((
+                    catalog.value.clone(),
+                    namespace.value.clone(),
+                    table.value.clone(),
+                ));
+            }
+            novarocks_parser::ast::walk_table_factor(self, factor);
+        }
+    }
+
+    let mut collector = Collector(Vec::new());
+    collector.visit_query(query);
+    collector.0
 }
 
 #[allow(
@@ -517,15 +542,12 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-    fn parse_query(sql: &str) -> sqlparser::ast::Query {
-        let normalized =
-            novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize sql");
-        let statement =
-            novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse sql");
-        let sqlparser::ast::Statement::Query(query) = statement else {
+    fn parse_query(sql: &str) -> novarocks_parser::ast::Query {
+        let statements = novarocks_parser::parse(sql).expect("parse query");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
             panic!("expected query");
         };
-        *query
+        query.clone()
     }
 
     fn base_ref() -> novarocks_catalog::identifier::TableIdentity {

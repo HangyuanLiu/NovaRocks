@@ -466,7 +466,12 @@ fn literal(value: &Literal, output: &mut String) {
     match &value.kind {
         LiteralKind::Null => output.push_str("NULL"),
         LiteralKind::Boolean(v) => output.push_str(if *v { "TRUE" } else { "FALSE" }),
-        LiteralKind::Number(v) | LiteralKind::HexString(v) => output.push_str(v),
+        LiteralKind::Number(v) => output.push_str(v),
+        LiteralKind::HexString(v) => {
+            output.push_str("X'");
+            output.push_str(v);
+            output.push('\'');
+        }
         LiteralKind::String(v) => {
             output.push('\'');
             output.push_str(&v.replace('\'', "''"));

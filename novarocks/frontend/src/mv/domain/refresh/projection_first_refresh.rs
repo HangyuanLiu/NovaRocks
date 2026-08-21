@@ -28,6 +28,7 @@ use crate::mv::domain::refresh::target_apply::{
     iceberg_mv_physical_select_sql, validate_reserved_projection_output_names,
 };
 use novarocks_execution::exec::chunk::Chunk;
+use novarocks_parser::{Span, ast, printer};
 use novarocks_sql::planning::mv::{MV_BRANCH_ID_COLUMN_NAME, MV_HIDDEN_APPLY_KEY_COLUMN_NAME};
 
 #[allow(
@@ -40,21 +41,15 @@ pub(crate) fn prepare_projection_full_read_sql(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<String, String> {
-    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(select_sql)
-        .map_err(|error| format!("iceberg projection full-read SELECT normalize error: {error}"))?;
-    let mut statement = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
-        .map_err(|error| format!("iceberg projection full-read SELECT parse error: {error}"))?;
-    let sqlparser::ast::Statement::Query(query) = &mut statement else {
-        return Err("iceberg projection full read expects a SELECT query".to_string());
-    };
+    let mut query = parse_stored_select_query(select_sql, "iceberg projection full read")?;
     inject_pin_as_for_version_as_of(
-        query,
+        &mut query,
         pin,
         &HashSet::new(),
         current_catalog,
         current_database,
     )?;
-    iceberg_mv_physical_select_sql(&statement.to_string())
+    iceberg_mv_physical_select_sql(&query)
 }
 
 #[allow(
@@ -94,17 +89,9 @@ pub(crate) fn prepare_union_projection_full_read_sql(
         format!("iceberg UNION ALL MV full refresh branch count {branch_count} does not fit in i32")
     })?;
 
-    let normalized =
-        novarocks_sql::syntax::normalize_for_raw_parse(select_sql).map_err(|error| {
-            format!("iceberg UNION ALL MV full-read SELECT normalize error: {error}")
-        })?;
-    let mut statement = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
-        .map_err(|error| format!("iceberg UNION ALL MV full-read SELECT parse error: {error}"))?;
-    let sqlparser::ast::Statement::Query(query) = &mut statement else {
-        return Err("iceberg UNION ALL MV full refresh expects a SELECT query".to_string());
-    };
+    let mut query = parse_stored_select_query(select_sql, "iceberg UNION ALL MV full refresh")?;
     inject_pin_as_for_version_as_of(
-        query,
+        &mut query,
         pin,
         &HashSet::new(),
         current_catalog,
@@ -131,7 +118,7 @@ pub(crate) fn prepare_union_projection_full_read_sql(
     let mut next_branch_id = 0_i32;
     append_union_projection_hidden_columns(query.body.as_mut(), &mut next_branch_id)?;
     debug_assert_eq!(next_branch_id, branch_count_i32);
-    Ok(statement.to_string())
+    Ok(printer::print_query(&query))
 }
 
 #[allow(
@@ -139,44 +126,39 @@ pub(crate) fn prepare_union_projection_full_read_sql(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn validate_union_projection_set_expr(
-    set_expr: &sqlparser::ast::SetExpr,
+    set_expr: &ast::SetExpr,
     branch_count: usize,
     validated_branch_count: &mut usize,
     saw_union_all: &mut bool,
 ) -> Result<(), String> {
     match set_expr {
-        sqlparser::ast::SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left,
-            right,
-        } => {
-            if *op != sqlparser::ast::SetOperator::Union
-                || *set_quantifier != sqlparser::ast::SetQuantifier::All
+        ast::SetExpr::SetOperation(operation) => {
+            if operation.operator != ast::SetOperator::Union
+                || operation.quantifier != ast::SetQuantifier::All
             {
                 return Err("iceberg UNION ALL MV full refresh supports UNION ALL only".to_string());
             }
             *saw_union_all = true;
             validate_union_projection_set_expr(
-                left.as_ref(),
+                operation.left.as_ref(),
                 branch_count,
                 validated_branch_count,
                 saw_union_all,
             )?;
             validate_union_projection_set_expr(
-                right.as_ref(),
+                operation.right.as_ref(),
                 branch_count,
                 validated_branch_count,
                 saw_union_all,
             )
         }
-        sqlparser::ast::SetExpr::Query(query) => validate_union_projection_set_expr(
+        ast::SetExpr::Query(query) => validate_union_projection_set_expr(
             query.body.as_ref(),
             branch_count,
             validated_branch_count,
             saw_union_all,
         ),
-        sqlparser::ast::SetExpr::Select(select) => {
+        ast::SetExpr::Select(select) => {
             if *validated_branch_count >= branch_count {
                 return Err(format!(
                     "iceberg UNION ALL MV full refresh found more than {branch_count} branches"
@@ -201,45 +183,80 @@ fn validate_union_projection_set_expr(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn append_union_projection_hidden_columns(
-    set_expr: &mut sqlparser::ast::SetExpr,
+    set_expr: &mut ast::SetExpr,
     next_branch_id: &mut i32,
 ) -> Result<(), String> {
     match set_expr {
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-            append_union_projection_hidden_columns(left.as_mut(), next_branch_id)?;
-            append_union_projection_hidden_columns(right.as_mut(), next_branch_id)
+        ast::SetExpr::SetOperation(operation) => {
+            append_union_projection_hidden_columns(operation.left.as_mut(), next_branch_id)?;
+            append_union_projection_hidden_columns(operation.right.as_mut(), next_branch_id)
         }
-        sqlparser::ast::SetExpr::Query(query) => {
+        ast::SetExpr::Query(query) => {
             append_union_projection_hidden_columns(query.body.as_mut(), next_branch_id)
         }
-        sqlparser::ast::SetExpr::Select(select) => {
+        ast::SetExpr::Select(select) => {
             let branch_id = *next_branch_id;
             *next_branch_id = next_branch_id
                 .checked_add(1)
                 .ok_or_else(|| "iceberg UNION ALL MV branch id overflow".to_string())?;
-            select
-                .projection
-                .push(sqlparser::ast::SelectItem::ExprWithAlias {
-                    expr: sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("_row_id")),
-                    alias: sqlparser::ast::Ident::new(MV_HIDDEN_APPLY_KEY_COLUMN_NAME),
-                });
-            select
-                .projection
-                .push(sqlparser::ast::SelectItem::ExprWithAlias {
-                    expr: sqlparser::ast::Expr::Cast {
-                        kind: sqlparser::ast::CastKind::Cast,
-                        expr: Box::new(sqlparser::ast::Expr::Value(
-                            sqlparser::ast::Value::Number(branch_id.to_string(), false).into(),
-                        )),
-                        data_type: sqlparser::ast::DataType::Int(None),
-                        array: false,
-                        format: None,
-                    },
-                    alias: sqlparser::ast::Ident::new(MV_BRANCH_ID_COLUMN_NAME),
-                });
+            select.projection.push(ast::SelectItem::ExprWithAlias {
+                expr: ast::Expr::Identifier(ident("_row_id")),
+                alias: ident(MV_HIDDEN_APPLY_KEY_COLUMN_NAME),
+                explicit_as: true,
+                span: Span::new(0, 0),
+            });
+            select.projection.push(ast::SelectItem::ExprWithAlias {
+                expr: ast::Expr::Cast(ast::CastExpr {
+                    kind: ast::CastKind::Cast,
+                    expr: Box::new(number_literal(branch_id)),
+                    data_type: native_int_type(),
+                    format: None,
+                    span: Span::new(0, 0),
+                }),
+                alias: ident(MV_BRANCH_ID_COLUMN_NAME),
+                explicit_as: true,
+                span: Span::new(0, 0),
+            });
             Ok(())
         }
         _ => Err("iceberg UNION ALL MV full refresh expects SELECT branches".to_string()),
+    }
+}
+
+fn parse_stored_select_query(sql: &str, context: &str) -> Result<ast::Query, String> {
+    let statements = novarocks_parser::parse(sql)
+        .map_err(|error| format!("{context} native SELECT parse error: {error}"))?;
+    let [ast::Statement::Query(query)] = statements.as_slice() else {
+        return Err(format!("{context} expects a SELECT query"));
+    };
+    Ok(query.clone())
+}
+
+fn ident(value: &str) -> ast::Ident {
+    ast::Ident {
+        value: value.to_string(),
+        quoted: false,
+        quote_style: None,
+        span: Span::new(0, 0),
+    }
+}
+
+fn number_literal(value: i32) -> ast::Expr {
+    ast::Expr::Literal(ast::Literal {
+        kind: ast::LiteralKind::Number(value.to_string()),
+        span: Span::new(0, 0),
+    })
+}
+
+fn native_int_type() -> ast::TypeName {
+    ast::TypeName {
+        name: ast::ObjectName {
+            parts: vec![ident("INT")],
+            span: Span::new(0, 0),
+        },
+        arguments: Vec::new(),
+        argument_separator_spaces: Vec::new(),
+        span: Span::new(0, 0),
     }
 }
 
@@ -313,7 +330,7 @@ mod tests {
     fn single_preparation_rejects_conflicting_explicit_time_travel_before_read() {
         let mut reads = 0;
         let error = prepare_projection_first_refresh_chunks(
-            "SELECT id FROM ice.db.fact VERSION AS OF 7",
+            "SELECT id FROM ice.db.fact FOR VERSION AS OF 7",
             &pin(),
             Some("ice"),
             "db",

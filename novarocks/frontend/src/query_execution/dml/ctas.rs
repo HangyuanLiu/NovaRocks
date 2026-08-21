@@ -47,15 +47,17 @@ use novarocks_spi::connector::{
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_parser::ast::{
-    CreateTableAsSelect, Literal, LiteralKind, PartitionTransform, TablePartition, TableStatement,
+    CreateTableAsSelect, Literal, LiteralKind, PartitionTransform, Query, TablePartition,
+    TableStatement,
 };
+use novarocks_parser::printer;
 use novarocks_protocol::lifecycle::QueryOptions;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CtasCommand {
     pub target_parts: Vec<String>,
     pub if_not_exists: bool,
-    pub source_sql: String,
+    pub source: Query,
     pub partitioning: Vec<ConnectorPartitionTransform>,
     pub properties: BTreeMap<Arc<str>, Arc<str>>,
 }
@@ -69,12 +71,11 @@ pub struct CtasAdmissionFailure {
 impl CtasCommand {
     /// Lower one already-admitted CTAS node to the narrow execution request.
     ///
-    /// The embedded query remains an exact source slice until SQLP-6.  It is
-    /// consumed only by the CTAS query-planning boundary below; this method
+    /// The embedded query is already a parser-owned typed AST. This method
     /// never reparses or canonicalizes the surrounding DDL text.
     pub fn from_typed(
         statement: &CreateTableAsSelect,
-        source: &str,
+        _source: &str,
     ) -> Result<Self, CtasAdmissionFailure> {
         let TableStatement::Create(table) = &statement.table;
         if table.temporary || table.external {
@@ -161,11 +162,6 @@ impl CtasCommand {
         properties.insert(Arc::from("format-version"), Arc::from("3"));
         properties.insert(Arc::from("write.row-lineage"), Arc::from("true"));
 
-        let query = source
-            .get(statement.query.span.start()..statement.query.span.end())
-            .map(str::trim)
-            .filter(|query| !query.is_empty())
-            .ok_or_else(|| unsupported(statement.query.span, "CTAS source span is invalid"))?;
         Ok(Self {
             target_parts: table
                 .name
@@ -174,7 +170,7 @@ impl CtasCommand {
                 .map(|part| part.value.clone())
                 .collect(),
             if_not_exists: table.if_not_exists,
-            source_sql: query.to_owned(),
+            source: statement.query.clone(),
             partitioning,
             properties,
         })
@@ -559,7 +555,7 @@ fn plan_query_for_ctas_source(
     state: &DmlExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
-    query: &sqlparser::ast::Query,
+    query: &Query,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PlannedCtasSourceQuery, String> {
@@ -1593,13 +1589,6 @@ impl CtasEngine for DmlExecutionKernel {
                 message: "CTAS source target does not match its exact preflight".to_string(),
             });
         }
-        let dialect = novarocks_sql::syntax::StarRocksDialect;
-        let mut parser = sqlparser::parser::Parser::new(&dialect)
-            .try_with_sql(&request.command.source_sql)
-            .map_err(|error| internal_failure(error.to_string()))?;
-        let query = parser
-            .parse_query()
-            .map_err(|error| internal_failure(error.to_string()))?;
         let connector_context = crate::connector::connector_request_context_for_execution(
             request.query_options.as_ref(),
             &request.execution,
@@ -1609,7 +1598,7 @@ impl CtasEngine for DmlExecutionKernel {
             self,
             request.current_catalog.as_deref(),
             &request.current_database,
-            &query,
+            &request.command.source,
             &request.execution,
             &connector_context,
         )
@@ -1655,7 +1644,7 @@ impl CtasEngine for DmlExecutionKernel {
             sha256(&[b"novarocks.ctas-execution.v1", execution_nonce.as_bytes()]);
         let plan_digest = sha256(&[
             b"novarocks.ctas-plan.v1",
-            request.command.source_sql.as_bytes(),
+            printer::print_query(&request.command.source).as_bytes(),
             optimized_fingerprint.as_slice(),
             settings_material.as_slice(),
             binding_material.as_slice(),
@@ -2406,18 +2395,16 @@ mod tests {
     }
 
     fn planned_source(sql: &str) -> PlannedCtasSourceQuery {
-        let dialect = novarocks_sql::syntax::StarRocksDialect;
-        let query = sqlparser::parser::Parser::new(&dialect)
-            .try_with_sql(sql)
-            .expect("parser init")
-            .parse_query()
-            .expect("source query");
+        let parsed = novarocks_parser::parse(sql).expect("parser init");
+        let [novarocks_parser::ast::Statement::Query(query)] = parsed.as_slice() else {
+            panic!("source must parse as a query");
+        };
         let execution = fe_execution(SessionOptimizerSettings::default());
         plan_query_for_ctas_source(
             &test_dml_kernel(),
             None,
             "analytics",
-            &query,
+            query,
             &execution,
             &connector_context(),
         )
@@ -2453,7 +2440,7 @@ mod tests {
                 .map(AsRef::as_ref),
             Some("true")
         );
-        assert_eq!(command.source_sql, "SELECT 1 AS region");
+        assert_eq!(printer::print_query(&command.source), "SELECT 1 AS region");
     }
 
     #[test]

@@ -6,8 +6,8 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
+use novarocks_parser::ast;
 use novarocks_types::SlotId;
-use sqlparser::ast as sqlast;
 
 use super::FrontendStatisticsService;
 use super::model::{AnalyzeStatusRow, ColumnStatRow, TableKey};
@@ -15,7 +15,7 @@ use super::model::{AnalyzeStatusRow, ColumnStatRow, TableKey};
 pub(super) fn try_query(
     service: &FrontendStatisticsService,
     sql: &str,
-    query: &sqlast::Query,
+    query: &ast::Query,
     current_database: &str,
 ) -> Result<Option<QueryResult>, String> {
     let lower = sql.to_ascii_lowercase();
@@ -455,19 +455,19 @@ fn sorted_columns(columns: &str) -> String {
     columns.join(",")
 }
 
-fn is_select_from_view(query: &sqlast::Query, view_name: &str) -> bool {
-    let sqlast::SetExpr::Select(select) = query.body.as_ref() else {
+fn is_select_from_view(query: &ast::Query, view_name: &str) -> bool {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
     if select.from.len() != 1 || !select.from[0].joins.is_empty() {
         return false;
     }
-    let sqlast::TableFactor::Table { name, .. } = &select.from[0].relation else {
+    let ast::TableFactor::Table { name, .. } = &select.from[0].relation else {
         return false;
     };
-    name.0
+    name.parts
         .last()
-        .map(|name| name.to_string().eq_ignore_ascii_case(view_name))
+        .map(|name| name.value.eq_ignore_ascii_case(view_name))
         .unwrap_or(false)
 }
 

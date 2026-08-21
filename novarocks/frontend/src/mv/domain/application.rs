@@ -25,6 +25,9 @@ use crate::mv::domain::repository::{
     CreateMvRepositoryRequest, MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvTarget,
 };
 use crate::runtime::query_result::QueryResult;
+use novarocks_parser::ast::{
+    LiteralKind, MaterializedViewPartitionArgument, MaterializedViewPartitionField, Query,
+};
 use novarocks_sql::syntax::{
     CreateMaterializedViewStmt, IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy,
 };
@@ -99,6 +102,71 @@ impl From<&IcebergPartitionFieldExpr> for MvCreatePartitionField {
     }
 }
 
+impl From<&MaterializedViewPartitionField> for MvCreatePartitionField {
+    fn from(value: &MaterializedViewPartitionField) -> Self {
+        let (transform, arguments) = match value {
+            MaterializedViewPartitionField::Identity(column) => {
+                return Self::Identity {
+                    column: normalized_partition_identifier(&column.value),
+                };
+            }
+            MaterializedViewPartitionField::Transform {
+                name, arguments, ..
+            } => (name.value.to_ascii_lowercase(), arguments.as_slice()),
+        };
+        let column = partition_column_argument(arguments, &transform);
+        match transform.as_str() {
+            "identity" => Self::Identity { column },
+            "year" => Self::Year { column },
+            "month" => Self::Month { column },
+            "day" => Self::Day { column },
+            "hour" => Self::Hour { column },
+            "void" => Self::Void { column },
+            "bucket" => Self::Bucket {
+                column,
+                num_buckets: partition_u32_argument(arguments, "bucket"),
+            },
+            "truncate" => Self::Truncate {
+                column,
+                width: partition_u32_argument(arguments, "truncate"),
+            },
+            _ => unreachable!("MV partition transform was validated during SQL admission"),
+        }
+    }
+}
+
+fn normalized_partition_identifier(value: &str) -> String {
+    novarocks_catalog::identifier::normalize_identifier(value)
+        .expect("MV partition identifier was validated during SQL admission")
+}
+
+fn partition_column_argument(
+    arguments: &[MaterializedViewPartitionArgument],
+    transform: &str,
+) -> String {
+    let Some(MaterializedViewPartitionArgument::Ident(column)) = arguments.first() else {
+        unreachable!("MV {transform} partition transform was validated during SQL admission");
+    };
+    normalized_partition_identifier(&column.value)
+}
+
+fn partition_u32_argument(arguments: &[MaterializedViewPartitionArgument], transform: &str) -> u32 {
+    let Some(MaterializedViewPartitionArgument::Literal(value)) = arguments.get(1) else {
+        unreachable!("MV {transform} partition transform was validated during SQL admission");
+    };
+    let LiteralKind::Number(value) = &value.kind else {
+        unreachable!("MV {transform} partition transform was validated during SQL admission");
+    };
+    let value = value
+        .parse::<u32>()
+        .expect("MV partition numeric argument was validated during SQL admission");
+    assert!(
+        value > 0,
+        "MV partition numeric argument was validated during SQL admission"
+    );
+    value
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MvCreateDistribution {
     pub hash_columns: Vec<String>,
@@ -135,7 +203,7 @@ pub struct MvCreateStatement {
     pub distribution: Option<MvCreateDistribution>,
     pub refresh_policy: MvCreateRefreshPolicy,
     pub select_sql: String,
-    pub select_query: sqlparser::ast::Query,
+    pub select_query: Query,
     pub properties: Vec<(String, String)>,
     pub primary_key: Option<Vec<String>>,
 }
@@ -143,7 +211,12 @@ pub struct MvCreateStatement {
 impl From<&CreateMaterializedViewStmt> for MvCreateStatement {
     fn from(value: &CreateMaterializedViewStmt) -> Self {
         Self {
-            name_parts: value.name.parts.clone(),
+            name_parts: value
+                .name
+                .parts
+                .iter()
+                .map(|part| part.value.clone())
+                .collect(),
             if_not_exists: value.if_not_exists,
             partition_by: value
                 .partition_by

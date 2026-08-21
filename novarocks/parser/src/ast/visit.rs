@@ -65,10 +65,6 @@ pub trait Visit {
         walk_dml_statement(self, statement);
     }
 
-    fn visit_raw_query_slice(&mut self, query: &RawQuerySlice) {
-        let _ = query;
-    }
-
     fn visit_query(&mut self, query: &Query) {
         walk_query(self, query);
     }
@@ -116,6 +112,10 @@ pub trait Visit {
     fn visit_nested_expr(&mut self, expression: &NestedExpr) {
         walk_nested_expr(self, expression);
     }
+
+    fn visit_table_factor(&mut self, factor: &TableFactor) {
+        walk_table_factor(self, factor);
+    }
 }
 
 pub fn walk_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Statement) {
@@ -133,7 +133,6 @@ pub fn walk_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Statement)
         Statement::Dml(statement) => visitor.visit_dml_statement(statement),
         Statement::Query(query) => visitor.visit_query(query),
         Statement::ExplainQuery(query) => visitor.visit_explain_query(query),
-        Statement::RawQuery(query) => visitor.visit_raw_query_slice(query),
     }
 }
 
@@ -335,9 +334,9 @@ pub fn walk_group_by<V: Visit + ?Sized>(visitor: &mut V, group_by: &GroupBy) {
 }
 
 pub fn walk_table_with_joins<V: Visit + ?Sized>(visitor: &mut V, table: &TableWithJoins) {
-    walk_table_factor(visitor, &table.relation);
+    visitor.visit_table_factor(&table.relation);
     for join in &table.joins {
-        walk_table_factor(visitor, &join.relation);
+        visitor.visit_table_factor(&join.relation);
         match &join.constraint {
             JoinConstraint::On(expr) => visitor.visit_expr(expr),
             JoinConstraint::Using { columns, .. } => {
@@ -354,12 +353,16 @@ pub fn walk_table_factor<V: Visit + ?Sized>(visitor: &mut V, factor: &TableFacto
     match factor {
         TableFactor::Table {
             name,
+            metadata,
             alias,
             version,
             hints,
             ..
         } => {
             visitor.visit_object_name(name);
+            if let Some(metadata) = metadata {
+                visitor.visit_ident(metadata);
+            }
             if let Some(alias) = alias {
                 walk_table_alias(visitor, alias);
             }
@@ -554,6 +557,9 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
             }
         }
         Expr::Array(expression) => {
+            if let Some(element_type) = &expression.element_type {
+                visitor.visit_type_name(element_type);
+            }
             for expr in &expression.elements {
                 visitor.visit_expr(expr);
             }
@@ -677,10 +683,6 @@ pub trait Fold {
         fold_dml_statement(self, statement)
     }
 
-    fn fold_raw_query_slice(&mut self, query: RawQuerySlice) -> RawQuerySlice {
-        query
-    }
-
     fn fold_query(&mut self, query: Query) -> Query {
         fold_query(self, query)
     }
@@ -728,6 +730,10 @@ pub trait Fold {
     fn fold_nested_expr(&mut self, expression: NestedExpr) -> NestedExpr {
         fold_nested_expr(self, expression)
     }
+
+    fn fold_table_factor(&mut self, factor: TableFactor) -> TableFactor {
+        fold_table_factor(self, factor)
+    }
 }
 
 pub fn fold_statement<F: Fold + ?Sized>(folder: &mut F, statement: Statement) -> Statement {
@@ -755,7 +761,6 @@ pub fn fold_statement<F: Fold + ?Sized>(folder: &mut F, statement: Statement) ->
         Statement::Dml(statement) => Statement::Dml(folder.fold_dml_statement(statement)),
         Statement::Query(query) => Statement::Query(folder.fold_query(query)),
         Statement::ExplainQuery(query) => Statement::ExplainQuery(folder.fold_explain_query(query)),
-        Statement::RawQuery(query) => Statement::RawQuery(folder.fold_raw_query_slice(query)),
     }
 }
 
@@ -1074,12 +1079,12 @@ pub fn fold_table_with_joins<F: Fold + ?Sized>(
     folder: &mut F,
     mut table: TableWithJoins,
 ) -> TableWithJoins {
-    table.relation = fold_table_factor(folder, table.relation);
+    table.relation = folder.fold_table_factor(table.relation);
     table.joins = table
         .joins
         .into_iter()
         .map(|mut join| {
-            join.relation = fold_table_factor(folder, join.relation);
+            join.relation = folder.fold_table_factor(join.relation);
             join.constraint = match join.constraint {
                 JoinConstraint::On(expr) => JoinConstraint::On(folder.fold_expr(expr)),
                 JoinConstraint::Using { columns, span } => JoinConstraint::Using {
@@ -1101,12 +1106,14 @@ pub fn fold_table_factor<F: Fold + ?Sized>(folder: &mut F, factor: TableFactor) 
     match factor {
         TableFactor::Table {
             name,
+            metadata,
             alias,
             version,
             hints,
             span,
         } => TableFactor::Table {
             name: folder.fold_object_name(name),
+            metadata: metadata.map(|metadata| folder.fold_ident(metadata)),
             alias: alias.map(|alias| fold_table_alias(folder, alias)),
             version: version.map(|mut version| {
                 version.value = folder.fold_expr(version.value);
@@ -1370,6 +1377,9 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
             Expr::Tuple(expression)
         }
         Expr::Array(mut expression) => {
+            expression.element_type = expression
+                .element_type
+                .map(|element_type| folder.fold_type_name(element_type));
             expression.elements = expression
                 .elements
                 .into_iter()

@@ -18,10 +18,10 @@
 //! Legacy materialized-view SQL carriers.
 //!
 //! These are execution-side DTOs for the SQLP-3 MV path. They intentionally
-//! live outside `parser::ast`: SQLP-5's parser-owned AST must not carry
-//! sqlparser nodes.
+//! live outside `parser::ast`: parser-owned syntax remains separate from the
+//! application-facing MV contract.
 
-use crate::parser::ast::{IcebergPartitionFieldExpr, ObjectName};
+use novarocks_parser::ast::{MaterializedViewPartitionField, ObjectName, Query};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaterializedViewDistribution {
@@ -43,11 +43,11 @@ pub enum MaterializedViewRefreshPolicy {
 pub struct CreateMaterializedViewStmt {
     pub name: ObjectName,
     pub if_not_exists: bool,
-    pub partition_by: Option<Vec<IcebergPartitionFieldExpr>>,
+    pub partition_by: Option<Vec<MaterializedViewPartitionField>>,
     pub distribution: Option<MaterializedViewDistribution>,
     pub refresh_policy: MaterializedViewRefreshPolicy,
     pub select_sql: String,
-    pub select_query: sqlparser::ast::Query,
+    pub select_query: Query,
     pub properties: Vec<(String, String)>,
     pub primary_key: Option<Vec<String>>,
 }
@@ -64,7 +64,7 @@ pub enum AlterMaterializedViewAction {
     SetProperties(Vec<(String, String)>),
     PauseRefresh,
     ResumeRefresh,
-    Repartition(Vec<IcebergPartitionFieldExpr>),
+    Repartition(Vec<MaterializedViewPartitionField>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

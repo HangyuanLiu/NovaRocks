@@ -29,6 +29,9 @@ pub struct Query {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExplainQuery {
     pub format: ExplainFormat,
+    /// Whether the EXPLAIN targets the logical planning view. This remains
+    /// separate from output detail so `EXPLAIN LOGICAL VERBOSE` is typed.
+    pub logical: bool,
     pub query: Box<Query>,
     pub span: Span,
 }

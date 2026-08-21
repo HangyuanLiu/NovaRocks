@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod iceberg_ref;
-pub use iceberg_ref::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
-
 use novarocks_catalog::partition::LegacyRangePartition;
 use novarocks_catalog::schema::SqlType;
 
@@ -130,15 +127,6 @@ pub struct ObjectName {
     pub parts: Vec<String>,
 }
 
-impl ObjectName {
-    pub(crate) fn leaf(&self) -> &str {
-        self.parts
-            .last()
-            .map(String::as_str)
-            .expect("object name must have at least one part")
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ColumnRef {
     pub name: String,
@@ -153,21 +141,6 @@ pub(crate) enum Expr {
         op: ArithmeticOp,
         right: Box<Expr>,
     },
-    Comparison {
-        left: Box<Expr>,
-        op: CompareOp,
-        right: Box<Expr>,
-    },
-    Logical {
-        left: Box<Expr>,
-        op: LogicalOp,
-        right: Box<Expr>,
-    },
-    IsNull {
-        expr: Box<Expr>,
-        negated: bool,
-    },
-    Aggregate(AggregateExpr),
     ScalarFunction(ScalarFunctionExpr),
     Array(Vec<Expr>),
     Cast {
@@ -177,25 +150,9 @@ pub(crate) enum Expr {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct AggregateExpr {
-    pub name: String,
-    pub args: Vec<Expr>,
-    pub distinct: bool,
-    pub order_by: Vec<FunctionOrderByExpr>,
-    pub alias: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ScalarFunctionExpr {
     pub name: String,
     pub args: Vec<Expr>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct FunctionOrderByExpr {
-    pub expr: Expr,
-    pub descending: bool,
-    pub nulls_first: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,22 +162,6 @@ pub(crate) enum ArithmeticOp {
     Mul,
     Div,
     Mod,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CompareOp {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LogicalOp {
-    And,
-    Or,
 }
 
 #[derive(Clone, Debug, PartialEq)]

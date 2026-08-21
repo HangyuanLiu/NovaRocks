@@ -22,9 +22,11 @@ use crate::{
     printer::{print_literal, print_object_name},
 };
 
-use super::{Fold, Ident, Literal, ObjectName, RawQuerySlice, Visit};
+use super::{Fold, Ident, Literal, ObjectName, Query, Visit};
 
 /// View commands owned by SQLP-2.
+// Keep statement variants inline so parser/visitor consumers retain a uniform typed AST.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ViewStatement {
     Create(CreateView),
@@ -52,7 +54,7 @@ pub struct CreateView {
     pub name: ObjectName,
     pub columns: Vec<Ident>,
     pub comment: Option<Literal>,
-    pub query: RawQuerySlice,
+    pub query: Query,
     pub span: Span,
 }
 
@@ -112,7 +114,7 @@ fn write_create(value: &CreateView, output: &mut String) {
         output.push_str(&print_literal(comment));
     }
     output.push_str(" AS ");
-    output.push_str(&value.query.text);
+    output.push_str(&crate::printer::print_query(&value.query));
 }
 
 fn write_drop(value: &DropView, output: &mut String) {
@@ -149,7 +151,7 @@ pub(crate) fn walk<V: Visit + ?Sized>(visitor: &mut V, statement: &ViewStatement
             if let Some(comment) = &value.comment {
                 visitor.visit_literal(comment);
             }
-            visitor.visit_raw_query_slice(&value.query);
+            visitor.visit_query(&value.query);
         }
         ViewStatement::Drop(value) => visitor.visit_object_name(&value.name),
         ViewStatement::Show(value) => {
@@ -171,7 +173,7 @@ pub(crate) fn fold<F: Fold + ?Sized>(folder: &mut F, statement: ViewStatement) -
                 .map(|column| folder.fold_ident(column))
                 .collect();
             value.comment = value.comment.map(|comment| folder.fold_literal(comment));
-            value.query = folder.fold_raw_query_slice(value.query);
+            value.query = folder.fold_query(value.query);
             ViewStatement::Create(value)
         }
         ViewStatement::Drop(mut value) => {

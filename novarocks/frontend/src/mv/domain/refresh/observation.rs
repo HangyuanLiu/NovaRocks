@@ -43,12 +43,13 @@ fn derive_rebind_query_source(
     query_definition: &crate::common::persisted_query_definition::PersistedQueryDefinition,
 ) -> Result<String, String> {
     let query = parse_mv_select_query(&query_definition.raw_query_source)?;
-    Ok(canonicalize_iceberg_mv_select_query(
-        &query,
-        Some(query_definition.resolution.default_catalog.as_str()),
-        &query_definition.resolution.default_database,
-    )
-    .to_string())
+    Ok(novarocks_parser::printer::print_query(
+        &canonicalize_iceberg_mv_select_query(
+            &query,
+            Some(query_definition.resolution.default_catalog.as_str()),
+            &query_definition.resolution.default_database,
+        ),
+    ))
 }
 
 /// Loads the current schema facts used to validate a persisted MV contract.

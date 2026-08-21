@@ -30,7 +30,7 @@ use crate::{
     token::Symbol,
 };
 
-use super::StatementParser;
+use super::{StatementParser, query};
 
 pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<Statement>, ParseError> {
     if parser.current_is_word("CREATE") && parser.peek_word(1, "MATERIALIZED") {
@@ -109,7 +109,7 @@ fn parse_create(parser: &mut StatementParser<'_, '_>) -> Result<Statement, Parse
             }
             properties = parse_properties(parser)?;
         } else if parser.consume_if_word("AS") {
-            query = parser.parse_raw_query_slice()?;
+            query = query::parse_query(parser)?;
             break;
         } else {
             return Err(parser.unexpected("materialized view clause or AS"));

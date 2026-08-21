@@ -251,7 +251,10 @@ mod tests {
             table.if_not_exists,
             "IF NOT EXISTS must set the if_not_exists field to true"
         );
-        assert_eq!(stmt.query.text, "SELECT 1 AS x");
+        assert_eq!(
+            novarocks_parser::printer::print_query(&stmt.query),
+            "SELECT 1 AS x"
+        );
     }
 
     #[test]

@@ -399,11 +399,10 @@ fn validate_frozen_join_base_facts(facts: &MvFirstRefreshLogicalContext) -> Resu
     dead_code,
     reason = "Retained for staged MV execution assembly and recovery wiring."
 )]
-fn parse_query_from_sql(sql: &str) -> Result<sqlparser::ast::Query, String> {
-    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
-    let statement = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)?;
-    let sqlparser::ast::Statement::Query(query) = statement else {
+fn parse_query_from_sql(sql: &str) -> Result<novarocks_parser::ast::Query, String> {
+    let statements = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
+    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
         return Err("MV first-refresh physical artifact is not a SELECT query".to_string());
     };
-    Ok(*query)
+    Ok(query.clone())
 }

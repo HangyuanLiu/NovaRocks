@@ -20,7 +20,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, BooleanArray, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use sqlparser::ast as sqlast;
+use novarocks_parser::{ast, printer};
 
 use crate::mv::domain::repository::MvRepository;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
@@ -80,9 +80,9 @@ impl InfoColumn {
 /// of whichever capability value composed the query.
 pub fn try_query_materialized_views(
     mv_repository: &dyn MvRepository,
-    query: &sqlast::Query,
+    query: &ast::Query,
 ) -> Result<Option<StatementResult>, String> {
-    let sqlast::SetExpr::Select(select) = query.body.as_ref() else {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return Ok(None);
     };
     if select.from.len() != 1 || !select.from[0].joins.is_empty() {
@@ -135,8 +135,8 @@ fn materialized_view_rows(
     Ok(rows)
 }
 
-fn is_information_schema_materialized_views(factor: &sqlast::TableFactor) -> bool {
-    let sqlast::TableFactor::Table { name, .. } = factor else {
+fn is_information_schema_materialized_views(factor: &ast::TableFactor) -> bool {
+    let ast::TableFactor::Table { name, .. } = factor else {
         return false;
     };
     let parts = object_name_parts(name);
@@ -148,11 +148,11 @@ fn is_information_schema_materialized_views(factor: &sqlast::TableFactor) -> boo
     )
 }
 
-fn projection_columns(select: &sqlast::Select) -> Result<Vec<InfoColumn>, String> {
+fn projection_columns(select: &ast::Select) -> Result<Vec<InfoColumn>, String> {
     let mut columns = Vec::new();
     for item in &select.projection {
         match item {
-            sqlast::SelectItem::Wildcard(_) => {
+            ast::SelectItem::Wildcard { .. } => {
                 columns.extend([
                     InfoColumn::TableSchema,
                     InfoColumn::TableName,
@@ -160,13 +160,13 @@ fn projection_columns(select: &sqlast::Select) -> Result<Vec<InfoColumn>, String
                     InfoColumn::InactiveReason,
                 ]);
             }
-            sqlast::SelectItem::UnnamedExpr(expr) => {
+            ast::SelectItem::UnnamedExpr(expr) => {
                 columns.push(expr_column(expr)?);
             }
-            sqlast::SelectItem::ExprWithAlias { expr, .. } => {
+            ast::SelectItem::ExprWithAlias { expr, .. } => {
                 columns.push(expr_column(expr)?);
             }
-            sqlast::SelectItem::QualifiedWildcard(_, _) => {
+            ast::SelectItem::QualifiedWildcard { .. } => {
                 return Err(
                     "information_schema.materialized_views does not support qualified wildcard"
                         .to_string(),
@@ -180,29 +180,33 @@ fn projection_columns(select: &sqlast::Select) -> Result<Vec<InfoColumn>, String
     Ok(columns)
 }
 
-fn expr_column(expr: &sqlast::Expr) -> Result<InfoColumn, String> {
+fn expr_column(expr: &ast::Expr) -> Result<InfoColumn, String> {
     let name = expr_column_name(expr).ok_or_else(|| {
-        format!("unsupported information_schema.materialized_views projection: {expr}")
+        format!(
+            "unsupported information_schema.materialized_views projection: {}",
+            printer::print_expr(expr)
+        )
     })?;
     InfoColumn::parse(&name)
         .ok_or_else(|| format!("unknown information_schema.materialized_views column `{name}`"))
 }
 
-fn selection_matches(row: &MaterializedViewInfoRow, expr: &sqlast::Expr) -> Result<bool, String> {
+fn selection_matches(row: &MaterializedViewInfoRow, expr: &ast::Expr) -> Result<bool, String> {
     match expr {
-        sqlast::Expr::BinaryOp { left, op, right } => match op {
-            sqlast::BinaryOperator::And => {
-                Ok(selection_matches(row, left)? && selection_matches(row, right)?)
+        ast::Expr::Binary(binary) => match binary.operator {
+            ast::BinaryOperator::And => {
+                Ok(selection_matches(row, &binary.left)? && selection_matches(row, &binary.right)?)
             }
-            sqlast::BinaryOperator::Or => {
-                Ok(selection_matches(row, left)? || selection_matches(row, right)?)
+            ast::BinaryOperator::Or => {
+                Ok(selection_matches(row, &binary.left)? || selection_matches(row, &binary.right)?)
             }
-            sqlast::BinaryOperator::Eq => {
-                let (column, value) = comparison_column_value(left, right)
-                    .or_else(|| comparison_column_value(right, left))
+            ast::BinaryOperator::Equal => {
+                let (column, value) = comparison_column_value(&binary.left, &binary.right)
+                    .or_else(|| comparison_column_value(&binary.right, &binary.left))
                     .ok_or_else(|| {
                         format!(
-                            "unsupported information_schema.materialized_views predicate: {expr}"
+                            "unsupported information_schema.materialized_views predicate: {}",
+                            printer::print_expr(expr)
                         )
                     })?;
                 Ok(row_string_value(row, column)
@@ -210,37 +214,33 @@ fn selection_matches(row: &MaterializedViewInfoRow, expr: &sqlast::Expr) -> Resu
                     .unwrap_or(false))
             }
             _ => Err(format!(
-                "unsupported information_schema.materialized_views predicate operator: {op}"
+                "unsupported information_schema.materialized_views predicate operator: {:?}",
+                binary.operator
             )),
         },
-        sqlast::Expr::Nested(inner) => selection_matches(row, inner),
+        ast::Expr::Nested(nested) => selection_matches(row, &nested.expression),
         _ => Err(format!(
-            "unsupported information_schema.materialized_views predicate: {expr}"
+            "unsupported information_schema.materialized_views predicate: {}",
+            printer::print_expr(expr)
         )),
     }
 }
 
 fn comparison_column_value<'a>(
-    column_expr: &'a sqlast::Expr,
-    value_expr: &'a sqlast::Expr,
+    column_expr: &'a ast::Expr,
+    value_expr: &'a ast::Expr,
 ) -> Option<(InfoColumn, String)> {
     let column = expr_column_name(column_expr).and_then(|name| InfoColumn::parse(&name))?;
     let value = string_literal(value_expr)?;
     Some((column, value))
 }
 
-fn apply_order_by(
-    query: &sqlast::Query,
-    rows: &mut [MaterializedViewInfoRow],
-) -> Result<(), String> {
-    let Some(sqlast::OrderBy {
-        kind: sqlast::OrderByKind::Expressions(exprs),
-        ..
-    }) = &query.order_by
-    else {
+fn apply_order_by(query: &ast::Query, rows: &mut [MaterializedViewInfoRow]) -> Result<(), String> {
+    if query.order_by.is_empty() {
         return Ok(());
-    };
-    let columns = exprs
+    }
+    let columns = query
+        .order_by
         .iter()
         .map(|order| expr_column(&order.expr))
         .collect::<Result<Vec<_>, _>>()?;
@@ -323,33 +323,26 @@ fn row_sort_value(row: &MaterializedViewInfoRow, column: InfoColumn) -> String {
     row_string_value(row, column).unwrap_or_default()
 }
 
-fn expr_column_name(expr: &sqlast::Expr) -> Option<String> {
+fn expr_column_name(expr: &ast::Expr) -> Option<String> {
     match expr {
-        sqlast::Expr::Identifier(ident) => Some(ident.value.clone()),
-        sqlast::Expr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.clone()),
+        ast::Expr::Identifier(ident) => Some(ident.value.clone()),
+        ast::Expr::CompoundIdentifier(parts) => parts.parts.last().map(|ident| ident.value.clone()),
         _ => None,
     }
 }
 
-fn string_literal(expr: &sqlast::Expr) -> Option<String> {
+fn string_literal(expr: &ast::Expr) -> Option<String> {
     match expr {
-        sqlast::Expr::Value(sqlast::ValueWithSpan {
-            value:
-                sqlast::Value::SingleQuotedString(value) | sqlast::Value::DoubleQuotedString(value),
-            ..
-        }) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-fn object_name_parts(name: &sqlast::ObjectName) -> Vec<String> {
-    name.0
-        .iter()
-        .filter_map(|part| match part {
-            sqlast::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
+        ast::Expr::Literal(literal) => match &literal.kind {
+            ast::LiteralKind::String(value) => Some(value.clone()),
             _ => None,
-        })
-        .collect()
+        },
+        _ => None,
+    }
+}
+
+fn object_name_parts(name: &ast::ObjectName) -> Vec<String> {
+    name.parts.iter().map(|part| part.value.clone()).collect()
 }
 
 fn normalize_column_name(name: &str) -> String {
