@@ -22,7 +22,7 @@ use crate::{
     printer::{print_literal, print_object_name},
 };
 
-use super::{Fold, Ident, Literal, ObjectName, RawQuerySlice, Visit};
+use super::{Fold, Ident, Literal, ObjectName, Query, Visit};
 
 /// Materialized-view commands owned by SQLP-3.
 #[expect(
@@ -53,9 +53,6 @@ impl MaterializedViewStatement {
 }
 
 /// `CREATE MATERIALIZED VIEW ... AS <query>`.
-///
-/// SQLP-3 owns the command shape but deliberately preserves the embedded
-/// query as source until SQLP-6 supplies the typed query AST.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateMaterializedView {
     pub if_not_exists: bool,
@@ -66,7 +63,7 @@ pub struct CreateMaterializedView {
     pub refresh: Option<MaterializedViewRefreshPolicy>,
     pub primary_key: Option<Vec<Ident>>,
     pub properties: Vec<MaterializedViewProperty>,
-    pub query: RawQuerySlice,
+    pub query: Query,
     pub span: Span,
 }
 
@@ -237,7 +234,7 @@ fn write_create(value: &CreateMaterializedView, output: &mut String) {
         output.push(')');
     }
     output.push_str(" AS ");
-    output.push_str(&value.query.text);
+    output.push_str(&crate::printer::print_query(&value.query));
 }
 
 fn write_drop(value: &DropMaterializedView, output: &mut String) {
@@ -414,7 +411,7 @@ pub(crate) fn walk<V: Visit + ?Sized>(visitor: &mut V, statement: &MaterializedV
                 }
             }
             walk_properties(visitor, &value.properties);
-            visitor.visit_raw_query_slice(&value.query);
+            visitor.visit_query(&value.query);
         }
         MaterializedViewStatement::Drop(value) => visitor.visit_object_name(&value.name),
         MaterializedViewStatement::Alter(value) => {
@@ -465,7 +462,7 @@ pub(crate) fn fold<F: Fold + ?Sized>(
                     .collect()
             });
             value.properties = fold_properties(folder, value.properties);
-            value.query = folder.fold_raw_query_slice(value.query);
+            value.query = folder.fold_query(value.query);
             MaterializedViewStatement::Create(value)
         }
         MaterializedViewStatement::Drop(mut value) => {

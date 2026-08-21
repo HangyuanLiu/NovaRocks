@@ -69,7 +69,7 @@ fn recursive_cte_max_depth(query: &Query) -> Option<usize> {
             let SelectHintValue::Call { arguments } = &hint.value else {
                 return None;
             };
-            let assignment = arguments.iter().find_map(|argument| {
+            arguments.iter().find_map(|argument| {
                 let Expr::Binary(binary) = argument else {
                     return None;
                 };
@@ -79,8 +79,7 @@ fn recursive_cte_max_depth(query: &Query) -> Option<usize> {
                 (binary.operator == BinaryOperator::Equal
                     && name.value.eq_ignore_ascii_case("recursive_cte_max_depth"))
                 .then_some(binary.right.as_ref())
-            })?;
-            assignment
+            })?
         } else {
             return None;
         };

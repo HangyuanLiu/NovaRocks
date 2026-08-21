@@ -42,7 +42,7 @@ select * from TABLE(generate_series(start=>2, stop=>5));
 select * from TABLE(generate_series(end=>5,start=>2, step = 2));
 
 -- query 7
--- @expect_error=Unexpected input '=>'
+-- @expect_error=expected expression, found `=>`
 select * from TABLE(generate_series(start=>2, =>5));
 
 -- query 8

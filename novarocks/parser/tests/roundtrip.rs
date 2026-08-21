@@ -26,7 +26,7 @@ use novarocks_parser::{
     Span,
     ast::{
         BackendStatement, BinaryExpr, BinaryOperator, Expr, Ident, Literal, LiteralKind,
-        RawQuerySlice, ShowBackends, Statement,
+        ShowBackends, Statement,
     },
     printer::{print_expr, print_statement},
 };
@@ -59,15 +59,6 @@ fn roundtrip_seed_ast_printer_contracts_cover_vertical_slice_and_expressions() {
         span: span(),
     }));
     assert_eq!(print_statement(&show_backends), "SHOW BACKENDS");
-
-    let raw_query = Statement::RawQuery(RawQuerySlice {
-        text: "SELECT /* retained verbatim */ 1".to_owned(),
-        span: span(),
-    });
-    assert_eq!(
-        print_statement(&raw_query),
-        "SELECT /* retained verbatim */ 1"
-    );
 
     let expression = binary(
         ident("a"),

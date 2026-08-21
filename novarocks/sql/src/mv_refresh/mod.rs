@@ -90,7 +90,12 @@ pub struct MvRefreshStatement {
 impl From<&RefreshMaterializedViewStmt> for MvRefreshStatement {
     fn from(statement: &RefreshMaterializedViewStmt) -> Self {
         Self {
-            name_parts: statement.name.parts.clone(),
+            name_parts: statement
+                .name
+                .parts
+                .iter()
+                .map(|part| part.value.clone())
+                .collect(),
             full: statement.full,
         }
     }

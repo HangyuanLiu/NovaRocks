@@ -22,9 +22,7 @@ use novarocks_catalog::schema::{ColumnDef, ColumnDefault};
 use novarocks_frontend::dml::{
     InsertCommand, InsertCommandSource, convert_insert_command, reorder_insert_rows,
 };
-use novarocks_frontend::query_execution::dml::insert::{
-    InsertOverwriteMode, InsertValue, parse_insert_source_query,
-};
+use novarocks_frontend::query_execution::dml::insert::{InsertOverwriteMode, InsertValue};
 
 fn parse_insert(sql: &str) -> novarocks_parser::ast::Insert {
     let statements = novarocks_parser::parse(sql).expect("statement should parse");
@@ -41,8 +39,7 @@ fn parse_insert(sql: &str) -> novarocks_parser::ast::Insert {
 
 fn convert_insert(sql: &str) -> Result<InsertCommand, String> {
     let statement = parse_insert(sql);
-    let source_query = parse_insert_source_query(&statement.source)?;
-    convert_insert_command(&statement, &source_query)
+    convert_insert_command(&statement)
 }
 
 fn column(

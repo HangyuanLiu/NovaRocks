@@ -69,7 +69,7 @@ pub struct IcebergMvRewriteContext {
 
     // ---- MV definition (post schema-contract rebind) ----
     pub mv_definition: Arc<StoredMvDefinition>,
-    pub canonical_select_query: Arc<sqlparser::ast::Query>,
+    pub canonical_select_query: Arc<novarocks_parser::ast::Query>,
 
     // ---- Base table inputs ----
     pub base_refs: Arc<[TableIdentity]>,
@@ -165,7 +165,7 @@ impl IcebergMvRewriteContext {
         current_catalog: Option<String>,
         current_database: String,
         mv_definition: Arc<StoredMvDefinition>,
-        canonical_select_query: Arc<sqlparser::ast::Query>,
+        canonical_select_query: Arc<novarocks_parser::ast::Query>,
         base_refs: Arc<[TableIdentity]>,
         pin: Arc<RefreshSnapshotPin>,
         previous_snapshot_ids: BTreeMap<String, i64>,
@@ -294,7 +294,7 @@ impl IcebergMvRewriteContext {
         current_catalog: Option<String>,
         current_database: String,
         mv_definition: Arc<StoredMvDefinition>,
-        canonical_select_query: Arc<sqlparser::ast::Query>,
+        canonical_select_query: Arc<novarocks_parser::ast::Query>,
         base_refs: Arc<[TableIdentity]>,
         pin: Arc<RefreshSnapshotPin>,
         target_snapshot_id: Option<i64>,
@@ -749,14 +749,12 @@ fn sql_schema_contract(contract: &MvSchemaContract) -> Result<SqlImvSchemaContra
 
 /// Whether `query`'s body is a UNION ALL set operation (possibly nested), used
 /// to decide whether to source aggregate calls from the first branch.
-fn is_union_all_query(query: &sqlparser::ast::Query) -> bool {
+fn is_union_all_query(query: &novarocks_parser::ast::Query) -> bool {
     matches!(
         query.body.as_ref(),
-        sqlparser::ast::SetExpr::SetOperation {
-            op: sqlparser::ast::SetOperator::Union,
-            set_quantifier: sqlparser::ast::SetQuantifier::All,
-            ..
-        }
+        novarocks_parser::ast::SetExpr::SetOperation(operation)
+            if operation.operator == novarocks_parser::ast::SetOperator::Union
+                && operation.quantifier == novarocks_parser::ast::SetQuantifier::All
     )
 }
 
@@ -764,14 +762,16 @@ fn is_union_all_query(query: &sqlparser::ast::Query) -> bool {
 /// FROM — a scan, a join, or a fan-in union). Works off the AST so a composed
 /// branch is not classified.
 pub fn first_union_branch_query(
-    query: &sqlparser::ast::Query,
-) -> Result<sqlparser::ast::Query, String> {
+    query: &novarocks_parser::ast::Query,
+) -> Result<novarocks_parser::ast::Query, String> {
     fn first_branch_body(
-        body: &sqlparser::ast::SetExpr,
-    ) -> Result<&sqlparser::ast::SetExpr, String> {
+        body: &novarocks_parser::ast::SetExpr,
+    ) -> Result<&novarocks_parser::ast::SetExpr, String> {
         match body {
-            sqlparser::ast::SetExpr::SetOperation { left, .. } => first_branch_body(left),
-            sqlparser::ast::SetExpr::Query(inner) => first_branch_body(inner.body.as_ref()),
+            novarocks_parser::ast::SetExpr::SetOperation(operation) => {
+                first_branch_body(&operation.left)
+            }
+            novarocks_parser::ast::SetExpr::Query(inner) => first_branch_body(inner.body.as_ref()),
             other => Ok(other),
         }
     }
@@ -828,10 +828,12 @@ fn aggregate_input_cast_type(
     explicit_cast_type(expr)
 }
 
-fn explicit_cast_type(expr: &sqlparser::ast::Expr) -> Result<Option<DataType>, String> {
+fn explicit_cast_type(expr: &novarocks_parser::ast::Expr) -> Result<Option<DataType>, String> {
     match expr {
-        sqlparser::ast::Expr::Cast { data_type, .. } => sql_data_type_to_arrow(data_type).map(Some),
-        sqlparser::ast::Expr::Nested(inner) => explicit_cast_type(inner),
+        novarocks_parser::ast::Expr::Cast(cast) => {
+            sql_data_type_to_arrow(&cast.data_type).map(Some)
+        }
+        novarocks_parser::ast::Expr::Nested(inner) => explicit_cast_type(&inner.expression),
         _ => Ok(None),
     }
 }
@@ -900,43 +902,52 @@ fn base_contracts(contract: &MvSchemaContract) -> Vec<&mv_schema::BaseContract> 
     }
 }
 
-fn sql_data_type_to_arrow(data_type: &sqlparser::ast::DataType) -> Result<DataType, String> {
-    use sqlparser::ast as sqlast;
+fn sql_data_type_to_arrow(data_type: &novarocks_parser::ast::TypeName) -> Result<DataType, String> {
+    use novarocks_parser::ast::{LiteralKind, TypeNameArgument};
 
-    Ok(match data_type {
-        sqlast::DataType::TinyInt(_) => DataType::Int8,
-        sqlast::DataType::SmallInt(_) => DataType::Int16,
-        sqlast::DataType::Int(_) | sqlast::DataType::Integer(_) => DataType::Int32,
-        sqlast::DataType::BigInt(_) => DataType::Int64,
-        sqlast::DataType::Float(_) => DataType::Float32,
-        sqlast::DataType::Double(_) | sqlast::DataType::DoublePrecision => DataType::Float64,
-        sqlast::DataType::Boolean => DataType::Boolean,
-        sqlast::DataType::Varchar(_)
-        | sqlast::DataType::CharVarying(_)
-        | sqlast::DataType::Text
-        | sqlast::DataType::Char(_)
-        | sqlast::DataType::Character(_)
-        | sqlast::DataType::String(_) => DataType::Utf8,
-        sqlast::DataType::Varbinary(_) | sqlast::DataType::Binary(_) => DataType::Binary,
-        sqlast::DataType::Date => DataType::Date32,
-        sqlast::DataType::Datetime(_) | sqlast::DataType::Timestamp(_, _) => {
-            DataType::Timestamp(TimeUnit::Microsecond, None)
+    let name = data_type
+        .name
+        .parts
+        .last()
+        .map(|part| part.value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let decimal_arg = |index: usize| -> Result<Option<i64>, String> {
+        let Some(TypeNameArgument::Literal(literal)) = data_type.arguments.get(index) else {
+            return Ok(None);
+        };
+        let LiteralKind::Number(value) = &literal.kind else {
+            return Err("aggregate MV explicit cast decimal argument is not numeric".to_string());
+        };
+        value
+            .parse()
+            .map(Some)
+            .map_err(|_| "aggregate MV explicit cast decimal argument is invalid".to_string())
+    };
+    match name.as_str() {
+        "tinyint" => Ok(DataType::Int8),
+        "smallint" => Ok(DataType::Int16),
+        "int" | "integer" => Ok(DataType::Int32),
+        "bigint" => Ok(DataType::Int64),
+        "float" => Ok(DataType::Float32),
+        "double" => Ok(DataType::Float64),
+        "boolean" | "bool" => Ok(DataType::Boolean),
+        "varchar" | "char" | "text" | "string" => Ok(DataType::Utf8),
+        "varbinary" | "binary" => Ok(DataType::Binary),
+        "date" => Ok(DataType::Date32),
+        "datetime" | "timestamp" => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        "decimal" | "dec" | "numeric" => {
+            let precision = decimal_arg(0)?.unwrap_or(38).try_into().map_err(|_| {
+                "aggregate MV explicit cast decimal precision is out of range".to_string()
+            })?;
+            let scale = decimal_arg(1)?.unwrap_or(0).try_into().map_err(|_| {
+                "aggregate MV explicit cast decimal scale is out of range".to_string()
+            })?;
+            Ok(DataType::Decimal128(precision, scale))
         }
-        sqlast::DataType::Decimal(info)
-        | sqlast::DataType::Dec(info)
-        | sqlast::DataType::Numeric(info) => match info {
-            sqlast::ExactNumberInfo::PrecisionAndScale(p, s) => {
-                DataType::Decimal128(*p as u8, *s as i8)
-            }
-            sqlast::ExactNumberInfo::Precision(p) => DataType::Decimal128(*p as u8, 0),
-            sqlast::ExactNumberInfo::None => DataType::Decimal128(38, 0),
-        },
-        other => {
-            return Err(format!(
-                "aggregate MV explicit cast input type is unsupported: {other}"
-            ));
-        }
-    })
+        _ => Err(format!(
+            "aggregate MV explicit cast input type is unsupported: {name}"
+        )),
+    }
 }
 
 fn arrow_type_from_contract_signature(type_signature: &str) -> Result<DataType, String> {
@@ -1161,13 +1172,12 @@ pub(crate) mod tests_support {
         }
     }
 
-    pub(crate) fn parse_query(sql: &str) -> sqlparser::ast::Query {
-        let dialect = sqlparser::dialect::GenericDialect {};
-        let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql).expect("parse_sql");
-        match statements.into_iter().next().expect("one statement") {
-            sqlparser::ast::Statement::Query(q) => *q,
-            other => panic!("expected SELECT, got {other:?}"),
-        }
+    pub(crate) fn parse_query(sql: &str) -> novarocks_parser::ast::Query {
+        let statements = novarocks_parser::parse(sql).expect("parse query");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected SELECT");
+        };
+        query.clone()
     }
 
     pub(crate) fn make_target() -> TableIdentity {

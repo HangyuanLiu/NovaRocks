@@ -23,6 +23,7 @@
 
 use std::sync::Arc;
 
+use crate::mv::domain::refresh::definition::parse_mv_select_query;
 use crate::mv::domain::repository::MvRepository;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::compiler::{
@@ -66,7 +67,7 @@ fn freeze_mv_rewrite_definition(
 
     SqlMvRewriteDefinitionFacts::try_new(
         definition.mv_id,
-        definition.query_definition.raw_query_source,
+        parse_mv_select_query(&definition.query_definition.raw_query_source)?,
         definition.base_table_refs,
         definition.storage_engine,
         definition.target_catalog,

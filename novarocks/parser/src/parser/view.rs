@@ -23,7 +23,7 @@ use crate::{
     token::Symbol,
 };
 
-use super::StatementParser;
+use super::{StatementParser, query};
 
 pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<Statement>, ParseError> {
     if parser.current_is_word("CREATE")
@@ -76,7 +76,7 @@ fn parse_create(parser: &mut StatementParser<'_, '_>) -> Result<Statement, Parse
         None
     };
     parser.consume_word("AS")?;
-    let query = parser.parse_raw_query_slice()?;
+    let query = query::parse_query(parser)?;
     let span = Span::new(start, query.span.end());
     Ok(Statement::View(ViewStatement::Create(CreateView {
         or_replace,

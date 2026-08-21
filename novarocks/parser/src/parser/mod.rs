@@ -308,8 +308,16 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
             TokenKind::Keyword(Keyword::True) => LiteralKind::Boolean(true),
             TokenKind::Keyword(Keyword::False) => LiteralKind::Boolean(false),
             TokenKind::Number => LiteralKind::Number(source.to_owned()),
-            TokenKind::HexNumber => LiteralKind::HexString(source.to_owned()),
-            TokenKind::String => LiteralKind::String(unquote_string(source)),
+            TokenKind::HexNumber => LiteralKind::HexString(
+                source
+                    .strip_prefix("0x")
+                    .or_else(|| source.strip_prefix("0X"))
+                    .expect("hex token must have 0x prefix")
+                    .to_owned(),
+            ),
+            TokenKind::String => hex_string_literal(source)
+                .map(LiteralKind::HexString)
+                .unwrap_or_else(|| LiteralKind::String(unquote_string(source))),
             _ => return Err(self.unexpected("literal")),
         };
         self.advance();
@@ -323,39 +331,6 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
 
     pub(super) fn source_slice(&self, span: Span) -> &str {
         &self.source[span.start()..span.end()]
-    }
-
-    /// Captures an embedded query through its final non-trivia token.
-    ///
-    /// Command-family parsers call this after consuming their `AS` delimiter.
-    /// It leaves the trailing semicolon for the statement-sequence parser and
-    /// excludes whitespace/comments that follow the query while preserving all
-    /// bytes between query tokens exactly.
-    pub(super) fn parse_raw_query_slice(
-        &mut self,
-    ) -> Result<crate::ast::RawQuerySlice, ParseError> {
-        let start = self.current_span().start();
-        let mut end = None;
-        while let Some(token) = self.current() {
-            if matches!(
-                token.kind,
-                TokenKind::End | TokenKind::Symbol(Symbol::Semicolon)
-            ) {
-                break;
-            }
-            if !matches!(token.kind, TokenKind::Trivia(_)) {
-                end = Some(token.span.end());
-            }
-            self.advance();
-        }
-        let Some(end) = end else {
-            return Err(self.unexpected("query"));
-        };
-        let span = Span::new(start, end);
-        Ok(crate::ast::RawQuerySlice {
-            text: self.source_slice(span).to_owned(),
-            span,
-        })
     }
 
     pub(super) fn current_is_symbol(&self, symbol: Symbol) -> bool {
@@ -439,6 +414,22 @@ fn unquote_string(source: &str) -> String {
         }
     }
     output
+}
+
+fn hex_string_literal(source: &str) -> Option<String> {
+    let prefix = source.chars().next()?;
+    if !matches!(prefix, 'x' | 'X') {
+        return None;
+    }
+    let quoted = &source[prefix.len_utf8()..];
+    let quote = quoted.chars().next()?;
+    if !matches!(quote, '\'' | '"') {
+        return None;
+    }
+    quoted
+        .strip_prefix(quote)
+        .and_then(|value| value.strip_suffix(quote))
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -568,7 +559,6 @@ mod tests {
                 Statement::Dml(_) => "DML",
                 Statement::Query(_) => "QUERY",
                 Statement::ExplainQuery(_) => "EXPLAIN QUERY",
-                Statement::RawQuery(_) => "RAW QUERY",
             })
             .collect()
     }

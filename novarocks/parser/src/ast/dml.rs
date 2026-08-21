@@ -19,11 +19,10 @@
 
 use crate::Span;
 
-use super::{
-    Expr, Fold, Ident, ObjectName, Query, RawQuerySlice, Statement, TableAlias, TableStatement,
-    Visit,
-};
+use super::{Expr, Fold, Ident, ObjectName, Query, Statement, TableAlias, TableStatement, Visit};
 
+// Keep statement variants inline so parser/visitor consumers retain a uniform typed AST.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DmlStatement {
     CreateTableAsSelect(CreateTableAsSelect),
@@ -49,7 +48,7 @@ impl DmlStatement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateTableAsSelect {
     pub table: TableStatement,
-    pub query: RawQuerySlice,
+    pub query: Query,
     pub span: Span,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,7 +58,7 @@ pub struct Insert {
     pub target: ObjectName,
     pub columns: Vec<Ident>,
     pub partitions: Option<InsertPartitions>,
-    pub source: RawQuerySlice,
+    pub source: Query,
     pub span: Span,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,7 +174,7 @@ pub(crate) fn write_sql(statement: &DmlStatement, output: &mut String) {
         DmlStatement::CreateTableAsSelect(v) => {
             super::table::write_sql(&v.table, output);
             output.push_str(" AS ");
-            output.push_str(&v.query.text);
+            output.push_str(&crate::printer::print_query(&v.query));
         }
         DmlStatement::Insert(v) => {
             output.push_str("INSERT");
@@ -209,7 +208,7 @@ pub(crate) fn write_sql(statement: &DmlStatement, output: &mut String) {
                 output.push(')');
             }
             output.push(' ');
-            output.push_str(&v.source.text);
+            output.push_str(&crate::printer::print_query(&v.source));
         }
         DmlStatement::Delete(v) => {
             output.push_str("DELETE FROM ");
@@ -391,7 +390,7 @@ pub(crate) fn walk<V: Visit + ?Sized>(visitor: &mut V, statement: &DmlStatement)
     match statement {
         DmlStatement::CreateTableAsSelect(v) => {
             visitor.visit_table_statement(&v.table);
-            visitor.visit_raw_query_slice(&v.query);
+            visitor.visit_query(&v.query);
         }
         DmlStatement::Insert(v) => {
             visitor.visit_object_name(&v.target);
@@ -406,7 +405,7 @@ pub(crate) fn walk<V: Visit + ?Sized>(visitor: &mut V, statement: &DmlStatement)
                     }
                 }
             }
-            visitor.visit_raw_query_slice(&v.source);
+            visitor.visit_query(&v.source);
         }
         DmlStatement::Delete(v) => {
             visitor.visit_object_name(&v.target);
@@ -508,7 +507,7 @@ pub(crate) fn fold<F: Fold + ?Sized>(folder: &mut F, statement: DmlStatement) ->
     match statement {
         DmlStatement::CreateTableAsSelect(mut v) => {
             v.table = folder.fold_table_statement(v.table);
-            v.query = folder.fold_raw_query_slice(v.query);
+            v.query = folder.fold_query(v.query);
             DmlStatement::CreateTableAsSelect(v)
         }
         DmlStatement::Insert(mut v) => {
@@ -530,7 +529,7 @@ pub(crate) fn fold<F: Fold + ?Sized>(folder: &mut F, statement: DmlStatement) ->
                     .collect();
                 p
             });
-            v.source = folder.fold_raw_query_slice(v.source);
+            v.source = folder.fold_query(v.source);
             DmlStatement::Insert(v)
         }
         DmlStatement::Delete(mut v) => {

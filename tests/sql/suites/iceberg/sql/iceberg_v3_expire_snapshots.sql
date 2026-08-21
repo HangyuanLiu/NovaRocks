@@ -25,7 +25,7 @@
 --
 -- Note: tbl$snapshots metadata table queries are not used here because the iceberg
 -- suite's current_catalog mode causes the pre-query table-registration step to try
--- to load `__nr_meta_snapshots__` as a real Iceberg table, which fails. Instead,
+-- to load the metadata relation as a real Iceberg table, which fails. Instead,
 -- correctness is verified through data-level assertions (SELECT COUNT(*), SELECT *).
 --
 -- The runner auto-creates `${case_db}` per case and drops it on cleanup, so

@@ -53,15 +53,13 @@ pub fn mv_definition_fingerprint(select_sql: &str) -> String {
 }
 
 /// Parses the raw stored MV SELECT SQL without invoking query compilation.
-pub fn parse_mv_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
-    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)
-        .map_err(|e| format!("stored MV SELECT normalize error: {e}"))?;
-    let statement = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
-        .map_err(|err| format!("sql parser error: {err}"))?;
-    let sqlparser::ast::Statement::Query(query) = statement else {
+pub fn parse_mv_select_query(sql: &str) -> Result<novarocks_parser::ast::Query, String> {
+    let statements =
+        novarocks_parser::parse(sql).map_err(|err| format!("sql parser error: {err}"))?;
+    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
         return Err("stored MV SQL must be a SELECT query".to_string());
     };
-    Ok(*query)
+    Ok(query.clone())
 }
 
 /// Parses persisted Iceberg base-table references into canonical identities.

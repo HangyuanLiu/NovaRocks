@@ -219,33 +219,32 @@ mod tests {
             .register(DEFAULT_DATABASE, test_metadata_table("local_ice"))
             .expect("register local iceberg table");
 
-        let statement = crate::parser::parse_sql_raw("SELECT * FROM local_ice$snapshots")
+        let statements = novarocks_parser::parse("SELECT * FROM local_ice$snapshots")
             .expect("parse metadata query");
-        let sqlparser::ast::Statement::Query(query) = statement else {
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
             panic!("expected query");
         };
-        crate::analyzer::analyze(&query, &catalog, DEFAULT_DATABASE)
+        crate::analyzer::analyze(query, &catalog, DEFAULT_DATABASE)
             .expect("analyze local metadata query");
 
-        let statement = crate::parser::parse_sql_raw("SELECT * FROM missing$snapshots")
+        let statements = novarocks_parser::parse("SELECT * FROM missing$snapshots")
             .expect("parse missing table query");
-        let sqlparser::ast::Statement::Query(query) = statement else {
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
             panic!("expected query");
         };
         assert_eq!(
-            crate::analyzer::analyze(&query, &catalog, DEFAULT_DATABASE)
+            crate::analyzer::analyze(query, &catalog, DEFAULT_DATABASE)
                 .expect_err("missing table must fail"),
             "unknown table: missing"
         );
 
-        let statement =
-            crate::parser::parse_sql_raw("SELECT * FROM missing_db.local_ice$snapshots")
-                .expect("parse missing database query");
-        let sqlparser::ast::Statement::Query(query) = statement else {
+        let statements = novarocks_parser::parse("SELECT * FROM missing_db.local_ice$snapshots")
+            .expect("parse missing database query");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
             panic!("expected query");
         };
         assert_eq!(
-            crate::analyzer::analyze(&query, &catalog, DEFAULT_DATABASE)
+            crate::analyzer::analyze(query, &catalog, DEFAULT_DATABASE)
                 .expect_err("missing database must fail"),
             "unknown database: missing_db"
         );

@@ -25,6 +25,9 @@
 use std::collections::{BTreeMap, HashSet};
 
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_parser::Span;
+use novarocks_parser::ast;
+use novarocks_parser::printer;
 use novarocks_spi::connector::ConnectorTableObjectId;
 
 use crate::planner::vocabulary::{BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME};
@@ -124,12 +127,12 @@ impl SqlMvSnapshotPin {
 }
 
 pub(super) fn prepare_projection_full_read_sql(
-    select_sql: &str,
+    select_query: &ast::Query,
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<String, String> {
-    let mut query = parse_stored_select_query(select_sql, "iceberg projection full-read")?;
+    let mut query = select_query.clone();
     inject_pin_as_version_as_of(
         &mut query,
         pin,
@@ -141,7 +144,7 @@ pub(super) fn prepare_projection_full_read_sql(
 }
 
 pub(super) fn prepare_union_projection_full_read_sql(
-    select_sql: &str,
+    select_query: &ast::Query,
     branch_count: usize,
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
@@ -153,7 +156,7 @@ pub(super) fn prepare_union_projection_full_read_sql(
     let branch_count_i32 = i32::try_from(branch_count).map_err(|_| {
         format!("iceberg UNION ALL MV full refresh branch count {branch_count} does not fit in i32")
     })?;
-    let mut query = parse_stored_select_query(select_sql, "iceberg UNION ALL MV full-read")?;
+    let mut query = select_query.clone();
     inject_pin_as_version_as_of(
         &mut query,
         pin,
@@ -182,16 +185,16 @@ pub(super) fn prepare_union_projection_full_read_sql(
     let mut next_branch_id = 0;
     append_union_projection_hidden_columns(query.body.as_mut(), &mut next_branch_id)?;
     debug_assert_eq!(next_branch_id, branch_count_i32);
-    Ok(query.to_string())
+    Ok(printer::print_query(&query))
 }
 
 pub(super) fn pin_state_sql(
-    state_sql: &str,
+    state_query: &ast::Query,
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<String, String> {
-    let mut query = parse_stored_select_query(state_sql, "stored MV")?;
+    let mut query = state_query.clone();
     inject_pin_as_version_as_of(
         &mut query,
         pin,
@@ -199,17 +202,14 @@ pub(super) fn pin_state_sql(
         current_catalog,
         current_database,
     )?;
-    Ok(query.to_string())
+    Ok(printer::print_query(&query))
 }
 
 pub(super) fn branch_union_queries(
-    select_sql: &str,
+    select_query: &ast::Query,
     branch_count: usize,
-) -> Result<Vec<(sqlparser::ast::Query, String)>, String> {
-    let query = parse_stored_select_query(
-        select_sql,
-        "iceberg branch UNION ALL aggregate first refresh",
-    )?;
+) -> Result<Vec<(ast::Query, String)>, String> {
+    let query = select_query.clone();
     let mut branch_bodies = Vec::new();
     flatten_branch_union_all_set_expr(query.body.as_ref(), &mut branch_bodies)?;
     if branch_bodies.len() != branch_count {
@@ -223,25 +223,42 @@ pub(super) fn branch_union_queries(
         .map(|body| {
             let mut branch_query = query.clone();
             branch_query.body = Box::new(body);
-            let branch_sql = branch_query.to_string();
+            let branch_sql = printer::print_query(&branch_query);
             Ok((branch_query, branch_sql))
         })
         .collect()
 }
 
-fn parse_stored_select_query(sql: &str, operation: &str) -> Result<sqlparser::ast::Query, String> {
-    let normalized = crate::parser::dialect::normalize_for_raw_parse(sql)
-        .map_err(|error| format!("{operation} SELECT normalize error: {error}"))?;
-    let statement = crate::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|error| format!("{operation} SELECT parse error: {error}"))?;
-    let sqlparser::ast::Statement::Query(query) = statement else {
-        return Err(format!("{operation} expects a SELECT query"));
-    };
-    Ok(*query)
+fn synthetic_ident(value: &str) -> ast::Ident {
+    ast::Ident {
+        value: value.to_string(),
+        quoted: false,
+        quote_style: None,
+        span: Span::new(0, 0),
+    }
 }
 
-fn append_physical_apply_key(mut query: sqlparser::ast::Query) -> Result<String, String> {
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+fn number_literal(value: String) -> ast::Expr {
+    ast::Expr::Literal(ast::Literal {
+        kind: ast::LiteralKind::Number(value),
+        span: Span::new(0, 0),
+    })
+}
+
+fn int_type_name() -> ast::TypeName {
+    ast::TypeName {
+        name: ast::ObjectName {
+            parts: vec![synthetic_ident("INT")],
+            span: Span::new(0, 0),
+        },
+        arguments: vec![],
+        argument_separator_spaces: vec![],
+        span: Span::new(0, 0),
+    }
+}
+
+fn append_physical_apply_key(mut query: ast::Query) -> Result<String, String> {
+    let ast::SetExpr::Select(select) = query.body.as_mut() else {
         return Err("iceberg MV physical SELECT expects a SELECT body".to_string());
     };
     validate_reserved_projection_output_names(
@@ -251,33 +268,31 @@ fn append_physical_apply_key(mut query: sqlparser::ast::Query) -> Result<String,
     for item in &select.projection {
         if matches!(
             item,
-            sqlparser::ast::SelectItem::Wildcard(_)
-                | sqlparser::ast::SelectItem::QualifiedWildcard(_, _)
+            ast::SelectItem::Wildcard { .. } | ast::SelectItem::QualifiedWildcard { .. }
         ) {
             return Err(
                 "iceberg MV physical SELECT requires explicit projection columns".to_string(),
             );
         }
     }
-    select
-        .projection
-        .push(sqlparser::ast::SelectItem::ExprWithAlias {
-            expr: sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("_row_id")),
-            alias: sqlparser::ast::Ident::new(HIDDEN_APPLY_KEY_COLUMN_NAME),
-        });
-    Ok(query.to_string())
+    select.projection.push(ast::SelectItem::ExprWithAlias {
+        expr: ast::Expr::Identifier(synthetic_ident("_row_id")),
+        alias: synthetic_ident(HIDDEN_APPLY_KEY_COLUMN_NAME),
+        explicit_as: true,
+        span: Span::new(0, 0),
+    });
+    Ok(printer::print_query(&query))
 }
 
 fn validate_reserved_projection_output_names(
-    select: &sqlparser::ast::Select,
+    select: &ast::Select,
     reserved: &[(&str, &str)],
 ) -> Result<(), String> {
     for item in &select.projection {
         let output_name = match item {
-            sqlparser::ast::SelectItem::UnnamedExpr(expr) => Some(expr.to_string()),
-            sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
-            sqlparser::ast::SelectItem::Wildcard(_)
-            | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => None,
+            ast::SelectItem::UnnamedExpr(expr) => Some(printer::print_expr(expr)),
+            ast::SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+            ast::SelectItem::Wildcard { .. } | ast::SelectItem::QualifiedWildcard { .. } => None,
         };
         let Some(output_name) = output_name else {
             continue;
@@ -294,21 +309,20 @@ fn validate_reserved_projection_output_names(
 }
 
 fn validate_union_projection_set_expr(
-    set_expr: &sqlparser::ast::SetExpr,
+    set_expr: &ast::SetExpr,
     branch_count: usize,
     validated_branch_count: &mut usize,
     saw_union_all: &mut bool,
 ) -> Result<(), String> {
     match set_expr {
-        sqlparser::ast::SetExpr::SetOperation {
-            op,
-            set_quantifier,
+        ast::SetExpr::SetOperation(ast::SetOperation {
+            operator,
+            quantifier,
             left,
             right,
-        } => {
-            if *op != sqlparser::ast::SetOperator::Union
-                || *set_quantifier != sqlparser::ast::SetQuantifier::All
-            {
+            ..
+        }) => {
+            if *operator != ast::SetOperator::Union || *quantifier != ast::SetQuantifier::All {
                 return Err("iceberg UNION ALL MV full refresh supports UNION ALL only".to_string());
             }
             *saw_union_all = true;
@@ -325,13 +339,13 @@ fn validate_union_projection_set_expr(
                 saw_union_all,
             )
         }
-        sqlparser::ast::SetExpr::Query(query) => validate_union_projection_set_expr(
+        ast::SetExpr::Query(query) => validate_union_projection_set_expr(
             query.body.as_ref(),
             branch_count,
             validated_branch_count,
             saw_union_all,
         ),
-        sqlparser::ast::SetExpr::Select(select) => {
+        ast::SetExpr::Select(select) => {
             if *validated_branch_count >= branch_count {
                 return Err(format!(
                     "iceberg UNION ALL MV full refresh found more than {branch_count} branches"
@@ -352,42 +366,40 @@ fn validate_union_projection_set_expr(
 }
 
 fn append_union_projection_hidden_columns(
-    set_expr: &mut sqlparser::ast::SetExpr,
+    set_expr: &mut ast::SetExpr,
     next_branch_id: &mut i32,
 ) -> Result<(), String> {
     match set_expr {
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+        ast::SetExpr::SetOperation(ast::SetOperation { left, right, .. }) => {
             append_union_projection_hidden_columns(left.as_mut(), next_branch_id)?;
             append_union_projection_hidden_columns(right.as_mut(), next_branch_id)
         }
-        sqlparser::ast::SetExpr::Query(query) => {
+        ast::SetExpr::Query(query) => {
             append_union_projection_hidden_columns(query.body.as_mut(), next_branch_id)
         }
-        sqlparser::ast::SetExpr::Select(select) => {
+        ast::SetExpr::Select(select) => {
             let branch_id = *next_branch_id;
             *next_branch_id = next_branch_id
                 .checked_add(1)
                 .ok_or_else(|| "iceberg UNION ALL MV branch id overflow".to_string())?;
-            select
-                .projection
-                .push(sqlparser::ast::SelectItem::ExprWithAlias {
-                    expr: sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("_row_id")),
-                    alias: sqlparser::ast::Ident::new(HIDDEN_APPLY_KEY_COLUMN_NAME),
-                });
-            select
-                .projection
-                .push(sqlparser::ast::SelectItem::ExprWithAlias {
-                    expr: sqlparser::ast::Expr::Cast {
-                        kind: sqlparser::ast::CastKind::Cast,
-                        expr: Box::new(sqlparser::ast::Expr::Value(
-                            sqlparser::ast::Value::Number(branch_id.to_string(), false).into(),
-                        )),
-                        data_type: sqlparser::ast::DataType::Int(None),
-                        array: false,
-                        format: None,
-                    },
-                    alias: sqlparser::ast::Ident::new(BRANCH_ID_COLUMN_NAME),
-                });
+            select.projection.push(ast::SelectItem::ExprWithAlias {
+                expr: ast::Expr::Identifier(synthetic_ident("_row_id")),
+                alias: synthetic_ident(HIDDEN_APPLY_KEY_COLUMN_NAME),
+                explicit_as: true,
+                span: Span::new(0, 0),
+            });
+            select.projection.push(ast::SelectItem::ExprWithAlias {
+                expr: ast::Expr::Cast(ast::CastExpr {
+                    kind: ast::CastKind::Cast,
+                    expr: Box::new(number_literal(branch_id.to_string())),
+                    data_type: int_type_name(),
+                    format: None,
+                    span: Span::new(0, 0),
+                }),
+                alias: synthetic_ident(BRANCH_ID_COLUMN_NAME),
+                explicit_as: true,
+                span: Span::new(0, 0),
+            });
             Ok(())
         }
         _ => Err("iceberg UNION ALL MV full refresh expects SELECT branches".to_string()),
@@ -395,7 +407,7 @@ fn append_union_projection_hidden_columns(
 }
 
 fn inject_pin_as_version_as_of(
-    query: &mut sqlparser::ast::Query,
+    query: &mut ast::Query,
     pin: &SqlMvSnapshotPin,
     delta_bearing: &HashSet<TableIdentity>,
     current_catalog: Option<&str>,
@@ -410,7 +422,7 @@ fn inject_pin_as_version_as_of(
         first_error: None,
     };
     if let Some(with) = &mut query.with {
-        for cte in &mut with.cte_tables {
+        for cte in &mut with.ctes {
             walk_set_expr(cte.query.body.as_mut(), &mut state);
         }
     }
@@ -427,60 +439,42 @@ struct InjectState<'a> {
     first_error: Option<String>,
 }
 
-fn walk_set_expr(expr: &mut sqlparser::ast::SetExpr, state: &mut InjectState<'_>) {
+fn walk_set_expr(expr: &mut ast::SetExpr, state: &mut InjectState<'_>) {
     if state.first_error.is_some() {
         return;
     }
     match expr {
-        sqlparser::ast::SetExpr::Select(select) => {
+        ast::SetExpr::Select(select) => {
             for table_with_joins in &mut select.from {
                 walk_table_with_joins(table_with_joins, state);
             }
         }
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+        ast::SetExpr::SetOperation(ast::SetOperation { left, right, .. }) => {
             walk_set_expr(left.as_mut(), state);
             walk_set_expr(right.as_mut(), state);
         }
-        sqlparser::ast::SetExpr::Query(query) => walk_set_expr(query.body.as_mut(), state),
+        ast::SetExpr::Query(query) => walk_set_expr(query.body.as_mut(), state),
         _ => {}
     }
 }
 
-fn walk_table_with_joins(
-    table_with_joins: &mut sqlparser::ast::TableWithJoins,
-    state: &mut InjectState<'_>,
-) {
+fn walk_table_with_joins(table_with_joins: &mut ast::TableWithJoins, state: &mut InjectState<'_>) {
     walk_factor(&mut table_with_joins.relation, state);
     for join in &mut table_with_joins.joins {
         walk_factor(&mut join.relation, state);
     }
 }
 
-fn walk_factor(factor: &mut sqlparser::ast::TableFactor, state: &mut InjectState<'_>) {
-    use sqlparser::ast::{Expr, ObjectNamePart, TableFactor, TableVersion, Value};
-
+fn walk_factor(factor: &mut ast::TableFactor, state: &mut InjectState<'_>) {
     if state.first_error.is_some() {
         return;
     }
     match factor {
-        TableFactor::Table {
-            name,
-            version,
-            args,
-            ..
-        } => {
-            if args.is_some() {
-                return;
-            }
+        ast::TableFactor::Table { name, version, .. } => {
             let parts = name
-                .0
+                .parts
                 .iter()
-                .filter_map(|part| match part {
-                    ObjectNamePart::Identifier(identifier) => {
-                        Some(identifier.value.to_ascii_lowercase())
-                    }
-                    _ => None,
-                })
+                .map(|part| part.value.to_ascii_lowercase())
                 .collect::<Vec<_>>();
             let Some(base_ref) =
                 resolve_table_factor(&parts, state.current_catalog, state.current_database)
@@ -500,13 +494,15 @@ fn walk_factor(factor: &mut sqlparser::ast::TableFactor, state: &mut InjectState
             if state.delta_bearing.contains(&base_ref) {
                 return;
             }
-            *version = Some(TableVersion::VersionAsOf(Expr::Value(
-                Value::Number(pinned.to_string(), false).into(),
-            )));
+            *version = Some(ast::TableVersion {
+                kind: ast::TableVersionKind::ForVersionAsOf,
+                value: number_literal(pinned.to_string()),
+                span: Span::new(0, 0),
+            });
             state.count += 1;
         }
-        TableFactor::Derived { subquery, .. } => walk_set_expr(subquery.body.as_mut(), state),
-        TableFactor::NestedJoin {
+        ast::TableFactor::Derived { subquery, .. } => walk_set_expr(subquery.body.as_mut(), state),
+        ast::TableFactor::NestedJoin {
             table_with_joins, ..
         } => walk_table_with_joins(table_with_joins.as_mut(), state),
         _ => {}
@@ -541,18 +537,19 @@ fn resolve_table_factor(
 }
 
 fn flatten_branch_union_all_set_expr(
-    body: &sqlparser::ast::SetExpr,
-    out: &mut Vec<sqlparser::ast::SetExpr>,
+    body: &ast::SetExpr,
+    out: &mut Vec<ast::SetExpr>,
 ) -> Result<(), String> {
     match body {
-        sqlparser::ast::SetExpr::SetOperation {
-            op,
-            set_quantifier,
+        ast::SetExpr::SetOperation(ast::SetOperation {
+            operator,
+            quantifier,
             left,
             right,
-        } => {
-            if !matches!(op, sqlparser::ast::SetOperator::Union)
-                || !matches!(set_quantifier, sqlparser::ast::SetQuantifier::All)
+            ..
+        }) => {
+            if !matches!(operator, ast::SetOperator::Union)
+                || !matches!(quantifier, ast::SetQuantifier::All)
             {
                 return Err(
                     "iceberg branch UNION ALL aggregate first refresh supports UNION ALL only"
@@ -562,10 +559,8 @@ fn flatten_branch_union_all_set_expr(
             flatten_branch_union_all_set_expr(left, out)?;
             flatten_branch_union_all_set_expr(right, out)
         }
-        sqlparser::ast::SetExpr::Query(query) => {
-            flatten_branch_union_all_set_expr(query.body.as_ref(), out)
-        }
-        sqlparser::ast::SetExpr::Select(_) => {
+        ast::SetExpr::Query(query) => flatten_branch_union_all_set_expr(query.body.as_ref(), out),
+        ast::SetExpr::Select(_) => {
             out.push(body.clone());
             Ok(())
         }
@@ -579,14 +574,22 @@ fn flatten_branch_union_all_set_expr(
 mod tests {
     use super::*;
 
+    fn parse_query(sql: &str) -> ast::Query {
+        let statements = novarocks_parser::parse(sql).expect("parse query");
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("fixture must be a query");
+        };
+        query.clone()
+    }
+
     #[test]
     fn sqlx2_mv_sql_shape_pins_projection_without_application_refresh_state() {
         let pin =
             SqlMvSnapshotPin::from_entries_for_tests(&[("ice.db.fact", 42, "fact-incarnation")]);
 
-        let sql =
-            prepare_projection_full_read_sql("SELECT id FROM ice.db.fact", &pin, Some("ice"), "db")
-                .expect("SQL-only projection shape");
+        let query = parse_query("SELECT id FROM ice.db.fact");
+        let sql = prepare_projection_full_read_sql(&query, &pin, Some("ice"), "db")
+            .expect("SQL-only projection shape");
 
         assert!(sql.contains("VERSION AS OF 42"), "{sql}");
         assert!(sql.contains("__nova_base_row_id"), "{sql}");

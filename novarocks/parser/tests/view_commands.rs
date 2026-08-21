@@ -23,7 +23,7 @@ use novarocks_parser::{
 };
 
 #[test]
-fn create_view_preserves_exact_embedded_query_bytes_and_span() {
+fn create_view_owns_a_typed_embedded_query_and_span() {
     let source = "  CREATE OR REPLACE VIEW analytics.orders_v (order_id, `order day`) \
         COMMENT 'daily' AS /* outside query */ SELECT order_id /* inside */\nFROM orders  /* trailing */ ;";
     let statements = parse(source).expect("CREATE VIEW should parse");
@@ -35,8 +35,8 @@ fn create_view_preserves_exact_embedded_query_bytes_and_span() {
     assert!(!create.if_not_exists);
     assert_eq!(create.columns.len(), 2);
     assert_eq!(
-        create.query.text,
-        "SELECT order_id /* inside */\nFROM orders"
+        novarocks_parser::printer::print_query(&create.query),
+        "SELECT order_id FROM orders"
     );
     let query_start = source.find("SELECT").expect("query start");
     let query_end = source.find("  /* trailing */").expect("query end");
@@ -44,7 +44,7 @@ fn create_view_preserves_exact_embedded_query_bytes_and_span() {
     assert_eq!(
         print_statements(&[Statement::View(ViewStatement::Create(create.clone()))]),
         "CREATE OR REPLACE VIEW analytics.orders_v (order_id, `order day`) COMMENT 'daily' AS \
-         SELECT order_id /* inside */\nFROM orders"
+         SELECT order_id FROM orders"
     );
 }
 
@@ -85,15 +85,10 @@ fn view_command_family_round_trips_through_the_typed_ast() {
 #[test]
 fn view_visitor_and_folder_reach_query_and_nested_names() {
     struct Count {
-        raw_queries: usize,
         identifiers: usize,
     }
 
     impl Visit for Count {
-        fn visit_raw_query_slice(&mut self, _: &novarocks_parser::ast::RawQuerySlice) {
-            self.raw_queries += 1;
-        }
-
         fn visit_ident(&mut self, _: &novarocks_parser::ast::Ident) {
             self.identifiers += 1;
         }
@@ -117,13 +112,9 @@ fn view_visitor_and_folder_reach_query_and_nested_names() {
         .expect("view should parse")
         .try_into()
         .expect("one statement");
-    let mut count = Count {
-        raw_queries: 0,
-        identifiers: 0,
-    };
+    let mut count = Count { identifiers: 0 };
     count.visit_statement(&statement);
-    assert_eq!(count.raw_queries, 1);
-    assert!(count.identifiers >= 2);
+    assert!(count.identifiers >= 4);
 
     let renamed = Rename.fold_statement(statement);
     assert_eq!(

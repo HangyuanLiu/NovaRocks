@@ -23,6 +23,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use novarocks_parser::ast::{Expr, LiteralKind, TableVersion, TableVersionKind};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IcebergRefKind {
     Branch,
@@ -168,26 +170,23 @@ pub struct IcebergDmlTarget {
 /// Resolution rules (Iceberg spec §4.2):
 /// - `VERSION AS OF <integer>` → snapshot id; must exist in metadata.
 /// - `VERSION AS OF '<string>'` → named ref (branch or tag); must exist in `metadata.refs()`.
-/// - `TIMESTAMP AS OF <integer>` or `FOR SYSTEM_TIME AS OF <integer>` → epoch-ms; finds the
+/// - `FOR SYSTEM_TIME AS OF <integer>` → epoch-ms; finds the
 ///   snapshot with the largest `timestamp_ms` ≤ requested_ms from `metadata.history()`.
 /// - `TIMESTAMP AS OF '<rfc3339-string>'` or `'<YYYY-MM-DD HH:MM:SS>'` → parsed to ms and
 ///   treated the same as an integer epoch-ms timestamp.
 /// - Any other expression (function call, identifier, cast, …) → fail-fast error.
-/// - `Function(_)` (BigQuery AT syntax) → rejected in phase 1.
 ///
 /// Phase-1 limitation: timestamp expressions must be literals (integer or quoted string).
 /// Expression-level timestamps (e.g. `CURRENT_TIMESTAMP() - INTERVAL 1 HOUR`) are rejected.
 pub fn resolve_read_binding(
-    version: &sqlparser::ast::TableVersion,
+    version: &TableVersion,
     metadata: &SqlIcebergRefMetadata,
     fully_qualified_name: &str,
 ) -> Result<IcebergRefBinding, String> {
-    use sqlparser::ast::{Expr, TableVersion, Value};
-
-    match version {
-        TableVersion::VersionAsOf(expr) => match expr {
-            Expr::Value(v) => match &v.value {
-                Value::Number(n, _) => {
+    match version.kind {
+        TableVersionKind::ForVersionAsOf => match &version.value {
+            Expr::Literal(literal) => match &literal.kind {
+                LiteralKind::Number(n) => {
                     let snapshot_id: i64 = n.parse().map_err(|_| {
                         format!("iceberg time travel: invalid snapshot id '{n}' for {fully_qualified_name}")
                     })?;
@@ -202,7 +201,7 @@ pub fn resolve_read_binding(
                         ref_kind: None,
                     })
                 }
-                Value::SingleQuotedString(s) => {
+                LiteralKind::String(s) => {
                     let entry = metadata.named_ref(s).ok_or_else(|| {
                         format!(
                             "iceberg time travel: ref '{s}' not found in {fully_qualified_name}"
@@ -215,68 +214,39 @@ pub fn resolve_read_binding(
                     })
                 }
                 other => Err(format!(
-                    "iceberg time travel: phase 1 only accepts literal snapshot id or ref name for VERSION AS OF; got value: {other}"
+                    "iceberg time travel: phase 1 only accepts literal snapshot id or ref name for VERSION AS OF; got value: {other:?}"
                 )),
             },
             other => Err(format!(
-                "iceberg time travel: phase 1 only accepts literal snapshot id or ref name for VERSION AS OF; got expression: {other}"
+                "iceberg time travel: phase 1 only accepts literal snapshot id or ref name for VERSION AS OF; got expression: {other:?}"
             )),
         },
 
-        TableVersion::TimestampAsOf(expr) | TableVersion::ForSystemTimeAsOf(expr) => {
-            // Check for the `__nr_ref:` magic prefix produced by `normalize_for_raw_parse`
-            // when rewriting `FOR VERSION AS OF '<string_ref>'` to a form that sqlparser
-            // can parse.  Branch/tag names are routed here because sqlparser 0.61 only
-            // accepts numeric literals for `VERSION AS OF`, so the normalizer encodes
-            // `VERSION AS OF 'branch'` as `SYSTEM_TIME AS OF '__nr_ref:branch'`.
-            if let sqlparser::ast::Expr::Value(v) = expr
-                && let sqlparser::ast::Value::SingleQuotedString(s) = &v.value
-                && let Some(ref_name) = s.strip_prefix("__nr_ref:")
-            {
-                let entry = metadata.named_ref(ref_name).ok_or_else(|| {
-                    format!(
-                        "iceberg time travel: ref '{ref_name}' not found in {fully_qualified_name}"
-                    )
-                })?;
-                return Ok(IcebergRefBinding {
-                    snapshot_id: entry.snapshot_id,
-                    ref_name: Some(ref_name.to_string()),
-                    ref_kind: Some(entry.kind.clone()),
-                });
-            }
-            let ts_ms = resolve_timestamp_expr(expr, fully_qualified_name)?;
+        TableVersionKind::ForSystemTimeAsOf => {
+            let ts_ms = resolve_timestamp_expr(&version.value, fully_qualified_name)?;
             find_snapshot_at_or_before(metadata, ts_ms, fully_qualified_name)
         }
-
-        TableVersion::Function(_) => Err(format!(
-            "iceberg time travel: BigQuery AT(...) syntax is not supported for {fully_qualified_name}; use VERSION AS OF or TIMESTAMP AS OF"
-        )),
     }
 }
 
 /// Parse a timestamp literal expression into epoch milliseconds.
 /// Phase 1: only accepts integer literals (epoch ms) or single-quoted strings
 /// parseable as RFC 3339 or `%Y-%m-%d %H:%M:%S`.
-fn resolve_timestamp_expr(
-    expr: &sqlparser::ast::Expr,
-    fully_qualified_name: &str,
-) -> Result<i64, String> {
-    use sqlparser::ast::{Expr, Value};
-
+fn resolve_timestamp_expr(expr: &Expr, fully_qualified_name: &str) -> Result<i64, String> {
     match expr {
-        Expr::Value(v) => match &v.value {
-            Value::Number(n, _) => n.parse::<i64>().map_err(|_| {
+        Expr::Literal(literal) => match &literal.kind {
+            LiteralKind::Number(n) => n.parse::<i64>().map_err(|_| {
                 format!(
                     "iceberg time travel: invalid epoch-ms value '{n}' for {fully_qualified_name}"
                 )
             }),
-            Value::SingleQuotedString(s) => parse_timestamp_string(s, fully_qualified_name),
+            LiteralKind::String(s) => parse_timestamp_string(s, fully_qualified_name),
             other => Err(format!(
-                "iceberg time travel: phase 1 only accepts literal timestamp; got value: {other}"
+                "iceberg time travel: phase 1 only accepts literal timestamp; got value: {other:?}"
             )),
         },
         other => Err(format!(
-            "iceberg time travel: phase 1 only accepts literal timestamp; got expression: {other}"
+            "iceberg time travel: phase 1 only accepts literal timestamp; got expression: {other:?}"
         )),
     }
 }
@@ -357,6 +327,10 @@ mod split_ref_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_parser::{
+        Span,
+        ast::{Ident, Literal},
+    };
 
     fn metadata_empty() -> SqlIcebergRefMetadata {
         SqlIcebergRefMetadata::default()
@@ -398,16 +372,30 @@ mod tests {
         )
     }
 
-    fn val_num(n: &str) -> sqlparser::ast::Expr {
-        sqlparser::ast::Expr::Value(
-            sqlparser::ast::Value::Number(n.to_string(), false).with_empty_span(),
-        )
+    fn span() -> Span {
+        Span::new(0, 0)
     }
 
-    fn val_str(s: &str) -> sqlparser::ast::Expr {
-        sqlparser::ast::Expr::Value(
-            sqlparser::ast::Value::SingleQuotedString(s.to_string()).with_empty_span(),
-        )
+    fn val_num(n: &str) -> Expr {
+        Expr::Literal(Literal {
+            kind: LiteralKind::Number(n.to_string()),
+            span: span(),
+        })
+    }
+
+    fn val_str(s: &str) -> Expr {
+        Expr::Literal(Literal {
+            kind: LiteralKind::String(s.to_string()),
+            span: span(),
+        })
+    }
+
+    fn version(kind: TableVersionKind, value: Expr) -> TableVersion {
+        TableVersion {
+            kind,
+            value,
+            span: span(),
+        }
     }
 
     #[test]
@@ -457,7 +445,7 @@ mod tests {
     #[test]
     fn version_as_of_int_resolves_snapshot() {
         let metadata = metadata_with_two_snapshots();
-        let version = sqlparser::ast::TableVersion::VersionAsOf(val_num("2"));
+        let version = version(TableVersionKind::ForVersionAsOf, val_num("2"));
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap();
         assert_eq!(binding.snapshot_id, 2);
         assert!(binding.ref_name.is_none());
@@ -467,7 +455,7 @@ mod tests {
     #[test]
     fn sqlx2_resolution_iceberg_ref_input_is_provider_neutral() {
         let metadata = metadata_with_ref("dev", IcebergRefKind::Branch);
-        let version = sqlparser::ast::TableVersion::VersionAsOf(val_str("dev"));
+        let version = version(TableVersionKind::ForVersionAsOf, val_str("dev"));
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t")
             .expect("resolve frozen SQL ref facts");
         assert_eq!(binding.snapshot_id, 1);
@@ -477,7 +465,7 @@ mod tests {
     #[test]
     fn version_as_of_string_resolves_branch() {
         let metadata = metadata_with_ref("dev", IcebergRefKind::Branch);
-        let version = sqlparser::ast::TableVersion::VersionAsOf(val_str("dev"));
+        let version = version(TableVersionKind::ForVersionAsOf, val_str("dev"));
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap();
         assert_eq!(binding.snapshot_id, 1);
         assert_eq!(binding.ref_name.as_deref(), Some("dev"));
@@ -487,7 +475,7 @@ mod tests {
     #[test]
     fn version_as_of_string_resolves_tag() {
         let metadata = metadata_with_ref("v1.0", IcebergRefKind::Tag);
-        let version = sqlparser::ast::TableVersion::VersionAsOf(val_str("v1.0"));
+        let version = version(TableVersionKind::ForVersionAsOf, val_str("v1.0"));
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap();
         assert_eq!(binding.snapshot_id, 1);
         assert_eq!(binding.ref_name.as_deref(), Some("v1.0"));
@@ -497,7 +485,7 @@ mod tests {
     #[test]
     fn unknown_ref_errors() {
         let metadata = metadata_with_ref("dev", IcebergRefKind::Branch);
-        let version = sqlparser::ast::TableVersion::VersionAsOf(val_str("nope"));
+        let version = version(TableVersionKind::ForVersionAsOf, val_str("nope"));
         let err = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap_err();
         assert!(
             err.contains("ref 'nope' not found"),
@@ -508,7 +496,7 @@ mod tests {
     #[test]
     fn version_as_of_unknown_snapshot_id_errors() {
         let metadata = metadata_with_two_snapshots();
-        let version = sqlparser::ast::TableVersion::VersionAsOf(val_num("99999"));
+        let version = version(TableVersionKind::ForVersionAsOf, val_num("99999"));
         let err = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap_err();
         assert!(
             err.contains("snapshot 99999 not found"),
@@ -521,7 +509,10 @@ mod tests {
         let metadata = metadata_with_two_snapshots();
         // snapshot 1 is at 1_700_000_000_000 ms, snapshot 2 at 1_700_000_001_000 ms
         // requesting at 1_700_000_000_500 should give snapshot 1
-        let version = sqlparser::ast::TableVersion::TimestampAsOf(val_num("1700000000500"));
+        let version = version(
+            TableVersionKind::ForSystemTimeAsOf,
+            val_num("1700000000500"),
+        );
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap();
         assert_eq!(binding.snapshot_id, 1);
     }
@@ -530,7 +521,10 @@ mod tests {
     fn timestamp_as_of_too_early_errors() {
         let metadata = metadata_with_two_snapshots();
         // before any snapshot
-        let version = sqlparser::ast::TableVersion::TimestampAsOf(val_num("1000000000000"));
+        let version = version(
+            TableVersionKind::ForSystemTimeAsOf,
+            val_num("1000000000000"),
+        );
         let err = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap_err();
         assert!(
             err.contains("no snapshot at or before"),
@@ -542,7 +536,10 @@ mod tests {
     fn timestamp_as_of_rfc3339_string_resolves() {
         let metadata = metadata_with_two_snapshots();
         // 2023-11-14T22:13:20Z = 1700000000 seconds = 1_700_000_000_000 ms (exactly snap1)
-        let version = sqlparser::ast::TableVersion::TimestampAsOf(val_str("2023-11-14T22:13:20Z"));
+        let version = version(
+            TableVersionKind::ForSystemTimeAsOf,
+            val_str("2023-11-14T22:13:20Z"),
+        );
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap();
         assert_eq!(binding.snapshot_id, 1);
     }
@@ -551,26 +548,18 @@ mod tests {
     fn expression_timestamp_rejected() {
         let metadata = metadata_with_two_snapshots();
         // Use an identifier expression (not a literal) to trigger the fail-fast path
-        let version = sqlparser::ast::TableVersion::TimestampAsOf(
-            sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("some_var")),
+        let version = version(
+            TableVersionKind::ForSystemTimeAsOf,
+            Expr::Identifier(Ident {
+                value: "some_var".to_string(),
+                quoted: false,
+                quote_style: None,
+                span: span(),
+            }),
         );
         let err = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap_err();
         assert!(
             err.contains("phase 1 only accepts literal timestamp"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn bigquery_function_syntax_rejected() {
-        let metadata = metadata_with_two_snapshots();
-        // Use a nested value expression to represent the unsupported Function-style AT(...)
-        let version = sqlparser::ast::TableVersion::Function(sqlparser::ast::Expr::Identifier(
-            sqlparser::ast::Ident::new("AT"),
-        ));
-        let err = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap_err();
-        assert!(
-            err.contains("BigQuery AT(...) syntax is not supported"),
             "unexpected error: {err}"
         );
     }

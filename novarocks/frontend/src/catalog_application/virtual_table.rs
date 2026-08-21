@@ -33,7 +33,7 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use sqlparser::ast as sqlast;
+use novarocks_parser::{Span, ast};
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::system_catalog::SystemCatalog;
@@ -69,7 +69,7 @@ pub fn rewrite_query(
     catalog_service: &QueryCatalogService,
     connector_control: &dyn ConnectorControlRegistry,
     system_catalog: &dyn SystemCatalog,
-    query: &mut sqlast::Query,
+    query: &mut ast::Query,
 ) -> Result<(), String> {
     rewrite_query_inner(catalog_service, connector_control, system_catalog, query)
 }
@@ -78,10 +78,10 @@ fn rewrite_query_inner(
     catalog_service: &QueryCatalogService,
     connector_control: &dyn ConnectorControlRegistry,
     system_catalog: &dyn SystemCatalog,
-    query: &mut sqlast::Query,
+    query: &mut ast::Query,
 ) -> Result<(), String> {
     if let Some(with_clause) = query.with.as_mut() {
-        for cte in with_clause.cte_tables.iter_mut() {
+        for cte in with_clause.ctes.iter_mut() {
             rewrite_query_inner(
                 catalog_service,
                 connector_control,
@@ -102,10 +102,10 @@ fn rewrite_set_expr(
     catalog_service: &QueryCatalogService,
     connector_control: &dyn ConnectorControlRegistry,
     system_catalog: &dyn SystemCatalog,
-    expr: &mut sqlast::SetExpr,
+    expr: &mut ast::SetExpr,
 ) -> Result<(), String> {
     match expr {
-        sqlast::SetExpr::Select(select) => {
+        ast::SetExpr::Select(select) => {
             for twj in select.from.iter_mut() {
                 rewrite_table_factor(
                     catalog_service,
@@ -123,24 +123,24 @@ fn rewrite_set_expr(
                 }
             }
         }
-        sqlast::SetExpr::Query(q) => rewrite_query_inner(
+        ast::SetExpr::Query(q) => rewrite_query_inner(
             catalog_service,
             connector_control,
             system_catalog,
             q.as_mut(),
         )?,
-        sqlast::SetExpr::SetOperation { left, right, .. } => {
+        ast::SetExpr::SetOperation(operation) => {
             rewrite_set_expr(
                 catalog_service,
                 connector_control,
                 system_catalog,
-                left.as_mut(),
+                operation.left.as_mut(),
             )?;
             rewrite_set_expr(
                 catalog_service,
                 connector_control,
                 system_catalog,
-                right.as_mut(),
+                operation.right.as_mut(),
             )?;
         }
         _ => {}
@@ -152,10 +152,10 @@ fn rewrite_table_factor(
     catalog_service: &QueryCatalogService,
     connector_control: &dyn ConnectorControlRegistry,
     system_catalog: &dyn SystemCatalog,
-    factor: &mut sqlast::TableFactor,
+    factor: &mut ast::TableFactor,
 ) -> Result<(), String> {
     match factor {
-        sqlast::TableFactor::Table { name, alias, .. } => {
+        ast::TableFactor::Table { name, alias, .. } => {
             let parts = object_name_idents(name);
             // Recognize 2-part `information_schema.X` and 3-part
             // `<catalog>.information_schema.X`.
@@ -214,11 +214,7 @@ fn rewrite_table_factor(
                                 return Ok(());
                             };
                             let tbl_name = tbl.clone();
-                            let alias = alias.take().unwrap_or_else(|| sqlast::TableAlias {
-                                explicit: false,
-                                name: sqlast::Ident::new(tbl_name),
-                                columns: Vec::new(),
-                            });
+                            let alias = alias.take().unwrap_or_else(|| table_alias(&tbl_name));
                             *factor = derived_values_factor(&data.columns, &data.batches, alias)?;
                             return Ok(());
                         }
@@ -256,21 +252,17 @@ fn rewrite_table_factor(
                 return Ok(());
             };
 
-            let alias = alias.take().unwrap_or_else(|| sqlast::TableAlias {
-                explicit: false,
-                name: sqlast::Ident::new(tbl),
-                columns: Vec::new(),
-            });
+            let alias = alias.take().unwrap_or_else(|| table_alias(&tbl));
             *factor = derived_values_factor(&data.columns, &data.batches, alias)?;
             Ok(())
         }
-        sqlast::TableFactor::Derived { subquery, .. } => rewrite_query_inner(
+        ast::TableFactor::Derived { subquery, .. } => rewrite_query_inner(
             catalog_service,
             connector_control,
             system_catalog,
             subquery.as_mut(),
         ),
-        sqlast::TableFactor::NestedJoin {
+        ast::TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
             rewrite_table_factor(
@@ -293,14 +285,8 @@ fn rewrite_table_factor(
     }
 }
 
-fn object_name_idents(name: &sqlast::ObjectName) -> Vec<String> {
-    name.0
-        .iter()
-        .filter_map(|p| match p {
-            sqlast::ObjectNamePart::Identifier(i) => Some(i.value.clone()),
-            _ => None,
-        })
-        .collect()
+fn object_name_idents(name: &ast::ObjectName) -> Vec<String> {
+    name.parts.iter().map(|part| part.value.clone()).collect()
 }
 
 /// Build a `TableFactor::Derived` whose body is a VALUES expression carrying
@@ -314,13 +300,10 @@ fn object_name_idents(name: &sqlast::ObjectName) -> Vec<String> {
 fn derived_values_factor(
     columns: &[ColumnDef],
     batches: &[RecordBatch],
-    alias: sqlast::TableAlias,
-) -> Result<sqlast::TableFactor, String> {
+    alias: ast::TableAlias,
+) -> Result<ast::TableFactor, String> {
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    let alias_columns: Vec<sqlast::TableAliasColumnDef> = columns
-        .iter()
-        .map(|c| sqlast::TableAliasColumnDef::from_name(c.name.clone()))
-        .collect();
+    let alias_columns: Vec<ast::Ident> = columns.iter().map(|c| ident(&c.name)).collect();
 
     if total_rows == 0 {
         return Err(format!(
@@ -329,7 +312,7 @@ fn derived_values_factor(
         ));
     }
 
-    let mut rows: Vec<Vec<sqlast::Expr>> = Vec::with_capacity(total_rows);
+    let mut rows: Vec<Vec<ast::Expr>> = Vec::with_capacity(total_rows);
     for batch in batches {
         if batch.num_columns() != columns.len() {
             return Err(format!(
@@ -352,33 +335,33 @@ fn derived_values_factor(
         }
     }
 
-    let values_query = sqlast::Query {
+    let values_query = ast::Query {
         with: None,
-        body: Box::new(sqlast::SetExpr::Values(sqlast::Values {
+        body: Box::new(ast::SetExpr::Values(ast::Values {
             explicit_row: false,
-            value_keyword: false,
             rows,
+            span: Span::new(0, 0),
         })),
-        order_by: None,
-        limit_clause: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        limit_comma_offset: false,
         fetch: None,
-        locks: Vec::new(),
-        for_clause: None,
-        settings: None,
-        format_clause: None,
-        pipe_operators: Vec::new(),
+        span: Span::new(0, 0),
     };
 
-    let alias = sqlast::TableAlias {
-        explicit: alias.explicit,
+    let alias = ast::TableAlias {
+        explicit_as: alias.explicit_as,
         name: alias.name,
         columns: alias_columns,
+        span: Span::new(0, 0),
     };
-    Ok(sqlast::TableFactor::Derived {
+    Ok(ast::TableFactor::Derived {
         lateral: false,
         subquery: Box::new(values_query),
+        hints: Vec::new(),
         alias: Some(alias),
-        sample: None,
+        span: Span::new(0, 0),
     })
 }
 
@@ -386,9 +369,9 @@ fn array_value_to_expr(
     array: &dyn Array,
     row: usize,
     declared: &DataType,
-) -> Result<sqlast::Expr, String> {
+) -> Result<ast::Expr, String> {
     if array.is_null(row) {
-        return Ok(sqlast::Expr::Value(sqlast::Value::Null.with_empty_span()));
+        return Ok(literal_expr(ast::LiteralKind::Null));
     }
     match declared {
         DataType::Utf8 | DataType::LargeUtf8 => {
@@ -398,9 +381,7 @@ fn array_value_to_expr(
                 .ok_or_else(|| "expected Utf8 array".to_string())?
                 .value(row)
                 .to_string();
-            Ok(sqlast::Expr::Value(
-                sqlast::Value::SingleQuotedString(s).with_empty_span(),
-            ))
+            Ok(literal_expr(ast::LiteralKind::String(s)))
         }
         DataType::Boolean => {
             let v = array
@@ -408,9 +389,7 @@ fn array_value_to_expr(
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| "expected Boolean array".to_string())?
                 .value(row);
-            Ok(sqlast::Expr::Value(
-                sqlast::Value::Boolean(v).with_empty_span(),
-            ))
+            Ok(literal_expr(ast::LiteralKind::Boolean(v)))
         }
         DataType::Int8 => num_to_expr(
             array
@@ -474,9 +453,7 @@ fn array_value_to_expr(
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| "expected Float32 array".to_string())?
                 .value(row);
-            Ok(sqlast::Expr::Value(
-                sqlast::Value::Number(format!("{v}"), false).with_empty_span(),
-            ))
+            Ok(literal_expr(ast::LiteralKind::Number(format!("{v}"))))
         }
         DataType::Float64 => {
             let v = array
@@ -484,9 +461,7 @@ fn array_value_to_expr(
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| "expected Float64 array".to_string())?
                 .value(row);
-            Ok(sqlast::Expr::Value(
-                sqlast::Value::Number(format!("{v}"), false).with_empty_span(),
-            ))
+            Ok(literal_expr(ast::LiteralKind::Number(format!("{v}"))))
         }
         other => Err(format!(
             "virtual table column with arrow type {other:?} is not yet supported by the VALUES rewriter"
@@ -494,8 +469,31 @@ fn array_value_to_expr(
     }
 }
 
-fn num_to_expr<N: std::fmt::Display>(n: N) -> Result<sqlast::Expr, String> {
-    Ok(sqlast::Expr::Value(
-        sqlast::Value::Number(format!("{n}"), false).with_empty_span(),
-    ))
+fn num_to_expr<N: std::fmt::Display>(n: N) -> Result<ast::Expr, String> {
+    Ok(literal_expr(ast::LiteralKind::Number(format!("{n}"))))
+}
+
+fn ident(value: &str) -> ast::Ident {
+    ast::Ident {
+        value: value.to_string(),
+        quoted: false,
+        quote_style: None,
+        span: Span::new(0, 0),
+    }
+}
+
+fn table_alias(name: &str) -> ast::TableAlias {
+    ast::TableAlias {
+        name: ident(name),
+        columns: Vec::new(),
+        explicit_as: false,
+        span: Span::new(0, 0),
+    }
+}
+
+fn literal_expr(kind: ast::LiteralKind) -> ast::Expr {
+    ast::Expr::Literal(ast::Literal {
+        kind,
+        span: Span::new(0, 0),
+    })
 }

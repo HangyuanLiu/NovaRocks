@@ -10,6 +10,7 @@ use std::sync::RwLock;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::runtime::query_result::QueryResult;
+use novarocks_parser::ast::Query;
 
 pub use legacy::{
     CatalogColumnStatistics, CatalogTableStatistics, StatisticsColumn, StatisticsInsertObservation,
@@ -50,17 +51,13 @@ impl FrontendStatisticsService {
     pub fn try_query(
         &self,
         sql: &str,
-        query: &sqlparser::ast::Query,
+        query: &Query,
         context: StatisticsRequestContext<'_>,
     ) -> Result<Option<QueryResult>, String> {
         query::try_query(self, sql, query, context.current_database)
     }
 
-    pub fn observe_query(
-        &self,
-        query: &sqlparser::ast::Query,
-        current_database: &str,
-    ) -> Result<(), String> {
+    pub fn observe_query(&self, query: &Query, current_database: &str) -> Result<(), String> {
         observation::observe_query(self, query, current_database)
     }
 

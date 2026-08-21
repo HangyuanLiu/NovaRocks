@@ -35,7 +35,7 @@ typeof(greatest(date('2026-01-11'), date('2026-01-14'), date('2026-01-09')))
 datetime
 
 -- query 10
-typeof(greatest(CAST(100 AS INT), CAST(200 AS BIGINT)))
+typeof(greatest(CAST(100 AS INT), CAST(200 AS bigint)))
 bigint
 
 -- query 11

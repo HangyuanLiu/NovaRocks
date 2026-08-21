@@ -24,7 +24,7 @@ mod shaping;
 use crate::common::admitted_query_context::RequestContext;
 use crate::query_execution::dml::insert::{
     IcebergInsertSource, InsertEngine, InsertOverwriteMode, InsertTargetName, InsertValue,
-    PrepareIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget, parse_insert_source_query,
+    PrepareIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
 };
 use novarocks_protocol::lifecycle::QueryOptions;
 
@@ -52,9 +52,8 @@ impl DmlService {
     ///
     /// Statement-family routing is complete before this boundary. `source`
     /// exists solely for diagnostic locations derived from AST spans; it must
-    /// not be reparsed or sliced to classify an INSERT form. The one D8
-    /// exception is `statement.source.text`, which becomes SQLP-6 query IR at
-    /// the execution boundary through [`parse_insert_source_query`].
+    /// not be reparsed or sliced to classify an INSERT form. Its query source
+    /// is already the parser-owned typed AST.
     #[allow(
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."
@@ -67,9 +66,7 @@ impl DmlService {
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
     ) -> Result<(), DmlError> {
-        let source_query = parse_insert_source_query(&statement.source)
-            .map_err(|error| insert_admit_error(source, statement.source.span, error))?;
-        let mut command = convert_insert_command(statement, &source_query)
+        let mut command = convert_insert_command(statement)
             .map_err(|error| insert_admit_error(source, statement.span, error))?;
         let statistics_source = statistics_source(&command.source);
         let (target, target_ref) = split_target_ref(&command.target)

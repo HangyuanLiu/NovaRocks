@@ -20,6 +20,11 @@ pub use crate::mv_refresh::{
     MvRefreshStatement, SqlMvTarget, VisibleAggregateOutput, first_refresh,
 };
 pub use crate::planner::vocabulary::ApplyKeySource;
+use novarocks_parser::{
+    Span,
+    ast::{self as ast, Expr, ObjectName, Query, Select, SelectItem, SetExpr, TableFactor},
+    printer,
+};
 
 /// SQL-owned branch marker used by sealed UNION ALL MV refresh layouts.
 /// Application materialization may attach only this immutable column label;
@@ -35,6 +40,62 @@ pub const MV_JOIN_APPLY_KEY_COLUMN_NAME: &str =
 /// contracts.
 pub const MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME: &str =
     crate::planner::vocabulary::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME;
+
+/// Reject non-COUNT aggregate stars at the Iceberg IMV boundary before the
+/// generic analyzer attempts to resolve the parser-native `*` as a column.
+///
+/// `COUNT(*)` has a typed empty-argument representation in the analyzer. All
+/// other supported IMV aggregates require one expression argument, so their
+/// syntactic star must produce the same contract error as an empty call.
+pub fn validate_imv_aggregate_star_arguments(query: &Query) -> Result<(), String> {
+    validate_imv_aggregate_star_set_expr(query.body.as_ref())
+}
+
+fn validate_imv_aggregate_star_set_expr(expr: &SetExpr) -> Result<(), String> {
+    match expr {
+        SetExpr::Select(select) => {
+            for item in &select.projection {
+                let expr = match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+                    SelectItem::Wildcard { .. } | SelectItem::QualifiedWildcard { .. } => continue,
+                };
+                validate_imv_aggregate_star_expr(expr)?;
+            }
+            Ok(())
+        }
+        SetExpr::SetOperation(operation) => {
+            validate_imv_aggregate_star_set_expr(&operation.left)?;
+            validate_imv_aggregate_star_set_expr(&operation.right)
+        }
+        SetExpr::Query(query) => validate_imv_aggregate_star_set_expr(query.body.as_ref()),
+        SetExpr::Values(_) => Ok(()),
+    }
+}
+
+fn validate_imv_aggregate_star_expr(expr: &Expr) -> Result<(), String> {
+    let Expr::FunctionCall(function) = expr else {
+        return Ok(());
+    };
+    let [Expr::Identifier(argument)] = function.arguments.as_slice() else {
+        return Ok(());
+    };
+    if argument.value != "*"
+        || !matches!(function.quantifier, ast::FunctionQuantifier::None)
+        || function.name.parts.len() != 1
+    {
+        return Ok(());
+    }
+    let name = function.name.parts[0].value.to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        "sum" | "avg" | "min" | "max" | "bool_or" | "boolor_agg" | "bool_and" | "booland_agg"
+    ) {
+        return Err(format!(
+            "Iceberg IMV refresh contract requires exactly one argument for aggregate function `{name}`"
+        ));
+    }
+    Ok(())
+}
 
 /// Immutable SQL-owned classification of an MV hidden apply key.
 ///
@@ -206,6 +267,14 @@ mod refresh_property_facade_tests {
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
 
+    fn parse_query(sql: &str) -> Query {
+        let statements = novarocks_parser::parse(sql).expect("parse query");
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected query");
+        };
+        query.clone()
+    }
+
     struct TestIcebergCatalog;
 
     impl PlannerTableProvider for TestIcebergCatalog {
@@ -252,10 +321,7 @@ mod refresh_property_facade_tests {
     }
 
     fn analyzed_refresh_input(sql: &str) -> SqlResolvedMvRefreshInput {
-        let statement = crate::parser::parse_sql_raw(sql).expect("parse query");
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("expected query");
-        };
+        let query = parse_query(sql);
         let (resolved, _, _) =
             crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales").expect("analyze query");
         SqlResolvedMvRefreshInput::from_analysis(resolved)
@@ -430,10 +496,7 @@ mod refresh_property_facade_tests {
     fn opaque_refresh_input_derives_aggregate_argument_types() {
         let sql = "SELECT region, sum(amount) AS total, avg(amount) AS average \
                    FROM fact_east GROUP BY region";
-        let statement = crate::parser::parse_sql_raw(sql).expect("parse query");
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("expected query");
-        };
+        let query = parse_query(sql);
         let input_types = analyzed_refresh_input(sql)
             .aggregate_layout_facts(&query, SqlMvAggregateLayoutScope::WholeQuery)
             .expect("derive aggregate input types");
@@ -448,10 +511,7 @@ mod refresh_property_facade_tests {
     fn opaque_refresh_input_projects_one_shot_aggregate_layout_facts() {
         let sql = "SELECT region, sum(amount) AS total, avg(amount) AS average \
                    FROM fact_east GROUP BY region";
-        let statement = crate::parser::parse_sql_raw(sql).expect("parse query");
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("expected query");
-        };
+        let query = parse_query(sql);
 
         let facts = analyzed_refresh_input(sql)
             .aggregate_layout_facts(&query, SqlMvAggregateLayoutScope::WholeQuery)
@@ -471,10 +531,7 @@ mod refresh_property_facade_tests {
     fn aggregate_layout_builder_keeps_sql_ddl_and_runtime_facts_together() {
         let sql = "SELECT region, sum(amount) AS total, avg(amount) AS average \
                    FROM fact_east GROUP BY region";
-        let statement = crate::parser::parse_sql_raw(sql).expect("parse query");
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("expected query");
-        };
+        let query = parse_query(sql);
         let facts = analyzed_refresh_input(sql)
             .aggregate_layout_facts(&query, SqlMvAggregateLayoutScope::WholeQuery)
             .expect("aggregate layout facts");
@@ -513,10 +570,7 @@ mod refresh_property_facade_tests {
         let sql = "SELECT region, sum(amount) AS total FROM fact_east GROUP BY region \
                    UNION ALL \
                    SELECT region, sum(amount) AS total FROM fact_west GROUP BY region";
-        let statement = crate::parser::parse_sql_raw(sql).expect("parse query");
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("expected query");
-        };
+        let query = parse_query(sql);
 
         let facts = analyzed_refresh_input(sql)
             .aggregate_layout_facts(&query, SqlMvAggregateLayoutScope::FirstUnionBranch)
@@ -538,16 +592,16 @@ mod refresh_property_facade_tests {
         );
         assert!(!apply_key.nullable);
 
-        let physical = iceberg_mv_physical_select_sql("SELECT id FROM fact_east")
+        let physical = iceberg_mv_physical_select_sql(&parse_query("SELECT id FROM fact_east"))
             .expect("shape physical projection");
         assert!(
             physical.contains(&format!("_row_id AS {MV_HIDDEN_APPLY_KEY_COLUMN_NAME}")),
             "{physical}"
         );
 
-        let reserved = iceberg_mv_physical_select_sql(&format!(
+        let reserved = iceberg_mv_physical_select_sql(&parse_query(&format!(
             "SELECT id AS {MV_HIDDEN_APPLY_KEY_COLUMN_NAME} FROM fact_east"
-        ))
+        )))
         .expect_err("reserved internal alias must fail");
         assert!(
             reserved.contains("reserved for internal apply key"),
@@ -555,7 +609,7 @@ mod refresh_property_facade_tests {
         );
 
         assert_eq!(
-            iceberg_mv_physical_select_sql("SELECT * FROM fact_east"),
+            iceberg_mv_physical_select_sql(&parse_query("SELECT * FROM fact_east")),
             Err("iceberg MV physical SELECT requires explicit projection columns".to_string())
         );
     }
@@ -617,7 +671,7 @@ impl SqlResolvedMvRefreshInput {
     /// analyzer tree to stitch those facts together.
     pub fn aggregate_layout_facts(
         &self,
-        query: &sqlparser::ast::Query,
+        query: &Query,
         scope: SqlMvAggregateLayoutScope,
     ) -> Result<SqlMvAggregateLayoutFacts, String> {
         let query = match scope {
@@ -1128,15 +1182,9 @@ pub fn mv_internal_target_column(
 }
 
 /// Shape a physical Iceberg MV projection under SQL's parser ownership.
-pub fn iceberg_mv_physical_select_sql(select_sql: &str) -> Result<String, String> {
-    let normalized = crate::parser::dialect::normalize_for_raw_parse(select_sql)
-        .map_err(|e| format!("iceberg MV physical SELECT normalize error: {e}"))?;
-    let mut statement = crate::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|e| format!("iceberg MV physical SELECT parse error: {e}"))?;
-    let sqlparser::ast::Statement::Query(query) = &mut statement else {
-        return Err("iceberg MV physical SELECT expects a SELECT query".to_string());
-    };
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+pub fn iceberg_mv_physical_select_sql(select_query: &Query) -> Result<String, String> {
+    let mut query = select_query.clone();
+    let SetExpr::Select(select) = query.body.as_mut() else {
         return Err("iceberg MV physical SELECT expects a SELECT body".to_string());
     };
 
@@ -1146,35 +1194,42 @@ pub fn iceberg_mv_physical_select_sql(select_sql: &str) -> Result<String, String
     )?;
     for item in &select.projection {
         match item {
-            sqlparser::ast::SelectItem::UnnamedExpr(_)
-            | sqlparser::ast::SelectItem::ExprWithAlias { .. } => {}
-            sqlparser::ast::SelectItem::Wildcard(_)
-            | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => {
+            SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => {}
+            SelectItem::Wildcard { .. } | SelectItem::QualifiedWildcard { .. } => {
                 return Err(
                     "iceberg MV physical SELECT requires explicit projection columns".to_string(),
                 );
             }
         }
     }
-    select
-        .projection
-        .push(sqlparser::ast::SelectItem::ExprWithAlias {
-            expr: sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("_row_id")),
-            alias: sqlparser::ast::Ident::new(MV_HIDDEN_APPLY_KEY_COLUMN_NAME),
-        });
-    Ok(statement.to_string())
+    select.projection.push(SelectItem::ExprWithAlias {
+        expr: Expr::Identifier(ast::Ident {
+            value: "_row_id".to_string(),
+            quoted: false,
+            quote_style: None,
+            span: Span::new(0, 0),
+        }),
+        alias: ast::Ident {
+            value: MV_HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+            quoted: false,
+            quote_style: None,
+            span: Span::new(0, 0),
+        },
+        explicit_as: true,
+        span: Span::new(0, 0),
+    });
+    Ok(printer::print_query(&query))
 }
 
 pub fn validate_reserved_projection_output_names(
-    select: &sqlparser::ast::Select,
+    select: &Select,
     reserved: &[(&str, &str)],
 ) -> Result<(), String> {
     for item in &select.projection {
         let output_name = match item {
-            sqlparser::ast::SelectItem::UnnamedExpr(expr) => Some(expr.to_string()),
-            sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
-            sqlparser::ast::SelectItem::Wildcard(_)
-            | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => None,
+            SelectItem::UnnamedExpr(expr) => Some(printer::print_expr(expr)),
+            SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+            SelectItem::Wildcard { .. } | SelectItem::QualifiedWildcard { .. } => None,
         };
         let Some(output_name) = output_name else {
             continue;
@@ -1438,30 +1493,23 @@ fn output_column_facts(resolved: &crate::analysis::ResolvedQuery) -> Vec<SqlMvOu
     }
 }
 
-fn first_union_branch_query(
-    query: &sqlparser::ast::Query,
-) -> Result<sqlparser::ast::Query, String> {
-    fn first_branch_body(
-        body: &sqlparser::ast::SetExpr,
-    ) -> Result<&sqlparser::ast::SetExpr, String> {
+fn first_union_branch_query(query: &Query) -> Result<Query, String> {
+    fn first_branch_body(body: &SetExpr) -> Result<&SetExpr, String> {
         match body {
-            sqlparser::ast::SetExpr::SetOperation {
-                op,
-                set_quantifier,
+            SetExpr::SetOperation(ast::SetOperation {
+                operator,
+                quantifier,
                 left,
                 ..
-            } if *op == sqlparser::ast::SetOperator::Union
-                && matches!(
-                    set_quantifier,
-                    sqlparser::ast::SetQuantifier::All | sqlparser::ast::SetQuantifier::AllByName
-                ) =>
+            }) if *operator == ast::SetOperator::Union
+                && matches!(quantifier, ast::SetQuantifier::All) =>
             {
                 first_branch_body(left)
             }
-            sqlparser::ast::SetExpr::SetOperation { .. } => {
+            SetExpr::SetOperation(_) => {
                 Err("aggregate MV first branch requires UNION ALL set operations".to_string())
             }
-            sqlparser::ast::SetExpr::Query(inner) => first_branch_body(inner.body.as_ref()),
+            SetExpr::Query(inner) => first_branch_body(inner.body.as_ref()),
             _ => Ok(body),
         }
     }
@@ -1495,7 +1543,7 @@ fn first_union_branch_resolved_query(
 
 /// Normalize catalog-qualified raw syntax for the local analyzer route. The
 /// parser visitor stays SQL-owned; Core only supplies the syntax query.
-pub fn strip_catalog_from_three_part_names(query: &mut sqlparser::ast::Query) {
+pub fn strip_catalog_from_three_part_names(query: &mut novarocks_parser::ast::Query) {
     crate::parser::query_refs::strip_catalog_from_three_part_names(query);
 }
 
@@ -1546,7 +1594,7 @@ pub enum IncrementalMvShape {
 }
 
 impl IncrementalMvShape {
-    pub fn base_table(&self) -> &sqlparser::ast::ObjectName {
+    pub fn base_table(&self) -> &ObjectName {
         match self {
             IncrementalMvShape::ProjectionFilter(shape) => &shape.base_table,
             IncrementalMvShape::Aggregate(shape) => &shape.base_table,
@@ -1561,14 +1609,14 @@ impl IncrementalMvShape {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectionFilterMvShape {
-    pub base_table: sqlparser::ast::ObjectName,
+    pub base_table: ObjectName,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AggregateMvShape {
-    pub base_table: sqlparser::ast::ObjectName,
+    pub base_table: ObjectName,
     /// All base tables that feed the aggregate when the shape has fan-in branches.
-    pub fan_in_bases: Vec<sqlparser::ast::ObjectName>,
+    pub fan_in_bases: Vec<ObjectName>,
     pub group_keys: Vec<GroupKeyShape>,
     pub aggregates: Vec<AggregateCallShape>,
     pub visible_outputs: Vec<VisibleAggregateOutput>,
@@ -1588,9 +1636,9 @@ pub struct UnionAllMvShape {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JoinProjectionFilterMvShape {
-    pub left_table: sqlparser::ast::ObjectName,
+    pub left_table: ObjectName,
     pub left_alias: String,
-    pub right_table: sqlparser::ast::ObjectName,
+    pub right_table: ObjectName,
     pub right_alias: String,
     pub join_keys: Vec<JoinKeyPairShape>,
 }
@@ -1617,14 +1665,14 @@ impl JoinAggregateMvShape {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JoinKeyPairShape {
-    pub left_expr: sqlparser::ast::Expr,
-    pub right_expr: sqlparser::ast::Expr,
+    pub left_expr: Expr,
+    pub right_expr: Expr,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupKeyShape {
     pub output_name: String,
-    pub expr: sqlparser::ast::Expr,
+    pub expr: Expr,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1637,7 +1685,7 @@ pub struct AggregateCallShape {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AggregateInput {
     Star,
-    Expr(Box<sqlparser::ast::Expr>),
+    Expr(Box<Expr>),
 }
 
 /// Immutable aggregate projection facts for one MV refresh statement.
@@ -1697,10 +1745,8 @@ pub struct SqlMvJoinAliases {
 
 /// Extract aggregate calls, GROUP BY keys, and visible output ordering from a
 /// plain aggregate SELECT without interpreting its FROM clause.
-pub fn extract_aggregate_sql_calls(
-    query: &sqlparser::ast::Query,
-) -> Result<SqlMvAggregateCalls, String> {
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+pub fn extract_aggregate_sql_calls(query: &Query) -> Result<SqlMvAggregateCalls, String> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
         return Err("extract_aggregate_sql_calls: expected a plain SELECT body".to_string());
     };
     let (group_keys, aggregates, visible_outputs) = classify_aggregate_select_outputs(select)?;
@@ -1712,8 +1758,8 @@ pub fn extract_aggregate_sql_calls(
 }
 
 /// Extract the table names and aliases from a two-relation plain SELECT join.
-pub fn extract_join_aliases(query: &sqlparser::ast::Query) -> Result<SqlMvJoinAliases, String> {
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+pub fn extract_join_aliases(query: &Query) -> Result<SqlMvJoinAliases, String> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
         return Err(
             "extract_join_aliases: expected a plain SELECT body, not a set operation".to_string(),
         );
@@ -1738,16 +1784,16 @@ pub fn extract_join_aliases(query: &sqlparser::ast::Query) -> Result<SqlMvJoinAl
     let (left_name, left_alias) = table_factor_name_and_alias(&from.relation)?;
     let (right_name, right_alias) = table_factor_name_and_alias(&join.relation)?;
     Ok(SqlMvJoinAliases {
-        left_table: left_name.to_string(),
+        left_table: printer::print_object_name(&left_name),
         left_alias,
-        right_table: right_name.to_string(),
+        right_table: printer::print_object_name(&right_name),
         right_alias,
     })
 }
 
 /// Extract the base-table FQN from a plain one-relation SELECT without joins.
-pub fn extract_single_scan_table_fqn(query: &sqlparser::ast::Query) -> Result<String, String> {
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+pub fn extract_single_scan_table_fqn(query: &Query) -> Result<String, String> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
         return Err(
             "extract_single_scan_table_fqn: expected a plain SELECT body, not a set operation"
                 .to_string(),
@@ -1766,16 +1812,11 @@ pub fn extract_single_scan_table_fqn(query: &sqlparser::ast::Query) -> Result<St
         );
     }
     let (name, _alias) = table_factor_name_and_alias(&from.relation)?;
-    Ok(name.to_string())
+    Ok(printer::print_object_name(&name))
 }
 
-pub fn classify_incremental_mv_query(
-    query: &sqlparser::ast::Query,
-) -> Result<IncrementalMvShape, String> {
-    if matches!(
-        query.body.as_ref(),
-        sqlparser::ast::SetExpr::SetOperation { .. }
-    ) {
+pub fn classify_incremental_mv_query(query: &Query) -> Result<IncrementalMvShape, String> {
+    if matches!(query.body.as_ref(), SetExpr::SetOperation(_)) {
         return classify_union_all_mv_query(query).map(IncrementalMvShape::UnionAll);
     }
 
@@ -1795,7 +1836,7 @@ pub fn classify_incremental_mv_query(
     classify_projection_filter_mv_query(query).map(IncrementalMvShape::ProjectionFilter)
 }
 
-fn classify_union_all_mv_query(query: &sqlparser::ast::Query) -> Result<UnionAllMvShape, String> {
+fn classify_union_all_mv_query(query: &Query) -> Result<UnionAllMvShape, String> {
     reject_unsupported_query_clauses(query).map_err(|_| union_all_error())?;
 
     let mut branch_bodies = Vec::new();
@@ -1828,30 +1869,28 @@ fn classify_union_all_mv_query(query: &sqlparser::ast::Query) -> Result<UnionAll
     })
 }
 
-fn flatten_union_all<'a>(
-    body: &'a sqlparser::ast::SetExpr,
-    out: &mut Vec<&'a sqlparser::ast::SetExpr>,
-) -> Result<(), String> {
+fn flatten_union_all<'a>(body: &'a SetExpr, out: &mut Vec<&'a SetExpr>) -> Result<(), String> {
     match body {
-        sqlparser::ast::SetExpr::SetOperation {
-            op,
-            set_quantifier,
+        SetExpr::SetOperation(ast::SetOperation {
+            operator,
+            quantifier,
             left,
             right,
-        } => {
-            if !matches!(op, sqlparser::ast::SetOperator::Union)
-                || !matches!(set_quantifier, sqlparser::ast::SetQuantifier::All)
+            ..
+        }) => {
+            if !matches!(operator, ast::SetOperator::Union)
+                || !matches!(quantifier, ast::SetQuantifier::All)
             {
                 return Err(union_all_non_all_error());
             }
             flatten_union_all(left, out)?;
             flatten_union_all(right, out)
         }
-        sqlparser::ast::SetExpr::Select(_) => {
+        SetExpr::Select(_) => {
             out.push(body);
             Ok(())
         }
-        sqlparser::ast::SetExpr::Query(inner) => {
+        SetExpr::Query(inner) => {
             reject_unsupported_query_clauses(inner).map_err(|_| union_all_error())?;
             flatten_union_all(inner.body.as_ref(), out)
         }
@@ -1859,18 +1898,13 @@ fn flatten_union_all<'a>(
     }
 }
 
-fn wrap_setexpr_as_query(
-    outer: &sqlparser::ast::Query,
-    body: &sqlparser::ast::SetExpr,
-) -> sqlparser::ast::Query {
+fn wrap_setexpr_as_query(outer: &Query, body: &SetExpr) -> Query {
     let mut query = outer.clone();
     query.body = Box::new(body.clone());
     query
 }
 
-fn classify_single_union_branch(
-    query: &sqlparser::ast::Query,
-) -> Result<IncrementalMvShape, String> {
+fn classify_single_union_branch(query: &Query) -> Result<IncrementalMvShape, String> {
     if is_probably_join_query(query) {
         return Err(union_all_branch_join_unsupported_error());
     }
@@ -1911,12 +1945,10 @@ fn validate_union_branch_outputs_compatible(branches: &[IncrementalMvShape]) -> 
     Ok(())
 }
 
-fn classify_projection_filter_mv_query(
-    query: &sqlparser::ast::Query,
-) -> Result<ProjectionFilterMvShape, String> {
+fn classify_projection_filter_mv_query(query: &Query) -> Result<ProjectionFilterMvShape, String> {
     reject_unsupported_query_clauses(query)?;
 
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+    let SetExpr::Select(select) = query.body.as_ref() else {
         return Err(projection_filter_error());
     };
     reject_unsupported_select_clauses(select)?;
@@ -1929,10 +1961,10 @@ fn classify_projection_filter_mv_query(
     Ok(ProjectionFilterMvShape { base_table })
 }
 
-fn classify_aggregate_mv_query(query: &sqlparser::ast::Query) -> Result<AggregateMvShape, String> {
+fn classify_aggregate_mv_query(query: &Query) -> Result<AggregateMvShape, String> {
     reject_unsupported_query_clauses(query).map_err(|_| aggregate_error())?;
 
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+    let SetExpr::Select(select) = query.body.as_ref() else {
         return Err(aggregate_error());
     };
     reject_unsupported_aggregate_select_clauses(select)?;
@@ -1956,9 +1988,7 @@ fn classify_aggregate_mv_query(query: &sqlparser::ast::Query) -> Result<Aggregat
     })
 }
 
-fn extract_union_all_fan_in_bases(
-    select: &sqlparser::ast::Select,
-) -> Result<Vec<sqlparser::ast::ObjectName>, String> {
+fn extract_union_all_fan_in_bases(select: &Select) -> Result<Vec<ObjectName>, String> {
     let [from] = select.from.as_slice() else {
         return Ok(Vec::new());
     };
@@ -1966,23 +1996,17 @@ fn extract_union_all_fan_in_bases(
         return Ok(Vec::new());
     }
 
-    let sqlparser::ast::TableFactor::Derived {
-        lateral,
-        subquery,
-        sample,
-        ..
+    let TableFactor::Derived {
+        lateral, subquery, ..
     } = &from.relation
     else {
         return Ok(Vec::new());
     };
-    if *lateral || sample.is_some() {
+    if *lateral {
         return Err(aggregate_error());
     }
     reject_unsupported_query_clauses(subquery).map_err(|_| aggregate_error())?;
-    if !matches!(
-        subquery.body.as_ref(),
-        sqlparser::ast::SetExpr::SetOperation { .. }
-    ) {
+    if !matches!(subquery.body.as_ref(), SetExpr::SetOperation(_)) {
         return Ok(Vec::new());
     }
 
@@ -1995,7 +2019,7 @@ fn extract_union_all_fan_in_bases(
     branch_bodies
         .into_iter()
         .map(|body| {
-            let sqlparser::ast::SetExpr::Select(branch_select) = body else {
+            let SetExpr::Select(branch_select) = body else {
                 return Err(aggregate_error());
             };
             extract_single_base_table(branch_select, aggregate_error, aggregate_error)
@@ -2003,12 +2027,10 @@ fn extract_union_all_fan_in_bases(
         .collect()
 }
 
-fn classify_join_aggregate_mv_query(
-    query: &sqlparser::ast::Query,
-) -> Result<JoinAggregateMvShape, String> {
+fn classify_join_aggregate_mv_query(query: &Query) -> Result<JoinAggregateMvShape, String> {
     reject_unsupported_query_clauses(query).map_err(|_| aggregate_error())?;
 
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+    let SetExpr::Select(select) = query.body.as_ref() else {
         return Err(aggregate_error());
     };
     reject_unsupported_aggregate_select_clauses(select)?;
@@ -2033,7 +2055,7 @@ type AggregateSelectOutputs = (
 );
 
 pub fn classify_aggregate_select_outputs(
-    select: &sqlparser::ast::Select,
+    select: &Select,
 ) -> Result<AggregateSelectOutputs, String> {
     let group_by_exprs = aggregate_group_by_exprs(&select.group_by)?;
     for expr in group_by_exprs {
@@ -2056,7 +2078,7 @@ pub fn classify_aggregate_select_outputs(
         let (expr, output_name) = projection_expr_and_output_name(item)?;
         if let Some(group_key_index) = group_keys
             .iter()
-            .position(|group_key| group_key.expr == *expr)
+            .position(|group_key| printer::print_expr(&group_key.expr) == printer::print_expr(expr))
         {
             if group_keys[group_key_index].output_name.is_empty() {
                 group_keys[group_key_index].output_name = output_name;
@@ -2085,10 +2107,10 @@ pub fn classify_aggregate_select_outputs(
 }
 
 fn classify_join_projection_filter_mv_query(
-    query: &sqlparser::ast::Query,
+    query: &Query,
 ) -> Result<JoinProjectionFilterMvShape, String> {
     reject_unsupported_query_clauses(query).map_err(|_| join_projection_filter_error())?;
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+    let SetExpr::Select(select) = query.body.as_ref() else {
         return Err(join_projection_filter_error());
     };
     reject_unsupported_select_clauses(select).map_err(|_| join_projection_filter_error())?;
@@ -2101,7 +2123,7 @@ fn classify_join_projection_filter_mv_query(
 }
 
 fn classify_join_projection_filter_mv_query_for_select(
-    select: &sqlparser::ast::Select,
+    select: &Select,
 ) -> Result<JoinProjectionFilterMvShape, String> {
     let [from] = select.from.as_slice() else {
         return Err(join_projection_filter_error());
@@ -2110,8 +2132,8 @@ fn classify_join_projection_filter_mv_query_for_select(
         return Err("incremental join MV requires exactly two Iceberg base tables".to_string());
     };
     if !matches!(
-        join.join_operator,
-        sqlparser::ast::JoinOperator::Join(_) | sqlparser::ast::JoinOperator::Inner(_)
+        join.operator,
+        ast::JoinOperator::Inner | ast::JoinOperator::InnerExplicit
     ) {
         return Err("incremental join MV supports only two-table inner equi-join".to_string());
     }
@@ -2120,9 +2142,8 @@ fn classify_join_projection_filter_mv_query_for_select(
     if left_alias.eq_ignore_ascii_case(&right_alias) {
         return Err("incremental join MV requires distinct join aliases".to_string());
     }
-    let condition = match &join.join_operator {
-        sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(expr))
-        | sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expr)) => expr,
+    let condition = match &join.constraint {
+        ast::JoinConstraint::On(expr) => expr,
         _ => return Err("incremental join MV requires JOIN ... ON equi predicates".to_string()),
     };
     let mut join_keys = Vec::new();
@@ -2139,33 +2160,21 @@ fn classify_join_projection_filter_mv_query_for_select(
     })
 }
 
-pub fn table_factor_name_and_alias(
-    factor: &sqlparser::ast::TableFactor,
-) -> Result<(sqlparser::ast::ObjectName, String), String> {
-    let sqlparser::ast::TableFactor::Table {
+pub fn table_factor_name_and_alias(factor: &TableFactor) -> Result<(ObjectName, String), String> {
+    let TableFactor::Table {
         name,
         alias,
-        args,
-        with_hints,
         version,
-        with_ordinality,
-        partitions,
-        json_path,
-        sample,
-        index_hints,
+        metadata,
+        hints,
         ..
     } = factor
     else {
         return Err("incremental join MV base relation must be a table".to_string());
     };
-    if args.is_some()
-        || !with_hints.is_empty()
+    if metadata.is_some()
         || version.is_some()
-        || *with_ordinality
-        || !partitions.is_empty()
-        || json_path.is_some()
-        || sample.is_some()
-        || !index_hints.is_empty()
+        || !hints.is_empty()
         || !is_three_part_object_name(name)
     {
         return Err(
@@ -2173,12 +2182,9 @@ pub fn table_factor_name_and_alias(
         );
     }
     let fallback = name
-        .0
+        .parts
         .last()
-        .and_then(|part| match part {
-            sqlparser::ast::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
-            _ => None,
-        })
+        .map(|part| part.value.clone())
         .ok_or_else(|| "incremental join MV table name has no identifier".to_string())?;
     let alias = alias
         .as_ref()
@@ -2188,43 +2194,35 @@ pub fn table_factor_name_and_alias(
 }
 
 fn collect_equi_join_keys(
-    expr: &sqlparser::ast::Expr,
+    expr: &Expr,
     left_alias: &str,
     right_alias: &str,
     out: &mut Vec<JoinKeyPairShape>,
 ) -> Result<(), String> {
     match expr {
-        sqlparser::ast::Expr::Nested(inner) => {
-            collect_equi_join_keys(inner, left_alias, right_alias, out)
+        Expr::Nested(inner) => {
+            collect_equi_join_keys(&inner.expression, left_alias, right_alias, out)
         }
-        sqlparser::ast::Expr::BinaryOp {
-            left,
-            op: sqlparser::ast::BinaryOperator::And,
-            right,
-        } => {
-            collect_equi_join_keys(left, left_alias, right_alias, out)?;
-            collect_equi_join_keys(right, left_alias, right_alias, out)
+        Expr::Binary(binary) if binary.operator == ast::BinaryOperator::And => {
+            collect_equi_join_keys(&binary.left, left_alias, right_alias, out)?;
+            collect_equi_join_keys(&binary.right, left_alias, right_alias, out)
         }
-        sqlparser::ast::Expr::BinaryOp {
-            left,
-            op: sqlparser::ast::BinaryOperator::Eq,
-            right,
-        } => {
-            let left_q = qualified_column_alias(left)?;
-            let right_q = qualified_column_alias(right)?;
+        Expr::Binary(binary) if binary.operator == ast::BinaryOperator::Equal => {
+            let left_q = qualified_column_alias(&binary.left)?;
+            let right_q = qualified_column_alias(&binary.right)?;
             if left_q.eq_ignore_ascii_case(left_alias) && right_q.eq_ignore_ascii_case(right_alias)
             {
                 out.push(JoinKeyPairShape {
-                    left_expr: left.as_ref().clone(),
-                    right_expr: right.as_ref().clone(),
+                    left_expr: (*binary.left).clone(),
+                    right_expr: (*binary.right).clone(),
                 });
                 Ok(())
             } else if left_q.eq_ignore_ascii_case(right_alias)
                 && right_q.eq_ignore_ascii_case(left_alias)
             {
                 out.push(JoinKeyPairShape {
-                    left_expr: right.as_ref().clone(),
-                    right_expr: left.as_ref().clone(),
+                    left_expr: (*binary.right).clone(),
+                    right_expr: (*binary.left).clone(),
                 });
                 Ok(())
             } else {
@@ -2238,23 +2236,23 @@ fn collect_equi_join_keys(
     }
 }
 
-fn qualified_column_alias(expr: &sqlparser::ast::Expr) -> Result<String, String> {
-    if let sqlparser::ast::Expr::Nested(inner) = expr {
-        return qualified_column_alias(inner);
+fn qualified_column_alias(expr: &Expr) -> Result<String, String> {
+    if let Expr::Nested(inner) = expr {
+        return qualified_column_alias(&inner.expression);
     }
-    let sqlparser::ast::Expr::CompoundIdentifier(parts) = expr else {
+    let Expr::CompoundIdentifier(parts) = expr else {
         return Err(
             "incremental join MV join key must be a qualified column reference".to_string(),
         );
     };
-    let [alias, _column] = parts.as_slice() else {
+    let [alias, _column] = parts.parts.as_slice() else {
         return Err("incremental join MV join key must be <alias>.<column>".to_string());
     };
     Ok(alias.value.clone())
 }
 
-fn is_probably_join_query(query: &sqlparser::ast::Query) -> bool {
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+fn is_probably_join_query(query: &Query) -> bool {
+    let SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
     select.from.len() > 1 || select.from.iter().any(|from| !from.joins.is_empty())
@@ -2265,64 +2263,43 @@ fn join_projection_filter_error() -> String {
         .to_string()
 }
 
-fn reject_unsupported_query_clauses(query: &sqlparser::ast::Query) -> Result<(), String> {
+fn reject_unsupported_query_clauses(query: &Query) -> Result<(), String> {
     if query.with.is_some()
-        || query.order_by.is_some()
-        || query.limit_clause.is_some()
+        || !query.order_by.is_empty()
+        || query.limit.is_some()
+        || query.offset.is_some()
         || query.fetch.is_some()
-        || !query.locks.is_empty()
-        || query.for_clause.is_some()
-        || query.settings.is_some()
-        || query.format_clause.is_some()
-        || !query.pipe_operators.is_empty()
     {
         return Err(projection_filter_error());
     }
     Ok(())
 }
 
-fn reject_unsupported_select_clauses(select: &sqlparser::ast::Select) -> Result<(), String> {
-    if select.distinct.is_some()
-        || select.select_modifiers.is_some()
-        || select.top.is_some()
-        || select.exclude.is_some()
-        || select.into.is_some()
-        || !select.lateral_views.is_empty()
-        || select.prewhere.is_some()
-        || !select.connect_by.is_empty()
-        || !is_empty_group_by(&select.group_by)
-        || !select.cluster_by.is_empty()
-        || !select.distribute_by.is_empty()
-        || !select.sort_by.is_empty()
+fn reject_unsupported_select_clauses(select: &Select) -> Result<(), String> {
+    if !select.hints.is_empty()
+        || !matches!(
+            select.quantifier,
+            ast::SelectQuantifier::None | ast::SelectQuantifier::All(_)
+        )
+        || !matches!(select.group_by, ast::GroupBy::None)
         || select.having.is_some()
-        || !select.named_window.is_empty()
+        || !select.windows.is_empty()
         || select.qualify.is_some()
-        || select.value_table_mode.is_some()
     {
         return Err(projection_filter_error());
     }
     Ok(())
 }
 
-fn reject_unsupported_aggregate_select_clauses(
-    select: &sqlparser::ast::Select,
-) -> Result<(), String> {
-    if select.optimizer_hint.is_some()
-        || select.distinct.is_some()
-        || select.select_modifiers.is_some()
-        || select.top.is_some()
-        || select.exclude.is_some()
-        || select.into.is_some()
-        || !select.lateral_views.is_empty()
-        || select.prewhere.is_some()
-        || !select.connect_by.is_empty()
-        || !select.cluster_by.is_empty()
-        || !select.distribute_by.is_empty()
-        || !select.sort_by.is_empty()
+fn reject_unsupported_aggregate_select_clauses(select: &Select) -> Result<(), String> {
+    if !select.hints.is_empty()
+        || !matches!(
+            select.quantifier,
+            ast::SelectQuantifier::None | ast::SelectQuantifier::All(_)
+        )
         || select.having.is_some()
-        || !select.named_window.is_empty()
+        || !select.windows.is_empty()
         || select.qualify.is_some()
-        || select.value_table_mode.is_some()
     {
         return Err(aggregate_error());
     }
@@ -2330,10 +2307,10 @@ fn reject_unsupported_aggregate_select_clauses(
 }
 
 fn extract_single_base_table(
-    select: &sqlparser::ast::Select,
+    select: &Select,
     shape_error: fn() -> String,
     single_table_error: fn() -> String,
-) -> Result<sqlparser::ast::ObjectName, String> {
+) -> Result<ObjectName, String> {
     let [from] = select.from.as_slice() else {
         return Err(single_table_error());
     };
@@ -2341,30 +2318,17 @@ fn extract_single_base_table(
         return Err(single_table_error());
     }
 
-    let sqlparser::ast::TableFactor::Table {
+    let TableFactor::Table {
         name,
-        args,
-        with_hints,
         version,
-        with_ordinality,
-        partitions,
-        json_path,
-        sample,
-        index_hints,
+        metadata,
+        hints,
         ..
     } = &from.relation
     else {
         return Err(shape_error());
     };
-    if args.is_some()
-        || !with_hints.is_empty()
-        || version.is_some()
-        || *with_ordinality
-        || !partitions.is_empty()
-        || json_path.is_some()
-        || sample.is_some()
-        || !index_hints.is_empty()
-    {
+    if metadata.is_some() || version.is_some() || !hints.is_empty() {
         return Err(single_table_error());
     }
     if !is_three_part_object_name(name) {
@@ -2373,118 +2337,88 @@ fn extract_single_base_table(
     Ok(name.clone())
 }
 
-fn aggregate_group_by_exprs(
-    group_by: &sqlparser::ast::GroupByExpr,
-) -> Result<&[sqlparser::ast::Expr], String> {
+fn aggregate_group_by_exprs(group_by: &ast::GroupBy) -> Result<&[Expr], String> {
     match group_by {
-        sqlparser::ast::GroupByExpr::Expressions(exprs, modifiers) => {
-            if exprs.is_empty() {
+        ast::GroupBy::Expressions { expressions, .. } => {
+            if matches!(expressions.as_slice(), [Expr::Identifier(ident)] if !ident.quoted && ident.value.eq_ignore_ascii_case("all")) {
+                return Err(
+                    "incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported"
+                        .to_string(),
+                );
+            }
+            if expressions.is_empty() {
                 return Err("incremental aggregate MV requires a non-empty GROUP BY".to_string());
             }
-            if !modifiers.is_empty() {
-                return Err("incremental aggregate MV does not support GROUP BY modifiers".to_string());
-            }
-            Ok(exprs)
+            Ok(expressions)
         }
-        sqlparser::ast::GroupByExpr::All(_) => Err(
+        ast::GroupBy::None => Err("incremental aggregate MV requires a non-empty GROUP BY".to_string()),
+        ast::GroupBy::Rollup { .. } | ast::GroupBy::Cube { .. } | ast::GroupBy::GroupingSets { .. } => Err(
             "incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported"
                 .to_string(),
         ),
     }
 }
 
-fn projection_expr_and_output_name(
-    item: &sqlparser::ast::SelectItem,
-) -> Result<(&sqlparser::ast::Expr, String), String> {
+fn projection_expr_and_output_name(item: &SelectItem) -> Result<(&Expr, String), String> {
     match item {
-        sqlparser::ast::SelectItem::UnnamedExpr(expr) => Ok((expr, expr.to_string())),
-        sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
-            Ok((expr, alias.value.clone()))
-        }
-        sqlparser::ast::SelectItem::QualifiedWildcard(_, _)
-        | sqlparser::ast::SelectItem::Wildcard(_) => Err(
+        SelectItem::UnnamedExpr(expr) => Ok((expr, printer::print_expr(expr))),
+        SelectItem::ExprWithAlias { expr, alias, .. } => Ok((expr, alias.value.clone())),
+        SelectItem::QualifiedWildcard { .. } | SelectItem::Wildcard { .. } => Err(
             "incremental aggregate MV projection can only contain expressions or aliases"
                 .to_string(),
         ),
     }
 }
 
-fn classify_aggregate_call(
-    expr: &sqlparser::ast::Expr,
-    output_name: String,
-) -> Result<AggregateCallShape, String> {
-    let sqlparser::ast::Expr::Function(function) = expr else {
+fn classify_aggregate_call(expr: &Expr, output_name: String) -> Result<AggregateCallShape, String> {
+    let Expr::FunctionCall(function) = expr else {
         return Err(
             "incremental aggregate MV scalar projection must be a GROUP BY key or aggregate call"
                 .to_string(),
         );
     };
-    if function.name.0.len() != 1
-        || !matches!(
-            function.name.0.first(),
-            Some(sqlparser::ast::ObjectNamePart::Identifier(_))
-        )
-        || function.uses_odbc_syntax
+    if function.name.parts.len() != 1
         || function.null_treatment.is_some()
         || function.over.is_some()
         || function.filter.is_some()
-        || !function.within_group.is_empty()
-        || !matches!(function.parameters, sqlparser::ast::FunctionArguments::None)
+        || !function.order_by.is_empty()
     {
         return Err(aggregate_error());
     }
 
-    let sqlparser::ast::FunctionArguments::List(args) = &function.args else {
-        return Err(aggregate_error());
-    };
-    if !args.clauses.is_empty() {
-        return Err(aggregate_error());
-    }
-
-    let function_name = function.name.to_string().to_ascii_lowercase();
-    if function_name == "count"
-        && let Some(duplicate_treatment) = &args.duplicate_treatment
+    let args = &function.arguments;
+    let function_name = function.name.parts[0].value.to_ascii_lowercase();
+    if function_name == "count" && matches!(function.quantifier, ast::FunctionQuantifier::Distinct)
     {
-        return match duplicate_treatment {
-            sqlparser::ast::DuplicateTreatment::Distinct => {
-                classify_count_distinct_from_distinct_syntax(&args.args, output_name)
-            }
-            sqlparser::ast::DuplicateTreatment::All => Err(aggregate_error()),
-        };
+        return classify_count_distinct_from_distinct_syntax(args, output_name);
     }
-    if args.duplicate_treatment.is_some() {
+    if !matches!(function.quantifier, ast::FunctionQuantifier::None) {
         return Err(format!(
             "incremental aggregate MV DISTINCT modifier is not supported on `{function_name}`; only count(DISTINCT col) is supported"
         ));
     }
 
     let (function, input) = match function_name.as_str() {
-        "count" => classify_count_input(&args.args)?,
+        "count" => classify_count_input(args)?,
         "count_distinct" | "multi_distinct_count" => (
             AggregateFunctionKind::CountDistinct,
-            classify_count_distinct_input(&args.args)?,
+            classify_count_distinct_input(args)?,
         ),
         "approx_count_distinct" | "ndv" | "hll_ndv" => (
             AggregateFunctionKind::ApproxCountDistinct,
-            classify_approx_count_distinct_input(&args.args)?,
+            classify_approx_count_distinct_input(args)?,
         ),
-        "sum" => (AggregateFunctionKind::Sum, classify_sum_input(&args.args)?),
-        "avg" => (AggregateFunctionKind::Avg, classify_avg_input(&args.args)?),
-        "min" => (
-            AggregateFunctionKind::Min,
-            classify_min_max_input(&args.args)?,
-        ),
-        "max" => (
-            AggregateFunctionKind::Max,
-            classify_min_max_input(&args.args)?,
-        ),
+        "sum" => (AggregateFunctionKind::Sum, classify_sum_input(args)?),
+        "avg" => (AggregateFunctionKind::Avg, classify_avg_input(args)?),
+        "min" => (AggregateFunctionKind::Min, classify_min_max_input(args)?),
+        "max" => (AggregateFunctionKind::Max, classify_min_max_input(args)?),
         "bool_or" | "boolor_agg" => (
             AggregateFunctionKind::BoolOr,
-            classify_bool_or_and_input(&args.args)?,
+            classify_bool_or_and_input(args)?,
         ),
         "bool_and" | "booland_agg" => (
             AggregateFunctionKind::BoolAnd,
-            classify_bool_or_and_input(&args.args)?,
+            classify_bool_or_and_input(args)?,
         ),
         _ => return Err(aggregate_error()),
     };
@@ -2497,7 +2431,7 @@ fn classify_aggregate_call(
 }
 
 fn classify_count_distinct_from_distinct_syntax(
-    args: &[sqlparser::ast::FunctionArg],
+    args: &[Expr],
     output_name: String,
 ) -> Result<AggregateCallShape, String> {
     Ok(AggregateCallShape {
@@ -2507,30 +2441,25 @@ fn classify_count_distinct_from_distinct_syntax(
     })
 }
 
-fn classify_count_input(
-    args: &[sqlparser::ast::FunctionArg],
-) -> Result<(AggregateFunctionKind, AggregateInput), String> {
+fn classify_count_input(args: &[Expr]) -> Result<(AggregateFunctionKind, AggregateInput), String> {
     let [arg] = args else {
         return Err(aggregate_error());
     };
-    match simple_aggregate_arg_expr(arg)? {
-        sqlparser::ast::FunctionArgExpr::Wildcard => {
+    match arg {
+        Expr::Identifier(ident) if ident.value == "*" => {
             Ok((AggregateFunctionKind::Count, AggregateInput::Star))
         }
-        sqlparser::ast::FunctionArgExpr::Expr(expr) => {
+        expr => {
             reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
             Ok((
                 AggregateFunctionKind::Count,
                 AggregateInput::Expr(Box::new(expr.clone())),
             ))
         }
-        sqlparser::ast::FunctionArgExpr::QualifiedWildcard(_) => Err(aggregate_error()),
     }
 }
 
-fn classify_count_distinct_input(
-    args: &[sqlparser::ast::FunctionArg],
-) -> Result<AggregateInput, String> {
+fn classify_count_distinct_input(args: &[Expr]) -> Result<AggregateInput, String> {
     if args.len() > 1 {
         return Err(format!(
             "COUNT(DISTINCT) with {} arguments is not supported in incremental materialized views; multi-column DISTINCT cannot be incrementally maintained",
@@ -2540,16 +2469,14 @@ fn classify_count_distinct_input(
     let [arg] = args else {
         return Err("COUNT(DISTINCT) requires exactly one column expression".to_string());
     };
-    let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
+    if matches!(arg, Expr::Identifier(ident) if ident.value == "*") {
         return Err("COUNT(DISTINCT *) is not supported".to_string());
-    };
-    reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(expr.clone())))
+    }
+    reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
+    Ok(AggregateInput::Expr(Box::new(arg.clone())))
 }
 
-fn classify_approx_count_distinct_input(
-    args: &[sqlparser::ast::FunctionArg],
-) -> Result<AggregateInput, String> {
+fn classify_approx_count_distinct_input(args: &[Expr]) -> Result<AggregateInput, String> {
     if args.len() > 1 {
         return Err(format!(
             "APPROX_COUNT_DISTINCT with {} arguments is not supported in incremental materialized views; the precision hint argument is not supported in IVM. Please use the single-argument form: APPROX_COUNT_DISTINCT(col)",
@@ -2559,49 +2486,47 @@ fn classify_approx_count_distinct_input(
     let [arg] = args else {
         return Err("APPROX_COUNT_DISTINCT requires exactly one column expression".to_string());
     };
-    let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
+    if matches!(arg, Expr::Identifier(ident) if ident.value == "*") {
         return Err("APPROX_COUNT_DISTINCT(*) is not supported".to_string());
-    };
-    reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(expr.clone())))
+    }
+    reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
+    Ok(AggregateInput::Expr(Box::new(arg.clone())))
 }
 
-fn classify_sum_input(args: &[sqlparser::ast::FunctionArg]) -> Result<AggregateInput, String> {
+fn classify_sum_input(args: &[Expr]) -> Result<AggregateInput, String> {
     let [arg] = args else {
         return Err(aggregate_error());
     };
-    let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
+    if matches!(arg, Expr::Identifier(ident) if ident.value == "*") {
         return Err(aggregate_error());
-    };
-    reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(expr.clone())))
+    }
+    reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
+    Ok(AggregateInput::Expr(Box::new(arg.clone())))
 }
 
-fn classify_avg_input(args: &[sqlparser::ast::FunctionArg]) -> Result<AggregateInput, String> {
+fn classify_avg_input(args: &[Expr]) -> Result<AggregateInput, String> {
     let [arg] = args else {
         return Err("AVG aggregate requires a column expression argument".to_string());
     };
-    let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
+    if matches!(arg, Expr::Identifier(ident) if ident.value == "*") {
         return Err("AVG aggregate requires a column expression argument".to_string());
-    };
-    reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(expr.clone())))
+    }
+    reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
+    Ok(AggregateInput::Expr(Box::new(arg.clone())))
 }
 
-fn classify_min_max_input(args: &[sqlparser::ast::FunctionArg]) -> Result<AggregateInput, String> {
+fn classify_min_max_input(args: &[Expr]) -> Result<AggregateInput, String> {
     let [arg] = args else {
         return Err("MIN/MAX aggregate requires a column expression argument".to_string());
     };
-    let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
+    if matches!(arg, Expr::Identifier(ident) if ident.value == "*") {
         return Err("MIN/MAX aggregate requires a column expression argument".to_string());
-    };
-    reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(expr.clone())))
+    }
+    reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
+    Ok(AggregateInput::Expr(Box::new(arg.clone())))
 }
 
-fn classify_bool_or_and_input(
-    args: &[sqlparser::ast::FunctionArg],
-) -> Result<AggregateInput, String> {
+fn classify_bool_or_and_input(args: &[Expr]) -> Result<AggregateInput, String> {
     // BOOL_OR / BOOL_AND require a single scalar Boolean-typed expression.
     // The input type is enforced later when state column physical types are
     // validated (`validate_state_column_type`); shape classification only
@@ -2609,29 +2534,19 @@ fn classify_bool_or_and_input(
     let [arg] = args else {
         return Err("BOOL_OR/BOOL_AND aggregate requires a column expression argument".to_string());
     };
-    let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
+    if matches!(arg, Expr::Identifier(ident) if ident.value == "*") {
         return Err("BOOL_OR/BOOL_AND aggregate requires a column expression argument".to_string());
-    };
-    reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(Box::new(expr.clone())))
-}
-
-fn simple_aggregate_arg_expr(
-    arg: &sqlparser::ast::FunctionArg,
-) -> Result<&sqlparser::ast::FunctionArgExpr, String> {
-    match arg {
-        sqlparser::ast::FunctionArg::Unnamed(arg) => Ok(arg),
-        sqlparser::ast::FunctionArg::Named { .. }
-        | sqlparser::ast::FunctionArg::ExprNamed { .. } => Err(aggregate_error()),
     }
+    reject_unsupported_expr(arg).map_err(aggregate_expr_error)?;
+    Ok(AggregateInput::Expr(Box::new(arg.clone())))
 }
 
-pub fn query_has_aggregate_surface(query: &sqlparser::ast::Query) -> bool {
+pub fn query_has_aggregate_surface(query: &Query) -> bool {
     is_probably_aggregate_query(query)
 }
 
-fn is_probably_aggregate_query(query: &sqlparser::ast::Query) -> bool {
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+fn is_probably_aggregate_query(query: &Query) -> bool {
+    let SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
     !is_empty_group_by(&select.group_by)
@@ -2642,114 +2557,85 @@ fn is_probably_aggregate_query(query: &sqlparser::ast::Query) -> bool {
             .any(select_item_contains_aggregate_function)
 }
 
-fn select_item_contains_aggregate_function(item: &sqlparser::ast::SelectItem) -> bool {
+fn select_item_contains_aggregate_function(item: &SelectItem) -> bool {
     match item {
-        sqlparser::ast::SelectItem::UnnamedExpr(expr)
-        | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
             expr_contains_aggregate_function(expr)
         }
-        sqlparser::ast::SelectItem::QualifiedWildcard(
-            sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr),
-            _,
-        ) => expr_contains_aggregate_function(expr),
-        sqlparser::ast::SelectItem::QualifiedWildcard(_, _)
-        | sqlparser::ast::SelectItem::Wildcard(_) => false,
+        SelectItem::QualifiedWildcard { .. } | SelectItem::Wildcard { .. } => false,
     }
 }
 
-fn expr_contains_aggregate_function(expr: &sqlparser::ast::Expr) -> bool {
-    use sqlparser::ast::Expr;
-
+fn expr_contains_aggregate_function(expr: &Expr) -> bool {
     match expr {
-        Expr::Function(function) => {
-            let name = function.name.to_string().to_ascii_lowercase();
+        Expr::FunctionCall(function) => {
+            let name = printer::print_object_name(&function.name).to_ascii_lowercase();
             is_aggregate_function(&name)
-                || function_args_contain_aggregate_function(&function.parameters)
-                || function_args_contain_aggregate_function(&function.args)
+                || function
+                    .arguments
+                    .iter()
+                    .any(expr_contains_aggregate_function)
                 || function
                     .filter
                     .as_ref()
                     .is_some_and(|filter| expr_contains_aggregate_function(filter))
                 || function
-                    .within_group
+                    .order_by
                     .iter()
                     .any(|order_by| expr_contains_aggregate_function(&order_by.expr))
         }
-        Expr::BinaryOp { left, right, .. }
-        | Expr::AnyOp { left, right, .. }
-        | Expr::AllOp { left, right, .. }
-        | Expr::IsDistinctFrom(left, right)
-        | Expr::IsNotDistinctFrom(left, right) => {
+        Expr::Binary(binary) => {
+            let left = &binary.left;
+            let right = &binary.right;
             expr_contains_aggregate_function(left) || expr_contains_aggregate_function(right)
         }
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNormalized { expr, .. }
-        | Expr::Nested(expr)
-        | Expr::OuterJoin(expr)
-        | Expr::Prior(expr)
-        | Expr::Cast { expr, .. }
-        | Expr::Extract { expr, .. }
-        | Expr::Ceil { expr, .. }
-        | Expr::Floor { expr, .. }
-        | Expr::Collate { expr, .. }
-        | Expr::Prefixed { value: expr, .. }
-        | Expr::Named { expr, .. } => expr_contains_aggregate_function(expr),
-        Expr::InList { expr, list, .. } => {
-            expr_contains_aggregate_function(expr)
-                || list.iter().any(expr_contains_aggregate_function)
+        Expr::Unary(unary) => expr_contains_aggregate_function(&unary.expression),
+        Expr::Nested(nested) => expr_contains_aggregate_function(&nested.expression),
+        Expr::Cast(cast) => expr_contains_aggregate_function(&cast.expr),
+        Expr::InList(list) => {
+            expr_contains_aggregate_function(&list.expr)
+                || list.list.iter().any(expr_contains_aggregate_function)
         }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            expr_contains_aggregate_function(expr)
-                || expr_contains_aggregate_function(low)
-                || expr_contains_aggregate_function(high)
+        Expr::Between(between) => {
+            expr_contains_aggregate_function(&between.expr)
+                || expr_contains_aggregate_function(&between.low)
+                || expr_contains_aggregate_function(&between.high)
         }
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            operand
+        Expr::Case(case) => {
+            case.operand
                 .as_ref()
                 .is_some_and(|operand| expr_contains_aggregate_function(operand))
-                || conditions.iter().any(|condition| {
-                    expr_contains_aggregate_function(&condition.condition)
-                        || expr_contains_aggregate_function(&condition.result)
-                })
-                || else_result
+                || case
+                    .conditions
+                    .iter()
+                    .zip(&case.results)
+                    .any(|(when, then)| {
+                        expr_contains_aggregate_function(when)
+                            || expr_contains_aggregate_function(then)
+                    })
+                || case
+                    .else_result
                     .as_ref()
                     .is_some_and(|else_result| expr_contains_aggregate_function(else_result))
         }
-        Expr::Tuple(values)
-        | Expr::Array(sqlparser::ast::Array { elem: values, .. })
-        | Expr::Struct { values, .. } => values.iter().any(expr_contains_aggregate_function),
+        Expr::Tuple(tuple) => tuple
+            .expressions
+            .iter()
+            .any(expr_contains_aggregate_function),
+        Expr::Array(array) => array.elements.iter().any(expr_contains_aggregate_function),
+        Expr::Struct(record) => record
+            .fields
+            .iter()
+            .any(|field| expr_contains_aggregate_function(&field.value)),
+        Expr::Map(map) => map.entries.iter().any(|entry| {
+            expr_contains_aggregate_function(&entry.key)
+                || expr_contains_aggregate_function(&entry.value)
+        }),
         _ => false,
     }
 }
 
-fn function_args_contain_aggregate_function(args: &sqlparser::ast::FunctionArguments) -> bool {
-    match args {
-        sqlparser::ast::FunctionArguments::None
-        | sqlparser::ast::FunctionArguments::Subquery(_) => false,
-        sqlparser::ast::FunctionArguments::List(list) => list.args.iter().any(|arg| match arg {
-            sqlparser::ast::FunctionArg::Named { arg, .. }
-            | sqlparser::ast::FunctionArg::ExprNamed { arg, .. }
-            | sqlparser::ast::FunctionArg::Unnamed(arg) => match arg {
-                sqlparser::ast::FunctionArgExpr::Expr(expr) => {
-                    expr_contains_aggregate_function(expr)
-                }
-                sqlparser::ast::FunctionArgExpr::QualifiedWildcard(_)
-                | sqlparser::ast::FunctionArgExpr::Wildcard => false,
-            },
-        }),
-    }
-}
-
-fn reject_unsupported_projection_filter_exprs(
-    select: &sqlparser::ast::Select,
-) -> Result<(), String> {
+fn reject_unsupported_projection_filter_exprs(select: &Select) -> Result<(), String> {
     for item in &select.projection {
         reject_unsupported_select_item_expr(item)?;
     }
@@ -2759,41 +2645,24 @@ fn reject_unsupported_projection_filter_exprs(
     Ok(())
 }
 
-fn reject_unsupported_select_item_expr(item: &sqlparser::ast::SelectItem) -> Result<(), String> {
+fn reject_unsupported_select_item_expr(item: &SelectItem) -> Result<(), String> {
     match item {
-        sqlparser::ast::SelectItem::UnnamedExpr(expr)
-        | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => reject_unsupported_expr(expr),
-        sqlparser::ast::SelectItem::QualifiedWildcard(kind, _) => {
-            if let sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr) = kind {
-                reject_unsupported_expr(expr)?;
-            }
-            Ok(())
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            reject_unsupported_expr(expr)
         }
-        sqlparser::ast::SelectItem::Wildcard(_) => Ok(()),
+        SelectItem::QualifiedWildcard { .. } | SelectItem::Wildcard { .. } => Ok(()),
     }
 }
 
-fn reject_match_against_before_from_shape_check(
-    select: &sqlparser::ast::Select,
-) -> Result<(), String> {
+fn reject_match_against_before_from_shape_check(select: &Select) -> Result<(), String> {
     for item in &select.projection {
         match item {
-            sqlparser::ast::SelectItem::UnnamedExpr(expr)
-            | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
                 if contains_match_against(expr) {
                     return Err(projection_filter_error());
                 }
             }
-            sqlparser::ast::SelectItem::QualifiedWildcard(
-                sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr),
-                _,
-            ) => {
-                if contains_match_against(expr) {
-                    return Err(projection_filter_error());
-                }
-            }
-            sqlparser::ast::SelectItem::QualifiedWildcard(_, _)
-            | sqlparser::ast::SelectItem::Wildcard(_) => {}
+            SelectItem::QualifiedWildcard { .. } | SelectItem::Wildcard { .. } => {}
         }
     }
     if let Some(selection) = &select.selection
@@ -2804,172 +2673,54 @@ fn reject_match_against_before_from_shape_check(
     Ok(())
 }
 
-fn contains_match_against(expr: &sqlparser::ast::Expr) -> bool {
-    matches!(expr, sqlparser::ast::Expr::MatchAgainst { .. })
-        || matches!(
-            expr,
-            sqlparser::ast::Expr::Function(function)
-                if function.name.to_string().eq_ignore_ascii_case("match")
-        )
+fn contains_match_against(expr: &Expr) -> bool {
+    matches!(expr, Expr::FunctionCall(function) if printer::print_object_name(&function.name).eq_ignore_ascii_case("match"))
 }
 
-fn reject_unsupported_expr(expr: &sqlparser::ast::Expr) -> Result<(), String> {
-    use sqlparser::ast::Expr;
-
+fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
     match expr {
-        Expr::Subquery(_)
-        | Expr::Exists { .. }
-        | Expr::InSubquery { .. }
-        | Expr::GroupingSets(_)
-        | Expr::Cube(_)
-        | Expr::Rollup(_)
-        | Expr::MatchAgainst { .. } => return Err(projection_filter_error()),
-        Expr::Function(function) => reject_unsupported_function(function)?,
-        Expr::CompoundFieldAccess { root, access_chain } => {
-            reject_unsupported_expr(root)?;
-            for access in access_chain {
-                reject_unsupported_access_expr(access)?;
-            }
+        Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(_) | Expr::UserVariable(_) => {
+            return Err(projection_filter_error());
         }
-        Expr::JsonAccess { value, .. }
-        | Expr::IsFalse(value)
-        | Expr::IsNotFalse(value)
-        | Expr::IsTrue(value)
-        | Expr::IsNotTrue(value)
-        | Expr::IsNull(value)
-        | Expr::IsNotNull(value)
-        | Expr::IsUnknown(value)
-        | Expr::IsNotUnknown(value)
-        | Expr::Nested(value)
-        | Expr::OuterJoin(value)
-        | Expr::Prior(value) => {
-            reject_unsupported_expr(value)?;
+        Expr::FunctionCall(function) => reject_unsupported_function(function)?,
+        Expr::Access(access) => reject_unsupported_access_expr(access)?,
+        Expr::Unary(unary) => reject_unsupported_expr(&unary.expression)?,
+        Expr::Nested(nested) => reject_unsupported_expr(&nested.expression)?,
+        Expr::InList(list) => {
+            reject_unsupported_expr(&list.expr)?;
+            reject_unsupported_exprs(&list.list)?;
         }
-        Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
-            reject_unsupported_expr(left)?;
-            reject_unsupported_expr(right)?;
+        Expr::Between(between) => {
+            reject_unsupported_expr(&between.expr)?;
+            reject_unsupported_expr(&between.low)?;
+            reject_unsupported_expr(&between.high)?;
         }
-        Expr::IsNormalized { expr, .. } | Expr::UnaryOp { expr, .. } => {
-            reject_unsupported_expr(expr)?;
+        Expr::Binary(binary) => {
+            reject_unsupported_expr(&binary.left)?;
+            reject_unsupported_expr(&binary.right)?;
         }
-        Expr::InList { expr, list, .. } => {
-            reject_unsupported_expr(expr)?;
-            reject_unsupported_exprs(list)?;
+        Expr::Like(like) => {
+            reject_unsupported_expr(&like.expr)?;
+            reject_unsupported_expr(&like.pattern)?;
         }
-        Expr::InUnnest {
-            expr, array_expr, ..
-        } => {
-            reject_unsupported_expr(expr)?;
-            reject_unsupported_expr(array_expr)?;
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            reject_unsupported_expr(expr)?;
-            reject_unsupported_expr(low)?;
-            reject_unsupported_expr(high)?;
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            reject_unsupported_expr(left)?;
-            reject_unsupported_expr(right)?;
-        }
-        Expr::Like { expr, pattern, .. }
-        | Expr::ILike { expr, pattern, .. }
-        | Expr::SimilarTo { expr, pattern, .. }
-        | Expr::RLike { expr, pattern, .. } => {
-            reject_unsupported_expr(expr)?;
-            reject_unsupported_expr(pattern)?;
-        }
-        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
-            reject_unsupported_expr(left)?;
-            reject_unsupported_expr(right)?;
-        }
-        Expr::Convert { expr, styles, .. } => {
-            reject_unsupported_expr(expr)?;
-            reject_unsupported_exprs(styles)?;
-        }
-        Expr::Cast { expr, .. } => reject_unsupported_expr(expr)?,
-        Expr::AtTimeZone {
-            timestamp,
-            time_zone,
-        } => {
-            reject_unsupported_expr(timestamp)?;
-            reject_unsupported_expr(time_zone)?;
-        }
-        Expr::Extract { expr, .. } => reject_unsupported_expr(expr)?,
-        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => reject_unsupported_expr(expr)?,
-        Expr::Position { expr, r#in } => {
-            reject_unsupported_expr(expr)?;
-            reject_unsupported_expr(r#in)?;
-        }
-        Expr::Substring {
-            expr,
-            substring_from,
-            substring_for,
-            ..
-        } => {
-            reject_unsupported_expr(expr)?;
-            if let Some(substring_from) = substring_from {
-                reject_unsupported_expr(substring_from)?;
-            }
-            if let Some(substring_for) = substring_for {
-                reject_unsupported_expr(substring_for)?;
-            }
-        }
-        Expr::Trim {
-            expr,
-            trim_what,
-            trim_characters,
-            ..
-        } => {
-            reject_unsupported_expr(expr)?;
-            if let Some(trim_what) = trim_what {
-                reject_unsupported_expr(trim_what)?;
-            }
-            if let Some(trim_characters) = trim_characters {
-                reject_unsupported_exprs(trim_characters)?;
-            }
-        }
-        Expr::Overlay {
-            expr,
-            overlay_what,
-            overlay_from,
-            overlay_for,
-        } => {
-            reject_unsupported_expr(expr)?;
-            reject_unsupported_expr(overlay_what)?;
-            reject_unsupported_expr(overlay_from)?;
-            if let Some(overlay_for) = overlay_for {
-                reject_unsupported_expr(overlay_for)?;
-            }
-        }
-        Expr::Collate { expr, .. } | Expr::Prefixed { value: expr, .. } => {
-            reject_unsupported_expr(expr)?;
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(operand) = operand {
+        Expr::IsPredicate(predicate) => reject_unsupported_expr(&predicate.expr)?,
+        Expr::Cast(cast) => reject_unsupported_expr(&cast.expr)?,
+        Expr::Case(case) => {
+            if let Some(operand) = &case.operand {
                 reject_unsupported_expr(operand)?;
             }
-            for condition in conditions {
-                reject_unsupported_expr(&condition.condition)?;
-                reject_unsupported_expr(&condition.result)?;
+            for (when, then) in case.conditions.iter().zip(&case.results) {
+                reject_unsupported_expr(when)?;
+                reject_unsupported_expr(then)?;
             }
-            if let Some(else_result) = else_result {
+            if let Some(else_result) = &case.else_result {
                 reject_unsupported_expr(else_result)?;
             }
         }
-        Expr::Tuple(values) | Expr::Array(sqlparser::ast::Array { elem: values, .. }) => {
-            reject_unsupported_exprs(values)?;
-        }
-        Expr::Struct { values, .. } => reject_unsupported_exprs(values)?,
-        Expr::Named { expr, .. } => reject_unsupported_expr(expr)?,
-        Expr::Dictionary(fields) => {
-            for field in fields {
+        Expr::Tuple(tuple) => reject_unsupported_exprs(&tuple.expressions)?,
+        Expr::Array(array) => reject_unsupported_exprs(&array.elements)?,
+        Expr::Struct(record) => {
+            for field in &record.fields {
                 reject_unsupported_expr(&field.value)?;
             }
         }
@@ -2981,55 +2732,39 @@ fn reject_unsupported_expr(expr: &sqlparser::ast::Expr) -> Result<(), String> {
         }
         Expr::Interval(interval) => reject_unsupported_expr(&interval.value)?,
         Expr::Lambda(lambda) => reject_unsupported_expr(&lambda.body)?,
-        Expr::MemberOf(member_of) => {
-            reject_unsupported_expr(&member_of.value)?;
-            reject_unsupported_expr(&member_of.array)?;
+        Expr::Identifier(ident) => {
+            if is_non_deterministic_bare_identifier(&ident.value) {
+                return Err(
+                    "incremental MV projection/filter query contains non-deterministic function"
+                        .to_string(),
+                );
+            }
         }
-        Expr::Identifier(_)
-        | Expr::CompoundIdentifier(_)
-        | Expr::Value(_)
-        | Expr::TypedString(_)
-        | Expr::Wildcard(_)
-        | Expr::QualifiedWildcard(_, _) => {}
+        Expr::CompoundIdentifier(_) | Expr::Literal(_) | Expr::TypedString(_) => {}
     }
     Ok(())
 }
 
-fn reject_unsupported_exprs(exprs: &[sqlparser::ast::Expr]) -> Result<(), String> {
+fn reject_unsupported_exprs(exprs: &[Expr]) -> Result<(), String> {
     for expr in exprs {
         reject_unsupported_expr(expr)?;
     }
     Ok(())
 }
 
-fn reject_unsupported_access_expr(access: &sqlparser::ast::AccessExpr) -> Result<(), String> {
-    match access {
-        sqlparser::ast::AccessExpr::Dot(expr) => reject_unsupported_expr(expr),
-        sqlparser::ast::AccessExpr::Subscript(subscript) => match subscript {
-            sqlparser::ast::Subscript::Index { index } => reject_unsupported_expr(index),
-            sqlparser::ast::Subscript::Slice {
-                lower_bound,
-                upper_bound,
-                stride,
-            } => {
-                if let Some(lower_bound) = lower_bound {
-                    reject_unsupported_expr(lower_bound)?;
-                }
-                if let Some(upper_bound) = upper_bound {
-                    reject_unsupported_expr(upper_bound)?;
-                }
-                if let Some(stride) = stride {
-                    reject_unsupported_expr(stride)?;
-                }
-                Ok(())
-            }
-        },
+fn reject_unsupported_access_expr(access: &ast::AccessExpr) -> Result<(), String> {
+    let ast::AccessExpr { expr, kind, .. } = access;
+    reject_unsupported_expr(expr)?;
+    match kind {
+        ast::AccessKind::Field(_) => Ok(()),
+        ast::AccessKind::Subscript(index) => reject_unsupported_expr(index),
+        ast::AccessKind::Json { path, .. } => reject_unsupported_expr(path),
     }
 }
 
-fn reject_unsupported_function(function: &sqlparser::ast::Function) -> Result<(), String> {
-    let function_name = function.name.to_string().to_ascii_lowercase();
-    if is_non_deterministic_function(&function_name, &function.args) {
+fn reject_unsupported_function(function: &ast::FunctionCall) -> Result<(), String> {
+    let function_name = printer::print_object_name(&function.name).to_ascii_lowercase();
+    if is_non_deterministic_function(&function_name, &function.arguments) {
         return Err(
             "incremental MV projection/filter query contains non-deterministic function"
                 .to_string(),
@@ -3039,64 +2774,27 @@ fn reject_unsupported_function(function: &sqlparser::ast::Function) -> Result<()
         || is_window_only_function(&function_name)
         || is_grouping_function(&function_name)
         || is_unsafe_scalar_function(&function_name)
-        || function.uses_odbc_syntax
+        || function_name == "match"
         || function.null_treatment.is_some()
         || function.over.is_some()
+        || !function.order_by.is_empty()
+        || function.separator.is_some()
+        || function.filter.is_some()
+        || !matches!(function.quantifier, ast::FunctionQuantifier::None)
     {
         return Err(projection_filter_error());
     }
-    if function.within_group.is_empty()
-        && function.filter.is_none()
-        && matches!(function.parameters, sqlparser::ast::FunctionArguments::None)
-    {
-        reject_unsupported_function_arguments(&function.args)?;
-        return Ok(());
-    }
-
-    if let Some(filter) = &function.filter {
-        reject_unsupported_expr(filter)?;
-    }
-    for order_by in &function.within_group {
-        reject_unsupported_expr(&order_by.expr)?;
-    }
-    reject_unsupported_function_arguments(&function.parameters)?;
-    reject_unsupported_function_arguments(&function.args)
+    reject_unsupported_function_arguments(&function.arguments)
 }
 
-fn reject_unsupported_function_arguments(
-    args: &sqlparser::ast::FunctionArguments,
-) -> Result<(), String> {
-    match args {
-        sqlparser::ast::FunctionArguments::None => Ok(()),
-        sqlparser::ast::FunctionArguments::Subquery(_) => Err(projection_filter_error()),
-        sqlparser::ast::FunctionArguments::List(list) => {
-            if list.duplicate_treatment.is_some() {
-                return Err(projection_filter_error());
-            }
-            if !list.clauses.is_empty() {
-                return Err(projection_filter_error());
-            }
-            for arg in &list.args {
-                reject_unsupported_function_arg(arg)?;
-            }
-            Ok(())
-        }
+fn reject_unsupported_function_arguments(args: &[Expr]) -> Result<(), String> {
+    for arg in args {
+        reject_unsupported_expr(arg)?;
     }
+    Ok(())
 }
 
-fn reject_unsupported_function_arg(arg: &sqlparser::ast::FunctionArg) -> Result<(), String> {
-    match arg {
-        sqlparser::ast::FunctionArg::Named { arg, .. }
-        | sqlparser::ast::FunctionArg::ExprNamed { arg, .. }
-        | sqlparser::ast::FunctionArg::Unnamed(arg) => match arg {
-            sqlparser::ast::FunctionArgExpr::Expr(expr) => reject_unsupported_expr(expr),
-            sqlparser::ast::FunctionArgExpr::QualifiedWildcard(_)
-            | sqlparser::ast::FunctionArgExpr::Wildcard => Ok(()),
-        },
-    }
-}
-
-fn is_non_deterministic_function(name: &str, args: &sqlparser::ast::FunctionArguments) -> bool {
+fn is_non_deterministic_function(name: &str, args: &[Expr]) -> bool {
     matches!(
         name,
         "now"
@@ -3115,12 +2813,22 @@ fn is_non_deterministic_function(name: &str, args: &sqlparser::ast::FunctionArgu
     ) || (name == "unix_timestamp" && function_argument_count(args) == Some(0))
 }
 
-fn function_argument_count(args: &sqlparser::ast::FunctionArguments) -> Option<usize> {
-    match args {
-        sqlparser::ast::FunctionArguments::None => Some(0),
-        sqlparser::ast::FunctionArguments::List(list) => Some(list.args.len()),
-        sqlparser::ast::FunctionArguments::Subquery(_) => None,
-    }
+fn is_non_deterministic_bare_identifier(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "current_timestamp"
+            | "localtime"
+            | "localtimestamp"
+            | "current_date"
+            | "curdate"
+            | "current_time"
+            | "curtime"
+            | "utc_time"
+    )
+}
+
+fn function_argument_count(args: &[Expr]) -> Option<usize> {
+    Some(args.len())
 }
 
 fn is_window_only_function(name: &str) -> bool {
@@ -3232,21 +2940,18 @@ fn is_aggregate_function(name: &str) -> bool {
     )
 }
 
-fn is_empty_group_by(group_by: &sqlparser::ast::GroupByExpr) -> bool {
+fn is_empty_group_by(group_by: &ast::GroupBy) -> bool {
     match group_by {
-        sqlparser::ast::GroupByExpr::Expressions(exprs, modifiers) => {
-            exprs.is_empty() && modifiers.is_empty()
-        }
-        sqlparser::ast::GroupByExpr::All(_) => false,
+        ast::GroupBy::None => true,
+        ast::GroupBy::Expressions { expressions, .. } => expressions.is_empty(),
+        ast::GroupBy::Rollup { .. }
+        | ast::GroupBy::Cube { .. }
+        | ast::GroupBy::GroupingSets { .. } => false,
     }
 }
 
-fn is_three_part_object_name(name: &sqlparser::ast::ObjectName) -> bool {
-    name.0.len() == 3
-        && name
-            .0
-            .iter()
-            .all(|part| matches!(part, sqlparser::ast::ObjectNamePart::Identifier(_)))
+fn is_three_part_object_name(name: &ObjectName) -> bool {
+    name.parts.len() == 3
 }
 
 fn single_base_table_error() -> String {
@@ -3294,25 +2999,15 @@ fn union_all_branch_output_mismatch_error() -> String {
 pub const AGG_RETRACTION_COUNT_STATE_COLUMN: &str = "__agg_state___ivm_row_count";
 
 pub fn rewrite_select_sql_for_state(
-    select_sql: &str,
+    select_query: &ast::Query,
     calls: &SqlMvAggregateCalls,
 ) -> Result<String, String> {
-    use sqlparser::ast::{SelectItem, SetExpr, Statement};
-
-    let normalized = crate::parser::dialect::normalize_for_raw_parse(select_sql)
-        .map_err(|e| format!("rewrite_select_sql_for_state normalize error: {e}"))?;
-    let stmt = crate::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|e| format!("rewrite_select_sql_for_state parse error: {e}"))?;
-    let mut stmt = stmt;
-
-    let Statement::Query(query) = &mut stmt else {
-        return Err("rewrite_select_sql_for_state: expected Query statement".to_string());
-    };
-    let SetExpr::Select(select) = query.body.as_mut() else {
+    let mut query = select_query.clone();
+    let ast::SetExpr::Select(select) = query.body.as_mut() else {
         return Err("rewrite_select_sql_for_state: expected SELECT body".to_string());
     };
 
-    let mut new_projection: Vec<SelectItem> =
+    let mut new_projection: Vec<ast::SelectItem> =
         Vec::with_capacity(calls.visible_outputs.len() + calls.aggregates.len() + 1);
     for output in &calls.visible_outputs {
         match output {
@@ -3322,9 +3017,11 @@ pub fn rewrite_select_sql_for_state(
                         "rewrite_select_sql_for_state: group key index {group_key_index} out of range"
                     )
                 })?;
-                new_projection.push(SelectItem::ExprWithAlias {
+                new_projection.push(ast::SelectItem::ExprWithAlias {
                     expr: group_key.expr.clone(),
                     alias: select_alias_ident(&group_key.output_name),
+                    explicit_as: true,
+                    span: Span::new(0, 0),
                 });
             }
             VisibleAggregateOutput::Aggregate(aggregate_index) => {
@@ -3344,13 +3041,13 @@ pub fn rewrite_select_sql_for_state(
     }
     select.projection = new_projection;
 
-    Ok(stmt.to_string())
+    Ok(printer::print_query(&query))
 }
 
 fn make_state_combinator_select_item(
     aggregate: &AggregateCallShape,
     signed: bool,
-) -> Result<sqlparser::ast::SelectItem, String> {
+) -> Result<ast::SelectItem, String> {
     Ok(make_aggregate_select_item(
         state_combinator_name_for_kind(aggregate.function, signed),
         state_combinator_input_expr(aggregate)?,
@@ -3358,15 +3055,11 @@ fn make_state_combinator_select_item(
     ))
 }
 
-fn state_combinator_input_expr(
-    aggregate: &AggregateCallShape,
-) -> Result<sqlparser::ast::Expr, String> {
+fn state_combinator_input_expr(aggregate: &AggregateCallShape) -> Result<ast::Expr, String> {
     match &aggregate.input {
         AggregateInput::Star => {
             if aggregate.function == AggregateFunctionKind::Count {
-                Ok(sqlparser::ast::Expr::Value(
-                    sqlparser::ast::Value::Number("1".to_string(), false).into(),
-                ))
+                Ok(number_literal("1"))
             } else {
                 Err(format!(
                     "rewrite_select_sql_for_state: {} requires an expression input",
@@ -3438,11 +3131,11 @@ fn state_combinator_name_for_kind(kind: AggregateFunctionKind, signed: bool) -> 
     }
 }
 
-fn select_alias_ident(alias: &str) -> sqlparser::ast::Ident {
+fn select_alias_ident(alias: &str) -> ast::Ident {
     if is_plain_identifier(alias) {
-        sqlparser::ast::Ident::new(alias)
+        synthetic_ident(alias, false)
     } else {
-        sqlparser::ast::Ident::with_quote('`', alias)
+        synthetic_ident(alias, true)
     }
 }
 
@@ -3455,71 +3148,82 @@ fn is_plain_identifier(alias: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-fn make_aggregate_select_item(
-    func_name: &str,
-    arg: sqlparser::ast::Expr,
-    alias: &str,
-) -> sqlparser::ast::SelectItem {
-    use sqlparser::ast::{
-        Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
-        ObjectName, ObjectNamePart, SelectItem,
-    };
-    let function = Function {
-        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(func_name))]),
-        uses_odbc_syntax: false,
-        parameters: FunctionArguments::None,
-        args: FunctionArguments::List(FunctionArgumentList {
-            duplicate_treatment: None,
-            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(arg))],
-            clauses: vec![],
-        }),
+fn make_aggregate_select_item(func_name: &str, arg: ast::Expr, alias: &str) -> ast::SelectItem {
+    let function = ast::FunctionCall {
+        name: ast::ObjectName {
+            parts: vec![synthetic_ident(func_name, false)],
+            span: Span::new(0, 0),
+        },
+        arguments: vec![arg],
+        quantifier: ast::FunctionQuantifier::None,
+        order_by: vec![],
+        separator: None,
         filter: None,
         null_treatment: None,
         over: None,
-        within_group: vec![],
+        substring_from_syntax: false,
+        span: Span::new(0, 0),
     };
-    SelectItem::ExprWithAlias {
-        expr: sqlparser::ast::Expr::Function(function),
-        alias: Ident::new(alias),
+    ast::SelectItem::ExprWithAlias {
+        expr: ast::Expr::FunctionCall(function),
+        alias: synthetic_ident(alias, false),
+        explicit_as: true,
+        span: Span::new(0, 0),
     }
 }
 
-fn make_count_star_select_item(alias: &str) -> sqlparser::ast::SelectItem {
-    use sqlparser::ast::{
-        Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
-        ObjectName, ObjectNamePart, SelectItem,
-    };
-    let function = Function {
-        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("COUNT"))]),
-        uses_odbc_syntax: false,
-        parameters: FunctionArguments::None,
-        args: FunctionArguments::List(FunctionArgumentList {
-            duplicate_treatment: None,
-            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Wildcard)],
-            clauses: vec![],
-        }),
+fn make_count_star_select_item(alias: &str) -> ast::SelectItem {
+    let function = ast::FunctionCall {
+        name: ast::ObjectName {
+            parts: vec![synthetic_ident("COUNT", false)],
+            span: Span::new(0, 0),
+        },
+        arguments: vec![ast::Expr::Identifier(synthetic_ident("*", false))],
+        quantifier: ast::FunctionQuantifier::None,
+        order_by: vec![],
+        separator: None,
         filter: None,
         null_treatment: None,
         over: None,
-        within_group: vec![],
+        substring_from_syntax: false,
+        span: Span::new(0, 0),
     };
-    SelectItem::ExprWithAlias {
-        expr: sqlparser::ast::Expr::Function(function),
-        alias: Ident::new(alias),
+    ast::SelectItem::ExprWithAlias {
+        expr: ast::Expr::FunctionCall(function),
+        alias: synthetic_ident(alias, false),
+        explicit_as: true,
+        span: Span::new(0, 0),
     }
+}
+
+fn synthetic_ident(value: &str, quoted: bool) -> ast::Ident {
+    ast::Ident {
+        value: value.to_string(),
+        quoted,
+        quote_style: quoted.then_some('`'),
+        span: Span::new(0, 0),
+    }
+}
+
+fn number_literal(value: &str) -> ast::Expr {
+    ast::Expr::Literal(ast::Literal {
+        kind: ast::LiteralKind::Number(value.to_string()),
+        span: Span::new(0, 0),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse_query(sql: &str) -> sqlparser::ast::Query {
-        let normalized = crate::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = crate::parser::parse_normalized_sql_raw(&normalized).expect("parse");
-        let sqlparser::ast::Statement::Query(query) = stmt else {
-            panic!("not a query: {stmt:?}");
+    const NATIVE_PARSE_REJECTION: &str = "native SQL parser rejection: ";
+
+    fn parse_query(sql: &str) -> Query {
+        let statements = novarocks_parser::parse(sql).expect("parse");
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("not a query");
         };
-        *query
+        query.clone()
     }
 
     fn classify_sql(sql: &str) -> Result<IncrementalMvShape, String> {
@@ -3527,47 +3231,55 @@ mod tests {
         classify_incremental_mv_query(&query)
     }
 
-    /// Like `classify_sql` but propagates parse errors as `Err` instead of
-    /// panicking. Used by rejection assertions: a construct unsupported for an
-    /// incremental MV is rejected either at classify time (specific reason) or,
-    /// for syntax sqlparser cannot fully parse (aggregate FILTER/OVER/ORDER BY,
-    /// exotic function-argument forms), at parse time via
-    /// `parse_normalized_sql_raw`'s trailing-token guard. Both are valid
-    /// rejections of the same "unsupported in incremental MV" intent.
+    /// Like `classify_sql` but propagates native parse errors instead of panicking.
     fn try_classify_sql(sql: &str) -> Result<IncrementalMvShape, String> {
-        let normalized = crate::parser::dialect::normalize_for_raw_parse(sql)
-            .map_err(|e| format!("normalize: {e}"))?;
-        let stmt = crate::parser::parse_normalized_sql_raw(&normalized)?;
-        let sqlparser::ast::Statement::Query(query) = stmt else {
-            return Err(format!("not a query: {stmt:?}"));
+        let statements =
+            novarocks_parser::parse(sql).map_err(|e| format!("{NATIVE_PARSE_REJECTION}{e}"))?;
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
+            return Err("not a query".to_string());
         };
-        classify_incremental_mv_query(&query)
+        classify_incremental_mv_query(query)
     }
 
     #[allow(
         dead_code,
         reason = "Retained for incremental MV parser fixtures compiled by other targets."
     )]
-    fn name(s: &str) -> sqlparser::ast::ObjectName {
-        let parts = s
-            .split('.')
-            .map(sqlparser::ast::Ident::new)
-            .collect::<Vec<_>>();
-        sqlparser::ast::ObjectName(
-            parts
-                .into_iter()
-                .map(sqlparser::ast::ObjectNamePart::Identifier)
+    fn name(s: &str) -> ObjectName {
+        ObjectName {
+            parts: s
+                .split('.')
+                .map(|part| synthetic_ident(part, false))
                 .collect(),
-        )
+            span: Span::new(0, 0),
+        }
     }
 
     fn parse_shape(sql: &str) -> Result<IncrementalMvShape, String> {
-        let normalized = crate::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = crate::parser::parse_normalized_sql_raw(&normalized).expect("parse");
-        let sqlparser::ast::Statement::Query(query) = stmt else {
-            panic!("expected query");
-        };
-        classify_incremental_mv_query(&query)
+        classify_incremental_mv_query(&parse_query(sql))
+    }
+
+    #[test]
+    fn imv_aggregate_star_prevalidation_keeps_contract_errors_ahead_of_column_resolution() {
+        for (sql, expected) in [
+            (
+                "SELECT k, AVG(*) FROM measurements GROUP BY k",
+                "Iceberg IMV refresh contract requires exactly one argument for aggregate function `avg`",
+            ),
+            (
+                "SELECT k, MIN(*) FROM measurements GROUP BY k",
+                "Iceberg IMV refresh contract requires exactly one argument for aggregate function `min`",
+            ),
+        ] {
+            let error = validate_imv_aggregate_star_arguments(&parse_query(sql))
+                .expect_err("non-COUNT aggregate star must fail at the IMV boundary");
+            assert_eq!(error, expected);
+        }
+
+        validate_imv_aggregate_star_arguments(&parse_query(
+            "SELECT k, COUNT(*) FROM measurements GROUP BY k",
+        ))
+        .expect("COUNT(*) remains a supported IMV aggregate input");
     }
 
     #[test]
@@ -3604,11 +3316,11 @@ mod tests {
 
     fn assert_rejects_with(sql: &str, needle: &str) {
         let err = try_classify_sql(sql).expect_err("query should be rejected");
-        // Accept either the specific classify-time reason or a parse-time syntax
-        // rejection: both mean the construct is not a supported incremental MV.
+        // A native parser rejection is an explicit fail-fast boundary; otherwise
+        // the classifier must provide the expected semantic reason.
         assert!(
-            err.contains(needle) || err.contains("syntax error"),
-            "expected error to contain `{needle}` or a syntax error for `{sql}`, got `{err}`"
+            err.contains(needle) || err.starts_with(NATIVE_PARSE_REJECTION),
+            "expected error to contain `{needle}` or a native parser rejection for `{sql}`, got `{err}`"
         );
     }
 
@@ -3668,10 +3380,14 @@ mod tests {
     #[test]
     fn rejects_union_all_by_name() {
         let err =
-            classify_sql("select k1 from ice.ns.t1 union all by name select k1 from ice.ns.t2")
-                .expect_err("UNION ALL BY NAME must be rejected");
+            try_classify_sql("select k1 from ice.ns.t1 union all by name select k1 from ice.ns.t2")
+                .expect_err(
+                    "UNION ALL BY NAME must be rejected at the native parse or classifier boundary",
+                );
         assert!(
-            err.contains("UNION ALL") || err.contains("BY NAME"),
+            err.contains("UNION ALL")
+                || err.contains("BY NAME")
+                || err.starts_with(NATIVE_PARSE_REJECTION),
             "unexpected: {err}"
         );
     }
@@ -3737,7 +3453,7 @@ mod tests {
         assert_eq!(
             a.fan_in_bases
                 .iter()
-                .map(|n| n.to_string())
+                .map(printer::print_object_name)
                 .collect::<Vec<_>>(),
             vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
         );
@@ -3777,11 +3493,17 @@ mod tests {
     fn accepts_single_table_projection_filter() {
         let shape = classify_sql("select k1, v2 + 1 as v3 from ice.ns.orders where v2 > 10")
             .expect("query should be accepted");
-        assert_eq!(shape.base_table().to_string(), "ice.ns.orders");
+        assert_eq!(
+            printer::print_object_name(shape.base_table()),
+            "ice.ns.orders"
+        );
         let IncrementalMvShape::ProjectionFilter(shape) = shape else {
             panic!("expected projection/filter shape");
         };
-        assert_eq!(shape.base_table.to_string(), "ice.ns.orders");
+        assert_eq!(
+            printer::print_object_name(&shape.base_table),
+            "ice.ns.orders"
+        );
     }
 
     #[test]
@@ -3791,30 +3513,36 @@ mod tests {
              from ice.ns.orders where v2 > 0 group by k1",
         )
         .expect("query should be accepted");
-        assert_eq!(shape.base_table().to_string(), "ice.ns.orders");
+        assert_eq!(
+            printer::print_object_name(shape.base_table()),
+            "ice.ns.orders"
+        );
         let IncrementalMvShape::Aggregate(shape) = shape else {
             panic!("expected aggregate shape");
         };
-        assert_eq!(shape.base_table.to_string(), "ice.ns.orders");
+        assert_eq!(
+            printer::print_object_name(&shape.base_table),
+            "ice.ns.orders"
+        );
         assert_eq!(shape.group_keys.len(), 1);
         assert_eq!(shape.group_keys[0].output_name, "k1");
-        assert_eq!(shape.group_keys[0].expr.to_string(), "k1");
+        assert_eq!(printer::print_expr(&shape.group_keys[0].expr), "k1");
         assert_eq!(shape.aggregates.len(), 3);
         assert_eq!(shape.aggregates[0].output_name, "c");
         assert_eq!(shape.aggregates[0].function, AggregateFunctionKind::Count);
         assert_eq!(shape.aggregates[0].input, AggregateInput::Star);
         assert_eq!(shape.aggregates[1].output_name, "cv");
         assert_eq!(shape.aggregates[1].function, AggregateFunctionKind::Count);
-        assert_eq!(
-            shape.aggregates[1].input,
-            AggregateInput::Expr(Box::new(sqlparser::ast::Expr::Identifier("v2".into())))
-        );
+        assert!(matches!(
+            &shape.aggregates[1].input,
+            AggregateInput::Expr(expr) if printer::print_expr(expr) == "v2"
+        ));
         assert_eq!(shape.aggregates[2].output_name, "s");
         assert_eq!(shape.aggregates[2].function, AggregateFunctionKind::Sum);
-        assert_eq!(
-            shape.aggregates[2].input,
-            AggregateInput::Expr(Box::new(sqlparser::ast::Expr::Identifier("v2".into())))
-        );
+        assert!(matches!(
+            &shape.aggregates[2].input,
+            AggregateInput::Expr(expr) if printer::print_expr(expr) == "v2"
+        ));
         assert_eq!(
             shape.visible_outputs,
             vec![
@@ -3982,8 +3710,11 @@ mod tests {
                 assert_eq!(join.left_alias, "l");
                 assert_eq!(join.right_alias, "r");
                 assert_eq!(join.join_keys.len(), 1);
-                assert_eq!(join.left_table.to_string(), "ice.ns.orders");
-                assert_eq!(join.right_table.to_string(), "ice.ns.dim");
+                assert_eq!(
+                    printer::print_object_name(&join.left_table),
+                    "ice.ns.orders"
+                );
+                assert_eq!(printer::print_object_name(&join.right_table), "ice.ns.dim");
             }
             other => panic!("expected join shape, got {other:?}"),
         }
@@ -4164,10 +3895,10 @@ mod tests {
         assert_eq!(shape.aggregates.len(), 1);
         assert_eq!(shape.aggregates[0].output_name, "a");
         assert_eq!(shape.aggregates[0].function, AggregateFunctionKind::Avg);
-        assert_eq!(
-            shape.aggregates[0].input,
-            AggregateInput::Expr(Box::new(sqlparser::ast::Expr::Identifier("v2".into())))
-        );
+        assert!(matches!(
+            &shape.aggregates[0].input,
+            AggregateInput::Expr(expr) if printer::print_expr(expr) == "v2"
+        ));
     }
 
     #[test]
@@ -4224,9 +3955,11 @@ mod tests {
 
     #[test]
     fn rejects_group_by_all() {
-        assert_rejects_with(
-            "select k1 from ice.ns.orders group by all",
-            "non-empty GROUP BY",
+        let err = try_classify_sql("select k1 from ice.ns.orders group by all")
+            .expect_err("GROUP BY ALL must be rejected at the native parse or classifier boundary");
+        assert!(
+            err.contains("GROUP BY ALL") || err.contains("GROUP") || err.contains("ALL"),
+            "unexpected: {err}"
         );
     }
 
@@ -4362,7 +4095,8 @@ mod tests {
     fn rewrite_select_sql_avg_to_avg_state() {
         let original = "SELECT k1, COUNT(*) AS c, AVG(v2) AS a FROM ice.ns.orders GROUP BY k1";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
-        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let rewritten =
+            rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
 
         assert!(
@@ -4383,7 +4117,8 @@ mod tests {
     fn rewrite_select_sql_count_sum_emits_per_kind_state() {
         let original = "SELECT k1, COUNT(*) AS c, SUM(v2) AS s FROM ice.ns.orders GROUP BY k1";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
-        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let rewritten =
+            rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
         assert!(
             upper.contains("COUNT_STATE(1) AS __AGG_STATE_C"),
@@ -4403,7 +4138,8 @@ mod tests {
     fn rewrite_select_sql_sum_only_adds_hidden_retraction_count() {
         let original = "SELECT k1, SUM(v2) AS s FROM ice.ns.orders GROUP BY k1";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
-        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let rewritten =
+            rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
         assert!(
             upper.contains("COUNT(*) AS __AGG_STATE___IVM_ROW_COUNT"),
@@ -4419,7 +4155,8 @@ mod tests {
     fn rewrite_select_sql_avg_only() {
         let original = "SELECT k1, AVG(v2) AS a FROM ice.ns.orders GROUP BY k1";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
-        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let rewritten =
+            rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
         assert!(
             upper.contains("AVG_STATE(V2) AS __AGG_STATE_A"),
@@ -4437,7 +4174,8 @@ mod tests {
     fn rewrite_select_sql_multiple_avg() {
         let original = "SELECT k1, AVG(v2) AS a1, AVG(v3) AS a2 FROM ice.ns.orders GROUP BY k1";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
-        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let rewritten =
+            rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
         assert!(
             upper.contains("AVG_STATE(V2) AS __AGG_STATE_A1"),
@@ -4457,7 +4195,8 @@ mod tests {
             IncrementalMvShape::Aggregate(s) => SqlMvAggregateCalls::from(&s),
             _ => panic!("expected aggregate shape"),
         };
-        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let rewritten =
+            rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
         assert!(upper.contains("AVG_STATE(V2)"), "got: {rewritten}");
         assert!(!upper.contains("AVG(V2)"), "got: {rewritten}");
@@ -4474,7 +4213,8 @@ mod tests {
             IncrementalMvShape::Aggregate(s) => SqlMvAggregateCalls::from(&s),
             _ => panic!("expected aggregate shape"),
         };
-        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let rewritten =
+            rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
         assert!(
             upper.contains("AVG_STATE(V2 + 1)") || upper.contains("AVG_STATE(V2+1)"),
@@ -4487,7 +4227,8 @@ mod tests {
     fn rewrite_select_sql_for_state_emits_bool_or_state() {
         let original = "SELECT region, BOOL_OR(flag) AS any_true, COUNT(*) AS c FROM ice.ns.events GROUP BY region";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
-        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let rewritten =
+            rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
         assert!(
             !upper.contains("BOOL_OR(FLAG)"),
@@ -4509,7 +4250,8 @@ mod tests {
                         APPROX_COUNT_DISTINCT(session_id) AS s, BOOL_OR(flag) AS f \
                         FROM ice.ns.events GROUP BY region";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
-        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let rewritten =
+            rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
 
         assert!(
@@ -4535,7 +4277,8 @@ mod tests {
         let original =
             "SELECT region, BOOL_AND(flag) AS all_true FROM ice.ns.events GROUP BY region";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
-        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let rewritten =
+            rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
         assert!(
             !upper.contains("BOOL_AND(FLAG)"),
@@ -4551,7 +4294,8 @@ mod tests {
     fn rewrite_select_sql_for_state_emits_min_state() {
         let original = "SELECT region, MIN(amount), COUNT(*) FROM ice.ns.tab GROUP BY region";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
-        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let rewritten =
+            rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
 
         assert!(
@@ -4569,7 +4313,8 @@ mod tests {
     fn rewrite_select_sql_for_state_emits_max_state() {
         let original = "SELECT region, MAX(name) FROM ice.ns.tab GROUP BY region";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
-        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let rewritten =
+            rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
 
         assert!(
@@ -4586,7 +4331,8 @@ mod tests {
     fn rewrite_select_sql_for_state_min_with_alias_uses_alias_for_state() {
         let original = "SELECT region, MIN(amount) AS mn FROM ice.ns.tab GROUP BY region";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
-        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let rewritten =
+            rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
 
         assert!(
@@ -4604,7 +4350,8 @@ mod tests {
         let original = "SELECT k1, MIN(v2) AS mn, MAX(v3) AS mx, SUM(v4) AS s, COUNT(*) AS c, AVG(v5) AS a \
                         FROM ice.ns.orders GROUP BY k1";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
-        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let rewritten =
+            rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
 
         assert!(

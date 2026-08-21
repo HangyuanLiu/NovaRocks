@@ -18,9 +18,8 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
-use sqlparser::ast as sqlast;
+use novarocks_parser::{ast, printer};
 
-use crate::analysis::JoinKind;
 use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
 // ---------------------------------------------------------------------------
@@ -31,7 +30,7 @@ use novarocks_types::logical::{LogicalType, field_with_logical_type};
 /// downstream type-desc walker can re-emit `TPrimitiveType::JSON`.
 fn nested_field_with_logical_type(
     name: &str,
-    sql_type: &sqlast::DataType,
+    sql_type: &novarocks_parser::ast::TypeName,
     nullable: bool,
 ) -> Result<Field, String> {
     let arrow = sql_type_to_arrow(sql_type)?;
@@ -42,93 +41,65 @@ fn nested_field_with_logical_type(
     Ok(field)
 }
 
-fn is_json_sql_type(sql_type: &sqlast::DataType) -> bool {
-    match sql_type {
-        sqlast::DataType::JSON | sqlast::DataType::JSONB => true,
-        sqlast::DataType::Custom(name, _) => {
-            let n = name.to_string().to_ascii_lowercase();
-            n == "json" || n == "jsonb"
-        }
-        _ => false,
-    }
+fn is_json_sql_type(sql_type: &novarocks_parser::ast::TypeName) -> bool {
+    sql_type
+        .name
+        .parts
+        .last()
+        .is_some_and(|part| matches!(part.value.to_ascii_lowercase().as_str(), "json" | "jsonb"))
 }
 
-pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, String> {
-    match sql_type {
-        sqlast::DataType::TinyInt(_) => Ok(DataType::Int8),
-        sqlast::DataType::SmallInt(_) => Ok(DataType::Int16),
-        sqlast::DataType::Int(_) | sqlast::DataType::Integer(_) => Ok(DataType::Int32),
-        sqlast::DataType::BigInt(_) => Ok(DataType::Int64),
-        sqlast::DataType::Float(_) => Ok(DataType::Float32),
-        sqlast::DataType::Double(_) | sqlast::DataType::DoublePrecision => Ok(DataType::Float64),
-        sqlast::DataType::Boolean => Ok(DataType::Boolean),
-        sqlast::DataType::Varchar(_)
-        | sqlast::DataType::CharVarying(_)
-        | sqlast::DataType::Text => Ok(DataType::Utf8),
-        sqlast::DataType::Char(_)
-        | sqlast::DataType::Character(_)
-        | sqlast::DataType::String(_) => Ok(DataType::Utf8),
-        sqlast::DataType::JSON | sqlast::DataType::JSONB => Ok(DataType::Utf8),
-        sqlast::DataType::Varbinary(_) | sqlast::DataType::Binary(_) => Ok(DataType::Binary),
-        sqlast::DataType::Date => Ok(DataType::Date32),
-        sqlast::DataType::Datetime(_) | sqlast::DataType::Timestamp(_, _) => Ok(
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-        ),
-        sqlast::DataType::Time(_, _) => {
-            Ok(DataType::Time64(arrow::datatypes::TimeUnit::Microsecond))
+pub(super) fn sql_type_to_arrow(
+    sql_type: &novarocks_parser::ast::TypeName,
+) -> Result<DataType, String> {
+    let type_name = sql_type
+        .name
+        .parts
+        .last()
+        .map(|part| part.value.to_ascii_lowercase())
+        .ok_or_else(|| "CAST target type has no name".to_string())?;
+    let type_args = &sql_type.arguments;
+    match type_name.as_str() {
+        "tinyint" => Ok(DataType::Int8),
+        "smallint" => Ok(DataType::Int16),
+        "int" | "integer" => Ok(DataType::Int32),
+        "bigint" => Ok(DataType::Int64),
+        "float" | "real" => Ok(DataType::Float32),
+        "double" | "double precision" => Ok(DataType::Float64),
+        "boolean" | "bool" => Ok(DataType::Boolean),
+        "varchar" | "char" | "character" | "string" | "text" => Ok(DataType::Utf8),
+        "json" | "jsonb" => Ok(DataType::Utf8),
+        "varbinary" | "binary" => Ok(DataType::Binary),
+        "date" => Ok(DataType::Date32),
+        "datetime" | "timestamp" | "timestamptz" => Ok(DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            None,
+        )),
+        "time" => Ok(DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)),
+        "largeint" => Ok(DataType::FixedSizeBinary(
+            novarocks_types::largeint::LARGEINT_BYTE_WIDTH,
+        )),
+        "variant" => Ok(DataType::LargeBinary),
+        "datetime_ns" | "timestamp_ns" | "timestamptz_ns" => Ok(DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Nanosecond,
+            None,
+        )),
+        "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
+            let precision = type_numeric_argument(type_args, 0)?.unwrap_or(38) as u8;
+            let scale = type_numeric_argument(type_args, 1)?.unwrap_or(0) as i8;
+            Ok(DataType::Decimal128(precision, scale))
         }
-        sqlast::DataType::Decimal(info)
-        | sqlast::DataType::Dec(info)
-        | sqlast::DataType::Numeric(info) => match info {
-            sqlast::ExactNumberInfo::PrecisionAndScale(p, s) => {
-                Ok(DataType::Decimal128(*p as u8, *s as i8))
-            }
-            sqlast::ExactNumberInfo::Precision(p) => Ok(DataType::Decimal128(*p as u8, 0)),
-            sqlast::ExactNumberInfo::None => Ok(DataType::Decimal128(38, 0)),
-        },
-        sqlast::DataType::Custom(name, modifiers) => {
-            let type_name = name.to_string().to_lowercase();
-            match type_name.as_str() {
-                "string" => Ok(DataType::Utf8),
-                "largeint" => Ok(DataType::FixedSizeBinary(
-                    novarocks_types::largeint::LARGEINT_BYTE_WIDTH,
-                )),
-                "json" | "jsonb" => Ok(DataType::Utf8),
-                "variant" => Ok(DataType::LargeBinary),
-                "varbinary" | "binary" => Ok(DataType::Binary),
-                "datetime_ns" | "timestamp_ns" | "timestamptz_ns" => Ok(DataType::Timestamp(
-                    arrow::datatypes::TimeUnit::Nanosecond,
-                    None,
-                )),
-                "array" => custom_array_type_to_arrow(sql_type),
-                "map" => custom_map_type_to_arrow(sql_type),
-                "struct" => custom_struct_type_to_arrow(sql_type),
-                // StarRocks-style storage-width decimal aliases. Arrow only has
-                // Decimal128 (and Decimal256) — the 32/64/128 distinction is a
-                // StarRocks storage optimization, not a logical type. Map all
-                // three to Decimal128 with the requested precision/scale.
-                "decimal32" | "decimal64" | "decimal128" => {
-                    let (precision, scale) = parse_custom_decimal_modifiers(modifiers);
-                    Ok(DataType::Decimal128(precision, scale))
-                }
-                _ => Err(format!("unsupported SQL type: {name}")),
-            }
+        "array" => {
+            let element = type_type_argument(type_args, 0, "ARRAY")?;
+            Ok(DataType::List(Arc::new(nested_field_with_logical_type(
+                "item", element, true,
+            )?)))
         }
-        sqlast::DataType::Array(elem_def) => {
-            let inner_sql = match elem_def {
-                sqlast::ArrayElemTypeDef::AngleBracket(inner_type)
-                | sqlast::ArrayElemTypeDef::SquareBracket(inner_type, _)
-                | sqlast::ArrayElemTypeDef::Parenthesis(inner_type) => inner_type.as_ref(),
-                sqlast::ArrayElemTypeDef::None => {
-                    return Err("ARRAY type requires an element type".to_string());
-                }
-            };
-            let item = nested_field_with_logical_type("item", inner_sql, true)?;
-            Ok(DataType::List(Arc::new(item)))
-        }
-        sqlast::DataType::Map(key_type, value_type) => {
-            let key = nested_field_with_logical_type("key", key_type, true)?;
-            let value = nested_field_with_logical_type("value", value_type, true)?;
+        "map" => {
+            let key = type_type_argument(type_args, 0, "MAP")?;
+            let value = type_type_argument(type_args, 1, "MAP")?;
+            let key = nested_field_with_logical_type("key", key, true)?;
+            let value = nested_field_with_logical_type("value", value, true)?;
             Ok(DataType::Map(
                 Arc::new(Field::new(
                     "entries",
@@ -138,1028 +109,449 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
                 false,
             ))
         }
-        sqlast::DataType::Struct(fields, _) => {
-            let out_fields: Vec<Arc<Field>> = fields
+        "struct" => {
+            let fields = type_args
                 .iter()
                 .enumerate()
-                .map(|(idx, field)| {
-                    let name = field
-                        .field_name
-                        .as_ref()
-                        .map(|ident| ident.value.clone())
-                        .unwrap_or_else(|| format!("f{}", idx + 1));
-                    Ok(Arc::new(nested_field_with_logical_type(
-                        &name,
-                        &field.field_type,
-                        true,
-                    )?))
-                })
-                .collect::<Result<_, String>>()?;
-            Ok(DataType::Struct(Fields::from(out_fields)))
-        }
-        other => Err(format!("unsupported CAST target type: {other:?}")),
-    }
-}
-
-fn custom_array_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, String> {
-    let sqlast::DataType::Custom(_, modifiers) = sql_type else {
-        return Err(format!("expected custom ARRAY type, got {sql_type:?}"));
-    };
-    if modifiers.len() != 1 {
-        return Err(format!(
-            "ARRAY type requires exactly one element type, got {}",
-            modifiers.len()
-        ));
-    }
-    let item = custom_field_with_logical_type("item", &modifiers[0])?;
-    Ok(DataType::List(Arc::new(item)))
-}
-
-/// Parse precision and scale from custom decimal-width type modifiers like
-/// `decimal64(18, 5)` → `["18", "5"]`. Defaults to `(38, 0)` when the
-/// modifiers are missing or unparseable, matching the parser-side helper.
-fn parse_custom_decimal_modifiers(modifiers: &[String]) -> (u8, i8) {
-    match modifiers.len() {
-        0 => (38, 0),
-        1 => {
-            let p = modifiers[0].trim().parse::<u8>().unwrap_or(38);
-            (p, 0)
-        }
-        _ => {
-            let p = modifiers[0].trim().parse::<u8>().unwrap_or(38);
-            let s = modifiers[1].trim().parse::<i8>().unwrap_or(0);
-            (p, s)
-        }
-    }
-}
-
-fn custom_map_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, String> {
-    let sqlast::DataType::Custom(_, modifiers) = sql_type else {
-        return Err(format!("expected custom MAP type, got {sql_type:?}"));
-    };
-    if modifiers.len() != 2 {
-        return Err(format!(
-            "MAP type requires exactly two type parameters, got {}",
-            modifiers.len()
-        ));
-    }
-    let key = custom_field_with_logical_type("key", &modifiers[0])?;
-    let value = custom_field_with_logical_type("value", &modifiers[1])?;
-    Ok(DataType::Map(
-        Arc::new(Field::new(
-            "entries",
-            DataType::Struct(Fields::from(vec![Arc::new(key), Arc::new(value)])),
-            false,
-        )),
-        false,
-    ))
-}
-
-fn custom_struct_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, String> {
-    let sqlast::DataType::Custom(_, modifiers) = sql_type else {
-        return Err(format!("expected custom STRUCT type, got {sql_type:?}"));
-    };
-    let fields = modifiers
-        .iter()
-        .enumerate()
-        .map(|(idx, field_spec)| {
-            let (name, field_type) = split_custom_struct_field(field_spec)?;
-            Ok(Arc::new(custom_field_with_logical_type(
-                &name.unwrap_or_else(|| format!("f{}", idx + 1)),
-                field_type,
-            )?))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(DataType::Struct(Fields::from(fields)))
-}
-
-/// Build a child `Field` from a custom-type modifier string (e.g. "json",
-/// "varchar"). Tags the field with `nr_logical_type=json` when the modifier
-/// names JSON so downstream rendering can preserve the JSON spelling inside
-/// nested types — `parse_custom_type_string` itself collapses JSON to
-/// `DataType::Utf8` (mirroring how StarRocks stores JSON as text).
-fn custom_field_with_logical_type(name: &str, modifier: &str) -> Result<Field, String> {
-    let inner = parse_custom_type_string(modifier)?;
-    let mut field = Field::new(name, inner, true);
-    if is_json_modifier(modifier) {
-        field = field_with_logical_type(field, LogicalType::Json);
-    }
-    Ok(field)
-}
-
-fn is_json_modifier(modifier: &str) -> bool {
-    let lower = modifier.trim().to_ascii_lowercase();
-    lower == "json" || lower == "jsonb"
-}
-
-fn split_custom_struct_field(field_spec: &str) -> Result<(Option<String>, &str), String> {
-    let trimmed = field_spec.trim();
-    let Some(split_idx) = find_top_level_type_whitespace(trimmed) else {
-        return Ok((None, trimmed));
-    };
-    let name = strip_identifier_quotes(trimmed[..split_idx].trim());
-    let field_type = trimmed[split_idx..].trim();
-    if field_type.is_empty() {
-        return Err(format!("STRUCT field missing type: {field_spec}"));
-    }
-    Ok((Some(name.to_string()), field_type))
-}
-
-fn strip_identifier_quotes(name: &str) -> &str {
-    name.strip_prefix('`')
-        .and_then(|inner| inner.strip_suffix('`'))
-        .or_else(|| {
-            name.strip_prefix('"')
-                .and_then(|inner| inner.strip_suffix('"'))
-        })
-        .unwrap_or(name)
-}
-
-fn parse_custom_type_string(type_sql: &str) -> Result<DataType, String> {
-    let trimmed = type_sql.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    match lower.as_str() {
-        "tinyint" => return Ok(DataType::Int8),
-        "smallint" => return Ok(DataType::Int16),
-        "int" | "integer" => return Ok(DataType::Int32),
-        "bigint" => return Ok(DataType::Int64),
-        "float" => return Ok(DataType::Float32),
-        "double" | "double precision" => return Ok(DataType::Float64),
-        "boolean" | "bool" => return Ok(DataType::Boolean),
-        "string" | "varchar" | "char" | "character" | "text" => return Ok(DataType::Utf8),
-        "varbinary" | "binary" => return Ok(DataType::Binary),
-        "date" => return Ok(DataType::Date32),
-        "datetime" | "timestamp" => {
-            return Ok(DataType::Timestamp(
-                arrow::datatypes::TimeUnit::Microsecond,
-                None,
-            ));
-        }
-        "largeint" => {
-            return Ok(DataType::FixedSizeBinary(
-                novarocks_types::largeint::LARGEINT_BYTE_WIDTH,
-            ));
-        }
-        "json" | "jsonb" => return Ok(DataType::Utf8),
-        "variant" => return Ok(DataType::LargeBinary),
-        _ => {}
-    }
-
-    if let Some(inner) = strip_type_parameters(trimmed, "array")? {
-        return Ok(DataType::List(Arc::new(custom_field_with_logical_type(
-            "item", inner,
-        )?)));
-    }
-    if let Some(inner) = strip_type_parameters(trimmed, "map")? {
-        let parts = split_top_level_type_items(inner, b',');
-        if parts.len() != 2 {
-            return Err(format!("MAP type requires two type parameters: {trimmed}"));
-        }
-        return Ok(DataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                DataType::Struct(Fields::from(vec![
-                    Arc::new(custom_field_with_logical_type("key", parts[0])?),
-                    Arc::new(custom_field_with_logical_type("value", parts[1])?),
-                ])),
-                false,
-            )),
-            false,
-        ));
-    }
-    if let Some(inner) = strip_type_parameters(trimmed, "struct")? {
-        let fields = split_top_level_type_items(inner, b',')
-            .into_iter()
-            .enumerate()
-            .map(|(idx, field_spec)| {
-                let (name, field_type) = split_custom_struct_field(field_spec)?;
-                Ok(Arc::new(custom_field_with_logical_type(
-                    &name.unwrap_or_else(|| format!("f{}", idx + 1)),
-                    field_type,
-                )?))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        return Ok(DataType::Struct(Fields::from(fields)));
-    }
-    if lower.starts_with("varchar(")
-        || lower.starts_with("char(")
-        || lower.starts_with("character(")
-    {
-        return Ok(DataType::Utf8);
-    }
-    if lower.starts_with("decimal(") || lower.starts_with("dec(") || lower.starts_with("numeric(") {
-        let open_idx = trimmed
-            .find('(')
-            .ok_or_else(|| format!("invalid decimal type: {trimmed}"))?;
-        let close_idx = find_matching_type_delimiter(trimmed, open_idx, b'(', b')')?;
-        let params = split_top_level_type_items(&trimmed[open_idx + 1..close_idx], b',');
-        let precision = params
-            .first()
-            .and_then(|value| value.trim().parse::<u8>().ok())
-            .unwrap_or(38);
-        let scale = params
-            .get(1)
-            .and_then(|value| value.trim().parse::<i8>().ok())
-            .unwrap_or(0);
-        return Ok(DataType::Decimal128(precision, scale));
-    }
-
-    Err(format!("unsupported SQL type: {trimmed}"))
-}
-
-fn strip_type_parameters<'a>(type_sql: &'a str, keyword: &str) -> Result<Option<&'a str>, String> {
-    if !type_sql
-        .get(..keyword.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
-    {
-        return Ok(None);
-    }
-    let bytes = type_sql.as_bytes();
-    let mut cursor = keyword.len();
-    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-        cursor += 1;
-    }
-    if cursor >= bytes.len() {
-        return Ok(None);
-    }
-    let (open, close) = match bytes[cursor] {
-        b'<' => (b'<', b'>'),
-        b'(' => (b'(', b')'),
-        _ => return Ok(None),
-    };
-    let end_idx = find_matching_type_delimiter(type_sql, cursor, open, close)?;
-    if !type_sql[end_idx + 1..].trim().is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(&type_sql[cursor + 1..end_idx]))
-}
-
-fn find_matching_type_delimiter(
-    sql: &str,
-    open_idx: usize,
-    open: u8,
-    close: u8,
-) -> Result<usize, String> {
-    let bytes = sql.as_bytes();
-    let mut depth = 0usize;
-    let mut idx = open_idx;
-    let mut single_quote = false;
-    let mut double_quote = false;
-    let mut backtick = false;
-    while idx < bytes.len() {
-        let byte = bytes[idx];
-        if single_quote {
-            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
-                single_quote = false;
-            }
-        } else if double_quote {
-            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
-                double_quote = false;
-            }
-        } else if backtick {
-            if byte == b'`' {
-                backtick = false;
-            }
-        } else {
-            match byte {
-                b'\'' => single_quote = true,
-                b'"' => double_quote = true,
-                b'`' => backtick = true,
-                value if value == open => depth += 1,
-                value if value == close => {
-                    depth = depth
-                        .checked_sub(1)
-                        .ok_or_else(|| format!("unbalanced type delimiter in {sql}"))?;
-                    if depth == 0 {
-                        return Ok(idx);
+                .map(|(index, argument)| match argument {
+                    novarocks_parser::ast::TypeNameArgument::Field(field) => Ok(Arc::new(
+                        nested_field_with_logical_type(&field.name.value, &field.data_type, true)?,
+                    )),
+                    novarocks_parser::ast::TypeNameArgument::Type(data_type) => {
+                        Ok(Arc::new(nested_field_with_logical_type(
+                            &format!("f{}", index + 1),
+                            data_type,
+                            true,
+                        )?))
                     }
-                }
-                _ => {}
-            }
+                    novarocks_parser::ast::TypeNameArgument::Literal(_) => {
+                        Err("STRUCT type field must include a type name".to_string())
+                    }
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(DataType::Struct(Fields::from(fields)))
         }
-        idx += 1;
+        _ => Err(format!("unsupported SQL type: {type_name}")),
     }
-    Err(format!("unterminated type parameters in {sql}"))
 }
 
-fn split_top_level_type_items(sql: &str, delimiter: u8) -> Vec<&str> {
-    let bytes = sql.as_bytes();
-    let mut items = Vec::new();
-    let mut start = 0usize;
-    let mut paren_depth = 0usize;
-    let mut square_depth = 0usize;
-    let mut angle_depth = 0usize;
-    let mut idx = 0usize;
-    let mut single_quote = false;
-    let mut double_quote = false;
-    let mut backtick = false;
-
-    while idx < bytes.len() {
-        let byte = bytes[idx];
-        if single_quote {
-            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
-                single_quote = false;
-            }
-            idx += 1;
-            continue;
-        }
-        if double_quote {
-            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
-                double_quote = false;
-            }
-            idx += 1;
-            continue;
-        }
-        if backtick {
-            if byte == b'`' {
-                backtick = false;
-            }
-            idx += 1;
-            continue;
-        }
-
-        match byte {
-            b'\'' => single_quote = true,
-            b'"' => double_quote = true,
-            b'`' => backtick = true,
-            b'(' => paren_depth += 1,
-            b')' => paren_depth = paren_depth.saturating_sub(1),
-            b'[' => square_depth += 1,
-            b']' => square_depth = square_depth.saturating_sub(1),
-            b'<' => angle_depth += 1,
-            b'>' => angle_depth = angle_depth.saturating_sub(1),
-            value
-                if paren_depth == 0
-                    && square_depth == 0
-                    && angle_depth == 0
-                    && value == delimiter =>
-            {
-                items.push(sql[start..idx].trim());
-                start = idx + 1;
-            }
-            _ => {}
-        }
-        idx += 1;
-    }
-    items.push(sql[start..].trim());
-    items
+fn type_numeric_argument(
+    arguments: &[novarocks_parser::ast::TypeNameArgument],
+    index: usize,
+) -> Result<Option<u64>, String> {
+    let Some(argument) = arguments.get(index) else {
+        return Ok(None);
+    };
+    let novarocks_parser::ast::TypeNameArgument::Literal(literal) = argument else {
+        return Err("numeric type parameter must be a literal".to_string());
+    };
+    let novarocks_parser::ast::LiteralKind::Number(value) = &literal.kind else {
+        return Err("numeric type parameter must be an integer literal".to_string());
+    };
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|error| format!("invalid numeric type parameter `{value}`: {error}"))
 }
 
-fn find_top_level_type_whitespace(sql: &str) -> Option<usize> {
-    let bytes = sql.as_bytes();
-    let mut paren_depth = 0usize;
-    let mut square_depth = 0usize;
-    let mut angle_depth = 0usize;
-    for (idx, byte) in bytes.iter().copied().enumerate() {
-        match byte {
-            b'(' => paren_depth += 1,
-            b')' => paren_depth = paren_depth.saturating_sub(1),
-            b'[' => square_depth += 1,
-            b']' => square_depth = square_depth.saturating_sub(1),
-            b'<' => angle_depth += 1,
-            b'>' => angle_depth = angle_depth.saturating_sub(1),
-            value
-                if paren_depth == 0
-                    && square_depth == 0
-                    && angle_depth == 0
-                    && value.is_ascii_whitespace() =>
-            {
-                return Some(idx);
-            }
-            _ => {}
-        }
-    }
-    None
+fn type_type_argument<'a>(
+    arguments: &'a [novarocks_parser::ast::TypeNameArgument],
+    index: usize,
+    kind: &str,
+) -> Result<&'a novarocks_parser::ast::TypeName, String> {
+    let Some(novarocks_parser::ast::TypeNameArgument::Type(data_type)) = arguments.get(index)
+    else {
+        return Err(format!("{kind} type requires a type parameter"));
+    };
+    Ok(data_type)
 }
 
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Expression display name
 // ---------------------------------------------------------------------------
 
-pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
+pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
     match expr {
-        // Strip outer parentheses: `(col)` → display name of `col`.
-        // This matches how `SELECT distinct(col)` is parsed: DISTINCT is
-        // the SELECT modifier and `(col)` is a Nested expression.
-        sqlast::Expr::Nested(inner) => expr_display_name(inner),
-        sqlast::Expr::Value(value) => format_literal_display_name(&value.value),
-        // MySQL/StarRocks convention: a `t.col` column reference (or
-        // `db.tbl.col` and deeper qualifications, and `struct_col.field`
-        // struct subfield access) displays as just the trailing identifier
-        // in the result header. The qualifier chain only exists for
-        // disambiguation during name resolution.
-        sqlast::Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
-            parts.last().unwrap().value.clone()
-        }
-        sqlast::Expr::CompoundFieldAccess { root, access_chain } => {
-            // When the root is an identifier (a column / qualified column
-            // reference) and the access chain is purely a series of Dot
-            // accesses, the MySQL-style header is just the trailing field
-            // name: `t.s.field`, `c2.field`, `db.tbl.col` all show as the
-            // last segment.
-            //
-            // Skip this shortcut when the root is a function call or any
-            // other non-identifier expression — e.g. `row(map1).col1` keeps
-            // the full path because the user is extracting a named field
-            // from an inline value expression, not naming a base column.
-            let root_is_ident = matches!(
-                root.as_ref(),
-                sqlast::Expr::Identifier(_) | sqlast::Expr::CompoundIdentifier(_)
-            );
-            let all_dot = !access_chain.is_empty()
-                && access_chain
-                    .iter()
-                    .all(|a| matches!(a, sqlast::AccessExpr::Dot(_)));
-            if root_is_ident
-                && all_dot
-                && let Some(sqlast::AccessExpr::Dot(last)) = access_chain.last()
-            {
-                return expr_display_name_preserve_path(last);
-            }
-            let mut out = expr_display_name_preserve_path(root);
-            for access in access_chain {
-                match access {
-                    sqlast::AccessExpr::Dot(expr) => {
-                        out.push('.');
-                        out.push_str(&expr_display_name_preserve_path(expr));
-                    }
-                    sqlast::AccessExpr::Subscript(sqlast::Subscript::Index { index }) => {
-                        out.push('[');
-                        out.push_str(&expr_display_name(index));
-                        out.push(']');
-                    }
-                    sqlast::AccessExpr::Subscript(sqlast::Subscript::Slice {
-                        lower_bound,
-                        upper_bound,
-                        stride,
-                    }) => {
-                        out.push('[');
-                        if let Some(lower) = lower_bound {
-                            out.push_str(&expr_display_name(lower));
-                        }
-                        out.push(':');
-                        if let Some(upper) = upper_bound {
-                            out.push_str(&expr_display_name(upper));
-                        }
-                        if let Some(stride) = stride {
-                            out.push(':');
-                            out.push_str(&expr_display_name(stride));
-                        }
-                        out.push(']');
-                    }
-                }
-            }
-            out
-        }
-        sqlast::Expr::Identifier(ident) => ident.value.clone(),
-        sqlast::Expr::Array(array) => format!(
+        ast::Expr::Nested(nested) => expr_display_name(&nested.expression),
+        ast::Expr::Literal(literal) => format_literal_display_name(literal),
+        ast::Expr::Identifier(ident) => ident.value.clone(),
+        ast::Expr::CompoundIdentifier(identifier) if !identifier.parts.is_empty() => identifier
+            .parts
+            .last()
+            .expect("non-empty compound identifier")
+            .value
+            .clone(),
+        ast::Expr::Access(access) => format_access_display_name(access),
+        ast::Expr::Array(array) => format!(
             "[{}]",
             array
-                .elem
+                .elements
                 .iter()
                 .map(expr_display_name)
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        sqlast::Expr::Function(f) => format_function_display_name(f),
-        sqlast::Expr::IsNull(inner) => {
-            format!("{} IS NULL", expr_display_name_with_parens(inner))
-        }
-        sqlast::Expr::IsNotNull(inner) => {
-            format!("{} IS NOT NULL", expr_display_name_with_parens(inner))
-        }
-        // CAST: uppercase keyword, StarRocks-style type names (DECIMAL64/DECIMAL128),
-        // wrap inner with parentheses if it's not a simple identifier or literal.
-        sqlast::Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } if matches!(data_type, sqlast::DataType::Array(_))
-            && matches!(inner.as_ref(), sqlast::Expr::Array(_)) =>
-        {
-            expr_display_name(inner)
-        }
-        sqlast::Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } => {
-            let inner_str = expr_display_name_with_parens(inner);
-            let type_str = format_cast_type(data_type);
-            format!("CAST({inner_str} AS {type_str})")
-        }
-        sqlast::Expr::BinaryOp {
-            left,
-            op: sqlast::BinaryOperator::Arrow,
-            right,
-        } => {
-            let left_str = expr_display_name_with_parens(left);
-            let right_str = expr_display_name_preserve_path(right);
-            format!("{left_str} -> {right_str}")
-        }
-        // Binary ops: wrap each operand with parentheses unless it's a simple
-        // identifier or literal, matching StarRocks AST2StringVisitor behavior.
-        sqlast::Expr::BinaryOp { left, op, right } => {
-            let left_str = expr_display_name_with_parens(left);
-            let right_str = expr_display_name_with_parens(right);
-            // StarRocks renders `<>` as `!=` in result-column display names;
-            // sqlparser's `Display` keeps the user's original spelling, so
-            // canonicalise here.
-            let op_str = match op {
-                sqlast::BinaryOperator::NotEq => "!=".to_string(),
-                _ => format!("{op}"),
+        ast::Expr::Map(map) => format!(
+            "map{{{}}}",
+            map.entries
+                .iter()
+                .map(|entry| format!(
+                    "{}:{}",
+                    expr_display_name(&entry.key),
+                    expr_display_name(&entry.value)
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        ast::Expr::Lambda(lambda) => {
+            let parameters = lambda
+                .parameters
+                .iter()
+                .map(|parameter| parameter.value.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let parameters = if lambda.parameters.len() == 1 {
+                parameters
+            } else {
+                format!("({parameters})")
             };
-            format!("{left_str} {op_str} {right_str}")
+            format!(
+                "{parameters} -> {}",
+                expr_display_name_preserve_path(&lambda.body)
+            )
         }
-        sqlast::Expr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let not = if *negated { " NOT" } else { "" };
-            let items = list
+        ast::Expr::FunctionCall(function) => format_function_display_name(function),
+        ast::Expr::IsPredicate(predicate) => format_is_predicate_display_name(predicate),
+        ast::Expr::Cast(cast) => {
+            if type_name_is(&cast.data_type, "array")
+                && matches!(cast.expr.as_ref(), ast::Expr::Array(_))
+            {
+                return expr_display_name(&cast.expr);
+            }
+            format!(
+                "CAST({} AS {})",
+                expr_display_name_with_parens(&cast.expr),
+                format_cast_type(&cast.data_type)
+            )
+        }
+        ast::Expr::Binary(binary) => format!(
+            "{} {} {}",
+            expr_display_name_with_parens(&binary.left),
+            binary_operator_display(binary.operator),
+            expr_display_name_with_parens(&binary.right)
+        ),
+        ast::Expr::InList(in_list) => {
+            let not = if in_list.negated { " NOT" } else { "" };
+            let items = in_list
+                .list
                 .iter()
                 .map(expr_display_name_with_parens)
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "{}{} IN ({})",
-                expr_display_name_with_parens(expr),
-                not,
-                items
+                "{}{} IN ({items})",
+                expr_display_name_with_parens(&in_list.expr),
+                not
             )
         }
-        sqlast::Expr::InSubquery {
-            expr,
-            subquery,
-            negated,
-        } => {
-            let not = if *negated { " NOT" } else { "" };
+        ast::Expr::InSubquery(in_subquery) => {
+            let not = if in_subquery.negated { " NOT" } else { "" };
             format!(
                 "{}{} IN ((({})))",
-                expr_display_name_with_parens(expr),
+                expr_display_name_with_parens(&in_subquery.expr),
                 not,
-                format_subquery_display_name(subquery)
+                format_subquery_display_name(&in_subquery.query)
             )
         }
-        // Expressions like SUBSTR, EXTRACT are rendered in uppercase by
-        // sqlparser's Display. Lowercase leading keyword to match StarRocks FE.
-        other => {
-            let s = format!("{other}");
-            // Lowercase leading keyword (up to the first '(') if present.
-            if let Some(paren) = s.find('(') {
-                let prefix = &s[..paren];
-                // Only lowercase if the prefix is all-ASCII-alpha (a keyword).
-                if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_alphabetic()) {
-                    format!("{}{}", prefix.to_lowercase(), &s[paren..])
-                } else {
-                    s
-                }
-            } else {
-                s
-            }
-        }
+        other => lowercase_leading_keyword(&printer::print_expr(other)),
     }
 }
 
-fn format_subquery_display_name(query: &sqlast::Query) -> String {
+fn format_subquery_display_name(query: &ast::Query) -> String {
     let mut query = query.clone();
     mark_query_aliases_explicit(&mut query);
-    format!("{query}")
+    printer::print_query(&query)
 }
 
-fn mark_query_aliases_explicit(query: &mut sqlast::Query) {
+fn mark_query_aliases_explicit(query: &mut ast::Query) {
     if let Some(with) = &mut query.with {
-        for cte in &mut with.cte_tables {
+        for cte in &mut with.ctes {
             mark_query_aliases_explicit(&mut cte.query);
         }
     }
-    mark_set_expr_aliases_explicit(query.body.as_mut());
+    mark_set_expr_aliases_explicit(&mut query.body);
 }
 
-fn mark_set_expr_aliases_explicit(set_expr: &mut sqlast::SetExpr) {
+fn mark_set_expr_aliases_explicit(set_expr: &mut ast::SetExpr) {
     match set_expr {
-        sqlast::SetExpr::Select(select) => {
+        ast::SetExpr::Select(select) => {
             for table_with_joins in &mut select.from {
                 mark_table_with_joins_aliases_explicit(table_with_joins);
             }
         }
-        sqlast::SetExpr::Query(query) => mark_query_aliases_explicit(query),
-        sqlast::SetExpr::SetOperation { left, right, .. } => {
-            mark_set_expr_aliases_explicit(left);
-            mark_set_expr_aliases_explicit(right);
+        ast::SetExpr::Query(query) => mark_query_aliases_explicit(query),
+        ast::SetExpr::SetOperation(operation) => {
+            mark_set_expr_aliases_explicit(&mut operation.left);
+            mark_set_expr_aliases_explicit(&mut operation.right);
         }
-        _ => {}
+        ast::SetExpr::Values(_) => {}
     }
 }
 
-fn mark_table_with_joins_aliases_explicit(table_with_joins: &mut sqlast::TableWithJoins) {
+fn mark_table_with_joins_aliases_explicit(table_with_joins: &mut ast::TableWithJoins) {
     mark_table_factor_aliases_explicit(&mut table_with_joins.relation);
     for join in &mut table_with_joins.joins {
         mark_table_factor_aliases_explicit(&mut join.relation);
     }
 }
 
-fn mark_table_factor_aliases_explicit(factor: &mut sqlast::TableFactor) {
+fn mark_table_factor_aliases_explicit(factor: &mut ast::TableFactor) {
     match factor {
-        sqlast::TableFactor::Table { alias, .. }
-        | sqlast::TableFactor::TableFunction { alias, .. }
-        | sqlast::TableFactor::Function { alias, .. }
-        | sqlast::TableFactor::UNNEST { alias, .. } => {
+        ast::TableFactor::Table { alias, .. }
+        | ast::TableFactor::TableFunction { alias, .. }
+        | ast::TableFactor::Unnest { alias, .. } => {
             if let Some(alias) = alias {
-                alias.explicit = true;
+                alias.explicit_as = true;
             }
         }
-        sqlast::TableFactor::Derived {
+        ast::TableFactor::Derived {
             subquery, alias, ..
         } => {
             if let Some(alias) = alias {
-                alias.explicit = true;
+                alias.explicit_as = true;
             }
             mark_query_aliases_explicit(subquery);
         }
-        sqlast::TableFactor::NestedJoin {
+        ast::TableFactor::NestedJoin {
             table_with_joins,
             alias,
+            ..
         } => {
             if let Some(alias) = alias {
-                alias.explicit = true;
+                alias.explicit_as = true;
             }
             mark_table_with_joins_aliases_explicit(table_with_joins);
         }
-        _ => {}
     }
 }
 
-fn expr_display_name_preserve_path(expr: &sqlast::Expr) -> String {
+fn format_access_display_name(access: &ast::AccessExpr) -> String {
+    if let ast::AccessKind::Field(field) = &access.kind
+        && matches!(
+            access.expr.as_ref(),
+            ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_)
+        )
+    {
+        return field.value.clone();
+    }
+
+    let base = expr_display_name_preserve_path(&access.expr);
+    match &access.kind {
+        ast::AccessKind::Field(field) => format!("{base}.{}", field.value),
+        ast::AccessKind::Subscript(index) => format!("{base}[{}]", expr_display_name(index)),
+        ast::AccessKind::Json { operator, path } => {
+            let operator = match operator {
+                ast::JsonOperator::Arrow => "->",
+                ast::JsonOperator::ArrowText => "->>",
+            };
+            format!(
+                "{base} {operator} {}",
+                expr_display_name_preserve_path(path)
+            )
+        }
+    }
+}
+fn expr_display_name_preserve_path(expr: &ast::Expr) -> String {
     match expr {
-        sqlast::Expr::Nested(inner) => expr_display_name_preserve_path(inner),
-        sqlast::Expr::CompoundIdentifier(parts) if !parts.is_empty() => parts
+        ast::Expr::Nested(nested) => expr_display_name_preserve_path(&nested.expression),
+        ast::Expr::CompoundIdentifier(identifier) => identifier
+            .parts
             .iter()
-            .map(|ident| ident.value.clone())
+            .map(|part| part.value.as_str())
             .collect::<Vec<_>>()
             .join("."),
-        sqlast::Expr::CompoundFieldAccess { .. } => expr_display_name(expr),
+        ast::Expr::Access(access) => format_access_display_name_preserve_path(access),
         _ => expr_display_name(expr),
     }
 }
 
-fn format_literal_display_name(value: &sqlast::Value) -> String {
-    match value {
-        sqlast::Value::SingleQuotedString(s) | sqlast::Value::DoubleQuotedString(s) => {
-            format!("'{}'", s.replace('\'', "''"))
+fn format_access_display_name_preserve_path(access: &ast::AccessExpr) -> String {
+    let base = expr_display_name_preserve_path(&access.expr);
+    match &access.kind {
+        ast::AccessKind::Field(field) => format!("{base}.{}", field.value),
+        ast::AccessKind::Subscript(index) => format!("{base}[{}]", expr_display_name(index)),
+        ast::AccessKind::Json { operator, path } => {
+            let operator = match operator {
+                ast::JsonOperator::Arrow => "->",
+                ast::JsonOperator::ArrowText => "->>",
+            };
+            format!(
+                "{base} {operator} {}",
+                expr_display_name_preserve_path(path)
+            )
         }
-        sqlast::Value::Boolean(true) => "TRUE".to_string(),
-        sqlast::Value::Boolean(false) => "FALSE".to_string(),
-        other => other.to_string(),
     }
 }
 
-/// Wraps `expr_display_name(expr)` in parentheses unless the expression is
-/// a simple identifier or literal — matching StarRocks `printWithParentheses`.
-fn expr_display_name_with_parens(expr: &sqlast::Expr) -> String {
+fn format_literal_display_name(literal: &ast::Literal) -> String {
+    match &literal.kind {
+        ast::LiteralKind::String(value) => format!("'{}'", value.replace('\'', "''")),
+        ast::LiteralKind::Boolean(true) => "TRUE".to_string(),
+        ast::LiteralKind::Boolean(false) => "FALSE".to_string(),
+        ast::LiteralKind::Null => "NULL".to_string(),
+        ast::LiteralKind::Number(value) => value.clone(),
+        ast::LiteralKind::HexString(value) => format!("X'{value}'"),
+    }
+}
+
+fn expr_display_name_with_parens(expr: &ast::Expr) -> String {
     match expr {
-        sqlast::Expr::Identifier(_) | sqlast::Expr::CompoundIdentifier(_) => {
+        ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_) | ast::Expr::Literal(_) => {
             expr_display_name(expr)
         }
-        sqlast::Expr::Value(_) => expr_display_name(expr),
-        sqlast::Expr::UnaryOp {
-            op: sqlast::UnaryOperator::Minus,
-            expr: inner,
-        } if matches!(inner.as_ref(), sqlast::Expr::Value(_)) => expr_display_name(expr),
-        sqlast::Expr::Nested(inner) => expr_display_name_with_parens(inner),
+        ast::Expr::Unary(unary)
+            if unary.operator == ast::UnaryOperator::Minus
+                && matches!(unary.expression.as_ref(), ast::Expr::Literal(_)) =>
+        {
+            expr_display_name(expr)
+        }
+        ast::Expr::Nested(nested) => expr_display_name_with_parens(&nested.expression),
         _ => format!("({})", expr_display_name(expr)),
     }
 }
 
-/// Format a CAST target type using StarRocks-style names.
-/// DECIMAL(p,s) is promoted to DECIMAL32/DECIMAL64/DECIMAL128 to match
-/// the analyzed type name that StarRocks FE emits in column aliases.
-fn format_cast_type(data_type: &sqlast::DataType) -> String {
-    match data_type {
-        sqlast::DataType::Decimal(info)
-        | sqlast::DataType::Dec(info)
-        | sqlast::DataType::Numeric(info) => match info {
-            sqlast::ExactNumberInfo::PrecisionAndScale(p, s) => {
-                let kind = decimal_kind(*p);
-                format!("{kind}({p},{s})")
-            }
-            sqlast::ExactNumberInfo::Precision(p) => {
-                let kind = decimal_kind(*p);
-                format!("{kind}({p},0)")
-            }
-            sqlast::ExactNumberInfo::None => "DECIMAL128(38,0)".to_string(),
-        },
-        sqlast::DataType::Custom(name, modifiers)
-            if name.to_string().eq_ignore_ascii_case("largeint") && modifiers.is_empty() =>
-        {
-            "LARGEINT".to_string()
-        }
-        // `STRING` is a StarRocks alias for `VARCHAR(65533)`; FE-side display
-        // canonicalises it to `VARCHAR(65533)` in result column names.
-        sqlast::DataType::Custom(name, modifiers)
-            if name.to_string().eq_ignore_ascii_case("string") && modifiers.is_empty() =>
-        {
-            "VARCHAR(65533)".to_string()
-        }
-        // Custom MAP/STRUCT come from the parser-side rewrite of `map<…>` /
-        // `struct<…>` (see `rewrite_collection_type_generics`). Restore the
-        // original `<…>` spelling so display aliases match StarRocks FE — each
-        // modifier is the raw inner text we previously single-quoted.
-        sqlast::DataType::Custom(name, modifiers) => {
-            let lower = name.to_string().to_ascii_lowercase();
-            match lower.as_str() {
-                // StarRocks renders `MAP<…>` casts in uppercase, with the
-                // *inner* types also uppercased and **without** MySQL-style
-                // width modifiers (so `int(11)` collapses to `INT`,
-                // `array<int(11)>` becomes `ARRAY<INT>`, etc.). The
-                // separator between key and value is a bare comma — no
-                // space. This is asymmetric with the STRUCT renderer,
-                // which keeps everything lowercase + width-bearing.
-                "map" => format!(
-                    "MAP<{}>",
-                    modifiers
-                        .iter()
-                        .map(|m| format_cast_type_modifier_for_map(m))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ),
-                "struct" => format!(
-                    "{}<{}>",
-                    lower,
-                    modifiers
-                        .iter()
-                        .map(|m| format_cast_type_struct_field(m))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                _ => format!("{name}"),
-            }
-        }
-        // ARRAY<…> bypasses the text rewriter (sqlparser parses it natively).
-        // StarRocks FE renders the top-level cast target with uppercase
-        // `ARRAY<…>` but nested arrays — those appearing inside a struct or
-        // map modifier string — with lowercase `array<…>`. We're in the
-        // top-level branch here, so emit the uppercase form; the nested case
-        // is handled separately via `format_cast_type_token`.
-        sqlast::DataType::Array(elem) => {
-            let inner = format_array_elem_for_cast(elem);
-            format!("ARRAY<{inner}>")
-        }
-        sqlast::DataType::String(_) => "VARCHAR(65533)".to_string(),
-        // `BINARY` and `BINARY(N)` are spelled `VARBINARY` in StarRocks FE
-        // display because BE only has the variable-length variant.
-        sqlast::DataType::Binary(_) => "VARBINARY".to_string(),
-        other => format!("{other}"),
-    }
-}
-
-/// Render the element type of an `Array(ArrayElemTypeDef::AngleBracket(...))`
-/// cast target back into its source-form spelling. The inner is a parsed
-/// `sqlast::DataType` (since sqlparser owns array parsing), so route through
-/// `format_cast_type` to canonicalise nested types consistently with the
-/// rest of the display logic — `int` becomes `int(11)`, nested
-/// `struct<…>`/`map<…>` re-render in `<…>` form, etc.
-fn format_array_elem_for_cast(elem: &sqlast::ArrayElemTypeDef) -> String {
-    let inner = match elem {
-        sqlast::ArrayElemTypeDef::AngleBracket(inner_type)
-        | sqlast::ArrayElemTypeDef::SquareBracket(inner_type, _)
-        | sqlast::ArrayElemTypeDef::Parenthesis(inner_type) => format_cast_type(inner_type),
-        sqlast::ArrayElemTypeDef::None => String::new(),
+fn format_is_predicate_display_name(predicate: &ast::IsPredicateExpr) -> String {
+    let suffix = match predicate.predicate {
+        ast::IsPredicate::Null => "IS NULL",
+        ast::IsPredicate::NotNull => "IS NOT NULL",
+        ast::IsPredicate::True => "IS TRUE",
+        ast::IsPredicate::NotTrue => "IS NOT TRUE",
+        ast::IsPredicate::False => "IS FALSE",
+        ast::IsPredicate::NotFalse => "IS NOT FALSE",
+        ast::IsPredicate::Unknown => "IS UNKNOWN",
+        ast::IsPredicate::NotUnknown => "IS NOT UNKNOWN",
     };
-    // Top-level scalars get their StarRocks display canonicalisation; other
-    // forms (already-rendered `<…>` / `(…)`) pass through unchanged.
-    canonicalize_array_inner_scalar(&inner)
+    format!(
+        "{} {suffix}",
+        expr_display_name_with_parens(&predicate.expr)
+    )
 }
 
-/// Apply scalar canonicalisation (int → int(11), string → varchar(65533), …)
-/// to bare type names produced by `format_cast_type`. Collection or
-/// parenthesised forms are returned unchanged.
-fn canonicalize_array_inner_scalar(inner: &str) -> String {
-    let trimmed = inner.trim();
-    if trimmed.contains('<') || trimmed.contains('(') {
-        return trimmed.to_string();
+fn binary_operator_display(operator: ast::BinaryOperator) -> &'static str {
+    match operator {
+        ast::BinaryOperator::NamedArgument => "=>",
+        ast::BinaryOperator::Or => "OR",
+        ast::BinaryOperator::And => "AND",
+        ast::BinaryOperator::Equal => "=",
+        ast::BinaryOperator::NullSafeEqual => "<=>",
+        ast::BinaryOperator::NotEqual => "!=",
+        ast::BinaryOperator::LessThan => "<",
+        ast::BinaryOperator::LessThanOrEqual => "<=",
+        ast::BinaryOperator::GreaterThan => ">",
+        ast::BinaryOperator::GreaterThanOrEqual => ">=",
+        ast::BinaryOperator::Add => "+",
+        ast::BinaryOperator::Subtract => "-",
+        ast::BinaryOperator::Multiply => "*",
+        ast::BinaryOperator::Divide => "/",
+        ast::BinaryOperator::Modulo => "%",
+        ast::BinaryOperator::BitwiseAnd => "&",
+        ast::BinaryOperator::BitwiseOr => "|",
+        ast::BinaryOperator::BitwiseXor => "^",
+        ast::BinaryOperator::ShiftLeft => "<<",
+        ast::BinaryOperator::ShiftRight => ">>",
+        ast::BinaryOperator::StringConcat => "||",
+        ast::BinaryOperator::IsDistinctFrom => "IS DISTINCT FROM",
+        ast::BinaryOperator::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
     }
-    format_cast_type_token(trimmed)
 }
 
-/// Render a single MAP modifier string back into its `<…>`-style spelling.
-/// The modifier is the raw type text that the parser rewrite captured between
-/// angle brackets (e.g. `int`, `array<int>`, `varchar`, `struct<col1 int>`) —
-/// render bare scalar names with StarRocks's display canonicalisation
-/// (int → int(11), …) and leave nested collection syntax untouched.
-#[allow(
-    dead_code,
-    reason = "Retained for staged SQL planner migration consumers and test helpers."
-)]
-fn format_cast_type_modifier(modifier: &str) -> String {
-    let trimmed = modifier.trim();
-    format_cast_type_token(trimmed)
+fn type_name_is(data_type: &ast::TypeName, expected: &str) -> bool {
+    data_type
+        .name
+        .parts
+        .last()
+        .is_some_and(|part| part.value.eq_ignore_ascii_case(expected))
 }
 
-/// MAP variant of `format_cast_type_modifier` — StarRocks uppercases the
-/// inner types in a `MAP<…>` cast and strips MySQL-style width modifiers,
-/// e.g. `int` and `int(11)` both display as `INT`, `array<int>` becomes
-/// `ARRAY<INT>`, and nested `MAP<…>` recurses with the same rules.
-fn format_cast_type_modifier_for_map(modifier: &str) -> String {
-    fn rewrite(token: &str) -> String {
-        let trimmed = token.trim();
-        if trimmed.is_empty() {
-            return String::new();
+fn format_cast_type(data_type: &ast::TypeName) -> String {
+    let name = data_type
+        .name
+        .parts
+        .last()
+        .map(|part| part.value.to_ascii_lowercase())
+        .unwrap_or_default();
+    match name.as_str() {
+        "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
+            let precision = numeric_type_argument(data_type, 0).unwrap_or(38);
+            let scale = numeric_type_argument(data_type, 1).unwrap_or(0);
+            format!("{}({precision},{scale})", decimal_kind(precision))
         }
-        // Nested collection: `array<…>`, `map<…>`, `struct<…>`. Walk the
-        // outer name and re-render with the MAP-flavored rules.
-        if let Some(open) = trimmed.find('<')
-            && trimmed.ends_with('>')
-        {
-            let head = trimmed[..open].trim();
-            let inner = &trimmed[open + 1..trimmed.len() - 1];
-            let head_upper = head.to_ascii_uppercase();
-            let parts = split_at_top_level_commas(inner);
-            let rendered = parts
+        "largeint" => "LARGEINT".to_string(),
+        "string" => "VARCHAR(65533)".to_string(),
+        "binary" | "varbinary" => "VARBINARY".to_string(),
+        "int" | "integer" => "INT".to_string(),
+        "array" => format!(
+            "ARRAY<{}>",
+            data_type
+                .arguments
+                .first()
+                .and_then(type_name_argument_as_type)
+                .map(format_cast_type)
+                .unwrap_or_default()
+        ),
+        "map" => format!(
+            "MAP<{}>",
+            data_type
+                .arguments
                 .iter()
-                .map(|p| rewrite(p.trim()))
+                .filter_map(type_name_argument_as_type)
+                .map(format_cast_type)
                 .collect::<Vec<_>>()
-                .join(",");
-            return format!("{head_upper}<{rendered}>");
-        }
-        // Bare scalar — strip any `(N)` / `(P,S)` width and uppercase.
-        let base = if let Some(paren) = trimmed.find('(') {
-            trimmed[..paren].trim()
-        } else {
-            trimmed
-        };
-        base.to_ascii_uppercase()
-    }
-    rewrite(modifier)
-}
-
-/// Split `inner` (the text between angle brackets) on top-level commas,
-/// respecting nested `<…>` and `(…)`.
-fn split_at_top_level_commas(inner: &str) -> Vec<&str> {
-    let bytes = inner.as_bytes();
-    let mut depth_angle = 0i32;
-    let mut depth_paren = 0i32;
-    let mut start = 0usize;
-    let mut out = Vec::new();
-    for (idx, b) in bytes.iter().enumerate() {
-        match b {
-            b'<' => depth_angle += 1,
-            b'>' => depth_angle -= 1,
-            b'(' => depth_paren += 1,
-            b')' => depth_paren -= 1,
-            b',' if depth_angle == 0 && depth_paren == 0 => {
-                out.push(&inner[start..idx]);
-                start = idx + 1;
-            }
-            _ => {}
-        }
-    }
-    if start < inner.len() {
-        out.push(&inner[start..]);
-    }
-    out
-}
-
-/// Render a single `struct<…>` field spec back as `name type`, applying the
-/// same scalar canonicalisation as `format_cast_type_modifier` to the type
-/// half. Anonymous (positional) fields use the bare type.
-fn format_cast_type_struct_field(modifier: &str) -> String {
-    let trimmed = modifier.trim();
-    match split_struct_field_at_top_level(trimmed) {
-        Some((name, ty)) => {
-            format!("{name} {}", format_cast_type_token(ty))
-        }
-        None => format_cast_type_token(trimmed),
+                .join(",")
+        ),
+        "struct" => format!(
+            "struct<{}>",
+            data_type
+                .arguments
+                .iter()
+                .map(format_struct_type_argument)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => printer::print_type_name(data_type),
     }
 }
 
-/// Split a struct field spec like `col1 int` into (name, type) at the first
-/// top-level whitespace. Returns None if the spec has no name component.
-fn split_struct_field_at_top_level(spec: &str) -> Option<(&str, &str)> {
-    let bytes = spec.as_bytes();
-    let mut depth_angle = 0i32;
-    let mut depth_paren = 0i32;
-    for (idx, b) in bytes.iter().enumerate() {
-        match b {
-            b'<' => depth_angle += 1,
-            b'>' => depth_angle -= 1,
-            b'(' => depth_paren += 1,
-            b')' => depth_paren -= 1,
-            _ if b.is_ascii_whitespace() && depth_angle == 0 && depth_paren == 0 => {
-                let name = spec[..idx].trim();
-                let ty = spec[idx + 1..].trim_start();
-                if !name.is_empty() && !ty.is_empty() {
-                    return Some((name, ty));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Canonicalise a bare type spelling for cast-display purposes. Mirrors the
-/// scalar rules already applied at the top level of `format_cast_type` —
-/// `int` → `int(11)`, `string` → `varchar(65533)`, etc. — and recurses into
-/// `array<…>` / `map<…>` / `struct<…>` so inner scalars are canonicalised
-/// the same way StarRocks FE renders them in result column names.
-fn format_cast_type_token(token: &str) -> String {
-    let trimmed = token.trim();
-    if let Some(inner) = strip_collection_brackets(trimmed, "array") {
-        return format!("array<{}>", format_cast_type_token(inner));
-    }
-    if let Some(inner) = strip_collection_brackets(trimmed, "map") {
-        let parts = split_top_level_comma(inner);
-        let rendered: Vec<String> = parts
-            .iter()
-            .map(|p| format_cast_type_token(p.trim()))
-            .collect();
-        return format!("map<{}>", rendered.join(", "));
-    }
-    if let Some(inner) = strip_collection_brackets(trimmed, "struct") {
-        let parts = split_top_level_comma(inner);
-        let rendered: Vec<String> = parts
-            .iter()
-            .map(|p| format_cast_type_struct_field(p))
-            .collect();
-        return format!("struct<{}>", rendered.join(", "));
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    match lower.as_str() {
-        "tinyint" => "tinyint(4)".to_string(),
-        "smallint" => "smallint(6)".to_string(),
-        "int" | "integer" => "int(11)".to_string(),
-        "bigint" => "bigint(20)".to_string(),
-        "string" => "varchar(65533)".to_string(),
-        "binary" => "varbinary".to_string(),
-        _ => trimmed.to_string(),
+fn numeric_type_argument(data_type: &ast::TypeName, index: usize) -> Option<u64> {
+    match data_type.arguments.get(index) {
+        Some(ast::TypeNameArgument::Literal(ast::Literal {
+            kind: ast::LiteralKind::Number(value),
+            ..
+        })) => value.parse().ok(),
+        _ => None,
     }
 }
 
-/// If `token` starts with the keyword followed by `<…>`, returns the inner
-/// substring (without the brackets). Used to recurse into nested cast-target
-/// type spellings during column-header rendering.
-fn strip_collection_brackets<'a>(token: &'a str, keyword: &str) -> Option<&'a str> {
-    let bytes = token.as_bytes();
-    let kw_bytes = keyword.as_bytes();
-    if bytes.len() < kw_bytes.len() {
-        return None;
+fn type_name_argument_as_type(argument: &ast::TypeNameArgument) -> Option<&ast::TypeName> {
+    match argument {
+        ast::TypeNameArgument::Type(data_type) => Some(data_type),
+        _ => None,
     }
-    if !token[..keyword.len()].eq_ignore_ascii_case(keyword) {
-        return None;
-    }
-    let mut cursor = keyword.len();
-    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-        cursor += 1;
-    }
-    if cursor >= bytes.len() || bytes[cursor] != b'<' {
-        return None;
-    }
-    // Find the matching `>`.
-    let mut depth = 1i32;
-    let mut idx = cursor + 1;
-    while idx < bytes.len() {
-        match bytes[idx] {
-            b'<' => depth += 1,
-            b'>' => {
-                depth -= 1;
-                if depth == 0 {
-                    if token[idx + 1..].trim().is_empty() {
-                        return Some(&token[cursor + 1..idx]);
-                    } else {
-                        return None;
-                    }
-                }
-            }
-            _ => {}
-        }
-        idx += 1;
-    }
-    None
 }
 
-fn split_top_level_comma(input: &str) -> Vec<&str> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    let mut depth_angle = 0i32;
-    let mut depth_paren = 0i32;
-    for (idx, b) in bytes.iter().enumerate() {
-        match b {
-            b'<' => depth_angle += 1,
-            b'>' => depth_angle -= 1,
-            b'(' => depth_paren += 1,
-            b')' => depth_paren -= 1,
-            b',' if depth_angle == 0 && depth_paren == 0 => {
-                out.push(&input[start..idx]);
-                start = idx + 1;
-            }
-            _ => {}
+fn format_struct_type_argument(argument: &ast::TypeNameArgument) -> String {
+    match argument {
+        ast::TypeNameArgument::Field(field) => {
+            format!(
+                "{} {}",
+                field.name.value,
+                format_cast_type(&field.data_type)
+            )
         }
+        ast::TypeNameArgument::Type(data_type) => format_cast_type(data_type),
+        ast::TypeNameArgument::Literal(literal) => format_literal_display_name(literal),
     }
-    out.push(&input[start..]);
-    out
 }
 
 fn decimal_kind(precision: u64) -> &'static str {
@@ -1173,78 +565,129 @@ fn decimal_kind(precision: u64) -> &'static str {
 }
 
 fn canonical_display_function_name(name: &str) -> String {
-    match name.to_lowercase().as_str() {
+    match name.to_ascii_lowercase().as_str() {
         "boolor_agg" => "bool_or".to_string(),
         "booland_agg" | "every" => "bool_and".to_string(),
         "string_agg" => "group_concat".to_string(),
         "array_agg_distinct" => "array_agg".to_string(),
         "approx_count_distinct_hll_sketch" => "ds_hll_count_distinct".to_string(),
-        // StarRocks renders the typeless `STRUCT(...)` constructor with the
-        // legacy `row(...)` spelling in result column names.
         "struct" => "row".to_string(),
         other => other.to_string(),
     }
 }
 
-fn format_function_display_name(function: &sqlast::Function) -> String {
-    let original_name = function.name.to_string().to_lowercase();
-    let canonical_name = canonical_display_function_name(&function.name.to_string());
-    if canonical_name == "group_concat" {
-        return format_group_concat_display_name(function, &canonical_name);
-    }
-    if original_name == "array_agg_distinct" {
-        return format_array_agg_distinct_display_name(function, &canonical_name);
-    }
-    if original_name == "array_unique_agg" {
-        return format_function_call_with_order_by(function, "array_unique_agg");
-    }
+fn format_function_display_name(function: &ast::FunctionCall) -> String {
+    let original_name = function
+        .name
+        .parts
+        .last()
+        .map(|part| part.value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let canonical_name = canonical_display_function_name(&original_name);
     if canonical_name == "map" {
         return format_map_display_name(function);
     }
-    // `element_at(container, key)` is rendered as `container[key]` to match
-    // the subscript-syntax variant — the two forms are semantically identical
-    // and downstream consumers (SQL test, MySQL clients reading column
-    // headers) expect a single canonical name regardless of which spelling
-    // the user wrote.
-    if canonical_name == "element_at"
-        && let sqlast::FunctionArguments::List(list) = &function.args
-        && list.args.len() == 2
-        && matches!(list.args[0], sqlast::FunctionArg::Unnamed(_))
-        && matches!(list.args[1], sqlast::FunctionArg::Unnamed(_))
-    {
-        let container = format_function_arg_display_name(&list.args[0]);
-        let key = format_function_arg_display_name(&list.args[1]);
-        return format!("{container}[{key}]");
-    }
-    let formatted_args =
-        format_function_arguments_with_ignore_nulls_after_first(&function.args, &canonical_name)
-            .unwrap_or_else(|| format_function_arguments(&function.args));
-    let mut out = format!(
-        "{}{}{}",
-        canonical_name, function.parameters, formatted_args
-    );
-    if !function.within_group.is_empty() {
-        out.push_str(" WITHIN GROUP (ORDER BY ");
-        out.push_str(
-            &function
-                .within_group
-                .iter()
-                .map(format_order_by_expr_display_name)
-                .collect::<Vec<_>>()
-                .join(", "),
+    if canonical_name == "element_at" && function.arguments.len() == 2 {
+        return format!(
+            "{}[{}]",
+            expr_display_name_preserve_path(&function.arguments[0]),
+            expr_display_name(&function.arguments[1])
         );
-        out.push(')');
     }
-    if let Some(filter_cond) = &function.filter {
+
+    let distinct = matches!(function.quantifier, ast::FunctionQuantifier::Distinct)
+        || original_name == "array_agg_distinct";
+    let (arguments, order_arguments, implicit_separator) = if canonical_name == "group_concat" {
+        // The native AST stores an explicit `SEPARATOR` separately. Preserve
+        // the legacy comma spelling only when its final positional argument
+        // is a string literal; all other value lists use the default comma
+        // separator.
+        let (values, separator) = match function.separator.as_deref() {
+            Some(separator) => (function.arguments.as_slice(), Some(separator)),
+            None if function.arguments.len() > 1
+                && function.arguments.last().is_some_and(|argument| {
+                    matches!(
+                        argument,
+                        ast::Expr::Literal(ast::Literal {
+                            kind: ast::LiteralKind::String(_),
+                            ..
+                        })
+                    )
+                }) =>
+            {
+                function
+                    .arguments
+                    .split_last()
+                    .map(|(separator, values)| (values, Some(separator)))
+                    .expect("more than one GROUP_CONCAT argument")
+            }
+            None => (function.arguments.as_slice(), None),
+        };
+        (
+            values
+                .iter()
+                .map(expr_display_name_preserve_path)
+                .collect::<Vec<_>>()
+                .join(","),
+            values,
+            separator,
+        )
+    } else {
+        (
+            format_function_arguments(function, &canonical_name),
+            function.arguments.as_slice(),
+            None,
+        )
+    };
+    let mut out = format!("{canonical_name}(");
+    if distinct {
+        out.push_str("DISTINCT ");
+    }
+    out.push_str(&arguments);
+    if !function.order_by.is_empty() {
+        let visible = function
+            .order_by
+            .iter()
+            .filter(|item| !is_constant_function_order_by(item, order_arguments))
+            .map(|item| format_function_order_by(item, order_arguments))
+            .collect::<Vec<_>>();
+        if !visible.is_empty() {
+            if !arguments.is_empty() {
+                out.push(' ');
+            }
+            out.push_str("ORDER BY ");
+            out.push_str(&visible.join(", "));
+        }
+    }
+    if canonical_name == "group_concat" {
+        if !arguments.is_empty() {
+            out.push(' ');
+        }
+        out.push_str("SEPARATOR ");
+        out.push_str(
+            function
+                .separator
+                .as_deref()
+                .map(expr_display_name)
+                .or_else(|| implicit_separator.map(expr_display_name))
+                .as_deref()
+                .unwrap_or("','"),
+        );
+    }
+    out.push(')');
+
+    if let Some(filter) = &function.filter {
         out.push_str(" FILTER (WHERE ");
-        out.push_str(&expr_display_name(filter_cond));
+        out.push_str(&expr_display_name(filter));
         out.push(')');
     }
-    if let Some(null_treatment) = &function.null_treatment {
+    if let Some(null_treatment) = function.null_treatment
+        && !function_null_treatment_is_argument(&canonical_name, function.arguments.len())
+    {
         out.push(' ');
         out.push_str(match null_treatment {
-            sqlast::NullTreatment::IgnoreNulls => "ignore nulls",
-            sqlast::NullTreatment::RespectNulls => "respect nulls",
+            ast::NullTreatment::IgnoreNulls => "ignore nulls",
+            ast::NullTreatment::RespectNulls => "respect nulls",
         });
     }
     if let Some(over) = &function.over {
@@ -1254,516 +697,189 @@ fn format_function_display_name(function: &sqlast::Function) -> String {
     out
 }
 
-/// StarRocks-style display for `LEAD(v IGNORE NULLS, n)` / `LAG(v IGNORE NULLS, n)` /
-/// `NTH_VALUE(v IGNORE NULLS, n)`: the modifier appears between the first arg and the
-/// remaining args, not at the end of the argument list. sqlparser's standard rendering
-/// places `IgnoreOrRespectNulls` at the end of args, which produces
-/// `LEAD(v, n ignore nulls)` — wrong. This helper rewrites the formatting only when
-/// the function is one of the lead-family and the clause is present.
-fn format_function_arguments_with_ignore_nulls_after_first(
-    args: &sqlast::FunctionArguments,
-    canonical_name: &str,
-) -> Option<String> {
-    if !matches!(canonical_name, "lead" | "lag" | "nth_value") {
-        return None;
-    }
-    let sqlast::FunctionArguments::List(list) = args else {
-        return None;
-    };
-    if list.args.len() < 2 {
-        return None;
-    }
-    let mut null_modifier: Option<&'static str> = None;
-    let mut other_clauses: Vec<&sqlast::FunctionArgumentClause> = Vec::new();
-    for clause in &list.clauses {
-        if let sqlast::FunctionArgumentClause::IgnoreOrRespectNulls(t) = clause {
-            null_modifier = Some(match t {
-                sqlast::NullTreatment::IgnoreNulls => "ignore nulls",
-                sqlast::NullTreatment::RespectNulls => "respect nulls",
-            });
-        } else {
-            other_clauses.push(clause);
-        }
-    }
-    let modifier = null_modifier?;
-
-    let mut inner = String::new();
-    if let Some(duplicate_treatment) = list.duplicate_treatment {
-        inner.push_str(&duplicate_treatment.to_string());
-        inner.push(' ');
-    }
-    inner.push_str(&format_function_arg_display_name(&list.args[0]));
-    inner.push(' ');
-    inner.push_str(modifier);
-    for arg in &list.args[1..] {
-        inner.push_str(", ");
-        inner.push_str(&format_function_arg_display_name(arg));
-    }
-    let extra_visible: Vec<String> = other_clauses
+fn format_function_arguments(function: &ast::FunctionCall, canonical_name: &str) -> String {
+    let mut arguments = function
+        .arguments
         .iter()
-        .map(|clause| format_function_clause_display_name(clause, &list.args))
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !extra_visible.is_empty() {
-        inner.push(' ');
-        inner.push_str(&extra_visible.join(" "));
+        .map(expr_display_name_preserve_path)
+        .collect::<Vec<_>>();
+    if function_null_treatment_is_argument(canonical_name, arguments.len())
+        && let Some(null_treatment) = function.null_treatment
+    {
+        let modifier = match null_treatment {
+            ast::NullTreatment::IgnoreNulls => "ignore nulls",
+            ast::NullTreatment::RespectNulls => "respect nulls",
+        };
+        arguments[0].push(' ');
+        arguments[0].push_str(modifier);
     }
-    Some(format!("({inner})"))
+    arguments.join(", ")
 }
 
-fn format_array_agg_distinct_display_name(
-    function: &sqlast::Function,
-    canonical_name: &str,
-) -> String {
-    let args_display = match &function.args {
-        sqlast::FunctionArguments::List(list) => list
-            .args
-            .iter()
-            .map(format_function_arg_display_name)
-            .collect::<Vec<_>>()
-            .join(", "),
-        other => format_function_arguments(other),
-    };
-    let mut out = format!("{canonical_name}(DISTINCT {args_display}");
-    if let sqlast::FunctionArguments::List(list) = &function.args {
-        for clause in &list.clauses {
-            if let sqlast::FunctionArgumentClause::OrderBy(order_by_exprs) = clause {
-                out.push_str(" ORDER BY ");
-                out.push_str(
-                    &order_by_exprs
-                        .iter()
-                        .map(|item| format_function_order_by_expr_display_name(item, &list.args))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
-            }
-        }
-    }
-    out.push(')');
-    out
+fn function_null_treatment_is_argument(canonical_name: &str, argument_count: usize) -> bool {
+    (matches!(canonical_name, "first_value" | "last_value") && argument_count >= 1)
+        || (matches!(canonical_name, "lead" | "lag" | "nth_value") && argument_count >= 2)
 }
 
-fn format_function_call_with_order_by(function: &sqlast::Function, function_name: &str) -> String {
-    let args_display = match &function.args {
-        sqlast::FunctionArguments::List(list) => list
-            .args
-            .iter()
-            .map(format_function_arg_display_name)
-            .collect::<Vec<_>>()
-            .join(", "),
-        other => format_function_arguments(other),
-    };
-    let mut out = format!("{function_name}({args_display}");
-    if let sqlast::FunctionArguments::List(list) = &function.args {
-        for clause in &list.clauses {
-            if let sqlast::FunctionArgumentClause::OrderBy(order_by_exprs) = clause {
-                out.push_str(" ORDER BY ");
-                out.push_str(
-                    &order_by_exprs
-                        .iter()
-                        .map(|item| format_function_order_by_expr_display_name(item, &list.args))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
-            }
-        }
-    }
-    out.push(')');
-    out
-}
-
-fn format_map_display_name(function: &sqlast::Function) -> String {
-    let sqlast::FunctionArguments::List(list) = &function.args else {
-        return format!("map{}", format_function_arguments(&function.args));
-    };
-    let mut parts = Vec::new();
-    let mut iter = list.args.iter();
-    while let Some(key) = iter.next() {
-        let value = iter.next();
-        let key_display = format_function_arg_display_name(key);
-        if let Some(value) = value {
-            parts.push(format!(
-                "{key_display}:{}",
-                format_function_arg_display_name(value)
-            ));
+fn format_map_display_name(function: &ast::FunctionCall) -> String {
+    let mut pairs = Vec::new();
+    let mut arguments = function.arguments.iter();
+    while let Some(key) = arguments.next() {
+        let key = expr_display_name_preserve_path(key);
+        if let Some(value) = arguments.next() {
+            pairs.push(format!("{key}:{}", expr_display_name_preserve_path(value)));
         } else {
-            parts.push(key_display);
+            pairs.push(key);
         }
     }
-    format!("map{{{}}}", parts.join(","))
+    format!("map{{{}}}", pairs.join(","))
 }
 
-fn format_group_concat_display_name(function: &sqlast::Function, function_name: &str) -> String {
-    let mut out = format!("{}{}", function_name, function.parameters);
-    out.push_str(&format_group_concat_arguments(&function.args));
-    if let Some(filter_cond) = &function.filter {
-        out.push_str(" FILTER (WHERE ");
-        out.push_str(&expr_display_name(filter_cond));
-        out.push(')');
+fn is_constant_function_order_by(order_by: &ast::FunctionOrderBy, arguments: &[ast::Expr]) -> bool {
+    ordinal_function_argument(&order_by.expr, arguments)
+        .map(is_constant_expr)
+        .unwrap_or_else(|| is_constant_expr(&order_by.expr))
+}
+
+fn ordinal_function_argument<'a>(
+    expr: &ast::Expr,
+    arguments: &'a [ast::Expr],
+) -> Option<&'a ast::Expr> {
+    let ast::Expr::Literal(ast::Literal {
+        kind: ast::LiteralKind::Number(position),
+        ..
+    }) = expr
+    else {
+        return None;
+    };
+    position
+        .parse::<usize>()
+        .ok()
+        .and_then(|position| arguments.get(position.saturating_sub(1)))
+}
+
+fn is_constant_expr(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(_) => true,
+        ast::Expr::Nested(nested) => is_constant_expr(&nested.expression),
+        _ => false,
     }
-    if let Some(null_treatment) = &function.null_treatment {
-        out.push(' ');
-        out.push_str(match null_treatment {
-            sqlast::NullTreatment::IgnoreNulls => "ignore nulls",
-            sqlast::NullTreatment::RespectNulls => "respect nulls",
+}
+
+fn format_function_order_by(order_by: &ast::FunctionOrderBy, arguments: &[ast::Expr]) -> String {
+    let expression = ordinal_function_argument(&order_by.expr, arguments)
+        .map(expr_display_name_preserve_path)
+        .unwrap_or_else(|| expr_display_name(&order_by.expr));
+    format_order_by_display_name(expression, order_by.asc, order_by.nulls_first)
+}
+
+fn format_order_by_display_name(
+    expression: String,
+    ascending: Option<bool>,
+    nulls_first: Option<bool>,
+) -> String {
+    let ascending = ascending.unwrap_or(true);
+    let mut out = format!("{expression} {}", if ascending { "ASC" } else { "DESC" });
+    if let Some(nulls_first) = nulls_first
+        && nulls_first != ascending
+    {
+        out.push_str(if nulls_first {
+            " NULLS FIRST"
+        } else {
+            " NULLS LAST"
         });
     }
-    if let Some(over) = &function.over {
-        out.push_str(" OVER ");
-        out.push_str(&format_window_display_name(over));
-    }
     out
 }
 
-fn format_window_display_name(over: &sqlast::WindowType) -> String {
-    let sqlast::WindowType::WindowSpec(spec) = over else {
-        return over.to_string();
-    };
+fn format_window_display_name(over: &ast::WindowSpec) -> String {
+    if let Some(name) = &over.existing_window_name {
+        return name.value.clone();
+    }
 
     let mut parts = Vec::new();
-    if !spec.partition_by.is_empty() {
+    if !over.partition_by.is_empty() {
         parts.push(format!(
             "PARTITION BY {}",
-            spec.partition_by
+            over.partition_by
                 .iter()
                 .map(expr_display_name)
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
     }
-    if !spec.order_by.is_empty() {
+    if !over.order_by.is_empty() {
         parts.push(format!(
             "ORDER BY {}",
-            spec.order_by
+            over.order_by
                 .iter()
-                .map(format_order_by_expr_display_name)
+                .map(|order_by| {
+                    format_order_by_display_name(
+                        expr_display_name(&order_by.expr),
+                        order_by.asc,
+                        order_by.nulls_first,
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
     }
-    let has_frame = spec.window_frame.is_some();
-    if let Some(frame) = &spec.window_frame {
+    if let Some(frame) = &over.window_frame {
         parts.push(format_window_frame_display_name(frame));
     }
 
     if parts.is_empty() {
         "()".to_string()
-    } else if has_frame {
-        // StarRocks omits the trailing space before `)` when a frame is
-        // present: `... ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)`.
+    } else if over.window_frame.is_some() {
         format!("({})", parts.join(" "))
     } else {
-        // ... but keeps it for plain PARTITION BY / ORDER BY:
-        // `... ORDER BY v1 ASC, v2 ASC )`.
         format!("({} )", parts.join(" "))
     }
 }
 
-fn format_window_frame_display_name(frame: &sqlast::WindowFrame) -> String {
+fn format_window_frame_display_name(frame: &ast::WindowFrame) -> String {
     let units = match frame.units {
-        sqlast::WindowFrameUnits::Rows => "ROWS",
-        sqlast::WindowFrameUnits::Range => "RANGE",
-        sqlast::WindowFrameUnits::Groups => "GROUPS",
+        ast::WindowFrameUnits::Rows => "ROWS",
+        ast::WindowFrameUnits::Range => "RANGE",
+        ast::WindowFrameUnits::Groups => "GROUPS",
     };
     let start = format_window_bound_display_name(&frame.start_bound);
-    if let Some(end) = &frame.end_bound {
-        format!(
-            "{} BETWEEN {} AND {}",
-            units,
-            start,
+    match &frame.end_bound {
+        Some(end) => format!(
+            "{units} BETWEEN {start} AND {}",
             format_window_bound_display_name(end)
-        )
-    } else {
-        format!("{units} {start}")
+        ),
+        None => format!("{units} {start}"),
     }
 }
 
-fn format_window_bound_display_name(bound: &sqlast::WindowFrameBound) -> String {
+fn format_window_bound_display_name(bound: &ast::WindowFrameBound) -> String {
     match bound {
-        sqlast::WindowFrameBound::CurrentRow => "CURRENT ROW".to_string(),
-        sqlast::WindowFrameBound::Preceding(None) => "UNBOUNDED PRECEDING".to_string(),
-        sqlast::WindowFrameBound::Preceding(Some(expr)) => {
+        ast::WindowFrameBound::CurrentRow(_) => "CURRENT ROW".to_string(),
+        ast::WindowFrameBound::Preceding(None, _) => "UNBOUNDED PRECEDING".to_string(),
+        ast::WindowFrameBound::Preceding(Some(expr), _) => {
             format!("{} PRECEDING", expr_display_name(expr))
         }
-        sqlast::WindowFrameBound::Following(None) => "UNBOUNDED FOLLOWING".to_string(),
-        sqlast::WindowFrameBound::Following(Some(expr)) => {
+        ast::WindowFrameBound::Following(None, _) => "UNBOUNDED FOLLOWING".to_string(),
+        ast::WindowFrameBound::Following(Some(expr), _) => {
             format!("{} FOLLOWING", expr_display_name(expr))
         }
     }
 }
 
-fn format_function_arguments(args: &sqlast::FunctionArguments) -> String {
-    match args {
-        sqlast::FunctionArguments::None => String::new(),
-        sqlast::FunctionArguments::Subquery(query) => format!("({query})"),
-        sqlast::FunctionArguments::List(list) => {
-            format!("({})", format_function_argument_list(list))
-        }
-    }
-}
-
-fn format_group_concat_arguments(args: &sqlast::FunctionArguments) -> String {
-    match args {
-        sqlast::FunctionArguments::None => String::new(),
-        sqlast::FunctionArguments::Subquery(query) => format!("({query})"),
-        sqlast::FunctionArguments::List(list) => {
-            format!("({})", format_group_concat_argument_list(list))
-        }
-    }
-}
-
-fn format_function_argument_list(list: &sqlast::FunctionArgumentList) -> String {
-    let mut out = String::new();
-    if let Some(duplicate_treatment) = list.duplicate_treatment {
-        out.push_str(&duplicate_treatment.to_string());
-        out.push(' ');
-    }
-    out.push_str(
-        &list
-            .args
-            .iter()
-            .map(format_function_arg_display_name)
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
-    let visible_clauses = list
-        .clauses
-        .iter()
-        .map(|clause| format_function_clause_display_name(clause, &list.args))
-        .filter(|clause| !clause.is_empty())
-        .collect::<Vec<_>>();
-    if !visible_clauses.is_empty() {
-        if !list.args.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(&visible_clauses.join(" "));
-    }
-    out
-}
-
-fn format_group_concat_argument_list(list: &sqlast::FunctionArgumentList) -> String {
-    let mut out = String::new();
-    let (value_args, separator_arg) = list
-        .args
-        .split_last()
-        .map(|(separator, values)| (values, Some(separator)))
-        .unwrap_or((&[][..], None));
-
-    if let Some(duplicate_treatment) = list.duplicate_treatment {
-        out.push_str(&duplicate_treatment.to_string());
-        out.push(' ');
-    }
-    out.push_str(
-        &value_args
-            .iter()
-            .map(format_function_arg_display_name)
-            .collect::<Vec<_>>()
-            .join(","),
-    );
-
-    let visible_clauses = list
-        .clauses
-        .iter()
-        .map(|clause| format_function_clause_display_name(clause, value_args))
-        .filter(|clause| !clause.is_empty())
-        .collect::<Vec<_>>();
-    if !visible_clauses.is_empty() {
-        if !value_args.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(&visible_clauses.join(" "));
-    }
-
-    let separator = separator_arg
-        .map(format_function_arg_display_name)
-        .unwrap_or_else(|| "','".to_string());
-    if !out.is_empty() {
-        out.push(' ');
-    }
-    out.push_str("SEPARATOR ");
-    out.push_str(&separator);
-    out
-}
-
-fn format_function_arg_display_name(arg: &sqlast::FunctionArg) -> String {
-    match arg {
-        sqlast::FunctionArg::Named {
-            name,
-            arg,
-            operator,
-        } => format!(
-            "{name} {operator} {}",
-            format_function_arg_expr_display_name(arg)
-        ),
-        sqlast::FunctionArg::ExprNamed {
-            name,
-            arg,
-            operator,
-        } => format!(
-            "{} {operator} {}",
-            expr_display_name(name),
-            format_function_arg_expr_display_name(arg)
-        ),
-        sqlast::FunctionArg::Unnamed(arg) => format_function_arg_expr_display_name(arg),
-    }
-}
-
-fn format_function_arg_expr_display_name(arg: &sqlast::FunctionArgExpr) -> String {
-    match arg {
-        // StarRocks-compatible behavior: a `t.col` reference appearing as a
-        // function argument keeps its qualifier in the displayed header
-        // (`count(t.col)` rather than `count(col)`). Top-level SELECT items
-        // still drop the qualifier — see `expr_display_name` for that path.
-        sqlast::FunctionArgExpr::Expr(expr) => expr_display_name_preserve_path(expr),
-        sqlast::FunctionArgExpr::QualifiedWildcard(prefix) => format!("{prefix}.*"),
-        sqlast::FunctionArgExpr::Wildcard => "*".to_string(),
-    }
-}
-
-fn format_function_clause_display_name(
-    clause: &sqlast::FunctionArgumentClause,
-    args: &[sqlast::FunctionArg],
-) -> String {
-    match clause {
-        sqlast::FunctionArgumentClause::OrderBy(order_by) => {
-            let visible = order_by
-                .iter()
-                .filter(|item| !is_constant_function_order_by_expr(item, args))
-                .map(|item| format_function_order_by_expr_display_name(item, args))
-                .collect::<Vec<_>>();
-            if visible.is_empty() {
-                String::new()
-            } else {
-                format!("ORDER BY {}", visible.join(", "))
-            }
-        }
-        sqlast::FunctionArgumentClause::Limit(limit) => {
-            format!("LIMIT {}", expr_display_name(limit))
-        }
-        // Match StarRocks display convention: lowercase keywords.
-        sqlast::FunctionArgumentClause::IgnoreOrRespectNulls(t) => match t {
-            sqlast::NullTreatment::IgnoreNulls => "ignore nulls".to_string(),
-            sqlast::NullTreatment::RespectNulls => "respect nulls".to_string(),
-        },
-        _ => clause.to_string(),
-    }
-}
-
-fn is_constant_function_order_by_expr(
-    order_by: &sqlast::OrderByExpr,
-    args: &[sqlast::FunctionArg],
-) -> bool {
-    match &order_by.expr {
-        sqlast::Expr::Value(sqlast::ValueWithSpan {
-            value: sqlast::Value::Number(n, false),
-            ..
-        }) => n
-            .parse::<usize>()
-            .ok()
-            .and_then(|pos| args.get(pos.saturating_sub(1)))
-            .map(function_arg_is_constant)
-            .unwrap_or(true),
-        sqlast::Expr::Value(_) => true,
-        _ => false,
-    }
-}
-
-fn function_arg_is_constant(arg: &sqlast::FunctionArg) -> bool {
-    match arg {
-        sqlast::FunctionArg::Named { arg, .. }
-        | sqlast::FunctionArg::ExprNamed { arg, .. }
-        | sqlast::FunctionArg::Unnamed(arg) => match arg {
-            sqlast::FunctionArgExpr::Expr(sqlast::Expr::Value(_)) => true,
-            sqlast::FunctionArgExpr::Expr(_) => false,
-            sqlast::FunctionArgExpr::QualifiedWildcard(_) | sqlast::FunctionArgExpr::Wildcard => {
-                false
-            }
-        },
-    }
-}
-
-fn format_order_by_expr_display_name(order_by: &sqlast::OrderByExpr) -> String {
-    let mut out = expr_display_name(&order_by.expr);
-    let asc = order_by.options.asc.unwrap_or(true);
-    out.push(' ');
-    out.push_str(if asc { "ASC" } else { "DESC" });
-    if let Some(nulls_first) = order_by.options.nulls_first
-        && nulls_first != asc
-    {
-        out.push_str(if nulls_first {
-            " NULLS FIRST"
-        } else {
-            " NULLS LAST"
-        });
-    }
-    if let Some(with_fill) = &order_by.with_fill {
-        out.push(' ');
-        out.push_str(&with_fill.to_string());
-    }
-    out
-}
-
-fn format_function_order_by_expr_display_name(
-    order_by: &sqlast::OrderByExpr,
-    args: &[sqlast::FunctionArg],
-) -> String {
-    let expr = match &order_by.expr {
-        sqlast::Expr::Value(sqlast::ValueWithSpan {
-            value: sqlast::Value::Number(n, false),
-            ..
-        }) => n
-            .parse::<usize>()
-            .ok()
-            .and_then(|pos| args.get(pos.saturating_sub(1)))
-            .map(format_function_arg_display_name)
-            .unwrap_or_else(|| expr_display_name(&order_by.expr)),
-        _ => expr_display_name(&order_by.expr),
+fn lowercase_leading_keyword(display: &str) -> String {
+    let Some(paren) = display.find('(') else {
+        return display.to_string();
     };
-
-    let mut out = expr;
-    let asc = order_by.options.asc.unwrap_or(true);
-    out.push(' ');
-    out.push_str(if asc { "ASC" } else { "DESC" });
-    if let Some(nulls_first) = order_by.options.nulls_first
-        && nulls_first != asc
+    let prefix = &display[..paren];
+    if !prefix.is_empty()
+        && prefix
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
     {
-        out.push_str(if nulls_first {
-            " NULLS FIRST"
-        } else {
-            " NULLS LAST"
-        });
-    }
-    if let Some(with_fill) = &order_by.with_fill {
-        out.push(' ');
-        out.push_str(&with_fill.to_string());
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// JOIN operator parsing
-// ---------------------------------------------------------------------------
-
-pub(super) fn parse_join_operator(
-    op: &sqlast::JoinOperator,
-) -> Result<(JoinKind, Option<&sqlast::JoinConstraint>), String> {
-    match op {
-        sqlast::JoinOperator::Join(c) | sqlast::JoinOperator::Inner(c) => {
-            Ok((JoinKind::Inner, Some(c)))
-        }
-        sqlast::JoinOperator::Left(c) | sqlast::JoinOperator::LeftOuter(c) => {
-            Ok((JoinKind::LeftOuter, Some(c)))
-        }
-        sqlast::JoinOperator::Right(c) | sqlast::JoinOperator::RightOuter(c) => {
-            Ok((JoinKind::RightOuter, Some(c)))
-        }
-        sqlast::JoinOperator::FullOuter(c) => Ok((JoinKind::FullOuter, Some(c))),
-        sqlast::JoinOperator::CrossJoin(_) => Ok((JoinKind::Cross, None)),
-        sqlast::JoinOperator::LeftSemi(c) => Ok((JoinKind::LeftSemi, Some(c))),
-        sqlast::JoinOperator::RightSemi(c) => Ok((JoinKind::RightSemi, Some(c))),
-        sqlast::JoinOperator::LeftAnti(c) => Ok((JoinKind::LeftAnti, Some(c))),
-        sqlast::JoinOperator::RightAnti(c) => Ok((JoinKind::RightAnti, Some(c))),
-        other => Err(format!("unsupported join type: {other:?}")),
+        format!("{}{}", prefix.to_ascii_lowercase(), &display[paren..])
+    } else {
+        display.to_string()
     }
 }
 
@@ -1771,131 +887,103 @@ pub(super) fn parse_join_operator(
 // LIMIT / OFFSET extraction
 // ---------------------------------------------------------------------------
 
-pub(super) fn extract_limit(query: &sqlast::Query) -> Result<Option<i64>, String> {
-    match &query.limit_clause {
-        Some(sqlast::LimitClause::LimitOffset {
-            limit:
-                Some(sqlast::Expr::Value(sqlast::ValueWithSpan {
-                    value: sqlast::Value::Number(n, _),
-                    ..
-                })),
-            ..
-        }) => n
-            .parse::<i64>()
-            .map(Some)
-            .map_err(|e| format!("invalid LIMIT value: {e}")),
-        Some(sqlast::LimitClause::LimitOffset { limit: None, .. }) => Ok(None),
-        Some(sqlast::LimitClause::LimitOffset { .. }) => {
-            Err("only constant LIMIT is supported".into())
-        }
-        Some(sqlast::LimitClause::OffsetCommaLimit {
-            limit:
-                sqlast::Expr::Value(sqlast::ValueWithSpan {
-                    value: sqlast::Value::Number(n, _),
-                    ..
-                }),
-            ..
-        }) => n
-            .parse::<i64>()
-            .map(Some)
-            .map_err(|e| format!("invalid LIMIT value: {e}")),
-        Some(sqlast::LimitClause::OffsetCommaLimit { .. }) => {
-            Err("only constant LIMIT is supported".into())
-        }
+pub(super) fn extract_limit(query: &ast::Query) -> Result<Option<i64>, String> {
+    match &query.limit {
+        Some(limit) => eval_limit_or_offset(limit, "LIMIT").map(Some),
         None => Ok(None),
     }
 }
 
-pub(super) fn extract_offset(query: &sqlast::Query) -> Result<Option<i64>, String> {
-    match &query.limit_clause {
-        Some(sqlast::LimitClause::LimitOffset {
-            offset:
-                Some(sqlast::Offset {
-                    value:
-                        sqlast::Expr::Value(sqlast::ValueWithSpan {
-                            value: sqlast::Value::Number(n, _),
-                            ..
-                        }),
-                    ..
-                }),
-            ..
-        }) => n
-            .parse::<i64>()
-            .map(Some)
-            .map_err(|e| format!("invalid OFFSET value: {e}")),
-        Some(sqlast::LimitClause::LimitOffset { offset: None, .. }) => Ok(None),
-        Some(sqlast::LimitClause::LimitOffset { .. }) => {
-            Err("only constant OFFSET is supported".into())
-        }
-        Some(sqlast::LimitClause::OffsetCommaLimit {
-            offset:
-                sqlast::Expr::Value(sqlast::ValueWithSpan {
-                    value: sqlast::Value::Number(n, _),
-                    ..
-                }),
-            ..
-        }) => n
-            .parse::<i64>()
-            .map(Some)
-            .map_err(|e| format!("invalid OFFSET value: {e}")),
-        Some(sqlast::LimitClause::OffsetCommaLimit { .. }) => {
-            Err("only constant OFFSET is supported".into())
-        }
+pub(super) fn extract_offset(query: &ast::Query) -> Result<Option<i64>, String> {
+    match &query.offset {
+        Some(offset) => eval_limit_or_offset(&offset.value, "OFFSET").map(Some),
         None => Ok(None),
+    }
+}
+
+fn eval_limit_or_offset(expr: &ast::Expr, keyword: &str) -> Result<i64, String> {
+    match expr {
+        ast::Expr::Literal(ast::Literal {
+            kind: ast::LiteralKind::Number(value),
+            ..
+        }) => value
+            .parse::<i64>()
+            .map_err(|error| format!("invalid {keyword} value: {error}")),
+        _ => Err(format!("only constant {keyword} is supported")),
     }
 }
 
 /// Evaluate a constant integer expression (literals and simple arithmetic).
-pub(super) fn eval_const_i64(expr: &sqlast::Expr) -> Result<i64, String> {
+pub(super) fn eval_const_i64(expr: &ast::Expr) -> Result<i64, String> {
     match expr {
-        sqlast::Expr::Value(v) => match &v.value {
-            sqlast::Value::Number(n, _) => n
-                .parse::<i64>()
-                .map_err(|e| format!("cannot parse integer literal `{n}`: {e}")),
-            _ => Err(format!("expected integer literal, got: {v}")),
-        },
-        sqlast::Expr::UnaryOp {
-            op: sqlast::UnaryOperator::Minus,
-            expr: inner,
-        } => Ok(-eval_const_i64(inner)?),
-        sqlast::Expr::BinaryOp { left, op, right } => {
-            let l = eval_const_i64(left)?;
-            let r = eval_const_i64(right)?;
-            match op {
-                sqlast::BinaryOperator::Plus => Ok(l + r),
-                sqlast::BinaryOperator::Minus => Ok(l - r),
-                sqlast::BinaryOperator::Multiply => Ok(l * r),
-                sqlast::BinaryOperator::Divide if r != 0 => Ok(l / r),
-                sqlast::BinaryOperator::Modulo if r != 0 => Ok(l % r),
-                _ => Err(format!("unsupported operator in constant expression: {op}")),
+        ast::Expr::Literal(ast::Literal {
+            kind: ast::LiteralKind::Number(value),
+            ..
+        }) => value
+            .parse::<i64>()
+            .map_err(|error| format!("cannot parse integer literal '{value}': {error}")),
+        ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Minus => {
+            Ok(-eval_const_i64(&unary.expression)?)
+        }
+        ast::Expr::Binary(binary) => {
+            let left = eval_const_i64(&binary.left)?;
+            let right = eval_const_i64(&binary.right)?;
+            match binary.operator {
+                ast::BinaryOperator::Add => Ok(left + right),
+                ast::BinaryOperator::Subtract => Ok(left - right),
+                ast::BinaryOperator::Multiply => Ok(left * right),
+                ast::BinaryOperator::Divide if right != 0 => Ok(left / right),
+                ast::BinaryOperator::Modulo if right != 0 => Ok(left % right),
+                _ => Err(format!(
+                    "unsupported operator in constant expression: {}",
+                    binary_operator_display(binary.operator)
+                )),
             }
         }
-        sqlast::Expr::Nested(inner) => eval_const_i64(inner),
-        _ => Err(format!("expected constant integer expression, got: {expr}")),
+        ast::Expr::Nested(nested) => eval_const_i64(&nested.expression),
+        _ => Err(format!(
+            "expected constant integer expression, got: {}",
+            printer::print_expr(expr)
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::{DataType, TimeUnit};
-    use sqlparser::ast as sqlast;
 
-    use super::{expr_display_name, parse_custom_type_string, sql_type_to_arrow};
-    use crate::parser::dialect::StarRocksDialect;
+    use super::{expr_display_name, sql_type_to_arrow};
 
-    fn parse_select_expr(sql: &str) -> sqlast::Expr {
-        let statements =
-            sqlparser::parser::Parser::parse_sql(&StarRocksDialect, sql).expect("parse sql");
-        let sqlast::Statement::Query(query) = &statements[0] else {
+    fn parse_select_expr(sql: &str) -> novarocks_parser::ast::Expr {
+        let statements = novarocks_parser::parse(sql).expect("parse SQL");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
             panic!("expected query");
         };
-        let sqlast::SetExpr::Select(select) = query.body.as_ref() else {
+        let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("expected select body");
         };
-        let sqlast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+        let [novarocks_parser::ast::SelectItem::UnnamedExpr(expr)] = select.projection.as_slice()
+        else {
             panic!("expected unnamed expr");
         };
         expr.clone()
+    }
+
+    fn parse_native_cast_type(sql: &str) -> novarocks_parser::ast::TypeName {
+        let statements = novarocks_parser::parse(sql).expect("parse native SQL");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected native query");
+        };
+        let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected native select body");
+        };
+        let [
+            novarocks_parser::ast::SelectItem::UnnamedExpr(novarocks_parser::ast::Expr::Cast(cast)),
+        ] = select.projection.as_slice()
+        else {
+            panic!("expected native cast expression");
+        };
+        cast.data_type.clone()
     }
 
     #[test]
@@ -1921,10 +1009,7 @@ mod tests {
 
     #[test]
     fn sql_type_to_arrow_accepts_datetime_ns_alias() {
-        let expr = parse_select_expr("SELECT CAST(NULL AS DATETIME_NS)");
-        let sqlast::Expr::Cast { data_type, .. } = expr else {
-            panic!("expected cast expression");
-        };
+        let data_type = parse_native_cast_type("SELECT CAST(NULL AS DATETIME_NS)");
 
         assert_eq!(
             sql_type_to_arrow(&data_type).expect("type"),
@@ -1934,29 +1019,10 @@ mod tests {
 
     #[test]
     fn sql_type_to_arrow_accepts_variant_alias() {
-        let expr = parse_select_expr("SELECT CAST(NULL AS VARIANT)");
-        let sqlast::Expr::Cast { data_type, .. } = expr else {
-            panic!("expected cast expression");
-        };
+        let data_type = parse_native_cast_type("SELECT CAST(NULL AS VARIANT)");
 
         assert_eq!(
             sql_type_to_arrow(&data_type).expect("type"),
-            DataType::LargeBinary
-        );
-    }
-
-    #[test]
-    fn parse_custom_type_string_accepts_varbinary_aliases() {
-        assert_eq!(
-            parse_custom_type_string("VARBINARY").expect("varbinary"),
-            DataType::Binary
-        );
-        assert_eq!(
-            parse_custom_type_string("BINARY").expect("binary"),
-            DataType::Binary
-        );
-        assert_eq!(
-            parse_custom_type_string("VARIANT").expect("variant"),
             DataType::LargeBinary
         );
     }

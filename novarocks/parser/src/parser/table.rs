@@ -3,7 +3,7 @@
 
 //! Table DDL grammar owned by SQLP-5.
 
-use super::StatementParser;
+use super::{StatementParser, query};
 use crate::{
     ParseError, Span,
     ast::{
@@ -83,7 +83,7 @@ pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<State
     loop {
         if parser.current_is_word("AS") {
             parser.consume_word("AS")?;
-            let query = parser.parse_raw_query_slice()?;
+            let query = query::parse_query(parser)?;
             let table = TableStatement::Create(CreateTable {
                 temporary,
                 external,
@@ -674,7 +674,7 @@ mod tests {
         else {
             panic!("ctas")
         };
-        assert_eq!(ctas.query.text, "SELECT 1 AS id");
+        assert_eq!(crate::printer::print_query(&ctas.query), "SELECT 1 AS id");
     }
 
     #[test]

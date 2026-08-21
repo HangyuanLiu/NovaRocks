@@ -23,6 +23,7 @@
 
 use crate::runtime::query_result::QueryResult;
 use arrow::datatypes::DataType;
+use novarocks_parser::ast::Query;
 
 pub struct StatisticsRequestContext<'a> {
     pub current_catalog: Option<&'a str>,
@@ -59,7 +60,7 @@ pub enum StatisticsLiteral {
 pub enum StatisticsInsertSource {
     Values(Vec<Vec<StatisticsLiteral>>),
     SelectLiteralRow(Vec<StatisticsLiteral>),
-    FromQuery(Box<sqlparser::ast::Query>),
+    FromQuery(Box<Query>),
 }
 
 pub struct StatisticsInsertObservation<'a> {

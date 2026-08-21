@@ -97,16 +97,14 @@ impl Printer {
             Statement::Dml(statement) => crate::ast::dml::write_sql(statement, &mut self.output),
             Statement::Query(query) => self.write_query(query),
             Statement::ExplainQuery(explain) => self.write_explain_query(explain),
-            Statement::RawQuery(query) => self.write_raw_query(query),
         }
-    }
-
-    fn write_raw_query(&mut self, query: &RawQuerySlice) {
-        self.output.push_str(&query.text);
     }
 
     fn write_explain_query(&mut self, explain: &ExplainQuery) {
         self.output.push_str("EXPLAIN");
+        if explain.logical {
+            self.output.push_str(" LOGICAL");
+        }
         match explain.format {
             ExplainFormat::Default => {}
             ExplainFormat::Analyze => self.output.push_str(" ANALYZE"),
@@ -881,8 +879,11 @@ impl Printer {
             LiteralKind::Boolean(value) => {
                 self.output.push_str(if *value { "TRUE" } else { "FALSE" })
             }
-            LiteralKind::Number(value) | LiteralKind::HexString(value) => {
-                self.output.push_str(value)
+            LiteralKind::Number(value) => self.output.push_str(value),
+            LiteralKind::HexString(value) => {
+                self.output.push_str("X'");
+                self.output.push_str(value);
+                self.output.push('\'');
             }
             LiteralKind::String(value) => self.write_quoted_string(value),
         }
@@ -1244,6 +1245,11 @@ impl Printer {
         self.output.push(')');
     }
     fn write_array_expr(&mut self, expression: &ArrayExpr) {
+        if let Some(element_type) = &expression.element_type {
+            self.output.push_str("ARRAY<");
+            self.write_type_name(element_type);
+            self.output.push('>');
+        }
         self.output.push('[');
         self.write_expr_list(&expression.elements);
         self.output.push(']');
@@ -1347,6 +1353,13 @@ pub fn print_statements(statements: &[Statement]) -> String {
 /// Renders one expression into canonical SQL.
 pub fn print_expr(expression: &Expr) -> String {
     Printer::new().expression(expression)
+}
+
+/// Renders one typed query without wrapping it in a top-level statement.
+pub fn print_query(query: &Query) -> String {
+    let mut printer = Printer::new();
+    printer.write_query(query);
+    printer.output
 }
 /// Renders an object name into canonical SQL.
 pub fn print_object_name(name: &ObjectName) -> String {
@@ -1619,6 +1632,7 @@ mod tests {
         assert_eq!(
             print_statement(&Statement::ExplainQuery(ExplainQuery {
                 format: ExplainFormat::Verbose,
+                logical: false,
                 query: Box::new(query),
                 span: span(),
             })),

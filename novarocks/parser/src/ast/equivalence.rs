@@ -96,7 +96,9 @@ impl SyntaxEq for StructField {
 
 impl SyntaxEq for ExplainQuery {
     fn syntax_eq(&self, other: &Self) -> bool {
-        self.format == other.format && self.query.syntax_eq(&other.query)
+        self.format == other.format
+            && self.logical == other.logical
+            && self.query.syntax_eq(&other.query)
     }
 }
 
@@ -690,7 +692,11 @@ impl SyntaxEq for TupleExpr {
 
 impl SyntaxEq for ArrayExpr {
     fn syntax_eq(&self, other: &Self) -> bool {
-        syntax_eq_slice(&self.elements, &other.elements)
+        match (&self.element_type, &other.element_type) {
+            (Some(left), Some(right)) if !left.syntax_eq(right) => false,
+            (None, None) | (Some(_), Some(_)) => syntax_eq_slice(&self.elements, &other.elements),
+            _ => false,
+        }
     }
 }
 

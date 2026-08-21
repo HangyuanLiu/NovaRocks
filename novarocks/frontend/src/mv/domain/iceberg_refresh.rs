@@ -110,6 +110,7 @@ use crate::mv::domain::storage_observation::MvTargetCreationObservation;
 use crate::runtime::statement_result::StatementResult;
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
+use novarocks_parser::{Span, ast};
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorInstanceId};
 use novarocks_sql::planning::mv::FULL_REFRESH_DISABLED_MESSAGE;
@@ -241,7 +242,7 @@ pub(crate) struct StandaloneMvEngine {
 
 struct IcebergMvCreatePreparation {
     target: IcebergMvTarget,
-    canonical_select_query: sqlparser::ast::Query,
+    canonical_select_query: ast::Query,
     analysis: MvAnalysis,
     refresh_contract: ImvRefreshContract,
     property: RefreshFragmentProperty,
@@ -1524,7 +1525,7 @@ pub(crate) fn union_branch_inner_apply_key(
 /// aggregate sub-query.
 fn create_target_columns_from_property(
     property: &RefreshFragmentProperty,
-    canonical_query: &sqlparser::ast::Query,
+    canonical_query: &ast::Query,
     analysis: &MvAnalysis,
 ) -> Result<Vec<TableColumnDef>, String> {
     match representative_aggregate_layout(property, canonical_query, analysis)? {
@@ -1541,7 +1542,7 @@ fn create_target_columns_from_property(
 /// non-aggregate identities), driven by the synthesized identity.
 fn aggregate_state_hidden_columns_from_property(
     property: &RefreshFragmentProperty,
-    canonical_query: &sqlparser::ast::Query,
+    canonical_query: &ast::Query,
     analysis: &MvAnalysis,
 ) -> Result<Vec<String>, String> {
     let Some(layout) = representative_aggregate_layout(property, canonical_query, analysis)? else {
@@ -1567,7 +1568,7 @@ fn aggregate_state_hidden_columns_from_property(
 /// extractor yields the right aggregate-call surface in every case.
 fn representative_aggregate_layout(
     property: &RefreshFragmentProperty,
-    canonical_query: &sqlparser::ast::Query,
+    canonical_query: &ast::Query,
     analysis: &MvAnalysis,
 ) -> Result<
     Option<novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout>,
@@ -1599,15 +1600,11 @@ fn representative_aggregate_layout(
 }
 
 /// Extract the first UNION ALL branch as a standalone AST query.
-fn first_union_branch_ast_query(
-    query: &sqlparser::ast::Query,
-) -> Result<sqlparser::ast::Query, String> {
-    fn first_branch_body(
-        body: &sqlparser::ast::SetExpr,
-    ) -> Result<&sqlparser::ast::SetExpr, String> {
+fn first_union_branch_ast_query(query: &ast::Query) -> Result<ast::Query, String> {
+    fn first_branch_body(body: &ast::SetExpr) -> Result<&ast::SetExpr, String> {
         match body {
-            sqlparser::ast::SetExpr::SetOperation { left, .. } => first_branch_body(left),
-            sqlparser::ast::SetExpr::Query(inner) => first_branch_body(inner.body.as_ref()),
+            ast::SetExpr::SetOperation(operation) => first_branch_body(&operation.left),
+            ast::SetExpr::Query(inner) => first_branch_body(inner.body.as_ref()),
             other => Ok(other),
         }
     }
@@ -1905,7 +1902,7 @@ fn iceberg_aggregate_target_columns_from_layout(
 fn build_iceberg_mv_schema_contract(
     refresh_contract: &ImvRefreshContract,
     property: &RefreshFragmentProperty,
-    canonical_query: &sqlparser::ast::Query,
+    canonical_query: &ast::Query,
     analysis: &crate::mv::domain::analysis::MvAnalysis,
     base_refs: &[TableIdentity],
     base_field_observations: &std::collections::BTreeMap<
@@ -1976,7 +1973,7 @@ struct NonBranchContractCore {
 /// opaque analyzed SQL input. Used for top-level non-branch MVs.
 fn build_non_branch_schema_contract(
     identity: &TargetIdentity,
-    query: &sqlparser::ast::Query,
+    query: &ast::Query,
     analysis: &crate::mv::domain::analysis::MvAnalysis,
     base_refs: &[TableIdentity],
     base_field_observations: &std::collections::BTreeMap<
@@ -2022,7 +2019,7 @@ fn build_non_branch_schema_contract(
 /// reproduced verbatim but keyed on the identity.
 fn build_non_branch_contract_core(
     identity: &TargetIdentity,
-    query: &sqlparser::ast::Query,
+    query: &ast::Query,
     analysis: &crate::mv::domain::analysis::MvAnalysis,
     base_refs: &[TableIdentity],
     base_field_observations: &std::collections::BTreeMap<
@@ -2110,8 +2107,8 @@ fn build_non_branch_contract_core(
 /// fan-in aggregate from a single-scan aggregate. A fan-in FROM is exactly one
 /// relation, no joins, a non-lateral derived subquery whose body is a `UNION ALL`
 /// set operation.
-fn from_clause_is_fan_in_union(query: &sqlparser::ast::Query) -> bool {
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+fn from_clause_is_fan_in_union(query: &ast::Query) -> bool {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
     let [from] = select.from.as_slice() else {
@@ -2120,7 +2117,7 @@ fn from_clause_is_fan_in_union(query: &sqlparser::ast::Query) -> bool {
     if !from.joins.is_empty() {
         return false;
     }
-    let sqlparser::ast::TableFactor::Derived {
+    let ast::TableFactor::Derived {
         lateral, subquery, ..
     } = &from.relation
     else {
@@ -2129,14 +2126,11 @@ fn from_clause_is_fan_in_union(query: &sqlparser::ast::Query) -> bool {
     if *lateral {
         return false;
     }
-    matches!(
-        subquery.body.as_ref(),
-        sqlparser::ast::SetExpr::SetOperation { .. }
-    )
+    matches!(subquery.body.as_ref(), ast::SetExpr::SetOperation(_))
 }
 
-fn from_clause_is_direct_inner_on_join(query: &sqlparser::ast::Query) -> bool {
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+fn from_clause_is_direct_inner_on_join(query: &ast::Query) -> bool {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
     let [from] = select.from.as_slice() else {
@@ -2146,14 +2140,13 @@ fn from_clause_is_direct_inner_on_join(query: &sqlparser::ast::Query) -> bool {
         return false;
     };
     matches!(
-        join.join_operator,
-        sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(_))
-            | sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(_))
-    )
+        join.operator,
+        ast::JoinOperator::Inner | ast::JoinOperator::InnerExplicit
+    ) && matches!(join.constraint, ast::JoinConstraint::On(_))
 }
 
-fn validate_composed_aggregate_fallback_query(query: &sqlparser::ast::Query) -> Result<(), String> {
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+fn validate_composed_aggregate_fallback_query(query: &ast::Query) -> Result<(), String> {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return Err("composed aggregate fallback requires a plain SELECT body".to_string());
     };
     if select.from.len() != 1 {
@@ -2170,18 +2163,16 @@ fn validate_composed_aggregate_fallback_query(query: &sqlparser::ast::Query) -> 
     }
     validate_composed_aggregate_table_factor(&from.relation)?;
     for join in &from.joins {
-        validate_composed_aggregate_join_operator(&join.join_operator)?;
+        validate_composed_aggregate_join(&join.operator, &join.constraint)?;
         validate_composed_aggregate_table_factor(&join.relation)?;
     }
     Ok(())
 }
 
-fn validate_composed_aggregate_table_factor(
-    factor: &sqlparser::ast::TableFactor,
-) -> Result<(), String> {
+fn validate_composed_aggregate_table_factor(factor: &ast::TableFactor) -> Result<(), String> {
     match factor {
-        sqlparser::ast::TableFactor::Table { .. } => Ok(()),
-        sqlparser::ast::TableFactor::NestedJoin { table_with_joins, .. } => {
+        ast::TableFactor::Table { .. } => Ok(()),
+        ast::TableFactor::NestedJoin { table_with_joins, .. } => {
             validate_composed_aggregate_table_factor(&table_with_joins.relation)?;
             if table_with_joins.joins.is_empty() {
                 return Err(
@@ -2190,7 +2181,7 @@ fn validate_composed_aggregate_table_factor(
                 );
             }
             for join in &table_with_joins.joins {
-                validate_composed_aggregate_join_operator(&join.join_operator)?;
+                validate_composed_aggregate_join(&join.operator, &join.constraint)?;
                 validate_composed_aggregate_table_factor(&join.relation)?;
             }
             Ok(())
@@ -2202,16 +2193,13 @@ fn validate_composed_aggregate_table_factor(
     }
 }
 
-fn validate_composed_aggregate_join_operator(
-    operator: &sqlparser::ast::JoinOperator,
+fn validate_composed_aggregate_join(
+    operator: &ast::JoinOperator,
+    constraint: &ast::JoinConstraint,
 ) -> Result<(), String> {
-    use sqlparser::ast::{JoinConstraint, JoinOperator};
-
-    match operator {
-        JoinOperator::Join(JoinConstraint::On(_)) | JoinOperator::Inner(JoinConstraint::On(_)) => {
-            Ok(())
-        }
-        JoinOperator::CrossJoin(JoinConstraint::None) => Ok(()),
+    match (operator, constraint) {
+        (ast::JoinOperator::Inner | ast::JoinOperator::InnerExplicit, ast::JoinConstraint::On(_)) => Ok(()),
+        (ast::JoinOperator::Cross, ast::JoinConstraint::None) => Ok(()),
         _ => Err(
             "composed aggregate fallback supports only direct INNER JOIN ... ON predicates or CROSS JOIN"
                 .to_string(),
@@ -2239,7 +2227,7 @@ fn mixed_output_contract(output_columns: &[SqlMvOutputColumnFacts]) -> mv_schema
 /// aggregate sits over a single scan, a join, or a fan-in union. Reproduces the
 /// legacy SingleAggregate / JoinAggregate / FanInAggregate arms.
 fn build_aggregate_contract_core(
-    query: &sqlparser::ast::Query,
+    query: &ast::Query,
     analysis: &crate::mv::domain::analysis::MvAnalysis,
     aggregate_layout_scope: SqlMvAggregateLayoutScope,
     base_refs: &[TableIdentity],
@@ -2465,7 +2453,7 @@ fn build_join_base_contracts_and_lineage(
 /// recursing through the non-branch dispatch over the first branch's own query.
 fn build_branch_union_schema_contract(
     inner: &TargetIdentity,
-    canonical_query: &sqlparser::ast::Query,
+    canonical_query: &ast::Query,
     analysis: &crate::mv::domain::analysis::MvAnalysis,
     base_refs: &[TableIdentity],
     base_field_observations: &std::collections::BTreeMap<
@@ -2614,11 +2602,13 @@ fn build_branch_union_schema_contract(
 
 /// Number of UNION ALL branches in `query`, counted off the AST so the build
 /// does not depend on a top-level classified shape.
-fn union_branch_count(query: &sqlparser::ast::Query) -> u32 {
-    fn count(body: &sqlparser::ast::SetExpr) -> u32 {
+fn union_branch_count(query: &ast::Query) -> u32 {
+    fn count(body: &ast::SetExpr) -> u32 {
         match body {
-            sqlparser::ast::SetExpr::SetOperation { left, right, .. } => count(left) + count(right),
-            sqlparser::ast::SetExpr::Query(inner) => count(inner.body.as_ref()),
+            ast::SetExpr::SetOperation(operation) => {
+                count(&operation.left) + count(&operation.right)
+            }
+            ast::SetExpr::Query(inner) => count(inner.body.as_ref()),
             _ => 1,
         }
     }
@@ -2632,7 +2622,7 @@ fn union_branch_count(query: &sqlparser::ast::Query) -> u32 {
 ///   * a two-table inner equi-join FROM    -> [left_table, right_table]
 ///   * a fan-in UNION ALL subquery in FROM -> one FQN per union branch
 ///   * a single scan                       -> [the single FROM table]
-fn branch_base_table_fqns(branch_query: &sqlparser::ast::Query) -> Result<Vec<String>, String> {
+fn branch_base_table_fqns(branch_query: &ast::Query) -> Result<Vec<String>, String> {
     if let Ok(join_aliases) = extract_join_aliases(branch_query) {
         return Ok(vec![join_aliases.left_table, join_aliases.right_table]);
     }
@@ -2642,13 +2632,13 @@ fn branch_base_table_fqns(branch_query: &sqlparser::ast::Query) -> Result<Vec<St
     // the fan-in FROM shape; the branch base tables come from flattening that
     // subquery's branches.
     if from_clause_is_fan_in_union(branch_query) {
-        let sqlparser::ast::SetExpr::Select(select) = branch_query.body.as_ref() else {
+        let ast::SetExpr::Select(select) = branch_query.body.as_ref() else {
             return Err("UNION ALL branch fan-in requires a SELECT body".to_string());
         };
         let [from] = select.from.as_slice() else {
             return Err("UNION ALL branch fan-in requires a single FROM relation".to_string());
         };
-        let sqlparser::ast::TableFactor::Derived { subquery, .. } = &from.relation else {
+        let ast::TableFactor::Derived { subquery, .. } = &from.relation else {
             return Err("UNION ALL branch fan-in requires a derived FROM subquery".to_string());
         };
         let mut branch_bodies = Vec::new();
@@ -2669,28 +2659,20 @@ fn branch_base_table_fqns(branch_query: &sqlparser::ast::Query) -> Result<Vec<St
 /// Flatten a (possibly nested) UNION ALL set-operation body into its leaf
 /// branch bodies without re-validating the UNION ALL operator (the fan-in shape
 /// is already confirmed by the caller).
-fn flatten_union_all_branches<'a>(
-    body: &'a sqlparser::ast::SetExpr,
-    out: &mut Vec<&'a sqlparser::ast::SetExpr>,
-) {
+fn flatten_union_all_branches<'a>(body: &'a ast::SetExpr, out: &mut Vec<&'a ast::SetExpr>) {
     match body {
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-            flatten_union_all_branches(left, out);
-            flatten_union_all_branches(right, out);
+        ast::SetExpr::SetOperation(operation) => {
+            flatten_union_all_branches(&operation.left, out);
+            flatten_union_all_branches(&operation.right, out);
         }
-        sqlparser::ast::SetExpr::Query(inner) => {
-            flatten_union_all_branches(inner.body.as_ref(), out)
-        }
+        ast::SetExpr::Query(inner) => flatten_union_all_branches(inner.body.as_ref(), out),
         other => out.push(other),
     }
 }
 
 /// Wrap a `SetExpr` branch body as a standalone `Query`, inheriting the outer
 /// query's non-body fields.
-fn wrap_set_expr_as_query(
-    outer: &sqlparser::ast::Query,
-    body: &sqlparser::ast::SetExpr,
-) -> sqlparser::ast::Query {
+fn wrap_set_expr_as_query(outer: &ast::Query, body: &ast::SetExpr) -> ast::Query {
     let mut query = outer.clone();
     query.body = Box::new(body.clone());
     query
@@ -2700,7 +2682,7 @@ fn wrap_set_expr_as_query(
 /// resolved order. Used to feed only a branch's own bases into the non-branch
 /// core builder.
 fn first_branch_base_refs(
-    branch_query: &sqlparser::ast::Query,
+    branch_query: &ast::Query,
     base_refs: &[TableIdentity],
 ) -> Result<Vec<TableIdentity>, String> {
     let branch_table_fqns = branch_base_table_fqns(branch_query)?
@@ -3218,13 +3200,12 @@ mod tests {
         dead_code,
         reason = "Retained for staged materialized-view integration and recovery wiring."
     )]
-    fn parse_select_query(sql: &str) -> sqlparser::ast::Query {
-        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse");
-        let sqlparser::ast::Statement::Query(q) = stmt else {
+    fn parse_select_query(sql: &str) -> ast::Query {
+        let statements = novarocks_parser::parse(sql).expect("parse");
+        let [ast::Statement::Query(q)] = statements.as_slice() else {
             panic!("expected SELECT");
         };
-        *q
+        q.clone()
     }
 
     #[test]
@@ -3775,18 +3756,18 @@ fn refresh_execution_definition_fingerprint(
     _current_catalog: Option<&str>,
     _current_database: &str,
 ) -> Result<String, String> {
-    let canonical_select_sql = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&mv_definition.query_definition.raw_query_source)?,
-        Some(
-            mv_definition
-                .query_definition
-                .resolution
-                .default_catalog
-                .as_str(),
-        ),
-        &mv_definition.query_definition.resolution.default_database,
-    )
-    .to_string();
+    let canonical_select_sql =
+        novarocks_parser::printer::print_query(&canonicalize_iceberg_mv_select_query(
+            &parse_mv_select_query(&mv_definition.query_definition.raw_query_source)?,
+            Some(
+                mv_definition
+                    .query_definition
+                    .resolution
+                    .default_catalog
+                    .as_str(),
+            ),
+            &mv_definition.query_definition.resolution.default_database,
+        ));
     let canonical_base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?
         .into_iter()
         .map(|base_ref| base_ref.fqn())
@@ -4485,7 +4466,7 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
     mv_definition: &StoredMvDefinition,
     base_refs: &[TableIdentity],
     caps: &RefreshCapabilities,
-    canonical_select_query: &sqlparser::ast::Query,
+    canonical_select_query: &ast::Query,
     schema_contract: &mv_schema::MvSchemaContract,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<RefreshPlan, RefreshError> {
@@ -4655,7 +4636,7 @@ fn plan_iceberg_aggregate_mv_refresh(
     mv_definition: &StoredMvDefinition,
     base_refs: &[TableIdentity],
     caps: &RefreshCapabilities,
-    canonical_select_query: &sqlparser::ast::Query,
+    canonical_select_query: &ast::Query,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<RefreshPlan, RefreshError> {
     let schema_contract =
@@ -5278,33 +5259,29 @@ pub fn join_base_refs_for_schema_contract<'a>(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn rewrite_snapshot_table_factor(
-    factor: &mut sqlparser::ast::TableFactor,
+    factor: &mut ast::TableFactor,
     base: &TableIdentity,
     snapshot_id: i64,
     default_alias: Option<&str>,
 ) -> Result<(), String> {
-    let sqlparser::ast::TableFactor::Table {
+    let ast::TableFactor::Table {
         name,
         version,
         alias,
-        args,
         ..
     } = factor
     else {
         return Err("join snapshot side must be a table".to_string());
     };
-    if args.is_some() {
-        return Err("join snapshot side must be a base table".to_string());
-    }
     if !object_name_matches_base(name, base)? {
         return Err(format!(
             "join snapshot rewrite expected base {}, got {}",
             base.fqn(),
-            name
+            novarocks_parser::printer::print_object_name(name)
         ));
     }
     if let Some(version) = version {
-        let rendered = version.to_string();
+        let rendered = novarocks_parser::printer::print_expr(&version.value);
         if !rendered.contains(&snapshot_id.to_string()) {
             return Err(format!(
                 "join snapshot side {} has conflicting version {rendered}",
@@ -5317,10 +5294,11 @@ fn rewrite_snapshot_table_factor(
     if alias.is_none()
         && let Some(default_alias) = default_alias
     {
-        *alias = Some(sqlparser::ast::TableAlias {
-            explicit: true,
-            name: sqlparser::ast::Ident::new(default_alias),
+        *alias = Some(ast::TableAlias {
+            name: generated_ident(default_alias),
             columns: Vec::new(),
+            explicit_as: true,
+            span: Span::new(0, 0),
         });
     }
     Ok(())
@@ -5330,10 +5308,7 @@ fn rewrite_snapshot_table_factor(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn object_name_matches_base(
-    name: &sqlparser::ast::ObjectName,
-    base: &TableIdentity,
-) -> Result<bool, String> {
+fn object_name_matches_base(name: &ast::ObjectName, base: &TableIdentity) -> Result<bool, String> {
     let parts = object_name_identifier_parts(name);
     Ok(match parts.as_slice() {
         [table] => table.eq_ignore_ascii_case(&base.table),
@@ -5354,14 +5329,8 @@ fn object_name_matches_base(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn object_name_identifier_parts(name: &sqlparser::ast::ObjectName) -> Vec<String> {
-    name.0
-        .iter()
-        .filter_map(|part| match part {
-            sqlparser::ast::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
-            _ => None,
-        })
-        .collect()
+fn object_name_identifier_parts(name: &ast::ObjectName) -> Vec<String> {
+    name.parts.iter().map(|ident| ident.value.clone()).collect()
 }
 
 #[allow(
@@ -5376,16 +5345,23 @@ fn synthetic_snapshot_table_name(base: &TableIdentity, snapshot_id: i64) -> Stri
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn synthetic_snapshot_object_name(
-    base: &TableIdentity,
-    snapshot_id: i64,
-) -> sqlparser::ast::ObjectName {
-    sqlparser::ast::ObjectName(vec![
-        sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(&base.namespace)),
-        sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(
-            synthetic_snapshot_table_name(base, snapshot_id),
-        )),
-    ])
+fn synthetic_snapshot_object_name(base: &TableIdentity, snapshot_id: i64) -> ast::ObjectName {
+    ast::ObjectName {
+        parts: vec![
+            generated_ident(&base.namespace),
+            generated_ident(&synthetic_snapshot_table_name(base, snapshot_id)),
+        ],
+        span: Span::new(0, 0),
+    }
+}
+
+fn generated_ident(value: &str) -> ast::Ident {
+    ast::Ident {
+        value: value.to_string(),
+        quoted: false,
+        quote_style: None,
+        span: Span::new(0, 0),
+    }
 }
 
 #[allow(
@@ -5687,7 +5663,7 @@ mod join_delta_append_only_fast_path_tests {
                 "right-uuid",
             )
             .expect("coalesce rewrite");
-        let rendered = coalesced.to_string();
+        let rendered = novarocks_parser::printer::print_query(&coalesced);
 
         assert!(rendered.contains("right__at_20"), "sql={rendered}");
         assert!(rendered.contains("left__at_11"), "sql={rendered}");
@@ -5710,13 +5686,12 @@ mod join_delta_append_only_fast_path_tests {
         }
     }
 
-    fn parse_query(sql: &str) -> sqlparser::ast::Query {
-        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize");
-        let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse");
-        let sqlparser::ast::Statement::Query(query) = stmt else {
+    fn parse_query(sql: &str) -> ast::Query {
+        let statements = novarocks_parser::parse(sql).expect("parse");
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
             panic!("expected query");
         };
-        *query
+        query.clone()
     }
 }
 
@@ -5725,10 +5700,10 @@ mod join_delta_append_only_fast_path_tests {
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn normalize_join_branch_snapshot_tables(
-    query: &mut sqlparser::ast::Query,
+    query: &mut ast::Query,
     branch: &crate::mv::domain::iceberg_join_branch::JoinDeltaBranchPlan,
 ) -> Result<(), String> {
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+    let ast::SetExpr::Select(select) = query.body.as_mut() else {
         return Err("join branch snapshot normalization requires SELECT body".to_string());
     };
     let [from] = select.from.as_mut_slice() else {
@@ -5765,7 +5740,18 @@ pub(crate) fn drop_iceberg_mv_with_ports(
 ) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
     let _refresh_guard = acquire_mv_refresh_lock()?;
-    let target = resolve_drop_target(current_catalog, current_database, &stmt.name)?;
+    let target = resolve_drop_target(
+        current_catalog,
+        current_database,
+        &ObjectName {
+            parts: stmt
+                .name
+                .parts
+                .iter()
+                .map(|part| part.value.clone())
+                .collect(),
+        },
+    )?;
     if !preflight_iceberg_mv_drop_with_repository(
         ports.repository.as_ref(),
         &target,

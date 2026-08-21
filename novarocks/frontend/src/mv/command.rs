@@ -24,23 +24,23 @@ use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::repository::MvRepository;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_parser::Span;
 use novarocks_parser::ast::{
     CallStatement, Literal, LiteralKind, MaterializedViewAlterAction as TypedAlterAction,
     MaterializedViewExplainLevel, MaterializedViewPartitionArgument,
     MaterializedViewPartitionField, MaterializedViewRefreshMode,
     MaterializedViewRefreshPolicy as TypedRefreshPolicy, MaterializedViewStatement,
+    ObjectName as TypedObjectName,
 };
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::syntax::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
     DropMaterializedViewStmt, IcebergPartitionFieldExpr,
     MaterializedViewDistribution as SyntaxMaterializedViewDistribution,
-    MaterializedViewRefreshPolicy, ObjectName, RefreshMaterializedViewStmt,
-    ShowMaterializedViewsStmt,
+    MaterializedViewRefreshPolicy, RefreshMaterializedViewStmt, ShowMaterializedViewsStmt,
 };
 
 use super::FrontendMvService;
-use crate::mv::domain::refresh::definition::parse_mv_select_query;
 use crate::mv::domain::refresh::resolve_refresh_mv_target;
 use crate::mv::domain::{
     alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports,
@@ -205,13 +205,14 @@ impl MvCommandExecutor {
             name: statement.name.clone(),
             full: false,
         };
+        let repartition_fields = lower_typed_partition_fields(fields)?;
         let preparation =
             crate::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_repartition_with_ports(
                 &self.ports,
                 current_catalog,
                 current_database,
                 &refresh_statement,
-                fields,
+                &repartition_fields,
                 connector_context,
             );
         self.refresh_service
@@ -264,9 +265,7 @@ impl MvCommandExecutor {
             let target_database = target.database.clone();
             let target_name = target.name.clone();
             let step_statement = RefreshMaterializedViewStmt {
-                name: ObjectName {
-                    parts: vec![target_database.clone(), target_name],
-                },
+                name: generated_object_name([target_database.clone(), target_name]),
                 full: false,
             };
             let preparation =
@@ -326,16 +325,24 @@ fn lower_typed_create(
             Ok(lowered)
         })
         .transpose()?;
-    let select_query = parse_mv_select_query(&statement.query.text)?;
+    let select_query = statement.query.clone();
+
+    let partition_by = statement
+        .partition_by
+        .as_ref()
+        .map(|fields| {
+            // Keep the parser-owned syntax in the SQL DTO, but validate the
+            // semantic Iceberg projection now so downstream application
+            // consumers only receive admitted partition transforms.
+            lower_typed_partition_fields(fields)?;
+            Ok::<_, String>(fields.clone())
+        })
+        .transpose()?;
 
     Ok(CreateMaterializedViewStmt {
         name: lower_typed_object_name(&statement.name)?,
         if_not_exists: statement.if_not_exists,
-        partition_by: statement
-            .partition_by
-            .as_ref()
-            .map(|fields| lower_typed_partition_fields(fields))
-            .transpose()?,
+        partition_by,
         distribution: Some(SyntaxMaterializedViewDistribution {
             hash_columns: distribution
                 .hash_columns
@@ -350,7 +357,7 @@ fn lower_typed_create(
                 .as_ref()
                 .unwrap_or(&TypedRefreshPolicy::Manual { deferred: false }),
         )?,
-        select_sql: statement.query.text.clone(),
+        select_sql: novarocks_parser::printer::print_query(&select_query),
         select_query,
         properties: lower_typed_properties(&statement.properties)?,
         primary_key,
@@ -385,7 +392,10 @@ fn lower_typed_alter(
         TypedAlterAction::PauseRefresh => AlterMaterializedViewAction::PauseRefresh,
         TypedAlterAction::ResumeRefresh => AlterMaterializedViewAction::ResumeRefresh,
         TypedAlterAction::Repartition(fields) => {
-            AlterMaterializedViewAction::Repartition(lower_typed_partition_fields(fields)?)
+            // Repartition keeps its parser-owned syntax in the SQL DTO. The
+            // execution boundary lowers it to the semantic Iceberg fields.
+            lower_typed_partition_fields(fields)?;
+            AlterMaterializedViewAction::Repartition(fields.clone())
         }
     };
     Ok(AlterMaterializedViewStmt {
@@ -575,14 +585,27 @@ fn lower_typed_properties(
         .collect()
 }
 
-fn lower_typed_object_name(name: &novarocks_parser::ast::ObjectName) -> Result<ObjectName, String> {
-    Ok(ObjectName {
-        parts: name
-            .parts
-            .iter()
-            .map(|part| normalize_identifier(&part.value))
-            .collect::<Result<Vec<_>, _>>()?,
-    })
+fn lower_typed_object_name(name: &TypedObjectName) -> Result<TypedObjectName, String> {
+    if name.parts.is_empty() {
+        return Err("materialized view name must not be empty".to_string());
+    }
+    Ok(name.clone())
+}
+
+fn generated_object_name(parts: impl IntoIterator<Item = String>) -> TypedObjectName {
+    let span = Span::new(0, 0);
+    TypedObjectName {
+        parts: parts
+            .into_iter()
+            .map(|value| novarocks_parser::ast::Ident {
+                value,
+                quoted: false,
+                quote_style: None,
+                span,
+            })
+            .collect(),
+        span,
+    }
 }
 
 fn lower_typed_u32(value: &Literal, context: &str) -> Result<u32, String> {
@@ -645,20 +668,37 @@ mod tests {
         };
 
         let lowered = lower_typed_create(&create).expect("typed create should lower");
-        assert_eq!(lowered.name.parts, vec!["analytics", "orders_mv"]);
+        assert_eq!(
+            lowered
+                .name
+                .parts
+                .iter()
+                .map(|part| part.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["analytics", "orders_mv"]
+        );
         assert_eq!(
             lowered.refresh_policy,
             MaterializedViewRefreshPolicy::AsyncInterval {
                 interval_ms: 7_200_000
             }
         );
+        assert!(matches!(
+            lowered.partition_by.as_deref(),
+            Some([MaterializedViewPartitionField::Transform {
+                name,
+                arguments,
+                ..
+            }]) if name.value == "month"
+                && matches!(
+                    arguments.as_slice(),
+                    [MaterializedViewPartitionArgument::Ident(column)] if column.value == "order_date"
+                )
+        ));
         assert_eq!(
-            lowered.partition_by,
-            Some(vec![IcebergPartitionFieldExpr::Month {
-                column: "order_date".to_string()
-            }])
+            novarocks_parser::printer::print_query(&lowered.select_query),
+            lowered.select_sql
         );
-        assert_eq!(lowered.select_query.to_string(), lowered.select_sql);
     }
 
     #[test]

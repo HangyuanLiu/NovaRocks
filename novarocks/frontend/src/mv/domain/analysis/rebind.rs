@@ -29,6 +29,8 @@
 //! rebind set. Ambiguity is a fail-fast error rather than a best-effort
 //! rewrite.
 
+use novarocks_parser::{Span, ast, printer};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RebindColumn {
     pub(crate) base_table_fqn: String,
@@ -44,20 +46,13 @@ pub(crate) fn rewrite_select_sql_for_rebind(
     if rebound_columns.is_empty() {
         return Ok(stored_sql.to_string());
     }
-    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(stored_sql)
-        .map_err(|e| format!("rebind rewrite: normalize_for_raw_parse: {e}"))?;
-    let mut stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
-        .map_err(|e| format!("rebind rewrite: parse: {e}"))?;
-    let sqlparser::ast::Statement::Query(query) = &mut stmt else {
-        return Err("rebind rewrite: expected SELECT query".to_string());
-    };
-    let order_by = query.order_by.as_mut();
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+    let mut query = parse_stored_select_query(stored_sql)?;
+    let ast::SetExpr::Select(select) = query.body.as_mut() else {
         return Err("rebind rewrite: expected SELECT body".to_string());
     };
     let ctx = RebindRewriteContext::new(select, rebound_columns)?;
-    rewrite_select(select, order_by, &ctx)?;
-    Ok(stmt.to_string())
+    rewrite_select(select, &mut query.order_by, &ctx)?;
+    Ok(printer::print_query(&query))
 }
 
 #[derive(Clone, Debug)]
@@ -73,10 +68,7 @@ struct RebindRewriteContext {
 }
 
 impl RebindRewriteContext {
-    fn new(
-        select: &sqlparser::ast::Select,
-        rebound_columns: &[RebindColumn],
-    ) -> Result<Self, String> {
+    fn new(select: &ast::Select, rebound_columns: &[RebindColumn]) -> Result<Self, String> {
         let mut rules_by_old_name: std::collections::HashMap<String, Vec<RebindRule>> =
             std::collections::HashMap::new();
         for col in rebound_columns {
@@ -95,7 +87,7 @@ impl RebindRewriteContext {
         })
     }
 
-    fn rewrite_unqualified(&self, ident: &mut sqlparser::ast::Ident) -> Result<(), String> {
+    fn rewrite_unqualified(&self, ident: &mut ast::Ident) -> Result<(), String> {
         let key = ident.value.to_ascii_lowercase();
         let Some(rules) = self.rules_by_old_name.get(&key) else {
             return Ok(());
@@ -111,7 +103,7 @@ impl RebindRewriteContext {
         Ok(())
     }
 
-    fn rewrite_qualified(&self, parts: &mut [sqlparser::ast::Ident]) -> Result<(), String> {
+    fn rewrite_qualified(&self, parts: &mut [ast::Ident]) -> Result<(), String> {
         if parts.len() < 2 {
             if let Some(last) = parts.last_mut() {
                 return self.rewrite_unqualified(last);
@@ -154,17 +146,15 @@ impl RebindRewriteContext {
     }
 }
 
-fn top_level_column_output_name(expr: &sqlparser::ast::Expr) -> Option<String> {
+fn top_level_column_output_name(expr: &ast::Expr) -> Option<String> {
     match expr {
-        sqlparser::ast::Expr::Identifier(ident) => Some(ident.value.clone()),
-        sqlparser::ast::Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
+        ast::Expr::Identifier(ident) => Some(ident.value.clone()),
+        ast::Expr::CompoundIdentifier(parts) => parts.parts.last().map(|p| p.value.clone()),
         _ => None,
     }
 }
 
-fn collect_select_qualifiers(
-    select: &sqlparser::ast::Select,
-) -> std::collections::HashMap<String, String> {
+fn collect_select_qualifiers(select: &ast::Select) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     for table_with_joins in &select.from {
         collect_table_factor_qualifier(&table_with_joins.relation, &mut out);
@@ -176,13 +166,13 @@ fn collect_select_qualifiers(
 }
 
 fn collect_table_factor_qualifier(
-    relation: &sqlparser::ast::TableFactor,
+    relation: &ast::TableFactor,
     out: &mut std::collections::HashMap<String, String>,
 ) {
-    if let sqlparser::ast::TableFactor::Table { name, alias, .. } = relation {
-        let fqn = name.to_string().to_ascii_lowercase();
+    if let ast::TableFactor::Table { name, alias, .. } = relation {
+        let fqn = printer::print_object_name(name).to_ascii_lowercase();
         out.insert(fqn.clone(), fqn.clone());
-        if let Some(last) = name.0.last().and_then(|p| p.as_ident()) {
+        if let Some(last) = name.parts.last() {
             out.insert(last.value.to_ascii_lowercase(), fqn.clone());
         }
         if let Some(alias) = alias {
@@ -192,13 +182,13 @@ fn collect_table_factor_qualifier(
 }
 
 fn rewrite_select(
-    select: &mut sqlparser::ast::Select,
-    order_by: Option<&mut sqlparser::ast::OrderBy>,
+    select: &mut ast::Select,
+    order_by: &mut [ast::OrderByExpr],
     ctx: &RebindRewriteContext,
 ) -> Result<(), String> {
     for item in &mut select.projection {
         match item {
-            sqlparser::ast::SelectItem::UnnamedExpr(e) => {
+            ast::SelectItem::UnnamedExpr(e) => {
                 // Preserve the original output column name when a top-level
                 // unaliased column reference is rewritten by rebind. SQL
                 // implicitly uses the last identifier as the output column
@@ -210,22 +200,20 @@ fn rewrite_select(
                 if let Some(original) = original_output_name {
                     let current = top_level_column_output_name(e);
                     if current.as_deref() != Some(original.as_str()) {
-                        let new_expr = std::mem::replace(
-                            e,
-                            sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("")),
-                        );
-                        *item = sqlparser::ast::SelectItem::ExprWithAlias {
+                        let new_expr = std::mem::replace(e, ast::Expr::Identifier(ident("")));
+                        *item = ast::SelectItem::ExprWithAlias {
                             expr: new_expr,
-                            alias: sqlparser::ast::Ident::new(original),
+                            alias: ident(&original),
+                            explicit_as: true,
+                            span: Span::new(0, 0),
                         };
                     }
                 }
             }
-            sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+            ast::SelectItem::ExprWithAlias { expr: e, .. } => {
                 rewrite_expr_idents(e, ctx)?;
             }
-            sqlparser::ast::SelectItem::Wildcard(_)
-            | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => {}
+            ast::SelectItem::Wildcard { .. } | ast::SelectItem::QualifiedWildcard { .. } => {}
         }
     }
     if let Some(filter) = &mut select.selection {
@@ -233,146 +221,91 @@ fn rewrite_select(
     }
     for table_with_joins in &mut select.from {
         for join in &mut table_with_joins.joins {
-            rewrite_join_constraint(&mut join.join_operator, ctx)?;
+            rewrite_join_constraint(join, ctx)?;
         }
     }
     match &mut select.group_by {
-        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
-            for expr in exprs {
+        ast::GroupBy::Expressions { expressions, .. } => {
+            for expr in expressions {
                 rewrite_expr_idents(expr, ctx)?;
             }
         }
-        sqlparser::ast::GroupByExpr::All(_) => {}
+        ast::GroupBy::None
+        | ast::GroupBy::Rollup { .. }
+        | ast::GroupBy::Cube { .. }
+        | ast::GroupBy::GroupingSets { .. } => {}
     }
     if let Some(having) = &mut select.having {
         rewrite_expr_idents(having, ctx)?;
     }
-    if let Some(order_by) = order_by
-        && let sqlparser::ast::OrderByKind::Expressions(exprs) = &mut order_by.kind
-    {
-        for item in exprs {
-            rewrite_expr_idents(&mut item.expr, ctx)?;
-        }
+    for item in order_by {
+        rewrite_expr_idents(&mut item.expr, ctx)?;
     }
     Ok(())
 }
 
-fn rewrite_join_constraint(
-    op: &mut sqlparser::ast::JoinOperator,
-    ctx: &RebindRewriteContext,
-) -> Result<(), String> {
-    use sqlparser::ast::JoinConstraint;
-    let constraint = match op {
-        sqlparser::ast::JoinOperator::Join(c)
-        | sqlparser::ast::JoinOperator::Inner(c)
-        | sqlparser::ast::JoinOperator::Left(c)
-        | sqlparser::ast::JoinOperator::LeftOuter(c)
-        | sqlparser::ast::JoinOperator::Right(c)
-        | sqlparser::ast::JoinOperator::RightOuter(c)
-        | sqlparser::ast::JoinOperator::FullOuter(c)
-        | sqlparser::ast::JoinOperator::CrossJoin(c)
-        | sqlparser::ast::JoinOperator::Semi(c)
-        | sqlparser::ast::JoinOperator::LeftSemi(c)
-        | sqlparser::ast::JoinOperator::RightSemi(c)
-        | sqlparser::ast::JoinOperator::Anti(c)
-        | sqlparser::ast::JoinOperator::LeftAnti(c)
-        | sqlparser::ast::JoinOperator::RightAnti(c)
-        | sqlparser::ast::JoinOperator::StraightJoin(c) => c,
-        sqlparser::ast::JoinOperator::AsOf {
-            match_condition,
-            constraint,
-        } => {
-            rewrite_expr_idents(match_condition, ctx)?;
-            if let JoinConstraint::On(expr) = constraint {
-                rewrite_expr_idents(expr, ctx)?;
-            }
-            return Ok(());
-        }
-        sqlparser::ast::JoinOperator::CrossApply | sqlparser::ast::JoinOperator::OuterApply => {
-            return Ok(());
-        }
-    };
-    if let JoinConstraint::On(expr) = constraint {
+fn rewrite_join_constraint(join: &mut ast::Join, ctx: &RebindRewriteContext) -> Result<(), String> {
+    if let ast::JoinConstraint::On(expr) = &mut join.constraint {
         rewrite_expr_idents(expr, ctx)?;
     }
     Ok(())
 }
 
-fn rewrite_expr_idents(
-    expr: &mut sqlparser::ast::Expr,
-    ctx: &RebindRewriteContext,
-) -> Result<(), String> {
-    use sqlparser::ast::Expr;
+fn rewrite_expr_idents(expr: &mut ast::Expr, ctx: &RebindRewriteContext) -> Result<(), String> {
+    use ast::Expr;
     match expr {
         Expr::Identifier(ident) => ctx.rewrite_unqualified(ident)?,
-        Expr::CompoundIdentifier(parts) => ctx.rewrite_qualified(parts)?,
-        Expr::BinaryOp { left, right, .. } => {
-            rewrite_expr_idents(left, ctx)?;
-            rewrite_expr_idents(right, ctx)?;
+        Expr::CompoundIdentifier(parts) => ctx.rewrite_qualified(&mut parts.parts)?,
+        Expr::Binary(binary) => {
+            rewrite_expr_idents(&mut binary.left, ctx)?;
+            rewrite_expr_idents(&mut binary.right, ctx)?;
         }
-        Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } | Expr::Nested(expr) => {
-            rewrite_expr_idents(expr, ctx)?;
-        }
-        Expr::Function(func) => {
-            if let sqlparser::ast::FunctionArguments::List(list) = &mut func.args {
-                for arg in &mut list.args {
-                    if let sqlparser::ast::FunctionArg::Unnamed(
-                        sqlparser::ast::FunctionArgExpr::Expr(inner),
-                    ) = arg
-                    {
-                        rewrite_expr_idents(inner, ctx)?;
-                    }
-                }
-                for clause in &mut list.clauses {
-                    if let sqlparser::ast::FunctionArgumentClause::OrderBy(order_by) = clause {
-                        for item in order_by {
-                            rewrite_expr_idents(&mut item.expr, ctx)?;
-                        }
-                    }
-                }
+        Expr::Unary(unary) => rewrite_expr_idents(&mut unary.expression, ctx)?,
+        Expr::Cast(cast) => rewrite_expr_idents(&mut cast.expr, ctx)?,
+        Expr::Nested(nested) => rewrite_expr_idents(&mut nested.expression, ctx)?,
+        Expr::IsPredicate(predicate) => rewrite_expr_idents(&mut predicate.expr, ctx)?,
+        Expr::FunctionCall(function) => {
+            for inner in &mut function.arguments {
+                rewrite_expr_idents(inner, ctx)?;
+            }
+            for item in &mut function.order_by {
+                rewrite_expr_idents(&mut item.expr, ctx)?;
+            }
+            if let Some(separator) = &mut function.separator {
+                rewrite_expr_idents(separator, ctx)?;
+            }
+            if let Some(filter) = &mut function.filter {
+                rewrite_expr_idents(filter, ctx)?;
             }
         }
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(op) = operand {
+        Expr::Case(case) => {
+            if let Some(op) = &mut case.operand {
                 rewrite_expr_idents(op, ctx)?;
             }
-            for c in conditions {
-                rewrite_expr_idents(&mut c.condition, ctx)?;
-                rewrite_expr_idents(&mut c.result, ctx)?;
+            for (condition, result) in case.conditions.iter_mut().zip(&mut case.results) {
+                rewrite_expr_idents(condition, ctx)?;
+                rewrite_expr_idents(result, ctx)?;
             }
-            if let Some(e) = else_result {
+            if let Some(e) = &mut case.else_result {
                 rewrite_expr_idents(e, ctx)?;
             }
         }
-        Expr::IsNull(inner)
-        | Expr::IsNotNull(inner)
-        | Expr::IsTrue(inner)
-        | Expr::IsFalse(inner)
-        | Expr::IsNotTrue(inner)
-        | Expr::IsNotFalse(inner) => rewrite_expr_idents(inner, ctx)?,
-        Expr::InList { expr, list, .. } => {
-            rewrite_expr_idents(expr, ctx)?;
-            for e in list {
+        Expr::InList(list) => {
+            rewrite_expr_idents(&mut list.expr, ctx)?;
+            for e in &mut list.list {
                 rewrite_expr_idents(e, ctx)?;
             }
         }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            rewrite_expr_idents(expr, ctx)?;
-            rewrite_expr_idents(low, ctx)?;
-            rewrite_expr_idents(high, ctx)?;
+        Expr::Between(between) => {
+            rewrite_expr_idents(&mut between.expr, ctx)?;
+            rewrite_expr_idents(&mut between.low, ctx)?;
+            rewrite_expr_idents(&mut between.high, ctx)?;
         }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            rewrite_expr_idents(expr, ctx)?;
-            rewrite_expr_idents(pattern, ctx)?;
+        Expr::Like(like) => {
+            rewrite_expr_idents(&mut like.expr, ctx)?;
+            rewrite_expr_idents(&mut like.pattern, ctx)?;
         }
-        Expr::Subquery(_) | Expr::Exists { .. } => {
+        Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(_) => {
             return Err(
                 "rebind rewrite: subqueries are not supported in Iceberg MV definitions"
                     .to_string(),
@@ -381,6 +314,30 @@ fn rewrite_expr_idents(
         _ => {}
     }
     Ok(())
+}
+
+fn ident(value: &str) -> ast::Ident {
+    let mut chars = value.chars();
+    let plain = chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
+    ast::Ident {
+        value: value.to_string(),
+        quoted: !plain,
+        quote_style: (!plain).then_some('`'),
+        span: Span::new(0, 0),
+    }
+}
+
+fn parse_stored_select_query(sql: &str) -> Result<ast::Query, String> {
+    let statements = novarocks_parser::parse(sql).map_err(|error| {
+        format!("rebind rewrite: native parser rejected stored SELECT: {error}")
+    })?;
+    let [ast::Statement::Query(query)] = statements.as_slice() else {
+        return Err("rebind rewrite: expected SELECT query".to_string());
+    };
+    Ok(query.clone())
 }
 
 #[cfg(test)]

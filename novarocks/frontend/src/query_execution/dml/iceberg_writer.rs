@@ -40,6 +40,7 @@ use crate::query_execution::write_transaction::{
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::ColumnDefault;
 use novarocks_catalog::schema::SqlType;
+use novarocks_parser::ast::{Query, Statement};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorTableHandle, ConnectorWriteAdmissionPurpose,
     ConnectorWriteFieldRequest, ConnectorWriteInputRequest, ConnectorWriteIntent,
@@ -55,7 +56,7 @@ use novarocks_sql::syntax::{Literal, column_default_to_literal, latin1_string_to
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IcebergWriteInput {
     Rows(Vec<Vec<Literal>>),
-    Query(Box<sqlparser::ast::Query>),
+    Query(Box<Query>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,7 +285,7 @@ fn prepare_iceberg_distributed_write(
     let executor = PreparedIcebergWriteExecutor {
         state: state.clone(),
         target: target.clone(),
-        query,
+        query: query.clone(),
         sql_write_input,
         table_bindings,
         execution,
@@ -586,7 +587,7 @@ impl PreparedIcebergWrite {
 struct PreparedIcebergWriteExecutor {
     state: DmlExecutionKernel,
     target: TargetBackend,
-    query: sqlparser::ast::Query,
+    query: Query,
     sql_write_input: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     execution: Option<QueryExecutionContext>,
@@ -606,7 +607,7 @@ pub(crate) fn build_iceberg_write_plan(
     insert_columns: &[String],
     source: &IcebergWriteInput,
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
-) -> Result<(sqlparser::ast::Query, Vec<ColumnDef>), String> {
+) -> Result<(Query, Vec<ColumnDef>), String> {
     let write_columns = insert_columns_from_connector_metadata(
         metadata,
         &write_defaults_by_name(&resolved.columns),
@@ -645,7 +646,7 @@ fn append_source_to_query(
     source: &IcebergWriteInput,
     insert_columns: &[String],
     target_columns: &[ColumnDef],
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<Query, String> {
     append_source_to_query_for_write(source, insert_columns, target_columns, target_columns)
 }
 
@@ -654,7 +655,7 @@ fn append_source_to_query_for_write(
     insert_columns: &[String],
     source_columns: &[ColumnDef],
     write_columns: &[ColumnDef],
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<Query, String> {
     match source {
         IcebergWriteInput::Query(query)
             if insert_columns.is_empty() && same_column_sequence(source_columns, write_columns) =>
@@ -677,11 +678,11 @@ fn append_source_to_query_for_write(
 }
 
 fn wrap_insert_query_with_write_projection(
-    query: &sqlparser::ast::Query,
+    query: &Query,
     insert_columns: &[String],
     source_columns: &[ColumnDef],
     write_columns: &[ColumnDef],
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<Query, String> {
     let insert_idx_by_target = if insert_columns.is_empty() {
         std::collections::HashMap::new()
     } else {
@@ -735,7 +736,7 @@ fn wrap_insert_query_with_write_projection(
     let sql = format!(
         "SELECT {} FROM ({}) AS {} ({})",
         projection.join(", "),
-        query,
+        novarocks_parser::printer::print_query(query),
         sql_identifier(source_alias),
         alias_columns
     );
@@ -747,7 +748,7 @@ fn values_append_source_to_query_for_write(
     insert_columns: &[String],
     source_columns: &[ColumnDef],
     write_columns: &[ColumnDef],
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<Query, String> {
     let insert_idx_by_target = if insert_columns.is_empty() {
         std::collections::HashMap::new()
     } else {
@@ -943,10 +944,19 @@ pub(crate) fn target_cast_expr_sql(expr_sql: &str, column: &ColumnDef) -> Result
     ))
 }
 
-fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Query, String> {
-    match novarocks_sql::planning::dml::parse_raw_statement(sql)? {
-        sqlparser::ast::Statement::Query(query) => Ok(*query),
-        other => Err(format!("{context}: generated non-query statement: {other}")),
+fn parse_generated_query(sql: &str, context: &str) -> Result<Query, String> {
+    let statements = novarocks_parser::parse(sql)
+        .map_err(|error| format!("{context}: native SQL parser rejection: {error}"))?;
+    match statements.as_slice() {
+        [Statement::Query(query)] => Ok(query.clone()),
+        [other] => Err(format!(
+            "{context}: generated non-query statement: {}",
+            novarocks_parser::printer::print_statement(other)
+        )),
+        _ => Err(format!(
+            "{context}: generated {} statements, expected exactly one query",
+            statements.len()
+        )),
     }
 }
 
@@ -1172,7 +1182,7 @@ fn target_string(t: &TargetBackend) -> String {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
-    use sqlparser::ast as sqlast;
+    use novarocks_parser::{ast, printer};
 
     use novarocks_catalog::schema::ColumnDefault;
 
@@ -1190,12 +1200,12 @@ mod tests {
         }
     }
 
-    fn parse_query(sql: &str) -> sqlast::Query {
-        let stmt = novarocks_sql::planning::dml::parse_raw_statement(sql).expect("parse query");
-        let sqlast::Statement::Query(query) = stmt else {
-            panic!("expected query statement");
+    fn parse_query(sql: &str) -> Query {
+        let statements = novarocks_parser::parse(sql).expect("parse query");
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected exactly one query statement");
         };
-        *query
+        query.clone()
     }
 
     fn test_map_type(key: DataType, value: DataType) -> DataType {
@@ -1252,11 +1262,14 @@ mod tests {
         )
         .expect("append source query");
 
-        let sqlast::SetExpr::Values(values) = query.body.as_ref() else {
-            panic!("expected VALUES query, got: {query}");
+        let ast::SetExpr::Values(values) = query.body.as_ref() else {
+            panic!(
+                "expected VALUES query, got: {}",
+                printer::print_query(&query)
+            );
         };
         let row = values.rows.first().expect("one row");
-        let rendered: Vec<String> = row.iter().map(ToString::to_string).collect();
+        let rendered: Vec<String> = row.iter().map(printer::print_expr).collect();
         assert_eq!(
             rendered,
             vec!["CAST(10 AS INT)", "CAST(5 AS INT)", "CAST(30 AS INT)"]
@@ -1409,11 +1422,14 @@ mod tests {
         let query =
             append_source_to_query(&source, &[], &target_columns).expect("append source query");
 
-        let sqlast::SetExpr::Values(values) = query.body.as_ref() else {
-            panic!("expected VALUES query, got: {query}");
+        let ast::SetExpr::Values(values) = query.body.as_ref() else {
+            panic!(
+                "expected VALUES query, got: {}",
+                printer::print_query(&query)
+            );
         };
-        let first_row: Vec<String> = values.rows[0].iter().map(ToString::to_string).collect();
-        let second_row: Vec<String> = values.rows[1].iter().map(ToString::to_string).collect();
+        let first_row: Vec<String> = values.rows[0].iter().map(printer::print_expr).collect();
+        let second_row: Vec<String> = values.rows[1].iter().map(printer::print_expr).collect();
         assert_eq!(
             first_row,
             vec![
@@ -1448,10 +1464,13 @@ mod tests {
         let query = append_source_to_query_for_write(&source, &[], &source_columns, &write_columns)
             .expect("append source query");
 
-        let sqlast::SetExpr::Values(values) = query.body.as_ref() else {
-            panic!("expected VALUES query, got: {query}");
+        let ast::SetExpr::Values(values) = query.body.as_ref() else {
+            panic!(
+                "expected VALUES query, got: {}",
+                printer::print_query(&query)
+            );
         };
-        let row: Vec<String> = values.rows[0].iter().map(ToString::to_string).collect();
+        let row: Vec<String> = values.rows[0].iter().map(printer::print_expr).collect();
         assert_eq!(
             row,
             vec!["CAST(1 AS INT)", "CAST(NULL AS STRING)", "CAST(10 AS INT)"]
@@ -1489,16 +1508,19 @@ mod tests {
         let query =
             append_source_to_query(&source, &[], &target_columns).expect("append source query");
 
-        let sqlast::SetExpr::Values(values) = query.body.as_ref() else {
-            panic!("expected VALUES query, got: {query}");
+        let ast::SetExpr::Values(values) = query.body.as_ref() else {
+            panic!(
+                "expected VALUES query, got: {}",
+                printer::print_query(&query)
+            );
         };
-        let sqlast::Expr::Cast { expr, .. } = &values.rows[0][0] else {
+        let ast::Expr::Cast(cast) = &values.rows[0][0] else {
             panic!("expected CAST expression");
         };
-        let sqlast::Expr::Value(value) = expr.as_ref() else {
+        let ast::Expr::Literal(value) = cast.expr.as_ref() else {
             panic!("expected string literal inside CAST");
         };
-        let sqlast::Value::SingleQuotedString(s) = &value.value else {
+        let ast::LiteralKind::String(s) = &value.kind else {
             panic!("expected single-quoted string");
         };
         assert_eq!(s, r"e\f");
@@ -1513,16 +1535,19 @@ mod tests {
         let query =
             append_source_to_query(&source, &[], &target_columns).expect("append source query");
 
-        let sqlast::SetExpr::Values(values) = query.body.as_ref() else {
-            panic!("expected VALUES query, got: {query}");
+        let ast::SetExpr::Values(values) = query.body.as_ref() else {
+            panic!(
+                "expected VALUES query, got: {}",
+                printer::print_query(&query)
+            );
         };
-        let sqlast::Expr::Cast { expr, .. } = &values.rows[0][0] else {
+        let ast::Expr::Cast(cast) = &values.rows[0][0] else {
             panic!("expected CAST expression");
         };
-        let sqlast::Expr::Value(value) = expr.as_ref() else {
+        let ast::Expr::Literal(value) = cast.expr.as_ref() else {
             panic!("expected hex literal inside CAST");
         };
-        let sqlast::Value::HexStringLiteral(s) = &value.value else {
+        let ast::LiteralKind::HexString(s) = &value.kind else {
             panic!("expected hex literal");
         };
         assert_eq!(s, "AB01");
@@ -1569,9 +1594,9 @@ mod tests {
         )
         .expect("append source query");
 
-        let rendered = query.to_string();
+        let rendered = printer::print_query(&query);
         assert!(
-            rendered.contains("FROM (SELECT x, y FROM src) AS `__nr_insert_src` (`c`, `a`)"),
+            rendered.contains("FROM (SELECT x, y FROM src) AS `__nr_insert_src`(`c`, `a`)"),
             "derived query should carry source column aliases, got: {rendered}"
         );
         assert!(
@@ -1603,7 +1628,7 @@ mod tests {
 
         let query = append_source_to_query(&source, &["k1".to_string()], &target_columns)
             .expect("append source query");
-        let rendered = query.to_string();
+        let rendered = printer::print_query(&query);
 
         assert!(
             rendered.contains("CAST(NULL AS MAP"),

@@ -48,7 +48,7 @@ use chrono::NaiveDateTime;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_parser::ast::{
     BinaryOperator, Delete, Expr, FunctionCall, IsPredicate, LiteralKind,
-    ObjectName as ParserObjectName, UnaryOperator,
+    ObjectName as ParserObjectName, Query, Statement, UnaryOperator,
 };
 use novarocks_spi::connector::ConnectorRowMutationStrategy;
 use novarocks_spi::connector::ConnectorWriteOperationId;
@@ -59,7 +59,7 @@ use novarocks_sql::syntax::ObjectName as SqlObjectName;
 pub(crate) fn prepare_delete_statement(
     state: &DmlExecutionKernel,
     stmt: &Delete,
-    source: &str,
+    _source: &str,
     current_catalog: Option<&str>,
     current_database: &str,
     execution: &QueryExecutionContext,
@@ -130,7 +130,7 @@ pub(crate) fn prepare_delete_statement(
             .to_string()
     })?;
     validate_where(where_clause, &target_binding.dml_target_columns())?;
-    let where_sql = source_slice(source, where_clause.span())?;
+    let where_sql = novarocks_parser::printer::print_expr(where_clause);
 
     // 4. Ask the provider to plan the row mutation. The physical strategy, the
     //    branch/format admission gates and the base version the frontend
@@ -171,7 +171,7 @@ pub(crate) fn prepare_delete_statement(
         connector_operation_id,
         &write_lease,
         &target_ref,
-        where_sql,
+        &where_sql,
         execution.clone(),
         connector_context,
         planning_lease,
@@ -181,7 +181,7 @@ pub(crate) fn prepare_delete_statement(
 struct DistributedDeleteWriteExecutor {
     state: DmlExecutionKernel,
     target: TargetBackend,
-    delete_query: sqlparser::ast::Query,
+    delete_query: Query,
     sql_write_input: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<QueryTableBindingStore>,
     execution: QueryExecutionContext,
@@ -385,7 +385,7 @@ fn build_delete_position_sink_query(
     where_clause: &str,
     sink_columns: &[ColumnDef],
     target_ref: &str,
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<Query, String> {
     let projection = sink_columns
         .iter()
         .map(|column| sql_identifier(&column.name))
@@ -420,10 +420,19 @@ fn write_input_columns(
         .collect()
 }
 
-fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Query, String> {
-    match novarocks_sql::planning::dml::parse_raw_statement(sql)? {
-        sqlparser::ast::Statement::Query(query) => Ok(*query),
-        other => Err(format!("{context}: generated non-query statement: {other}")),
+fn parse_generated_query(sql: &str, context: &str) -> Result<Query, String> {
+    let statements = novarocks_parser::parse(sql)
+        .map_err(|error| format!("{context}: native SQL parser rejection: {error}"))?;
+    match statements.as_slice() {
+        [Statement::Query(query)] => Ok(query.clone()),
+        [other] => Err(format!(
+            "{context}: generated non-query statement: {}",
+            novarocks_parser::printer::print_statement(other)
+        )),
+        _ => Err(format!(
+            "{context}: generated {} statements, expected exactly one query",
+            statements.len()
+        )),
     }
 }
 
@@ -448,12 +457,6 @@ fn sql_object_name(name: &ParserObjectName) -> SqlObjectName {
     SqlObjectName {
         parts: name.parts.iter().map(|part| part.value.clone()).collect(),
     }
-}
-
-fn source_slice(source: &str, span: novarocks_parser::Span) -> Result<&str, String> {
-    source
-        .get(span.start()..span.end())
-        .ok_or_else(|| "DELETE predicate span was outside the admitted source".to_string())
 }
 
 /// Check that a DELETE `WHERE` clause is inside the subset this engine supports.
@@ -888,7 +891,7 @@ mod tests {
         let query =
             super::build_delete_position_sink_query(&target, where_clause, &sink_columns, "main")
                 .expect("rewrite query");
-        let rendered = query.to_string();
+        let rendered = novarocks_parser::printer::print_query(&query);
 
         assert!(rendered.contains("`_file`"));
         assert!(rendered.contains("`_pos`"));
@@ -915,9 +918,9 @@ mod tests {
             super::build_delete_position_sink_query(&target, where_clause, &sink_columns, "dev")
                 .expect("rewrite query");
 
-        let rendered = query.to_string();
+        let rendered = novarocks_parser::printer::print_query(&query);
         assert!(rendered.contains("FROM `ice`.`db`.`orders`"));
-        assert!(rendered.contains("FOR SYSTEM_TIME AS OF '__nr_ref:dev'"));
+        assert!(rendered.contains("FOR VERSION AS OF 'dev'"));
     }
 
     // --------------- Timestamp predicate tests ---------------

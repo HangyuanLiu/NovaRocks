@@ -299,7 +299,7 @@ pub struct SqlStatementInput {
 )]
 enum SqlStatementInputKind {
     Sql(String),
-    ParsedQuery(Box<sqlparser::ast::Query>),
+    ParsedQuery(Box<novarocks_parser::ast::Query>),
     /// A SQL-owned logical transformation that must re-enter the canonical
     /// optimizer kernel without reopening catalog resolution.  Application
     /// code uses this only after compiler-produced logical facts have been
@@ -317,7 +317,7 @@ impl SqlStatementInput {
         }
     }
 
-    pub fn parsed_query(query: Box<sqlparser::ast::Query>) -> Self {
+    pub fn parsed_query(query: Box<novarocks_parser::ast::Query>) -> Self {
         Self {
             kind: SqlStatementInputKind::ParsedQuery(query),
         }
@@ -632,7 +632,7 @@ enum SqlCompileOutputKind {
 /// SQL consumes the opaque rewrite snapshot and keeps logical-plan ownership
 /// internal; Core receives only the rendered lines.
 pub struct SqlImvRefreshExplainContext<'a> {
-    pub canonical_query: Box<sqlparser::ast::Query>,
+    pub canonical_query: Box<novarocks_parser::ast::Query>,
     pub imv_rewrite: SqlImvPlanningInput,
     pub current_catalog: Option<String>,
     pub current_database: String,
@@ -649,7 +649,7 @@ pub struct SqlImvRefreshExplainContext<'a> {
 /// parsed syntax and its frozen catalog snapshot in, but receives only the
 /// opaque analyzed-MV carrier back.
 pub struct SqlMvRefreshAnalysisContext<'a> {
-    pub query: Box<sqlparser::ast::Query>,
+    pub query: Box<novarocks_parser::ast::Query>,
     pub current_database: String,
     pub catalog: &'a dyn SqlCatalogSnapshot,
 }
@@ -664,6 +664,7 @@ pub fn analyze_mv_refresh_input(
         current_database,
         catalog,
     } = context;
+    crate::planning::mv::validate_imv_aggregate_star_arguments(&query)?;
     let (resolved, _, _) =
         crate::analyzer::analyze(&query, catalog.planner_table_provider(), &current_database)?;
     Ok(crate::planning::mv::SqlResolvedMvRefreshInput::from_analysis(resolved))
@@ -707,7 +708,7 @@ pub fn compile_imv_refresh_explain_lines(
 
 #[allow(clippy::too_many_arguments)]
 fn imv_refresh_explain_request<'a>(
-    query: sqlparser::ast::Query,
+    query: novarocks_parser::ast::Query,
     imv_rewrite: &'a SqlImvPlanningInput,
     current_catalog: Option<String>,
     current_database: String,
@@ -1349,7 +1350,9 @@ impl SqlCompiler {
     }
 }
 
-fn parse_query(statement: &SqlStatementInput) -> Result<sqlparser::ast::Query, SqlCompileError> {
+fn parse_query(
+    statement: &SqlStatementInput,
+) -> Result<novarocks_parser::ast::Query, SqlCompileError> {
     let sql = match &statement.kind {
         SqlStatementInputKind::Sql(sql) => sql,
         SqlStatementInputKind::ParsedQuery(query) => return Ok((**query).clone()),
@@ -1359,12 +1362,16 @@ fn parse_query(statement: &SqlStatementInput) -> Result<sqlparser::ast::Query, S
             ));
         }
     };
-    let normalized = crate::parser::dialect::normalize_for_raw_parse(sql)
-        .map_err(SqlCompileError::Compilation)?;
-    match crate::parser::parse_normalized_sql_raw(&normalized)
+    match novarocks_parser::parse(sql)
         .map_err(|error| SqlCompileError::Compilation(error.to_string()))?
     {
-        sqlparser::ast::Statement::Query(query) => Ok(*query),
+        mut statements if statements.len() == 1 => match statements.remove(0) {
+            novarocks_parser::ast::Statement::Query(query) => Ok(query),
+            _ => Err(SqlCompileError::InvalidRequest(
+                "SQL compiler requires a query statement after application preprocessing"
+                    .to_string(),
+            )),
+        },
         _ => Err(SqlCompileError::InvalidRequest(
             "SQL compiler requires a query statement after application preprocessing".to_string(),
         )),
@@ -1924,14 +1931,14 @@ mod tests {
 
     #[test]
     fn imv_refresh_explain_terminal_keeps_logical_rewrite_inside_sql() {
-        let statement = crate::parser::parse_sql_raw("SELECT 1").expect("query fixture parses");
-        let sqlparser::ast::Statement::Query(query) = statement else {
+        let mut statements = novarocks_parser::parse("SELECT 1").expect("query fixture parses");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_mut_slice() else {
             panic!("expected query fixture");
         };
         let cancellation = Arc::new(Cancellation::default());
         let input = imv_validation_input(SqlImvRewriteValidation::None);
         let request = imv_refresh_explain_request(
-            *query,
+            query.clone(),
             &input,
             Some("ice".to_string()),
             "db".to_string(),
@@ -1953,12 +1960,12 @@ mod tests {
             compile_imv_refresh_explain_lines;
     }
 
-    fn mv_analysis_query(sql: &str) -> Box<sqlparser::ast::Query> {
-        let statement = crate::parser::parse_sql_raw(sql).expect("MV analysis query parses");
-        let sqlparser::ast::Statement::Query(query) = statement else {
+    fn mv_analysis_query(sql: &str) -> Box<novarocks_parser::ast::Query> {
+        let mut statements = novarocks_parser::parse(sql).expect("MV analysis query parses");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_mut_slice() else {
             panic!("expected MV analysis query");
         };
-        query
+        Box::new(query.clone())
     }
 
     #[test]
@@ -2184,16 +2191,16 @@ mod tests {
 
     #[test]
     fn parsed_query_input_preserves_complex_types_and_escapes_without_sql_round_trip() {
-        let statement =
-            crate::parser::parse_sql_raw(r"SELECT CAST('{}' AS MAP<STRING, INT>), 'e\\f'")
+        let mut statements =
+            novarocks_parser::parse(r"SELECT CAST('{}' AS MAP<STRING, INT>), 'e\\f'")
                 .expect("query fixture must parse");
-        let sqlparser::ast::Statement::Query(query) = statement else {
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_mut_slice() else {
             panic!("expected query fixture");
         };
 
         assert_eq!(
-            parse_query(&SqlStatementInput::parsed_query(query.clone())),
-            Ok(*query)
+            parse_query(&SqlStatementInput::parsed_query(Box::new(query.clone()))),
+            Ok(query.clone())
         );
     }
 

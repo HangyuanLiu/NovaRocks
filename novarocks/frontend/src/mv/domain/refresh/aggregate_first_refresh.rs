@@ -31,6 +31,7 @@ use crate::mv::domain::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_vers
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_execution::exec::mv::aggregate_state::materialize_aggregate_result_chunks;
+use novarocks_parser::{ast, printer};
 use novarocks_sql::planning::mv::VisibleAggregateOutput;
 use novarocks_sql::planning::mv::{
     MV_BRANCH_ID_COLUMN_NAME, SqlMvAggregateCalls as AggregateSqlCalls, extract_aggregate_sql_calls,
@@ -60,7 +61,7 @@ pub(crate) fn prepare_aggregate_first_refresh_chunks<F>(
     read: &mut F,
 ) -> Result<Vec<Chunk>, String>
 where
-    F: FnMut(&str, &AggregateSqlCalls, sqlparser::ast::Query) -> Result<AggregateStateRead, String>,
+    F: FnMut(&str, &AggregateSqlCalls, ast::Query) -> Result<AggregateStateRead, String>,
 {
     let read = read_aggregate_state(
         select_sql,
@@ -87,9 +88,11 @@ fn read_aggregate_state<F>(
     read: &mut F,
 ) -> Result<AggregateStateRead, String>
 where
-    F: FnMut(&str, &AggregateSqlCalls, sqlparser::ast::Query) -> Result<AggregateStateRead, String>,
+    F: FnMut(&str, &AggregateSqlCalls, ast::Query) -> Result<AggregateStateRead, String>,
 {
-    let state_sql = novarocks_sql::planning::mv::rewrite_select_sql_for_state(select_sql, calls)?;
+    let original_query = parse_stored_select_query(select_sql)?;
+    let state_sql =
+        novarocks_sql::planning::mv::rewrite_select_sql_for_state(&original_query, calls)?;
     let mut state_query = parse_stored_select_query(&state_sql)?;
     inject_pin_as_for_version_as_of(
         &mut state_query,
@@ -117,7 +120,9 @@ pub(crate) fn prepare_aggregate_first_refresh_state_sql(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<String, String> {
-    let state_sql = novarocks_sql::planning::mv::rewrite_select_sql_for_state(select_sql, calls)?;
+    let original_query = parse_stored_select_query(select_sql)?;
+    let state_sql =
+        novarocks_sql::planning::mv::rewrite_select_sql_for_state(&original_query, calls)?;
     let mut state_query = parse_stored_select_query(&state_sql)?;
     inject_pin_as_for_version_as_of(
         &mut state_query,
@@ -126,7 +131,7 @@ pub(crate) fn prepare_aggregate_first_refresh_state_sql(
         current_catalog,
         current_database,
     )?;
-    Ok(state_query.to_string())
+    Ok(printer::print_query(&state_query))
 }
 
 /// Return each pinned state-shaped branch of a branch-UNION aggregate first
@@ -181,7 +186,7 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_chunks<F>(
     read: &mut F,
 ) -> Result<Vec<Chunk>, String>
 where
-    F: FnMut(&str, &AggregateSqlCalls, sqlparser::ast::Query) -> Result<AggregateStateRead, String>,
+    F: FnMut(&str, &AggregateSqlCalls, ast::Query) -> Result<AggregateStateRead, String>,
 {
     let branches = branch_union_first_refresh_branch_queries(select_sql, branch_count)?;
     let mut target_layout = None;
@@ -235,7 +240,7 @@ where
 fn branch_union_first_refresh_branch_queries(
     select_sql: &str,
     branch_count: usize,
-) -> Result<Vec<(sqlparser::ast::Query, String)>, String> {
+) -> Result<Vec<(ast::Query, String)>, String> {
     let query = parse_stored_select_query(select_sql).map_err(|error| {
         format!("iceberg branch UNION ALL aggregate first refresh SELECT parse error: {error}")
     })?;
@@ -252,7 +257,7 @@ fn branch_union_first_refresh_branch_queries(
         .map(|body| {
             let mut branch_query = query.clone();
             branch_query.body = Box::new(body);
-            let branch_sql = branch_query.to_string();
+            let branch_sql = printer::print_query(&branch_query);
             Ok((branch_query, branch_sql))
         })
         .collect()
@@ -263,31 +268,24 @@ fn branch_union_first_refresh_branch_queries(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn flatten_branch_union_all_set_expr(
-    body: &sqlparser::ast::SetExpr,
-    out: &mut Vec<sqlparser::ast::SetExpr>,
+    body: &ast::SetExpr,
+    out: &mut Vec<ast::SetExpr>,
 ) -> Result<(), String> {
     match body {
-        sqlparser::ast::SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left,
-            right,
-        } => {
-            if !matches!(op, sqlparser::ast::SetOperator::Union)
-                || !matches!(set_quantifier, sqlparser::ast::SetQuantifier::All)
+        ast::SetExpr::SetOperation(operation) => {
+            if operation.operator != ast::SetOperator::Union
+                || operation.quantifier != ast::SetQuantifier::All
             {
                 return Err(
                     "iceberg branch UNION ALL aggregate first refresh supports UNION ALL only"
                         .to_string(),
                 );
             }
-            flatten_branch_union_all_set_expr(left, out)?;
-            flatten_branch_union_all_set_expr(right, out)
+            flatten_branch_union_all_set_expr(operation.left.as_ref(), out)?;
+            flatten_branch_union_all_set_expr(operation.right.as_ref(), out)
         }
-        sqlparser::ast::SetExpr::Query(query) => {
-            flatten_branch_union_all_set_expr(query.body.as_ref(), out)
-        }
-        sqlparser::ast::SetExpr::Select(_) => {
+        ast::SetExpr::Query(query) => flatten_branch_union_all_set_expr(query.body.as_ref(), out),
+        ast::SetExpr::Select(_) => {
             out.push(body.clone());
             Ok(())
         }
@@ -345,15 +343,13 @@ fn append_branch_id_to_chunk(chunk: Chunk, branch_id: i32) -> Result<Chunk, Stri
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn parse_stored_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
-    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)
-        .map_err(|error| format!("stored MV SELECT normalize error: {error}"))?;
-    let statement = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
-        .map_err(|error| format!("sql parser error: {error}"))?;
-    let sqlparser::ast::Statement::Query(query) = statement else {
+fn parse_stored_select_query(sql: &str) -> Result<ast::Query, String> {
+    let statements = novarocks_parser::parse(sql)
+        .map_err(|error| format!("native stored MV SELECT parse error: {error}"))?;
+    let [ast::Statement::Query(query)] = statements.as_slice() else {
         return Err("stored MV SQL must be a SELECT query".to_string());
     };
-    Ok(*query)
+    Ok(query.clone())
 }
 
 #[allow(
@@ -798,13 +794,7 @@ mod tests {
     use novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout;
 
     fn parse_calls(sql: &str) -> AggregateSqlCalls {
-        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)
-            .expect("normalize aggregate select");
-        let stmt = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
-            .expect("parse aggregate select");
-        let sqlparser::ast::Statement::Query(query) = stmt else {
-            panic!("expected query");
-        };
+        let query = parse_stored_select_query(sql).expect("parse aggregate select");
         extract_aggregate_sql_calls(&query).expect("extract aggregate calls")
     }
 
@@ -884,18 +874,12 @@ mod tests {
     }
 
     fn first_branch_calls(select_sql: &str) -> AggregateSqlCalls {
-        let normalized =
-            novarocks_sql::syntax::normalize_for_raw_parse(select_sql).expect("normalize union");
-        let stmt =
-            novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse union");
-        let sqlparser::ast::Statement::Query(query) = stmt else {
-            panic!("expected union query");
-        };
-        let sqlparser::ast::SetExpr::SetOperation { left, .. } = query.body.as_ref() else {
+        let query = parse_stored_select_query(select_sql).expect("parse union");
+        let ast::SetExpr::SetOperation(operation) = query.body.as_ref() else {
             panic!("expected set operation");
         };
-        let mut first_query = query.as_ref().clone();
-        first_query.body = left.clone();
+        let mut first_query = query.clone();
+        first_query.body = operation.left.clone();
         extract_aggregate_sql_calls(&first_query).expect("first calls")
     }
 
@@ -913,20 +897,20 @@ mod tests {
         let pin =
             RefreshSnapshotPin::from_entries_for_tests(&[("ice.sales.fact", 42, b"fact-object")]);
         let mut reads = 0;
-        let mut read =
-            |visible_sql: &str, actual_calls: &AggregateSqlCalls, query: sqlparser::ast::Query| {
-                reads += 1;
-                assert_eq!(visible_sql, select_sql);
-                assert_eq!(actual_calls, &calls);
-                assert!(
-                    query.to_string().contains("VERSION AS OF 42"),
-                    "query={query}"
-                );
-                Ok(AggregateStateRead {
-                    result: reordered_count_result(),
-                    source_layout: count_layout("region"),
-                })
-            };
+        let mut read = |visible_sql: &str, actual_calls: &AggregateSqlCalls, query: ast::Query| {
+            reads += 1;
+            assert_eq!(visible_sql, select_sql);
+            assert_eq!(actual_calls, &calls);
+            assert!(
+                printer::print_query(&query).contains("VERSION AS OF 42"),
+                "query={}",
+                printer::print_query(&query)
+            );
+            Ok(AggregateStateRead {
+                result: reordered_count_result(),
+                source_layout: count_layout("region"),
+            })
+        };
 
         let chunks = prepare_aggregate_first_refresh_chunks(
             select_sql,
@@ -962,8 +946,9 @@ mod tests {
             "sales",
             &mut |_, _, state_query| {
                 assert!(
-                    state_query.to_string().contains("AS `f.region`"),
-                    "query={state_query}"
+                    printer::print_query(&state_query).contains("AS `f.region`"),
+                    "query={}",
+                    printer::print_query(&state_query)
                 );
                 Ok(AggregateStateRead {
                     result: count_result("f.region", 2),
@@ -1075,24 +1060,22 @@ mod tests {
         let first_calls = first_branch_calls(select_sql);
         let pin = branch_pin();
         let mut reads = 0;
-        let mut read =
-            |visible_sql: &str, _: &AggregateSqlCalls, state_query: sqlparser::ast::Query| {
-                let branch = reads;
-                reads += 1;
-                let source_name = if branch == 0 { "region" } else { "area" };
-                let snapshot = if branch == 0 { 41 } else { 42 };
-                assert!(visible_sql.contains(source_name), "sql={visible_sql}");
-                assert!(
-                    state_query
-                        .to_string()
-                        .contains(&format!("VERSION AS OF {snapshot}")),
-                    "query={state_query}"
-                );
-                Ok(AggregateStateRead {
-                    result: count_result(source_name, branch as i64 + 1),
-                    source_layout: count_layout(source_name),
-                })
-            };
+        let mut read = |visible_sql: &str, _: &AggregateSqlCalls, state_query: ast::Query| {
+            let branch = reads;
+            reads += 1;
+            let source_name = if branch == 0 { "region" } else { "area" };
+            let snapshot = if branch == 0 { 41 } else { 42 };
+            assert!(visible_sql.contains(source_name), "sql={visible_sql}");
+            assert!(
+                printer::print_query(&state_query).contains(&format!("VERSION AS OF {snapshot}")),
+                "query={}",
+                printer::print_query(&state_query)
+            );
+            Ok(AggregateStateRead {
+                result: count_result(source_name, branch as i64 + 1),
+                source_layout: count_layout(source_name),
+            })
+        };
 
         let chunks = prepare_branch_union_aggregate_first_refresh_chunks(
             select_sql,
@@ -1125,7 +1108,7 @@ mod tests {
         let first_calls =
             parse_calls("select region, count(*) as c from ice.sales.fact_a group by region");
         let pin = branch_pin();
-        let mut read = |_: &str, _: &AggregateSqlCalls, _: sqlparser::ast::Query| {
+        let mut read = |_: &str, _: &AggregateSqlCalls, _: ast::Query| {
             panic!("invalid branch shape must fail before reading")
         };
 

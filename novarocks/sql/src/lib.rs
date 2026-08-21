@@ -40,6 +40,7 @@ pub(crate) mod optimizer;
 pub(crate) mod analyzer;
 pub(crate) mod explain;
 pub(crate) mod planner;
+mod syntax_ast;
 
 #[cfg(test)]
 mod common_tests {

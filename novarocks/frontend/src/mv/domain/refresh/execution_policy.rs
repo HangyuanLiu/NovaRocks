@@ -51,7 +51,7 @@ pub fn select_join_incremental_execution_mode(
 
 #[cfg(test)]
 pub fn should_use_join_delta_append_only_fast_path(
-    query: &sqlparser::ast::Query,
+    query: &novarocks_parser::ast::Query,
     left_has_delete_changes: bool,
     right_has_delete_changes: bool,
 ) -> bool {

@@ -1514,15 +1514,12 @@ mod is_known_rule_name_tests {
         }
 
         let sql = "SELECT k1 FROM t1";
-        let dialect = crate::parser::dialect::StarRocksDialect;
-        let mut ast = sqlparser::parser::Parser::parse_sql(&dialect, sql).expect("parse query");
-        let stmt = ast.pop().expect("expected a statement");
-        let query = match stmt {
-            sqlparser::ast::Statement::Query(q) => q,
-            _ => panic!("expected a query"),
+        let statements = novarocks_parser::parse(sql).expect("parse query");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected a query");
         };
         let (resolved, cte_registry, mut factory) =
-            crate::analyzer::analyze(&query, &MinimalCatalog, "default").expect("analyze");
+            crate::analyzer::analyze(query, &MinimalCatalog, "default").expect("analyze");
         let logical =
             crate::planner::plan_query(resolved, cte_registry, &mut factory).expect("plan query");
         let hash_col = match &logical.kind {
@@ -1653,15 +1650,12 @@ mod is_known_rule_name_tests {
             WHERE rk <= 2
             ORDER BY region, amount DESC
         ";
-        let dialect = crate::parser::dialect::StarRocksDialect;
-        let mut ast = sqlparser::parser::Parser::parse_sql(&dialect, sql).expect("parse query");
-        let stmt = ast.pop().expect("expected a statement");
-        let query = match stmt {
-            sqlparser::ast::Statement::Query(q) => q,
-            _ => panic!("expected a query"),
+        let statements = novarocks_parser::parse(sql).expect("parse query");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected a query");
         };
         let (resolved, cte_registry, mut factory) =
-            crate::analyzer::analyze(&query, &RankingCatalog, "default").expect("analyze");
+            crate::analyzer::analyze(query, &RankingCatalog, "default").expect("analyze");
         let logical =
             crate::planner::plan_query(resolved, cte_registry, &mut factory).expect("plan query");
         let mut scalars = crate::optimizer::scalar::ScalarArena::new();
@@ -1766,17 +1760,12 @@ mod is_known_rule_name_tests {
         let sql = "SELECT k1 FROM t1 WHERE k1 = (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1)";
 
         // parse → analyze
-        let dialect = crate::parser::dialect::StarRocksDialect;
-        let mut ast = sqlparser::parser::Parser::parse_sql(&dialect, sql)
-            .map_err(|e| e.to_string())
-            .expect("parse must succeed");
-        let stmt = ast.pop().expect("expected a statement");
-        let query = match stmt {
-            sqlparser::ast::Statement::Query(q) => q,
-            _ => panic!("expected a query"),
+        let statements = novarocks_parser::parse(sql).expect("parse must succeed");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected a query");
         };
         let (resolved, cte_registry, mut factory) =
-            crate::analyzer::analyze(&query, &MinimalCatalog, "default")
+            crate::analyzer::analyze(query, &MinimalCatalog, "default")
                 .expect("analyze with apply framework must succeed");
 
         // plan_query: turns the ApplyScalarSpec into LogicalPlanKind::Apply.

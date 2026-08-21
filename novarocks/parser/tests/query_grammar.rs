@@ -58,6 +58,8 @@ fn query_forms_parse_and_print_as_typed_syntax() {
         "SELECT * FROM (((SELECT 1 UNION ALL SELECT 2))) AS source",
         "SELECT * FROM (SELECT 1) catalog",
         "EXPLAIN VERBOSE SELECT k1 FROM __nr_ivm_delta('orders', 0, 0)",
+        "EXPLAIN LOGICAL VERBOSE SELECT k1 FROM t",
+        "EXPLAIN LOGICAL COSTS SELECT k1 FROM t",
         "SELECT @@time_zone, @user_name",
         "SELECT 1 AS \"order count\"",
         "SELECT array_sortby((x) -> x.item, x)",

@@ -2193,12 +2193,12 @@ dependencies = [
  "hex",
  "md-5",
  "novarocks-catalog",
+ "novarocks-parser",
  "novarocks-spi",
  "novarocks-types",
  "serde",
  "serde_json",
  "sha2",
- "sqlparser",
  "tracing",
  "uuid",
 ]

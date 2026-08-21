@@ -49,6 +49,7 @@ pub(super) fn parse(
 
     if parser.current_is_keyword(Keyword::Explain) {
         let start = parser.consume_word("EXPLAIN")?;
+        let mut logical = false;
         let format = if parser.consume_if_word("ANALYZE") {
             ExplainFormat::Analyze
         } else if parser.consume_if_word("VERBOSE") {
@@ -56,13 +57,21 @@ pub(super) fn parse(
         } else if parser.consume_if_word("COSTS") {
             ExplainFormat::Costs
         } else if parser.consume_if_word("LOGICAL") {
-            ExplainFormat::Logical
+            logical = true;
+            if parser.consume_if_word("VERBOSE") {
+                ExplainFormat::Verbose
+            } else if parser.consume_if_word("COSTS") {
+                ExplainFormat::Costs
+            } else {
+                ExplainFormat::Default
+            }
         } else {
             ExplainFormat::Default
         };
         let query = parse_query(parser)?;
         return Ok(Some(Statement::ExplainQuery(ExplainQuery {
             format,
+            logical,
             span: Span::new(start.start(), query.span.end()),
             query: Box::new(query),
         })));

@@ -34,6 +34,8 @@ use crate::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
 use crate::planner::logical::LogicalPlanNode;
 use crate::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
+use novarocks_parser::Span;
+use novarocks_parser::ast;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -339,7 +341,7 @@ pub fn compile_mv_first_refresh_connector_write(
 /// already sealed by the compiler facade; the query is syntax only, not a
 /// logical or physical planner graph.
 pub struct SqlMvJoinFirstRefreshAnalyzeContext<'a> {
-    pub canonical_query: Box<sqlparser::ast::Query>,
+    pub canonical_query: Box<ast::Query>,
     pub rewrite_snapshot: crate::compiler::SqlImvRewriteSnapshotHandle,
     pub expected_root_hash_column: String,
     pub current_catalog: Option<String>,
@@ -469,7 +471,7 @@ pub enum SqlMvIncrementalWriteMode {
 /// no logical/optimized plan, factory, mutable DAG, lease, or lifecycle state
 /// can cross this API.
 pub struct SqlMvJoinIncrementalRefreshAnalyzeContext<'a> {
-    pub canonical_query: Box<sqlparser::ast::Query>,
+    pub canonical_query: Box<ast::Query>,
     pub rewrite_snapshot: crate::compiler::SqlImvRewriteSnapshotHandle,
     pub join_mode: SqlMvJoinIncrementalRefreshMode,
     pub write_mode: SqlMvIncrementalWriteMode,
@@ -590,7 +592,7 @@ pub fn compile_join_incremental_refresh_change_stream(
 /// provider-signed route facts are bound only after SQL has produced the
 /// complete change-stream producer.
 pub struct SqlMvIncrementalRefreshAnalyzeContext<'a> {
-    pub canonical_query: Box<sqlparser::ast::Query>,
+    pub canonical_query: Box<ast::Query>,
     pub imv_rewrite: crate::compiler::SqlImvPlanningInput,
     pub write_mode: SqlMvIncrementalWriteMode,
     pub routes: Vec<crate::planning::dml::DmlChangeStreamRoute>,
@@ -679,7 +681,7 @@ pub fn compile_mv_incremental_refresh_change_stream(
 
 #[allow(clippy::too_many_arguments)]
 fn canonical_incremental_change_stream_request<'a>(
-    query: sqlparser::ast::Query,
+    query: ast::Query,
     imv_rewrite: &'a crate::compiler::SqlImvPlanningInput,
     current_catalog: Option<String>,
     current_database: String,
@@ -708,11 +710,11 @@ fn canonical_incremental_change_stream_request<'a>(
 }
 
 fn alias_incremental_aggregate_group_key_projection(
-    query: &mut sqlparser::ast::Query,
+    query: &mut ast::Query,
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
 ) -> Result<(), String> {
     let (calls, layout) = snapshot.aggregate_shape_and_layout_for_execution()?;
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+    let ast::SetExpr::Select(select) = query.body.as_mut() else {
         return Err("aggregate MV incremental refresh SELECT body is required".to_string());
     };
     for (projection_index, output) in calls.visible_outputs.iter().enumerate() {
@@ -738,26 +740,31 @@ fn alias_incremental_aggregate_group_key_projection(
             format!("aggregate MV group key projection position {projection_index} is missing")
         })?;
         alias_incremental_select_projection_item(item, expected_name)?;
-        if let sqlparser::ast::GroupByExpr::Expressions(expressions, _) = &mut select.group_by
+        if let ast::GroupBy::Expressions { expressions, .. } = &mut select.group_by
             && let Some(group_expr) = expressions.get_mut(*group_key_index)
         {
-            *group_expr = sqlparser::ast::Expr::Identifier(incremental_alias_ident(expected_name));
+            *group_expr = ast::Expr::Identifier(incremental_alias_ident(expected_name));
         }
     }
     Ok(())
 }
 
 fn alias_incremental_select_projection_item(
-    item: &mut sqlparser::ast::SelectItem,
+    item: &mut ast::SelectItem,
     alias: &str,
 ) -> Result<(), String> {
-    use sqlparser::ast::SelectItem;
+    use ast::SelectItem;
 
     let alias = incremental_alias_ident(alias);
     match item {
         SelectItem::UnnamedExpr(expr) => {
             let expr = expr.clone();
-            *item = SelectItem::ExprWithAlias { expr, alias };
+            *item = SelectItem::ExprWithAlias {
+                expr,
+                alias,
+                explicit_as: true,
+                span: Span::new(0, 0),
+            };
             Ok(())
         }
         SelectItem::ExprWithAlias {
@@ -766,13 +773,13 @@ fn alias_incremental_select_projection_item(
             *existing = alias;
             Ok(())
         }
-        SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {
+        SelectItem::QualifiedWildcard { .. } | SelectItem::Wildcard { .. } => {
             Err("aggregate MV group key projection cannot be a wildcard".to_string())
         }
     }
 }
 
-fn incremental_alias_ident(alias: &str) -> sqlparser::ast::Ident {
+fn incremental_alias_ident(alias: &str) -> ast::Ident {
     let mut chars = alias.chars();
     let is_plain = chars
         .next()
@@ -780,9 +787,19 @@ fn incremental_alias_ident(alias: &str) -> sqlparser::ast::Ident {
         .unwrap_or(false)
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
     if is_plain {
-        sqlparser::ast::Ident::new(alias)
+        ast::Ident {
+            value: alias.to_string(),
+            quoted: false,
+            quote_style: None,
+            span: Span::new(0, 0),
+        }
     } else {
-        sqlparser::ast::Ident::with_quote('`', alias)
+        ast::Ident {
+            value: alias.to_string(),
+            quoted: true,
+            quote_style: Some('`'),
+            span: Span::new(0, 0),
+        }
     }
 }
 
@@ -1266,7 +1283,7 @@ const fn incremental_route_effect_code(route: i32) -> i64 {
     reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
 )]
 fn plain_join_first_refresh_logical_request<'a>(
-    query: sqlparser::ast::Query,
+    query: ast::Query,
     current_catalog: Option<String>,
     current_database: String,
     optimizer_settings: crate::compiler::SessionOptimizerSettings,
@@ -1885,7 +1902,7 @@ pub enum SqlMvFirstRefreshArtifactShape {
 /// alone selects the private state-shaping path and verifies that its root
 /// distribution matches the frozen target contract.
 pub struct SqlMvFirstRefreshArtifactBuilder {
-    select_sql: String,
+    select_query: ast::Query,
     pin: SqlMvSnapshotPin,
     current_catalog: Option<String>,
     current_database: String,
@@ -1896,14 +1913,14 @@ pub struct SqlMvFirstRefreshArtifactBuilder {
 impl SqlMvFirstRefreshArtifactBuilder {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
-        select_sql: String,
+        select_query: ast::Query,
         pin: SqlMvSnapshotPin,
         current_catalog: Option<String>,
         current_database: String,
         target_contract: MvFirstRefreshTargetContract,
         shape: SqlMvFirstRefreshArtifactShape,
     ) -> Result<Self, String> {
-        if select_sql.trim().is_empty() || current_database.trim().is_empty() {
+        if current_database.trim().is_empty() {
             return Err("invalid MV first-refresh artifact facts".to_string());
         }
         target_contract.validate_for_artifact()?;
@@ -1917,7 +1934,7 @@ impl SqlMvFirstRefreshArtifactBuilder {
             _ => {}
         }
         Ok(Self {
-            select_sql,
+            select_query,
             pin,
             current_catalog,
             current_database,
@@ -1932,7 +1949,7 @@ impl SqlMvFirstRefreshArtifactBuilder {
         let physical = match &self.shape {
             SqlMvFirstRefreshArtifactShape::Projection => {
                 prepare_projection_first_refresh_write_sql(
-                    &self.select_sql,
+                    &self.select_query,
                     &self.pin,
                     current_catalog,
                     &self.current_database,
@@ -1940,7 +1957,7 @@ impl SqlMvFirstRefreshArtifactBuilder {
             }
             SqlMvFirstRefreshArtifactShape::UnionProjection { branch_count } => {
                 prepare_union_projection_first_refresh_write_sql(
-                    &self.select_sql,
+                    &self.select_query,
                     *branch_count,
                     &self.pin,
                     current_catalog,
@@ -1953,7 +1970,7 @@ impl SqlMvFirstRefreshArtifactBuilder {
             } => {
                 let calls = private_aggregate_calls(calls);
                 prepare_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
-                    &self.select_sql,
+                    &self.select_query,
                     &calls,
                     &self.pin,
                     current_catalog,
@@ -1968,7 +1985,7 @@ impl SqlMvFirstRefreshArtifactBuilder {
             } => {
                 let calls = private_aggregate_calls(calls);
                 prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
-                    &self.select_sql,
+                    &self.select_query,
                     &calls,
                     &self.pin,
                     current_catalog,
@@ -1983,7 +2000,7 @@ impl SqlMvFirstRefreshArtifactBuilder {
             } => {
                 let calls = private_aggregate_calls(calls);
                 prepare_branch_union_aggregate_first_refresh_write_sql_with_target_schema(
-                    &self.select_sql,
+                    &self.select_query,
                     *branch_count,
                     &calls,
                     &self.pin,
@@ -2036,12 +2053,13 @@ fn private_aggregate_calls(calls: &crate::planning::mv::SqlMvAggregateCalls) -> 
 }
 
 pub(crate) fn prepare_projection_first_refresh_write_sql(
-    select_sql: &str,
+    select_query: &ast::Query,
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<SqlMvFirstRefreshArtifact, String> {
-    let sql = prepare_projection_full_read_sql(select_sql, pin, current_catalog, current_database)?;
+    let sql =
+        prepare_projection_full_read_sql(select_query, pin, current_catalog, current_database)?;
     Ok(SqlMvFirstRefreshArtifact::from_physical(
         MvFirstRefreshPhysicalSql {
             sql,
@@ -2051,14 +2069,14 @@ pub(crate) fn prepare_projection_first_refresh_write_sql(
 }
 
 pub(crate) fn prepare_union_projection_first_refresh_write_sql(
-    select_sql: &str,
+    select_query: &ast::Query,
     branch_count: usize,
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<SqlMvFirstRefreshArtifact, String> {
     let sql = prepare_union_projection_full_read_sql(
-        select_sql,
+        select_query,
         branch_count,
         pin,
         current_catalog,
@@ -2077,14 +2095,14 @@ pub(crate) fn prepare_union_projection_first_refresh_write_sql(
     reason = "The aggregate first-refresh SQL builder is retained for the staged application handoff."
 )]
 pub(crate) fn prepare_aggregate_first_refresh_write_sql(
-    select_sql: &str,
+    select_query: &ast::Query,
     calls: &SqlAggregateCalls,
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<SqlMvFirstRefreshArtifact, String> {
     prepare_aggregate_first_refresh_write_sql_with_target_schema(
-        select_sql,
+        select_query,
         calls,
         pin,
         current_catalog,
@@ -2098,7 +2116,7 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql(
     reason = "The schema-aware aggregate builder is retained for the staged first-refresh handoff."
 )]
 pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema(
-    select_sql: &str,
+    select_query: &ast::Query,
     calls: &SqlAggregateCalls,
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
@@ -2106,7 +2124,7 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema(
     target_schema: Option<&Schema>,
 ) -> Result<SqlMvFirstRefreshArtifact, String> {
     prepare_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
-        select_sql,
+        select_query,
         calls,
         pin,
         current_catalog,
@@ -2117,7 +2135,7 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema(
 }
 
 pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
-    select_sql: &str,
+    select_query: &ast::Query,
     calls: &SqlAggregateCalls,
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
@@ -2126,7 +2144,7 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema_and_i
     aggregate_input_types: Option<&[Option<DataType>]>,
 ) -> Result<SqlMvFirstRefreshArtifact, String> {
     let state_sql = prepare_aggregate_first_refresh_state_sql(
-        select_sql,
+        select_query,
         calls,
         pin,
         current_catalog,
@@ -2155,14 +2173,14 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema_and_i
     reason = "The fan-in aggregate builder is retained for the staged first-refresh handoff."
 )]
 pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql(
-    select_sql: &str,
+    select_query: &ast::Query,
     calls: &SqlAggregateCalls,
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<SqlMvFirstRefreshArtifact, String> {
     prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema(
-        select_sql,
+        select_query,
         calls,
         pin,
         current_catalog,
@@ -2176,7 +2194,7 @@ pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql(
     reason = "The schema-aware fan-in builder is retained for the staged first-refresh handoff."
 )]
 pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema(
-    select_sql: &str,
+    select_query: &ast::Query,
     calls: &SqlAggregateCalls,
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
@@ -2184,7 +2202,7 @@ pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schem
     target_schema: Option<&Schema>,
 ) -> Result<SqlMvFirstRefreshArtifact, String> {
     prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
-        select_sql,
+        select_query,
         calls,
         pin,
         current_catalog,
@@ -2195,7 +2213,7 @@ pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schem
 }
 
 pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
-    select_sql: &str,
+    select_query: &ast::Query,
     calls: &SqlAggregateCalls,
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
@@ -2204,7 +2222,7 @@ pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schem
     aggregate_input_types: Option<&[Option<DataType>]>,
 ) -> Result<SqlMvFirstRefreshArtifact, String> {
     prepare_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
-        select_sql,
+        select_query,
         calls,
         pin,
         current_catalog,
@@ -2223,14 +2241,14 @@ pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schem
     reason = "The composed aggregate builder is retained for the staged first-refresh handoff."
 )]
 pub(crate) fn prepare_composed_aggregate_first_refresh_write_sql(
-    select_sql: &str,
+    select_query: &ast::Query,
     calls: &SqlAggregateCalls,
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<SqlMvFirstRefreshArtifact, String> {
     prepare_aggregate_first_refresh_write_sql(
-        select_sql,
+        select_query,
         calls,
         pin,
         current_catalog,
@@ -2243,7 +2261,7 @@ pub(crate) fn prepare_composed_aggregate_first_refresh_write_sql(
     reason = "The branch-union aggregate builder is retained for the staged first-refresh handoff."
 )]
 pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql(
-    select_sql: &str,
+    select_query: &ast::Query,
     branch_count: usize,
     first_branch_calls: &SqlAggregateCalls,
     pin: &SqlMvSnapshotPin,
@@ -2251,7 +2269,7 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql(
     current_database: &str,
 ) -> Result<SqlMvFirstRefreshArtifact, String> {
     prepare_branch_union_aggregate_first_refresh_write_sql_with_target_schema(
-        select_sql,
+        select_query,
         branch_count,
         first_branch_calls,
         pin,
@@ -2262,7 +2280,7 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql(
 }
 
 pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql_with_target_schema(
-    select_sql: &str,
+    select_query: &ast::Query,
     branch_count: usize,
     first_branch_calls: &SqlAggregateCalls,
     pin: &SqlMvSnapshotPin,
@@ -2271,7 +2289,7 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql_with_target
     target_schema: Option<&Schema>,
 ) -> Result<SqlMvFirstRefreshArtifact, String> {
     let branches = prepare_branch_union_aggregate_first_refresh_state_sqls(
-        select_sql,
+        select_query,
         branch_count,
         first_branch_calls,
         pin,
@@ -2299,28 +2317,28 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql_with_target
 }
 
 fn prepare_aggregate_first_refresh_state_sql(
-    select_sql: &str,
+    select_query: &ast::Query,
     calls: &SqlAggregateCalls,
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<String, String> {
-    let state_sql = rewrite_select_sql_for_state(select_sql, calls)?;
-    pin_state_sql(&state_sql, pin, current_catalog, current_database)
+    let state_query = rewrite_select_sql_for_state(select_query, calls)?;
+    pin_state_sql(&state_query, pin, current_catalog, current_database)
 }
 
 fn prepare_branch_union_aggregate_first_refresh_state_sqls(
-    select_sql: &str,
+    select_query: &ast::Query,
     branch_count: usize,
     first_branch_calls: &SqlAggregateCalls,
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<Vec<(SqlAggregateCalls, String)>, String> {
-    branch_union_queries(select_sql, branch_count)?
+    branch_union_queries(select_query, branch_count)?
         .into_iter()
         .enumerate()
-        .map(|(branch_index, (branch_query, branch_sql))| {
+        .map(|(branch_index, (branch_query, _branch_sql))| {
             let branch_calls = SqlAggregateCalls::extract(&branch_query)?;
             if branch_index == 0 && &branch_calls != first_branch_calls {
                 return Err(
@@ -2329,7 +2347,7 @@ fn prepare_branch_union_aggregate_first_refresh_state_sqls(
                 );
             }
             let state_sql = prepare_aggregate_first_refresh_state_sql(
-                &branch_sql,
+                &branch_query,
                 &branch_calls,
                 pin,
                 current_catalog,
@@ -2558,6 +2576,14 @@ mod tests {
 
     use super::*;
 
+    fn parse_query(sql: &str) -> ast::Query {
+        let statements = novarocks_parser::parse(sql).expect("parse query");
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("fixture must be a query");
+        };
+        query.clone()
+    }
+
     fn sqlx2_target_binding() -> SqlTableBindingId {
         SqlTableBindingId::new(
             crate::binding::SqlTableBindingScopeId::new(NonZeroU64::new(701).unwrap()),
@@ -2606,15 +2632,11 @@ mod tests {
 
     #[test]
     fn join_first_refresh_canonical_request_avoids_imv_rewrite_and_terminal_is_sealed() {
-        let statement =
-            crate::parser::parse_normalized_sql_raw("SELECT 1").expect("parse canonical query");
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("fixture must be a query");
-        };
+        let query = parse_query("SELECT 1");
         let catalog = CanonicalCatalog;
         let functions = CanonicalFunctions;
         let request = plain_join_first_refresh_logical_request(
-            *query,
+            query,
             None,
             "db".to_string(),
             crate::compiler::SessionOptimizerSettings::default(),
@@ -2640,15 +2662,11 @@ mod tests {
 
     #[test]
     fn join_incremental_terminal_keeps_canonical_request_plain_and_sealed() {
-        let statement =
-            crate::parser::parse_normalized_sql_raw("SELECT 1").expect("parse canonical query");
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("fixture must be a query");
-        };
+        let query = parse_query("SELECT 1");
         let catalog = CanonicalCatalog;
         let functions = CanonicalFunctions;
         let request = plain_join_first_refresh_logical_request(
-            *query,
+            query,
             None,
             "db".to_string(),
             crate::compiler::SessionOptimizerSettings::default(),
@@ -2674,11 +2692,7 @@ mod tests {
 
     #[test]
     fn canonical_incremental_terminal_enables_only_sealed_imv_rewrite() {
-        let statement =
-            crate::parser::parse_normalized_sql_raw("SELECT 1").expect("parse canonical query");
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("fixture must be a query");
-        };
+        let query = parse_query("SELECT 1");
         let input = crate::compiler::SqlImvPlanningInput::new(
             crate::compiler::mv_rewrite::test_incremental_snapshot_handle(),
             crate::compiler::SqlImvRewriteValidation::None,
@@ -2686,7 +2700,7 @@ mod tests {
         let catalog = CanonicalCatalog;
         let functions = CanonicalFunctions;
         let request = canonical_incremental_change_stream_request(
-            *query,
+            query,
             &input,
             None,
             "db".to_string(),
@@ -2719,19 +2733,14 @@ mod tests {
 
     #[test]
     fn canonical_incremental_terminal_aliases_aggregate_group_keys_inside_sql() {
-        let statement =
-            crate::parser::parse_normalized_sql_raw("SELECT k, sum(v) FROM b GROUP BY k")
-                .expect("parse aggregate query");
-        let sqlparser::ast::Statement::Query(mut query) = statement else {
-            panic!("fixture must be a query");
-        };
+        let mut query = parse_query("SELECT k, sum(v) FROM b GROUP BY k");
         let snapshot = crate::compiler::mv_rewrite::test_aggregate_snapshot(Vec::new(), None, None);
         alias_incremental_aggregate_group_key_projection(&mut query, &snapshot)
             .expect("sealed aggregate snapshot aliases the canonical query");
-        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("fixture must retain SELECT body");
         };
-        let sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } = &select.projection[0] else {
+        let ast::SelectItem::ExprWithAlias { alias, .. } = &select.projection[0] else {
             panic!("group key must have SQL-owned alias");
         };
         assert_eq!(alias.value, "k");
@@ -2923,12 +2932,7 @@ mod tests {
     }
 
     fn aggregate_calls(sql: &str) -> crate::planning::mv::SqlMvAggregateCalls {
-        let normalized = crate::parser::dialect::normalize_for_raw_parse(sql).unwrap();
-        let statement = crate::parser::parse_normalized_sql_raw(&normalized).unwrap();
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("expected SELECT")
-        };
-        crate::planning::mv::extract_aggregate_sql_calls(&query).unwrap()
+        crate::planning::mv::extract_aggregate_sql_calls(&parse_query(sql)).unwrap()
     }
 
     fn aggregate_target_contract() -> MvFirstRefreshTargetContract {
@@ -2979,7 +2983,7 @@ mod tests {
         let branch_calls = aggregate_calls("SELECT k, sum(v) AS total FROM ice.db.a GROUP BY k");
 
         let projection = SqlMvFirstRefreshArtifactBuilder::try_new(
-            "SELECT v FROM ice.db.fact".to_string(),
+            parse_query("SELECT v FROM ice.db.fact"),
             pin(),
             Some("ice".to_string()),
             "db".to_string(),
@@ -2995,7 +2999,7 @@ mod tests {
         );
 
         let union = SqlMvFirstRefreshArtifactBuilder::try_new(
-            union_sql.to_string(),
+            parse_query(union_sql),
             union_pin.clone(),
             Some("ice".to_string()),
             "db".to_string(),
@@ -3011,7 +3015,7 @@ mod tests {
         );
 
         let aggregate = SqlMvFirstRefreshArtifactBuilder::try_new(
-            aggregate_sql.to_string(),
+            parse_query(aggregate_sql),
             pin(),
             Some("ice".to_string()),
             "db".to_string(),
@@ -3028,7 +3032,7 @@ mod tests {
 
         let fan_in_sql = "SELECT k, sum(v) AS total FROM (SELECT k, v FROM ice.db.a UNION ALL SELECT k, v FROM ice.db.b) AS input GROUP BY k";
         let fan_in = SqlMvFirstRefreshArtifactBuilder::try_new(
-            fan_in_sql.to_string(),
+            parse_query(fan_in_sql),
             union_pin.clone(),
             Some("ice".to_string()),
             "db".to_string(),
@@ -3044,7 +3048,7 @@ mod tests {
         assert_eq!(fan_in.root_hash_column(), SQL_MV_ROW_ID_COLUMN);
 
         let branch = SqlMvFirstRefreshArtifactBuilder::try_new(
-            branch_sql.to_string(),
+            parse_query(branch_sql),
             union_pin,
             Some("ice".to_string()),
             "db".to_string(),
@@ -3064,7 +3068,7 @@ mod tests {
     fn first_refresh_artifact_builder_fails_closed_for_malformed_facts() {
         assert!(
             SqlMvFirstRefreshArtifactBuilder::try_new(
-                "SELECT v FROM ice.db.fact".to_string(),
+                parse_query("SELECT v FROM ice.db.fact"),
                 pin(),
                 Some("ice".to_string()),
                 "db".to_string(),
@@ -3087,7 +3091,7 @@ mod tests {
         .unwrap();
         assert!(
             SqlMvFirstRefreshArtifactBuilder::try_new(
-                "SELECT v FROM ice.db.fact".to_string(),
+                parse_query("SELECT v FROM ice.db.fact"),
                 pin(),
                 Some("ice".to_string()),
                 "db".to_string(),
@@ -3110,7 +3114,7 @@ mod tests {
         .unwrap();
         assert!(
             SqlMvFirstRefreshArtifactBuilder::try_new(
-                "SELECT v FROM ice.db.fact".to_string(),
+                parse_query("SELECT v FROM ice.db.fact"),
                 pin(),
                 Some("ice".to_string()),
                 "db".to_string(),
@@ -3126,7 +3130,7 @@ mod tests {
     #[test]
     fn projection_keeps_pinned_hidden_apply_key_for_writer_distribution() {
         let prepared = prepare_projection_first_refresh_write_sql(
-            "SELECT v FROM ice.db.fact",
+            &parse_query("SELECT v FROM ice.db.fact"),
             &pin(),
             Some("ice"),
             "db",
@@ -3146,23 +3150,11 @@ mod tests {
 
     #[test]
     fn aggregate_uses_be_visible_and_state_projection() {
-        let normalized = crate::parser::dialect::normalize_for_raw_parse(
-            "SELECT k, sum(v) AS total FROM ice.db.fact GROUP BY k",
-        )
-        .unwrap();
-        let statement = crate::parser::parse_normalized_sql_raw(&normalized).unwrap();
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("expected SELECT")
-        };
+        let query = parse_query("SELECT k, sum(v) AS total FROM ice.db.fact GROUP BY k");
         let calls = SqlAggregateCalls::extract(&query).unwrap();
-        let prepared = prepare_aggregate_first_refresh_write_sql(
-            "SELECT k, sum(v) AS total FROM ice.db.fact GROUP BY k",
-            &calls,
-            &pin(),
-            Some("ice"),
-            "db",
-        )
-        .unwrap();
+        let prepared =
+            prepare_aggregate_first_refresh_write_sql(&query, &calls, &pin(), Some("ice"), "db")
+                .unwrap();
         assert_eq!(prepared.root_hash_column(), SQL_MV_ROW_ID_COLUMN);
         assert!(prepared.sql().contains("mv_group_row_id"));
         assert!(prepared.sql().contains("sum_state_visible"));
@@ -3173,19 +3165,20 @@ mod tests {
     #[test]
     fn fan_in_aggregate_remains_one_pinned_be_state_project() {
         let sql = "SELECT k, sum(v) AS total FROM (SELECT k, v FROM ice.db.a UNION ALL SELECT k, v FROM ice.db.b) AS input GROUP BY k";
-        let normalized = crate::parser::dialect::normalize_for_raw_parse(sql).unwrap();
-        let statement = crate::parser::parse_normalized_sql_raw(&normalized).unwrap();
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("expected SELECT")
-        };
+        let query = parse_query(sql);
         let calls = SqlAggregateCalls::extract(&query).unwrap();
         let pin = SqlMvSnapshotPin::from_entries_for_tests(&[
             ("ice.db.a", 11, "a-uuid"),
             ("ice.db.b", 22, "b-uuid"),
         ]);
-        let prepared =
-            prepare_fan_in_aggregate_first_refresh_write_sql(sql, &calls, &pin, Some("ice"), "db")
-                .unwrap();
+        let prepared = prepare_fan_in_aggregate_first_refresh_write_sql(
+            &query,
+            &calls,
+            &pin,
+            Some("ice"),
+            "db",
+        )
+        .unwrap();
         assert_eq!(prepared.root_hash_column(), SQL_MV_ROW_ID_COLUMN);
         assert!(prepared.sql().contains("VERSION AS OF 11"));
         assert!(prepared.sql().contains("VERSION AS OF 22"));
@@ -3195,11 +3188,7 @@ mod tests {
     #[test]
     fn fan_in_decimal_avg_freezes_input_scale_and_visible_type_in_be_sql() {
         let sql = "SELECT k, avg(d) AS a_d FROM (SELECT k, d FROM ice.db.a UNION ALL SELECT k, d FROM ice.db.b) AS input GROUP BY k";
-        let normalized = crate::parser::dialect::normalize_for_raw_parse(sql).unwrap();
-        let statement = crate::parser::parse_normalized_sql_raw(&normalized).unwrap();
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("expected SELECT")
-        };
+        let query = parse_query(sql);
         let calls = SqlAggregateCalls::extract(&query).unwrap();
         let target = Schema::new(vec![
             Field::new("k", DataType::Int32, true),
@@ -3207,7 +3196,7 @@ mod tests {
         ]);
         let prepared =
             prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
-                sql,
+                &query,
                 &calls,
                 &SqlMvSnapshotPin::from_entries_for_tests(&[
                     ("ice.db.a", 11, "a"),
@@ -3225,18 +3214,14 @@ mod tests {
     #[test]
     fn composed_aggregate_remains_one_pinned_be_state_project() {
         let sql = "SELECT a.k, count(*) AS total FROM ice.db.a AS a JOIN ice.db.b AS b ON a.k = b.k GROUP BY a.k";
-        let normalized = crate::parser::dialect::normalize_for_raw_parse(sql).unwrap();
-        let statement = crate::parser::parse_normalized_sql_raw(&normalized).unwrap();
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("expected SELECT")
-        };
+        let query = parse_query(sql);
         let calls = SqlAggregateCalls::extract(&query).unwrap();
         let pin = SqlMvSnapshotPin::from_entries_for_tests(&[
             ("ice.db.a", 11, "a-uuid"),
             ("ice.db.b", 22, "b-uuid"),
         ]);
         let prepared = prepare_composed_aggregate_first_refresh_write_sql(
-            sql,
+            &query,
             &calls,
             &pin,
             Some("ice"),

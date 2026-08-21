@@ -24,6 +24,9 @@ use crate::query_execution::kernels::{
     DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
 };
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_parser::ast::{
+    Ident, ObjectName as ParserObjectName, Query, SetExpr, TableAlias, TableFactor, TableWithJoins,
+};
 use novarocks_spi::connector::{ConnectorReadReferenceFacts, ConnectorReadReferenceKind};
 #[cfg(test)]
 use novarocks_sql::planning::catalog::SqlTestDeltaTableFacts;
@@ -117,10 +120,10 @@ fn project_iceberg_ref_metadata(
 
 /// Returns true if the query contains any `TableFactor::Table` node with a
 /// `version: Some(...)` clause. Used as a cheap pre-check before cloning.
-pub fn has_time_travel_refs(query: &sqlparser::ast::Query) -> bool {
+pub fn has_time_travel_refs(query: &Query) -> bool {
     if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
-            if has_time_travel_in_set_expr(cte.query.body.as_ref()) {
+        for cte in &with.ctes {
+            if has_time_travel_in_query(cte.query.as_ref()) {
                 return true;
             }
         }
@@ -128,9 +131,22 @@ pub fn has_time_travel_refs(query: &sqlparser::ast::Query) -> bool {
     has_time_travel_in_set_expr(query.body.as_ref())
 }
 
-fn has_time_travel_in_set_expr(expr: &sqlparser::ast::SetExpr) -> bool {
+fn has_time_travel_in_query(query: &Query) -> bool {
+    if let Some(with) = &query.with {
+        if with
+            .ctes
+            .iter()
+            .any(|cte| has_time_travel_in_query(cte.query.as_ref()))
+        {
+            return true;
+        }
+    }
+    has_time_travel_in_set_expr(query.body.as_ref())
+}
+
+fn has_time_travel_in_set_expr(expr: &SetExpr) -> bool {
     match expr {
-        sqlparser::ast::SetExpr::Select(select) => {
+        SetExpr::Select(select) => {
             for tw in &select.from {
                 if has_time_travel_in_factor(&tw.relation) {
                     return true;
@@ -143,22 +159,32 @@ fn has_time_travel_in_set_expr(expr: &sqlparser::ast::SetExpr) -> bool {
             }
             false
         }
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-            has_time_travel_in_set_expr(left) || has_time_travel_in_set_expr(right)
+        SetExpr::SetOperation(operation) => {
+            has_time_travel_in_set_expr(&operation.left)
+                || has_time_travel_in_set_expr(&operation.right)
         }
-        sqlparser::ast::SetExpr::Query(q) => has_time_travel_in_set_expr(q.body.as_ref()),
+        SetExpr::Query(q) => has_time_travel_in_query(q),
         _ => false,
     }
 }
 
-fn has_time_travel_in_factor(factor: &sqlparser::ast::TableFactor) -> bool {
+fn has_time_travel_in_factor(factor: &TableFactor) -> bool {
     match factor {
-        sqlparser::ast::TableFactor::Table { version, .. } => version.is_some(),
-        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
-            has_time_travel_in_set_expr(subquery.body.as_ref())
-        }
+        TableFactor::Table { version, .. } => version.is_some(),
+        TableFactor::Derived { subquery, .. } => has_time_travel_in_query(subquery),
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => has_time_travel_in_table_with_joins(table_with_joins),
         _ => false,
     }
+}
+
+fn has_time_travel_in_table_with_joins(table: &TableWithJoins) -> bool {
+    has_time_travel_in_factor(&table.relation)
+        || table
+            .joins
+            .iter()
+            .any(|join| has_time_travel_in_factor(&join.relation))
 }
 
 /// The exact leaf ports required to rewrite `FOR VERSION/TIMESTAMP AS OF`.
@@ -203,17 +229,44 @@ pub(crate) fn rewrite_time_travel_refs(
     resolver: &impl TimeTravelResolver,
     current_catalog: Option<&str>,
     current_database: &str,
-    query: &mut sqlparser::ast::Query,
+    query: &mut Query,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     // Walk CTEs
     if let Some(with) = &mut query.with {
-        for cte in &mut with.cte_tables {
-            rewrite_time_travel_in_set_expr(
+        for cte in &mut with.ctes {
+            rewrite_time_travel_in_query(
                 resolver,
                 current_catalog,
                 current_database,
-                cte.query.body.as_mut(),
+                cte.query.as_mut(),
+                connector_context,
+            )?;
+        }
+    }
+    rewrite_time_travel_in_set_expr(
+        resolver,
+        current_catalog,
+        current_database,
+        query.body.as_mut(),
+        connector_context,
+    )
+}
+
+fn rewrite_time_travel_in_query(
+    resolver: &impl TimeTravelResolver,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &mut Query,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), String> {
+    if let Some(with) = &mut query.with {
+        for cte in &mut with.ctes {
+            rewrite_time_travel_in_query(
+                resolver,
+                current_catalog,
+                current_database,
+                cte.query.as_mut(),
                 connector_context,
             )?;
         }
@@ -231,11 +284,11 @@ fn rewrite_time_travel_in_set_expr(
     resolver: &impl TimeTravelResolver,
     current_catalog: Option<&str>,
     current_database: &str,
-    expr: &mut sqlparser::ast::SetExpr,
+    expr: &mut SetExpr,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     match expr {
-        sqlparser::ast::SetExpr::Select(select) => {
+        SetExpr::Select(select) => {
             for tw in &mut select.from {
                 rewrite_time_travel_in_factor(
                     resolver,
@@ -256,27 +309,27 @@ fn rewrite_time_travel_in_set_expr(
             }
             Ok(())
         }
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+        SetExpr::SetOperation(operation) => {
             rewrite_time_travel_in_set_expr(
                 resolver,
                 current_catalog,
                 current_database,
-                left.as_mut(),
+                operation.left.as_mut(),
                 connector_context,
             )?;
             rewrite_time_travel_in_set_expr(
                 resolver,
                 current_catalog,
                 current_database,
-                right.as_mut(),
+                operation.right.as_mut(),
                 connector_context,
             )
         }
-        sqlparser::ast::SetExpr::Query(q) => rewrite_time_travel_in_set_expr(
+        SetExpr::Query(q) => rewrite_time_travel_in_query(
             resolver,
             current_catalog,
             current_database,
-            q.body.as_mut(),
+            q.as_mut(),
             connector_context,
         ),
         _ => Ok(()),
@@ -287,11 +340,11 @@ fn rewrite_time_travel_in_factor(
     resolver: &impl TimeTravelResolver,
     current_catalog: Option<&str>,
     current_database: &str,
-    factor: &mut sqlparser::ast::TableFactor,
+    factor: &mut TableFactor,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     match factor {
-        sqlparser::ast::TableFactor::Table {
+        TableFactor::Table {
             name,
             version,
             alias,
@@ -301,14 +354,9 @@ fn rewrite_time_travel_in_factor(
 
             // Extract name parts for our ObjectName lookup
             let parts: Vec<String> = name
-                .0
+                .parts
                 .iter()
-                .filter_map(|p| match p {
-                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
-                        Some(ident.value.to_ascii_lowercase())
-                    }
-                    _ => None,
-                })
+                .map(|ident| ident.value.to_ascii_lowercase())
                 .collect();
 
             if parts.is_empty() {
@@ -330,6 +378,7 @@ fn rewrite_time_travel_in_factor(
                 }
             }
 
+            let name_span = name.span;
             let our_name = ObjectName { parts };
             let target =
                 resolve_table_target(resolver, &our_name, current_catalog, current_database)?;
@@ -337,7 +386,11 @@ fn rewrite_time_travel_in_factor(
             if target.backend_name != "iceberg" {
                 return Err(format!(
                     "iceberg time travel: table '{}' is not an Iceberg table; time travel is only supported for Iceberg",
-                    our_name.parts.last().expect("checked nonempty table name")
+                    our_name
+                        .parts
+                        .last()
+                        .expect("checked nonempty table name")
+                        .as_str()
                 ));
             }
 
@@ -375,41 +428,83 @@ fn rewrite_time_travel_in_factor(
                     .parts
                     .last()
                     .expect("checked nonempty table name")
-                    .to_string();
-                *alias = Some(sqlparser::ast::TableAlias {
-                    name: sqlparser::ast::Ident::new(original_leaf),
+                    .clone();
+                *alias = Some(TableAlias {
+                    name: Ident {
+                        value: original_leaf,
+                        quoted: false,
+                        quote_style: None,
+                        span: name_span,
+                    },
                     columns: vec![],
-                    explicit: false,
+                    explicit_as: false,
+                    span: name_span,
                 });
             }
 
             // Route the synthetic analyzer identity through the canonical
             // connector catalog so the query catalog materializer resolves the
             // query-local binding above instead of consulting global state.
-            *name = sqlparser::ast::ObjectName(vec![
-                sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(
-                    target.catalog.clone(),
-                )),
-                sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(
-                    target.namespace.clone(),
-                )),
-                sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(
-                    synthetic_table_name,
-                )),
-            ]);
+            *name = ParserObjectName {
+                parts: vec![target.catalog, target.namespace, synthetic_table_name]
+                    .into_iter()
+                    .map(|value| Ident {
+                        value,
+                        quoted: false,
+                        quote_style: None,
+                        span: name_span,
+                    })
+                    .collect(),
+                span: name_span,
+            };
 
             Ok(())
         }
-        sqlparser::ast::TableFactor::Table { .. } => Ok(()),
-        sqlparser::ast::TableFactor::Derived { subquery, .. } => rewrite_time_travel_in_set_expr(
+        TableFactor::Table { .. } => Ok(()),
+        TableFactor::Derived { subquery, .. } => rewrite_time_travel_in_query(
             resolver,
             current_catalog,
             current_database,
-            subquery.body.as_mut(),
+            subquery.as_mut(),
+            connector_context,
+        ),
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => rewrite_time_travel_in_table_with_joins(
+            resolver,
+            current_catalog,
+            current_database,
+            table_with_joins,
             connector_context,
         ),
         _ => Ok(()),
     }
+}
+
+fn rewrite_time_travel_in_table_with_joins(
+    resolver: &impl TimeTravelResolver,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    table: &mut TableWithJoins,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), String> {
+    rewrite_time_travel_in_factor(
+        resolver,
+        current_catalog,
+        current_database,
+        &mut table.relation,
+        connector_context,
+    )?;
+    for join in &mut table.joins {
+        rewrite_time_travel_in_factor(
+            resolver,
+            current_catalog,
+            current_database,
+            &mut join.relation,
+            connector_context,
+        )?;
+    }
+    Ok(())
 }
 
 /// Resolve statement-level connector schema facts without registering a

@@ -506,16 +506,14 @@ mod tests {
     }
 
     fn test_count_layout() -> SqlMvAggregatePhysicalLayout {
-        let normalized = novarocks_sql::syntax::normalize_for_raw_parse(
+        let statements = novarocks_parser::parse(
             "select region, count(*) as c from ice.sales.fact group by region",
         )
-        .expect("normalize aggregate select");
-        let statement = novarocks_sql::syntax::parse_normalized_sql_raw(&normalized)
-            .expect("parse aggregate select");
-        let sqlparser::ast::Statement::Query(query) = statement else {
+        .expect("parse aggregate select");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
             panic!("expected query");
         };
-        let calls = extract_aggregate_sql_calls(&query).expect("extract aggregate calls");
+        let calls = extract_aggregate_sql_calls(query).expect("extract aggregate calls");
         let outputs = vec![
             OutputColumn {
                 column_id: ColumnId::UNSET,

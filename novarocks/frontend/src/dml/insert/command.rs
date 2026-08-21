@@ -16,8 +16,10 @@
 // under the License.
 
 use crate::query_execution::dml::insert::{InsertOverwriteMode, InsertTargetName, InsertValue};
-use novarocks_parser::ast::Insert;
-use sqlparser::ast as sqlast;
+use novarocks_parser::{
+    ast::{self, Insert},
+    printer,
+};
 
 /// Frontend application command produced from one SQLP-5 typed INSERT.
 #[derive(Clone, Debug, PartialEq)]
@@ -33,19 +35,11 @@ pub struct InsertCommand {
 pub enum InsertCommandSource {
     Values(Vec<Vec<InsertValue>>),
     SelectLiteralRow(Vec<InsertValue>),
-    FromQuery(Box<sqlast::Query>),
+    FromQuery(Box<ast::Query>),
 }
 
-/// Convert the typed statement plus already-lowered trailing query payload
-/// into the frontend-owned execution command.
-///
-/// Parsing `source_query` is deliberately outside this converter: SQLP-5
-/// determines the statement family and all INSERT capability facts before the
-/// SQLP-6 query IR is formed at the execution boundary.
-pub fn convert_insert_command(
-    insert: &Insert,
-    source_query: &sqlast::Query,
-) -> Result<InsertCommand, String> {
+/// Convert the typed INSERT statement into the frontend-owned execution command.
+pub fn convert_insert_command(insert: &Insert) -> Result<InsertCommand, String> {
     let target_parts = insert
         .target
         .parts
@@ -71,10 +65,10 @@ pub fn convert_insert_command(
         return Err("INSERT target is empty after overwrite normalization".to_string());
     }
 
-    let source = if should_route_insert_via_from_query(source_query) {
-        InsertCommandSource::FromQuery(Box::new(source_query.clone()))
+    let source = if should_route_insert_via_from_query(&insert.source) {
+        InsertCommandSource::FromQuery(Box::new(insert.source.clone()))
     } else {
-        convert_set_expr_to_source(source_query.body.as_ref())?
+        convert_set_expr_to_source(insert.source.body.as_ref())?
     };
 
     Ok(InsertCommand {
@@ -91,16 +85,16 @@ pub fn convert_insert_command(
     })
 }
 
-fn convert_set_expr_to_source(body: &sqlast::SetExpr) -> Result<InsertCommandSource, String> {
+fn convert_set_expr_to_source(body: &ast::SetExpr) -> Result<InsertCommandSource, String> {
     match body {
-        sqlast::SetExpr::Values(values) => Ok(InsertCommandSource::Values(
+        ast::SetExpr::Values(values) => Ok(InsertCommandSource::Values(
             values
                 .rows
                 .iter()
                 .map(|row| row.iter().map(expr_to_insert_value).collect())
                 .collect::<Result<Vec<_>, _>>()?,
         )),
-        sqlast::SetExpr::Select(select) => {
+        ast::SetExpr::Select(select) => {
             if !select.from.is_empty() {
                 return Err("INSERT SELECT with FROM must use the query pipeline".to_string());
             }
@@ -113,47 +107,35 @@ fn convert_set_expr_to_source(body: &sqlast::SetExpr) -> Result<InsertCommandSou
                     .collect::<Result<Vec<_>, _>>()?,
             ))
         }
-        sqlast::SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left,
-            right,
-        } => {
-            if !matches!(op, sqlast::SetOperator::Union) {
+        ast::SetExpr::SetOperation(operation) => {
+            if !matches!(operation.operator, ast::SetOperator::Union) {
                 return Err("INSERT SELECT set operation is only UNION ALL here".to_string());
             }
-            if !matches!(
-                set_quantifier,
-                sqlast::SetQuantifier::All | sqlast::SetQuantifier::AllByName
-            ) {
+            if !matches!(operation.quantifier, ast::SetQuantifier::All) {
                 return Err(
                     "INSERT SELECT UNION requires UNION ALL (UNION/UNION DISTINCT unsupported)"
                         .to_string(),
                 );
             }
             let mut rows = Vec::new();
-            flatten_literal_union_all(left, &mut rows)?;
-            flatten_literal_union_all(right, &mut rows)?;
+            flatten_literal_union_all(&operation.left, &mut rows)?;
+            flatten_literal_union_all(&operation.right, &mut rows)?;
             Ok(InsertCommandSource::Values(rows))
         }
-        sqlast::SetExpr::Query(query) => convert_set_expr_to_source(query.body.as_ref()),
-        _ => Err("unsupported INSERT source".to_string()),
+        ast::SetExpr::Query(query) => convert_set_expr_to_source(query.body.as_ref()),
     }
 }
 
 fn flatten_literal_union_all(
-    body: &sqlast::SetExpr,
+    body: &ast::SetExpr,
     out: &mut Vec<Vec<InsertValue>>,
 ) -> Result<(), String> {
-    if let sqlast::SetExpr::SetOperation {
-        op: sqlast::SetOperator::Union,
-        set_quantifier: sqlast::SetQuantifier::All | sqlast::SetQuantifier::AllByName,
-        left,
-        right,
-    } = body
+    if let ast::SetExpr::SetOperation(operation) = body
+        && matches!(operation.operator, ast::SetOperator::Union)
+        && matches!(operation.quantifier, ast::SetQuantifier::All)
     {
-        flatten_literal_union_all(left, out)?;
-        flatten_literal_union_all(right, out)
+        flatten_literal_union_all(&operation.left, out)?;
+        flatten_literal_union_all(&operation.right, out)
     } else {
         match convert_set_expr_to_source(body)? {
             InsertCommandSource::Values(rows) => out.extend(rows),
@@ -168,18 +150,18 @@ fn flatten_literal_union_all(
     }
 }
 
-fn should_route_insert_via_from_query(query: &sqlast::Query) -> bool {
+fn should_route_insert_via_from_query(query: &ast::Query) -> bool {
     query.with.is_some()
-        || query.order_by.is_some()
-        || query.limit_clause.is_some()
+        || !query.order_by.is_empty()
+        || query.limit.is_some()
+        || query.offset.is_some()
         || query.fetch.is_some()
-        || !query.locks.is_empty()
         || body_requires_pipeline(query.body.as_ref())
 }
 
-fn body_requires_pipeline(body: &sqlast::SetExpr) -> bool {
+fn body_requires_pipeline(body: &ast::SetExpr) -> bool {
     match body {
-        sqlast::SetExpr::Select(select) => {
+        ast::SetExpr::Select(select) => {
             !select.from.is_empty()
                 || select.projection.iter().any(|item| {
                     select_item_expr(item)
@@ -187,121 +169,134 @@ fn body_requires_pipeline(body: &sqlast::SetExpr) -> bool {
                         .is_err()
                 })
         }
-        sqlast::SetExpr::Values(values) => values
+        ast::SetExpr::Values(values) => values
             .rows
             .iter()
             .flatten()
             .any(|expr| expr_to_insert_value(expr).is_err()),
-        sqlast::SetExpr::Query(query) => should_route_insert_via_from_query(query),
-        sqlast::SetExpr::SetOperation { left, right, .. } => {
-            body_requires_pipeline(left) || body_requires_pipeline(right)
+        ast::SetExpr::Query(query) => should_route_insert_via_from_query(query),
+        ast::SetExpr::SetOperation(operation) => {
+            body_requires_pipeline(&operation.left) || body_requires_pipeline(&operation.right)
         }
-        _ => false,
     }
 }
 
-fn select_item_expr(item: &sqlast::SelectItem) -> Result<&sqlast::Expr, String> {
+fn select_item_expr(item: &ast::SelectItem) -> Result<&ast::Expr, String> {
     match item {
-        sqlast::SelectItem::UnnamedExpr(expr) | sqlast::SelectItem::ExprWithAlias { expr, .. } => {
+        ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => {
             Ok(expr)
         }
         _ => Err("INSERT SELECT source only supports expressions".to_string()),
     }
 }
 
-fn expr_to_insert_value(expr: &sqlast::Expr) -> Result<InsertValue, String> {
+fn expr_to_insert_value(expr: &ast::Expr) -> Result<InsertValue, String> {
     match expr {
-        sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => match value {
-            sqlast::Value::Null => Ok(InsertValue::Null),
-            sqlast::Value::Boolean(value) => Ok(InsertValue::Bool(*value)),
-            sqlast::Value::Number(value, _) => Ok(number_to_insert_value(value)),
-            sqlast::Value::SingleQuotedString(value) | sqlast::Value::DoubleQuotedString(value) => {
-                Ok(InsertValue::String(value.clone()))
-            }
-            sqlast::Value::HexStringLiteral(value) => {
+        ast::Expr::Literal(literal) => match &literal.kind {
+            ast::LiteralKind::Null => Ok(InsertValue::Null),
+            ast::LiteralKind::Boolean(value) => Ok(InsertValue::Bool(*value)),
+            ast::LiteralKind::Number(value) => Ok(number_to_insert_value(value)),
+            ast::LiteralKind::String(value) => Ok(InsertValue::String(value.clone())),
+            ast::LiteralKind::HexString(value) => {
                 let bytes = hex::decode(value)
                     .map_err(|error| format!("invalid hex literal X'{value}': {error}"))?;
                 Ok(InsertValue::String(
                     bytes.into_iter().map(char::from).collect(),
                 ))
             }
-            _ => Err(format!("unsupported literal in INSERT VALUES: {value}")),
         },
-        sqlast::Expr::UnaryOp {
-            op: sqlast::UnaryOperator::Minus,
-            expr,
-        } => negate_insert_value(expr_to_insert_value(expr)?),
-        sqlast::Expr::Nested(expr) => expr_to_insert_value(expr),
-        sqlast::Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } => {
-            if cast_data_type_is_decimal(data_type) {
+        ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Minus) => {
+            negate_insert_value(expr_to_insert_value(&unary.expression)?)
+        }
+        ast::Expr::Nested(nested) => expr_to_insert_value(&nested.expression),
+        ast::Expr::Cast(cast) => {
+            if cast_data_type_is_decimal(&cast.data_type) {
                 return Err(format!(
-                    "CAST to DECIMAL in INSERT SELECT requires pipeline evaluation: {expr}"
+                    "CAST to DECIMAL in INSERT SELECT requires pipeline evaluation: {}",
+                    printer::print_expr(expr)
                 ));
             }
-            expr_to_insert_value(inner)
+            expr_to_insert_value(&cast.expr)
         }
-        sqlast::Expr::TypedString(typed) => Ok(InsertValue::String(typed.value.to_string())),
-        sqlast::Expr::Identifier(ident) => Ok(InsertValue::String(ident.value.clone())),
-        sqlast::Expr::BinaryOp { left, op, right } => {
-            let left = expr_to_insert_value(left)?;
-            let right = expr_to_insert_value(right)?;
-            match (left, op, right) {
-                (InsertValue::Int(left), sqlast::BinaryOperator::Plus, InsertValue::Int(right)) => {
-                    left.checked_add(right)
-                        .map(InsertValue::Int)
-                        .ok_or_else(|| format!("integer literal overflow in `{expr}`"))
-                }
+        ast::Expr::TypedString(typed) => {
+            expr_to_insert_value(&ast::Expr::Literal(typed.value.clone()))
+        }
+        ast::Expr::Identifier(ident) => Ok(InsertValue::String(ident.value.clone())),
+        ast::Expr::Binary(binary) => {
+            let left = expr_to_insert_value(&binary.left)?;
+            let right = expr_to_insert_value(&binary.right)?;
+            match (left, binary.operator, right) {
+                (InsertValue::Int(left), ast::BinaryOperator::Add, InsertValue::Int(right)) => left
+                    .checked_add(right)
+                    .map(InsertValue::Int)
+                    .ok_or_else(|| {
+                        format!(
+                            "integer literal overflow in `{}`",
+                            printer::print_expr(expr)
+                        )
+                    }),
                 (
                     InsertValue::Int(left),
-                    sqlast::BinaryOperator::Minus,
+                    ast::BinaryOperator::Subtract,
                     InsertValue::Int(right),
                 ) => left
                     .checked_sub(right)
                     .map(InsertValue::Int)
-                    .ok_or_else(|| format!("integer literal overflow in `{expr}`")),
+                    .ok_or_else(|| {
+                        format!(
+                            "integer literal overflow in `{}`",
+                            printer::print_expr(expr)
+                        )
+                    }),
                 (
                     InsertValue::Int(left),
-                    sqlast::BinaryOperator::Multiply,
+                    ast::BinaryOperator::Multiply,
                     InsertValue::Int(right),
                 ) => left
                     .checked_mul(right)
                     .map(InsertValue::Int)
-                    .ok_or_else(|| format!("integer literal overflow in `{expr}`")),
+                    .ok_or_else(|| {
+                        format!(
+                            "integer literal overflow in `{}`",
+                            printer::print_expr(expr)
+                        )
+                    }),
+                (InsertValue::Float(left), ast::BinaryOperator::Add, InsertValue::Float(right)) => {
+                    Ok(InsertValue::Float(left + right))
+                }
                 (
                     InsertValue::Float(left),
-                    sqlast::BinaryOperator::Plus,
-                    InsertValue::Float(right),
-                ) => Ok(InsertValue::Float(left + right)),
-                (
-                    InsertValue::Float(left),
-                    sqlast::BinaryOperator::Minus,
+                    ast::BinaryOperator::Subtract,
                     InsertValue::Float(right),
                 ) => Ok(InsertValue::Float(left - right)),
-                _ => Err(format!("unsupported expression in INSERT VALUES: {expr}")),
+                _ => Err(format!(
+                    "unsupported expression in INSERT VALUES: {}",
+                    printer::print_expr(expr)
+                )),
             }
         }
-        sqlast::Expr::Array(sqlast::Array { elem, .. }) => Ok(InsertValue::Array(
-            elem.iter()
-                .map(expr_to_insert_value)
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        sqlast::Expr::Tuple(values) => Ok(InsertValue::Struct(
-            values
+        ast::Expr::Array(array) => Ok(InsertValue::Array(
+            array
+                .elements
                 .iter()
                 .map(expr_to_insert_value)
                 .collect::<Result<Vec<_>, _>>()?,
         )),
-        sqlast::Expr::Struct { values, .. } => Ok(InsertValue::Struct(
-            values
+        ast::Expr::Tuple(tuple) => Ok(InsertValue::Struct(
+            tuple
+                .expressions
                 .iter()
                 .map(expr_to_insert_value)
                 .collect::<Result<Vec<_>, _>>()?,
         )),
-        sqlast::Expr::Map(map) => Ok(InsertValue::Map(
+        ast::Expr::Struct(structure) => Ok(InsertValue::Struct(
+            structure
+                .fields
+                .iter()
+                .map(|field| expr_to_insert_value(&field.value))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        ast::Expr::Map(map) => Ok(InsertValue::Map(
             map.entries
                 .iter()
                 .map(|entry| {
@@ -312,14 +307,17 @@ fn expr_to_insert_value(expr: &sqlast::Expr) -> Result<InsertValue, String> {
                 })
                 .collect::<Result<Vec<_>, String>>()?,
         )),
-        sqlast::Expr::Function(function) => function_to_insert_value(function),
-        _ => Err(format!("unsupported expression in INSERT VALUES: {expr}")),
+        ast::Expr::FunctionCall(function) => function_to_insert_value(function),
+        _ => Err(format!(
+            "unsupported expression in INSERT VALUES: {}",
+            printer::print_expr(expr)
+        )),
     }
 }
 
-fn function_to_insert_value(function: &sqlast::Function) -> Result<InsertValue, String> {
-    let args = function_expr_args(&function.args)?;
-    let name = function.name.to_string().to_ascii_lowercase();
+fn function_to_insert_value(function: &ast::FunctionCall) -> Result<InsertValue, String> {
+    let args = function_expr_args(function)?;
+    let name = printer::print_object_name(&function.name).to_ascii_lowercase();
     match name.as_str() {
         "parse_json" => {
             if args.len() != 1 {
@@ -378,28 +376,25 @@ fn function_to_insert_value(function: &sqlast::Function) -> Result<InsertValue, 
         }
         _ => Err(format!(
             "unsupported expression in INSERT VALUES: {}",
-            sqlast::Expr::Function(function.clone())
+            printer::print_expr(&ast::Expr::FunctionCall(function.clone()))
         )),
     }
 }
 
-fn function_expr_args(args: &sqlast::FunctionArguments) -> Result<Vec<&sqlast::Expr>, String> {
-    match args {
-        sqlast::FunctionArguments::None => Ok(Vec::new()),
-        sqlast::FunctionArguments::List(list) => list
-            .args
-            .iter()
-            .map(|arg| match arg {
-                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(expr)) => Ok(expr),
-                other => Err(format!(
-                    "unsupported function argument in INSERT VALUES: {other}"
-                )),
-            })
-            .collect(),
-        other => Err(format!(
-            "unsupported function argument form in INSERT VALUES: {other}"
-        )),
+fn function_expr_args(function: &ast::FunctionCall) -> Result<Vec<&ast::Expr>, String> {
+    if !matches!(function.quantifier, ast::FunctionQuantifier::None)
+        || !function.order_by.is_empty()
+        || function.separator.is_some()
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+    {
+        return Err(format!(
+            "unsupported function modifiers in INSERT VALUES: {}",
+            printer::print_expr(&ast::Expr::FunctionCall(function.clone()))
+        ));
     }
+    Ok(function.arguments.iter().collect())
 }
 
 fn number_to_insert_value(value: &str) -> InsertValue {
@@ -430,15 +425,11 @@ fn negate_insert_value(value: InsertValue) -> Result<InsertValue, String> {
     }
 }
 
-fn cast_data_type_is_decimal(data_type: &sqlast::DataType) -> bool {
-    match data_type {
-        sqlast::DataType::Decimal(_) | sqlast::DataType::Dec(_) | sqlast::DataType::Numeric(_) => {
-            true
-        }
-        sqlast::DataType::Custom(name, _) => matches!(
-            name.to_string().to_ascii_lowercase().as_str(),
-            "decimal" | "decimal32" | "decimal64" | "decimal128"
-        ),
-        _ => false,
-    }
+fn cast_data_type_is_decimal(data_type: &ast::TypeName) -> bool {
+    matches!(
+        printer::print_object_name(&data_type.name)
+            .to_ascii_lowercase()
+            .as_str(),
+        "decimal" | "decimal32" | "decimal64" | "decimal128" | "dec" | "numeric"
+    )
 }

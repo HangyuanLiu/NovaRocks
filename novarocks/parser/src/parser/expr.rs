@@ -172,10 +172,38 @@ mod tests {
         ));
         assert!(matches!(parse("(SELECT 1) + 2"), Expr::Binary(_)));
         assert!(matches!(parse("[1, 2, 3]"), Expr::Array(_)));
+        let Expr::Array(typed_array) = parse("ARRAY<double>[0.25, 0.5]") else {
+            panic!("expected typed array literal");
+        };
+        assert_eq!(typed_array.elements.len(), 2);
+        assert_eq!(
+            typed_array
+                .element_type
+                .as_ref()
+                .and_then(|element_type| element_type.name.parts.last())
+                .map(|part| part.value.as_str()),
+            Some("double")
+        );
+        assert_eq!(
+            crate::printer::print_expr(&Expr::Array(typed_array.clone())),
+            "ARRAY<double>[0.25, 0.5]"
+        );
+        let hex = parse("X'AB01'");
+        let Expr::Literal(hex_literal) = &hex else {
+            panic!("expected hex literal");
+        };
+        assert_eq!(hex_literal.kind, LiteralKind::HexString("AB01".to_owned()));
+        assert_eq!(crate::printer::print_expr(&hex), "X'AB01'");
         assert!(matches!(parse("map{1: [2, 3], NULL: 4}"), Expr::Map(_)));
         assert!(matches!(parse("(a, b)"), Expr::Tuple(_)));
         assert!(matches!(
             parse("CAST(map{1: NULL} AS MAP<INT, ARRAY<INT>>)"),
+            Expr::Cast(_)
+        ));
+        assert!(matches!(
+            parse(
+                "CAST(row(1, [row(1, 1)], map{1: 1}) AS STRUCT<s1 INT, s2 ARRAY<STRUCT<a INT, b INT>>, s3 MAP<INT, INT>>)"
+            ),
             Expr::Cast(_)
         ));
         assert!(matches!(parse("items[1]"), Expr::Access(_)));

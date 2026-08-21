@@ -249,9 +249,10 @@ fn plan_iceberg_metadata_scan(
             rel.table.name
         ));
     }
-    let synthetic_name = format!("{}__nr_meta__", rel.table.name);
     let synthetic_table = TableDef {
-        name: synthetic_name,
+        // Metadata identity is already structured in `SqlScanKind::Metadata`;
+        // no normalizer-injected display-name marker is needed.
+        name: rel.table.name,
         columns: rel.table.columns,
         iceberg_row_lineage_metadata_columns: vec![],
         source: ScanSource::Sql(source),

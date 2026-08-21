@@ -22,6 +22,7 @@ pub mod refresh_property;
 use std::collections::HashSet;
 
 use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_parser::ast::{Ident, Query, SetExpr, TableFactor, TableWithJoins};
 use novarocks_sql::planning::mv::{
     SqlMvOutputColumnFacts, SqlResolvedMvRefreshInput, SqlResolvedMvRefreshInputSource,
     strip_catalog_from_three_part_names,
@@ -52,7 +53,7 @@ pub struct MvAnalysis {
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedMvSelect {
     resolved_refs: Vec<ResolvedTableRef>,
-    query_for_analysis: sqlparser::ast::Query,
+    query_for_analysis: Query,
 }
 
 impl PreparedMvSelect {
@@ -60,7 +61,7 @@ impl PreparedMvSelect {
         &self.resolved_refs
     }
 
-    pub(crate) fn query_for_analysis(&self) -> &sqlparser::ast::Query {
+    pub(crate) fn query_for_analysis(&self) -> &Query {
         &self.query_for_analysis
     }
 }
@@ -70,7 +71,7 @@ impl PreparedMvSelect {
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 pub(crate) fn prepare_mv_select(
-    query: &sqlparser::ast::Query,
+    query: &Query,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<PreparedMvSelect, String> {
@@ -82,7 +83,7 @@ pub(crate) fn prepare_mv_select(
 /// local-catalog adapter, this retains three-part identities so each relation
 /// is materialized under its own request-local connector binding.
 pub(crate) fn prepare_mv_select_for_catalog_provider(
-    query: &sqlparser::ast::Query,
+    query: &Query,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<PreparedMvSelect, String> {
@@ -90,7 +91,7 @@ pub(crate) fn prepare_mv_select_for_catalog_provider(
 }
 
 fn prepare_mv_select_with_catalog_paths(
-    query: &sqlparser::ast::Query,
+    query: &Query,
     current_catalog: Option<&str>,
     current_database: &str,
     retain_catalog_paths: bool,
@@ -129,7 +130,7 @@ where
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 pub(crate) fn analyze_mv_select_with<Register, Analyze, T>(
-    query: &sqlparser::ast::Query,
+    query: &Query,
     current_catalog: Option<&str>,
     current_database: &str,
     register: Register,
@@ -137,7 +138,7 @@ pub(crate) fn analyze_mv_select_with<Register, Analyze, T>(
 ) -> Result<MvAnalysis, String>
 where
     Register: FnOnce(&[ResolvedTableRef]) -> Result<(), String>,
-    Analyze: FnOnce(&sqlparser::ast::Query) -> Result<T, String>,
+    Analyze: FnOnce(&Query) -> Result<T, String>,
     T: SqlResolvedMvRefreshInputSource,
 {
     let prepared = prepare_mv_select(query, current_catalog, current_database)?;
@@ -146,107 +147,54 @@ where
     Ok(finish_mv_analysis(prepared, source))
 }
 
-fn validate_mv_select_raw_query_clauses(query: &sqlparser::ast::Query) -> Result<(), String> {
+fn validate_mv_select_raw_query_clauses(query: &Query) -> Result<(), String> {
     if query.with.is_some() {
         return Err(unsupported_mv_query_clause("WITH"));
     }
-    if query.order_by.is_some() {
+    if !query.order_by.is_empty() {
         return Err(unsupported_mv_query_clause("ORDER BY"));
     }
-    if query.limit_clause.is_some() {
+    if query.limit.is_some() || query.offset.is_some() {
         return Err(unsupported_mv_query_clause("LIMIT or OFFSET"));
     }
     if query.fetch.is_some() {
         return Err(unsupported_mv_query_clause("FETCH"));
     }
-    if !query.locks.is_empty() {
-        return Err(unsupported_mv_query_clause("locking clauses"));
-    }
-    if query.for_clause.is_some() {
-        return Err(unsupported_mv_query_clause("FOR clauses"));
-    }
-    if query.settings.is_some() {
-        return Err(unsupported_mv_query_clause("SETTINGS"));
-    }
-    if query.format_clause.is_some() {
-        return Err(unsupported_mv_query_clause("FORMAT"));
-    }
-    if !query.pipe_operators.is_empty() {
-        return Err(unsupported_mv_query_clause("pipe operators"));
-    }
     validate_mv_select_raw_clauses_in_set_expr(query.body.as_ref())
 }
 
-fn validate_mv_select_raw_clauses_in_set_expr(
-    expr: &sqlparser::ast::SetExpr,
-) -> Result<(), String> {
+fn validate_mv_select_raw_clauses_in_set_expr(expr: &SetExpr) -> Result<(), String> {
     match expr {
-        sqlparser::ast::SetExpr::Select(select) => {
+        SetExpr::Select(select) => {
             validate_mv_select_raw_select_clauses(select)?;
             for from in &select.from {
                 validate_mv_select_raw_clauses_in_table_with_joins(from)?;
             }
             Ok(())
         }
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-            validate_mv_select_raw_clauses_in_set_expr(left.as_ref())?;
-            validate_mv_select_raw_clauses_in_set_expr(right.as_ref())
+        SetExpr::SetOperation(operation) => {
+            validate_mv_select_raw_clauses_in_set_expr(operation.left.as_ref())?;
+            validate_mv_select_raw_clauses_in_set_expr(operation.right.as_ref())
         }
-        sqlparser::ast::SetExpr::Query(query) => validate_mv_select_raw_query_clauses(query),
-        sqlparser::ast::SetExpr::Values(_)
-        | sqlparser::ast::SetExpr::Insert(_)
-        | sqlparser::ast::SetExpr::Update(_)
-        | sqlparser::ast::SetExpr::Delete(_)
-        | sqlparser::ast::SetExpr::Merge(_)
-        | sqlparser::ast::SetExpr::Table(_) => Ok(()),
+        SetExpr::Query(query) => validate_mv_select_raw_query_clauses(query),
+        SetExpr::Values(_) => Ok(()),
     }
 }
 
-fn validate_mv_select_raw_select_clauses(select: &sqlparser::ast::Select) -> Result<(), String> {
-    if select.select_modifiers.is_some() {
-        return Err(unsupported_mv_select_clause("SELECT modifiers"));
-    }
-    if select.top.is_some() {
-        return Err(unsupported_mv_select_clause("TOP"));
-    }
-    if select.exclude.is_some() {
-        return Err(unsupported_mv_select_clause("EXCLUDE"));
-    }
-    if select.into.is_some() {
-        return Err(unsupported_mv_select_clause("SELECT INTO"));
-    }
-    if !select.lateral_views.is_empty() {
-        return Err(unsupported_mv_select_clause("LATERAL VIEW"));
-    }
-    if select.prewhere.is_some() {
-        return Err(unsupported_mv_select_clause("PREWHERE"));
-    }
-    if !select.connect_by.is_empty() {
-        return Err(unsupported_mv_select_clause("CONNECT BY"));
-    }
-    if !select.cluster_by.is_empty() {
-        return Err(unsupported_mv_select_clause("CLUSTER BY"));
-    }
-    if !select.distribute_by.is_empty() {
-        return Err(unsupported_mv_select_clause("DISTRIBUTE BY"));
-    }
-    if !select.sort_by.is_empty() {
-        return Err(unsupported_mv_select_clause("SORT BY"));
-    }
-    if !select.named_window.is_empty() {
+fn validate_mv_select_raw_select_clauses(
+    select: &novarocks_parser::ast::Select,
+) -> Result<(), String> {
+    if !select.windows.is_empty() {
         return Err(unsupported_mv_select_clause("named WINDOW clauses"));
     }
     if select.qualify.is_some() {
         return Err(unsupported_mv_select_clause("QUALIFY"));
     }
-    if select.value_table_mode.is_some() {
-        return Err(unsupported_mv_select_clause("SELECT AS VALUE or STRUCT"));
-    }
     Ok(())
 }
 
 fn validate_mv_select_raw_clauses_in_table_with_joins(
-    table: &sqlparser::ast::TableWithJoins,
+    table: &TableWithJoins,
 ) -> Result<(), String> {
     validate_mv_select_raw_clauses_in_factor(&table.relation)?;
     for join in &table.joins {
@@ -255,76 +203,29 @@ fn validate_mv_select_raw_clauses_in_table_with_joins(
     Ok(())
 }
 
-fn validate_mv_select_raw_clauses_in_factor(
-    factor: &sqlparser::ast::TableFactor,
-) -> Result<(), String> {
+fn validate_mv_select_raw_clauses_in_factor(factor: &TableFactor) -> Result<(), String> {
     match factor {
-        sqlparser::ast::TableFactor::Table {
-            args,
-            with_hints,
-            version,
-            with_ordinality,
-            partitions,
-            json_path,
-            sample,
-            index_hints,
-            ..
-        } => {
-            if args.is_some() {
-                return Err(unsupported_mv_from_clause("table function arguments"));
-            }
-            if !with_hints.is_empty() {
+        TableFactor::Table { hints, version, .. } => {
+            if !hints.is_empty() {
                 return Err(unsupported_mv_from_clause("table hints"));
             }
             if version.is_some() {
                 return Err(unsupported_mv_from_clause("table version qualifiers"));
             }
-            if *with_ordinality {
-                return Err(unsupported_mv_from_clause("WITH ORDINALITY"));
-            }
-            if !partitions.is_empty() {
-                return Err(unsupported_mv_from_clause("partition selection"));
-            }
-            if json_path.is_some() {
-                return Err(unsupported_mv_from_clause("JSON path table access"));
-            }
-            if sample.is_some() {
-                return Err(unsupported_mv_from_clause("TABLESAMPLE"));
-            }
-            if !index_hints.is_empty() {
-                return Err(unsupported_mv_from_clause("index hints"));
-            }
             Ok(())
         }
-        sqlparser::ast::TableFactor::Derived {
-            lateral,
-            subquery,
-            sample,
-            ..
+        TableFactor::Derived {
+            lateral, subquery, ..
         } => {
             if *lateral {
                 return Err(unsupported_mv_from_clause("LATERAL derived tables"));
             }
-            if sample.is_some() {
-                return Err(unsupported_mv_from_clause("TABLESAMPLE"));
-            }
             validate_mv_select_raw_query_clauses(subquery)
         }
-        sqlparser::ast::TableFactor::NestedJoin {
+        TableFactor::NestedJoin {
             table_with_joins, ..
         } => validate_mv_select_raw_clauses_in_table_with_joins(table_with_joins),
-        sqlparser::ast::TableFactor::Pivot { table, .. }
-        | sqlparser::ast::TableFactor::Unpivot { table, .. }
-        | sqlparser::ast::TableFactor::MatchRecognize { table, .. } => {
-            validate_mv_select_raw_clauses_in_factor(table)
-        }
-        sqlparser::ast::TableFactor::TableFunction { .. }
-        | sqlparser::ast::TableFactor::Function { .. }
-        | sqlparser::ast::TableFactor::UNNEST { .. }
-        | sqlparser::ast::TableFactor::JsonTable { .. }
-        | sqlparser::ast::TableFactor::OpenJsonTable { .. }
-        | sqlparser::ast::TableFactor::XmlTable { .. }
-        | sqlparser::ast::TableFactor::SemanticView { .. } => {
+        TableFactor::TableFunction { .. } | TableFactor::Unnest { .. } => {
             Err(unsupported_mv_from_clause("table functions"))
         }
     }
@@ -342,11 +243,20 @@ fn unsupported_mv_from_clause(clause: &str) -> String {
     format!("materialized view SELECT does not support {clause} in FROM")
 }
 
+fn synthetic_ident(value: impl Into<String>, span: novarocks_parser::Span) -> Ident {
+    Ident {
+        value: value.into(),
+        quoted: false,
+        quote_style: None,
+        span,
+    }
+}
+
 pub fn canonicalize_iceberg_mv_select_query(
-    query: &sqlparser::ast::Query,
+    query: &Query,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> sqlparser::ast::Query {
+) -> Query {
     let mut query = query.clone();
     let Some(catalog) = current_catalog else {
         return query;
@@ -359,13 +269,9 @@ pub fn canonicalize_iceberg_mv_select_query(
     query
 }
 
-fn qualify_current_catalog_refs_in_query(
-    query: &mut sqlparser::ast::Query,
-    catalog: &str,
-    current_database: &str,
-) {
+fn qualify_current_catalog_refs_in_query(query: &mut Query, catalog: &str, current_database: &str) {
     if let Some(with) = &mut query.with {
-        for cte in &mut with.cte_tables {
+        for cte in &mut with.ctes {
             qualify_current_catalog_refs_in_set_expr(
                 cte.query.body.as_mut(),
                 catalog,
@@ -377,12 +283,12 @@ fn qualify_current_catalog_refs_in_query(
 }
 
 fn qualify_current_catalog_refs_in_set_expr(
-    expr: &mut sqlparser::ast::SetExpr,
+    expr: &mut SetExpr,
     catalog: &str,
     current_database: &str,
 ) {
     match expr {
-        sqlparser::ast::SetExpr::Select(select) => {
+        SetExpr::Select(select) => {
             for from in &mut select.from {
                 qualify_current_catalog_refs_in_factor(
                     &mut from.relation,
@@ -398,11 +304,19 @@ fn qualify_current_catalog_refs_in_set_expr(
                 }
             }
         }
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-            qualify_current_catalog_refs_in_set_expr(left.as_mut(), catalog, current_database);
-            qualify_current_catalog_refs_in_set_expr(right.as_mut(), catalog, current_database);
+        SetExpr::SetOperation(operation) => {
+            qualify_current_catalog_refs_in_set_expr(
+                operation.left.as_mut(),
+                catalog,
+                current_database,
+            );
+            qualify_current_catalog_refs_in_set_expr(
+                operation.right.as_mut(),
+                catalog,
+                current_database,
+            );
         }
-        sqlparser::ast::SetExpr::Query(query) => {
+        SetExpr::Query(query) => {
             qualify_current_catalog_refs_in_set_expr(
                 query.body.as_mut(),
                 catalog,
@@ -414,21 +328,16 @@ fn qualify_current_catalog_refs_in_set_expr(
 }
 
 fn qualify_current_catalog_refs_in_factor(
-    factor: &mut sqlparser::ast::TableFactor,
+    factor: &mut TableFactor,
     catalog: &str,
     current_database: &str,
 ) {
     match factor {
-        sqlparser::ast::TableFactor::Table { name, .. } => {
+        TableFactor::Table { name, .. } => {
             let parts = name
-                .0
+                .parts
                 .iter()
-                .filter_map(|part| match part {
-                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
-                        Some(ident.value.to_ascii_lowercase())
-                    }
-                    _ => None,
-                })
+                .map(|ident| ident.value.to_ascii_lowercase())
                 .collect::<Vec<_>>();
             let qualified = match parts.as_slice() {
                 [table] => Some((
@@ -440,16 +349,14 @@ fn qualify_current_catalog_refs_in_factor(
                 _ => None,
             };
             if let Some((catalog, namespace, table)) = qualified {
-                name.0 = vec![
-                    sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(catalog)),
-                    sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(
-                        namespace,
-                    )),
-                    sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(table)),
+                name.parts = vec![
+                    synthetic_ident(catalog, name.span),
+                    synthetic_ident(namespace, name.span),
+                    synthetic_ident(table, name.span),
                 ];
             }
         }
-        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+        TableFactor::Derived { subquery, .. } => {
             qualify_current_catalog_refs_in_set_expr(
                 subquery.body.as_mut(),
                 catalog,
@@ -550,13 +457,13 @@ fn mv_partition_source_column(field: &IcebergPartitionFieldExpr) -> &str {
 }
 
 fn collect_table_refs_from_query(
-    query: &sqlparser::ast::Query,
+    query: &Query,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Vec<ResolvedTableRef> {
     let mut refs = Vec::new();
     if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
+        for cte in &with.ctes {
             collect_table_refs_from_set_expr(
                 cte.query.body.as_ref(),
                 current_catalog,
@@ -575,13 +482,13 @@ fn collect_table_refs_from_query(
 }
 
 fn collect_table_refs_from_set_expr(
-    expr: &sqlparser::ast::SetExpr,
+    expr: &SetExpr,
     current_catalog: Option<&str>,
     current_database: &str,
     refs: &mut Vec<ResolvedTableRef>,
 ) {
     match expr {
-        sqlparser::ast::SetExpr::Select(select) => {
+        SetExpr::Select(select) => {
             for from in &select.from {
                 collect_table_refs_from_factor(
                     &from.relation,
@@ -599,11 +506,21 @@ fn collect_table_refs_from_set_expr(
                 }
             }
         }
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-            collect_table_refs_from_set_expr(left, current_catalog, current_database, refs);
-            collect_table_refs_from_set_expr(right, current_catalog, current_database, refs);
+        SetExpr::SetOperation(operation) => {
+            collect_table_refs_from_set_expr(
+                &operation.left,
+                current_catalog,
+                current_database,
+                refs,
+            );
+            collect_table_refs_from_set_expr(
+                &operation.right,
+                current_catalog,
+                current_database,
+                refs,
+            );
         }
-        sqlparser::ast::SetExpr::Query(query) => {
+        SetExpr::Query(query) => {
             collect_table_refs_from_set_expr(
                 query.body.as_ref(),
                 current_catalog,
@@ -616,22 +533,17 @@ fn collect_table_refs_from_set_expr(
 }
 
 fn collect_table_refs_from_factor(
-    factor: &sqlparser::ast::TableFactor,
+    factor: &TableFactor,
     current_catalog: Option<&str>,
     current_database: &str,
     refs: &mut Vec<ResolvedTableRef>,
 ) {
     match factor {
-        sqlparser::ast::TableFactor::Table { name, .. } => {
+        TableFactor::Table { name, .. } => {
             let parts: Vec<String> = name
-                .0
+                .parts
                 .iter()
-                .filter_map(|part| match part {
-                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
-                        Some(ident.value.to_ascii_lowercase())
-                    }
-                    _ => None,
-                })
+                .map(|ident| ident.value.to_ascii_lowercase())
                 .collect();
             let resolved = match parts.as_slice() {
                 [catalog, namespace, table] => ResolvedTableRef::Iceberg {
@@ -671,9 +583,9 @@ fn collect_table_refs_from_factor(
                 refs.push(resolved);
             }
         }
-        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+        TableFactor::Derived { subquery, .. } => {
             if let Some(with) = &subquery.with {
-                for cte in &with.cte_tables {
+                for cte in &with.ctes {
                     collect_table_refs_from_set_expr(
                         cte.query.body.as_ref(),
                         current_catalog,
@@ -714,16 +626,18 @@ pub(crate) fn output_column_to_table_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_parser::printer::Printer;
 
-    fn parse_query(sql: &str) -> sqlparser::ast::Query {
-        let normalized =
-            novarocks_sql::syntax::normalize_for_raw_parse(sql).expect("normalize query");
-        let statement =
-            novarocks_sql::syntax::parse_normalized_sql_raw(&normalized).expect("parse query");
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!("expected query")
+    fn parse_query(sql: &str) -> Query {
+        let statements = novarocks_parser::parse(sql).expect("parse query");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected query");
         };
-        *query
+        query.clone()
+    }
+
+    fn render_query(query: &Query) -> String {
+        Printer::new().statement(&novarocks_parser::ast::Statement::Query(query.clone()))
     }
 
     #[test]
@@ -758,10 +672,7 @@ mod tests {
                 },
             ]
         );
-        let analysis_sql = prepared
-            .query_for_analysis()
-            .to_string()
-            .to_ascii_lowercase();
+        let analysis_sql = render_query(prepared.query_for_analysis()).to_ascii_lowercase();
         assert!(analysis_sql.contains("sales.first"), "{analysis_sql}");
         assert!(analysis_sql.contains("sales.second"), "{analysis_sql}");
         assert!(!analysis_sql.contains("ice.sales"), "{analysis_sql}");
@@ -775,10 +686,7 @@ mod tests {
 
         let prepared = prepare_mv_select_for_catalog_provider(&query, Some("ice"), "sales")
             .expect("prepare query");
-        let analysis_sql = prepared
-            .query_for_analysis()
-            .to_string()
-            .to_ascii_lowercase();
+        let analysis_sql = render_query(prepared.query_for_analysis()).to_ascii_lowercase();
 
         assert!(analysis_sql.contains("ice.sales.first"), "{analysis_sql}");
         assert!(
@@ -840,8 +748,11 @@ mod tests {
         let query =
             parse_query("SELECT o.id FROM Orders o JOIN Marketing.Customers c ON o.id = c.id");
 
-        let canonical =
-            canonicalize_iceberg_mv_select_query(&query, Some("ICE"), "Sales").to_string();
+        let canonical = render_query(&canonicalize_iceberg_mv_select_query(
+            &query,
+            Some("ICE"),
+            "Sales",
+        ));
         let canonical = canonical.to_ascii_lowercase();
 
         assert!(canonical.contains("ice.sales.orders"), "{canonical}");

@@ -20,7 +20,10 @@ use crate::view::{
     CreateExternalViewRequest, ViewEngine, ViewRequestContext, ViewStatementResult, ViewTarget,
 };
 use novarocks_catalog::identifier::normalize_identifier;
-use novarocks_parser::ast::{CreateView, ObjectName};
+use novarocks_parser::{
+    ast::{CreateView, ObjectName},
+    printer,
+};
 use novarocks_spi::connector::DropPolicy;
 
 use super::{DEFAULT_CATALOG, build_query_result};
@@ -73,7 +76,7 @@ pub(super) fn create_external_view(
         .ok_or_else(|| "external view mutation requires connector request context".to_string())?;
 
     let definition = PersistedQueryDefinition::new(
-        statement.query.text.clone(),
+        printer::print_query(&statement.query),
         PersistedQueryDialect::StarRocks,
         context.current_catalog.unwrap_or(DEFAULT_CATALOG),
         context.current_database,

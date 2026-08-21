@@ -35,30 +35,11 @@ use crate::query_execution::dml::external_write_fence::{
 };
 use crate::query_execution::dml::iceberg_writer;
 use crate::query_execution::kernels::DmlExecutionKernel;
-use novarocks_parser::ast::{Insert, RawQuerySlice};
+use novarocks_parser::ast::{Insert, Query};
 use novarocks_protocol::lifecycle::QueryOptions;
-use novarocks_sql::planning::dml::parse_raw_statement;
 use novarocks_sql::syntax::{Literal, ObjectName};
 
 pub use crate::query_execution::dml::iceberg_writer::PreparedIcebergWriteNativeEncoding;
-
-/// Convert the SQLP-5-owned trailing query payload into the existing SQLP-6
-/// query IR at the execution boundary.
-///
-/// The surrounding INSERT family, target, columns, and overwrite semantics
-/// have already been decided by the typed AST. This function must not be used
-/// to re-classify a statement or make capability decisions.
-pub fn parse_insert_source_query(
-    source: &RawQuerySlice,
-) -> Result<Box<sqlparser::ast::Query>, String> {
-    match parse_raw_statement(&source.text)? {
-        sqlparser::ast::Statement::Query(query) => Ok(query),
-        statement => Err(format!(
-            "INSERT source must be a query, found {}",
-            statement
-        )),
-    }
-}
 
 /// Encode one constant JSON literal for frontend-owned INSERT conversion.
 ///
@@ -142,7 +123,7 @@ impl std::fmt::Debug for ResolvedInsertTarget {
 #[derive(Clone, Debug, PartialEq)]
 pub enum IcebergInsertSource {
     Rows(Vec<Vec<InsertValue>>),
-    Query(Box<sqlparser::ast::Query>),
+    Query(Box<Query>),
 }
 
 /// Prepare an Iceberg INSERT without starting writers or external commit.
@@ -649,30 +630,6 @@ mod tests {
     fn insert_engine_is_object_safe() {
         fn accepts_object_safe_engine(_engine: Option<&dyn InsertEngine>) {}
         accepts_object_safe_engine(None);
-    }
-
-    fn raw_query_slice(text: &str) -> RawQuerySlice {
-        RawQuerySlice {
-            text: text.to_owned(),
-            span: novarocks_parser::Span::new(0, text.len()),
-        }
-    }
-
-    #[test]
-    fn parse_insert_source_query_forms_sqlp6_query_ir() {
-        let query = parse_insert_source_query(&raw_query_slice("VALUES (1)"))
-            .expect("VALUES source should form a query IR");
-        assert!(matches!(
-            query.body.as_ref(),
-            sqlparser::ast::SetExpr::Values(_)
-        ));
-    }
-
-    #[test]
-    fn parse_insert_source_query_rejects_non_query_payload() {
-        let error = parse_insert_source_query(&raw_query_slice("DELETE FROM db.t"))
-            .expect_err("non-query payload must fail at the D8 execution boundary");
-        assert!(error.contains("INSERT source must be a query"), "{error}");
     }
 
     #[test]

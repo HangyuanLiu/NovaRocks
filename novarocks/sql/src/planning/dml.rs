@@ -324,11 +324,17 @@ fn evidence_to_base_statistics(
     }
 }
 
-/// Parse one normalized raw statement for DML admission.  The returned AST is
-/// the upstream SQL parser's public syntax tree; NovaRocks custom syntax is
-/// normalized before this boundary.
-pub fn parse_raw_statement(sql: &str) -> Result<sqlparser::ast::Statement, String> {
-    crate::parser::parse_sql_raw(sql)
+/// Parse exactly one DML statement through NovaRocks' native parser.
+///
+/// DML callers receive the parser-owned syntax tree directly.  There is no
+/// normalizer or secondary parser boundary on this path.
+pub fn parse_raw_statement(sql: &str) -> Result<novarocks_parser::ast::Statement, String> {
+    let mut statements = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
+    match statements.len() {
+        1 => Ok(statements.remove(0)),
+        0 => Err("DML admission requires exactly one statement".to_string()),
+        _ => Err("DML admission requires exactly one statement".to_string()),
+    }
 }
 
 /// The SQL-visible kind of terminal row-mutation writer.  This maps one

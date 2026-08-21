@@ -213,11 +213,11 @@ named_struct('a', st1, 'b', st2)[1].sm2
 {50:508}
 
 -- query 21
-CAST((row(1, 2, 3)) AS struct<a double, b varchar(65533), c bigint(20)>)
+CAST((row(1, 2, 3)) AS struct<a double, b VARCHAR(65533), c BIGINT>)
 {"a":1,"b":"2","c":3}
 
 -- query 22
-CAST((named_struct('1', 1, '2', 2, '3', 3)) AS struct<a double, b varchar(65533), c bigint(20)>)
+CAST((named_struct('1', 1, '2', 2, '3', 3)) AS struct<a double, b VARCHAR(65533), c BIGINT>)
 {"a":1,"b":"2","c":3}
 
 -- query 23

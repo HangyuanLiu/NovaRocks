@@ -66,7 +66,7 @@ pub fn build_neutral_refresh_rewrite_context(
     current_catalog: Option<&str>,
     current_database: &str,
     definition: Arc<StoredMvDefinition>,
-    canonical_query: Arc<sqlparser::ast::Query>,
+    canonical_query: Arc<novarocks_parser::ast::Query>,
     base_refs: Arc<[TableIdentity]>,
     pin: Arc<RefreshSnapshotPin>,
     previous_snapshot_ids: BTreeMap<String, i64>,

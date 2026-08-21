@@ -29,6 +29,8 @@
 //! alternate rewrite path.
 
 use arrow::datatypes::DataType;
+use novarocks_parser::ast;
+use novarocks_parser::printer;
 
 use crate::analysis::*;
 
@@ -277,7 +279,7 @@ impl<'a> AnalyzerContext<'a> {
 
             return Err(format!(
                 "subquery shape is not supported by Apply rewrite: {}",
-                sq_info.subquery
+                novarocks_parser::printer::print_query(&sq_info.subquery)
             ));
         }
 
@@ -371,7 +373,7 @@ impl<'a> AnalyzerContext<'a> {
             inner: resolved_sub,
             correlation_column_ids: corr_ids,
             need_check_max_rows: true,
-            subquery_text: sq_info.subquery.to_string(),
+            subquery_text: printer::print_query(&sq_info.subquery),
         });
         Ok(true)
     }
@@ -426,11 +428,11 @@ impl<'a> AnalyzerContext<'a> {
                     .in_expr
                     .as_ref()
                     .ok_or_else(|| "IN subquery missing LHS expression".to_string())?;
-                if matches!(in_expr.as_ref(), sqlparser::ast::Expr::Tuple(_))
+                if matches!(in_expr.as_ref(), ast::Expr::Tuple(_))
                     || matches!(
                         in_expr.as_ref(),
-                        sqlparser::ast::Expr::Nested(inner)
-                            if matches!(inner.as_ref(), sqlparser::ast::Expr::Tuple(_))
+                        ast::Expr::Nested(ast::NestedExpr { expression, .. })
+                            if matches!(expression.as_ref(), ast::Expr::Tuple(_))
                     )
                 {
                     let SubqueryKind::InSubquery { negated } = &sq_info.kind else {
@@ -509,7 +511,7 @@ impl<'a> AnalyzerContext<'a> {
             correlation_column_ids: corr_ids,
             in_lhs,
             use_semi_anti: true,
-            subquery_text: sq_info.subquery.to_string(),
+            subquery_text: printer::print_query(&sq_info.subquery),
         });
         Ok(true)
     }
@@ -1616,14 +1618,16 @@ impl<'a> AnalyzerContext<'a> {
             .as_ref()
             .ok_or("IN subquery rewrite: missing left-hand expression")?;
 
-        // Multi-column LHS: `(a, b) IN (SELECT c, d FROM ...)`. sqlparser
-        // emits the LHS as `Expr::Tuple(items)` (possibly wrapped in
+        // Multi-column LHS: `(a, b) IN (SELECT c, d FROM ...)`. The typed AST
+        // retains the LHS as `Expr::Tuple` (possibly wrapped in
         // `Expr::Nested`). Analyze each component separately and pair
         // them with the subquery's output columns one-to-one.
-        let lhs_items_ast: Vec<&sqlparser::ast::Expr> = match in_expr_ast.as_ref() {
-            sqlparser::ast::Expr::Tuple(items) => items.iter().collect(),
-            sqlparser::ast::Expr::Nested(inner) => match inner.as_ref() {
-                sqlparser::ast::Expr::Tuple(items) => items.iter().collect(),
+        let lhs_items_ast: Vec<&ast::Expr> = match in_expr_ast.as_ref() {
+            ast::Expr::Tuple(ast::TupleExpr { expressions, .. }) => expressions.iter().collect(),
+            ast::Expr::Nested(ast::NestedExpr { expression, .. }) => match expression.as_ref() {
+                ast::Expr::Tuple(ast::TupleExpr { expressions, .. }) => {
+                    expressions.iter().collect()
+                }
                 other => vec![other],
             },
             other => vec![other],
@@ -2274,7 +2278,7 @@ impl<'a> AnalyzerContext<'a> {
     /// Analyze a query with outer scope, also returning the inner scope.
     fn analyze_query_in_scope_with_inner(
         &self,
-        query: &sqlparser::ast::Query,
+        query: &ast::Query,
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), String> {
         let child_ctx = AnalyzerContext {
@@ -2315,7 +2319,7 @@ impl<'a> AnalyzerContext<'a> {
     /// Returns (ResolvedQuery, inner_scope_from_FROM_clause).
     pub(super) fn analyze_query_with_outer_scope_inner(
         &self,
-        query: &sqlparser::ast::Query,
+        query: &ast::Query,
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), String> {
         let (maybe_child_ctx, local_cte_ids) = if let Some(ref with_clause) = query.with {
@@ -2328,7 +2332,7 @@ impl<'a> AnalyzerContext<'a> {
 
         let body = query.body.as_ref();
         let result = match body {
-            sqlparser::ast::SetExpr::Select(s) => {
+            ast::SetExpr::Select(s) => {
                 let (sel, cols, inner_scope) =
                     ctx.analyze_select_with_outer_scope(s, outer_scope)?;
                 let body = QueryBody::Select(sel);
@@ -2381,11 +2385,9 @@ impl<'a> AnalyzerContext<'a> {
     /// Returns (ResolvedSelect, output_columns, inner_scope).
     fn analyze_select_with_outer_scope(
         &self,
-        select: &sqlparser::ast::Select,
+        select: &ast::Select,
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>, AnalyzerScope), String> {
-        use sqlparser::ast as sqlast;
-
         // --- FROM clause ---
         let (from, inner_scope) = if select.from.is_empty() {
             (None, self.new_scope())
@@ -2445,8 +2447,11 @@ impl<'a> AnalyzerContext<'a> {
 
         // --- GROUP BY ---
         let group_by_exprs = match &select.group_by {
-            sqlast::GroupByExpr::Expressions(exprs, _) => exprs.clone(),
-            sqlast::GroupByExpr::All(_) => {
+            ast::GroupBy::None => Vec::new(),
+            ast::GroupBy::Expressions { expressions, .. } => expressions.clone(),
+            ast::GroupBy::Rollup { .. }
+            | ast::GroupBy::Cube { .. }
+            | ast::GroupBy::GroupingSets { .. } => {
                 return Err("GROUP BY ALL is not supported".into());
             }
         };
@@ -2516,7 +2521,7 @@ impl<'a> AnalyzerContext<'a> {
             None => None,
         };
 
-        let distinct = matches!(select.distinct, Some(sqlast::Distinct::Distinct));
+        let distinct = matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. });
 
         let mut resolved_select = ResolvedSelect {
             from,

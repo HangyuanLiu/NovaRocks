@@ -41,6 +41,7 @@ use crate::query_execution::planning::time_travel::{
 };
 use crate::query_execution::post_compile::{PostCompileIntent, prepare_compiled_distributed_query};
 use crate::view::ViewRequestContext;
+use novarocks_parser::ast::{ExplainFormat, ExplainQuery, Query, Statement};
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::compiler::{
@@ -48,7 +49,6 @@ use novarocks_sql::compiler::{
     SqlOptimizeRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
     builtin_sql_function_catalog,
 };
-use novarocks_sql::syntax::{normalize_for_raw_parse, parse_normalized_sql_raw};
 
 #[derive(Clone)]
 pub(crate) struct FrontendQueryCompiler {
@@ -76,50 +76,28 @@ impl FrontendQueryCompiler {
         }
     }
 
-    pub(crate) fn prepare(
+    pub(crate) fn prepare_statement(
         &self,
-        sql: &str,
+        statement: &Statement,
         context: &RequestContext,
         query_options: Option<QueryOptions>,
     ) -> Result<PreparedQueryOperation, String> {
-        if !is_query_sql(sql) {
-            return Err(
-                "non-query statements must be executed through a typed command capability".into(),
-            );
-        }
         let connector_context = connector_request_context_for_query(
             query_options.as_ref(),
             context.execution().cancellation().clone(),
         )?;
         let current_catalog = context.session().current_catalog();
         let current_database = context.session().current_database();
-        let normalized = normalize_for_raw_parse(sql)?;
-        let (parse_sql, forced_explain_level, force_logical_explain) =
-            classify_explain_sql(normalized);
-        let statement = parse_normalized_sql_raw(&parse_sql)
-            .map_err(|error| format_parser_error(&error.to_string()))?;
 
         match statement {
-            sqlparser::ast::Statement::Explain {
-                statement,
-                verbose,
-                analyze: false,
-                ..
-            } => {
-                let sqlparser::ast::Statement::Query(ref query) = *statement else {
-                    return Err("EXPLAIN only supports SELECT queries".to_string());
-                };
+            Statement::ExplainQuery(explain) if explain.format != ExplainFormat::Analyze => {
+                let (level, force_logical_explain) = explain_mode(explain);
                 let query = self.prepare_explain_query(
-                    query,
+                    explain.query.as_ref(),
                     current_catalog,
                     current_database,
                     &connector_context,
                 )?;
-                let level = forced_explain_level.unwrap_or(if verbose {
-                    ExplainLevel::Verbose
-                } else {
-                    ExplainLevel::Normal
-                });
                 let catalog_service = query_catalog_service_snapshot(&self.query);
                 let materializer = build_catalog_service_provider(
                     current_catalog,
@@ -172,32 +150,23 @@ impl FrontendQueryCompiler {
                         .map_err(|error| error.to_string())?,
                 )
             }
-            sqlparser::ast::Statement::Explain {
-                statement,
-                analyze: true,
-                ..
-            } => {
-                let sqlparser::ast::Statement::Query(ref query) = *statement else {
-                    return Err("EXPLAIN ANALYZE only supports SELECT queries".to_string());
-                };
-                self.prepare_explain_analyze(
-                    query,
-                    current_catalog,
-                    current_database,
-                    query_options,
-                    &connector_context,
-                    context.execution(),
-                )
-            }
-            sqlparser::ast::Statement::Query(ref query) => {
+            Statement::ExplainQuery(explain) => self.prepare_explain_analyze(
+                explain.query.as_ref(),
+                current_catalog,
+                current_database,
+                query_options,
+                &connector_context,
+                context.execution(),
+            ),
+            Statement::Query(query) => {
                 if let Some(result) = information_schema::try_query_materialized_views(
                     self.system_tables.mv_repository().as_ref(),
-                    query,
+                    &query,
                 )? {
                     return Ok(PreparedQueryOperation::immediate(result));
                 }
                 let query = self.prepare_query(
-                    query.as_ref(),
+                    &query,
                     current_catalog,
                     current_database,
                     &connector_context,
@@ -221,7 +190,7 @@ impl FrontendQueryCompiler {
     #[allow(clippy::too_many_arguments)]
     fn prepare_distributed_query(
         &self,
-        query: &sqlparser::ast::Query,
+        query: &Query,
         current_catalog: Option<&str>,
         current_database: &str,
         query_options: Option<QueryOptions>,
@@ -284,7 +253,7 @@ impl FrontendQueryCompiler {
     #[allow(clippy::too_many_arguments)]
     fn analyze_request<'a>(
         &self,
-        query: &sqlparser::ast::Query,
+        query: &Query,
         current_catalog: Option<&str>,
         current_database: &str,
         execution: &QueryExecutionContext,
@@ -318,11 +287,11 @@ impl FrontendQueryCompiler {
 
     fn prepare_query(
         &self,
-        query: &sqlparser::ast::Query,
+        query: &Query,
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<sqlparser::ast::Query, String> {
+    ) -> Result<Query, String> {
         let mut prepared = self.prepare_explain_query(
             query,
             current_catalog,
@@ -340,11 +309,11 @@ impl FrontendQueryCompiler {
 
     fn prepare_explain_query(
         &self,
-        query: &sqlparser::ast::Query,
+        query: &Query,
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<sqlparser::ast::Query, String> {
+    ) -> Result<Query, String> {
         let mut prepared = query.clone();
         self.view.view_service().rewrite_query(
             &self.view,
@@ -369,7 +338,7 @@ impl FrontendQueryCompiler {
 
     fn prepare_explain_analyze(
         &self,
-        query: &sqlparser::ast::Query,
+        query: &Query,
         current_catalog: Option<&str>,
         current_database: &str,
         query_options: Option<QueryOptions>,
@@ -412,88 +381,16 @@ fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> Que
     QueryOptions::parse(raw).expect("enabling query profiling does not invalidate query options")
 }
 
-fn is_query_sql(sql: &str) -> bool {
-    let mut words = sql.split_whitespace();
-    match words.next().map(|word| word.to_ascii_lowercase()) {
-        Some(keyword) if matches!(keyword.as_str(), "select" | "with") => true,
-        Some(keyword) if keyword == "explain" => {
-            let mut target = words.next().map(|word| word.to_ascii_lowercase());
-            while matches!(
-                target.as_deref(),
-                Some("analyze" | "verbose" | "costs" | "logical")
-            ) {
-                target = words.next().map(|word| word.to_ascii_lowercase());
-            }
-            matches!(target.as_deref(), Some("select" | "with"))
-        }
-        _ => false,
-    }
-}
-
-fn format_parser_error(raw: &str) -> String {
-    let mut out = format!("sql parser error: {raw}");
-    if let Some(start) = raw.find("found: ") {
-        let after = &raw[start + "found: ".len()..];
-        let token = after
-            .split(|character: char| character.is_whitespace() || character == ',')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_matches(|character: char| character == '`' || character == '"');
-        if !token.is_empty() {
-            out.push_str(&format!(" Unexpected input '{token}'."));
-        }
-    }
-    out
-}
-
-fn split_explain_costs_sql(sql: &str) -> Option<(String, ExplainLevel)> {
-    let body = consume_leading_keyword(consume_leading_keyword(sql, "EXPLAIN")?, "COSTS")?;
-    Some((
-        format!("EXPLAIN {}", body.trim_start()),
-        ExplainLevel::Costs,
-    ))
-}
-
-pub(crate) fn classify_explain_sql(sql: String) -> (String, Option<ExplainLevel>, bool) {
-    if let Some((rewritten, level)) = split_explain_logical_sql(&sql) {
-        (rewritten, Some(level), true)
-    } else if let Some((rewritten, level)) = split_explain_costs_sql(&sql) {
-        (rewritten, Some(level), false)
-    } else {
-        (sql, None, false)
-    }
-}
-
-fn split_explain_logical_sql(sql: &str) -> Option<(String, ExplainLevel)> {
-    let mut body = consume_leading_keyword(consume_leading_keyword(sql, "EXPLAIN")?, "LOGICAL")?;
-    let mut level = ExplainLevel::Normal;
-    for (keyword, candidate) in [
-        ("VERBOSE", ExplainLevel::Verbose),
-        ("COSTS", ExplainLevel::Costs),
-    ] {
-        if let Some(rest) = consume_leading_keyword(body, keyword) {
-            level = candidate;
-            body = rest;
-            break;
-        }
-    }
-    Some((format!("EXPLAIN {}", body.trim_start()), level))
-}
-
-fn consume_leading_keyword<'a>(sql: &'a str, keyword: &str) -> Option<&'a str> {
-    let trimmed = sql.trim_start();
-    let head = trimmed.as_bytes().get(..keyword.len())?;
-    if !head.eq_ignore_ascii_case(keyword.as_bytes()) {
-        return None;
-    }
-    let rest = &trimmed[keyword.len()..];
-    if rest
-        .chars()
-        .next()
-        .is_some_and(|character| !character.is_ascii_whitespace())
-    {
-        return None;
-    }
-    Some(rest)
+pub(crate) fn explain_mode(explain: &ExplainQuery) -> (ExplainLevel, bool) {
+    let level = match explain.format {
+        ExplainFormat::Default => ExplainLevel::Normal,
+        ExplainFormat::Verbose => ExplainLevel::Verbose,
+        ExplainFormat::Costs => ExplainLevel::Costs,
+        ExplainFormat::Logical => ExplainLevel::Normal,
+        ExplainFormat::Analyze => ExplainLevel::Analyze,
+    };
+    (
+        level,
+        explain.logical || matches!(explain.format, ExplainFormat::Logical),
+    )
 }

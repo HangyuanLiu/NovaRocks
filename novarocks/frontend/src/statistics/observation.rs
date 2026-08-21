@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use arrow::datatypes::DataType;
-use sqlparser::ast as sqlast;
+use novarocks_parser::ast;
 
 use super::model::{AnalyzeStatusRow, ColumnStatRow, TableKey};
 use super::query::normalize_name;
@@ -12,7 +12,7 @@ use super::{
 
 pub(super) fn observe_query(
     service: &FrontendStatisticsService,
-    query: &sqlast::Query,
+    query: &ast::Query,
     current_database: &str,
 ) -> Result<(), String> {
     observe_query_with_ctes(service, query, current_database, &BTreeSet::new())
@@ -20,16 +20,16 @@ pub(super) fn observe_query(
 
 fn observe_query_with_ctes(
     service: &FrontendStatisticsService,
-    query: &sqlast::Query,
+    query: &ast::Query,
     current_database: &str,
     inherited_ctes: &BTreeSet<String>,
 ) -> Result<(), String> {
     let mut visible_ctes = inherited_ctes.clone();
     if let Some(with) = query.with.as_ref() {
-        for cte in &with.cte_tables {
-            visible_ctes.insert(normalize_name(&cte.alias.name.value)?);
+        for cte in &with.ctes {
+            visible_ctes.insert(normalize_name(&cte.name.value)?);
         }
-        for cte in &with.cte_tables {
+        for cte in &with.ctes {
             observe_query_with_ctes(service, &cte.query, current_database, &visible_ctes)?;
         }
     }
@@ -43,19 +43,19 @@ fn observe_query_with_ctes(
 
 fn observe_set_expr(
     service: &FrontendStatisticsService,
-    set_expr: &sqlast::SetExpr,
+    set_expr: &ast::SetExpr,
     current_database: &str,
     visible_ctes: &BTreeSet<String>,
 ) -> Result<(), String> {
     match set_expr {
-        sqlast::SetExpr::Select(select) => {
+        ast::SetExpr::Select(select) => {
             observe_select(service, select, current_database, visible_ctes)
         }
-        sqlast::SetExpr::SetOperation { left, right, .. } => {
-            observe_set_expr(service, left, current_database, visible_ctes)?;
-            observe_set_expr(service, right, current_database, visible_ctes)
+        ast::SetExpr::SetOperation(operation) => {
+            observe_set_expr(service, &operation.left, current_database, visible_ctes)?;
+            observe_set_expr(service, &operation.right, current_database, visible_ctes)
         }
-        sqlast::SetExpr::Query(query) => {
+        ast::SetExpr::Query(query) => {
             observe_query_with_ctes(service, query, current_database, visible_ctes)
         }
         _ => Ok(()),
@@ -64,7 +64,7 @@ fn observe_set_expr(
 
 fn observe_select(
     service: &FrontendStatisticsService,
-    select: &sqlast::Select,
+    select: &ast::Select,
     current_database: &str,
     visible_ctes: &BTreeSet<String>,
 ) -> Result<(), String> {
@@ -81,13 +81,13 @@ fn observe_select(
             {
                 aliases.insert(alias.unwrap_or_else(|| key.table.clone()), key);
             }
-            collect_usage_from_join_operator(service, &aliases, &join.join_operator)?;
+            collect_usage_from_join(service, &aliases, join)?;
         }
     }
     if let Some(selection) = select.selection.as_ref() {
         collect_usage_from_expr(service, &aliases, selection, "predicate")?;
     }
-    if let sqlast::GroupByExpr::Expressions(expressions, _) = &select.group_by {
+    if let ast::GroupBy::Expressions { expressions, .. } = &select.group_by {
         for expression in expressions {
             collect_usage_from_expr(service, &aliases, expression, "group_by")?;
         }
@@ -236,39 +236,19 @@ pub(super) fn drop_database(service: &FrontendStatisticsService, database: &str)
     state.column_usage.retain(|key, _| key.db != db);
 }
 
-fn collect_usage_from_join_operator(
+fn collect_usage_from_join(
     service: &FrontendStatisticsService,
     aliases: &BTreeMap<String, TableKey>,
-    operator: &sqlast::JoinOperator,
+    join: &ast::Join,
 ) -> Result<(), String> {
-    use sqlast::{JoinConstraint, JoinOperator};
-    let constraint = match operator {
-        JoinOperator::Join(value)
-        | JoinOperator::Inner(value)
-        | JoinOperator::Left(value)
-        | JoinOperator::LeftOuter(value)
-        | JoinOperator::Right(value)
-        | JoinOperator::RightOuter(value)
-        | JoinOperator::FullOuter(value)
-        | JoinOperator::CrossJoin(value)
-        | JoinOperator::Semi(value)
-        | JoinOperator::LeftSemi(value)
-        | JoinOperator::RightSemi(value)
-        | JoinOperator::Anti(value)
-        | JoinOperator::LeftAnti(value)
-        | JoinOperator::RightAnti(value)
-        | JoinOperator::StraightJoin(value) => value,
-        _ => return Ok(()),
-    };
-    match constraint {
-        JoinConstraint::On(expression) => {
+    match &join.constraint {
+        ast::JoinConstraint::On(expression) => {
             collect_usage_from_expr(service, aliases, expression, "join")
         }
-        JoinConstraint::Using(columns) => {
+        ast::JoinConstraint::Using { columns, .. } => {
             for column in columns {
-                let column = column.0.last().map(ToString::to_string).unwrap_or_default();
                 for key in aliases.values() {
-                    mark_usage(service, key, &column, "join")?;
+                    mark_usage(service, key, &column.value, "join")?;
                 }
             }
             Ok(())
@@ -280,10 +260,10 @@ fn collect_usage_from_join_operator(
 fn collect_usage_from_expr(
     service: &FrontendStatisticsService,
     aliases: &BTreeMap<String, TableKey>,
-    expression: &sqlast::Expr,
+    expression: &ast::Expr,
     usage: &'static str,
 ) -> Result<(), String> {
-    use sqlast::Expr;
+    use ast::Expr;
     match expression {
         Expr::Identifier(identifier) => {
             if aliases.len() == 1
@@ -292,44 +272,44 @@ fn collect_usage_from_expr(
                 mark_usage(service, key, &identifier.value, usage)?;
             }
         }
-        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
-            let alias = normalize_name(&parts[parts.len() - 2].value)?;
+        Expr::CompoundIdentifier(parts) if parts.parts.len() >= 2 => {
+            let alias = normalize_name(&parts.parts[parts.parts.len() - 2].value)?;
             if let Some(key) = aliases.get(&alias) {
-                mark_usage(service, key, &parts[parts.len() - 1].value, usage)?;
+                mark_usage(
+                    service,
+                    key,
+                    &parts.parts[parts.parts.len() - 1].value,
+                    usage,
+                )?;
             }
         }
-        Expr::BinaryOp { left, right, .. } => {
-            collect_usage_from_expr(service, aliases, left, usage)?;
-            collect_usage_from_expr(service, aliases, right, usage)?;
+        Expr::Binary(binary) => {
+            collect_usage_from_expr(service, aliases, &binary.left, usage)?;
+            collect_usage_from_expr(service, aliases, &binary.right, usage)?;
         }
-        Expr::Nested(inner)
-        | Expr::UnaryOp { expr: inner, .. }
-        | Expr::IsNull(inner)
-        | Expr::IsNotNull(inner) => {
-            collect_usage_from_expr(service, aliases, inner, usage)?;
+        Expr::Nested(nested) => {
+            collect_usage_from_expr(service, aliases, &nested.expression, usage)?;
         }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            collect_usage_from_expr(service, aliases, expr, usage)?;
-            collect_usage_from_expr(service, aliases, low, usage)?;
-            collect_usage_from_expr(service, aliases, high, usage)?;
+        Expr::Unary(unary) => {
+            collect_usage_from_expr(service, aliases, &unary.expression, usage)?;
         }
-        Expr::InList { expr, list, .. } => {
-            collect_usage_from_expr(service, aliases, expr, usage)?;
-            for item in list {
+        Expr::IsPredicate(predicate) => {
+            collect_usage_from_expr(service, aliases, &predicate.expr, usage)?;
+        }
+        Expr::Between(between) => {
+            collect_usage_from_expr(service, aliases, &between.expr, usage)?;
+            collect_usage_from_expr(service, aliases, &between.low, usage)?;
+            collect_usage_from_expr(service, aliases, &between.high, usage)?;
+        }
+        Expr::InList(list) => {
+            collect_usage_from_expr(service, aliases, &list.expr, usage)?;
+            for item in &list.list {
                 collect_usage_from_expr(service, aliases, item, usage)?;
             }
         }
-        Expr::Function(function) => {
-            if let sqlast::FunctionArguments::List(arguments) = &function.args {
-                for argument in &arguments.args {
-                    if let sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(expr)) =
-                        argument
-                    {
-                        collect_usage_from_expr(service, aliases, expr, usage)?;
-                    }
-                }
+        Expr::FunctionCall(function) => {
+            for argument in &function.arguments {
+                collect_usage_from_expr(service, aliases, argument, usage)?;
             }
         }
         _ => {}
@@ -358,20 +338,29 @@ fn mark_usage(
 }
 
 fn relation_table_key(
-    relation: &sqlast::TableFactor,
+    relation: &ast::TableFactor,
     current_database: &str,
     visible_ctes: &BTreeSet<String>,
 ) -> Result<Option<(TableKey, Option<String>)>, String> {
-    let sqlast::TableFactor::Table {
-        name, alias, args, ..
+    let ast::TableFactor::Table {
+        name,
+        alias,
+        metadata,
+        version,
+        hints,
+        ..
     } = relation
     else {
         return Ok(None);
     };
-    if args.is_some() {
+    if metadata.is_some() || version.is_some() || !hints.is_empty() {
         return Ok(None);
     }
-    let parts = name.0.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let parts = name
+        .parts
+        .iter()
+        .map(|part| part.value.clone())
+        .collect::<Vec<_>>();
     if let [table] = parts.as_slice()
         && visible_ctes.contains(&normalize_name(table)?)
     {
@@ -417,7 +406,7 @@ fn estimate_column_min_max(
 ) -> (String, String) {
     if let StatisticsInsertSource::FromQuery(query) = source
         && let Some((start, end, _)) = generate_series_bounds(query)
-        && let sqlast::SetExpr::Select(select) = query.body.as_ref()
+        && let ast::SetExpr::Select(select) = query.body.as_ref()
         && let Some(item) = select.projection.get(column_index)
         && let Some(expression) = select_item_expression(item)
         && let (Some(first), Some(last)) = (
@@ -526,7 +515,7 @@ fn compare_stat_values(left: &str, right: &str, data_type: &DataType) -> std::cm
     left.cmp(right)
 }
 
-fn estimate_generate_series_row_count(query: &sqlast::Query) -> Option<i64> {
+fn estimate_generate_series_row_count(query: &ast::Query) -> Option<i64> {
     let (start, end, step) = generate_series_bounds(query)?;
     if step == 0 || (step > 0 && start > end) || (step < 0 && start < end) {
         return Some(0);
@@ -534,29 +523,32 @@ fn estimate_generate_series_row_count(query: &sqlast::Query) -> Option<i64> {
     Some((end - start).abs() / step.abs() + 1)
 }
 
-fn generate_series_bounds(query: &sqlast::Query) -> Option<(i64, i64, i64)> {
-    let sqlast::SetExpr::Select(select) = query.body.as_ref() else {
+fn generate_series_bounds(query: &ast::Query) -> Option<(i64, i64, i64)> {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return None;
     };
     let relation = &select.from.first()?.relation;
-    let sqlast::TableFactor::Table {
-        name,
-        args: Some(arguments),
-        ..
-    } = relation
-    else {
+    let ast::TableFactor::TableFunction { expr, .. } = relation else {
         return None;
     };
-    if !name.to_string().eq_ignore_ascii_case("generate_series") {
+    let ast::Expr::FunctionCall(function) = expr else {
+        return None;
+    };
+    if function.name.parts.len() != 1
+        || !function.name.parts[0]
+            .value
+            .eq_ignore_ascii_case("generate_series")
+    {
         return None;
     }
-    let values = arguments
-        .args
+    let values = function
+        .arguments
         .iter()
         .filter_map(|argument| match argument {
-            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(sqlast::Expr::Value(
-                value,
-            ))) => value.value.to_string().parse::<i64>().ok(),
+            ast::Expr::Literal(value) => match &value.kind {
+                ast::LiteralKind::Number(value) => value.parse::<i64>().ok(),
+                _ => None,
+            },
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -569,36 +561,39 @@ fn generate_series_bounds(query: &sqlast::Query) -> Option<(i64, i64, i64)> {
     Some((start, end, step))
 }
 
-fn select_item_expression(item: &sqlast::SelectItem) -> Option<&sqlast::Expr> {
+fn select_item_expression(item: &ast::SelectItem) -> Option<&ast::Expr> {
     match item {
-        sqlast::SelectItem::UnnamedExpr(expression)
-        | sqlast::SelectItem::ExprWithAlias {
+        ast::SelectItem::UnnamedExpr(expression)
+        | ast::SelectItem::ExprWithAlias {
             expr: expression, ..
         } => Some(expression),
         _ => None,
     }
 }
 
-fn evaluate_series_expression(expression: &sqlast::Expr, series_value: i64) -> Option<f64> {
-    use sqlast::{BinaryOperator, Expr, UnaryOperator};
+fn evaluate_series_expression(expression: &ast::Expr, series_value: i64) -> Option<f64> {
+    use ast::{BinaryOperator, Expr, UnaryOperator};
     match expression {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Some(series_value as f64),
-        Expr::Value(value) => value.value.to_string().parse().ok(),
-        Expr::Nested(inner) => evaluate_series_expression(inner, series_value),
-        Expr::UnaryOp { op, expr } => {
-            let value = evaluate_series_expression(expr, series_value)?;
-            match op {
+        Expr::Literal(value) => match &value.kind {
+            ast::LiteralKind::Number(value) => value.parse().ok(),
+            _ => None,
+        },
+        Expr::Nested(nested) => evaluate_series_expression(&nested.expression, series_value),
+        Expr::Unary(unary) => {
+            let value = evaluate_series_expression(&unary.expression, series_value)?;
+            match unary.operator {
                 UnaryOperator::Plus => Some(value),
                 UnaryOperator::Minus => Some(-value),
                 _ => None,
             }
         }
-        Expr::BinaryOp { left, op, right } => {
-            let left = evaluate_series_expression(left, series_value)?;
-            let right = evaluate_series_expression(right, series_value)?;
-            match op {
-                BinaryOperator::Plus => Some(left + right),
-                BinaryOperator::Minus => Some(left - right),
+        Expr::Binary(binary) => {
+            let left = evaluate_series_expression(&binary.left, series_value)?;
+            let right = evaluate_series_expression(&binary.right, series_value)?;
+            match binary.operator {
+                BinaryOperator::Add => Some(left + right),
+                BinaryOperator::Subtract => Some(left - right),
                 BinaryOperator::Multiply => Some(left * right),
                 BinaryOperator::Divide if right != 0.0 => Some(left / right),
                 _ => None,

@@ -22,16 +22,18 @@ use novarocks_frontend::state_store::coordination::{ControlPlaneMode, Incarnatio
 use novarocks_frontend::view::repository::database_key;
 use novarocks_frontend::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
-    ViewEngine, ViewRequestContext, ViewService, ViewSqlDialect, ViewStatementResult, ViewTarget,
+    ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
 };
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
     FrontendApplicationHost, FrontendExecutionConfig,
 };
-use novarocks_parser::parse as parse_typed_statement;
+use novarocks_parser::{
+    ast::{Query, Statement as ParsedStatement},
+    parse as parse_typed_statement,
+    printer::print_query,
+};
 use novarocks_spi::state_store::{CommitOutcome, Key, Precondition, TransactionId, Value};
-use sqlparser::ast::{Query, Statement};
-use sqlparser::parser::Parser;
 use std::sync::Arc;
 use std::time::Duration;
 mod common;
@@ -157,12 +159,12 @@ fn execute_view_statement(
     service.execute_statement(engine, statement, context)
 }
 
-fn parse_query(sql: &str) -> Box<Query> {
-    let mut parser = Parser::new(&ViewSqlDialect).try_with_sql(sql).unwrap();
-    match parser.parse_statement().unwrap() {
-        Statement::Query(query) => query,
-        other => panic!("expected query, got {other:?}"),
-    }
+fn parse_query(sql: &str) -> Query {
+    let statements = parse_typed_statement(sql).expect("parse typed query");
+    let [ParsedStatement::Query(query)] = statements.as_slice() else {
+        panic!("expected typed query");
+    };
+    query.clone()
 }
 
 fn state_store_input() -> novarocks_frontend::StateStoreHostInput {
@@ -442,7 +444,7 @@ async fn configured_host_restores_views_through_its_service_after_reopen() {
         .rewrite_query(&SessionViewEngine, &mut query, view_context())
         .expect("reopened host must restore the view");
     assert_eq!(
-        query.to_string(),
+        print_query(&query),
         "SELECT * FROM (SELECT 42 AS answer) durable_view"
     );
     reopened.shutdown().await.expect("reopened host shutdown");

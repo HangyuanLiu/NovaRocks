@@ -22,17 +22,15 @@ use std::sync::Arc;
 use crate::common::persisted_query_definition::PersistedQueryDefinition;
 use crate::state_store::metrics::StateStoreMetrics;
 use crate::state_store::{OperationId, RunFailure, run_side_effect_free};
-use crate::view::ViewSqlDialect;
 use bytes::Bytes;
 use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_parser::ast::Statement;
 use novarocks_spi::state_store::{
     Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore,
     StateStoreLimits, Value, WriteTransaction,
 };
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
-use sqlparser::ast::Statement;
-use sqlparser::parser::Parser;
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
@@ -414,9 +412,8 @@ fn normalize_identity(kind: &str, value: &str) -> Result<String, String> {
 }
 
 fn parse_query(sql: &str) -> Result<(), String> {
-    let normalized = novarocks_sql::syntax::normalize_for_raw_parse(sql)?;
-    let statements = Parser::parse_sql(&ViewSqlDialect, &normalized)
-        .map_err(|error| format!("query parse failed: {error}"))?;
+    let statements =
+        novarocks_parser::parse(sql).map_err(|error| format!("query parse failed: {error}"))?;
     match statements.as_slice() {
         [Statement::Query(_)] => Ok(()),
         _ => Err("view SQL must contain exactly one query statement".to_string()),

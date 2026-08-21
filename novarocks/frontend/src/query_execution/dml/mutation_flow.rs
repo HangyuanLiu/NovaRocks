@@ -352,7 +352,7 @@ impl DmlRowMutationEffectSet {
 fn compile_dml_change_stream_write(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
-    query: sqlparser::ast::Query,
+    query: novarocks_parser::ast::Query,
     kind: DmlChangeStreamKind,
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
     execution: &QueryExecutionContext,
@@ -1630,10 +1630,16 @@ fn update_change_stream_target_sql(
     )
 }
 
-fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Query, String> {
-    match novarocks_sql::planning::dml::parse_raw_statement(sql)? {
-        sqlparser::ast::Statement::Query(query) => Ok(*query),
-        other => Err(format!("{context} generated non-query statement: {other}")),
+fn parse_generated_query(sql: &str, context: &str) -> Result<novarocks_parser::ast::Query, String> {
+    let statements = novarocks_parser::parse(sql).map_err(|error| format!("{context}: {error}"))?;
+    match statements.as_slice() {
+        [novarocks_parser::ast::Statement::Query(query)] => Ok(query.clone()),
+        [other] => Err(format!(
+            "{context} generated non-query statement: {other:?}"
+        )),
+        _ => Err(format!(
+            "{context} generated an empty or multi-statement query"
+        )),
     }
 }
 
@@ -1961,7 +1967,7 @@ struct CowFrozenRead {
 struct CowCohortWritePlan {
     cohort_id: novarocks_spi::connector::ConnectorWriteCohortId,
     preparation: novarocks_spi::connector::ConnectorWritePreparation,
-    query: sqlparser::ast::Query,
+    query: novarocks_parser::ast::Query,
     frozen_read: Option<CowFrozenRead>,
 }
 
@@ -2155,7 +2161,7 @@ fn build_cow_append_query(
     recipe: &novarocks_spi::connector::ConnectorRowMutationCohortRecipe,
     route: &novarocks_spi::connector::ConnectorRowMutationRoute,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<novarocks_parser::ast::Query, String> {
     let fields = route_field_by_token(route);
     let inputs = ordered_route_inputs(route)?;
     let mut value_rows = Vec::with_capacity(recipe.selection_ordinals().len());
@@ -2226,7 +2232,7 @@ fn build_cow_rewrite_query(
     scan_bindings: &[novarocks_spi::connector::ConnectorRowMutationScanBinding],
     match_tokens: &[novarocks_spi::connector::ConnectorWriteFieldToken],
     written_version_token: Option<novarocks_spi::connector::ConnectorWriteFieldToken>,
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<novarocks_parser::ast::Query, String> {
     let contract = preparation.match_contract();
     let fields = route_field_by_token(route);
     let inputs = ordered_route_inputs(route)?;
@@ -2927,7 +2933,7 @@ fn execute_update_match_query(
 fn execute_exact_cow_match_query(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
-    query: &sqlparser::ast::Query,
+    query: &novarocks_parser::ast::Query,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     target_schema: &arrow::datatypes::SchemaRef,
@@ -3315,7 +3321,7 @@ fn build_exact_cow_update_selection_query(
     stmt: &PreparedUpdateStatement,
     source_sql: Option<&str>,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<novarocks_parser::ast::Query, String> {
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
     let qualify = |name: &str| format!("{}.{}", sql_identifier(target_alias), sql_identifier(name));
     let assignments = stmt
@@ -3955,7 +3961,7 @@ fn build_exact_cow_merge_selection_query(
     current_catalog: Option<&str>,
     insert_columns: Option<&[MergeInsertColumn]>,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<novarocks_parser::ast::Query, String> {
     let target_alias = stmt
         .target_alias
         .as_deref()
@@ -4388,7 +4394,7 @@ fn build_merge_unmatched_insert_query(
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     insert_columns: &MergeInsertColumns,
-) -> Result<sqlparser::ast::Query, String> {
+) -> Result<novarocks_parser::ast::Query, String> {
     let target_alias = stmt
         .target_alias
         .as_deref()
@@ -5154,7 +5160,7 @@ mod tests {
             Some(fixture.written_version_token),
         )
         .expect("query");
-        let sql = query.to_string();
+        let sql = novarocks_parser::printer::print_query(&query);
 
         // The source and its field names are provider-signed scan facts; Core
         // binds them only through recipe tokens and ordinals.
@@ -5221,7 +5227,7 @@ mod tests {
             Some(fixture.written_version_token),
         )
         .expect("query");
-        let sql = query.to_string();
+        let sql = novarocks_parser::printer::print_query(&query);
 
         assert!(sql.contains("CAST(X'0C000000010203' AS VARIANT)"), "{sql}");
         assert!(sql.contains("CASE WHEN"), "{sql}");
@@ -5405,7 +5411,7 @@ mod tests {
             &insert_columns,
         )
         .expect("query");
-        let sql = query.to_string();
+        let sql = novarocks_parser::printer::print_query(&query);
 
         assert!(sql.contains("LEFT JOIN"), "{sql}");
         assert!(sql.contains("_row_id"), "{sql}");

@@ -58,7 +58,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
-use novarocks_parser::ast::Statement as ParsedStatement;
+use novarocks_parser::ast::{self, Fold, Statement as ParsedStatement};
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_types::{ClusterRole, EngineErrorCode};
 use novarocks_user_error::UserError;
@@ -276,12 +276,8 @@ impl CoreCommandRoute for TypedCommandRoute {
                 "typed DDL/DML admission is enabled, but execution routing remains intentionally unconnected until SQLP-5 T10"
                     .to_string(),
             ),
-            ParsedStatement::Query(_) | ParsedStatement::ExplainQuery(_) => Err(
-                "typed query syntax has no frontend execution owner; LegacyFrontier remains authoritative"
-                    .to_string(),
-            ),
-            ParsedStatement::RawQuery(_) => {
-                Err("statement was admitted before its command-family owner cut".to_string())
+            ParsedStatement::Query(_) | ParsedStatement::ExplainQuery(_) => {
+                Err("typed query execution is owned by the query compiler".to_string())
             }
         }
     }
@@ -772,8 +768,6 @@ impl FrontendQuerySession {
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
-        let sql = novarocks_sql::syntax::substitute_user_variables(&sql, &assignments)
-            .map_err(classify_engine_error)?;
         let (admission, parsed_statements) =
             crate::query_execution::statement_admission::admit_statement(&sql)
                 .map_err(QueryServiceError::from_user_error)?;
@@ -785,7 +779,10 @@ impl FrontendQuerySession {
                         "command admission requires exactly one statement",
                     ));
                 };
-                Some(statement.clone())
+                Some(
+                    substitute_session_user_variables(statement.clone(), &assignments)
+                        .map_err(classify_engine_error)?,
+                )
             }
             crate::query_execution::statement_admission::StatementAdmission::LegacyFrontier => None,
         };
@@ -852,14 +849,31 @@ impl FrontendQuerySession {
         let truncate_engine = Arc::clone(&self.service.truncate_engine);
         let query_options = with_allow_throw_exception(
             state.execution_settings.query_options(),
-            novarocks_sql::syntax::extract_allow_throw_exception_hint(&sql),
+            parsed_statement
+                .as_ref()
+                .is_some_and(|statement| match statement {
+                    ParsedStatement::Query(query) => {
+                        novarocks_sql::syntax::extract_allow_throw_exception_hint(query)
+                    }
+                    ParsedStatement::ExplainQuery(explain) => {
+                        novarocks_sql::syntax::extract_allow_throw_exception_hint(&explain.query)
+                    }
+                    _ => false,
+                }),
         );
-        let is_query = parsed_statement.is_none() && is_query_statement(&sql);
         let mut worker = task::spawn_blocking(move || {
             let result: Result<StatementResult, RoutedExecutionError> = if let Some(statement) =
                 parsed_statement
             {
-                if let ParsedStatement::Dml(statement) = &statement {
+                if matches!(
+                    statement,
+                    ParsedStatement::Query(_) | ParsedStatement::ExplainQuery(_)
+                ) {
+                    compiler
+                        .prepare_statement(&statement, &context, Some(query_options))
+                        .and_then(|operation| execute_prepared_query(operation, &query_execution))
+                        .map_err(RoutedExecutionError::Engine)
+                } else if let ParsedStatement::Dml(statement) = &statement {
                     execute_typed_dml_statement(
                         dml.as_ref(),
                         insert_engine.as_ref(),
@@ -922,11 +936,6 @@ impl FrontendQuerySession {
                         .execute_typed(&statement, &context, query_options)
                         .map_err(RoutedExecutionError::Engine)
                 }
-            } else if is_query {
-                compiler
-                    .prepare(&sql, &context, Some(query_options))
-                    .and_then(|operation| execute_prepared_query(operation, &query_execution))
-                    .map_err(RoutedExecutionError::Engine)
             } else {
                 Err(RoutedExecutionError::Engine(
                     "statement was admitted before its command-family owner cut".to_string(),
@@ -971,6 +980,57 @@ impl FrontendQuerySession {
             }
         }
     }
+}
+
+fn substitute_session_user_variables(
+    statement: ParsedStatement,
+    assignments: &[(String, String)],
+) -> Result<ParsedStatement, String> {
+    if assignments.is_empty() {
+        return Ok(statement);
+    }
+
+    let mut values = BTreeMap::new();
+    for (name, value) in assignments {
+        let statements = novarocks_parser::parse(&format!("SELECT {value}"))
+            .map_err(|error| format!("invalid session user variable {name}: {error}"))?;
+        let [ParsedStatement::Query(query)] = statements.as_slice() else {
+            return Err(format!("invalid session user variable {name}"));
+        };
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            return Err(format!("invalid session user variable {name}"));
+        };
+        let [item] = select.projection.as_slice() else {
+            return Err(format!("invalid session user variable {name}"));
+        };
+        let expression = match item {
+            ast::SelectItem::UnnamedExpr(expression)
+            | ast::SelectItem::ExprWithAlias {
+                expr: expression, ..
+            } => expression.clone(),
+            ast::SelectItem::Wildcard { .. } | ast::SelectItem::QualifiedWildcard { .. } => {
+                return Err(format!("invalid session user variable {name}"));
+            }
+        };
+        values.insert(name.to_ascii_lowercase(), expression);
+    }
+
+    struct Substituter {
+        values: BTreeMap<String, ast::Expr>,
+    }
+
+    impl Fold for Substituter {
+        fn fold_expr(&mut self, expression: ast::Expr) -> ast::Expr {
+            if let ast::Expr::UserVariable(variable) = &expression
+                && let Some(value) = self.values.get(&variable.value.to_ascii_lowercase())
+            {
+                return value.clone();
+            }
+            ast::fold_expr(self, expression)
+        }
+    }
+
+    Ok(Substituter { values }.fold_statement(statement))
 }
 
 fn with_allow_throw_exception(query_options: QueryOptions, enabled: bool) -> QueryOptions {
@@ -1322,24 +1382,6 @@ fn parse_bool(value: &str) -> Result<bool, QueryServiceError> {
             QueryServiceErrorKind::InvalidValue,
             format!("invalid boolean value `{value}`"),
         )),
-    }
-}
-
-fn is_query_statement(sql: &str) -> bool {
-    let mut words = sql.split_whitespace();
-    match words.next().map(|word| word.to_ascii_lowercase()) {
-        Some(keyword) if matches!(keyword.as_str(), "select" | "with") => true,
-        Some(keyword) if keyword == "explain" => {
-            let mut target = words.next().map(|word| word.to_ascii_lowercase());
-            while matches!(
-                target.as_deref(),
-                Some("analyze" | "verbose" | "costs" | "logical")
-            ) {
-                target = words.next().map(|word| word.to_ascii_lowercase());
-            }
-            matches!(target.as_deref(), Some("select" | "with"))
-        }
-        _ => false,
     }
 }
 
@@ -2145,15 +2187,6 @@ mod tests {
             Some(false)
         );
         assert_eq!(settings.max_reorder_node_use_exhaustive, Some(2));
-    }
-
-    #[test]
-    fn explain_refresh_is_a_command_but_explain_select_is_a_query() {
-        assert!(is_query_statement("EXPLAIN VERBOSE SELECT 1"));
-        assert!(is_query_statement(
-            "EXPLAIN ANALYZE WITH cte AS (SELECT 1) SELECT * FROM cte"
-        ));
-        assert!(!is_query_statement("EXPLAIN REFRESH MATERIALIZED VIEW mv"));
     }
 
     #[test]

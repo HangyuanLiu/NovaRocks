@@ -516,7 +516,12 @@ fn write_literal(literal: &Literal, output: &mut String) {
     match &literal.kind {
         LiteralKind::Null => output.push_str("NULL"),
         LiteralKind::Boolean(value) => output.push_str(if *value { "TRUE" } else { "FALSE" }),
-        LiteralKind::Number(value) | LiteralKind::HexString(value) => output.push_str(value),
+        LiteralKind::Number(value) => output.push_str(value),
+        LiteralKind::HexString(value) => {
+            output.push_str("X'");
+            output.push_str(value);
+            output.push('\'');
+        }
         LiteralKind::String(value) => write_quoted_string(value, output),
     }
 }

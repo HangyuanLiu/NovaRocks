@@ -24,6 +24,28 @@ use novarocks_frontend::view::{
     CreateExternalViewRequest, ResolvedExternalView, ViewColumnDefinition, ViewEngine,
     ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
 };
+use novarocks_parser::{
+    Span,
+    ast::{Ident, ObjectName, TypeName},
+};
+
+fn native_bigint_type() -> TypeName {
+    let span = Span::new(0, 0);
+    TypeName {
+        name: ObjectName {
+            parts: vec![Ident {
+                value: "BIGINT".to_string(),
+                quoted: false,
+                quote_style: None,
+                span,
+            }],
+            span,
+        },
+        arguments: Vec::new(),
+        argument_separator_spaces: Vec::new(),
+        span,
+    }
+}
 
 #[test]
 fn frontend_facing_view_ports_and_dtos_are_publicly_nameable() {
@@ -36,7 +58,7 @@ fn frontend_facing_view_ports_and_dtos_are_publicly_nameable() {
         target: target.clone(),
         columns: vec![ViewColumnDefinition {
             name: "sale_count".to_string(),
-            data_type: sqlparser::ast::DataType::BigInt(None),
+            data_type: native_bigint_type(),
             nullable: false,
         }],
         definition: PersistedQueryDefinition::new(
