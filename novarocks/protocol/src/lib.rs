@@ -7,7 +7,7 @@
 
 pub const SCHEMA_LEDGER_VERSION: u32 = 1;
 
-// Design: ADR-0085 (docs/adr/ADR-0085-native-protocol-error-contract.md)
+// Design: ADR-0098 (docs/adr/ADR-0098-native-protocol-error-contract.md)
 pub mod error;
 pub use error::{FieldPath, FieldPathSegment, ProtocolError, ProtocolErrorKind};
 

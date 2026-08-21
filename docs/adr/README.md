@@ -115,7 +115,7 @@ code-anchors:
 - ADR-0081 — 统计为何是带版本、允许陈旧、由读侧逐 metric 决定可用性的估计事实（active）
 - ADR-0082 — 同一快照上的统计发布为何以覆盖度排序、且冲突重试必须重新判定（active）
 - ADR-0084 — durable statistics job 为何持久化逻辑目标、物理对象 ID 与列意图，并在 attempt 时解析当前数据版本（active）
-- ADR-0085 — durable MV 与维护基表 identity 为何保持 opaque、只在 provider-local 边界解释（active）
+- ADR-0097 — durable MV 与维护基表 identity 为何保持 opaque、只在 provider-local 边界解释（active）
 - ADR-0089 — Predicate-driven Parquet page pruning 为何只在 FS reader-open 按实际 physical leaf 计算（active）
 
 #### 历史
@@ -140,7 +140,7 @@ code-anchors:
 - ADR-0078 — Runtime Filter terminal observation 为何只作观测，且以 P0/P1/P2 查询终止契约交付（active）
 - ADR-0079 — IDL/proto 为何是 FE/BE 中立 query lifecycle 契约的规范形式、Protocol 如何同时拥有 schema 与已验证值（active）
 - ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
-- ADR-0085 — native DTO 的字段路径与验证错误为何由 Protocol 独占、而不保留 Core family 门面（active）
+- ADR-0098 — native DTO 的字段路径与验证错误为何由 Protocol 独占、而不保留 Core family 门面（active）
 
 #### 历史
 
@@ -153,7 +153,7 @@ code-anchors:
 - ADR-0073 — SQL compiler 为何先完成全部 binding 分析物化、再冻结 statistics 并以无 catalog 的第二阶段优化封存（active）
 - ADR-0040 — SQL compiler 为何先完成依赖倒置闭包、再进行独立 crate 物理迁移（active）
 - ADR-0050 — sealed DistributedPlan 为何以 logical mutation effect 与 opaque provider route 服务跨 owner encoder（active）
-- ADR-0090 — 常量折叠为何经注入端口复用执行 kernel，并对无法一致表示的结果拒绝折叠（active）
+- ADR-0100 — 常量折叠为何经注入端口复用执行 kernel，并对无法一致表示的结果拒绝折叠（active）
 
 #### 历史
 
@@ -244,7 +244,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0037 — 历史 MV refresh 为什么只能跨 incarnation 做 lake inspection 与 guarded cleanup（active）
 - ADR-0038 — Frontend 为何拥有 MV background worker lifecycle 与 per-target activity gate（active）
 - ADR-0064 — MV publication 为何需要 lake 上专用的 fence ref，并在推进 main 的同一 commit 中做四方 exact 比较（active）
-- ADR-0074 — MV refresh 所有权为何按 target 上锁、且必须在每个事务内校验（active）
+- ADR-0096 — MV refresh 所有权为何按 target 上锁、且必须在每个事务内校验（active）
 - ADR-0075 — ledger 丢失后 MV attempt 为何以 lake-first 有界发现 + 保守分类收敛，而非按时间/ID 猜 winner（active）
 - ADR-0086 — MV storage observation 为何以中立 SPI facts 连接 provider 与 Frontend durable contracts（active）
 
@@ -280,8 +280,8 @@ fallback 模糊 owner 和故障语义。
 - ADR-0058 — 架构隔离为何由 crate 边界强制，而不用硬编码的 source-shape guard（active）
 - ADR-0069 — 共享测试机械能力为何使用零产品依赖的独立叶子 crate，而领域断言仍跟随其 owner（active）
 - ADR-0071 — 分布式测试编排为何由唯一 cluster harness 拥有、SQL runner 只作 frontend adapter（active）
-- ADR-0085 — native DTO 的字段路径与验证错误为何由 Protocol 独占、而不保留 Core family 门面（active）
-- ADR-0088 — 聚合 Core 退场后为何按真实 owner 物理切断依赖（active）
+- ADR-0098 — native DTO 的字段路径与验证错误为何由 Protocol 独占、而不保留 Core family 门面（active）
+- ADR-0099 — 聚合 Core 退场后为何按真实 owner 物理切断依赖（active）
 - ADR-0093 — StateStore provider 为何作为 leaf crate、Frontend 直接拥有 consumer runtime（active）
 - ADR-0094 — 空 catalog crate 为何在真实 owner 收敛后删除，而不保留 facade（active）
 

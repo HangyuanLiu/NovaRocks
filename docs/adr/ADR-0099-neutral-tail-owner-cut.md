@@ -1,5 +1,5 @@
 ---
-id: ADR-0088
+id: ADR-0099
 title: "Neutral tail owner cut"
 domain: [crate-boundary]
 status: active
@@ -10,7 +10,8 @@ provenance:
   - "implementation: neutral-tail owner cut; PR number pending"
   - "discussion: 2026-08-18 neutral owner boundaries"
 code-anchors:
-  - "novarocks/core/src/lib.rs (empty compatibility shell)"
+  - "Cargo.toml (workspace members)"
+  - "novarocks/failpoint/src/lib.rs (owner-neutral failpoint vocabulary)"
 ---
 
 ## 问题

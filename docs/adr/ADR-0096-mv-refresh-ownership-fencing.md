@@ -1,5 +1,5 @@
 ---
-id: ADR-0074
+id: ADR-0096
 title: "MV refresh ownership is fenced per target and inside each transaction"
 domain: [frontend-mv, cluster-membership]
 status: active

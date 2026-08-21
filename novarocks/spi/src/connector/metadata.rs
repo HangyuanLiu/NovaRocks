@@ -96,7 +96,7 @@ pub const MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES: usize = 256;
 /// catalog lookup, this value answers whether a lookup still denotes the same
 /// physical object across versions. Core and frontend may compare and persist
 /// it, but must not parse or rewrite its bytes.
-// Design: ADR-0085 (docs/adr/ADR-0085-durable-base-object-identities-remain-opaque.md)
+// Design: ADR-0097 (docs/adr/ADR-0097-durable-base-object-identities-remain-opaque.md)
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct ConnectorTableObjectId(Bytes);
 
