@@ -40,20 +40,12 @@ pub const SESSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
 ];
 
 /// Capability failures owned by the frontend session-statement application.
-#[allow(
-    dead_code,
-    reason = "SQLP-9 T4 consumes these typed errors after the parser family is registered."
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionAdmitError {
     GlobalScopeUnsupported,
     KillConnectionUnsupported,
 }
 
-#[allow(
-    dead_code,
-    reason = "SQLP-9 T4 constructs these typed errors after the parser family is registered."
-)]
 impl SessionAdmitError {
     const fn descriptor(self) -> ErrorCodeDescriptor {
         match self {

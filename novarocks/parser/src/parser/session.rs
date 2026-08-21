@@ -106,12 +106,17 @@ fn parse_assignment(parser: &mut StatementParser<'_, '_>) -> Result<SetAssignmen
         });
     } else if parser.current_is_word("CATALOG") {
         let target_span = parser.consume_word("CATALOG")?;
-        let value = parser.parse_contextual_ident()?;
+        let value = if parser.consume_if_symbol(Symbol::Eq) {
+            parse_assignment_value(parser)?
+        } else {
+            let value = parser.parse_contextual_ident()?;
+            SetValue::Words(vec![SetWord::Ident(value)])
+        };
         return Ok(SetAssignment {
             scope,
             target: SetTarget::Catalog { span: target_span },
-            span: Span::new(start, value.span.end()),
-            value: SetValue::Words(vec![SetWord::Ident(value)]),
+            span: Span::new(start, value.span().end()),
+            value,
         });
     } else {
         parse_variable_target(parser, &mut scope)?
@@ -355,7 +360,7 @@ mod tests {
             "SET @@session.query_timeout = 1, @@global.pipeline_dop = 2; \
              SET NAMES 'utf8' COLLATE 'utf8_general_ci'; \
              SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
-             SET CATALOG warehouse",
+             SET CATALOG warehouse; SET CATALOG = warehouse",
         )
         .expect("session forms should parse");
         let Statement::Session(SessionStatement::Set(set)) = &statements[0] else {
