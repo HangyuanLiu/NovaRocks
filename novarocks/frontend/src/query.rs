@@ -275,6 +275,9 @@ impl CoreCommandRoute for TypedCommandRoute {
                 "typed DDL/DML admission is enabled, but execution routing remains intentionally unconnected until SQLP-5 T10"
                     .to_string(),
             ),
+            ParsedStatement::Session(_) => Err(
+                "typed session execution is not connected until SQLP-9 T4".to_string(),
+            ),
             ParsedStatement::Query(_) | ParsedStatement::ExplainQuery(_) => {
                 Err("typed query execution is owned by the query compiler".to_string())
             }

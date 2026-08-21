@@ -95,8 +95,66 @@ impl Printer {
                 crate::ast::table::write_sql(statement, &mut self.output)
             }
             Statement::Dml(statement) => crate::ast::dml::write_sql(statement, &mut self.output),
+            Statement::Session(statement) => self.write_session_statement(statement),
             Statement::Query(query) => self.write_query(query),
             Statement::ExplainQuery(explain) => self.write_explain_query(explain),
+        }
+    }
+
+    fn write_session_statement(&mut self, statement: &SessionStatement) {
+        match statement {
+            SessionStatement::Set(statement) => {
+                self.output.push_str("SET ");
+                for (index, assignment) in statement.assignments.iter().enumerate() {
+                    if index != 0 {
+                        self.output.push_str(", ");
+                    }
+                    match assignment.scope {
+                        SetScope::Default => {}
+                        SetScope::Session => self.output.push_str("SESSION "),
+                        SetScope::Local => self.output.push_str("LOCAL "),
+                        SetScope::Global => self.output.push_str("GLOBAL "),
+                    }
+                    match &assignment.target {
+                        SetTarget::UserVariable(variable) => self.output.push_str(&variable.value),
+                        SetTarget::SystemVariable(variable) => self.write_ident(variable),
+                        SetTarget::Names { .. } => self.output.push_str("NAMES"),
+                        SetTarget::Transaction { .. } => self.output.push_str("TRANSACTION"),
+                        SetTarget::Catalog { .. } => self.output.push_str("CATALOG"),
+                    }
+                    if matches!(
+                        assignment.target,
+                        SetTarget::UserVariable(_) | SetTarget::SystemVariable(_)
+                    ) {
+                        self.output.push_str(" = ");
+                    } else {
+                        self.output.push(' ');
+                    }
+                    match &assignment.value {
+                        SetValue::Expression(value) => self.write_expr(value),
+                        SetValue::Query(value) => {
+                            self.output.push('(');
+                            self.write_query(value);
+                            self.output.push(')');
+                        }
+                        SetValue::Words(words) => self.write_ident_list(words),
+                    }
+                }
+            }
+            SessionStatement::Use(statement) => {
+                self.output.push_str("USE ");
+                self.write_ident(&statement.database);
+            }
+            SessionStatement::Kill(statement) => {
+                self.output.push_str("KILL");
+                match statement.kind {
+                    KillKind::Default => {}
+                    KillKind::Query => self.output.push_str(" QUERY"),
+                    KillKind::Connection => self.output.push_str(" CONNECTION"),
+                }
+                self.output.push(' ');
+                self.write_literal(&statement.connection_id);
+            }
         }
     }
 

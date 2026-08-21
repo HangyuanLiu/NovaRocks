@@ -557,6 +557,7 @@ mod tests {
                 Statement::View(_) => "VIEW",
                 Statement::Table(_) => "TABLE",
                 Statement::Dml(_) => "DML",
+                Statement::Session(_) => "SESSION",
                 Statement::Query(_) => "QUERY",
                 Statement::ExplainQuery(_) => "EXPLAIN QUERY",
             })
