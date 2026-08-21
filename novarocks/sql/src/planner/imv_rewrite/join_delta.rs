@@ -1566,7 +1566,7 @@ mod tests {
     use crate::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
     };
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     #[test]
     fn supported_join_delta_kinds_are_inner_and_cross_only() {

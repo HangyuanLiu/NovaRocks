@@ -45,7 +45,6 @@ use crate::query_execution::planning::write_sink::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
-use novarocks_catalog::schema::ColumnDef;
 use novarocks_parser::ast::{
     BinaryOperator, Delete, Expr, FunctionCall, IsPredicate, LiteralKind,
     ObjectName as ParserObjectName, Query, Statement, UnaryOperator,
@@ -55,6 +54,7 @@ use novarocks_spi::connector::ConnectorWriteOperationId;
 use novarocks_sql::planning::dml::{DmlWriteSinkMode, IcebergRefSuffix, split_ref_suffix};
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
 use novarocks_sql::syntax::ObjectName as SqlObjectName;
+use novarocks_types::schema::ColumnDef;
 
 pub(crate) fn prepare_delete_statement(
     state: &DmlExecutionKernel,
@@ -818,8 +818,8 @@ mod tests {
     use novarocks_parser::Span;
     use novarocks_parser::ast::{DmlStatement, Expr, Literal, LiteralKind, Statement};
 
-    fn column(name: &str, data_type: DataType) -> novarocks_catalog::schema::ColumnDef {
-        novarocks_catalog::schema::ColumnDef {
+    fn column(name: &str, data_type: DataType) -> novarocks_types::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
             name: name.to_string(),
             data_type,
             nullable: false,
@@ -839,14 +839,14 @@ mod tests {
 
     /// Variant columns reach row DML as LargeBinary, which is what keeps them
     /// distinguishable from a genuine string column.
-    fn columns_with_variant() -> Vec<novarocks_catalog::schema::ColumnDef> {
+    fn columns_with_variant() -> Vec<novarocks_types::schema::ColumnDef> {
         vec![
             column("id", DataType::Int32),
             column("v", DataType::LargeBinary),
         ]
     }
 
-    fn columns_with_timestamp() -> Vec<novarocks_catalog::schema::ColumnDef> {
+    fn columns_with_timestamp() -> Vec<novarocks_types::schema::ColumnDef> {
         vec![
             column("id", DataType::Int32),
             column(

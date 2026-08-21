@@ -31,7 +31,6 @@ use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
     admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
-use novarocks_catalog::schema::ColumnDef;
 use novarocks_parser::ast::{AddEqualityDelete, LiteralKind, ObjectName, Query, Statement};
 use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
@@ -43,6 +42,7 @@ use novarocks_sql::syntax::{
     Literal as SqlLiteral, ObjectName as SqlObjectName, parse_date_string_to_days,
     parse_datetime_string_to_micros,
 };
+use novarocks_types::schema::ColumnDef;
 
 type Literal = SqlLiteral;
 

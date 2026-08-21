@@ -18,8 +18,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorTableResolution};
+use novarocks_types::naming::TableIdentity;
 
 /// Freeze the narrow base-table facts used by one MV refresh attempt, from the
 /// exact control and observation ports selected for that attempt.

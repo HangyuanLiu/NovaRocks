@@ -405,7 +405,7 @@ pub fn metadata_load_connector_table_with_planning_lease(
 pub(crate) fn sql_columns_from_connector_schema(
     schema: &arrow::datatypes::Schema,
     planning_facts: &novarocks_spi::connector::ConnectorTablePlanningFacts,
-) -> Vec<novarocks_catalog::schema::ColumnDef> {
+) -> Vec<novarocks_types::schema::ColumnDef> {
     schema
         .fields()
         .iter()
@@ -419,7 +419,7 @@ pub(crate) fn sql_columns_from_connector_schema(
                 .get(novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL)
                 .is_none_or(|value| !value.eq_ignore_ascii_case("true"))
         })
-        .map(|(ordinal, field)| novarocks_catalog::schema::ColumnDef {
+        .map(|(ordinal, field)| novarocks_types::schema::ColumnDef {
             name: field.name().clone(),
             data_type: field.data_type().clone(),
             nullable: field.is_nullable(),
@@ -437,7 +437,7 @@ pub(crate) fn sql_columns_from_connector_schema(
 pub fn connector_write_default_at(
     planning_facts: &novarocks_spi::connector::ConnectorTablePlanningFacts,
     ordinal: usize,
-) -> Option<novarocks_catalog::schema::ColumnDefault> {
+) -> Option<novarocks_types::schema::ColumnDefault> {
     planning_facts
         .column_facts()
         .get(ordinal)
@@ -452,9 +452,9 @@ pub fn connector_write_default_at(
 /// crate.
 pub fn connector_default_to_column_default(
     value: &novarocks_spi::connector::ConnectorColumnDefault,
-) -> novarocks_catalog::schema::ColumnDefault {
-    use novarocks_catalog::schema::ColumnDefault;
+) -> novarocks_types::schema::ColumnDefault {
     use novarocks_spi::connector::ConnectorColumnDefault as Spi;
+    use novarocks_types::schema::ColumnDefault;
 
     match value {
         Spi::Null => ColumnDefault::Null,

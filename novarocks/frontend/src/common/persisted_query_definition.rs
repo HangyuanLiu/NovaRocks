@@ -21,7 +21,7 @@
 //! printer result.  Consumers may derive normalized or qualified compiler input from
 //! it for one request, but those derived values are not durable facts.
 
-use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_types::naming::normalize_identifier;
 use serde::{Deserialize, Serialize};
 
 pub const PERSISTED_QUERY_DEFINITION_FORMAT_VERSION: u16 = 1;

@@ -31,8 +31,8 @@ use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use crate::syntax_ast::{
     ArithmeticOp, ColumnRef, DefaultLiteral, Expr, Literal, ScalarFunctionExpr,
 };
-use novarocks_catalog::schema::{ColumnDefault, SqlType, validate_column_default};
 use novarocks_parser::{ast, printer};
+use novarocks_types::schema::{ColumnDefault, SqlType, validate_column_default};
 
 #[allow(
     dead_code,
@@ -997,9 +997,9 @@ pub(crate) fn eval_literal_arithmetic(
 /// Cast a `Literal` to the given SQL type without `ManualValue`.
 pub(crate) fn cast_literal(
     value: Literal,
-    data_type: &novarocks_catalog::schema::SqlType,
+    data_type: &novarocks_types::schema::SqlType,
 ) -> Result<Literal, String> {
-    use novarocks_catalog::schema::SqlType;
+    use novarocks_types::schema::SqlType;
     match data_type {
         SqlType::String | SqlType::Json => match &value {
             Literal::Null => Ok(Literal::Null),

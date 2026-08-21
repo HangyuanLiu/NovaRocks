@@ -26,9 +26,6 @@ use std::sync::Arc;
 use crate::catalog_application::query_catalog::drop_local_table_registration_if_exists;
 use crate::runtime::statement_result::StatementResult;
 use bytes::Bytes;
-use novarocks_catalog::identifier::normalize_identifier;
-use novarocks_catalog::identifier::resolve_local_table_name;
-use novarocks_catalog::schema::SqlType;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorColumnAggregation, ConnectorColumnDefinition,
@@ -39,6 +36,8 @@ use novarocks_spi::connector::{
     CreatePolicy, DropPolicy,
 };
 use novarocks_sql::syntax::{CreateTableKind, DefaultLiteral, ObjectName};
+use novarocks_types::naming::{normalize_identifier, resolve_local_table_name};
+use novarocks_types::schema::SqlType;
 
 use novarocks_parser::ast::{
     ColumnDefinition as TypedColumnDefinition, CreateTable as TypedCreateTable,
@@ -111,7 +110,6 @@ pub(crate) fn execute_create_table_statement(
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    let legacy_range_partitions = stmt.legacy_range_partitions.clone();
     match stmt.kind {
         CreateTableKind::Iceberg {
             columns,
@@ -132,8 +130,8 @@ pub(crate) fn execute_create_table_statement(
                     .find(|c| c.name.eq_ignore_ascii_case(&dist_lower))
                     && matches!(
                         column.data_type,
-                        novarocks_catalog::schema::SqlType::Bitmap
-                            | novarocks_catalog::schema::SqlType::Hll
+                        novarocks_types::schema::SqlType::Bitmap
+                            | novarocks_types::schema::SqlType::Hll
                     )
                 {
                     return Err(format!(
@@ -162,10 +160,7 @@ pub(crate) fn execute_create_table_statement(
                 if let Some(column) = columns
                     .iter()
                     .find(|column| column.name.eq_ignore_ascii_case(source_column))
-                    && matches!(
-                        column.data_type,
-                        novarocks_catalog::schema::SqlType::Variant
-                    )
+                    && matches!(column.data_type, novarocks_types::schema::SqlType::Variant)
                 {
                     return Err(format!(
                         "iceberg table column `{}` is variant; variant columns cannot appear in the partition spec. Use a non-variant source column for partition transforms.",
@@ -212,7 +207,6 @@ pub(crate) fn execute_create_table_statement(
                 },
                 connector_context.clone(),
             )?;
-            let _ = legacy_range_partitions;
             Ok(StatementResult::Ok)
         }
     }
@@ -314,7 +308,6 @@ pub(crate) fn execute_typed_create_table_statement(
                 partition_fields,
                 properties,
             },
-            legacy_range_partitions: Vec::new(),
             if_not_exists: statement.if_not_exists,
         },
         current_catalog,

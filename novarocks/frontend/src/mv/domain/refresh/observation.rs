@@ -31,12 +31,12 @@ use crate::mv::domain::schema_validation::{
 use crate::mv::domain::storage_observation::{
     MvRefreshBaseObservation, MvSchemaValidationObservation,
 };
-use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
     ConnectorTableObjectCaptureRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
 };
+use novarocks_types::naming::TableIdentity;
 use std::sync::Arc;
 
 fn derive_rebind_query_source(

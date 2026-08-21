@@ -715,7 +715,7 @@ mod tests {
     use crate::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
     };
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
     use std::num::{NonZeroU32, NonZeroU64};
 
     fn sql_schema(fields: &[(i32, &str, &str, bool)]) -> SqlMvLineageSchema {

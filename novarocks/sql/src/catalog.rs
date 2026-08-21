@@ -17,10 +17,10 @@
 
 use crate::planner::table::TableDef;
 use crate::planning::catalog::MetadataTableKind;
-use novarocks_catalog::identifier::TableIdentity;
-use novarocks_catalog::table::CatalogTable;
+use novarocks_types::naming::TableIdentity;
+use novarocks_types::schema::CatalogTable;
 
-pub(crate) mod local;
+pub(crate) mod memory;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TableLookupMode {

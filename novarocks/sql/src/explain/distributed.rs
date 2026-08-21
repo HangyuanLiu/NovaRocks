@@ -1760,7 +1760,7 @@ mod tests {
         PhysicalPlanStats, PlannerBroadcastDecision, PlannerConfidence,
     };
     use crate::planner::table::TableDef;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn explain_distributed_plan_analyze(
         plan: &crate::planner::distributed::DistributedPlan,

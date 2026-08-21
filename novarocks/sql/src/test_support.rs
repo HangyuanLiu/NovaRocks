@@ -1557,7 +1557,7 @@ fn native_ordinary_iceberg_id_equality_predicate_scan_plan() -> Result<Distribut
     )
 }
 
-fn ordinary_iceberg_columns() -> Vec<novarocks_catalog::schema::ColumnDef> {
+fn ordinary_iceberg_columns() -> Vec<novarocks_types::schema::ColumnDef> {
     vec![
         column_def("id", DataType::Int32, false),
         column_def("category", DataType::Utf8, true),
@@ -1960,7 +1960,7 @@ fn mv_target_state_source(row_id_column_name: &str) -> SqlScanKind {
 
 fn native_scan_fixture_plan(
     source: SqlScanKind,
-    table_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    table_columns: Vec<novarocks_types::schema::ColumnDef>,
     output_columns: Vec<OutputColumn>,
     required_columns: Option<Vec<String>>,
     variant_columns: Vec<ScanVariantColumn>,
@@ -1977,7 +1977,7 @@ fn native_scan_fixture_plan(
 
 fn native_scan_fixture_plan_with_predicates(
     source: SqlScanKind,
-    table_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    table_columns: Vec<novarocks_types::schema::ColumnDef>,
     output_columns: Vec<OutputColumn>,
     required_columns: Option<Vec<String>>,
     variant_columns: Vec<ScanVariantColumn>,
@@ -1996,12 +1996,12 @@ fn native_scan_fixture_plan_with_predicates(
 
 fn native_scan_fixture_plan_with_lineage(
     source: SqlScanKind,
-    table_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    table_columns: Vec<novarocks_types::schema::ColumnDef>,
     output_columns: Vec<OutputColumn>,
     required_columns: Option<Vec<String>>,
     variant_columns: Vec<ScanVariantColumn>,
     predicates: Vec<TypedExpr>,
-    iceberg_row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    iceberg_row_lineage_metadata_columns: Vec<novarocks_types::schema::ColumnDef>,
 ) -> Result<DistributedPlan, String> {
     let table = TableDef {
         name: "orders".to_string(),
@@ -2394,8 +2394,8 @@ fn column_def(
     name: &str,
     data_type: DataType,
     nullable: bool,
-) -> novarocks_catalog::schema::ColumnDef {
-    novarocks_catalog::schema::ColumnDef {
+) -> novarocks_types::schema::ColumnDef {
+    novarocks_types::schema::ColumnDef {
         name: name.to_string(),
         data_type,
         nullable,

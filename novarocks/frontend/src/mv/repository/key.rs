@@ -19,9 +19,9 @@ use crate::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use bytes::Bytes;
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::ConnectorInstanceId;
 use novarocks_spi::state_store::Key;
+use novarocks_types::naming::normalize_identifier;
 
 const PREFIX: &str = "novarocks/frontend/mv/v1";
 const DEPENDENCY_SEPARATOR: char = '|';

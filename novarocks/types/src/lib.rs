@@ -29,9 +29,11 @@ pub mod identity;
 pub mod largeint;
 pub mod logical;
 pub mod mv_aggregate_layout;
+pub mod naming;
 pub mod network;
 mod predicate;
 pub mod primitive;
+pub mod schema;
 pub mod slot_id;
 pub mod value;
 

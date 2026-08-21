@@ -421,7 +421,7 @@ mod tests {
     use crate::optimizer::scalar::ScalarArena;
     use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     // Helper: intern a TypedExpr that uses ColumnId::UNSET (used for
     // passthrough project tests where column ids are not resolved).

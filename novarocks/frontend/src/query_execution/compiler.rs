@@ -34,8 +34,8 @@ use crate::catalog_application::query_catalog::QueryCatalogService;
 #[cfg(test)]
 use crate::catalog_application::query_materializer::build_catalog_service_provider;
 use crate::mv::domain::repository::MvRepository;
-use novarocks_catalog::identifier::normalize_identifier;
 pub use novarocks_sql::planning::catalog::TableLookupMode;
+use novarocks_types::naming::normalize_identifier;
 
 use crate::catalog_application::query_catalog::{CatalogServiceSource, catalog_service_snapshot};
 use crate::query_execution::kernels as domain;

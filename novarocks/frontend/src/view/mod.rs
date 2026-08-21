@@ -26,7 +26,6 @@ use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
 use novarocks_parser::{
     ast::{CreateView, Query, Statement, ViewStatement},
@@ -34,6 +33,7 @@ use novarocks_parser::{
 };
 use novarocks_spi::state_store::StateStore;
 use novarocks_types::SlotId;
+use novarocks_types::naming::normalize_identifier;
 use tokio::runtime::Handle;
 
 pub(crate) mod command;

@@ -344,7 +344,7 @@ mod tests {
     use crate::planner::payload::{AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode};
     use crate::planner::table::{ScanSource, SqlScanKind, SqlScanSource, TableDef};
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     #[test]
     fn rewrites_top_union_of_aggregates_into_branch_scoped_merges() {

@@ -31,13 +31,18 @@
 
 use std::sync::{Arc, RwLock};
 
-use novarocks_catalog::identifier::TableIdentity;
-use novarocks_catalog::registry::{Catalog, CatalogRegistry};
-use novarocks_catalog::schema_cache::SchemaCache;
-use novarocks_catalog::service::CatalogService;
-use novarocks_catalog::table::CatalogTable;
+use novarocks_types::naming::TableIdentity;
+use novarocks_types::schema::CatalogTable;
 
 use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
+
+mod registry;
+mod schema_cache;
+mod service;
+
+use registry::{Catalog, CatalogRegistry};
+use schema_cache::SchemaCache;
+pub use service::QueryCatalogService;
 
 /// Provider-neutral table facts admitted for one request.  Core projects the
 /// typed SPI metadata into SQL facts, preserves the opaque scan authority, and
@@ -45,8 +50,8 @@ use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
 #[derive(Clone)]
 pub struct ConnectorQueryTableMaterialization {
     pub schema_version: Option<Vec<u8>>,
-    pub columns: Vec<novarocks_catalog::schema::ColumnDef>,
-    pub row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub columns: Vec<novarocks_types::schema::ColumnDef>,
+    pub row_lineage_metadata_columns: Vec<novarocks_types::schema::ColumnDef>,
     pub read_table: novarocks_spi::connector::ConnectorTableHandle,
     pub read_schema: arrow::datatypes::SchemaRef,
     pub read_selector: novarocks_spi::connector::ConnectorReadSelector,
@@ -146,14 +151,14 @@ pub fn connector_table_materialization_from_metadata(
         let fact = metadata.planning_facts.column_facts().get(ordinal);
         let logical_type = match fact.map(|fact| fact.semantic_kind()) {
             Some(ConnectorTableColumnSemanticKind::Bitmap) => {
-                Some(novarocks_catalog::schema::SqlType::Bitmap)
+                Some(novarocks_types::schema::SqlType::Bitmap)
             }
             Some(ConnectorTableColumnSemanticKind::Hll) => {
-                Some(novarocks_catalog::schema::SqlType::Hll)
+                Some(novarocks_types::schema::SqlType::Hll)
             }
             _ => None,
         };
-        let column = novarocks_catalog::schema::ColumnDef {
+        let column = novarocks_types::schema::ColumnDef {
             name: field.name().to_string(),
             data_type: field.data_type().clone(),
             nullable: field.is_nullable(),
@@ -235,9 +240,6 @@ impl CatalogRuntimeMetadata {
 /// The registry keeps durable SQL catalog facts only. Provider authority is
 /// supplied separately through the exact Connector control lease captured for
 /// each request.
-pub type QueryCatalogService =
-    CatalogService<novarocks_sql::planning::catalog::SqlLocalCatalogEntry, CatalogRuntimeMetadata>;
-
 struct InternalCatalog {
     name: String,
     local: Arc<RwLock<PlannerMemoryCatalog>>,
@@ -252,7 +254,7 @@ impl InternalCatalog {
     }
 }
 
-impl Catalog<CatalogRuntimeMetadata> for InternalCatalog {
+impl Catalog for InternalCatalog {
     fn name(&self) -> &str {
         &self.name
     }
@@ -279,7 +281,7 @@ impl Catalog<CatalogRuntimeMetadata> for InternalCatalog {
 struct ConnectorCatalog {
     name: String,
     controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-    cache: SchemaCache<CatalogRuntimeMetadata>,
+    cache: SchemaCache,
 }
 
 impl ConnectorCatalog {
@@ -295,7 +297,7 @@ impl ConnectorCatalog {
     }
 }
 
-impl Catalog<CatalogRuntimeMetadata> for ConnectorCatalog {
+impl Catalog for ConnectorCatalog {
     fn name(&self) -> &str {
         &self.name
     }
@@ -337,15 +339,15 @@ impl Catalog<CatalogRuntimeMetadata> for ConnectorCatalog {
 /// Frontend has installed their Connector control generation.
 pub fn new_query_catalog_service() -> QueryCatalogService {
     let local = Arc::new(RwLock::new(PlannerMemoryCatalog::default()));
-    let service = CatalogService::new(Arc::clone(&local), CatalogRegistry::new());
+    let service = QueryCatalogService::new(Arc::clone(&local), CatalogRegistry::new());
     service.register_catalog(Arc::new(InternalCatalog::new("default_catalog", local)));
     service
 }
 
-pub fn build_connector_catalog(
+pub(crate) fn build_connector_catalog(
     name: &str,
     controls: Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-) -> Arc<dyn Catalog<CatalogRuntimeMetadata>> {
+) -> Arc<dyn Catalog> {
     Arc::new(ConnectorCatalog::new(name, controls))
 }
 

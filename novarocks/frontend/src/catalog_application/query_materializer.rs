@@ -25,9 +25,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use novarocks_catalog::partition::LegacyRangePartition;
-use novarocks_catalog::provider::CatalogProvider;
-use novarocks_catalog::table::CatalogTable;
 use novarocks_spi::connector::ConnectorControlResolver;
 
 use crate::catalog_application::query_bindings::{
@@ -385,36 +382,6 @@ fn project_binding_for_sql(
 ) -> Result<QueryTableBinding, String> {
     binding.validate_sql_scan_binding(binding_id)?;
     Ok(binding)
-}
-
-impl CatalogProvider for CatalogServiceMaterializer<'_> {
-    fn get_table(&self, database: &str, table: &str) -> Result<CatalogTable, String> {
-        self.resolve_table_for_analysis_once(None, database, table)
-            .map(|resolved| novarocks_sql::planning::catalog::catalog_table(&resolved))
-    }
-
-    fn get_table_in_catalog(
-        &self,
-        catalog: Option<&str>,
-        database: &str,
-        table: &str,
-    ) -> Result<CatalogTable, String> {
-        self.resolve_table_for_analysis_once(catalog, database, table)
-            .map(|resolved| novarocks_sql::planning::catalog::catalog_table(&resolved))
-    }
-
-    fn get_legacy_range_partition(
-        &self,
-        database: &str,
-        table: &str,
-        partition: &str,
-    ) -> Result<Option<LegacyRangePartition>, String> {
-        self.service
-            .local()
-            .read()
-            .expect("catalog service local read lock")
-            .get_legacy_range_partition(database, table, partition)
-    }
 }
 
 impl PlannerTableProvider for CatalogServiceMaterializer<'_> {
@@ -950,12 +917,9 @@ mod tests {
                 .is_none(),
             "analysis-only overlays do not manufacture a provider read handle"
         );
+        let local = service.local().read().expect("catalog read");
         assert!(
-            service
-                .local()
-                .read()
-                .expect("catalog read")
-                .get("db", "__nr_cow_orders")
+            novarocks_sql::planning::catalog::local_catalog_table(&local, "db", "__nr_cow_orders")
                 .is_err()
         );
     }

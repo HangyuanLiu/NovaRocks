@@ -19,12 +19,12 @@ use crate::common::persisted_query_definition::{PersistedQueryDefinition, Persis
 use crate::view::{
     CreateExternalViewRequest, ViewEngine, ViewRequestContext, ViewStatementResult, ViewTarget,
 };
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_parser::{
     ast::{CreateView, ObjectName},
     printer,
 };
 use novarocks_spi::connector::DropPolicy;
+use novarocks_types::naming::normalize_identifier;
 
 use super::{DEFAULT_CATALOG, build_query_result};
 

@@ -2803,10 +2803,10 @@ fn replace_grouping_markers_in_relation(
     }
 }
 
-fn is_bitmap_or_hll_type(sql_type: &novarocks_catalog::schema::SqlType) -> bool {
+fn is_bitmap_or_hll_type(sql_type: &novarocks_types::schema::SqlType) -> bool {
     matches!(
         sql_type,
-        novarocks_catalog::schema::SqlType::Bitmap | novarocks_catalog::schema::SqlType::Hll
+        novarocks_types::schema::SqlType::Bitmap | novarocks_types::schema::SqlType::Hll
     )
 }
 
@@ -2833,7 +2833,7 @@ mod tests {
         ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
         SqlTableVersionSelector, TableDef,
     };
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
     use std::num::{NonZeroU32, NonZeroU64};
 
     struct TestCatalog;

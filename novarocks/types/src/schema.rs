@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::naming::TableIdentity;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ColumnDef {
     pub name: String,
@@ -175,6 +177,13 @@ pub enum SqlType {
     /// Iceberg v3 unshredded variant. Carried as Arrow `LargeBinary`
     /// in execution; persisted as a parquet group with `LogicalType::Variant`.
     Variant,
+}
+
+#[derive(Clone, Debug)]
+pub struct CatalogTable {
+    pub identity: TableIdentity,
+    pub columns: Vec<ColumnDef>,
+    pub hidden_columns: Vec<ColumnDef>,
 }
 
 #[cfg(test)]

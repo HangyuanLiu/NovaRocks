@@ -35,7 +35,7 @@ use crate::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::planner::table::{ScanSource, SqlScanKind};
-use novarocks_catalog::schema::ColumnDef;
+use novarocks_types::schema::ColumnDef;
 
 pub(crate) struct ImvRowIdColumn;
 
@@ -158,7 +158,7 @@ mod tests {
     use crate::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
     };
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
     use std::cell::RefCell;
     use std::num::{NonZeroU32, NonZeroU64};
     use std::rc::Rc;

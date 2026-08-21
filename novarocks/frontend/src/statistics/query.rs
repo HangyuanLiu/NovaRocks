@@ -472,7 +472,7 @@ fn is_select_from_view(query: &ast::Query, view_name: &str) -> bool {
 }
 
 pub(super) fn normalize_name(name: &str) -> Result<String, String> {
-    novarocks_catalog::identifier::normalize_identifier(name.trim().trim_matches('`'))
+    novarocks_types::naming::normalize_identifier(name.trim().trim_matches('`'))
 }
 
 pub(super) fn ok_result() -> Result<QueryResult, String> {

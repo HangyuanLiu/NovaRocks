@@ -43,14 +43,14 @@ use super::{SqlFunctionCatalog, SqlStatisticsPlan, SqlStatisticsSnapshot};
 /// it contains neither a provider table nor a request lifecycle capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlImvBaseSnapshotFacts {
-    table: novarocks_catalog::identifier::TableIdentity,
+    table: novarocks_types::naming::TableIdentity,
     snapshot_id: i64,
     table_object_id: ConnectorTableObjectId,
 }
 
 impl SqlImvBaseSnapshotFacts {
     pub fn try_new(
-        table: novarocks_catalog::identifier::TableIdentity,
+        table: novarocks_types::naming::TableIdentity,
         snapshot_id: i64,
         table_object_id: ConnectorTableObjectId,
     ) -> Result<Self, String> {
@@ -77,11 +77,11 @@ impl SqlImvBaseSnapshotFacts {
 /// Defaults and provider metadata are intentionally absent.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqlImvTargetColumnsFacts {
-    columns: Arc<[novarocks_catalog::schema::ColumnDef]>,
+    columns: Arc<[novarocks_types::schema::ColumnDef]>,
 }
 
 impl SqlImvTargetColumnsFacts {
-    pub fn try_new(columns: Vec<novarocks_catalog::schema::ColumnDef>) -> Result<Self, String> {
+    pub fn try_new(columns: Vec<novarocks_types::schema::ColumnDef>) -> Result<Self, String> {
         if columns.is_empty()
             || columns.iter().any(|column| column.name.trim().is_empty())
             || columns.iter().enumerate().any(|(index, column)| {
@@ -97,7 +97,7 @@ impl SqlImvTargetColumnsFacts {
         })
     }
 
-    fn into_columns(self) -> Arc<[novarocks_catalog::schema::ColumnDef]> {
+    fn into_columns(self) -> Arc<[novarocks_types::schema::ColumnDef]> {
         self.columns
     }
 }
@@ -106,7 +106,7 @@ impl SqlImvTargetColumnsFacts {
 /// contract facts are supplied by the SQL-owned builder; applications can
 /// never recover or mutate the resulting planner snapshot.
 pub struct SqlImvRewriteSnapshotBuilder {
-    target: novarocks_catalog::identifier::TableIdentity,
+    target: novarocks_types::naming::TableIdentity,
     target_binding: SqlTableBindingId,
     mv_id: i64,
     base_snapshots: Vec<SqlImvBaseSnapshotFacts>,
@@ -118,7 +118,7 @@ pub struct SqlImvRewriteSnapshotBuilder {
 
 impl SqlImvRewriteSnapshotBuilder {
     pub fn try_new(
-        target: novarocks_catalog::identifier::TableIdentity,
+        target: novarocks_types::naming::TableIdentity,
         target_binding: SqlTableBindingId,
         mv_id: i64,
     ) -> Result<Self, String> {
@@ -158,7 +158,7 @@ impl SqlImvRewriteSnapshotBuilder {
         Ok(())
     }
 
-    pub fn target(&self) -> &novarocks_catalog::identifier::TableIdentity {
+    pub fn target(&self) -> &novarocks_types::naming::TableIdentity {
         &self.target
     }
 
@@ -257,9 +257,7 @@ impl SqlImvRewriteSnapshotBuilder {
         ))
     }
 
-    fn take_target_columns(
-        &mut self,
-    ) -> Result<Arc<[novarocks_catalog::schema::ColumnDef]>, String> {
+    fn take_target_columns(&mut self) -> Result<Arc<[novarocks_types::schema::ColumnDef]>, String> {
         self.target_columns
             .take()
             .map(SqlImvTargetColumnsFacts::into_columns)
@@ -321,7 +319,7 @@ impl SqlImvRefreshHistoryFacts {
 /// lease into this value before calling the compiler.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvBaseSnapshot {
-    pub(crate) table: novarocks_catalog::identifier::TableIdentity,
+    pub(crate) table: novarocks_types::naming::TableIdentity,
     pub(crate) snapshot_id: i64,
     pub(crate) table_object_id: ConnectorTableObjectId,
 }
@@ -1191,7 +1189,7 @@ impl SqlImvAggregateExecutionFacts {
 /// compiler never uses it to access application state.
 #[derive(Clone, Debug)]
 pub(crate) struct SqlImvRewriteSnapshot {
-    pub(crate) target: novarocks_catalog::identifier::TableIdentity,
+    pub(crate) target: novarocks_types::naming::TableIdentity,
     /// Exact request-local target materialization. Every target-state and
     /// target-locator scan produced by the rewrite carries this token, so
     /// preparation cannot silently reacquire a newer target generation.
@@ -1212,7 +1210,7 @@ pub(crate) struct SqlImvRewriteSnapshot {
     pub(crate) target_table_uuid: String,
     /// SQL-safe target field facts projected by the application.  This avoids
     /// exposing an Iceberg schema or Iceberg default-literal values to SQL.
-    pub(crate) target_columns: Arc<[novarocks_catalog::schema::ColumnDef]>,
+    pub(crate) target_columns: Arc<[novarocks_types::schema::ColumnDef]>,
     /// SQL projection of the persisted MV planning contract frozen at
     /// admission. Resolving or mutating the serialized contract remains in
     /// the application facade.
@@ -1225,7 +1223,7 @@ pub(crate) struct SqlImvRewriteSnapshot {
 impl SqlImvRewriteSnapshot {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_frozen_parts(
-        target: novarocks_catalog::identifier::TableIdentity,
+        target: novarocks_types::naming::TableIdentity,
         target_binding: SqlTableBindingId,
         mv_id: i64,
         base_snapshots: Arc<[SqlImvBaseSnapshot]>,
@@ -1233,7 +1231,7 @@ impl SqlImvRewriteSnapshot {
         previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
         target_snapshot_id: Option<i64>,
         target_table_uuid: String,
-        target_columns: Arc<[novarocks_catalog::schema::ColumnDef]>,
+        target_columns: Arc<[novarocks_types::schema::ColumnDef]>,
         schema_contract: Arc<SqlImvSchemaContract>,
         aggregate_execution: Option<SqlImvAggregateExecutionLayout>,
     ) -> Result<Self, String> {
@@ -1294,7 +1292,7 @@ impl SqlImvRewriteSnapshot {
     )]
     pub(crate) fn base_snapshot_for_identity(
         &self,
-        table: &novarocks_catalog::identifier::TableIdentity,
+        table: &novarocks_types::naming::TableIdentity,
     ) -> Option<&SqlImvBaseSnapshot> {
         self.base_snapshots.iter().find(|base| {
             base.table.catalog.eq_ignore_ascii_case(&table.catalog)
@@ -1341,8 +1339,8 @@ fn test_object_id(value: &str) -> ConnectorTableObjectId {
 /// never rely on a synthetic first-refresh fallback.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
-    let base = novarocks_catalog::identifier::TableIdentity::new("ice", "db", "b");
-    let target = novarocks_catalog::identifier::TableIdentity::new("ice", "db", "mv");
+    let base = novarocks_types::naming::TableIdentity::new("ice", "db", "b");
+    let target = novarocks_types::naming::TableIdentity::new("ice", "db", "mv");
     let mut previous_snapshot_ids = BTreeMap::new();
     previous_snapshot_ids.insert(base.fqn(), 11);
     let mut previous_table_object_ids = BTreeMap::new();
@@ -1361,7 +1359,7 @@ pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
             previous_table_object_ids,
             Some(1),
             "target-uuid".to_string(),
-            Arc::from(vec![novarocks_catalog::schema::ColumnDef {
+            Arc::from(vec![novarocks_types::schema::ColumnDef {
                 name: "k".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
@@ -1587,21 +1585,21 @@ pub(crate) fn test_aggregate_snapshot(
         },
     });
     let mut target_columns = vec![
-        novarocks_catalog::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
             name: "k".to_string(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
-        novarocks_catalog::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
             name: "s".to_string(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: true,
             write_default: None,
             logical_type: None,
         },
-        novarocks_catalog::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
             name: "__row_id__".to_string(),
             data_type: arrow::datatypes::DataType::Utf8,
             nullable: false,
@@ -1609,21 +1607,23 @@ pub(crate) fn test_aggregate_snapshot(
             logical_type: None,
         },
     ];
-    target_columns.extend(state_columns.iter().map(|column| {
-        novarocks_catalog::schema::ColumnDef {
-            name: column.column_name.clone(),
-            data_type: if column.type_signature == "long" {
-                arrow::datatypes::DataType::Int64
-            } else {
-                arrow::datatypes::DataType::Binary
-            },
-            nullable: column.role == SqlImvAggregateStateRoleContract::Single,
-            write_default: None,
-            logical_type: None,
-        }
-    }));
+    target_columns.extend(
+        state_columns
+            .iter()
+            .map(|column| novarocks_types::schema::ColumnDef {
+                name: column.column_name.clone(),
+                data_type: if column.type_signature == "long" {
+                    arrow::datatypes::DataType::Int64
+                } else {
+                    arrow::datatypes::DataType::Binary
+                },
+                nullable: column.role == SqlImvAggregateStateRoleContract::Single,
+                write_default: None,
+                logical_type: None,
+            }),
+    );
     if let Some(branch) = snapshot.schema_contract.branch.as_ref() {
-        target_columns.push(novarocks_catalog::schema::ColumnDef {
+        target_columns.push(novarocks_types::schema::ColumnDef {
             name: branch.branch_id_column_name.clone(),
             data_type: arrow::datatypes::DataType::Int32,
             nullable: false,
@@ -1784,28 +1784,28 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
         },
     });
     let mut target_columns = vec![
-        novarocks_catalog::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
             name: "k".to_string(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
-        novarocks_catalog::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
             name: "s".to_string(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: true,
             write_default: None,
             logical_type: None,
         },
-        novarocks_catalog::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
             name: "__row_id__".to_string(),
             data_type: arrow::datatypes::DataType::Utf8,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
-        novarocks_catalog::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
             name: "__branch_id__".to_string(),
             data_type: arrow::datatypes::DataType::Int32,
             nullable: false,
@@ -1813,32 +1813,34 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
             logical_type: None,
         },
     ];
-    target_columns.extend(state_columns.iter().map(|column| {
-        novarocks_catalog::schema::ColumnDef {
-            name: column.column_name.clone(),
-            data_type: if column.type_signature == "long" {
-                arrow::datatypes::DataType::Int64
-            } else {
-                arrow::datatypes::DataType::Binary
-            },
-            nullable: column.role == SqlImvAggregateStateRoleContract::Single,
-            write_default: None,
-            logical_type: None,
-        }
-    }));
+    target_columns.extend(
+        state_columns
+            .iter()
+            .map(|column| novarocks_types::schema::ColumnDef {
+                name: column.column_name.clone(),
+                data_type: if column.type_signature == "long" {
+                    arrow::datatypes::DataType::Int64
+                } else {
+                    arrow::datatypes::DataType::Binary
+                },
+                nullable: column.role == SqlImvAggregateStateRoleContract::Single,
+                write_default: None,
+                logical_type: None,
+            }),
+    );
     Arc::new(
         SqlImvRewriteSnapshot::from_frozen_parts(
-            novarocks_catalog::identifier::TableIdentity::new("ice", "db", "mv"),
+            novarocks_types::naming::TableIdentity::new("ice", "db", "mv"),
             test_target_binding(),
             42,
             Arc::from(vec![
                 SqlImvBaseSnapshot {
-                    table: novarocks_catalog::identifier::TableIdentity::new("ice", "db", "l"),
+                    table: novarocks_types::naming::TableIdentity::new("ice", "db", "l"),
                     snapshot_id: 22,
                     table_object_id: test_object_id("object-l"),
                 },
                 SqlImvBaseSnapshot {
-                    table: novarocks_catalog::identifier::TableIdentity::new("ice", "db", "r"),
+                    table: novarocks_types::naming::TableIdentity::new("ice", "db", "r"),
                     snapshot_id: 44,
                     table_object_id: test_object_id("object-r"),
                 },
@@ -1921,42 +1923,42 @@ pub(crate) fn test_branch_union_snapshot() -> Arc<SqlImvRewriteSnapshot> {
         layout.layout.visible_columns[1].name = "s".to_string();
     }
     snapshot.target_columns = Arc::from(vec![
-        novarocks_catalog::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
             name: "region".to_string(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
-        novarocks_catalog::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
             name: "s".to_string(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: true,
             write_default: None,
             logical_type: None,
         },
-        novarocks_catalog::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
             name: "__row_id__".to_string(),
             data_type: arrow::datatypes::DataType::Utf8,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
-        novarocks_catalog::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
             name: "__agg_state_s".to_string(),
             data_type: arrow::datatypes::DataType::Binary,
             nullable: true,
             write_default: None,
             logical_type: None,
         },
-        novarocks_catalog::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
             name: "__agg_state___ivm_row_count".to_string(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
-        novarocks_catalog::schema::ColumnDef {
+        novarocks_types::schema::ColumnDef {
             name: "__branch_id__".to_string(),
             data_type: arrow::datatypes::DataType::Int32,
             nullable: false,
@@ -2499,7 +2501,7 @@ mod tests {
         fn table(table: &str, binding: u32) -> crate::planner::table::TableDef {
             crate::planner::table::TableDef {
                 name: table.to_string(),
-                columns: vec![novarocks_catalog::schema::ColumnDef {
+                columns: vec![novarocks_types::schema::ColumnDef {
                     name: "k".to_string(),
                     data_type: arrow::datatypes::DataType::Int64,
                     nullable: false,
@@ -2781,12 +2783,12 @@ mod tests {
 
     #[test]
     fn sealed_snapshot_builder_rejects_incomplete_and_duplicate_base_facts() {
-        let target = novarocks_catalog::identifier::TableIdentity {
+        let target = novarocks_types::naming::TableIdentity {
             catalog: "iceberg".to_string(),
             namespace: "db".to_string(),
             table: "mv".to_string(),
         };
-        let base = novarocks_catalog::identifier::TableIdentity {
+        let base = novarocks_types::naming::TableIdentity {
             catalog: "iceberg".to_string(),
             namespace: "db".to_string(),
             table: "base".to_string(),
@@ -2818,8 +2820,8 @@ mod tests {
 
     #[test]
     fn sealed_snapshot_builder_accepts_complete_value_only_facts() {
-        let target = novarocks_catalog::identifier::TableIdentity::new("iceberg", "db", "mv");
-        let base = novarocks_catalog::identifier::TableIdentity::new("iceberg", "db", "base");
+        let target = novarocks_types::naming::TableIdentity::new("iceberg", "db", "mv");
+        let base = novarocks_types::naming::TableIdentity::new("iceberg", "db", "base");
         let mut builder =
             SqlImvRewriteSnapshotBuilder::try_new(target.clone(), test_target_binding(), 7)
                 .expect("builder");
@@ -2831,7 +2833,7 @@ mod tests {
             .expect("base accepted");
         builder
             .set_target_columns(
-                SqlImvTargetColumnsFacts::try_new(vec![novarocks_catalog::schema::ColumnDef {
+                SqlImvTargetColumnsFacts::try_new(vec![novarocks_types::schema::ColumnDef {
                     name: "k".to_string(),
                     data_type: arrow::datatypes::DataType::Int64,
                     nullable: false,

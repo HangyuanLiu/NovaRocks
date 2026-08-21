@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::mv::domain::model::{AffectedTargetPartitions, MvStorageEngine, MvTarget};
 use crate::mv::domain::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
 use crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision;
-use novarocks_catalog::identifier::TableIdentity;
+use novarocks_types::naming::TableIdentity;
 
 #[allow(
     dead_code,
@@ -245,8 +245,8 @@ mod tests {
     use crate::mv::domain::model::{AffectedTargetPartitions, MvStorageEngine, MvTarget};
     use crate::mv::domain::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
     use crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision;
-    use novarocks_catalog::identifier::TableIdentity;
     use novarocks_spi::connector::ConnectorTableObjectId;
+    use novarocks_types::naming::TableIdentity;
 
     fn object_id(value: &str) -> ConnectorTableObjectId {
         ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(value.as_bytes()))

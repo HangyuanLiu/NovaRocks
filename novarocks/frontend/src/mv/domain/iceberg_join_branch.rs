@@ -58,8 +58,8 @@ pub(crate) const JOIN_DELTA_TARGET_LOCATOR_TABLE: &str = "__nr_join_delta_target
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JoinDeltaBranchPlan {
-    pub(crate) left_base: novarocks_catalog::identifier::TableIdentity,
-    pub(crate) right_base: novarocks_catalog::identifier::TableIdentity,
+    pub(crate) left_base: novarocks_types::naming::TableIdentity,
+    pub(crate) right_base: novarocks_types::naming::TableIdentity,
     pub(crate) left: BranchSide,
     pub(crate) right: BranchSide,
 }
@@ -79,8 +79,8 @@ impl JoinDeltaBranchPlan {
 }
 
 pub fn plan_join_delta_branches(
-    left_base: &novarocks_catalog::identifier::TableIdentity,
-    right_base: &novarocks_catalog::identifier::TableIdentity,
+    left_base: &novarocks_types::naming::TableIdentity,
+    right_base: &novarocks_types::naming::TableIdentity,
     left_window: SnapshotWindow,
     right_window: SnapshotWindow,
     left_has_changes: bool,
@@ -671,7 +671,7 @@ fn replace_branch_cte_queries(
 )]
 fn rewrite_branch_factor(
     factor: &mut ast::TableFactor,
-    base: &novarocks_catalog::identifier::TableIdentity,
+    base: &novarocks_types::naming::TableIdentity,
     side: BranchSide,
     alias: &str,
 ) -> Result<BranchRewrite, String> {
@@ -741,7 +741,7 @@ fn table_factor_alias(factor: &ast::TableFactor) -> Option<Option<ast::Ident>> {
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn base_table_object_name(base: &novarocks_catalog::identifier::TableIdentity) -> ast::ObjectName {
+fn base_table_object_name(base: &novarocks_types::naming::TableIdentity) -> ast::ObjectName {
     ast::ObjectName {
         parts: vec![
             generated_ident(&base.catalog),
@@ -757,7 +757,7 @@ fn base_table_object_name(base: &novarocks_catalog::identifier::TableIdentity) -
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn build_nr_ivm_delta_table_factor_for_join(
-    base: &novarocks_catalog::identifier::TableIdentity,
+    base: &novarocks_types::naming::TableIdentity,
     window: SnapshotWindow,
     alias: ast::Ident,
 ) -> ast::TableFactor {
@@ -865,8 +865,8 @@ fn render_ident(ident: &ast::Ident) -> String {
 mod tests {
     use super::*;
 
-    fn base(name: &str) -> novarocks_catalog::identifier::TableIdentity {
-        novarocks_catalog::identifier::TableIdentity {
+    fn base(name: &str) -> novarocks_types::naming::TableIdentity {
+        novarocks_types::naming::TableIdentity {
             catalog: "ice".to_string(),
             namespace: "ns".to_string(),
             table: name.to_string(),

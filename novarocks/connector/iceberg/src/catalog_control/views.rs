@@ -17,10 +17,10 @@
 
 use std::collections::HashMap;
 
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::{
     ConnectorColumnDefinition, ConnectorViewDefinition, ConnectorViewSourceFormat,
 };
+use novarocks_types::naming::normalize_identifier;
 
 use crate::catalog_config::IcebergCatalogKind;
 use crate::control_runtime::IcebergControlRuntime;

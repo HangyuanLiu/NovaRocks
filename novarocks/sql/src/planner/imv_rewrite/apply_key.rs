@@ -258,7 +258,7 @@ mod tests {
     use crate::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
     use crate::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::planner::table::TableDef;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
     use std::cell::RefCell;
     use std::rc::Rc;
 

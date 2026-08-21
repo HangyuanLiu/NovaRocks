@@ -24,13 +24,13 @@ use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
 use crate::mv::domain::refresh::target::{IcebergMvTarget, load_iceberg_mv_target_binding};
 use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
-use novarocks_catalog::identifier::TableIdentity;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorChangeWindow, ConnectorChangeWindowAdmission, ConnectorControlRegistry,
     ConnectorRequestContext, ConnectorScanAdmission, ConnectorTableObjectId,
     ConnectorTableResolution,
 };
+use novarocks_types::naming::TableIdentity;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AdmittedChangeFacts {

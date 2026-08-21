@@ -402,7 +402,7 @@ mod tests {
     use crate::optimizer::scalar::ScalarArena;
     use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn scan_plan() -> OptExpr {
         OptExpr::leaf(Operator::LogicalScan(ScanOp {

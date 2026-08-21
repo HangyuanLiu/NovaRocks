@@ -25,7 +25,7 @@ use novarocks_spi::connector::{
 
 use crate::catalog_application::resolver::TargetBackend;
 use crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_PACKAGE_ID_PROP;
-use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IcebergMvUserMutation {

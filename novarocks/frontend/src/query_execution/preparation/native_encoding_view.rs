@@ -21,12 +21,12 @@
 //! mutable collections.  They expose only the frozen facts that an encoder may
 //! map into a native carrier.
 
-use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorExecutionDeclaration, ConnectorPredicateDisposition,
     ConnectorScan, ConnectorSplit, ConnectorStaticPredicate,
 };
 use novarocks_sql::plan_read::{ColumnId, FragmentId, OutputColumn, TypedExpr};
+use novarocks_types::schema::ColumnDef;
 
 use super::scan::{
     PlannedConnectorRead, ResolvedReadReason, ResolvedScanBinding, ResolvedScanColumnKind,

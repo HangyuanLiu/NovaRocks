@@ -1485,7 +1485,7 @@ struct JoinBaseScan {
 
 fn find_unique_base_scan(
     plan: &crate::planner::logical::LogicalPlanNode,
-    base: &novarocks_catalog::identifier::TableIdentity,
+    base: &novarocks_types::naming::TableIdentity,
     role: &str,
 ) -> Result<JoinBaseScan, String> {
     let mut scans = Vec::new();
@@ -1505,7 +1505,7 @@ fn find_unique_base_scan(
 
 fn collect_base_scans(
     plan: &crate::planner::logical::LogicalPlanNode,
-    base: &novarocks_catalog::identifier::TableIdentity,
+    base: &novarocks_types::naming::TableIdentity,
     scans: &mut Vec<JoinBaseScan>,
 ) {
     if let crate::planner::logical::LogicalPlanKind::Scan(scan) = &plan.kind
@@ -1548,8 +1548,8 @@ fn find_row_id_column(
 
 fn join_key_pairs(
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
-    left: &novarocks_catalog::identifier::TableIdentity,
-    right: &novarocks_catalog::identifier::TableIdentity,
+    left: &novarocks_types::naming::TableIdentity,
+    right: &novarocks_types::naming::TableIdentity,
     left_scan: &JoinBaseScan,
     right_scan: &JoinBaseScan,
 ) -> Result<Vec<crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair>, String>
@@ -1621,8 +1621,8 @@ fn base_field_name(
 )]
 fn build_join_descriptor(
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
-    left: &novarocks_catalog::identifier::TableIdentity,
-    right: &novarocks_catalog::identifier::TableIdentity,
+    left: &novarocks_types::naming::TableIdentity,
+    right: &novarocks_types::naming::TableIdentity,
     payload_columns: Vec<crate::analysis::OutputColumn>,
     left_row_id_column: crate::analysis::OutputColumn,
     right_row_id_column: crate::analysis::OutputColumn,

@@ -273,7 +273,7 @@ mod tests {
     use crate::optimizer::rewrite::context::RewriteContext;
     use crate::optimizer::scalar::ScalarArena;
     use crate::planner::table::TableDef;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn make_ctx(arena: ScalarArena) -> RewriteContext {
         let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());

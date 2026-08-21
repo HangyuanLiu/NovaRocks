@@ -18,19 +18,25 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub trait Catalog<M>: Send + Sync {
+use super::CatalogRuntimeMetadata;
+
+pub trait Catalog: Send + Sync {
     fn name(&self) -> &str;
 
-    fn get_table_metadata(&self, namespace: &str, table: &str) -> Result<M, String>;
+    fn get_table_metadata(
+        &self,
+        namespace: &str,
+        table: &str,
+    ) -> Result<CatalogRuntimeMetadata, String>;
 
     fn invalidate_table(&self, _namespace: &str, _table: &str) {}
 }
 
-pub struct CatalogRegistry<M> {
-    catalogs: HashMap<String, Arc<dyn Catalog<M>>>,
+pub struct CatalogRegistry {
+    catalogs: HashMap<String, Arc<dyn Catalog>>,
 }
 
-impl<M> Clone for CatalogRegistry<M> {
+impl Clone for CatalogRegistry {
     fn clone(&self) -> Self {
         Self {
             catalogs: self.catalogs.clone(),
@@ -38,7 +44,7 @@ impl<M> Clone for CatalogRegistry<M> {
     }
 }
 
-impl<M> Default for CatalogRegistry<M> {
+impl Default for CatalogRegistry {
     fn default() -> Self {
         Self {
             catalogs: HashMap::new(),
@@ -46,12 +52,12 @@ impl<M> Default for CatalogRegistry<M> {
     }
 }
 
-impl<M> CatalogRegistry<M> {
+impl CatalogRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn register(&mut self, catalog: Arc<dyn Catalog<M>>) {
+    pub fn register(&mut self, catalog: Arc<dyn Catalog>) {
         self.catalogs
             .insert(catalog.name().to_ascii_lowercase(), catalog);
     }
@@ -71,14 +77,19 @@ impl<M> CatalogRegistry<M> {
         Ok(())
     }
 
-    pub fn get_catalog(&self, name: &str) -> Result<Arc<dyn Catalog<M>>, String> {
+    pub fn get_catalog(&self, name: &str) -> Result<Arc<dyn Catalog>, String> {
         self.catalogs
             .get(&name.to_ascii_lowercase())
             .cloned()
             .ok_or_else(|| format!("unknown catalog: {name}"))
     }
 
-    pub fn resolve(&self, catalog: &str, namespace: &str, table: &str) -> Result<M, String> {
+    pub fn resolve(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<CatalogRuntimeMetadata, String> {
         self.get_catalog(catalog)?
             .get_table_metadata(namespace, table)
     }
@@ -90,13 +101,29 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{Catalog, CatalogRegistry};
+    use crate::catalog_application::query_catalog::CatalogRuntimeMetadata;
+    use novarocks_types::naming::TableIdentity;
+    use novarocks_types::schema::CatalogTable;
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct TestMetadata {
-        catalog: String,
-        namespace: String,
-        table: String,
+    fn metadata(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
         revision: u64,
+    ) -> CatalogRuntimeMetadata {
+        CatalogRuntimeMetadata {
+            table: CatalogTable {
+                identity: TableIdentity::new(catalog, namespace, table),
+                columns: vec![novarocks_types::schema::ColumnDef {
+                    name: revision.to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                }],
+                hidden_columns: Vec::new(),
+            },
+        }
     }
 
     struct TestCatalog {
@@ -115,18 +142,17 @@ mod tests {
         }
     }
 
-    impl Catalog<TestMetadata> for TestCatalog {
+    impl Catalog for TestCatalog {
         fn name(&self) -> &str {
             &self.name
         }
 
-        fn get_table_metadata(&self, namespace: &str, table: &str) -> Result<TestMetadata, String> {
-            Ok(TestMetadata {
-                catalog: self.name.clone(),
-                namespace: namespace.to_string(),
-                table: table.to_string(),
-                revision: self.revision,
-            })
+        fn get_table_metadata(
+            &self,
+            namespace: &str,
+            table: &str,
+        ) -> Result<CatalogRuntimeMetadata, String> {
+            Ok(metadata(&self.name, namespace, table, self.revision))
         }
 
         fn invalidate_table(&self, _namespace: &str, _table: &str) {
@@ -141,15 +167,11 @@ mod tests {
 
         let handle = registry.get_catalog("iCE").expect("get mixed-case catalog");
         assert_eq!(handle.name(), "Ice");
-        assert_eq!(
-            registry.resolve("ICE", "Analytics", "Orders"),
-            Ok(TestMetadata {
-                catalog: "Ice".to_string(),
-                namespace: "Analytics".to_string(),
-                table: "Orders".to_string(),
-                revision: 1,
-            })
-        );
+        let metadata = registry
+            .resolve("ICE", "Analytics", "Orders")
+            .expect("resolve metadata");
+        assert_eq!(metadata.table.identity.fqn(), "Ice.Analytics.Orders");
+        assert_eq!(metadata.table.columns[0].name, "1");
     }
 
     #[test]
@@ -162,27 +184,29 @@ mod tests {
             registry
                 .resolve("ice", "ns", "t")
                 .expect("resolve replacement")
-                .revision,
-            2
+                .table
+                .columns[0]
+                .name,
+            "2"
         );
 
         registry.unregister("iCe");
         assert_eq!(
-            registry.resolve("ICE", "ns", "t"),
+            registry.resolve("ICE", "ns", "t").map(|_| ()),
             Err("unknown catalog: ICE".to_string())
         );
     }
 
     #[test]
     fn unknown_catalog_preserves_exact_error_text() {
-        let registry = CatalogRegistry::<TestMetadata>::new();
+        let registry = CatalogRegistry::new();
 
         match registry.get_catalog("Missing") {
             Ok(_) => panic!("missing catalog unexpectedly resolved"),
             Err(error) => assert_eq!(error, "unknown catalog: Missing"),
         }
         assert_eq!(
-            registry.resolve("Missing", "ns", "t"),
+            registry.resolve("Missing", "ns", "t").map(|_| ()),
             Err("unknown catalog: Missing".to_string())
         );
         assert_eq!(

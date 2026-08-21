@@ -49,7 +49,7 @@ use self::session::{
 };
 use crate::common::query_cancellation::QueryCancellationReason;
 use crate::runtime::statement_result::StatementResult;
-use novarocks_catalog::memory::DEFAULT_DATABASE;
+use novarocks_types::naming::DEFAULT_DATABASE;
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;
 const ROOT_USER: &str = "root";

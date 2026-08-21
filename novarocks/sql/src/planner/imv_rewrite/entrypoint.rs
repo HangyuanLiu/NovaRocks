@@ -509,7 +509,7 @@ pub(crate) mod tests {
         BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
     };
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     /// Set up a fresh ScalarArena on `ctx`, convert `plan` to `OptExpr`, and
     /// return the `OptExpr`. Use this when calling `pipeline.rewrite()` directly

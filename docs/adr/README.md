@@ -283,6 +283,7 @@ fallback 模糊 owner 和故障语义。
 - ADR-0085 — native DTO 的字段路径与验证错误为何由 Protocol 独占、而不保留 Core family 门面（active）
 - ADR-0088 — 聚合 Core 退场后为何按真实 owner 物理切断依赖（active）
 - ADR-0093 — StateStore provider 为何作为 leaf crate、Frontend 直接拥有 consumer runtime（active）
+- ADR-0094 — 空 catalog crate 为何在真实 owner 收敛后删除，而不保留 facade（active）
 
 ### configuration
 

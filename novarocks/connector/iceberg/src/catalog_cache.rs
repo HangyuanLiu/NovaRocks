@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_types::naming::normalize_identifier;
 
 use crate::manifest::DataFileWithStats;
 

@@ -2782,13 +2782,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-catalog"
-version = "0.1.0"
-dependencies = [
- "arrow",
-]
-
-[[package]]
 name = "novarocks-connector-iceberg"
 version = "0.1.0"
 dependencies = [
@@ -2803,7 +2796,6 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-hms",
  "iceberg-catalog-rest",
- "novarocks-catalog",
  "novarocks-fs",
  "novarocks-spi",
  "novarocks-types",
@@ -2914,7 +2906,6 @@ dependencies = [
  "hex",
  "libc",
  "mysql_common",
- "novarocks-catalog",
  "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-fs",
@@ -3029,13 +3020,12 @@ dependencies = [
  "chrono",
  "hex",
  "md-5",
- "novarocks-catalog",
+ "novarocks-parser",
  "novarocks-spi",
  "novarocks-types",
  "serde",
  "serde_json",
  "sha2",
- "sqlparser",
  "tracing",
  "uuid",
 ]

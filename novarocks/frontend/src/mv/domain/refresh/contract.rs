@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::mv::domain::refresh::apply_key::ApplyKeyContract;
-use novarocks_catalog::identifier::TableIdentity;
+use novarocks_types::naming::TableIdentity;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImvRefreshContract {

@@ -58,12 +58,12 @@ use crate::mv::domain::repository::MvRepository;
 use crate::mv::domain::storage_observation::{MvLakePackageObservation, MvLakePublication};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::runtime::statement_result::StatementResult;
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue};
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
 };
+use novarocks_types::naming::normalize_identifier;
 
 pub const PROCEDURE_NAME: &str = "novarocks_imv_stateless_rebuild";
 const TEST_ENABLE_ENV: &str = "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD";

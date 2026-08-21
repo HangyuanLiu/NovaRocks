@@ -273,8 +273,8 @@ fn scan_source_requires_resolved_binding(_: &SqlScanSourceRead) -> bool {
 fn resolved_binding_table_columns(
     binding: NativeScanBindingView<'_>,
 ) -> (
-    Vec<novarocks_catalog::schema::ColumnDef>,
-    Vec<novarocks_catalog::schema::ColumnDef>,
+    Vec<novarocks_types::schema::ColumnDef>,
+    Vec<novarocks_types::schema::ColumnDef>,
 ) {
     let mut columns = Vec::new();
     let mut metadata_columns = Vec::new();
@@ -303,8 +303,8 @@ fn merged_bound_table_columns(
     scan_columns: &[AnalysisOutputColumn],
     binding: NativeScanBindingView<'_>,
 ) -> (
-    Vec<novarocks_catalog::schema::ColumnDef>,
-    Vec<novarocks_catalog::schema::ColumnDef>,
+    Vec<novarocks_types::schema::ColumnDef>,
+    Vec<novarocks_types::schema::ColumnDef>,
 ) {
     let mut columns = src.columns.clone();
     let mut metadata_columns = src.iceberg_row_lineage_metadata_columns.clone();
@@ -336,10 +336,10 @@ fn merged_bound_table_columns(
 }
 
 fn overlay_bound_column(
-    columns: &mut Vec<novarocks_catalog::schema::ColumnDef>,
+    columns: &mut Vec<novarocks_types::schema::ColumnDef>,
     planner_name: &str,
     planner_source_name: Option<&str>,
-    source: &novarocks_catalog::schema::ColumnDef,
+    source: &novarocks_types::schema::ColumnDef,
 ) {
     if let Some(index) = columns.iter().position(|column| {
         column.name.eq_ignore_ascii_case(planner_name)
@@ -353,8 +353,8 @@ fn overlay_bound_column(
 }
 
 fn replace_column_by_name(
-    columns: &mut [novarocks_catalog::schema::ColumnDef],
-    source: &novarocks_catalog::schema::ColumnDef,
+    columns: &mut [novarocks_types::schema::ColumnDef],
+    source: &novarocks_types::schema::ColumnDef,
 ) -> bool {
     let Some(column) = columns
         .iter_mut()
@@ -367,7 +367,7 @@ fn replace_column_by_name(
 }
 
 pub(super) fn encode_column_def(
-    src: &novarocks_catalog::schema::ColumnDef,
+    src: &novarocks_types::schema::ColumnDef,
 ) -> Result<plan::ColumnDef, String> {
     Ok(plan::ColumnDef {
         name: src.name.clone(),

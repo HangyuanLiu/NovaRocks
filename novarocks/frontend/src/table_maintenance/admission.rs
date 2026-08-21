@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::query_execution::maintenance::MaintenanceRequestContext;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsedMaintenanceStatement {

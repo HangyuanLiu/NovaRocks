@@ -24,11 +24,11 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use novarocks_catalog::identifier::TableIdentity;
 use novarocks_parser::Span;
 use novarocks_parser::ast;
 use novarocks_parser::printer;
 use novarocks_spi::connector::ConnectorTableObjectId;
+use novarocks_types::naming::TableIdentity;
 
 use crate::planner::vocabulary::{BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME};
 

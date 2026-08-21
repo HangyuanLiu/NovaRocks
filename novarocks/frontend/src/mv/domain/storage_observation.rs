@@ -24,7 +24,6 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorControlResolver, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
@@ -41,6 +40,7 @@ use novarocks_spi::connector::{
     MvRefreshTargetObservation as SpiRefreshTargetObservation,
     MvSchemaValidationObservation as SpiSchemaValidationObservation, MvStorageObservationPort,
 };
+use novarocks_types::naming::normalize_identifier;
 
 use crate::mv::domain::persistence::{descriptor::MvDescriptorV2, schema::MvPartitionContract};
 

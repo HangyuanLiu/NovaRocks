@@ -198,7 +198,7 @@ fn resolved_source_column<'a>(
     scan: &'a PlanScanNode,
     name: &str,
 ) -> Option<(
-    &'a novarocks_catalog::schema::ColumnDef,
+    &'a novarocks_types::schema::ColumnDef,
     ResolvedScanColumnKind,
 )> {
     if let Some(column) = scan

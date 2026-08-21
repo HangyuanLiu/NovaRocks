@@ -136,7 +136,7 @@ impl From<&MaterializedViewPartitionField> for MvCreatePartitionField {
 }
 
 fn normalized_partition_identifier(value: &str) -> String {
-    novarocks_catalog::identifier::normalize_identifier(value)
+    novarocks_types::naming::normalize_identifier(value)
         .expect("MV partition identifier was validated during SQL admission")
 }
 

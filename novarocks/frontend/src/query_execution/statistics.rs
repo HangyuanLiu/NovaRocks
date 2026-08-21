@@ -393,7 +393,7 @@ pub fn prepare_statistics_collection_request(
                 .plan
                 .scan_columns()
                 .iter()
-                .map(|column| novarocks_catalog::schema::ColumnDef {
+                .map(|column| novarocks_types::schema::ColumnDef {
                     name: column.name().to_string(),
                     data_type: column.data_type().clone(),
                     nullable: column.nullable(),

@@ -48,7 +48,7 @@ use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::planner::payload::PlanScanNode;
 use crate::planner::table::{ScanSource, SqlScanKind, SqlScanSource};
 use crate::planner::vocabulary::{HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME};
-use novarocks_catalog::schema::ColumnDef;
+use novarocks_types::schema::ColumnDef;
 
 pub(crate) struct ImvActionColumn;
 
@@ -465,7 +465,7 @@ mod tests {
     use crate::planner::table::{
         SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
     };
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
     use std::num::{NonZeroU32, NonZeroU64};
 
     #[test]

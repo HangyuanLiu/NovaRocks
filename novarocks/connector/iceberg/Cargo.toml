@@ -48,7 +48,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 typetag = "0.2"
 url = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
-novarocks-catalog = { path = "../../catalog" }
 novarocks-fs = { path = "../../fs" }
 novarocks-spi = { path = "../../spi" }
 novarocks-types = { path = "../../types" }

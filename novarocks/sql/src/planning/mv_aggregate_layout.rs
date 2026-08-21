@@ -25,12 +25,12 @@
 use std::collections::HashSet;
 
 use arrow::datatypes::{DataType, TimeUnit};
-use novarocks_catalog::identifier::normalize_identifier;
-use novarocks_catalog::schema::SqlType;
 use novarocks_types::mv_aggregate_layout::{
     MvAggregateRuntimeKind, MvAggregateRuntimeLayout, MvAggregateStateColumn, MvAggregateStateRole,
     MvAggregateVisibleColumn,
 };
+use novarocks_types::naming::normalize_identifier;
+use novarocks_types::schema::SqlType;
 
 use crate::mv_refresh::AggregateFunctionKind;
 use crate::planning::mv::SqlMvAggregateLayoutFacts;

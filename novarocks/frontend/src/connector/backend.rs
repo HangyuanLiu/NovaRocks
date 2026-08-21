@@ -17,8 +17,8 @@
 
 //! Connector-agnostic metadata and materialized-view backend traits.
 
-use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::{ConnectorTableHandle, StatisticsDataVersion};
+use novarocks_types::schema::ColumnDef;
 
 /// Immutable table/version pair from one connector metadata resolution.
 #[derive(Clone)]

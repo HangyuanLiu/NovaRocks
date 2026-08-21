@@ -266,7 +266,7 @@ fn map_resolution_failure(error: StatisticsResolutionFailure) -> DmlStatisticsFa
 }
 
 fn metric_request(
-    columns: &[novarocks_catalog::schema::ColumnDef],
+    columns: &[novarocks_types::schema::ColumnDef],
 ) -> Result<StatisticsMetricRequest, novarocks_spi::connector::ConnectorError> {
     let mut metrics = Vec::with_capacity(1 + columns.len() * 5);
     metrics.push(StatisticsMetric::RowCount);
@@ -299,7 +299,6 @@ mod unified_tests {
 
     use arrow::datatypes::DataType;
     use bytes::Bytes;
-    use novarocks_catalog::schema::ColumnDef;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorControlBinding, ConnectorControlPlanningLease,
         ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
@@ -310,6 +309,7 @@ mod unified_tests {
         StatisticsDataVersion, StatisticsEvidence, StatisticsMetric, StatisticsReadRequest,
         StatisticsReader,
     };
+    use novarocks_types::schema::ColumnDef;
 
     use super::*;
 

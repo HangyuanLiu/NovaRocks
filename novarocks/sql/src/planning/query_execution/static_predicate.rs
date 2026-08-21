@@ -299,7 +299,7 @@ mod tests {
     use crate::column_id::ColumnId;
     use crate::plan_read::table::TableDef;
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn column(id: u32, name: &str, data_type: DataType, nullable: bool) -> TypedExpr {
         TypedExpr {

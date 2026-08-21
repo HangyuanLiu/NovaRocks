@@ -25,7 +25,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use novarocks_catalog::schema::ColumnDef;
+use novarocks_types::schema::ColumnDef;
 
 use crate::catalog_application::resolver::TargetBackend;
 use crate::common::admitted_query_context::{QueryExecutionContext, RequestContext};

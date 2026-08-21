@@ -3114,13 +3114,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-catalog"
-version = "0.1.0"
-dependencies = [
- "arrow",
-]
-
-[[package]]
 name = "novarocks-cluster-harness"
 version = "0.1.0"
 dependencies = [
@@ -3149,7 +3142,6 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-hms",
  "iceberg-catalog-rest",
- "novarocks-catalog",
  "novarocks-fs",
  "novarocks-spi",
  "novarocks-types",
@@ -3263,7 +3255,6 @@ dependencies = [
  "hex",
  "libc",
  "mysql_common 0.32.4",
- "novarocks-catalog",
  "novarocks-connector-starrocks",
  "novarocks-execution",
  "novarocks-failpoint",
@@ -3390,7 +3381,6 @@ dependencies = [
  "chrono",
  "hex",
  "md-5",
- "novarocks-catalog",
  "novarocks-parser",
  "novarocks-spi",
  "novarocks-types",

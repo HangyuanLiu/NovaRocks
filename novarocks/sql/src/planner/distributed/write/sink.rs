@@ -24,8 +24,8 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
-use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::ConnectorWriterHandle;
+use novarocks_types::schema::ColumnDef;
 
 use crate::analysis::TypedExpr;
 use crate::planner::distributed::write::contract::{ConnectorWriteInputBinding, SqlWritePlanInput};

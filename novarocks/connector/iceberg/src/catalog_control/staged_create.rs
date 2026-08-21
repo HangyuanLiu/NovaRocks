@@ -26,7 +26,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bytes::Bytes;
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_spi::connector::{
     ConnectorColumnDefinition, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
     ConnectorInstanceDescriptor, ConnectorInstanceIncarnation, ConnectorMutationFailure,
@@ -41,6 +40,7 @@ use novarocks_spi::connector::{
     ConnectorStagedWritePlanningRequest, ConnectorWriteControl, ConnectorWriteOperationCompletion,
     CreatePolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
 };
+use novarocks_types::naming::normalize_identifier;
 
 use crate::commit::{
     AbortLog, CommitCtx, CommitOpKind, IcebergCommitCollector, IcebergWriteControl,

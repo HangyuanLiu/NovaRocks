@@ -787,11 +787,11 @@ mod tests {
 
     use super::*;
     use crate::runtime::query_result::{QueryResultColumn, record_batch_to_chunk};
-    use novarocks_catalog::schema::SqlType;
     use novarocks_execution::exec::mv::state_codec::encode_count_state;
     use novarocks_sql::plan_read::{ColumnId, OutputColumn};
     use novarocks_sql::planning::mv::SqlMvAggregateLayoutFacts;
     use novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout;
+    use novarocks_types::schema::SqlType;
 
     fn parse_calls(sql: &str) -> AggregateSqlCalls {
         let query = parse_stored_select_query(sql).expect("parse aggregate select");

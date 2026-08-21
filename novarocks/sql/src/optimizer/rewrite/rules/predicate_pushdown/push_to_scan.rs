@@ -167,7 +167,7 @@ mod tests {
     use crate::optimizer::scalar::ScalarArena;
     use crate::planner::table::TableDef;
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn test_col_id(name: &str) -> ColumnId {
         match name {

@@ -22,8 +22,8 @@
 //! AND-only, no OR/functions/subqueries/joins; non-DUP tables require
 //! key columns; floating-point columns reject `=`.
 
-use novarocks_catalog::schema::ColumnDef;
 use novarocks_parser::ast::{BinaryOperator, Expr, IsPredicate, LiteralKind, UnaryOperator};
+use novarocks_types::schema::ColumnDef;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmpOp {

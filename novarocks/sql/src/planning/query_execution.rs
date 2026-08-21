@@ -618,11 +618,11 @@ fn push_unique_name(names: &mut Vec<String>, name: &str) {
     }
 }
 
-fn column_defs(input_schema: &SchemaRef) -> Vec<novarocks_catalog::schema::ColumnDef> {
+fn column_defs(input_schema: &SchemaRef) -> Vec<novarocks_types::schema::ColumnDef> {
     input_schema
         .fields()
         .iter()
-        .map(|field| novarocks_catalog::schema::ColumnDef {
+        .map(|field| novarocks_types::schema::ColumnDef {
             name: field.name().to_string(),
             data_type: field.data_type().clone(),
             nullable: field.is_nullable(),

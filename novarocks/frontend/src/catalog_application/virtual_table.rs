@@ -37,8 +37,8 @@ use novarocks_parser::{Span, ast};
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::system_catalog::SystemCatalog;
-use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::ConnectorControlRegistry;
+use novarocks_types::schema::ColumnDef;
 
 pub(crate) const INFORMATION_SCHEMA_DB: &str = "information_schema";
 

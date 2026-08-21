@@ -777,7 +777,7 @@ mod tests {
     use crate::planner::optimizer_bridge::scalar::intern_project_items;
     use crate::planner::physical::PhysicalPlanKind;
     use crate::planner::table::TableDef;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
     use std::sync::Arc;
 
     fn int_expr(v: i64) -> TypedExpr {

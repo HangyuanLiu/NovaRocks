@@ -2468,7 +2468,7 @@ mod tests {
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
     };
     use arrow::datatypes::DataType;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
         let mut opt_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(

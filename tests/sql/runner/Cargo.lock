@@ -2139,13 +2139,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-catalog"
-version = "0.1.0"
-dependencies = [
- "arrow",
-]
-
-[[package]]
 name = "novarocks-cluster-harness"
 version = "0.1.0"
 dependencies = [
@@ -2192,7 +2185,6 @@ dependencies = [
  "chrono",
  "hex",
  "md-5",
- "novarocks-catalog",
  "novarocks-parser",
  "novarocks-spi",
  "novarocks-types",

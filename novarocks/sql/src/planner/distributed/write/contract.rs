@@ -26,8 +26,8 @@
 
 use std::collections::BTreeSet;
 
-use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::ConnectorWriteFieldToken;
+use novarocks_types::schema::ColumnDef;
 
 use crate::analysis::TypedExpr;
 use crate::binding::SqlTableBindingId;

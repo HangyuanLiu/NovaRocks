@@ -691,7 +691,7 @@ mod tests {
     use crate::optimizer::rewrite::tree_binder::bind_tree;
     use crate::optimizer::scalar::{HashableLiteral, ScalarNode};
     use crate::planner::table::TableDef;
-    use novarocks_catalog::schema::ColumnDef;
+    use novarocks_types::schema::ColumnDef;
 
     fn output_col(id: u32, name: &str) -> OutputColumn {
         OutputColumn {

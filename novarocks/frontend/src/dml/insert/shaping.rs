@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 use crate::query_execution::dml::insert::InsertValue;
 use arrow::datatypes::{DataType, TimeUnit};
-use novarocks_catalog::identifier::normalize_identifier;
-use novarocks_catalog::schema::{ColumnDef, ColumnDefault, validate_column_default};
+use novarocks_types::naming::normalize_identifier;
+use novarocks_types::schema::{ColumnDef, ColumnDefault, validate_column_default};
 
 /// Reorder literal rows into target-column order and materialize omitted values.
 pub fn reorder_insert_rows(

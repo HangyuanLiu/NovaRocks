@@ -1585,7 +1585,7 @@ mod tests {
                 database,
                 crate::planner::table::TableDef {
                     name: table.to_string(),
-                    columns: vec![novarocks_catalog::schema::ColumnDef {
+                    columns: vec![novarocks_types::schema::ColumnDef {
                         name: "order_id".to_string(),
                         data_type: arrow::datatypes::DataType::Int64,
                         nullable: false,
@@ -1970,7 +1970,7 @@ mod tests {
 
     #[test]
     fn mv_refresh_analysis_terminal_returns_only_opaque_analysis_input() {
-        let mut catalog = crate::catalog::local::PlannerMemoryCatalog::default();
+        let mut catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
         catalog
             .create_database("db")
             .expect("create MV analysis database");
@@ -1979,7 +1979,7 @@ mod tests {
                 "db",
                 crate::planner::table::TableDef {
                     name: "orders".to_string(),
-                    columns: vec![novarocks_catalog::schema::ColumnDef {
+                    columns: vec![novarocks_types::schema::ColumnDef {
                         name: "order_id".to_string(),
                         data_type: arrow::datatypes::DataType::Int64,
                         nullable: false,
@@ -2012,7 +2012,7 @@ mod tests {
 
     #[test]
     fn mv_refresh_analysis_terminal_fails_closed_for_missing_table() {
-        let mut catalog = crate::catalog::local::PlannerMemoryCatalog::default();
+        let mut catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
         catalog
             .create_database("db")
             .expect("create MV analysis database");
@@ -2079,7 +2079,7 @@ mod tests {
 
     #[test]
     fn explain_analyze_renderer_accepts_only_facts_for_the_sealed_plan() {
-        let catalog = crate::catalog::local::PlannerMemoryCatalog::default();
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
         let plan = analyze_then_optimize(SqlAnalyzeRequest::new(
@@ -2131,7 +2131,7 @@ mod tests {
 
     #[test]
     fn sqlx1_kernel_compiles_a_query_without_application_state() {
-        let catalog = crate::catalog::local::PlannerMemoryCatalog::default();
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
         let request = SqlAnalyzeRequest::new(
@@ -2161,7 +2161,7 @@ mod tests {
 
     #[test]
     fn sqlx2_kernel_compiles_a_query_from_sql_owned_inputs() {
-        let catalog = crate::catalog::local::PlannerMemoryCatalog::default();
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
         let request = SqlAnalyzeRequest::new(
@@ -2206,7 +2206,7 @@ mod tests {
 
     #[test]
     fn sqlx1_kernel_write_root_requirement_is_validated_in_sql() {
-        let catalog = crate::catalog::local::PlannerMemoryCatalog::default();
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
         let request = SqlAnalyzeRequest::new(

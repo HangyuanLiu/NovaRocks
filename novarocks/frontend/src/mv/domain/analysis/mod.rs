@@ -21,13 +21,13 @@ pub mod rebind;
 pub mod refresh_property;
 use std::collections::HashSet;
 
-use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_parser::ast::{Ident, Query, SetExpr, TableFactor, TableWithJoins};
 use novarocks_sql::planning::mv::{
     SqlMvOutputColumnFacts, SqlResolvedMvRefreshInput, SqlResolvedMvRefreshInputSource,
     strip_catalog_from_three_part_names,
 };
 use novarocks_sql::syntax::{IcebergPartitionFieldExpr, ObjectName, TableColumnDef};
+use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResolvedTableRef {
