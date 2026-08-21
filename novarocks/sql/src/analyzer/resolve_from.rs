@@ -20,6 +20,7 @@ use novarocks_parser::ast;
 use novarocks_parser::printer::print_expr;
 
 use crate::analysis::*;
+use crate::analyze_error::AnalyzeError;
 use crate::column_id::ColumnId;
 
 use super::scope::AnalyzerScope;
@@ -29,7 +30,7 @@ impl<'a> super::AnalyzerContext<'a> {
     pub(super) fn analyze_from(
         &self,
         twj: &ast::TableWithJoins,
-    ) -> Result<(Relation, AnalyzerScope), String> {
+    ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
         self.analyze_from_with_outer(twj, None)
     }
 
@@ -41,7 +42,7 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         twj: &ast::TableWithJoins,
         outer_scope: Option<&AnalyzerScope>,
-    ) -> Result<(Relation, AnalyzerScope), String> {
+    ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
         let (mut current_rel, mut current_scope) =
             self.analyze_table_factor_with_outer(&twj.relation, outer_scope)?;
 
@@ -145,8 +146,11 @@ impl<'a> super::AnalyzerContext<'a> {
                         Some(result)
                     }
                 }
-                Some(ast::JoinConstraint::Natural(_)) => {
-                    return Err("NATURAL JOIN is not yet supported".into());
+                Some(ast::JoinConstraint::Natural(span)) => {
+                    return Err(AnalyzeError::unsupported_query_shape(
+                        "NATURAL JOIN is not yet supported",
+                        *span,
+                    ));
                 }
                 Some(ast::JoinConstraint::None) | None => None,
             };
@@ -212,8 +216,11 @@ impl<'a> super::AnalyzerContext<'a> {
                                 match (left_q, right_q) {
                                     (Some(l), Some(r)) => out.push((name, l, r)),
                                     _ => {
-                                        return Err(format!(
-                                            "USING column `{name}` must exist on both sides"
+                                        return Err(AnalyzeError::invalid_query_shape(
+                                            format!(
+                                                "USING column `{name}` must exist on both sides"
+                                            ),
+                                            join.span,
                                         ));
                                     }
                                 }
@@ -282,7 +289,7 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         factor: &ast::TableFactor,
         outer_scope: Option<&AnalyzerScope>,
-    ) -> Result<(Relation, AnalyzerScope), String> {
+    ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
         match factor {
             ast::TableFactor::Table {
                 name,
@@ -298,17 +305,23 @@ impl<'a> super::AnalyzerContext<'a> {
                     let metadata_ty =
                         crate::planner::table::SqlMetadataTableKind::parse(&metadata.value)
                             .map_err(|_| {
-                                format!(
-                                    "unsupported iceberg metadata table type: {}",
-                                    metadata.value
+                                AnalyzeError::unsupported_query_shape(
+                                    format!(
+                                        "unsupported iceberg metadata table type: {}",
+                                        metadata.value
+                                    ),
+                                    metadata.span,
                                 )
                             })?;
                     // Reject branch/tag combo: `t.branch_dev$snapshots` is meaningless.
                     if let Some(last) = parts.last()
                         && (last.starts_with("branch_") || last.starts_with("tag_"))
                     {
-                        return Err(format!(
-                            "iceberg metadata table cannot be combined with branch/tag suffix: {parts:?}"
+                        return Err(AnalyzeError::invalid_query_shape(
+                            format!(
+                                "iceberg metadata table cannot be combined with branch/tag suffix: {parts:?}"
+                            ),
+                            name.span,
                         ));
                     }
 
@@ -325,16 +338,21 @@ impl<'a> super::AnalyzerContext<'a> {
                             tbl.to_lowercase(),
                         ),
                         _ => {
-                            return Err(format!(
-                                "iceberg metadata table requires <tbl> | <db>.<tbl> | <cat>.<db>.<tbl>, got: {parts:?}"
+                            return Err(AnalyzeError::invalid_query_shape(
+                                format!(
+                                    "iceberg metadata table requires <tbl> | <db>.<tbl> | <cat>.<db>.<tbl>, got: {parts:?}"
+                                ),
+                                name.span,
                             ));
                         }
                     };
 
                     let metadata_provider =
                         self.catalog.iceberg_metadata_provider().ok_or_else(|| {
-                            "iceberg metadata table lookup is not supported by this catalog"
-                                .to_string()
+                            AnalyzeError::unsupported_query_shape(
+                                "iceberg metadata table lookup is not supported by this catalog",
+                                name.span,
+                            )
                         })?;
                     let table_def = metadata_provider
                         .get_iceberg_metadata_table(
@@ -342,7 +360,8 @@ impl<'a> super::AnalyzerContext<'a> {
                             &db_lower,
                             &tbl_lower,
                             metadata_ty,
-                        )?
+                        )
+                        .map_err(|error| AnalyzeError::unknown_table(error, name.span))?
                         .planner;
                     let alias_name = alias.as_ref().map(|a| a.name.value.clone());
 
@@ -387,24 +406,30 @@ impl<'a> super::AnalyzerContext<'a> {
                         parts[1].clone(),
                         parts[2].clone(),
                     ),
-                    _ => return Err(format!("unsupported table name: {name:?}")),
+                    _ => {
+                        return Err(AnalyzeError::invalid_query_shape(
+                            format!("unsupported table name: {name:?}"),
+                            name.span,
+                        ));
+                    }
                 };
                 let db_lower = db.to_lowercase();
                 let tbl_lower = tbl.to_lowercase();
 
                 if parts.len() == 1 {
                     if self.pending_ctes.contains(&tbl_lower) {
-                        return Err(format!(
-                            "forward CTE reference is not supported: {tbl_lower}"
+                        return Err(AnalyzeError::invalid_query_shape(
+                            format!("forward CTE reference is not supported: {tbl_lower}"),
+                            name.span,
                         ));
                     }
 
                     if let Some(&cte_id) = self.ctes.get(&tbl_lower) {
                         let (producer_columns, entry_id) = {
                             let registry = self.cte_registry.borrow();
-                            let entry = registry
-                                .get(cte_id)
-                                .ok_or_else(|| format!("unknown CTE id: {cte_id}"))?;
+                            let entry = registry.get(cte_id).ok_or_else(|| {
+                                AnalyzeError::internal(format!("unknown CTE id: {cte_id}"))
+                            })?;
                             (entry.output_columns.clone(), entry.id)
                         };
                         let alias_name = alias
@@ -458,11 +483,10 @@ impl<'a> super::AnalyzerContext<'a> {
                     }
                 }
 
-                let resolved_table = self.catalog.resolve_table_for_analysis(
-                    catalog_override.as_deref(),
-                    &db_lower,
-                    &tbl_lower,
-                )?;
+                let resolved_table = self
+                    .catalog
+                    .resolve_table_for_analysis(catalog_override.as_deref(), &db_lower, &tbl_lower)
+                    .map_err(|error| AnalyzeError::unknown_table(error, name.span))?;
                 let table_def = resolved_table.planner;
                 let alias_name = alias.as_ref().map(|a| a.name.value.clone());
 
@@ -499,12 +523,20 @@ impl<'a> super::AnalyzerContext<'a> {
                 Ok((relation, scope))
             }
             ast::TableFactor::Derived {
-                subquery, alias, ..
+                subquery,
+                alias,
+                span,
+                ..
             } => {
                 let alias_name = alias
                     .as_ref()
                     .map(|a| a.name.value.clone())
-                    .ok_or("subquery in FROM requires an alias")?;
+                    .ok_or_else(|| {
+                        AnalyzeError::invalid_query_shape(
+                            "subquery in FROM requires an alias",
+                            *span,
+                        )
+                    })?;
 
                 let resolved_query = self.analyze_query(subquery)?;
                 let output_columns =
@@ -539,15 +571,26 @@ impl<'a> super::AnalyzerContext<'a> {
                 alias,
                 array_exprs,
                 with_offset,
+                span,
                 ..
-            } => self.analyze_unnest(array_exprs, alias.as_ref(), *with_offset, outer_scope),
+            } => self.analyze_unnest(
+                array_exprs,
+                alias.as_ref(),
+                *with_offset,
+                *span,
+                outer_scope,
+            ),
             ast::TableFactor::NestedJoin {
                 table_with_joins,
                 alias,
+                span,
                 ..
             } => {
                 if alias.is_some() {
-                    return Err("alias on parenthesized JOIN is not yet supported".into());
+                    return Err(AnalyzeError::unsupported_query_shape(
+                        "alias on parenthesized JOIN is not yet supported",
+                        *span,
+                    ));
                 }
                 self.analyze_from(table_with_joins)
             }
@@ -559,16 +602,26 @@ impl<'a> super::AnalyzerContext<'a> {
         array_exprs: &[ast::Expr],
         alias: Option<&ast::TableAlias>,
         with_offset: bool,
+        span: novarocks_parser::Span,
         outer_scope: Option<&AnalyzerScope>,
-    ) -> Result<(Relation, AnalyzerScope), String> {
+    ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
         if with_offset {
-            return Err("UNNEST WITH OFFSET/ORDINALITY is not yet supported".into());
+            return Err(AnalyzeError::unsupported_query_shape(
+                "UNNEST WITH OFFSET/ORDINALITY is not yet supported",
+                span,
+            ));
         }
         if array_exprs.is_empty() {
-            return Err("UNNEST requires at least one ARRAY expression".into());
+            return Err(AnalyzeError::invalid_query_shape(
+                "UNNEST requires at least one ARRAY expression",
+                span,
+            ));
         }
         let Some(outer_scope) = outer_scope else {
-            return Err("UNNEST is currently supported only in LATERAL JOIN".into());
+            return Err(AnalyzeError::unsupported_query_shape(
+                "UNNEST is currently supported only in LATERAL JOIN",
+                span,
+            ));
         };
 
         let alias_columns = alias
@@ -580,10 +633,13 @@ impl<'a> super::AnalyzerContext<'a> {
             })
             .unwrap_or_default();
         if !alias_columns.is_empty() && alias_columns.len() != array_exprs.len() {
-            return Err(format!(
-                "UNNEST alias has {} columns but produces {} columns",
-                alias_columns.len(),
-                array_exprs.len()
+            return Err(AnalyzeError::invalid_query_shape(
+                format!(
+                    "UNNEST alias has {} columns but produces {} columns",
+                    alias_columns.len(),
+                    array_exprs.len()
+                ),
+                alias.map(|alias| alias.span).unwrap_or(span),
             ));
         }
 
@@ -596,10 +652,13 @@ impl<'a> super::AnalyzerContext<'a> {
         for (idx, expr) in array_exprs.iter().enumerate() {
             let typed = self.analyze_expr(expr, outer_scope)?;
             let DataType::List(item_field) = &typed.data_type else {
-                return Err(format!(
-                    "UNNEST argument {} must be ARRAY, got {:?}",
-                    idx + 1,
-                    typed.data_type
+                return Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "UNNEST argument {} must be ARRAY, got {:?}",
+                        idx + 1,
+                        typed.data_type
+                    ),
+                    expr.span(),
                 ));
             };
             let col_name = alias_columns.get(idx).cloned().unwrap_or_else(|| {
@@ -638,9 +697,12 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         expr: &ast::Expr,
         alias: Option<&ast::TableAlias>,
-    ) -> Result<(Relation, AnalyzerScope), String> {
+    ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
         let ast::Expr::FunctionCall(function) = expr else {
-            return Err(format!("TABLE() requires a function call, got: {expr:?}"));
+            return Err(AnalyzeError::invalid_query_shape(
+                format!("TABLE() requires a function call, got: {expr:?}"),
+                expr.span(),
+            ));
         };
         let func_name = function
             .name
@@ -654,7 +716,10 @@ impl<'a> super::AnalyzerContext<'a> {
             return self.analyze_iceberg_delta_table_function(function, alias);
         }
         if func_name != "generate_series" {
-            return Err(format!("unsupported table function: {func_name}"));
+            return Err(AnalyzeError::unsupported_query_shape(
+                format!("unsupported table function: {func_name}"),
+                function.name.span,
+            ));
         }
 
         // Detect whether the call uses named args (start=>2, end=>5, ...).
@@ -681,11 +746,20 @@ impl<'a> super::AnalyzerContext<'a> {
                 .find(|arg| !generate_series_named_arg_is_some(arg))
             {
                 if matches!(arg, ast::Expr::Lambda(_)) {
-                    return Err("No viable statement for input".to_string());
+                    return Err(AnalyzeError::invalid_argument(
+                        "No viable statement for input",
+                        arg.span(),
+                    ));
                 }
-                return Err(format!("Unexpected input '{}'.", print_expr(arg)));
+                return Err(AnalyzeError::invalid_argument(
+                    format!("Unexpected input '{}'.", print_expr(arg)),
+                    arg.span(),
+                ));
             }
-            return Err("Unknown table function: generate_series".into());
+            return Err(AnalyzeError::invalid_argument(
+                "Unknown table function: generate_series",
+                function.span,
+            ));
         }
 
         let (start, end, step) = if any_named {
@@ -694,7 +768,10 @@ impl<'a> super::AnalyzerContext<'a> {
             let mut step_v: Option<Option<i64>> = None;
             for arg in arguments {
                 let Some((name, expr)) = generate_series_named_arg(arg) else {
-                    return Err("Unknown table function: generate_series".into());
+                    return Err(AnalyzeError::invalid_argument(
+                        "Unknown table function: generate_series",
+                        arg.span(),
+                    ));
                 };
                 let key = name.value.to_ascii_lowercase();
                 let value = if is_null_literal(expr) {
@@ -706,23 +783,46 @@ impl<'a> super::AnalyzerContext<'a> {
                     "start" => &mut start_v,
                     "end" => &mut end_v,
                     "step" => &mut step_v,
-                    _ => return Err(format!("Unknown table function: generate_series ({key})")),
+                    _ => {
+                        return Err(AnalyzeError::invalid_argument(
+                            format!("Unknown table function: generate_series ({key})"),
+                            name.span,
+                        ));
+                    }
                 };
                 if slot.is_some() {
-                    return Err("Unknown table function: generate_series".into());
+                    return Err(AnalyzeError::invalid_argument(
+                        "Unknown table function: generate_series",
+                        name.span,
+                    ));
                 }
                 *slot = Some(value);
             }
-            let start =
-                start_v.ok_or_else(|| "Unknown table function: generate_series".to_string())?;
-            let end = end_v.ok_or_else(|| "Unknown table function: generate_series".to_string())?;
+            let start = start_v.ok_or_else(|| {
+                AnalyzeError::invalid_argument(
+                    "Unknown table function: generate_series",
+                    function.span,
+                )
+            })?;
+            let end = end_v.ok_or_else(|| {
+                AnalyzeError::invalid_argument(
+                    "Unknown table function: generate_series",
+                    function.span,
+                )
+            })?;
             // Named args do not allow NULL values for any parameter.
             if start.is_none() || end.is_none() || matches!(step_v, Some(None)) {
-                return Err("table function not support null parameter".into());
+                return Err(AnalyzeError::invalid_argument(
+                    "table function not support null parameter",
+                    function.span,
+                ));
             }
             let step = step_v.flatten().unwrap_or(1);
             if step == 0 {
-                return Err("generate_series step must not be zero".into());
+                return Err(AnalyzeError::invalid_argument(
+                    "generate_series step must not be zero",
+                    function.span,
+                ));
             }
             (start.unwrap(), end.unwrap(), step)
         } else {
@@ -734,11 +834,19 @@ impl<'a> super::AnalyzerContext<'a> {
                 [s, e] => (*s, *e, 1i64),
                 [s, e, st] => {
                     if *st == 0 {
-                        return Err("generate_series step must not be zero".into());
+                        return Err(AnalyzeError::invalid_argument(
+                            "generate_series step must not be zero",
+                            function.span,
+                        ));
                     }
                     (*s, *e, *st)
                 }
-                _ => return Err("Unknown table function: generate_series".into()),
+                _ => {
+                    return Err(AnalyzeError::invalid_argument(
+                        "Unknown table function: generate_series",
+                        function.span,
+                    ));
+                }
             }
         };
 
@@ -773,12 +881,15 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         function: &ast::FunctionCall,
         alias: Option<&ast::TableAlias>,
-    ) -> Result<(Relation, AnalyzerScope), String> {
+    ) -> Result<(Relation, AnalyzerScope), AnalyzeError> {
         if function.arguments.len() != 3 {
-            return Err(format!(
-                "__nr_ivm_delta requires 3 positional arguments \
-                 (catalog.namespace.table, from_snapshot_id, to_snapshot_id), got {}",
-                function.arguments.len()
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "__nr_ivm_delta requires 3 positional arguments \
+                     (catalog.namespace.table, from_snapshot_id, to_snapshot_id), got {}",
+                    function.arguments.len()
+                ),
+                function.span,
             ));
         }
 
@@ -790,17 +901,23 @@ impl<'a> super::AnalyzerContext<'a> {
                 ..
             }) => s.clone(),
             _ => {
-                return Err(format!(
-                    "__nr_ivm_delta argument 0 must be a string literal \
+                return Err(AnalyzeError::invalid_literal(
+                    format!(
+                        "__nr_ivm_delta argument 0 must be a string literal \
                          (catalog.namespace.table), got {three_part:?}"
+                    ),
+                    three_part.span(),
                 ));
             }
         };
         let parts: Vec<&str> = three_part.split('.').collect();
         if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
-            return Err(format!(
-                "__nr_ivm_delta argument 0 must be a three-part identifier \
-                 'catalog.namespace.table', got '{three_part}'"
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "__nr_ivm_delta argument 0 must be a three-part identifier \
+                     'catalog.namespace.table', got '{three_part}'"
+                ),
+                function.arguments[0].span(),
             ));
         }
         let catalog = parts[0].to_string();
@@ -810,29 +927,44 @@ impl<'a> super::AnalyzerContext<'a> {
         // Argument 1 / 2: from_snapshot_id, to_snapshot_id (non-negative i64).
         let from_expr = &function.arguments[1];
         let to_expr = &function.arguments[2];
-        let from_snapshot_id = eval_const_i64(from_expr)
-            .map_err(|e| format!("__nr_ivm_delta from_snapshot_id: {e}"))?;
-        let to_snapshot_id =
-            eval_const_i64(to_expr).map_err(|e| format!("__nr_ivm_delta to_snapshot_id: {e}"))?;
+        let from_snapshot_id = eval_const_i64(from_expr).map_err(|error| {
+            AnalyzeError::invalid_literal(
+                format!("__nr_ivm_delta from_snapshot_id: {error}"),
+                from_expr.span(),
+            )
+        })?;
+        let to_snapshot_id = eval_const_i64(to_expr).map_err(|error| {
+            AnalyzeError::invalid_literal(
+                format!("__nr_ivm_delta to_snapshot_id: {error}"),
+                to_expr.span(),
+            )
+        })?;
         if from_snapshot_id < 0 || to_snapshot_id < 0 {
-            return Err(format!(
-                "__nr_ivm_delta requires non-negative snapshot ids; \
-                 got from={from_snapshot_id}, to={to_snapshot_id}"
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "__nr_ivm_delta requires non-negative snapshot ids; \
+                     got from={from_snapshot_id}, to={to_snapshot_id}"
+                ),
+                function.span,
             ));
         }
 
         // Look up the base table. `__nr_ivm_delta` requires that the table
         // exposes Iceberg v3 row-lineage metadata columns — without them
         // we cannot recover row identity across snapshots.
-        let resolved_table =
-            self.catalog
-                .resolve_table_for_analysis(None, &namespace, &table_name)?;
+        let resolved_table = self
+            .catalog
+            .resolve_table_for_analysis(None, &namespace, &table_name)
+            .map_err(|error| AnalyzeError::unknown_table(error, function.arguments[0].span()))?;
         let table_def = resolved_table.planner;
         if resolved_table.catalog.hidden_columns.is_empty() {
-            return Err(format!(
-                "__nr_ivm_delta requires base table '{three_part}' to expose Iceberg v3 \
-                 row-lineage metadata columns; rebuild the table with \
-                 `write.row-lineage = true` (Iceberg v3)"
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "__nr_ivm_delta requires base table '{three_part}' to expose Iceberg v3 \
+                     row-lineage metadata columns; rebuild the table with \
+                     `write.row-lineage = true` (Iceberg v3)"
+                ),
+                function.arguments[0].span(),
             ));
         }
 
@@ -866,7 +998,7 @@ impl<'a> super::AnalyzerContext<'a> {
 fn parse_join_operator(
     operator: ast::JoinOperator,
     constraint: &ast::JoinConstraint,
-) -> Result<(JoinKind, Option<&ast::JoinConstraint>), String> {
+) -> Result<(JoinKind, Option<&ast::JoinConstraint>), AnalyzeError> {
     use ast::JoinOperator as Operator;
 
     let kind = match operator {
@@ -903,14 +1035,17 @@ fn generate_series_named_arg(expr: &ast::Expr) -> Option<(&ast::Ident, &ast::Exp
     Some((name, binary.right.as_ref()))
 }
 
-fn eval_const_i64(expr: &ast::Expr) -> Result<i64, String> {
+fn eval_const_i64(expr: &ast::Expr) -> Result<i64, AnalyzeError> {
     match expr {
         ast::Expr::Literal(ast::Literal {
             kind: ast::LiteralKind::Number(number),
             ..
-        }) => number
-            .parse::<i64>()
-            .map_err(|error| format!("cannot parse integer literal `{number}`: {error}")),
+        }) => number.parse::<i64>().map_err(|error| {
+            AnalyzeError::invalid_literal(
+                format!("cannot parse integer literal `{number}`: {error}"),
+                expr.span(),
+            )
+        }),
         ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Minus) => {
             Ok(-eval_const_i64(&unary.expression)?)
         }
@@ -923,14 +1058,16 @@ fn eval_const_i64(expr: &ast::Expr) -> Result<i64, String> {
                 ast::BinaryOperator::Multiply => Ok(left * right),
                 ast::BinaryOperator::Divide if right != 0 => Ok(left / right),
                 ast::BinaryOperator::Modulo if right != 0 => Ok(left % right),
-                operator => Err(format!(
-                    "unsupported operator in constant expression: {operator:?}"
+                operator => Err(AnalyzeError::invalid_argument(
+                    format!("unsupported operator in constant expression: {operator:?}"),
+                    expr.span(),
                 )),
             }
         }
         ast::Expr::Nested(nested) => eval_const_i64(&nested.expression),
-        _ => Err(format!(
-            "expected constant integer expression, got: {expr:?}"
+        _ => Err(AnalyzeError::invalid_literal(
+            format!("expected constant integer expression, got: {expr:?}"),
+            expr.span(),
         )),
     }
 }
@@ -948,7 +1085,7 @@ fn is_null_literal(expr: &ast::Expr) -> bool {
 fn derived_table_output_columns(
     columns: &[OutputColumn],
     alias: Option<&ast::TableAlias>,
-) -> Result<Vec<OutputColumn>, String> {
+) -> Result<Vec<OutputColumn>, AnalyzeError> {
     let Some(alias) = alias else {
         return Ok(columns.to_vec());
     };
@@ -956,11 +1093,14 @@ fn derived_table_output_columns(
         return Ok(columns.to_vec());
     }
     if alias.columns.len() != columns.len() {
-        return Err(format!(
-            "derived table alias '{}' has {} column aliases but subquery produces {} columns",
-            alias.name.value,
-            alias.columns.len(),
-            columns.len()
+        return Err(AnalyzeError::invalid_query_shape(
+            format!(
+                "derived table alias '{}' has {} column aliases but subquery produces {} columns",
+                alias.name.value,
+                alias.columns.len(),
+                columns.len()
+            ),
+            alias.span,
         ));
     }
     Ok(columns

@@ -2283,6 +2283,7 @@ version = "0.1.0"
 dependencies = [
  "novarocks-frontend",
  "novarocks-parser",
+ "novarocks-sql",
  "novarocks-user-error",
 ]
 
@@ -2442,6 +2443,7 @@ dependencies = [
  "novarocks-parser",
  "novarocks-spi",
  "novarocks-types",
+ "novarocks-user-error",
  "serde",
  "serde_json",
  "sha2",

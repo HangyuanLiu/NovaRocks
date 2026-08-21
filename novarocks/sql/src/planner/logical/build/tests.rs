@@ -235,7 +235,7 @@ fn parse_analyze_query(
     let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
         return Err("expected query".into());
     };
-    crate::analyzer::analyze(query, &TestCatalog, "default")
+    crate::analyzer::analyze(query, &TestCatalog, "default").map_err(|error| error.to_string())
 }
 
 fn parse_analyze_query_apply(

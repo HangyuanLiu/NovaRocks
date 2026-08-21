@@ -28,6 +28,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::analyze_error::AnalyzeError;
 pub use crate::explain::ExplainLevel;
 pub use crate::functions::builtin_sql_function_catalog;
 pub use crate::optimizer::options::SessionOptimizerSettings;
@@ -664,9 +665,14 @@ pub fn analyze_mv_refresh_input(
         current_database,
         catalog,
     } = context;
-    crate::planning::mv::validate_imv_aggregate_star_arguments(&query)?;
+    // The public MV-refresh facade still returns String while its frontend
+    // owner is outside SQLP-7. Keep the typed parser rejection intact until
+    // that boundary; no category is inferred from this message.
+    crate::planning::mv::validate_imv_aggregate_star_arguments(&query)
+        .map_err(|error| error.to_string())?;
     let (resolved, _, _) =
-        crate::analyzer::analyze(&query, catalog.planner_table_provider(), &current_database)?;
+        crate::analyzer::analyze(&query, catalog.planner_table_provider(), &current_database)
+            .map_err(|error| error.to_string())?;
     Ok(crate::planning::mv::SqlResolvedMvRefreshInput::from_analysis(resolved))
 }
 
@@ -1065,6 +1071,7 @@ pub enum SqlCompileError {
     Cancelled,
     DeadlineExceeded,
     InvalidRequest(String),
+    Analyze(AnalyzeError),
     Compilation(String),
 }
 
@@ -1074,6 +1081,7 @@ impl std::fmt::Display for SqlCompileError {
             Self::Cancelled => f.write_str("SQL compilation was cancelled"),
             Self::DeadlineExceeded => f.write_str("SQL compilation deadline exceeded"),
             Self::InvalidRequest(error) | Self::Compilation(error) => f.write_str(error),
+            Self::Analyze(error) => error.fmt(f),
         }
     }
 }
@@ -1113,7 +1121,7 @@ impl SqlCompiler {
                     &request.session.current_database,
                     functions,
                 )
-                .map_err(SqlCompileError::Compilation)?;
+                .map_err(SqlCompileError::Analyze)?;
                 request.check_control()?;
                 let logical_plan = crate::planner::plan_query(resolved, ctes, &mut factory)
                     .map_err(SqlCompileError::Compilation)?;

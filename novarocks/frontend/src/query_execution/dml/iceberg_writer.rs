@@ -504,7 +504,10 @@ impl PreparedIcebergWrite {
 
     fn prepare_native_assembly(
         &self,
-    ) -> Result<crate::query_execution::compiler::PreparedDmlWriteAssembly, String> {
+    ) -> Result<
+        crate::query_execution::compiler::PreparedDmlWriteAssembly,
+        crate::dml::error::DmlExecutionError,
+    > {
         crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_context(
             &self.executor.state,
             Some(&self.executor.target.catalog),
@@ -520,7 +523,9 @@ impl PreparedIcebergWrite {
         )
     }
 
-    pub(crate) fn native_encoding(&self) -> Result<PreparedIcebergWriteNativeEncoding<'_>, String> {
+    pub(crate) fn native_encoding(
+        &self,
+    ) -> Result<PreparedIcebergWriteNativeEncoding<'_>, crate::dml::error::DmlExecutionError> {
         let mut assembly = self
             .native_assembly
             .lock()

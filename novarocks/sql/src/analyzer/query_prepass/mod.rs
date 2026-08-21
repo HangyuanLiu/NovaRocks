@@ -32,6 +32,8 @@ use novarocks_parser::{
     },
 };
 
+use crate::analyze_error::AnalyzeError;
+
 const DEFAULT_RECURSIVE_CTE_MAX_DEPTH: usize = 5;
 
 /// Applies syntax-complete, catalog-independent query semantics.
@@ -39,7 +41,7 @@ const DEFAULT_RECURSIVE_CTE_MAX_DEPTH: usize = 5;
 /// This is intentionally not connected to an analyzer entry point yet.  The
 /// contract is owned here first so the SQLP-6 cutover can flip every producer
 /// and consumer together without a raw-text bridge.
-pub(crate) fn preanalyze(mut query: Query) -> Result<Query, String> {
+pub(crate) fn preanalyze(mut query: Query) -> Result<Query, AnalyzeError> {
     let max_depth = recursive_cte_max_depth(&query).unwrap_or(DEFAULT_RECURSIVE_CTE_MAX_DEPTH);
     rewrite_nested_queries(&mut query, max_depth.max(1))?;
     normalize_cross_joins(&mut query);
@@ -101,10 +103,10 @@ fn root_select(body: &SetExpr) -> Option<&Select> {
     }
 }
 
-fn rewrite_nested_queries(query: &mut Query, max_depth: usize) -> Result<(), String> {
+fn rewrite_nested_queries(query: &mut Query, max_depth: usize) -> Result<(), AnalyzeError> {
     struct RecursiveUnroller {
         max_depth: usize,
-        error: Option<String>,
+        error: Option<AnalyzeError>,
     }
 
     impl Fold for RecursiveUnroller {
@@ -139,7 +141,7 @@ fn rewrite_nested_queries(query: &mut Query, max_depth: usize) -> Result<(), Str
 fn unroll_with_clause(
     with: &mut novarocks_parser::ast::With,
     max_depth: usize,
-) -> Result<(), String> {
+) -> Result<(), AnalyzeError> {
     let originals = std::mem::take(&mut with.ctes);
     let mut rewritten = Vec::with_capacity(originals.len());
     for cte in originals {
@@ -156,7 +158,7 @@ fn unroll_with_clause(
 fn try_unroll_cte(
     cte: &novarocks_parser::ast::Cte,
     max_depth: usize,
-) -> Result<Option<novarocks_parser::ast::Cte>, String> {
+) -> Result<Option<novarocks_parser::ast::Cte>, AnalyzeError> {
     let name = cte.name.value.to_ascii_lowercase();
     let union_chain = extract_union_chain(cte.query.body.as_ref());
     if matches!(union_chain, Some(Err(())))
@@ -164,7 +166,10 @@ fn try_unroll_cte(
     {
         // ADR-0088: a mixed chain that is actually recursive is known before
         // catalog materialization and therefore cannot fall through to it.
-        return Err("unsupported recursive CTE shape: mixed UNION quantifiers".to_owned());
+        return Err(AnalyzeError::unsupported_query_shape(
+            "unsupported recursive CTE shape: mixed UNION quantifiers",
+            cte.span,
+        ));
     }
     let Some(Ok((quantifier, operands))) = union_chain else {
         return Ok(None);
@@ -174,7 +179,10 @@ fn try_unroll_cte(
     if set_expr_references_table(anchor, &name) {
         // ADR-0088: an anchor cannot self-reference. Reject the shape before
         // catalog resolution even when no later UNION operand references it.
-        return Err(format!("unknown table: {}", cte.name.value));
+        return Err(AnalyzeError::unknown_table(
+            format!("unknown table: {}", cte.name.value),
+            cte.name.span,
+        ));
     }
     let self_references = recursive_parts
         .iter()
@@ -255,12 +263,15 @@ fn extract_union_chain(expr: &SetExpr) -> Option<Result<(SetQuantifier, Vec<SetE
 fn derive_column_aliases(
     cte: &novarocks_parser::ast::Cte,
     anchor: &SetExpr,
-) -> Result<Vec<Ident>, String> {
+) -> Result<Vec<Ident>, AnalyzeError> {
     if !cte.columns.is_empty() {
         return Ok(cte.columns.clone());
     }
     let Some(select) = root_select(anchor) else {
-        return Err("recursive CTE anchor must be a SELECT statement".to_owned());
+        return Err(AnalyzeError::invalid_query_shape(
+            "recursive CTE anchor must be a SELECT statement",
+            anchor.span(),
+        ));
     };
     Ok(select
         .projection
@@ -593,7 +604,7 @@ fn substitute_table_with_derived(
                         // the query body resolve the same name locally.
                         return query;
                     }
-                    cte.query = Box::new(self.fold_query(*cte.query.clone()));
+                    *cte.query = self.fold_query(*cte.query.clone());
                 }
             }
             novarocks_parser::ast::fold_query(self, query)
@@ -705,12 +716,12 @@ fn normalize_cross_factor(factor: &mut TableFactor) {
     }
 }
 
-fn collect_user_variable_assignments(query: &Query) -> Result<HashMap<String, Expr>, String> {
-    fn collect(query: &Query, assignments: &mut HashMap<String, Expr>) -> Result<(), String> {
+fn collect_user_variable_assignments(query: &Query) -> Result<HashMap<String, Expr>, AnalyzeError> {
+    fn collect(query: &Query, assignments: &mut HashMap<String, Expr>) -> Result<(), AnalyzeError> {
         fn collect_set_expr(
             expr: &SetExpr,
             assignments: &mut HashMap<String, Expr>,
-        ) -> Result<(), String> {
+        ) -> Result<(), AnalyzeError> {
             match expr {
                 SetExpr::Select(select) => {
                     for hint in &select.hints {
@@ -718,17 +729,29 @@ fn collect_user_variable_assignments(query: &Query) -> Result<HashMap<String, Ex
                             continue;
                         }
                         let SelectHintValue::Call { arguments } = &hint.value else {
-                            return Err("invalid set_user_variable hint assignment".to_owned());
+                            return Err(AnalyzeError::invalid_argument(
+                                "invalid set_user_variable hint assignment",
+                                hint.span,
+                            ));
                         };
                         for assignment in arguments {
                             let Expr::Binary(binary) = assignment else {
-                                return Err("invalid set_user_variable hint assignment".to_owned());
+                                return Err(AnalyzeError::invalid_argument(
+                                    "invalid set_user_variable hint assignment",
+                                    assignment.span(),
+                                ));
                             };
                             let Expr::UserVariable(variable) = binary.left.as_ref() else {
-                                return Err("invalid set_user_variable hint assignment".to_owned());
+                                return Err(AnalyzeError::invalid_argument(
+                                    "invalid set_user_variable hint assignment",
+                                    binary.left.span(),
+                                ));
                             };
                             if binary.operator != BinaryOperator::Equal {
-                                return Err("invalid set_user_variable hint assignment".to_owned());
+                                return Err(AnalyzeError::invalid_argument(
+                                    "invalid set_user_variable hint assignment",
+                                    assignment.span(),
+                                ));
                             }
                             assignments.insert(
                                 variable.value.to_ascii_lowercase(),
@@ -755,7 +778,7 @@ fn collect_user_variable_assignments(query: &Query) -> Result<HashMap<String, Ex
         fn collect_factor(
             factor: &TableFactor,
             assignments: &mut HashMap<String, Expr>,
-        ) -> Result<(), String> {
+        ) -> Result<(), AnalyzeError> {
             match factor {
                 TableFactor::Derived { subquery, .. } => collect(subquery, assignments),
                 TableFactor::NestedJoin {
@@ -875,7 +898,8 @@ mod tests {
     fn recursive_anchor_self_reference_fails_before_catalog_lookup() {
         let query =
             parse_query("WITH RECURSIVE n AS (SELECT * FROM n UNION ALL SELECT 1) SELECT * FROM n");
-        assert_eq!(preanalyze(query), Err("unknown table: n".to_owned()));
+        let error = preanalyze(query).expect_err("recursive anchor must be rejected");
+        assert_eq!(error.message(), "unknown table: n");
     }
 
     #[test]
@@ -883,7 +907,8 @@ mod tests {
         let query = parse_query(
             "WITH RECURSIVE n AS (SELECT 1 WHERE 1 IN (SELECT 1 FROM n) UNION ALL SELECT 2) SELECT * FROM n",
         );
-        assert_eq!(preanalyze(query), Err("unknown table: n".to_owned()));
+        let error = preanalyze(query).expect_err("recursive nested predicate must be rejected");
+        assert_eq!(error.message(), "unknown table: n");
     }
 
     #[test]
@@ -891,7 +916,8 @@ mod tests {
         let query = parse_query(
             "WITH RECURSIVE n AS (SELECT 1 WHERE EXISTS (WITH x AS (SELECT * FROM n) SELECT 1 FROM x) UNION ALL SELECT 2) SELECT * FROM n",
         );
-        assert_eq!(preanalyze(query), Err("unknown table: n".to_owned()));
+        let error = preanalyze(query).expect_err("recursive nested CTE body must be rejected");
+        assert_eq!(error.message(), "unknown table: n");
     }
 
     #[test]

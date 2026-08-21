@@ -89,11 +89,12 @@ impl WriteExecutor for MutationWriteExecutor<'_> {
     fn run_coordinated_write(
         &self,
         _spec: &WriteTransactionSpec,
-    ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, String> {
+    ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, DmlError> {
         let native_encoder = FrontendMutationNativeFragmentEncoder;
         match self
             .engine
-            .stage_mutation_with_native_encoder(self.prepared.handle.as_ref(), &native_encoder)?
+            .stage_mutation_with_native_encoder(self.prepared.handle.as_ref(), &native_encoder)
+            .map_err(|error| error.into_dml_error(Some(&self.prepared.sql_source)))?
         {
             MutationStageOutcome::NoOp => Ok(CoordinatedWriteReport::NoOp),
             MutationStageOutcome::AbortRequired { reason, handle } => {
@@ -375,13 +376,14 @@ mod tests {
                     base_snapshot_id: Some(7),
                 },
                 handle: Arc::new(TestPrepared),
+                sql_source: request.source.to_string(),
             })
         }
 
         fn stage_mutation(
             &self,
             _prepared: &dyn MutationPrepared,
-        ) -> Result<MutationStageOutcome, String> {
+        ) -> Result<MutationStageOutcome, crate::dml::error::DmlExecutionError> {
             let operations = self.journal.list_operations().unwrap();
             assert_eq!(operations.len(), 1);
             assert_eq!(operations[0].state, OperationState::Writing);

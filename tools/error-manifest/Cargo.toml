@@ -29,4 +29,5 @@ path = "src/main.rs"
 [dependencies]
 novarocks-frontend = { path = "../../novarocks/frontend" }
 novarocks-parser = { path = "../../novarocks/parser" }
+novarocks-sql = { path = "../../novarocks/sql" }
 novarocks-user-error = { path = "../../novarocks/user-error" }

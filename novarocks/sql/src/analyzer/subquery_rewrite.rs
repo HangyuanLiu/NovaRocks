@@ -33,6 +33,7 @@ use novarocks_parser::ast;
 use novarocks_parser::printer;
 
 use crate::analysis::*;
+use crate::analyze_error::AnalyzeError;
 
 use super::AnalyzerContext;
 use super::scope::AnalyzerScope;
@@ -207,7 +208,7 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         select: &mut ResolvedSelect,
         scope: &mut AnalyzerScope,
-    ) -> Result<(), String> {
+    ) -> Result<(), AnalyzeError> {
         let subqueries: Vec<SubqueryInfo> =
             self.collected_subqueries.borrow_mut().drain(..).collect();
         if subqueries.is_empty() {
@@ -277,9 +278,12 @@ impl<'a> AnalyzerContext<'a> {
                 continue;
             }
 
-            return Err(format!(
-                "subquery shape is not supported by Apply rewrite: {}",
-                novarocks_parser::printer::print_query(&sq_info.subquery)
+            return Err(AnalyzeError::unsupported_query_shape(
+                format!(
+                    "subquery shape is not supported by Apply rewrite: {}",
+                    novarocks_parser::printer::print_query(&sq_info.subquery)
+                ),
+                sq_info.subquery.span,
             ));
         }
 
@@ -300,7 +304,7 @@ impl<'a> AnalyzerContext<'a> {
         select: &mut ResolvedSelect,
         scope: &mut AnalyzerScope,
         sq_info: &SubqueryInfo,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, AnalyzeError> {
         use crate::analysis::{ApplyScalarSpec, OutputColumn};
 
         // 1. Determine which clause the placeholder lives in.
@@ -314,7 +318,10 @@ impl<'a> AnalyzerContext<'a> {
         let (mut resolved_sub, inner_scope) =
             self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
         if resolved_sub.output_columns.len() != 1 {
-            return Err("scalar subquery must produce exactly one output column".to_string());
+            return Err(AnalyzeError::invalid_query_shape(
+                "scalar subquery must produce exactly one output column",
+                sq_info.subquery.span,
+            ));
         }
 
         if let QueryBody::Select(ref mut sel) = resolved_sub.body
@@ -387,7 +394,7 @@ impl<'a> AnalyzerContext<'a> {
         select: &mut ResolvedSelect,
         scope: &mut AnalyzerScope,
         sq_info: &SubqueryInfo,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, AnalyzeError> {
         use crate::analysis::{ApplyClause, ApplyPredicateSpec, OutputColumn};
 
         let top_level_where_conjunct = select
@@ -427,7 +434,7 @@ impl<'a> AnalyzerContext<'a> {
                 let in_expr = sq_info
                     .in_expr
                     .as_ref()
-                    .ok_or_else(|| "IN subquery missing LHS expression".to_string())?;
+                    .ok_or_else(|| AnalyzeError::internal("IN subquery missing LHS expression"))?;
                 if matches!(in_expr.as_ref(), ast::Expr::Tuple(_))
                     || matches!(
                         in_expr.as_ref(),
@@ -442,7 +449,10 @@ impl<'a> AnalyzerContext<'a> {
                     return Ok(true);
                 }
                 if resolved_sub.output_columns.len() != 1 {
-                    return Err("IN subquery must produce exactly one output column".to_string());
+                    return Err(AnalyzeError::invalid_query_shape(
+                        "IN subquery must produce exactly one output column",
+                        sq_info.subquery.span,
+                    ));
                 }
                 let lhs = self.analyze_expr(in_expr, scope)?;
                 let inner_col = &resolved_sub.output_columns[0];
@@ -454,8 +464,11 @@ impl<'a> AnalyzerContext<'a> {
                         SubqueryKind::InSubquery { negated: true } => "NOT IN",
                         _ => "IN",
                     };
-                    return Err(format!(
-                        "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
+                    return Err(AnalyzeError::type_mismatch(
+                        format!(
+                            "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
+                        ),
+                        in_expr.span(),
                     ));
                 }
                 Some(lhs)
@@ -468,10 +481,10 @@ impl<'a> AnalyzerContext<'a> {
             collect_predicate_correlation_column_ids_for_apply(&resolved_sub, &inner_scope, scope);
         let outer_refs = collect_subquery_outer_ref_usage(&resolved_sub, &inner_scope, scope);
         if outer_refs.outside_filter || (outer_refs.filter && corr_ids.is_empty()) {
-            return Err(
-                "correlated EXISTS/IN subquery must use comparison predicates in the subquery filter"
-                    .to_string(),
-            );
+            return Err(AnalyzeError::unsupported_query_shape(
+                "correlated EXISTS/IN subquery must use comparison predicates in the subquery filter",
+                sq_info.subquery.span,
+            ));
         }
 
         let output_name = format!("__pred_sq_{}", sq_info.id);
@@ -489,16 +502,19 @@ impl<'a> AnalyzerContext<'a> {
                 Self::remove_placeholder_from_filter(&mut select.filter, sq_info.id);
             }
             ApplyClause::AggregateInput => {
-                return Err(
-                    "predicate subquery in an aggregate argument requires value-form rewrite"
-                        .into(),
-                );
+                return Err(AnalyzeError::unsupported_query_shape(
+                    "predicate subquery in an aggregate argument requires value-form rewrite",
+                    sq_info.subquery.span,
+                ));
             }
             ApplyClause::Having => {
                 Self::remove_placeholder_from_filter(&mut select.having, sq_info.id);
             }
             ApplyClause::Projection => {
-                return Err("predicate subquery in SELECT list requires value-form rewrite".into());
+                return Err(AnalyzeError::unsupported_query_shape(
+                    "predicate subquery in SELECT list requires value-form rewrite",
+                    sq_info.subquery.span,
+                ));
             }
         }
 
@@ -590,7 +606,7 @@ impl<'a> AnalyzerContext<'a> {
         rel: &mut Relation,
         scope: &mut AnalyzerScope,
         sq_info: &SubqueryInfo,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, AnalyzeError> {
         match rel {
             Relation::Join(join_box) => {
                 if self.rewrite_subquery_in_relation(&mut join_box.left, scope, sq_info)? {
@@ -631,7 +647,7 @@ impl<'a> AnalyzerContext<'a> {
         join: &mut JoinRelation,
         scope: &mut AnalyzerScope,
         sq_info: &SubqueryInfo,
-    ) -> Result<(), String> {
+    ) -> Result<(), AnalyzeError> {
         let (resolved_sub, inner_scope) =
             self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
 
@@ -706,24 +722,39 @@ impl<'a> AnalyzerContext<'a> {
         resolved_sub: ResolvedQuery,
         sq_alias: String,
         negated: bool,
-    ) -> Result<(), String> {
-        let in_expr_ast = sq_info
-            .in_expr
-            .as_ref()
-            .ok_or("IN subquery rewrite (JOIN ON, correlated): missing left-hand expression")?;
+    ) -> Result<(), AnalyzeError> {
+        let in_expr_ast = sq_info.in_expr.as_ref().ok_or_else(|| {
+            AnalyzeError::internal(
+                "IN subquery rewrite (JOIN ON, correlated): missing left-hand expression",
+            )
+        })?;
         let lhs_typed = self.analyze_expr(in_expr_ast, scope)?;
 
         let (sub_from, sub_filter) = match resolved_sub.body {
             QueryBody::Select(sel) => (sel.from, sel.filter),
-            _ => return Err("correlated IN subquery must be a SELECT".into()),
+            _ => {
+                return Err(AnalyzeError::unsupported_query_shape(
+                    "correlated IN subquery must be a SELECT",
+                    sq_info.subquery.span,
+                ));
+            }
         };
         let sub_first_col = resolved_sub
             .output_columns
             .first()
-            .ok_or("IN subquery must produce at least one column")?
+            .ok_or_else(|| {
+                AnalyzeError::invalid_query_shape(
+                    "IN subquery must produce at least one column",
+                    sq_info.subquery.span,
+                )
+            })?
             .clone();
-        let sub_rel =
-            sub_from.ok_or("correlated IN subquery must have a FROM clause".to_string())?;
+        let sub_rel = sub_from.ok_or_else(|| {
+            AnalyzeError::unsupported_query_shape(
+                "correlated IN subquery must have a FROM clause",
+                sq_info.subquery.span,
+            )
+        })?;
 
         // Build the equality condition plus the lifted WHERE.
         let eq_cond = TypedExpr {
@@ -805,13 +836,22 @@ impl<'a> AnalyzerContext<'a> {
         resolved_sub: ResolvedQuery,
         sq_alias: String,
         negated: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), AnalyzeError> {
         let (sub_from, sub_filter) = match resolved_sub.body {
             QueryBody::Select(sel) => (sel.from, sel.filter),
-            _ => return Err("correlated EXISTS subquery must be a SELECT".into()),
+            _ => {
+                return Err(AnalyzeError::unsupported_query_shape(
+                    "correlated EXISTS subquery must be a SELECT",
+                    sq_info.subquery.span,
+                ));
+            }
         };
-        let sub_rel =
-            sub_from.ok_or("correlated EXISTS subquery must have a FROM clause".to_string())?;
+        let sub_rel = sub_from.ok_or_else(|| {
+            AnalyzeError::unsupported_query_shape(
+                "correlated EXISTS subquery must have a FROM clause",
+                sq_info.subquery.span,
+            )
+        })?;
 
         // Pick the first output column of the FROM relation as the match indicator.
         //
@@ -828,9 +868,11 @@ impl<'a> AnalyzerContext<'a> {
         // column IS in the plan (it is attached via `attach_aux_join`) and its
         // value is non-NULL whenever the correlated subquery matches a row,
         // which is exactly the semantics we need for the EXISTS IS NOT NULL check.
-        let indicator = relation_first_output_column(&sub_rel).ok_or(
-            "correlated EXISTS subquery: FROM relation has no output column for indicator",
-        )?;
+        let indicator = relation_first_output_column(&sub_rel).ok_or_else(|| {
+            AnalyzeError::internal(
+                "correlated EXISTS subquery: FROM relation has no output column for indicator",
+            )
+        })?;
 
         let side = match sub_filter.as_ref() {
             Some(f) => choose_aux_join_side(join, std::slice::from_ref(f)),
@@ -874,7 +916,7 @@ impl<'a> AnalyzerContext<'a> {
         sq_info: &SubqueryInfo,
         resolved_sub: ResolvedQuery,
         sq_alias: String,
-    ) -> Result<(), String> {
+    ) -> Result<(), AnalyzeError> {
         // For correlated scalar (typically `SELECT agg(...) FROM t WHERE
         // <correlated>`), we re-wrap the subquery as a Subquery relation
         // but pre-extract the correlation predicate up into a LEFT OUTER
@@ -883,7 +925,10 @@ impl<'a> AnalyzerContext<'a> {
         // builds a per-correlation-key aggregate, which is what we want.
         // Reuse it.
         if resolved_sub.output_columns.is_empty() {
-            return Err("correlated scalar subquery must produce at least one column".into());
+            return Err(AnalyzeError::invalid_query_shape(
+                "correlated scalar subquery must produce at least one column",
+                sq_info.subquery.span,
+            ));
         }
         let inner_scope_filter = match resolved_sub.body {
             QueryBody::Select(ref s) => s.filter.clone(),
@@ -897,7 +942,12 @@ impl<'a> AnalyzerContext<'a> {
                     self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
                 scope
             }
-            _ => return Err("correlated scalar subquery must be a SELECT".into()),
+            _ => {
+                return Err(AnalyzeError::unsupported_query_shape(
+                    "correlated scalar subquery must be a SELECT",
+                    sq_info.subquery.span,
+                ));
+            }
         };
         let corr_preds = match (&inner_scope_filter, &resolved_sub.body) {
             (Some(filter), QueryBody::Select(_)) => {
@@ -954,14 +1004,16 @@ impl<'a> AnalyzerContext<'a> {
         resolved_sub: ResolvedQuery,
         sq_alias: String,
         negated: bool,
-    ) -> Result<(), String> {
-        let in_expr_ast = sq_info
-            .in_expr
-            .as_ref()
-            .ok_or("IN subquery rewrite (JOIN ON): missing left-hand expression")?;
+    ) -> Result<(), AnalyzeError> {
+        let in_expr_ast = sq_info.in_expr.as_ref().ok_or_else(|| {
+            AnalyzeError::internal("IN subquery rewrite (JOIN ON): missing left-hand expression")
+        })?;
         let lhs_typed = self.analyze_expr(in_expr_ast, scope)?;
         if resolved_sub.output_columns.is_empty() {
-            return Err("IN subquery must produce at least one column".into());
+            return Err(AnalyzeError::invalid_query_shape(
+                "IN subquery must produce at least one column",
+                sq_info.subquery.span,
+            ));
         }
         let sub_col = resolved_sub.output_columns[0].clone();
         let match_col = format!("__match_{}", sq_info.id);
@@ -1141,7 +1193,7 @@ impl<'a> AnalyzerContext<'a> {
         resolved_sub: ResolvedQuery,
         sq_alias: String,
         negated: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), AnalyzeError> {
         let match_col = format!("__exists_{}", sq_info.id);
         // Project a single non-null indicator so LEFT OUTER JOIN against
         // `__sq_alias` yields a row with `__exists IS NOT NULL` iff the
@@ -1231,9 +1283,12 @@ impl<'a> AnalyzerContext<'a> {
         sq_info: &SubqueryInfo,
         resolved_sub: ResolvedQuery,
         sq_alias: String,
-    ) -> Result<(), String> {
+    ) -> Result<(), AnalyzeError> {
         if resolved_sub.output_columns.is_empty() {
-            return Err("scalar subquery must produce at least one column".into());
+            return Err(AnalyzeError::invalid_query_shape(
+                "scalar subquery must produce at least one column",
+                sq_info.subquery.span,
+            ));
         }
         let scalar_col = resolved_sub.output_columns[0].clone();
         let output_columns = resolved_sub.output_columns.clone();
@@ -1279,7 +1334,7 @@ impl<'a> AnalyzerContext<'a> {
         select: &mut ResolvedSelect,
         scope: &mut AnalyzerScope,
         sq_info: SubqueryInfo,
-    ) -> Result<(), String> {
+    ) -> Result<(), AnalyzeError> {
         match &sq_info.kind {
             SubqueryKind::Exists { negated } => {
                 let negated = *negated;
@@ -1303,7 +1358,7 @@ impl<'a> AnalyzerContext<'a> {
         scope: &mut AnalyzerScope,
         sq_info: SubqueryInfo,
         negated: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), AnalyzeError> {
         let (resolved, inner_scope) =
             self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
 
@@ -1326,12 +1381,16 @@ impl<'a> AnalyzerContext<'a> {
             .iter()
             .any(|item| expr_contains_placeholder(&item.expr, sq_info.id))
         {
-            return Err("correlated EXISTS subquery in SELECT list is not supported".to_string());
+            return Err(AnalyzeError::unsupported_query_shape(
+                "correlated EXISTS subquery in SELECT list is not supported",
+                sq_info.subquery.span,
+            ));
         }
         if predicate_placeholder_is_value_form(select, sq_info.id) {
-            return Err(
-                "correlated EXISTS subquery in value-form expression is not supported".to_string(),
-            );
+            return Err(AnalyzeError::unsupported_query_shape(
+                "correlated EXISTS subquery in value-form expression is not supported",
+                sq_info.subquery.span,
+            ));
         }
 
         let join_type = if negated {
@@ -1368,10 +1427,20 @@ impl<'a> AnalyzerContext<'a> {
             // inner predicates into proper hash joins.
             let (sub_from, sub_filter) = match resolved.body {
                 QueryBody::Select(sel) => (sel.from, sel.filter),
-                _ => return Err("EXISTS subquery must be a SELECT".into()),
+                _ => {
+                    return Err(AnalyzeError::unsupported_query_shape(
+                        "EXISTS subquery must be a SELECT",
+                        sq_info.subquery.span,
+                    ));
+                }
             };
 
-            let sub_rel = sub_from.ok_or("EXISTS subquery must have a FROM clause")?;
+            let sub_rel = sub_from.ok_or_else(|| {
+                AnalyzeError::unsupported_query_shape(
+                    "EXISTS subquery must have a FROM clause",
+                    sq_info.subquery.span,
+                )
+            })?;
 
             // Build join condition: correlation predicates + remaining filter.
             // For correlated EXISTS, extract correlation preds as equi-join keys
@@ -1514,7 +1583,7 @@ impl<'a> AnalyzerContext<'a> {
         mut resolved_sub: ResolvedQuery,
         sq_id: usize,
         negated: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), AnalyzeError> {
         let sq_alias = format!("__sq_{}", sq_id);
         let match_col = format!("__exists_{}", sq_id);
         let exists_col_id = self.alloc_column_id(
@@ -1612,11 +1681,10 @@ impl<'a> AnalyzerContext<'a> {
         scope: &mut AnalyzerScope,
         sq_info: SubqueryInfo,
         negated: bool,
-    ) -> Result<(), String> {
-        let in_expr_ast = sq_info
-            .in_expr
-            .as_ref()
-            .ok_or("IN subquery rewrite: missing left-hand expression")?;
+    ) -> Result<(), AnalyzeError> {
+        let in_expr_ast = sq_info.in_expr.as_ref().ok_or_else(|| {
+            AnalyzeError::internal("IN subquery rewrite: missing left-hand expression")
+        })?;
 
         // Multi-column LHS: `(a, b) IN (SELECT c, d FROM ...)`. The typed AST
         // retains the LHS as `Expr::Tuple` (possibly wrapped in
@@ -1641,10 +1709,13 @@ impl<'a> AnalyzerContext<'a> {
             self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
 
         if resolved_sub.output_columns.len() != lhs_typed_list.len() {
-            return Err(format!(
-                "IN subquery column count mismatch: LHS has {} expression(s) but subquery produces {} column(s)",
-                lhs_typed_list.len(),
-                resolved_sub.output_columns.len()
+            return Err(AnalyzeError::invalid_query_shape(
+                format!(
+                    "IN subquery column count mismatch: LHS has {} expression(s) but subquery produces {} column(s)",
+                    lhs_typed_list.len(),
+                    resolved_sub.output_columns.len()
+                ),
+                sq_info.subquery.span,
             ));
         }
         // Per-pair shape check: `x IN (SELECT y …)` is rewritten into an
@@ -1664,8 +1735,11 @@ impl<'a> AnalyzerContext<'a> {
                 &sub_col.data_type,
             ) {
                 let op_sym = if negated { "NOT IN" } else { "IN" };
-                return Err(format!(
-                    "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
+                return Err(AnalyzeError::type_mismatch(
+                    format!(
+                        "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
+                    ),
+                    in_expr_ast.span(),
                 ));
             }
         }
@@ -1703,9 +1777,10 @@ impl<'a> AnalyzerContext<'a> {
         };
 
         if is_correlated && value_form {
-            return Err(
-                "correlated IN subquery in value-form expression is not supported".to_string(),
-            );
+            return Err(AnalyzeError::unsupported_query_shape(
+                "correlated IN subquery in value-form expression is not supported",
+                sq_info.subquery.span,
+            ));
         }
 
         if is_correlated {
@@ -1715,6 +1790,7 @@ impl<'a> AnalyzerContext<'a> {
                 lhs_typed,
                 resolved_sub,
                 sq_info.id,
+                sq_info.subquery.span,
                 negated,
             );
         }
@@ -1722,9 +1798,10 @@ impl<'a> AnalyzerContext<'a> {
         let sq_alias = format!("__sq_{}", sq_info.id);
 
         if value_form && lhs_typed_list.len() > 1 {
-            return Err(
-                "multi-column IN subquery in value-form expression is not supported".to_string(),
-            );
+            return Err(AnalyzeError::unsupported_query_shape(
+                "multi-column IN subquery in value-form expression is not supported",
+                sq_info.subquery.span,
+            ));
         }
 
         // Build per-column equality conjuncts. For a single-column IN this
@@ -2018,6 +2095,10 @@ impl<'a> AnalyzerContext<'a> {
     /// inner WHERE would no longer resolve. Instead, we mirror the EXISTS
     /// path: take the subquery's FROM as the join's right side, and place
     /// the subquery's full WHERE plus the eq_cond into the join condition.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The rewrite accepts the frozen correlated-subquery facts without rebuilding a synthetic carrier."
+    )]
     fn rewrite_correlated_in_subquery(
         &self,
         select: &mut ResolvedSelect,
@@ -2025,18 +2106,32 @@ impl<'a> AnalyzerContext<'a> {
         lhs_typed: TypedExpr,
         resolved_sub: ResolvedQuery,
         sq_id: usize,
+        subquery_span: novarocks_parser::Span,
         negated: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), AnalyzeError> {
         let (sub_from, sub_filter, sub_projection) = match resolved_sub.body {
             QueryBody::Select(sel) => (sel.from, sel.filter, sel.projection),
-            _ => return Err("correlated IN subquery must be a SELECT".into()),
+            _ => {
+                return Err(AnalyzeError::unsupported_query_shape(
+                    "correlated IN subquery must be a SELECT",
+                    subquery_span,
+                ));
+            }
         };
 
         if sub_projection.is_empty() {
-            return Err("IN subquery must produce a column".into());
+            return Err(AnalyzeError::invalid_query_shape(
+                "IN subquery must produce a column",
+                subquery_span,
+            ));
         }
         let rhs_expr = sub_projection[0].expr.clone();
-        let sub_rel = sub_from.ok_or("IN subquery must have a FROM clause".to_string())?;
+        let sub_rel = sub_from.ok_or_else(|| {
+            AnalyzeError::unsupported_query_shape(
+                "IN subquery must have a FROM clause",
+                subquery_span,
+            )
+        })?;
 
         // Keep the key condition as a plain equality so the optimizer can
         // implement it as a hash join key. For nullable NOT IN semantics,
@@ -2122,7 +2217,7 @@ impl<'a> AnalyzerContext<'a> {
         select: &mut ResolvedSelect,
         scope: &mut AnalyzerScope,
         sq_info: SubqueryInfo,
-    ) -> Result<(), String> {
+    ) -> Result<(), AnalyzeError> {
         let sq_alias = format!("__sq_{}", sq_info.id);
 
         // Analyze the subquery. We get back (resolved, inner_scope) where
@@ -2131,7 +2226,10 @@ impl<'a> AnalyzerContext<'a> {
             self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
 
         if resolved_sub.output_columns.is_empty() {
-            return Err("scalar subquery must produce at least one output column".into());
+            return Err(AnalyzeError::invalid_query_shape(
+                "scalar subquery must produce at least one output column",
+                sq_info.subquery.span,
+            ));
         }
 
         // Factor out common correlation predicates from OR branches before
@@ -2280,7 +2378,7 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         query: &ast::Query,
         outer_scope: &AnalyzerScope,
-    ) -> Result<(ResolvedQuery, AnalyzerScope), String> {
+    ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
         let child_ctx = AnalyzerContext {
             catalog: self.catalog,
             current_database: self.current_database,
@@ -2321,7 +2419,7 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         query: &ast::Query,
         outer_scope: &AnalyzerScope,
-    ) -> Result<(ResolvedQuery, AnalyzerScope), String> {
+    ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
         let (maybe_child_ctx, local_cte_ids) = if let Some(ref with_clause) = query.with {
             let (child_ctx, local_cte_ids) = self.build_with_clause_context(with_clause)?;
             (Some(child_ctx), local_cte_ids)
@@ -2387,7 +2485,7 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         select: &ast::Select,
         outer_scope: &AnalyzerScope,
-    ) -> Result<(ResolvedSelect, Vec<OutputColumn>, AnalyzerScope), String> {
+    ) -> Result<(ResolvedSelect, Vec<OutputColumn>, AnalyzerScope), AnalyzeError> {
         // --- FROM clause ---
         let (from, inner_scope) = if select.from.is_empty() {
             (None, self.new_scope())
@@ -2449,10 +2547,13 @@ impl<'a> AnalyzerContext<'a> {
         let group_by_exprs = match &select.group_by {
             ast::GroupBy::None => Vec::new(),
             ast::GroupBy::Expressions { expressions, .. } => expressions.clone(),
-            ast::GroupBy::Rollup { .. }
-            | ast::GroupBy::Cube { .. }
-            | ast::GroupBy::GroupingSets { .. } => {
-                return Err("GROUP BY ALL is not supported".into());
+            ast::GroupBy::Rollup { span, .. }
+            | ast::GroupBy::Cube { span, .. }
+            | ast::GroupBy::GroupingSets { span, .. } => {
+                return Err(AnalyzeError::unsupported_query_shape(
+                    "GROUP BY ALL is not supported",
+                    *span,
+                ));
             }
         };
         let mut group_by = Vec::with_capacity(group_by_exprs.len());
@@ -2558,7 +2659,7 @@ impl<'a> AnalyzerContext<'a> {
         _outer_scope: &AnalyzerScope,
         _sq_alias: &str,
         correlated_cols: &[CorrelationPred],
-    ) -> Result<(ResolvedQuery, Option<TypedExpr>), String> {
+    ) -> Result<(ResolvedQuery, Option<TypedExpr>), AnalyzeError> {
         let mut join_conds: Vec<TypedExpr> = Vec::new();
         let mut extra_group_by: Vec<TypedExpr> = Vec::new();
         let mut extra_output: Vec<OutputColumn> = Vec::new();
@@ -2653,7 +2754,7 @@ impl<'a> AnalyzerContext<'a> {
         mut resolved: ResolvedQuery,
         nested_sqs: Vec<SubqueryInfo>,
         outer_scope: &AnalyzerScope,
-    ) -> Result<ResolvedQuery, String> {
+    ) -> Result<ResolvedQuery, AnalyzeError> {
         if let QueryBody::Select(ref mut sel) = resolved.body {
             let mut scope = self.new_scope();
             if let Some(ref from_rel) = sel.from {

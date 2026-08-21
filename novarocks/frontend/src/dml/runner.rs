@@ -88,10 +88,14 @@ pub trait WriteExecutor {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "The public transaction runner retains DmlError so typed analysis errors reach the client boundary."
+    )]
     fn run_coordinated_write(
         &self,
         spec: &WriteTransactionSpec,
-    ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, String>;
+    ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, DmlError>;
 
     fn abort(
         &self,
@@ -154,7 +158,7 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
 
         let report = match self.executor.run_coordinated_write(&spec) {
             Ok(report) => report,
-            Err(message) => return self.known_uncommitted(operation_id, message),
+            Err(error) => return self.known_uncommitted_error(operation_id, error),
         };
         match report {
             CoordinatedWriteReport::Aborted { reason } => {
@@ -324,6 +328,26 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
         )?;
         Err(DmlError::executor(message))
     }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "The runner must preserve a typed client error after recording the failed write outcome."
+    )]
+    fn known_uncommitted_error(
+        &self,
+        operation_id: DmlOperationId,
+        error: DmlError,
+    ) -> Result<WriteTransactionOutcome, DmlError> {
+        let failure = ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Internal,
+            error.to_string(),
+        );
+        self.record_outcome(
+            operation_id,
+            &ExternalMutationOutcome::KnownUncommitted { failure },
+        )?;
+        Err(error.with_operation_id(operation_id))
+    }
 }
 
 /// Build the durable intent that must be admitted and claimed before provider
@@ -391,7 +415,7 @@ impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
         self.establish_external_fence(spec)?;
         let report = match self.executor.run_coordinated_write(spec) {
             Ok(report) => report,
-            Err(message) => return self.known_uncommitted(message),
+            Err(error) => return self.known_uncommitted_error(error),
         };
         match report {
             CoordinatedWriteReport::Aborted { reason } => self.known_uncommitted(reason),
@@ -638,6 +662,22 @@ impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
             ConnectorMutationFailure::new(ConnectorMutationFailureKind::Internal, message.clone());
         self.record_outcome(&ExternalMutationOutcome::KnownUncommitted { failure })?;
         Err(DmlError::executor(message))
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "The active runner must preserve a typed client error after recording the failed write outcome."
+    )]
+    fn known_uncommitted_error(
+        &mut self,
+        error: DmlError,
+    ) -> Result<WriteTransactionOutcome, DmlError> {
+        let failure = ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Internal,
+            error.to_string(),
+        );
+        self.record_outcome(&ExternalMutationOutcome::KnownUncommitted { failure })?;
+        Err(error.with_operation_id(self.operation.operation_id()))
     }
 
     #[allow(
@@ -1118,13 +1158,14 @@ mod tests {
         fn run_coordinated_write(
             &self,
             _spec: &WriteTransactionSpec,
-        ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, String> {
+        ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, DmlError>
+        {
             // This is where core begins the connector write operation and
             // where the three `mutation_flow.rs` abort sites read the fence
             // off the lease. Both must already see an established fence.
-            self.lease
-                .require_external_fence()
-                .map_err(|error| format!("write operation began without a fence: {error}"))?;
+            self.lease.require_external_fence().map_err(|error| {
+                DmlError::executor(format!("write operation began without a fence: {error}"))
+            })?;
             self.push("begin-write-operation");
             Ok(CoordinatedWriteReport::NoOp)
         }
@@ -1170,7 +1211,8 @@ mod tests {
         fn run_coordinated_write(
             &self,
             _spec: &WriteTransactionSpec,
-        ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, String> {
+        ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, DmlError>
+        {
             Ok(CoordinatedWriteReport::CommitRequired(()))
         }
 
@@ -1212,7 +1254,8 @@ mod tests {
         fn run_coordinated_write(
             &self,
             _spec: &WriteTransactionSpec,
-        ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, String> {
+        ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, DmlError>
+        {
             Ok(CoordinatedWriteReport::AbortRequired {
                 reason: "stage requires abort".to_string(),
                 handle: (),
@@ -1255,7 +1298,8 @@ mod tests {
         fn run_coordinated_write(
             &self,
             _spec: &WriteTransactionSpec,
-        ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, String> {
+        ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, DmlError>
+        {
             Ok(CoordinatedWriteReport::AbortRequired {
                 reason: "MOR UPDATE matched target row: duplicate _row_id=7".to_string(),
                 handle: (),

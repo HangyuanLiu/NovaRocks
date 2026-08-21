@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
 use std::collections::BTreeSet;
 
 use sha2::{Digest, Sha256};
@@ -267,6 +268,7 @@ impl KeyspaceCodec {
         .concat()
     }
 
+    #[cfg(test)]
     pub fn assign_change_sequences(
         changed_keys: impl IntoIterator<Item = Vec<u8>>,
     ) -> Vec<(Vec<u8>, u32)> {

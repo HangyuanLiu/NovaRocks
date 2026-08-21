@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::analyze_error::AnalyzeError;
 use crate::planner::table::TableDef;
 use novarocks_parser::ast::{Query, TableVersion};
 #[cfg(test)]
@@ -232,7 +233,7 @@ pub fn resolve_time_travel_snapshot_binding(
     version: &TableVersion,
     metadata: &SqlTimeTravelReferenceMetadataFacts,
     fully_qualified_name: &str,
-) -> Result<SqlTimeTravelSnapshotBindingFacts, String> {
+) -> Result<SqlTimeTravelSnapshotBindingFacts, AnalyzeError> {
     let metadata = metadata.as_iceberg_ref_metadata();
     let binding = crate::analyzer::iceberg_ref::resolve_read_binding(
         version,
@@ -1055,6 +1056,6 @@ mod tests {
         ) else {
             panic!("unknown requested snapshot must fail closed");
         };
-        assert!(err.contains("snapshot 999 not found"));
+        assert!(err.message().contains("snapshot 999 not found"));
     }
 }

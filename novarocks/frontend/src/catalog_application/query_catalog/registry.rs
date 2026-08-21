@@ -32,6 +32,7 @@ pub trait Catalog: Send + Sync {
     fn invalidate_table(&self, _namespace: &str, _table: &str) {}
 }
 
+#[derive(Default)]
 pub struct CatalogRegistry {
     catalogs: HashMap<String, Arc<dyn Catalog>>,
 }
@@ -40,14 +41,6 @@ impl Clone for CatalogRegistry {
     fn clone(&self) -> Self {
         Self {
             catalogs: self.catalogs.clone(),
-        }
-    }
-}
-
-impl Default for CatalogRegistry {
-    fn default() -> Self {
-        Self {
-            catalogs: HashMap::new(),
         }
     }
 }

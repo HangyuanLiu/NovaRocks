@@ -20,6 +20,7 @@
 
 #![allow(dead_code)]
 
+use crate::analyze_error::AnalyzeError;
 use crate::analyzer::iceberg_ref::{IcebergRefKind, SqlIcebergRefMetadata};
 use novarocks_parser::ast::{
     AlterIcebergTable, IcebergReferenceAction, IcebergReferenceKind, IcebergTableAction,
@@ -67,13 +68,19 @@ pub fn analyze_alter_iceberg_ref(
     namespace: &str,
     table: &str,
     table_metadata: &SqlIcebergRefMetadata,
-) -> Result<RefActionPlan, String> {
+) -> Result<RefActionPlan, AnalyzeError> {
     let IcebergTableAction::Reference(action) = &stmt.action else {
-        return Err("iceberg ref: expected a branch or tag action".to_string());
+        return Err(AnalyzeError::invalid_query_shape(
+            "iceberg ref: expected a branch or tag action",
+            stmt.span,
+        ));
     };
     let name = action_name(action);
     if name == "main" {
-        return Err("iceberg ref: 'main' is reserved".to_string());
+        return Err(AnalyzeError::invalid_argument(
+            "iceberg ref: 'main' is reserved",
+            action_name_ident(action).span,
+        ));
     }
 
     let action = match action {
@@ -86,7 +93,7 @@ pub fn analyze_alter_iceberg_ref(
             options,
         } => {
             let _ = options;
-            check_kind(table_metadata, &name.value, IcebergRefKind::Branch)?;
+            check_kind(table_metadata, name, IcebergRefKind::Branch)?;
             let snapshot_id = resolve_anchor(anchor, table_metadata, name)?;
             RefAction::CreateBranch {
                 name: name.value.clone(),
@@ -104,7 +111,7 @@ pub fn analyze_alter_iceberg_ref(
             options,
         } => {
             let _ = options;
-            check_kind(table_metadata, &name.value, IcebergRefKind::Tag)?;
+            check_kind(table_metadata, name, IcebergRefKind::Tag)?;
             let snapshot_id = resolve_anchor(anchor, table_metadata, name)?;
             RefAction::CreateTag {
                 name: name.value.clone(),
@@ -118,7 +125,7 @@ pub fn analyze_alter_iceberg_ref(
             name,
             if_exists,
         } => {
-            check_kind(table_metadata, &name.value, IcebergRefKind::Branch)?;
+            check_kind(table_metadata, name, IcebergRefKind::Branch)?;
             RefAction::DropBranch {
                 name: name.value.clone(),
                 if_exists: *if_exists,
@@ -129,7 +136,7 @@ pub fn analyze_alter_iceberg_ref(
             name,
             if_exists,
         } => {
-            check_kind(table_metadata, &name.value, IcebergRefKind::Tag)?;
+            check_kind(table_metadata, name, IcebergRefKind::Tag)?;
             RefAction::DropTag {
                 name: name.value.clone(),
                 if_exists: *if_exists,
@@ -146,9 +153,13 @@ pub fn analyze_alter_iceberg_ref(
 }
 
 fn action_name(a: &IcebergReferenceAction) -> &str {
+    &action_name_ident(a).value
+}
+
+fn action_name_ident(a: &IcebergReferenceAction) -> &novarocks_parser::ast::Ident {
     match a {
         IcebergReferenceAction::Create { name, .. } | IcebergReferenceAction::Drop { name, .. } => {
-            &name.value
+            name
         }
     }
 }
@@ -157,28 +168,38 @@ fn resolve_anchor(
     anchor: &ReferenceAnchor,
     metadata: &SqlIcebergRefMetadata,
     ref_name: &novarocks_parser::ast::Ident,
-) -> Result<i64, String> {
+) -> Result<i64, AnalyzeError> {
     match anchor {
         ReferenceAnchor::Version(literal) => {
             let LiteralKind::Number(value) = &literal.kind else {
-                return Err("iceberg ref: snapshot version must be a numeric literal".to_string());
+                return Err(AnalyzeError::invalid_literal(
+                    "iceberg ref: snapshot version must be a numeric literal",
+                    literal.span,
+                ));
             };
-            let n = value
-                .parse::<i64>()
-                .map_err(|_| "iceberg ref: snapshot version must fit i64".to_string())?;
+            let n = value.parse::<i64>().map_err(|_| {
+                AnalyzeError::invalid_literal(
+                    "iceberg ref: snapshot version must fit i64",
+                    literal.span,
+                )
+            })?;
             if !metadata.has_snapshot(n) {
-                return Err(format!(
-                    "iceberg ref: snapshot {n} not found; cannot anchor '{}'",
-                    ref_name.value
+                return Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "iceberg ref: snapshot {n} not found; cannot anchor '{}'",
+                        ref_name.value
+                    ),
+                    literal.span,
                 ));
             }
             Ok(n)
         }
         ReferenceAnchor::CurrentMain => match metadata.current_snapshot_id() {
             Some(snapshot_id) => Ok(snapshot_id),
-            None => Err(
-                "iceberg ref: cannot create branch on table without a current snapshot".to_string(),
-            ),
+            None => Err(AnalyzeError::invalid_argument(
+                "iceberg ref: cannot create branch on table without a current snapshot",
+                ref_name.span,
+            )),
         },
     }
 }
@@ -187,10 +208,10 @@ fn resolve_anchor(
 /// kind (branch vs tag). Mismatches are rejected.
 fn check_kind(
     metadata: &SqlIcebergRefMetadata,
-    name: &str,
+    name: &novarocks_parser::ast::Ident,
     expected: IcebergRefKind,
-) -> Result<(), String> {
-    if let Some(existing) = metadata.named_ref(name) {
+) -> Result<(), AnalyzeError> {
+    if let Some(existing) = metadata.named_ref(&name.value) {
         let existing_kind = existing.kind.clone();
         if existing_kind != expected {
             let actual = match existing_kind {
@@ -201,7 +222,10 @@ fn check_kind(
                 IcebergRefKind::Branch => "branch",
                 IcebergRefKind::Tag => "tag",
             };
-            return Err(format!("iceberg ref: '{name}' is a {actual}, not a {exp}"));
+            return Err(AnalyzeError::invalid_argument(
+                format!("iceberg ref: '{}' is a {actual}, not a {exp}", name.value),
+                name.span,
+            ));
         }
     }
     Ok(())
@@ -270,7 +294,7 @@ mod tests {
         });
         let err = analyze_alter_iceberg_ref(&stmt, "c", "s", "t", &md).unwrap_err();
         assert!(
-            err.contains("'main' is reserved"),
+            err.message().contains("'main' is reserved"),
             "unexpected error: {err}"
         );
     }
@@ -291,7 +315,7 @@ mod tests {
         });
         let err = analyze_alter_iceberg_ref(&stmt, "c", "s", "t", &md).unwrap_err();
         assert!(
-            err.contains("snapshot 99999 not found"),
+            err.message().contains("snapshot 99999 not found"),
             "unexpected error: {err}"
         );
     }
@@ -309,7 +333,7 @@ mod tests {
         });
         let err = analyze_alter_iceberg_ref(&stmt, "c", "s", "t", &md).unwrap_err();
         assert!(
-            err.contains("'dev' is a branch, not a tag"),
+            err.message().contains("'dev' is a branch, not a tag"),
             "unexpected error: {err}"
         );
     }

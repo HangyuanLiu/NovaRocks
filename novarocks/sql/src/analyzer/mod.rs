@@ -43,6 +43,7 @@ pub(crate) mod mv_lineage;
 use arrow::datatypes::DataType;
 use novarocks_parser::ast;
 
+use crate::analyze_error::AnalyzeError;
 use crate::catalog::PlannerTableProvider;
 use crate::column_id::ColumnId;
 
@@ -78,7 +79,7 @@ pub(crate) fn analyze(
         crate::analysis::cte::CTERegistry,
         crate::column_id::ColumnRefFactory,
     ),
-    String,
+    AnalyzeError,
 > {
     analyze_with_function_catalog(
         query,
@@ -103,7 +104,7 @@ pub(crate) fn analyze_with_function_catalog(
         crate::analysis::cte::CTERegistry,
         crate::column_id::ColumnRefFactory,
     ),
-    String,
+    AnalyzeError,
 > {
     analyze_with_factory_and_function_catalog(
         query,
@@ -133,7 +134,7 @@ pub(crate) fn analyze_with_factory(
         crate::analysis::cte::CTERegistry,
         crate::column_id::ColumnRefFactory,
     ),
-    String,
+    AnalyzeError,
 > {
     analyze_with_factory_and_function_catalog(
         query,
@@ -158,7 +159,30 @@ pub(crate) fn analyze_with_factory_and_function_catalog(
         crate::analysis::cte::CTERegistry,
         crate::column_id::ColumnRefFactory,
     ),
-    String,
+    AnalyzeError,
+> {
+    analyze_with_factory_and_function_catalog_inner(
+        query,
+        catalog,
+        current_database,
+        factory,
+        function_catalog,
+    )
+}
+
+fn analyze_with_factory_and_function_catalog_inner(
+    query: &ast::Query,
+    catalog: &dyn PlannerTableProvider,
+    current_database: &str,
+    factory: crate::column_id::ColumnRefFactory,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+) -> Result<
+    (
+        ResolvedQuery,
+        crate::analysis::cte::CTERegistry,
+        crate::column_id::ColumnRefFactory,
+    ),
+    AnalyzeError,
 > {
     let query = query_prepass::preanalyze(query.clone())?;
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
@@ -249,7 +273,7 @@ impl<'a> AnalyzerContext<'a> {
     fn build_with_clause_context(
         &self,
         with_clause: &ast::With,
-    ) -> Result<(AnalyzerContext<'a>, Vec<crate::analysis::cte::CteId>), String> {
+    ) -> Result<(AnalyzerContext<'a>, Vec<crate::analysis::cte::CteId>), AnalyzeError> {
         let mut pending_ctes = self.pending_ctes.clone();
         pending_ctes.extend(
             with_clause
@@ -307,7 +331,7 @@ impl<'a> AnalyzerContext<'a> {
     }
 
     /// Top-level query analysis.
-    fn analyze_query(&self, query: &ast::Query) -> Result<ResolvedQuery, String> {
+    fn analyze_query(&self, query: &ast::Query) -> Result<ResolvedQuery, AnalyzeError> {
         let (maybe_child_ctx, local_cte_ids) = if let Some(ref with_clause) = query.with {
             let (child_ctx, local_cte_ids) = self.build_with_clause_context(with_clause)?;
             (Some(child_ctx), local_cte_ids)
@@ -347,7 +371,7 @@ impl<'a> AnalyzerContext<'a> {
     fn analyze_set_expr(
         &self,
         set_expr: &ast::SetExpr,
-    ) -> Result<(QueryBody, Vec<OutputColumn>), String> {
+    ) -> Result<(QueryBody, Vec<OutputColumn>), AnalyzeError> {
         match set_expr {
             ast::SetExpr::Select(s) => {
                 // Check if GROUP BY contains ROLLUP/CUBE/GROUPING SETS.
@@ -365,10 +389,13 @@ impl<'a> AnalyzerContext<'a> {
 
                 // Validate column count
                 if left_cols.len() != right_cols.len() {
-                    return Err(format!(
-                        "set operation column count mismatch: left has {}, right has {}",
-                        left_cols.len(),
-                        right_cols.len()
+                    return Err(AnalyzeError::invalid_query_shape(
+                        format!(
+                            "set operation column count mismatch: left has {}, right has {}",
+                            left_cols.len(),
+                            right_cols.len()
+                        ),
+                        operation.span,
                     ));
                 }
 
@@ -420,7 +447,7 @@ impl<'a> AnalyzerContext<'a> {
         }
     }
 
-    fn analyze_set_operand(&self, set_expr: &ast::SetExpr) -> Result<ResolvedQuery, String> {
+    fn analyze_set_operand(&self, set_expr: &ast::SetExpr) -> Result<ResolvedQuery, AnalyzeError> {
         match set_expr {
             ast::SetExpr::Query(q) => self.analyze_query(q),
             _ => {
@@ -441,7 +468,7 @@ impl<'a> AnalyzerContext<'a> {
     fn analyze_values(
         &self,
         values: &ast::Values,
-    ) -> Result<(ResolvedValues, Vec<OutputColumn>), String> {
+    ) -> Result<(ResolvedValues, Vec<OutputColumn>), AnalyzeError> {
         let scope = self.new_scope(); // VALUES has no table scope
         let mut resolved_rows = Vec::with_capacity(values.rows.len());
         let mut column_types: Vec<DataType> = Vec::new();
@@ -489,7 +516,7 @@ impl<'a> AnalyzerContext<'a> {
     fn analyze_select(
         &self,
         select: &ast::Select,
-    ) -> Result<(ResolvedSelect, Vec<OutputColumn>), String> {
+    ) -> Result<(ResolvedSelect, Vec<OutputColumn>), AnalyzeError> {
         // --- FROM clause ---
         let (from, scope) = if select.from.is_empty() {
             // SELECT without FROM (dual)
@@ -538,10 +565,9 @@ impl<'a> AnalyzerContext<'a> {
             ast::GroupBy::Rollup { .. }
             | ast::GroupBy::Cube { .. }
             | ast::GroupBy::GroupingSets { .. } => {
-                return Err(
-                    "internal error: repeat GROUP BY must be expanded before select analysis"
-                        .into(),
-                );
+                return Err(AnalyzeError::internal(
+                    "internal error: repeat GROUP BY must be expanded before select analysis",
+                ));
             }
         };
         let mut group_by = Vec::with_capacity(group_by_exprs.len());
@@ -551,35 +577,48 @@ impl<'a> AnalyzerContext<'a> {
                 ..
             }) = gb_expr
             {
-                let pos = n
-                    .parse::<usize>()
-                    .map_err(|e| format!("invalid GROUP BY position: {e}"))?;
+                let pos = n.parse::<usize>().map_err(|e| {
+                    AnalyzeError::invalid_literal(
+                        format!("invalid GROUP BY position: {e}"),
+                        gb_expr.span(),
+                    )
+                })?;
                 if pos == 0 || pos > projection.len() {
-                    return Err(format!(
-                        "GROUP BY position {pos} is out of range (1..{})",
-                        projection.len()
+                    return Err(AnalyzeError::invalid_argument(
+                        format!(
+                            "GROUP BY position {pos} is out of range (1..{})",
+                            projection.len()
+                        ),
+                        gb_expr.span(),
                     ));
                 }
-                let select_item = select
-                    .projection
-                    .get(pos - 1)
-                    .ok_or_else(|| format!("GROUP BY position {pos} is out of range"))?;
+                let select_item = select.projection.get(pos - 1).ok_or_else(|| {
+                    AnalyzeError::invalid_argument(
+                        format!("GROUP BY position {pos} is out of range"),
+                        gb_expr.span(),
+                    )
+                })?;
                 let select_expr = match select_item {
                     ast::SelectItem::UnnamedExpr(expr)
                     | ast::SelectItem::ExprWithAlias { expr, .. } => expr,
                     _ => {
-                        return Err(format!(
-                            "GROUP BY position {pos} must reference a select expression"
+                        return Err(AnalyzeError::invalid_argument(
+                            format!("GROUP BY position {pos} must reference a select expression"),
+                            gb_expr.span(),
                         ));
                     }
                 };
                 if self.expr_contains_aggregate(select_expr) {
-                    return Err(format!(
-                        "GROUP BY position {pos} cannot reference an aggregate expression"
+                    return Err(AnalyzeError::invalid_argument(
+                        format!("GROUP BY position {pos} cannot reference an aggregate expression"),
+                        gb_expr.span(),
                     ));
                 }
                 if contains_subquery_placeholder(&projection[pos - 1].expr) {
-                    return Err("subquery is not supported in GROUP BY".to_string());
+                    return Err(AnalyzeError::unsupported_query_shape(
+                        "subquery is not supported in GROUP BY",
+                        gb_expr.span(),
+                    ));
                 }
                 group_by.push(projection[pos - 1].expr.clone());
                 continue;
@@ -587,7 +626,10 @@ impl<'a> AnalyzerContext<'a> {
             match self.analyze_expr(gb_expr, &scope) {
                 Ok(typed) => {
                     if contains_subquery_placeholder(&typed) {
-                        return Err("subquery is not supported in GROUP BY".to_string());
+                        return Err(AnalyzeError::unsupported_query_shape(
+                            "subquery is not supported in GROUP BY",
+                            gb_expr.span(),
+                        ));
                     }
                     group_by.push(typed);
                 }
@@ -606,7 +648,10 @@ impl<'a> AnalyzerContext<'a> {
                     // Substitute alias ref with original expression
                     let typed = self.substitute_select_aliases(typed, &projection);
                     if contains_subquery_placeholder(&typed) {
-                        return Err("subquery is not supported in GROUP BY".to_string());
+                        return Err(AnalyzeError::unsupported_query_shape(
+                            "subquery is not supported in GROUP BY",
+                            gb_expr.span(),
+                        ));
                     }
                     group_by.push(typed);
                 }
@@ -618,8 +663,11 @@ impl<'a> AnalyzerContext<'a> {
         // sees a clear error before lowering / codegen.
         for gb in &group_by {
             if let Some(logical) = scope.logical_type_of_expr(gb).filter(is_bitmap_or_hll_type) {
-                return Err(format!(
-                    "BITMAP/HLL columns cannot appear in GROUP BY (column has type {logical:?})"
+                return Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "BITMAP/HLL columns cannot appear in GROUP BY (column has type {logical:?})"
+                    ),
+                    select.span,
                 ));
             }
         }
@@ -1134,7 +1182,7 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         select: &ast::Select,
         repeat_spec: &RepeatGroupBySpec,
-    ) -> Result<(QueryBody, Vec<OutputColumn>), String> {
+    ) -> Result<(QueryBody, Vec<OutputColumn>), AnalyzeError> {
         use crate::analysis::RepeatInfo;
 
         let all_rollup_columns: Vec<String> = repeat_spec
@@ -1307,7 +1355,7 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         items: &[ast::SelectItem],
         scope: &AnalyzerScope,
-    ) -> Result<(Vec<ProjectItem>, Vec<OutputColumn>), String> {
+    ) -> Result<(Vec<ProjectItem>, Vec<OutputColumn>), AnalyzeError> {
         let mut projection: Vec<ProjectItem> = Vec::new();
         let mut output_columns = Vec::new();
         // StarRocks allows later SELECT items to reference earlier item
@@ -1428,7 +1476,7 @@ impl<'a> AnalyzerContext<'a> {
                         });
                     }
                 }
-                ast::SelectItem::QualifiedWildcard { prefix, .. } => {
+                ast::SelectItem::QualifiedWildcard { prefix, span, .. } => {
                     let qualifier_str = prefix
                         .iter()
                         .map(|ident| ident.value.as_str())
@@ -1481,7 +1529,10 @@ impl<'a> AnalyzerContext<'a> {
                         });
                     }
                     if !found {
-                        return Err(format!("no columns found for qualifier `{qualifier_str}`"));
+                        return Err(AnalyzeError::unknown_table(
+                            format!("no columns found for qualifier `{qualifier_str}`"),
+                            *span,
+                        ));
                     }
                 }
             }
@@ -1499,7 +1550,7 @@ impl<'a> AnalyzerContext<'a> {
         items: &[ast::SelectItem],
         expr_scope: &AnalyzerScope,
         wildcard_scope: &AnalyzerScope,
-    ) -> Result<(Vec<ProjectItem>, Vec<OutputColumn>), String> {
+    ) -> Result<(Vec<ProjectItem>, Vec<OutputColumn>), AnalyzeError> {
         let mut projection = Vec::new();
         let mut output_columns = Vec::new();
 
@@ -1547,7 +1598,7 @@ impl<'a> AnalyzerContext<'a> {
 
     /// Rebuild the FROM scope from an already-resolved Relation tree.
     /// Used by ORDER BY fallback when the expression doesn't match projection columns.
-    fn rebuild_from_scope(&self, relation: &Relation) -> Result<((), AnalyzerScope), String> {
+    fn rebuild_from_scope(&self, relation: &Relation) -> Result<((), AnalyzerScope), AnalyzeError> {
         let mut scope = self.new_scope();
         self.collect_relation_scope(relation, &mut scope)?;
         Ok(((), scope))
@@ -1557,7 +1608,7 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         relation: &Relation,
         scope: &mut AnalyzerScope,
-    ) -> Result<(), String> {
+    ) -> Result<(), AnalyzeError> {
         match relation {
             Relation::Scan(scan) => {
                 let qualifier = scan.alias.as_deref().unwrap_or(&scan.table.name);
@@ -1701,7 +1752,7 @@ impl<'a> AnalyzerContext<'a> {
         query: &ast::Query,
         body_output: &[OutputColumn],
         body: &QueryBody,
-    ) -> Result<Vec<SortItem>, String> {
+    ) -> Result<Vec<SortItem>, AnalyzeError> {
         let order_by_exprs = &query.order_by;
         if order_by_exprs.is_empty() {
             return Ok(vec![]);
@@ -1762,13 +1813,19 @@ impl<'a> AnalyzerContext<'a> {
                     ..
                 }) => {
                     // Positional reference: ORDER BY 1
-                    let pos: usize = n
-                        .parse::<usize>()
-                        .map_err(|e| format!("invalid ORDER BY position: {e}"))?;
+                    let pos: usize = n.parse::<usize>().map_err(|e| {
+                        AnalyzeError::invalid_literal(
+                            format!("invalid ORDER BY position: {e}"),
+                            ob.expr.span(),
+                        )
+                    })?;
                     if pos == 0 || pos > body_output.len() {
-                        return Err(format!(
-                            "ORDER BY position {pos} is out of range (1..{})",
-                            body_output.len()
+                        return Err(AnalyzeError::invalid_argument(
+                            format!(
+                                "ORDER BY position {pos} is out of range (1..{})",
+                                body_output.len()
+                            ),
+                            ob.expr.span(),
                         ));
                     }
                     let col = &body_output[pos - 1];
@@ -1936,7 +1993,10 @@ impl<'a> AnalyzerContext<'a> {
                 None => typed,
             };
             if contains_subquery_placeholder(&typed) {
-                return Err("subquery is not supported in ORDER BY".to_string());
+                return Err(AnalyzeError::unsupported_query_shape(
+                    "subquery is not supported in ORDER BY",
+                    ob.span,
+                ));
             }
 
             let asc = ob.asc.unwrap_or(true);
@@ -1970,8 +2030,11 @@ impl<'a> AnalyzerContext<'a> {
                         .filter(is_bitmap_or_hll_type)
                 });
             if let Some(logical) = logical {
-                return Err(format!(
-                    "BITMAP/HLL columns cannot appear in ORDER BY (column has type {logical:?})"
+                return Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "BITMAP/HLL columns cannot appear in ORDER BY (column has type {logical:?})"
+                    ),
+                    query.span,
                 ));
             }
         }
@@ -3402,7 +3465,8 @@ mod tests {
 
     fn parse_and_analyze(sql: &str) -> Result<ResolvedQuery, String> {
         let query = parse_native_query(sql)?;
-        let (resolved, _registry, _factory) = analyze(&query, &TestCatalog, "default")?;
+        let (resolved, _registry, _factory) =
+            analyze(&query, &TestCatalog, "default").map_err(|error| error.to_string())?;
         Ok(resolved)
     }
 
@@ -3410,13 +3474,15 @@ mod tests {
         sql: &str,
     ) -> Result<(ResolvedQuery, crate::analysis::cte::CTERegistry), String> {
         let query = parse_native_query(sql)?;
-        let (resolved, registry, _factory) = analyze(&query, &TestCatalog, "default")?;
+        let (resolved, registry, _factory) =
+            analyze(&query, &TestCatalog, "default").map_err(|error| error.to_string())?;
         Ok((resolved, registry))
     }
 
     fn parse_raw_and_analyze(sql: &str) -> Result<ResolvedQuery, String> {
         let query = parse_native_query(sql)?;
-        let (resolved, _registry, _factory) = analyze(&query, &TestCatalog, "default")?;
+        let (resolved, _registry, _factory) =
+            analyze(&query, &TestCatalog, "default").map_err(|error| error.to_string())?;
         Ok(resolved)
     }
 
@@ -6020,7 +6086,8 @@ mod tests {
 
     fn parse_and_analyze_for_apply_specs(sql: &str) -> Result<ResolvedQuery, String> {
         let query = parse_native_query(sql)?;
-        let (resolved, _cte, _factory) = analyze(&query, &TestCatalog, "default")?;
+        let (resolved, _cte, _factory) =
+            analyze(&query, &TestCatalog, "default").map_err(|error| error.to_string())?;
         Ok(resolved)
     }
 

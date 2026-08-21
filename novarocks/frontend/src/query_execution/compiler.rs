@@ -39,6 +39,8 @@ use novarocks_types::naming::normalize_identifier;
 
 use crate::catalog_application::query_catalog::{CatalogServiceSource, catalog_service_snapshot};
 use crate::query_execution::kernels as domain;
+#[cfg(test)]
+use crate::query_execution::planning::time_travel::TimeTravelRewriteError;
 use crate::query_execution::planning::time_travel::{
     has_time_travel_refs, rewrite_time_travel_refs,
 };
@@ -951,6 +953,42 @@ pub enum TestPreparedQueryOperation {
     },
 }
 
+/// Test-only compiler carrier that keeps Analyze failures typed across the
+/// fixture's direct compiler calls until its string-only public API.
+#[cfg(test)]
+#[derive(Debug)]
+enum TestQueryCompilerError {
+    Engine(String),
+    Analyze(novarocks_sql::analyze_error::AnalyzeError),
+}
+
+#[cfg(test)]
+impl From<String> for TestQueryCompilerError {
+    fn from(error: String) -> Self {
+        Self::Engine(error)
+    }
+}
+
+#[cfg(test)]
+impl From<novarocks_sql::compiler::SqlCompileError> for TestQueryCompilerError {
+    fn from(error: novarocks_sql::compiler::SqlCompileError) -> Self {
+        match error {
+            novarocks_sql::compiler::SqlCompileError::Analyze(error) => Self::Analyze(error),
+            error => Self::Engine(error.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Display for TestQueryCompilerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Engine(error) => formatter.write_str(error),
+            Self::Analyze(error) => error.fmt(formatter),
+        }
+    }
+}
+
 /// Narrow core compiler kernel consumed by frontend QueryService.
 ///
 /// It deliberately exposes neither a composition aggregate nor connector internals.
@@ -994,6 +1032,7 @@ impl TestQueryCompiler {
             context.execution().cancellation().clone(),
         )?;
         self.prepare_with_connector_context(sql, context, query_opts, connector_context)
+            .map_err(|error| error.to_string())
     }
 
     fn prepare_with_connector_context(
@@ -1002,22 +1041,24 @@ impl TestQueryCompiler {
         request_context: &crate::common::admitted_query_context::RequestContext,
         query_opts: Option<QueryOptions>,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<TestPreparedQueryOperation, String> {
+    ) -> Result<TestPreparedQueryOperation, TestQueryCompilerError> {
         let current_catalog = request_context.session().current_catalog();
         let current_database = request_context.session().current_database();
         let statements =
             novarocks_parser::parse(sql).map_err(|error| format!("sql parser error: {error}"))?;
         let [statement] = statements.as_slice() else {
-            return Err("query compiler requires exactly one typed query statement".to_string());
+            return Err(TestQueryCompilerError::Engine(
+                "query compiler requires exactly one typed query statement".to_string(),
+            ));
         };
         let statement = match statement {
             novarocks_parser::ast::Statement::Query(_)
             | novarocks_parser::ast::Statement::ExplainQuery(_) => statement.clone(),
             _ => {
-                return Err(
+                return Err(TestQueryCompilerError::Engine(
                     "non-query statements must be executed through a typed command capability"
                         .to_string(),
-                );
+                ));
             }
         };
         match statement {
@@ -1102,7 +1143,8 @@ impl TestQueryCompiler {
                         current_database,
                         &mut prepared,
                         &connector_context,
-                    )?;
+                    )
+                    .map_err(test_time_travel_rewrite_error)?;
                 }
                 let catalog_service_snapshot = catalog_service_snapshot(&self.query);
                 let analyzer_provider = build_catalog_service_provider(
@@ -1132,7 +1174,9 @@ impl TestQueryCompiler {
                     completion: PreparedQueryCompletion::result(),
                 })
             }
-            _ => Err("query compiler only supports SELECT and EXPLAIN statements".to_string()),
+            _ => Err(TestQueryCompilerError::Engine(
+                "query compiler only supports SELECT and EXPLAIN statements".to_string(),
+            )),
         }
     }
 
@@ -1144,7 +1188,7 @@ impl TestQueryCompiler {
         query_opts: Option<QueryOptions>,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &crate::common::admitted_query_context::QueryExecutionContext,
-    ) -> Result<TestPreparedQueryOperation, String> {
+    ) -> Result<TestPreparedQueryOperation, TestQueryCompilerError> {
         let query = prepare_explain_query_with_ports(
             &self.query,
             &self.view,
@@ -1406,10 +1450,19 @@ fn prepare_explain_query_with_ports(
             current_database,
             &mut prepared,
             connector_context,
-        )?;
+        )
+        .map_err(test_time_travel_rewrite_error)?;
     }
 
     Ok(prepared)
+}
+
+#[cfg(test)]
+fn test_time_travel_rewrite_error(error: TimeTravelRewriteError) -> String {
+    match error {
+        TimeTravelRewriteError::Engine(error) => error,
+        TimeTravelRewriteError::Analyze(error) => error.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1453,7 +1506,7 @@ pub(crate) fn prepare_query_as_iceberg_write(
     query_opts: Option<QueryOptions>,
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
-) -> Result<PreparedDmlWriteAssembly, String> {
+) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     // This public write helper is also used by non-session transaction executors,
     // so it owns an operation-scoped context when no request signal is available.
     let connector_context = crate::connector::connector_request_context(
@@ -1488,7 +1541,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_context(
     execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: Option<crate::query_execution::contract::ConnectorWritePlanningTemplate>,
-) -> Result<PreparedDmlWriteAssembly, String> {
+) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     prepare_query_as_iceberg_write_with_connector_binding(
         state,
         current_catalog,
@@ -1519,7 +1572,7 @@ pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_connector_context
     execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
-) -> Result<PreparedDmlWriteAssembly, String> {
+) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     prepare_query_as_iceberg_write_with_connector_binding(
         state,
         current_catalog,
@@ -1556,7 +1609,7 @@ pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_query_local_overl
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
     scan_resolver: &dyn crate::query_execution::preparation::scan::ScanBindingResolver,
     overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
-) -> Result<PreparedDmlWriteAssembly, String> {
+) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     prepare_query_as_iceberg_write_with_connector_binding(
         state,
         current_catalog,
@@ -1653,7 +1706,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     connector_write: Option<DistributedConnectorWrite>,
     scan_resolver: Option<&dyn crate::query_execution::preparation::scan::ScanBindingResolver>,
     query_local_overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
-) -> Result<PreparedDmlWriteAssembly, String> {
+) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     let maintenance_execution;
     let execution = match execution {
         Some(execution) => execution,
@@ -1696,7 +1749,9 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     let resolved_bindings = analyzer_provider.query_table_bindings();
     if !Arc::ptr_eq(&table_bindings, &resolved_bindings) {
         return Err(
-            "SQL write catalog materializer replaced the admitted binding store".to_string(),
+            "SQL write catalog materializer replaced the admitted binding store"
+                .to_string()
+                .into(),
         );
     }
     let catalog_snapshot =
@@ -1726,7 +1781,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         ),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(analyze_request)
-        .map_err(|error| error.to_string())?
+        .map_err(crate::dml::error::DmlExecutionError::from_compile)?
         .into_pending()
         .map_err(|error| error.to_string())?;
     let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
@@ -2138,7 +2193,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         novarocks_sql::plan_read::DistributedPlan,
         crate::query_execution::profile::ConnectorStaticPlanningMetrics,
     ),
-    String,
+    TestQueryCompilerError,
 > {
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| {
@@ -2196,9 +2251,9 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         },
     };
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(planning_inputs.analyze_request)
-        .map_err(|error| error.to_string())?
+        .map_err(TestQueryCompilerError::from)?
         .into_pending()
-        .map_err(|error| error.to_string())?;
+        .map_err(TestQueryCompilerError::from)?;
     let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
         query_kernel,
         planning_inputs.post_compile.table_bindings.clone(),
@@ -2207,9 +2262,9 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     let distributed_plan = novarocks_sql::compiler::SqlCompiler::optimize(
         novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics),
     )
-    .map_err(|error| error.to_string())?
+    .map_err(TestQueryCompilerError::from)?
     .into_distributed_plan()
-    .map_err(|error| error.to_string())?;
+    .map_err(TestQueryCompilerError::from)?;
     ensure_mainline_distributed_execution(false, query_kernel.exchange_port())?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
@@ -2245,7 +2300,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     level: novarocks_sql::compiler::ExplainLevel,
     logical: bool,
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, TestQueryCompilerError> {
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| {
             "SQL compilation requires a non-empty admitted backend topology".to_string()
@@ -2294,13 +2349,15 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
         },
     };
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(planning_inputs.analyze_request)
-        .map_err(|error| error.to_string())?;
+        .map_err(TestQueryCompilerError::from)?;
     let compiled = if logical {
         analyzed
             .into_complete()
-            .map_err(|error| error.to_string())?
+            .map_err(TestQueryCompilerError::from)?
     } else {
-        let analyzed = analyzed.into_pending().map_err(|error| error.to_string())?;
+        let analyzed = analyzed
+            .into_pending()
+            .map_err(TestQueryCompilerError::from)?;
         let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
             query_kernel,
             planning_inputs.post_compile.table_bindings.clone(),
@@ -2309,12 +2366,12 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
         novarocks_sql::compiler::SqlCompiler::optimize(
             novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics),
         )
-        .map_err(|error| error.to_string())?
+        .map_err(TestQueryCompilerError::from)?
     };
     let lines = compiled
         .into_explain_lines(level, logical)
-        .map_err(|error| error.to_string())?;
-    build_string_query_result("Explain String", lines)
+        .map_err(TestQueryCompilerError::from)?;
+    Ok(build_string_query_result("Explain String", lines)?)
 }
 
 #[allow(

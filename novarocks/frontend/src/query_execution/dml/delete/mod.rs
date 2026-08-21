@@ -92,6 +92,7 @@ pub struct DeleteOperation {
 pub struct PreparedDelete {
     pub operation: DeleteOperation,
     pub handle: Arc<dyn DeletePrepared>,
+    pub sql_source: String,
 }
 
 pub enum DeleteWriteReport {
@@ -177,7 +178,9 @@ pub(crate) trait PreparedDeleteExecution: Send + Sync {
         )
     }
 
-    fn native_encoding(&self) -> Result<DeleteNativeEncoding<'_>, String>;
+    fn native_encoding(
+        &self,
+    ) -> Result<DeleteNativeEncoding<'_>, crate::dml::error::DmlExecutionError>;
     fn run_with_native_bundle(
         &self,
         native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
@@ -223,8 +226,10 @@ pub trait DeleteEngine: Send + Sync {
     fn delete_native_encoding<'a>(
         &self,
         _prepared: &'a dyn DeletePrepared,
-    ) -> Result<DeleteNativeEncoding<'a>, String> {
-        Err("DELETE engine does not expose native encoding input".to_string())
+    ) -> Result<DeleteNativeEncoding<'a>, crate::dml::error::DmlExecutionError> {
+        Err(crate::dml::error::DmlExecutionError::from(
+            "DELETE engine does not expose native encoding input".to_string(),
+        ))
     }
     fn run_delete_with_native_bundle(
         &self,
@@ -269,7 +274,7 @@ impl DeleteEngine for DmlExecutionKernel {
             request.query_options.as_ref(),
             &request.execution,
         )?;
-        match request.statement {
+        let mut prepared = match request.statement {
             DeleteStatement::Predicate(statement) => standard::prepare_delete_statement(
                 self,
                 statement,
@@ -287,7 +292,9 @@ impl DeleteEngine for DmlExecutionKernel {
                 &request.execution,
                 &connector_context,
             ),
-        }
+        }?;
+        prepared.sql_source = request.source.to_string();
+        Ok(prepared)
     }
 
     fn run_delete(&self, prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String> {
@@ -298,7 +305,7 @@ impl DeleteEngine for DmlExecutionKernel {
     fn delete_native_encoding<'a>(
         &self,
         prepared: &'a dyn DeletePrepared,
-    ) -> Result<DeleteNativeEncoding<'a>, String> {
+    ) -> Result<DeleteNativeEncoding<'a>, crate::dml::error::DmlExecutionError> {
         downcast_prepared(prepared)?.execution.native_encoding()
     }
 
@@ -403,6 +410,7 @@ pub(crate) fn prepared_delete(
             operation,
             execution,
         }),
+        sql_source: String::new(),
     }
 }
 

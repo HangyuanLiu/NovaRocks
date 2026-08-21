@@ -211,7 +211,10 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
 
     fn native_encoding(
         &self,
-    ) -> Result<crate::query_execution::dml::delete::DeleteNativeEncoding<'_>, String> {
+    ) -> Result<
+        crate::query_execution::dml::delete::DeleteNativeEncoding<'_>,
+        crate::dml::error::DmlExecutionError,
+    > {
         let mut assembly = self
             .native_assembly
             .lock()

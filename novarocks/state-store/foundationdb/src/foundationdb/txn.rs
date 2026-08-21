@@ -93,12 +93,8 @@ enum CommitPreparation {
     Immediate(CommitOutcome),
 }
 
-enum PrepareErrorDecision {
-    DurableFallback(CommitOutcome),
-}
-
-fn decide_prepare_error(error: StateStoreError) -> PrepareErrorDecision {
-    PrepareErrorDecision::DurableFallback(classify_precommit_error(error))
+fn decide_prepare_error(error: StateStoreError) -> CommitOutcome {
+    classify_precommit_error(error)
 }
 
 impl FoundationDbStateStore {
@@ -329,8 +325,7 @@ impl FoundationDbWriteTransaction {
                 Ok(record) => record,
                 Err(error) => {
                     record_provider_error_metric(self.metrics.as_ref(), &error);
-                    let PrepareErrorDecision::DurableFallback(outcome) =
-                        decide_prepare_error(error);
+                    let outcome = decide_prepare_error(error);
                     drop(transaction);
                     return CommitPreparation::DurableFailure(
                         PreparedFailure {
@@ -852,11 +847,7 @@ mod tests {
             StateStoreErrorKind::DeadlineExceeded,
             StateStoreErrorKind::LimitExceeded,
         ] {
-            let PrepareErrorDecision::DurableFallback(outcome) =
-                decide_prepare_error(StateStoreError::new(kind, "prepare error"))
-            else {
-                panic!("prepare errors must not bypass durable commit-state resolution");
-            };
+            let outcome = decide_prepare_error(StateStoreError::new(kind, "prepare error"));
             assert_eq!(
                 matches!(outcome, CommitOutcome::TransientBeforeCommit(_)),
                 matches!(

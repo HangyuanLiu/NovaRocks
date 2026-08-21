@@ -131,6 +131,9 @@ pub struct PrepareIcebergInsert {
     pub target: ResolvedInsertTarget,
     pub insert_columns: Vec<String>,
     pub source: IcebergInsertSource,
+    /// Original client SQL retained for typed analysis error rendering after
+    /// native assembly.
+    pub sql_source: String,
     pub overwrite_mode: InsertOverwriteMode,
     pub target_ref: String,
     pub query_options: Option<QueryOptions>,
@@ -165,6 +168,7 @@ pub struct IcebergInsertOperation {
 pub struct PreparedIcebergInsert {
     pub operation: IcebergInsertOperation,
     pub handle: Arc<dyn IcebergPreparedInsert>,
+    pub sql_source: String,
 }
 
 /// Connector-neutral result of the coordinated writer phase.
@@ -222,8 +226,10 @@ pub trait InsertEngine: Send + Sync {
     fn iceberg_write_native_encoding<'a>(
         &self,
         _prepared: &'a dyn IcebergPreparedInsert,
-    ) -> Result<PreparedIcebergWriteNativeEncoding<'a>, String> {
-        Err("Iceberg INSERT engine does not expose native encoding input".to_string())
+    ) -> Result<PreparedIcebergWriteNativeEncoding<'a>, crate::dml::error::DmlExecutionError> {
+        Err(crate::dml::error::DmlExecutionError::from(
+            "Iceberg INSERT engine does not expose native encoding input".to_string(),
+        ))
     }
 
     /// Execute the request finalized from the exact pair previously borrowed
@@ -366,6 +372,7 @@ impl InsertEngine for DmlExecutionKernel {
         Ok(PreparedIcebergInsert {
             operation,
             handle: Arc::new(CorePreparedIcebergInsert { prepared }),
+            sql_source: request.sql_source,
         })
     }
 
@@ -394,7 +401,7 @@ impl InsertEngine for DmlExecutionKernel {
     fn iceberg_write_native_encoding<'a>(
         &self,
         prepared: &'a dyn IcebergPreparedInsert,
-    ) -> Result<PreparedIcebergWriteNativeEncoding<'a>, String> {
+    ) -> Result<PreparedIcebergWriteNativeEncoding<'a>, crate::dml::error::DmlExecutionError> {
         downcast_prepared(prepared)?.prepared.native_encoding()
     }
 

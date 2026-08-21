@@ -3384,6 +3384,7 @@ dependencies = [
  "novarocks-parser",
  "novarocks-spi",
  "novarocks-types",
+ "novarocks-user-error",
  "serde",
  "serde_json",
  "sha2",

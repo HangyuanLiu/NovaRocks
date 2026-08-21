@@ -23,6 +23,7 @@ use novarocks_parser::ast;
 use novarocks_parser::printer::{print_expr, print_object_name, print_type_name};
 
 use crate::analysis::*;
+use crate::analyze_error::AnalyzeError;
 use novarocks_types::{arithmetic_result_type_with_op, comparison_common_type, wider_type};
 
 use super::functions::*;
@@ -30,6 +31,17 @@ use super::helpers::{eval_const_i64, expr_display_name, sql_type_to_arrow};
 use super::scope::AnalyzerScope;
 
 type WindowSpecAnalysis = (Vec<TypedExpr>, Vec<SortItem>, Option<WindowFrame>);
+
+fn scalar_function_is_unknown(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    name: &str,
+    arg_types: &[DataType],
+) -> bool {
+    matches!(
+        function_catalog.resolve_scalar_signature(name, arg_types),
+        Err(crate::functions::ResolveError::UnknownFunction)
+    ) && legacy_scalar_return_type_with_catalog(function_catalog, name, arg_types).is_none()
+}
 
 fn interval_field_name(field: ast::IntervalField) -> &'static str {
     match field {
@@ -59,7 +71,7 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         expr: &ast::Expr,
         scope: &AnalyzerScope,
-    ) -> Result<TypedExpr, String> {
+    ) -> Result<TypedExpr, AnalyzeError> {
         match expr {
             // Simple column reference
             ast::Expr::Identifier(ident) => {
@@ -104,7 +116,8 @@ impl<'a> super::AnalyzerContext<'a> {
                 if let Some(expr) = scope.computed_column_for(&ident.value) {
                     return Ok(expr.clone());
                 }
-                let (column_id, data_type, nullable) = scope.resolve(None, &ident.value)?;
+                let (column_id, data_type, nullable) =
+                    scope.resolve_at(None, &ident.value, ident.span)?;
                 Ok(TypedExpr {
                     kind: ExprKind::ColumnRef {
                         column_id,
@@ -162,10 +175,10 @@ impl<'a> super::AnalyzerContext<'a> {
 
             // A lambda is valid only as a higher-order function argument.
             // Those callers bind its parameters before analyzing the body.
-            ast::Expr::Lambda(_) => Err(
-                "lambda expressions are only allowed inside higher-order function calls"
-                    .to_string(),
-            ),
+            ast::Expr::Lambda(lambda) => Err(AnalyzeError::unsupported_expression(
+                "lambda expressions are only allowed inside higher-order function calls",
+                lambda.span,
+            )),
 
             // Unary NOT
             ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Not) => {
@@ -247,8 +260,11 @@ impl<'a> super::AnalyzerContext<'a> {
                     .filter(is_bitmap_or_hll_type)
                 {
                     let col = column_name_of_expr(&expr_typed);
-                    return Err(format!(
-                        "BITMAP/HLL columns cannot appear in {kw} expressions (operand `{col}` has type {logical:?})"
+                    return Err(AnalyzeError::invalid_argument(
+                        format!(
+                            "BITMAP/HLL columns cannot appear in {kw} expressions (operand `{col}` has type {logical:?})"
+                        ),
+                        in_list.span,
                     ));
                 }
                 for item in &list_typed {
@@ -257,8 +273,11 @@ impl<'a> super::AnalyzerContext<'a> {
                         .filter(is_bitmap_or_hll_type)
                     {
                         let col = column_name_of_expr(item);
-                        return Err(format!(
-                            "BITMAP/HLL columns cannot appear in {kw} expressions (operand `{col}` has type {logical:?})"
+                        return Err(AnalyzeError::invalid_argument(
+                            format!(
+                                "BITMAP/HLL columns cannot appear in {kw} expressions (operand `{col}` has type {logical:?})"
+                            ),
+                            in_list.span,
                         ));
                     }
                 }
@@ -266,9 +285,9 @@ impl<'a> super::AnalyzerContext<'a> {
                     if incompatible_complex_compare(&expr_typed.data_type, &item.data_type)
                         .is_some()
                     {
-                        return Err(in_predicate_type_error(
-                            &expr_typed.data_type,
-                            &item.data_type,
+                        return Err(AnalyzeError::type_mismatch(
+                            in_predicate_type_error(&expr_typed.data_type, &item.data_type),
+                            in_list.span,
                         ));
                     }
                 }
@@ -321,8 +340,11 @@ impl<'a> super::AnalyzerContext<'a> {
                         .filter(is_bitmap_or_hll_type)
                     {
                         let col = column_name_of_expr(operand);
-                        return Err(format!(
-                            "BITMAP/HLL columns cannot appear in BETWEEN expressions (operand `{col}` has type {logical:?})"
+                        return Err(AnalyzeError::invalid_argument(
+                            format!(
+                                "BITMAP/HLL columns cannot appear in BETWEEN expressions (operand `{col}` has type {logical:?})"
+                            ),
+                            between.span,
                         ));
                     }
                 }
@@ -381,7 +403,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
             ast::Expr::Access(access) => {
                 let base = self.analyze_expr(&access.expr, scope)?;
-                self.analyze_access(base, &access.kind, scope)
+                self.analyze_access(base, &access.kind, scope, access.span)
             }
 
             // Nested (parenthesized)
@@ -473,7 +495,10 @@ impl<'a> super::AnalyzerContext<'a> {
                     // wait until later.
                     let in_expr_typed = self.analyze_expr(&in_subquery.expr, scope)?;
                     if is_json_in_subquery_operand(&in_expr_typed, scope) {
-                        return Err("In predicate of JSON does not support subquery".to_string());
+                        return Err(AnalyzeError::unsupported_expression(
+                            "In predicate of JSON does not support subquery",
+                            in_subquery.span,
+                        ));
                     }
                     if let Some(logical) = scope
                         .logical_type_of_expr(&in_expr_typed)
@@ -481,8 +506,11 @@ impl<'a> super::AnalyzerContext<'a> {
                     {
                         let col = column_name_of_expr(&in_expr_typed);
                         let kw = if in_subquery.negated { "NOT IN" } else { "IN" };
-                        return Err(format!(
-                            "BITMAP/HLL columns cannot appear in {kw} subquery expressions (operand `{col}` has type {logical:?})"
+                        return Err(AnalyzeError::invalid_argument(
+                            format!(
+                                "BITMAP/HLL columns cannot appear in {kw} subquery expressions (operand `{col}` has type {logical:?})"
+                            ),
+                            in_subquery.span,
                         ));
                     }
                 }
@@ -535,14 +563,22 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::Expr::TypedString(typed_str) => {
                 let target = sql_type_to_arrow(&typed_str.data_type)?;
                 let ast::LiteralKind::String(value) = &typed_str.value.kind else {
-                    return Err("typed string requires a string literal".to_string());
+                    return Err(AnalyzeError::invalid_literal(
+                        "typed string requires a string literal",
+                        typed_str.span,
+                    ));
                 };
                 let value = value.clone();
                 // For DATE literals, constant-fold to Date32 integer value
                 if target == DataType::Date32 {
                     let date_str = value.trim_matches(|c| c == '\'' || c == '"');
                     let days = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-                        .map_err(|e| format!("invalid date literal '{date_str}': {e}"))?
+                        .map_err(|e| {
+                            AnalyzeError::invalid_literal(
+                                format!("invalid date literal '{date_str}': {e}"),
+                                typed_str.span,
+                            )
+                        })?
                         .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
                         .num_days();
                     return Ok(TypedExpr {
@@ -576,7 +612,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 })
             }
 
-            other => Err(format!("unsupported expression: {}", print_expr(other))),
+            other => Err(AnalyzeError::unsupported_expression(
+                format!("unsupported expression: {}", print_expr(other)),
+                other.span(),
+            )),
         }
     }
 
@@ -585,10 +624,11 @@ impl<'a> super::AnalyzerContext<'a> {
         base: TypedExpr,
         access: &ast::AccessKind,
         scope: &AnalyzerScope,
-    ) -> Result<TypedExpr, String> {
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
         match access {
             ast::AccessKind::Field(ident) => {
-                self.analyze_struct_field_access(base, ident.value.clone())
+                self.analyze_struct_field_access(base, ident.value.clone(), ident.span)
             }
             ast::AccessKind::Subscript(index) => {
                 let mut index_typed = self.analyze_expr(index, scope)?;
@@ -600,10 +640,16 @@ impl<'a> super::AnalyzerContext<'a> {
                     }
                     DataType::Map(entries, _) => {
                         let DataType::Struct(fields) = entries.data_type() else {
-                            return Err("map subscript expects STRUCT map entries".to_string());
+                            return Err(AnalyzeError::invalid_argument(
+                                "map subscript expects STRUCT map entries",
+                                span,
+                            ));
                         };
                         if fields.len() != 2 {
-                            return Err("map subscript expects key/value entries".to_string());
+                            return Err(AnalyzeError::invalid_argument(
+                                "map subscript expects key/value entries",
+                                span,
+                            ));
                         }
                         index_typed =
                             cast_null_preserving_target_type(index_typed, fields[0].data_type());
@@ -612,32 +658,41 @@ impl<'a> super::AnalyzerContext<'a> {
                     DataType::Struct(fields) => {
                         return match &index_typed.kind {
                             ExprKind::Literal(LiteralValue::String(field_name)) => {
-                                self.analyze_struct_field_access(base, field_name.clone())
+                                self.analyze_struct_field_access(base, field_name.clone(), span)
                             }
                             // 1-based positional access: `struct_val[1]` →
                             // first field of the STRUCT. Matches StarRocks /
                             // Spark / Trino convention.
                             ExprKind::Literal(LiteralValue::Int(pos)) => {
                                 if *pos < 1 || (*pos as usize) > fields.len() {
-                                    return Err(format!(
-                                        "struct subscript {} is out of range (1..{})",
-                                        pos,
-                                        fields.len()
+                                    return Err(AnalyzeError::invalid_argument(
+                                        format!(
+                                            "struct subscript {} is out of range (1..{})",
+                                            pos,
+                                            fields.len()
+                                        ),
+                                        span,
                                     ));
                                 }
                                 let field_name = fields[(*pos as usize) - 1].name().clone();
-                                self.analyze_struct_field_access(base, field_name)
+                                self.analyze_struct_field_access(base, field_name, span)
                             }
-                            _ => Err(format!(
-                                "struct subscript requires a string literal field name or 1-based integer index, got {:?}",
-                                index_typed.kind
+                            _ => Err(AnalyzeError::invalid_argument(
+                                format!(
+                                    "struct subscript requires a string literal field name or 1-based integer index, got {:?}",
+                                    index_typed.kind
+                                ),
+                                span,
                             )),
                         };
                     }
                     other => {
-                        return Err(format!(
-                            "subscript access expects ARRAY, MAP, or STRUCT input, got {:?}",
-                            other
+                        return Err(AnalyzeError::invalid_argument(
+                            format!(
+                                "subscript access expects ARRAY, MAP, or STRUCT input, got {:?}",
+                                other
+                            ),
+                            span,
                         ));
                     }
                 };
@@ -699,7 +754,7 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         parts: &[ast::Ident],
         scope: &AnalyzerScope,
-    ) -> Result<TypedExpr, String> {
+    ) -> Result<TypedExpr, AnalyzeError> {
         // A compound identifier `a.b.c.d...` can mean several different things
         // depending on schema and aliases. Try them in order of specificity:
         //
@@ -725,7 +780,8 @@ impl<'a> super::AnalyzerContext<'a> {
                 nullable: param.nullable,
             };
             for field in &parts[1..] {
-                current = self.analyze_struct_field_access(current, field.value.clone())?;
+                current =
+                    self.analyze_struct_field_access(current, field.value.clone(), field.span)?;
             }
             return Ok(current);
         }
@@ -755,7 +811,8 @@ impl<'a> super::AnalyzerContext<'a> {
                     col_name,
                 );
                 for field in &parts[2..] {
-                    current = self.analyze_struct_field_access(current, field.value.clone())?;
+                    current =
+                        self.analyze_struct_field_access(current, field.value.clone(), field.span)?;
                 }
                 return Ok(current);
             }
@@ -775,7 +832,8 @@ impl<'a> super::AnalyzerContext<'a> {
                     col_name,
                 );
                 for field in &parts[3..] {
-                    current = self.analyze_struct_field_access(current, field.value.clone())?;
+                    current =
+                        self.analyze_struct_field_access(current, field.value.clone(), field.span)?;
                 }
                 return Ok(current);
             }
@@ -784,10 +842,10 @@ impl<'a> super::AnalyzerContext<'a> {
         // Form 3: leading identifier is the column itself, the rest walk a
         // STRUCT. Falls back to producing a `Column 'X' cannot be resolved`
         // error from `scope.resolve` if even this fails.
-        let (column_id, data_type, nullable) = scope.resolve(None, base_name)?;
+        let (column_id, data_type, nullable) = scope.resolve_at(None, base_name, parts[0].span)?;
         let mut current = build_column_ref(column_id, data_type, nullable, None, base_name);
         for field in &parts[1..] {
-            current = self.analyze_struct_field_access(current, field.value.clone())?;
+            current = self.analyze_struct_field_access(current, field.value.clone(), field.span)?;
         }
         Ok(current)
     }
@@ -796,11 +854,15 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         base: TypedExpr,
         field_name: String,
-    ) -> Result<TypedExpr, String> {
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
         let DataType::Struct(fields) = &base.data_type else {
-            return Err(format!(
-                "field access expects STRUCT input, got {:?}",
-                base.data_type
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "field access expects STRUCT input, got {:?}",
+                    base.data_type
+                ),
+                span,
             ));
         };
         // STRUCT field names are case-insensitive for resolution (Iceberg and
@@ -812,7 +874,12 @@ impl<'a> super::AnalyzerContext<'a> {
         let field = fields
             .iter()
             .find(|field| field.name().eq_ignore_ascii_case(&field_name))
-            .ok_or_else(|| format!("struct field '{}' does not exist", field_name))?;
+            .ok_or_else(|| {
+                AnalyzeError::unknown_column(
+                    format!("struct field '{}' does not exist", field_name),
+                    span,
+                )
+            })?;
         let field_type = field.data_type().clone();
         let canonical_field_name = field.name().clone();
         let field_name_expr = TypedExpr {
@@ -833,7 +900,7 @@ impl<'a> super::AnalyzerContext<'a> {
     }
 
     /// Analyze a literal value.
-    fn analyze_literal(&self, value: &ast::Literal) -> Result<TypedExpr, String> {
+    fn analyze_literal(&self, value: &ast::Literal) -> Result<TypedExpr, AnalyzeError> {
         match value {
             ast::Literal {
                 kind: ast::LiteralKind::Number(n),
@@ -847,9 +914,12 @@ impl<'a> super::AnalyzerContext<'a> {
                         nullable: false,
                     })
                 } else if !n.contains('.') && !n.contains('e') && !n.contains('E') {
-                    let v = n
-                        .parse::<i128>()
-                        .map_err(|_| format!("invalid numeric literal: {n}"))?;
+                    let v = n.parse::<i128>().map_err(|_| {
+                        AnalyzeError::invalid_literal(
+                            format!("invalid numeric literal: {n}"),
+                            value.span,
+                        )
+                    })?;
                     Ok(TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::LargeInt(v)),
                         data_type: DataType::FixedSizeBinary(
@@ -858,7 +928,8 @@ impl<'a> super::AnalyzerContext<'a> {
                         nullable: false,
                     })
                 } else if n.contains('.') && !n.contains('e') && !n.contains('E') {
-                    let data_type = infer_decimal_literal_type(n)?;
+                    let data_type = infer_decimal_literal_type(n)
+                        .map_err(|message| AnalyzeError::invalid_literal(message, value.span))?;
                     Ok(TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Decimal(n.clone())),
                         data_type,
@@ -871,7 +942,10 @@ impl<'a> super::AnalyzerContext<'a> {
                         nullable: false,
                     })
                 } else {
-                    Err(format!("invalid numeric literal: {n}"))
+                    Err(AnalyzeError::invalid_literal(
+                        format!("invalid numeric literal: {n}"),
+                        value.span,
+                    ))
                 }
             }
             ast::Literal {
@@ -896,8 +970,12 @@ impl<'a> super::AnalyzerContext<'a> {
                 kind: ast::LiteralKind::HexString(s),
                 ..
             } => {
-                let bytes =
-                    hex::decode(s).map_err(|err| format!("invalid hex literal X'{s}': {err}"))?;
+                let bytes = hex::decode(s).map_err(|err| {
+                    AnalyzeError::invalid_literal(
+                        format!("invalid hex literal X'{s}': {err}"),
+                        value.span,
+                    )
+                })?;
                 Ok(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Binary(bytes)),
                     data_type: DataType::Binary,
@@ -927,7 +1005,7 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         array: &ast::ArrayExpr,
         scope: &AnalyzerScope,
-    ) -> Result<TypedExpr, String> {
+    ) -> Result<TypedExpr, AnalyzeError> {
         let mut args = Vec::with_capacity(array.elements.len());
         let explicit_item_type = array
             .element_type
@@ -981,7 +1059,7 @@ impl<'a> super::AnalyzerContext<'a> {
         left_typed: TypedExpr,
         right: &ast::Expr,
         scope: &AnalyzerScope,
-    ) -> Result<TypedExpr, String> {
+    ) -> Result<TypedExpr, AnalyzeError> {
         let right_typed = self.analyze_expr(right, scope)?;
         let nullable = true;
         let fn_name = "json_query";
@@ -1008,7 +1086,7 @@ impl<'a> super::AnalyzerContext<'a> {
         op: &ast::BinaryOperator,
         right: &ast::Expr,
         scope: &AnalyzerScope,
-    ) -> Result<TypedExpr, String> {
+    ) -> Result<TypedExpr, AnalyzeError> {
         let left_typed = self.analyze_expr(left, scope)?;
         let right_typed = self.analyze_expr(right, scope)?;
 
@@ -1045,16 +1123,22 @@ impl<'a> super::AnalyzerContext<'a> {
                     .logical_type_of_expr(&left_typed)
                     .filter(is_bitmap_or_hll_type)
                 {
-                    return Err(format!(
-                        "comparison operator `{op_sym}` is not supported for BITMAP/HLL (left operand has type {logical:?})"
+                    return Err(AnalyzeError::invalid_argument(
+                        format!(
+                            "comparison operator `{op_sym}` is not supported for BITMAP/HLL (left operand has type {logical:?})"
+                        ),
+                        left.span(),
                     ));
                 }
                 if let Some(logical) = scope
                     .logical_type_of_expr(&right_typed)
                     .filter(is_bitmap_or_hll_type)
                 {
-                    return Err(format!(
-                        "comparison operator `{op_sym}` is not supported for BITMAP/HLL (right operand has type {logical:?})"
+                    return Err(AnalyzeError::invalid_argument(
+                        format!(
+                            "comparison operator `{op_sym}` is not supported for BITMAP/HLL (right operand has type {logical:?})"
+                        ),
+                        right.span(),
                     ));
                 }
                 // Ordering operators (`<`, `<=`, `>`, `>=`) are undefined on
@@ -1081,8 +1165,11 @@ impl<'a> super::AnalyzerContext<'a> {
                     if let Some(kind) = unsupported_complex_kind(&left_typed.data_type)
                         .or_else(|| unsupported_complex_kind(&right_typed.data_type))
                     {
-                        return Err(format!(
-                            "comparison operator `{op_sym}` does not support binary predicate operation on {kind} values"
+                        return Err(AnalyzeError::invalid_argument(
+                            format!(
+                                "comparison operator `{op_sym}` does not support binary predicate operation on {kind} values"
+                            ),
+                            left.span(),
                         ));
                     }
                 }
@@ -1094,8 +1181,11 @@ impl<'a> super::AnalyzerContext<'a> {
                 if let Some(reason) =
                     incompatible_complex_compare(&left_typed.data_type, &right_typed.data_type)
                 {
-                    return Err(format!(
-                        "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
+                    return Err(AnalyzeError::type_mismatch(
+                        format!(
+                            "comparison operator `{op_sym}` does not support binary predicate operation between {reason}"
+                        ),
+                        left.span(),
                     ));
                 }
                 let right_coerced = coerce_literal_for_comparison(&left_typed, right_typed);
@@ -1107,7 +1197,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 // matching key types so the RF gate (rf_key_types_match) passes.
                 // Non-numeric pairs return None and are left to literal coercion /
                 // the execution-time normalizer (normalize_comparison_types).
-                match comparison_common_type(&left_coerced.data_type, &right_coerced.data_type)? {
+                match comparison_common_type(&left_coerced.data_type, &right_coerced.data_type)
+                    .map_err(|message| AnalyzeError::type_mismatch(message, left.span()))?
+                {
                     Some(common) => (
                         cast_null_preserving_target_type(left_coerced, &common),
                         cast_null_preserving_target_type(right_coerced, &common),
@@ -1196,13 +1288,21 @@ impl<'a> super::AnalyzerContext<'a> {
                 });
             }
 
-            other => return Err(format!("unsupported binary operator: {other:?}")),
+            other => {
+                return Err(AnalyzeError::unsupported_expression(
+                    format!("unsupported binary operator: {other:?}"),
+                    left.span(),
+                ));
+            }
         };
 
         if let DataType::Decimal128(precision, scale) = &result_type
             && *scale > *precision as i8
         {
-            return Err(format!("scale {scale} is greater than max {precision}"));
+            return Err(AnalyzeError::invalid_literal(
+                format!("scale {scale} is greater than max {precision}"),
+                left.span(),
+            ));
         }
 
         let nullable = left_typed.nullable || right_typed.nullable;
@@ -1225,7 +1325,7 @@ impl<'a> super::AnalyzerContext<'a> {
         results: &[ast::Expr],
         else_result: Option<&ast::Expr>,
         scope: &AnalyzerScope,
-    ) -> Result<TypedExpr, String> {
+    ) -> Result<TypedExpr, AnalyzeError> {
         let operand_typed = match operand {
             Some(e) => Some(Box::new(self.analyze_expr(e, scope)?)),
             None => None,
@@ -1301,10 +1401,13 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         func: &ast::FunctionCall,
         scope: &AnalyzerScope,
-    ) -> Result<TypedExpr, String> {
+    ) -> Result<TypedExpr, AnalyzeError> {
         let original_name = print_object_name(&func.name).to_ascii_lowercase();
         if original_name == "ds_theta_count_distinct" {
-            return Err("unsupported agg function: ds_theta_count_distinct".to_string());
+            return Err(AnalyzeError::unsupported_expression(
+                "unsupported agg function: ds_theta_count_distinct",
+                func.span,
+            ));
         }
         let name = match original_name.as_str() {
             "approx_count_distinct_hll_sketch" => "ds_hll_count_distinct".to_string(),
@@ -1335,25 +1438,27 @@ impl<'a> super::AnalyzerContext<'a> {
         // Reject these shapes before aggregate ORDER BY validation so the
         // StarRocks-compatible parse error remains stable.
         if func.arguments.is_empty() && !func.order_by.is_empty() {
-            return Err(
+            return Err(AnalyzeError::invalid_query_shape(
                 if matches!(func.quantifier, ast::FunctionQuantifier::Distinct) {
                     "Unexpected input 'order', the most similar input is {a legal identifier}."
                         .to_string()
                 } else {
                     "Unexpected input '(', the most similar input is {<EOF>, ';'}.".to_string()
                 },
-            );
+                func.span,
+            ));
         }
         if func.arguments.is_empty() && func.separator.is_some() {
-            return Err(format!(
-                "No viable statement for input '{}(separator NULL'.",
-                name
+            return Err(AnalyzeError::invalid_query_shape(
+                format!("No viable statement for input '{}(separator NULL'.", name),
+                func.span,
             ));
         }
         if func.separator.is_some() && !matches!(name.as_str(), "group_concat" | "string_agg") {
-            return Err(
-                "Unexpected input 'separator', the most similar input is {',', ')'}.".to_string(),
-            );
+            return Err(AnalyzeError::invalid_query_shape(
+                "Unexpected input 'separator', the most similar input is {',', ')'}.",
+                func.span,
+            ));
         }
 
         // Check for DISTINCT
@@ -1413,7 +1518,10 @@ impl<'a> super::AnalyzerContext<'a> {
         // to the unit-specific scalar function without reconstructing SQL.
         if original_name == "extract" && arg_exprs.len() == 2 {
             let ast::Expr::Identifier(field) = arg_exprs[0] else {
-                return Err("unsupported EXTRACT field".to_string());
+                return Err(AnalyzeError::unsupported_expression(
+                    "unsupported EXTRACT field",
+                    func.span,
+                ));
             };
             let function_name = match field.value.to_ascii_lowercase().as_str() {
                 "year" => "year",
@@ -1422,7 +1530,12 @@ impl<'a> super::AnalyzerContext<'a> {
                 "hour" => "hour",
                 "minute" => "minute",
                 "second" => "second",
-                other => return Err(format!("unsupported EXTRACT field: {other}")),
+                other => {
+                    return Err(AnalyzeError::unsupported_expression(
+                        format!("unsupported EXTRACT field: {other}"),
+                        field.span,
+                    ));
+                }
             };
             let argument = self.analyze_expr(arg_exprs[1], scope)?;
             return Ok(TypedExpr {
@@ -1488,23 +1601,33 @@ impl<'a> super::AnalyzerContext<'a> {
             });
         }
         if matches!(name.as_str(), "group_concat" | "string_agg") && arg_exprs.is_empty() {
-            return Err("group_concat should have at least one input.".to_string());
+            return Err(AnalyzeError::invalid_argument(
+                "group_concat should have at least one input.",
+                func.span,
+            ));
         }
         if matches!(
             name.as_str(),
             "array_agg" | "array_agg_distinct" | "array_unique_agg"
         ) {
             if arg_exprs.is_empty() {
-                return Err("array_agg should have at least one input.".to_string());
+                return Err(AnalyzeError::invalid_argument(
+                    "array_agg should have at least one input.",
+                    func.span,
+                ));
             }
             if arg_exprs.len() != 1 {
-                return Err(
-                    "Unexpected input 'order', the most similar input is {',', ')'}.".to_string(),
-                );
+                return Err(AnalyzeError::invalid_query_shape(
+                    "Unexpected input 'order', the most similar input is {',', ')'}.",
+                    func.span,
+                ));
             }
         }
         if name == "any_value" && is_distinct {
-            return Err("Getting syntax error".to_string());
+            return Err(AnalyzeError::invalid_query_shape(
+                "Getting syntax error",
+                func.span,
+            ));
         }
         // `date_add(dt, INTERVAL expr <UNIT>)` / `date_sub(...)` in MySQL
         // syntax: route to the unit-specific function (`seconds_add`,
@@ -1544,10 +1667,10 @@ impl<'a> super::AnalyzerContext<'a> {
         {
             if let ast::Expr::Interval(interval) = arg_exprs[2] {
                 if !is_integer_const_literal(interval.value.as_ref()) {
-                    return Err(
-                        "array_generate requires step parameter must be a constant integer"
-                            .to_string(),
-                    );
+                    return Err(AnalyzeError::invalid_argument(
+                        "array_generate requires step parameter must be a constant integer",
+                        interval.span,
+                    ));
                 }
                 let unit = interval_field_name(interval.leading_field).to_string();
                 vec![
@@ -1584,8 +1707,9 @@ impl<'a> super::AnalyzerContext<'a> {
                     // intervals at planning time; mirror that error
                     // here rather than silently producing NULL.
                     if !is_integer_const_literal(interval.value.as_ref()) {
-                        return Err(format!(
-                            "{name} requires second parameter must be a constant interval"
+                        return Err(AnalyzeError::invalid_argument(
+                            format!("{name} requires second parameter must be a constant interval"),
+                            interval.span,
                         ));
                     }
                     rewritten.push((*interval.value).clone());
@@ -1626,12 +1750,12 @@ impl<'a> super::AnalyzerContext<'a> {
         };
 
         if let Some(rewritten) =
-            self.try_analyze_higher_order_function(&name, &effective_arg_exprs, scope)?
+            self.try_analyze_higher_order_function(&name, &effective_arg_exprs, scope, func.span)?
         {
             return Ok(rewritten);
         }
         if let Some(rewritten) =
-            self.try_analyze_array_map_cast_lambda(&name, &effective_arg_exprs, scope)?
+            self.try_analyze_array_map_cast_lambda(&name, &effective_arg_exprs, scope, func.span)?
         {
             return Ok(rewritten);
         }
@@ -1645,11 +1769,21 @@ impl<'a> super::AnalyzerContext<'a> {
                 .and_then(|expr| parse_array_sortby_lambda(expr))
                 .is_some()
         {
-            self.analyze_array_sortby_lambda_arguments(&effective_arg_exprs, scope)?
+            self.analyze_array_sortby_lambda_arguments(&effective_arg_exprs, scope, func.span)?
         } else if is_higher_order_function_with_lambda(&name, &effective_arg_exprs) {
-            self.analyze_higher_order_lambda_arguments(&name, &effective_arg_exprs, scope)?
+            self.analyze_higher_order_lambda_arguments(
+                &name,
+                &effective_arg_exprs,
+                scope,
+                func.span,
+            )?
         } else if is_map_higher_order_function_with_lambda(&name, &effective_arg_exprs) {
-            self.analyze_map_higher_order_lambda_arguments(&name, &effective_arg_exprs, scope)?
+            self.analyze_map_higher_order_lambda_arguments(
+                &name,
+                &effective_arg_exprs,
+                scope,
+                func.span,
+            )?
         } else {
             let mut args_typed = Vec::with_capacity(effective_arg_exprs.len());
             let mut arg_types = Vec::with_capacity(effective_arg_exprs.len());
@@ -1702,15 +1836,18 @@ impl<'a> super::AnalyzerContext<'a> {
             arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
         }
 
-        self.validate_ds_hll_arguments(&name, &args_typed)?;
+        self.validate_ds_hll_arguments(&name, &args_typed, func.span)?;
 
         if name == "array_flatten"
             && let Some(DataType::List(item)) = arg_types.first()
             && !matches!(item.data_type(), DataType::List(_))
         {
-            return Err(format!(
-                "The only one input of array_flatten should be an array of arrays, rather than {}",
-                starrocks_error_type_name(&arg_types[0])
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "The only one input of array_flatten should be an array of arrays, rather than {}",
+                    starrocks_error_type_name(&arg_types[0])
+                ),
+                func.span,
             ));
         }
 
@@ -1719,15 +1856,18 @@ impl<'a> super::AnalyzerContext<'a> {
                 .first()
                 .is_some_and(is_non_groupable_map_constructor)
             {
-                return Err("Unknown error".to_string());
+                return Err(AnalyzeError::invalid_argument("Unknown error", func.span));
             }
             if let Some(semantic_type) = args_typed
                 .first()
                 .and_then(json_semantic_group_by_type_name)
             {
                 let arg_display = expr_display_name(arg_exprs[0]);
-                return Err(format!(
-                    "array_agg(DISTINCT {arg_display}) can't rewrite distinct to group by on ({semantic_type})."
+                return Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "array_agg(DISTINCT {arg_display}) can't rewrite distinct to group by on ({semantic_type})."
+                    ),
+                    func.span,
                 ));
             }
         }
@@ -1761,13 +1901,16 @@ impl<'a> super::AnalyzerContext<'a> {
         }
 
         if name == "count_if" && is_distinct {
-            return Err(
-                "Unexpected input '(', the most similar input is {<EOF>, ';'}.".to_string(),
-            );
+            return Err(AnalyzeError::invalid_query_shape(
+                "Unexpected input '(', the most similar input is {<EOF>, ';'}.",
+                func.span,
+            ));
         }
 
-        validate_group_concat_separator_argument(&name, &arg_exprs, &args_typed)?;
-        validate_group_concat_value_arguments(&name, &args_typed)?;
+        validate_group_concat_separator_argument(&name, &arg_exprs, &args_typed)
+            .map_err(|message| AnalyzeError::invalid_argument(message, func.span))?;
+        validate_group_concat_value_arguments(&name, &args_typed)
+            .map_err(|message| AnalyzeError::invalid_argument(message, func.span))?;
 
         // Extract ORDER BY within function args (for aggregates like array_agg)
         let func_order_by = self.extract_function_order_by(func, scope, &args_typed)?;
@@ -1775,7 +1918,10 @@ impl<'a> super::AnalyzerContext<'a> {
         // Check for window function: func(...) OVER (...)
         if let Some(ref window_type) = func.over {
             if name == "any_value" {
-                return Err("any_value not supported with OVER clause".to_string());
+                return Err(AnalyzeError::unsupported_expression(
+                    "any_value not supported with OVER clause",
+                    func.span,
+                ));
             }
             // StarRocks rejects LEAD/LAG when the third (default) argument
             // doesn't match a per-shape type rule. The error message echoes
@@ -1785,11 +1931,23 @@ impl<'a> super::AnalyzerContext<'a> {
                 let value_type = args_typed[0].data_type.clone();
                 let default_arg = &args_typed[2];
                 if !is_lead_lag_default_arg_acceptable(default_arg, &value_type) {
-                    return Err(format!(
-                        "The type of the third parameter of LEAD/LAG not match the type {}.",
-                        lead_lag_type_display(&value_type)
+                    return Err(AnalyzeError::type_mismatch(
+                        format!(
+                            "The type of the third parameter of LEAD/LAG not match the type {}.",
+                            lead_lag_type_display(&value_type)
+                        ),
+                        func.span,
                     ));
                 }
+            }
+            if !is_window_only_function(&name)
+                && !is_aggregate_function(&name)
+                && scalar_function_is_unknown(self.function_catalog, &name, &arg_types)
+            {
+                return Err(AnalyzeError::unknown_function(
+                    format!("Unknown function: {name}"),
+                    func.span,
+                ));
             }
             let return_type = if is_window_only_function(&name) {
                 infer_window_return_type(&name, &arg_types)
@@ -1908,12 +2066,20 @@ impl<'a> super::AnalyzerContext<'a> {
         }
 
         let mut bound_scalar = None;
-        self.validate_percentile_arguments(&name, &args_typed)?;
+        self.validate_percentile_arguments(&name, &args_typed, func.span)?;
         if is_aggregate_function(&name) {
-            validate_aggregate_function_call(&name, &arg_types)?;
+            validate_aggregate_function_call(&name, &arg_types)
+                .map_err(|message| AnalyzeError::invalid_argument(message, func.span))?;
         } else {
+            if scalar_function_is_unknown(self.function_catalog, &name, &arg_types) {
+                return Err(AnalyzeError::unknown_function(
+                    format!("Unknown function: {name}"),
+                    func.span,
+                ));
+            }
             let bound =
-                bind_scalar_function_call_with_catalog(self.function_catalog, &name, args_typed)?;
+                bind_scalar_function_call_with_catalog(self.function_catalog, &name, args_typed)
+                    .map_err(|message| AnalyzeError::type_mismatch(message, func.span))?;
             arg_types = bound.args.iter().map(|arg| arg.data_type.clone()).collect();
             args_typed = bound.args.clone();
             bound_scalar = Some(bound);
@@ -1945,7 +2111,11 @@ impl<'a> super::AnalyzerContext<'a> {
                 });
             }
             "ds_hll_combine" => {
-                self.ensure_ds_hll_binary_arg("ds_hll_count_distinct_union", args_typed.first())?;
+                self.ensure_ds_hll_binary_arg(
+                    "ds_hll_count_distinct_union",
+                    args_typed.first(),
+                    func.span,
+                )?;
                 return Ok(TypedExpr {
                     kind: ExprKind::AggregateCall {
                         name: "ds_hll_count_distinct_union".to_string(),
@@ -1958,7 +2128,11 @@ impl<'a> super::AnalyzerContext<'a> {
                 });
             }
             "ds_hll_estimate" => {
-                self.ensure_ds_hll_binary_arg("ds_hll_count_distinct_merge", args_typed.first())?;
+                self.ensure_ds_hll_binary_arg(
+                    "ds_hll_count_distinct_merge",
+                    args_typed.first(),
+                    func.span,
+                )?;
                 return Ok(TypedExpr {
                     kind: ExprKind::AggregateCall {
                         name: "ds_hll_count_distinct_merge".to_string(),
@@ -2050,25 +2224,34 @@ impl<'a> super::AnalyzerContext<'a> {
             // reject non-literal arguments up front.
             if matches!(name.as_str(), "variant_get" | "try_variant_get") {
                 if !(2..=3).contains(&args_typed.len()) {
-                    return Err(format!(
-                        "{name} expects 2 or 3 arguments, got {}",
-                        args_typed.len()
+                    return Err(AnalyzeError::invalid_argument(
+                        format!("{name} expects 2 or 3 arguments, got {}", args_typed.len()),
+                        func.span,
                     ));
                 }
                 match &args_typed[1].kind {
                     ExprKind::Literal(LiteralValue::String(_)) => {}
                     _ => {
-                        return Err(format!("{name} path argument must be a string literal"));
+                        return Err(AnalyzeError::invalid_argument(
+                            format!("{name} path argument must be a string literal"),
+                            func.span,
+                        ));
                     }
                 }
                 if args_typed.len() == 3 {
                     match &args_typed[2].kind {
                         ExprKind::Literal(LiteralValue::String(t)) => {
                             return_type =
-                                novarocks_types::value::variant::variant_get_target_type(t)?;
+                                novarocks_types::value::variant::variant_get_target_type(t)
+                                    .map_err(|message| {
+                                        AnalyzeError::invalid_literal(message, func.span)
+                                    })?;
                         }
                         _ => {
-                            return Err(format!("{name} type argument must be a string literal"));
+                            return Err(AnalyzeError::invalid_argument(
+                                format!("{name} type argument must be a string literal"),
+                                func.span,
+                            ));
                         }
                     }
                 }
@@ -2090,13 +2273,14 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         map: &ast::MapExpr,
         scope: &AnalyzerScope,
-    ) -> Result<TypedExpr, String> {
+    ) -> Result<TypedExpr, AnalyzeError> {
         let mut args = Vec::with_capacity(map.entries.len() * 2);
         for entry in &map.entries {
             args.push(self.analyze_expr(&entry.key, scope)?);
             args.push(self.analyze_expr(&entry.value, scope)?);
         }
-        let bound = bind_scalar_function_call_with_catalog(self.function_catalog, "map", args)?;
+        let bound = bind_scalar_function_call_with_catalog(self.function_catalog, "map", args)
+            .map_err(|message| AnalyzeError::invalid_argument(message, map.span))?;
         Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
                 volatility: self.function_catalog.volatility("map"),
@@ -2113,27 +2297,34 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         arg_exprs: &[&ast::Expr],
         scope: &AnalyzerScope,
-    ) -> Result<(Vec<TypedExpr>, Vec<DataType>), String> {
+        span: Span,
+    ) -> Result<(Vec<TypedExpr>, Vec<DataType>), AnalyzeError> {
         if arg_exprs.len() != 2 {
-            return Err(
-                "array_sortby lambda rewrite currently supports exactly one lambda and one array argument"
-                    .to_string(),
-            );
+            return Err(AnalyzeError::invalid_argument(
+                "array_sortby lambda rewrite currently supports exactly one lambda and one array argument",
+                span,
+            ));
         }
-        let (param_name, lambda_body) = parse_array_sortby_lambda(arg_exprs[0])
-            .ok_or_else(|| "array_sortby lambda rewrite expected a lambda argument".to_string())?;
+        let (param_name, lambda_body) =
+            parse_array_sortby_lambda(arg_exprs[0]).ok_or_else(|| {
+                AnalyzeError::invalid_argument(
+                    "array_sortby lambda rewrite expected a lambda argument",
+                    span,
+                )
+            })?;
         let array_expr = self.analyze_expr(arg_exprs[1], scope)?;
-        let field_chain = extract_lambda_field_chain(lambda_body, &param_name)?;
+        let field_chain = extract_lambda_field_chain(lambda_body, &param_name)
+            .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
         if field_chain.is_empty() {
-            return Err(
-                "array_sortby lambda rewrite requires direct struct field access like (x) -> x.item"
-                    .to_string(),
-            );
+            return Err(AnalyzeError::invalid_argument(
+                "array_sortby lambda rewrite requires direct struct field access like (x) -> x.item",
+                span,
+            ));
         }
 
         let mut key_expr = array_expr.clone();
         for field_name in field_chain {
-            key_expr = self.build_array_struct_subfield_expr(key_expr, field_name)?;
+            key_expr = self.build_array_struct_subfield_expr(key_expr, field_name, span)?;
         }
 
         let arg_types = vec![array_expr.data_type.clone(), key_expr.data_type.clone()];
@@ -2144,17 +2335,24 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         base: TypedExpr,
         field_name: String,
-    ) -> Result<TypedExpr, String> {
+        span: Span,
+    ) -> Result<TypedExpr, AnalyzeError> {
         let DataType::List(item_field) = &base.data_type else {
-            return Err(format!(
-                "array_sortby lambda expects ARRAY input, got {:?}",
-                base.data_type
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "array_sortby lambda expects ARRAY input, got {:?}",
+                    base.data_type
+                ),
+                span,
             ));
         };
         let DataType::Struct(fields) = item_field.data_type() else {
-            return Err(format!(
-                "array_sortby lambda field access expects ARRAY<STRUCT>, got {:?}",
-                base.data_type
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "array_sortby lambda field access expects ARRAY<STRUCT>, got {:?}",
+                    base.data_type
+                ),
+                span,
             ));
         };
         // Same case-insensitive resolution + canonical name forwarding as the
@@ -2163,7 +2361,12 @@ impl<'a> super::AnalyzerContext<'a> {
         let field = fields
             .iter()
             .find(|field| field.name().eq_ignore_ascii_case(&field_name))
-            .ok_or_else(|| format!("struct field '{}' does not exist", field_name))?;
+            .ok_or_else(|| {
+                AnalyzeError::unknown_column(
+                    format!("struct field '{}' does not exist", field_name),
+                    span,
+                )
+            })?;
         let field_type = field.data_type().clone();
         let canonical_field_name = field.name().clone();
         let field_name_expr = TypedExpr {
@@ -2190,7 +2393,8 @@ impl<'a> super::AnalyzerContext<'a> {
         name: &str,
         arg_exprs: &[&ast::Expr],
         scope: &AnalyzerScope,
-    ) -> Result<Option<TypedExpr>, String> {
+        span: Span,
+    ) -> Result<Option<TypedExpr>, AnalyzeError> {
         if !matches!(
             name,
             "array_map"
@@ -2213,21 +2417,29 @@ impl<'a> super::AnalyzerContext<'a> {
             .filter_map(|(idx, expr)| (idx != lambda_pos).then_some(*expr))
             .collect::<Vec<_>>();
         if array_exprs.is_empty() {
-            return Err(format!("{name} expects at least one ARRAY argument"));
+            return Err(AnalyzeError::invalid_argument(
+                format!("{name} expects at least one ARRAY argument"),
+                span,
+            ));
         }
 
         if name == "array_sort" {
             if array_exprs.len() != 1 || params.len() != 2 {
-                return Err(
-                    "array_sort lambda comparator expects one ARRAY argument and two lambda parameters"
-                        .to_string(),
-                );
+                return Err(AnalyzeError::invalid_argument(
+                    "array_sort lambda comparator expects one ARRAY argument and two lambda parameters",
+                    span,
+                ));
             }
             let source = self.analyze_expr(array_exprs[0], scope)?;
             let (item_type, item_nullable) = match &source.data_type {
                 DataType::List(item) => (item.data_type().clone(), item.is_nullable()),
                 DataType::Null => (DataType::Null, true),
-                other => return Err(format!("array_sort expects ARRAY argument, got {other:?}")),
+                other => {
+                    return Err(AnalyzeError::invalid_argument(
+                        format!("array_sort expects ARRAY argument, got {other:?}"),
+                        span,
+                    ));
+                }
             };
             let lambda_params = params
                 .iter()
@@ -2247,10 +2459,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 || typed_expr_contains_nondeterministic_call(self.function_catalog, &body)
                 || !typed_expr_references_all_lambda_params(&body, &lambda_params)
             {
-                return Err(
-                    "Lambda function in sort_array should only depend on both two arguments and contain no non-deterministic functions"
-                        .to_string(),
-                );
+                return Err(AnalyzeError::invalid_argument(
+                    "Lambda function in sort_array should only depend on both two arguments and contain no non-deterministic functions",
+                    span,
+                ));
             }
             let lambda = TypedExpr {
                 data_type: body.data_type.clone(),
@@ -2279,13 +2491,21 @@ impl<'a> super::AnalyzerContext<'a> {
             let (data_type, nullable) = match &typed.data_type {
                 DataType::List(item) => (item.data_type().clone(), item.is_nullable()),
                 DataType::Null => (DataType::Null, true),
-                other => return Err(format!("{name} expects ARRAY argument, got {other:?}")),
+                other => {
+                    return Err(AnalyzeError::invalid_argument(
+                        format!("{name} expects ARRAY argument, got {other:?}"),
+                        span,
+                    ));
+                }
             };
             let Some(param_name) = params.get(idx) else {
-                return Err(format!(
-                    "{name} lambda argument count {} does not match ARRAY argument count {}",
-                    params.len(),
-                    array_exprs.len()
+                return Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "{name} lambda argument count {} does not match ARRAY argument count {}",
+                        params.len(),
+                        array_exprs.len()
+                    ),
+                    span,
                 ));
             };
             lambda_params.push(LambdaParam {
@@ -2297,10 +2517,13 @@ impl<'a> super::AnalyzerContext<'a> {
             array_args.push(typed);
         }
         if params.len() != array_args.len() {
-            return Err(format!(
-                "{name} lambda argument count {} does not match ARRAY argument count {}",
-                params.len(),
-                array_args.len()
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "{name} lambda argument count {} does not match ARRAY argument count {}",
+                    params.len(),
+                    array_args.len()
+                ),
+                span,
             ));
         }
 
@@ -2369,10 +2592,9 @@ impl<'a> super::AnalyzerContext<'a> {
                 }))
             }
             "array_filter" | "filter" => {
-                let source = array_args
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| "array_filter missing ARRAY argument".to_string())?;
+                let source = array_args.first().cloned().ok_or_else(|| {
+                    AnalyzeError::invalid_argument("array_filter missing ARRAY argument", span)
+                })?;
                 let filter_type = DataType::List(Arc::new(arrow::datatypes::Field::new(
                     "item",
                     lambda.data_type.clone(),
@@ -2418,20 +2640,29 @@ impl<'a> super::AnalyzerContext<'a> {
         name: &str,
         arg_exprs: &[&ast::Expr],
         scope: &AnalyzerScope,
-    ) -> Result<(Vec<TypedExpr>, Vec<DataType>), String> {
+        span: Span,
+    ) -> Result<(Vec<TypedExpr>, Vec<DataType>), AnalyzeError> {
         if arg_exprs.len() < 2 {
-            return Err(format!(
-                "{name} expects a lambda and at least one array argument"
+            return Err(AnalyzeError::invalid_argument(
+                format!("{name} expects a lambda and at least one array argument"),
+                span,
             ));
         }
-        let (param_names, body_expr) = parse_multi_param_lambda(arg_exprs[0])
-            .ok_or_else(|| format!("{name} expects a lambda function as its first argument"))?;
+        let (param_names, body_expr) = parse_multi_param_lambda(arg_exprs[0]).ok_or_else(|| {
+            AnalyzeError::invalid_argument(
+                format!("{name} expects a lambda function as its first argument"),
+                span,
+            )
+        })?;
         let array_count = arg_exprs.len() - 1;
         if param_names.len() != array_count {
-            return Err(format!(
-                "{name} lambda has {} parameter(s) but {} array argument(s) were supplied",
-                param_names.len(),
-                array_count
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "{name} lambda has {} parameter(s) but {} array argument(s) were supplied",
+                    param_names.len(),
+                    array_count
+                ),
+                span,
             ));
         }
 
@@ -2445,7 +2676,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 | DataType::FixedSizeList(field, _) => field.data_type().clone(),
                 DataType::Null => DataType::Null,
                 other => {
-                    return Err(format!("{name} expects ARRAY arguments, got {:?}", other));
+                    return Err(AnalyzeError::invalid_argument(
+                        format!("{name} expects ARRAY arguments, got {:?}", other),
+                        span,
+                    ));
                 }
             };
             element_types.push(elem_type);
@@ -2491,13 +2725,21 @@ impl<'a> super::AnalyzerContext<'a> {
         name: &str,
         arg_exprs: &[&ast::Expr],
         scope: &AnalyzerScope,
-    ) -> Result<(Vec<TypedExpr>, Vec<DataType>), String> {
-        let (param_names, body_expr) = parse_multi_param_lambda(arg_exprs[0])
-            .ok_or_else(|| format!("{name} expects a lambda function as its first argument"))?;
+        span: Span,
+    ) -> Result<(Vec<TypedExpr>, Vec<DataType>), AnalyzeError> {
+        let (param_names, body_expr) = parse_multi_param_lambda(arg_exprs[0]).ok_or_else(|| {
+            AnalyzeError::invalid_argument(
+                format!("{name} expects a lambda function as its first argument"),
+                span,
+            )
+        })?;
         if param_names.len() != 2 {
-            return Err(format!(
-                "{name} lambda must take exactly 2 parameters (key, value); got {}",
-                param_names.len()
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "{name} lambda must take exactly 2 parameters (key, value); got {}",
+                    param_names.len()
+                ),
+                span,
             ));
         }
 
@@ -2508,14 +2750,22 @@ impl<'a> super::AnalyzerContext<'a> {
                     (fields[0].data_type().clone(), fields[1].data_type().clone())
                 }
                 other => {
-                    return Err(format!(
-                        "{name} expects MAP argument with struct<key,value> entries, got {:?}",
-                        other
+                    return Err(AnalyzeError::invalid_argument(
+                        format!(
+                            "{name} expects MAP argument with struct<key,value> entries, got {:?}",
+                            other
+                        ),
+                        span,
                     ));
                 }
             },
             DataType::Null => (DataType::Null, DataType::Null),
-            other => return Err(format!("{name} expects a MAP argument, got {:?}", other)),
+            other => {
+                return Err(AnalyzeError::invalid_argument(
+                    format!("{name} expects a MAP argument, got {:?}", other),
+                    span,
+                ));
+            }
         };
 
         // Bind the (key, value) lambda parameters as proper lambda slots, NOT
@@ -2573,9 +2823,12 @@ impl<'a> super::AnalyzerContext<'a> {
                     _ => Vec::new(),
                 };
                 if tuple_items.len() != 2 {
-                    return Err(format!(
-                        "map_apply lambda body must produce (new_key, new_value), got {} items",
-                        tuple_items.len()
+                    return Err(AnalyzeError::invalid_argument(
+                        format!(
+                            "map_apply lambda body must produce (new_key, new_value), got {} items",
+                            tuple_items.len()
+                        ),
+                        span,
                     ));
                 }
                 (
@@ -2643,7 +2896,8 @@ impl<'a> super::AnalyzerContext<'a> {
         name: &str,
         arg_exprs: &[&ast::Expr],
         scope: &AnalyzerScope,
-    ) -> Result<Option<TypedExpr>, String> {
+        span: Span,
+    ) -> Result<Option<TypedExpr>, AnalyzeError> {
         if !matches!(name, "array_map" | "transform") {
             return Ok(None);
         }
@@ -2655,16 +2909,20 @@ impl<'a> super::AnalyzerContext<'a> {
             return Ok(None);
         };
         if !lambda_body_casts_param_to_utf8(lambda_body, &param_name) {
-            return Err(
-                "array_map lambda rewrite currently supports x -> CAST(x AS STRING)".to_string(),
-            );
+            return Err(AnalyzeError::unsupported_expression(
+                "array_map lambda rewrite currently supports x -> CAST(x AS STRING)",
+                span,
+            ));
         }
 
         let array_expr = self.analyze_expr(arg_exprs[1], scope)?;
         if !matches!(array_expr.data_type, DataType::List(_)) {
-            return Err(format!(
-                "array_map lambda expects ARRAY input, got {:?}",
-                array_expr.data_type
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "array_map lambda expects ARRAY input, got {:?}",
+                    array_expr.data_type
+                ),
+                span,
             ));
         }
         let target = DataType::List(Arc::new(arrow::datatypes::Field::new(
@@ -2682,15 +2940,21 @@ impl<'a> super::AnalyzerContext<'a> {
         }))
     }
 
-    fn validate_percentile_arguments(&self, name: &str, args: &[TypedExpr]) -> Result<(), String> {
+    fn validate_percentile_arguments(
+        &self,
+        name: &str,
+        args: &[TypedExpr],
+        span: Span,
+    ) -> Result<(), AnalyzeError> {
         match name {
             "percentile_cont" | "percentile_disc_lc" => {
                 if let Some(expr) = args.get(1)
                     && let Some(value) = const_numeric_value(expr)
                     && !(0.0..=1.0).contains(&value)
                 {
-                    return Err(format!(
-                        "{name} second parameter'value should be between 0 and 1"
+                    return Err(AnalyzeError::invalid_argument(
+                        format!("{name} second parameter'value should be between 0 and 1"),
+                        span,
                     ));
                 }
                 return Ok(());
@@ -2701,15 +2965,18 @@ impl<'a> super::AnalyzerContext<'a> {
         match name {
             "percentile_approx" => {
                 if let Some(expr) = args.first() {
-                    validate_percentile_numeric_arg(name, 0, "value", expr)?;
+                    validate_percentile_numeric_arg(name, 0, "value", expr)
+                        .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
                 }
             }
             "percentile_approx_weighted" => {
                 if let Some(expr) = args.first() {
-                    validate_percentile_numeric_arg(name, 0, "value", expr)?;
+                    validate_percentile_numeric_arg(name, 0, "value", expr)
+                        .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
                 }
                 if let Some(expr) = args.get(1) {
-                    validate_percentile_numeric_arg(name, 1, "weight", expr)?;
+                    validate_percentile_numeric_arg(name, 1, "weight", expr)
+                        .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
                 }
             }
             _ => {}
@@ -2721,10 +2988,10 @@ impl<'a> super::AnalyzerContext<'a> {
             _ => return Ok(()),
         };
         if let Some(expr) = args.get(quantile_idx) {
-            self.validate_percentile_quantile_arg(name, quantile_idx, expr)?;
+            self.validate_percentile_quantile_arg(name, quantile_idx, expr, span)?;
         }
         if let Some(expr) = args.get(compression_idx) {
-            self.validate_percentile_compression_arg(name, expr)?;
+            self.validate_percentile_compression_arg(name, expr, span)?;
         }
         Ok(())
     }
@@ -2734,33 +3001,42 @@ impl<'a> super::AnalyzerContext<'a> {
         name: &str,
         quantile_idx: usize,
         expr: &TypedExpr,
-    ) -> Result<(), String> {
+        span: Span,
+    ) -> Result<(), AnalyzeError> {
         match &expr.data_type {
             DataType::List(item) => {
                 if matches!(item.data_type(), DataType::Null) {
-                    return Err(format!(
-                        "{name} requires the {} parameter (percentile) to be ARRAY<NUMERIC>, but got: ARRAY<NULL_TYPE>.",
-                        ordinal_name(quantile_idx)
+                    return Err(AnalyzeError::invalid_argument(
+                        format!(
+                            "{name} requires the {} parameter (percentile) to be ARRAY<NUMERIC>, but got: ARRAY<NULL_TYPE>.",
+                            ordinal_name(quantile_idx)
+                        ),
+                        span,
                     ));
                 }
                 if !is_numeric_type(item.data_type()) {
-                    return Err(format!(
-                        "{name} requires the {} parameter (percentile) to be ARRAY<NUMERIC>, but got: ARRAY<{:?}>.",
-                        ordinal_name(quantile_idx),
-                        item.data_type()
+                    return Err(AnalyzeError::invalid_argument(
+                        format!(
+                            "{name} requires the {} parameter (percentile) to be ARRAY<NUMERIC>, but got: ARRAY<{:?}>.",
+                            ordinal_name(quantile_idx),
+                            item.data_type()
+                        ),
+                        span,
                     ));
                 }
                 if let Some(items) = array_literal_items(expr) {
                     for (idx, item) in items.iter().enumerate() {
                         if let Some(value) = const_numeric_value(item) {
-                            validate_percentile_value(name, value, Some(idx))?;
+                            validate_percentile_value(name, value, Some(idx))
+                                .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
                         }
                     }
                 }
             }
             data_type if is_numeric_type(data_type) => {
                 if let Some(value) = const_numeric_value(expr) {
-                    validate_percentile_value(name, value, None)?;
+                    validate_percentile_value(name, value, None)
+                        .map_err(|message| AnalyzeError::invalid_argument(message, span))?;
                 }
             }
             _ => {}
@@ -2772,13 +3048,17 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         name: &str,
         expr: &TypedExpr,
-    ) -> Result<(), String> {
+        span: Span,
+    ) -> Result<(), AnalyzeError> {
         if let Some(value) = const_numeric_value(expr)
             && value <= 0.0
         {
-            return Err(format!(
-                "Type check failed. compression parameter must be positive in {name}, but got: {}",
-                format_percentile_error_value(value)
+            return Err(AnalyzeError::invalid_argument(
+                format!(
+                    "Type check failed. compression parameter must be positive in {name}, but got: {}",
+                    format_percentile_error_value(value)
+                ),
+                span,
             ));
         }
         Ok(())
@@ -2790,7 +3070,7 @@ impl<'a> super::AnalyzerContext<'a> {
         func: &ast::FunctionCall,
         scope: &AnalyzerScope,
         args: &[TypedExpr],
-    ) -> Result<Vec<SortItem>, String> {
+    ) -> Result<Vec<SortItem>, AnalyzeError> {
         let func_name = print_object_name(&func.name).to_ascii_lowercase();
         let visible_args =
             if matches!(func_name.as_str(), "group_concat" | "string_agg") && !args.is_empty() {
@@ -2820,8 +3100,11 @@ impl<'a> super::AnalyzerContext<'a> {
                         } else {
                             func_name.as_str()
                         };
-                        return Err(format!(
-                            "ORDER BY position {pos} is not in {display_name} output list."
+                        return Err(AnalyzeError::invalid_argument(
+                            format!(
+                                "ORDER BY position {pos} is not in {display_name} output list."
+                            ),
+                            ob.span,
                         ));
                     } else {
                         self.analyze_expr(&ob.expr, scope)?
@@ -2847,9 +3130,12 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         over: &ast::WindowSpec,
         scope: &AnalyzerScope,
-    ) -> Result<WindowSpecAnalysis, String> {
+    ) -> Result<WindowSpecAnalysis, AnalyzeError> {
         if over.existing_window_name.is_some() {
-            return Err("named window references are not supported".into());
+            return Err(AnalyzeError::unsupported_expression(
+                "named window references are not supported",
+                over.span,
+            ));
         }
         let spec = over;
 
@@ -2878,7 +3164,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 ast::WindowFrameUnits::Rows => WindowFrameType::Rows,
                 ast::WindowFrameUnits::Range => WindowFrameType::Range,
                 ast::WindowFrameUnits::Groups => {
-                    return Err("GROUPS window frame is not supported".into());
+                    return Err(AnalyzeError::unsupported_expression(
+                        "GROUPS window frame is not supported",
+                        frame.span,
+                    ));
                 }
             };
             let start = self.analyze_window_bound(&frame.start_bound)?;
@@ -2913,61 +3202,79 @@ impl<'a> super::AnalyzerContext<'a> {
         Ok((partition_by, order_by, window_frame))
     }
 
-    fn analyze_window_bound(&self, bound: &ast::WindowFrameBound) -> Result<WindowBound, String> {
+    fn analyze_window_bound(
+        &self,
+        bound: &ast::WindowFrameBound,
+    ) -> Result<WindowBound, AnalyzeError> {
         match bound {
             ast::WindowFrameBound::CurrentRow(_) => Ok(WindowBound::CurrentRow),
             ast::WindowFrameBound::Preceding(None, _) => Ok(WindowBound::UnboundedPreceding),
             ast::WindowFrameBound::Preceding(Some(expr), _) => {
-                let n = eval_const_i64(expr)
-                    .map_err(|_| "window frame offset must be a constant integer")?;
+                let n = eval_const_i64(expr).map_err(|_| {
+                    AnalyzeError::invalid_argument(
+                        "window frame offset must be a constant integer",
+                        bound.span(),
+                    )
+                })?;
                 Ok(WindowBound::Preceding(n))
             }
             ast::WindowFrameBound::Following(None, _) => Ok(WindowBound::UnboundedFollowing),
             ast::WindowFrameBound::Following(Some(expr), _) => {
-                let n = eval_const_i64(expr)
-                    .map_err(|_| "window frame offset must be a constant integer")?;
+                let n = eval_const_i64(expr).map_err(|_| {
+                    AnalyzeError::invalid_argument(
+                        "window frame offset must be a constant integer",
+                        bound.span(),
+                    )
+                })?;
                 Ok(WindowBound::Following(n))
             }
         }
     }
 
-    fn validate_ds_hll_arguments(&self, name: &str, args: &[TypedExpr]) -> Result<(), String> {
+    fn validate_ds_hll_arguments(
+        &self,
+        name: &str,
+        args: &[TypedExpr],
+        span: Span,
+    ) -> Result<(), AnalyzeError> {
         if name != "ds_hll_count_distinct" {
             return Ok(());
         }
 
         if args.len() > 3 {
-            return Err(
-                "ds_hll_count_distinct requires one/two/three parameters: ds_hll_count_distinct(col, <log_k>, <tgt_type>)"
-                    .to_string(),
-            );
+            return Err(AnalyzeError::invalid_argument(
+                "ds_hll_count_distinct requires one/two/three parameters: ds_hll_count_distinct(col, <log_k>, <tgt_type>)",
+                span,
+            ));
         }
 
         if let Some(log_k) = args.get(1) {
             let ExprKind::Literal(LiteralValue::Int(value)) = &log_k.kind else {
-                return Err(
-                    "ds_hll_count_distinct 's second parameter's data type is wrong ".to_string(),
-                );
+                return Err(AnalyzeError::invalid_argument(
+                    "ds_hll_count_distinct 's second parameter's data type is wrong ",
+                    span,
+                ));
             };
             if !(4..=21).contains(value) {
-                return Err(
-                    "ds_hll_count_distinct second parameter'value should be between 4 and 21."
-                        .to_string(),
-                );
+                return Err(AnalyzeError::invalid_argument(
+                    "ds_hll_count_distinct second parameter'value should be between 4 and 21.",
+                    span,
+                ));
             }
         }
 
         if let Some(target) = args.get(2) {
             let ExprKind::Literal(LiteralValue::String(value)) = &target.kind else {
-                return Err(
-                    "ds_hll_count_distinct 's third parameter's data type is wrong ".to_string(),
-                );
+                return Err(AnalyzeError::invalid_argument(
+                    "ds_hll_count_distinct 's third parameter's data type is wrong ",
+                    span,
+                ));
             };
             if !matches!(value.as_str(), "HLL_4" | "HLL_6" | "HLL_8") {
-                return Err(
-                    "ds_hll_count_distinct third  parameter'value should be in HLL_4/HLL_6/HLL_8."
-                        .to_string(),
-                );
+                return Err(AnalyzeError::invalid_argument(
+                    "ds_hll_count_distinct third  parameter'value should be in HLL_4/HLL_6/HLL_8.",
+                    span,
+                ));
             }
         }
 
@@ -2978,7 +3285,8 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         fn_name: &str,
         arg: Option<&TypedExpr>,
-    ) -> Result<(), String> {
+        span: Span,
+    ) -> Result<(), AnalyzeError> {
         let Some(arg) = arg else {
             return Ok(());
         };
@@ -2996,8 +3304,9 @@ impl<'a> super::AnalyzerContext<'a> {
         {
             Ok(())
         } else {
-            Err(format!(
-                "Resolved function {fn_name} has no binary as argument type."
+            Err(AnalyzeError::type_mismatch(
+                format!("Resolved function {fn_name} has no binary as argument type."),
+                span,
             ))
         }
     }
@@ -4939,7 +5248,8 @@ mod tests {
         let [ast::Statement::Query(query)] = statements.as_slice() else {
             return Err("expected query".to_string());
         };
-        let (resolved, _registry, _factory) = analyze(query, &EmptyCatalog, "default")?;
+        let (resolved, _registry, _factory) =
+            analyze(query, &EmptyCatalog, "default").map_err(|error| error.to_string())?;
         let QueryBody::Select(select) = resolved.body else {
             return Err("expected select".to_string());
         };
@@ -5006,7 +5316,8 @@ mod tests {
         };
         last_name_part.value = name.to_string();
 
-        let (resolved, _registry, _factory) = analyze(query, &EmptyCatalog, "default")?;
+        let (resolved, _registry, _factory) =
+            analyze(query, &EmptyCatalog, "default").map_err(|error| error.to_string())?;
         let QueryBody::Select(select) = resolved.body else {
             return Err("expected select".to_string());
         };
@@ -5133,6 +5444,23 @@ mod tests {
                 .expect_err("wrong arity must fail during analysis");
             assert!(err.contains("No matching function"), "{name}: {err}");
         }
+    }
+
+    #[test]
+    fn unregistered_scalar_function_is_an_analyze_error() {
+        let statements = novarocks_parser::parse("select sqlp7_not_a_function(1)")
+            .expect("test query should parse");
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected query");
+        };
+
+        let error = analyze(query, &EmptyCatalog, "default")
+            .expect_err("an unregistered scalar function must fail during analysis");
+        assert_eq!(error.code().as_str(), "sql.analyze.unknown_function");
+        assert!(
+            error.span().is_some(),
+            "function AST span must be preserved"
+        );
     }
 
     #[test]

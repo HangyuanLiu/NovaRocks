@@ -192,6 +192,7 @@ impl InsertEngine for FakeInsertEngine {
                 base_snapshot_id: Some(10),
             },
             handle: Arc::new(FakePrepared { is_overwrite }),
+            sql_source: request.sql_source,
         })
     }
 
@@ -225,9 +226,10 @@ impl InsertEngine for FakeInsertEngine {
         _prepared: &'a dyn IcebergPreparedInsert,
     ) -> Result<
         novarocks_frontend::query_execution::dml::insert::PreparedIcebergWriteNativeEncoding<'a>,
-        String,
+        novarocks_frontend::dml::error::DmlExecutionError,
     > {
         novarocks_frontend::query_execution::dml::insert::PreparedIcebergWriteNativeEncoding::test_fixture()
+            .map_err(novarocks_frontend::dml::error::DmlExecutionError::from)
     }
 
     fn run_iceberg_write_with_native_bundle(

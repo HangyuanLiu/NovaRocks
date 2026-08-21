@@ -83,6 +83,7 @@ pub struct MutationOperation {
 pub struct PreparedMutation {
     pub operation: MutationOperation,
     pub handle: Arc<dyn MutationPrepared>,
+    pub sql_source: String,
 }
 
 pub enum MutationStageOutcome {
@@ -115,7 +116,7 @@ pub trait MutationEngine: Send + Sync {
     fn stage_mutation(
         &self,
         prepared: &dyn MutationPrepared,
-    ) -> Result<MutationStageOutcome, String>;
+    ) -> Result<MutationStageOutcome, crate::dml::error::DmlExecutionError>;
 
     /// Stage through the Frontend-owned native encoding boundary. The default
     /// preserves narrow test doubles that never materialize a Core plan.
@@ -123,7 +124,7 @@ pub trait MutationEngine: Send + Sync {
         &self,
         prepared: &dyn MutationPrepared,
         _encoder: &dyn MutationNativeFragmentEncoder,
-    ) -> Result<MutationStageOutcome, String> {
+    ) -> Result<MutationStageOutcome, crate::dml::error::DmlExecutionError> {
         self.stage_mutation(prepared)
     }
 
@@ -569,21 +570,27 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
             finalizer: Mutex::new(None),
             state: AtomicU8::new(PREPARED),
         });
-        Ok(PreparedMutation { operation, handle })
+        Ok(PreparedMutation {
+            operation,
+            handle,
+            sql_source: request.source.to_string(),
+        })
     }
 
     fn stage_mutation(
         &self,
         _prepared: &dyn MutationPrepared,
-    ) -> Result<MutationStageOutcome, String> {
-        Err("mutation staging requires the Frontend native fragment encoder".to_string())
+    ) -> Result<MutationStageOutcome, crate::dml::error::DmlExecutionError> {
+        Err(crate::dml::error::DmlExecutionError::from(
+            "mutation staging requires the Frontend native fragment encoder".to_string(),
+        ))
     }
 
     fn stage_mutation_with_native_encoder(
         &self,
         prepared: &dyn MutationPrepared,
         encoder: &dyn MutationNativeFragmentEncoder,
-    ) -> Result<MutationStageOutcome, String> {
+    ) -> Result<MutationStageOutcome, crate::dml::error::DmlExecutionError> {
         let prepared = prepared_handle(prepared)?;
         if prepared
             .state
@@ -591,7 +598,9 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
             .is_err()
         {
             return Err(
-                "mutation prepared handle has already reached a terminal stage".to_string(),
+                "mutation prepared handle has already reached a terminal stage"
+                    .to_string()
+                    .into(),
             );
         }
         let kernel = prepared

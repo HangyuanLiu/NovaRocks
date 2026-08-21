@@ -123,6 +123,7 @@ impl DeleteEngine for FakeDeleteEngine {
     }
 
     fn prepare_delete(&self, request: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String> {
+        let sql_source = request.source.to_string();
         self.prepare_calls.lock().unwrap().push((
             request.kind(),
             request.execution.topology().revision(),
@@ -138,6 +139,7 @@ impl DeleteEngine for FakeDeleteEngine {
                 base_snapshot_id: Some(7),
             },
             handle: Arc::new(FakePrepared),
+            sql_source,
         })
     }
 
@@ -158,9 +160,12 @@ impl DeleteEngine for FakeDeleteEngine {
     fn delete_native_encoding<'a>(
         &self,
         _prepared: &'a dyn DeletePrepared,
-    ) -> Result<novarocks_frontend::query_execution::dml::delete::DeleteNativeEncoding<'a>, String>
-    {
+    ) -> Result<
+        novarocks_frontend::query_execution::dml::delete::DeleteNativeEncoding<'a>,
+        novarocks_frontend::dml::error::DmlExecutionError,
+    > {
         novarocks_frontend::query_execution::dml::delete::DeleteNativeEncoding::test_fixture()
+            .map_err(novarocks_frontend::dml::error::DmlExecutionError::from)
     }
 
     fn run_delete_with_native_bundle(

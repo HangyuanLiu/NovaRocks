@@ -25,7 +25,12 @@ use crate::analysis::{
     BinOp, ExprKind, JoinKind, JoinRelation, QueryBody, Relation, ResolvedQuery, ResolvedSelect,
     TypedExpr,
 };
+use crate::analyze_error::AnalyzeError;
 use std::collections::{BTreeMap, BTreeSet};
+
+fn lineage_internal(message: impl Into<String>) -> AnalyzeError {
+    AnalyzeError::internal(message)
+}
 
 /// Immutable SQL facts for one resolved base-table schema.
 ///
@@ -117,10 +122,14 @@ pub(crate) struct SqlMvJoinLineageResult {
 pub(crate) fn build_projection_filter_lineage(
     resolved: &ResolvedQuery,
     base_schema: &SqlMvLineageSchema,
-) -> Result<SqlMvLineageResult, String> {
+) -> Result<SqlMvLineageResult, AnalyzeError> {
     let select = match &resolved.body {
         QueryBody::Select(s) => s,
-        _ => return Err("A11 lineage builder requires a SELECT query".to_string()),
+        _ => {
+            return Err(lineage_internal(
+                "A11 lineage builder requires a SELECT query",
+            ));
+        }
     };
     single_scan_or_err(select)?;
 
@@ -197,15 +206,27 @@ pub(crate) fn build_projection_filter_lineage(
 pub(crate) fn build_join_projection_filter_lineage(
     resolved: &ResolvedQuery,
     base_schemas: &[(&str, &str, &SqlMvLineageSchema)],
-) -> Result<SqlMvJoinLineageResult, String> {
+) -> Result<SqlMvJoinLineageResult, AnalyzeError> {
     let select = match &resolved.body {
         QueryBody::Select(s) => s,
-        _ => return Err("join lineage builder requires a SELECT query".to_string()),
+        _ => {
+            return Err(lineage_internal(
+                "join lineage builder requires a SELECT query",
+            ));
+        }
     };
     let join = match select.from.as_ref() {
         Some(Relation::Join(join)) => join,
-        Some(_) => return Err("join lineage builder requires a join relation".to_string()),
-        None => return Err("join lineage builder requires a FROM clause".to_string()),
+        Some(_) => {
+            return Err(lineage_internal(
+                "join lineage builder requires a join relation",
+            ));
+        }
+        None => {
+            return Err(lineage_internal(
+                "join lineage builder requires a FROM clause",
+            ));
+        }
     };
 
     let mut collector = QualifiedLineageCollector::new(base_schemas);
@@ -246,7 +267,10 @@ impl<'a> QualifiedLineageCollector<'a> {
         }
     }
 
-    fn output_lineage(&mut self, expr: &TypedExpr) -> Result<SqlMvOutputColumnLineage, String> {
+    fn output_lineage(
+        &mut self,
+        expr: &TypedExpr,
+    ) -> Result<SqlMvOutputColumnLineage, AnalyzeError> {
         let mut refs = Vec::new();
         let mut kind_hint = ExpressionKindHint::default();
         self.collect_qualified_refs(expr, &mut refs, &mut kind_hint)?;
@@ -259,7 +283,7 @@ impl<'a> QualifiedLineageCollector<'a> {
         })
     }
 
-    fn filter_lineage(&mut self, expr: &TypedExpr) -> Result<SqlMvFilterLineage, String> {
+    fn filter_lineage(&mut self, expr: &TypedExpr) -> Result<SqlMvFilterLineage, AnalyzeError> {
         let mut refs = Vec::new();
         let mut kind_hint = ExpressionKindHint::default();
         self.collect_qualified_refs(expr, &mut refs, &mut kind_hint)?;
@@ -274,15 +298,15 @@ impl<'a> QualifiedLineageCollector<'a> {
         expr: &TypedExpr,
         out: &mut Vec<SqlMvQualifiedFieldLineage>,
         kind: &mut ExpressionKindHint,
-    ) -> Result<(), String> {
+    ) -> Result<(), AnalyzeError> {
         match &expr.kind {
             ExprKind::ColumnRef {
                 qualifier, column, ..
             } => {
                 kind.saw_column();
-                let qualifier = qualifier
-                    .as_ref()
-                    .ok_or_else(|| format!("join MV column `{column}` must be qualified"))?;
+                let qualifier = qualifier.as_ref().ok_or_else(|| {
+                    lineage_internal(format!("join MV column `{column}` must be qualified"))
+                })?;
                 out.push(self.resolve_field(qualifier, column)?);
             }
             ExprKind::Literal(_) => kind.saw_literal(),
@@ -315,10 +339,12 @@ impl<'a> QualifiedLineageCollector<'a> {
         &mut self,
         qualifier: &str,
         column: &str,
-    ) -> Result<SqlMvQualifiedFieldLineage, String> {
+    ) -> Result<SqlMvQualifiedFieldLineage, AnalyzeError> {
         let key = qualifier.to_ascii_lowercase();
         let (table_fqn, schema) = self.schemas.get(&key).ok_or_else(|| {
-            format!("join MV qualifier `{qualifier}` does not match a base table alias")
+            lineage_internal(format!(
+                "join MV qualifier `{qualifier}` does not match a base table alias"
+            ))
         })?;
         let field = resolve_field(schema, column)?;
         self.base_fields_by_table
@@ -338,19 +364,23 @@ impl<'a> QualifiedLineageCollector<'a> {
         })
     }
 
-    fn join_contract(&mut self, join: &JoinRelation) -> Result<SqlMvJoinContract, String> {
+    fn join_contract(&mut self, join: &JoinRelation) -> Result<SqlMvJoinContract, AnalyzeError> {
         if join.join_type != JoinKind::Inner {
-            return Err("incremental join MV supports only inner equi-join lineage".to_string());
+            return Err(lineage_internal(
+                "incremental join MV supports only inner equi-join lineage",
+            ));
         }
         let condition = join
             .condition
             .as_ref()
-            .ok_or_else(|| "join MV requires ON condition".to_string())?;
+            .ok_or_else(|| lineage_internal("join MV requires ON condition"))?;
         let sides = join_side_qualifiers(join)?;
         let mut predicates = Vec::new();
         self.collect_join_predicates(condition, &sides, &mut predicates)?;
         if predicates.is_empty() {
-            return Err("incremental join MV requires at least one join predicate".to_string());
+            return Err(lineage_internal(
+                "incremental join MV requires at least one join predicate",
+            ));
         }
         Ok(SqlMvJoinContract {
             kind: SqlMvJoinContractKind::InnerEquiJoin,
@@ -363,7 +393,7 @@ impl<'a> QualifiedLineageCollector<'a> {
         expr: &TypedExpr,
         sides: &JoinSideQualifiers,
         out: &mut Vec<SqlMvJoinPredicateLineage>,
-    ) -> Result<(), String> {
+    ) -> Result<(), AnalyzeError> {
         match &unwrap_nested_expr(expr).kind {
             ExprKind::BinaryOp {
                 left,
@@ -383,27 +413,27 @@ impl<'a> QualifiedLineageCollector<'a> {
                 out.push(normalize_join_predicate(left_ref, right_ref, sides)?);
                 Ok(())
             }
-            _ => Err(
-                "incremental join MV supports only AND-combined equi-join predicates".to_string(),
-            ),
+            _ => Err(lineage_internal(
+                "incremental join MV supports only AND-combined equi-join predicates",
+            )),
         }
     }
 
     fn single_qualified_column(
         &mut self,
         expr: &TypedExpr,
-    ) -> Result<SqlMvQualifiedFieldLineage, String> {
+    ) -> Result<SqlMvQualifiedFieldLineage, AnalyzeError> {
         let ExprKind::ColumnRef {
             qualifier, column, ..
         } = &unwrap_nested_expr(expr).kind
         else {
-            return Err(
-                "incremental join MV join key must be a qualified column reference".to_string(),
-            );
+            return Err(lineage_internal(
+                "incremental join MV join key must be a qualified column reference",
+            ));
         };
-        let qualifier = qualifier
-            .as_ref()
-            .ok_or_else(|| "incremental join MV join key must be <alias>.<column>".to_string())?;
+        let qualifier = qualifier.as_ref().ok_or_else(|| {
+            lineage_internal("incremental join MV join key must be <alias>.<column>")
+        })?;
         self.resolve_field(qualifier, column)
     }
 
@@ -426,23 +456,26 @@ struct JoinSideQualifiers {
     right: BTreeSet<String>,
 }
 
-fn join_side_qualifiers(join: &JoinRelation) -> Result<JoinSideQualifiers, String> {
+fn join_side_qualifiers(join: &JoinRelation) -> Result<JoinSideQualifiers, AnalyzeError> {
     Ok(JoinSideQualifiers {
         left: relation_qualifiers(&join.left, "left")?,
         right: relation_qualifiers(&join.right, "right")?,
     })
 }
 
-fn relation_qualifiers(relation: &Relation, side_name: &str) -> Result<BTreeSet<String>, String> {
+fn relation_qualifiers(
+    relation: &Relation,
+    side_name: &str,
+) -> Result<BTreeSet<String>, AnalyzeError> {
     match relation {
         Relation::Scan(scan) => {
             let qualifier = scan.alias.as_deref().unwrap_or(&scan.table.name);
             Ok(one_qualifier(qualifier))
         }
         Relation::Subquery { alias, .. } => Ok(one_qualifier(alias)),
-        _ => Err(format!(
+        _ => Err(lineage_internal(format!(
             "join MV lineage requires a single scan or subquery on the {side_name} side"
-        )),
+        ))),
     }
 }
 
@@ -454,7 +487,7 @@ fn normalize_join_predicate(
     left_ref: SqlMvQualifiedFieldLineage,
     right_ref: SqlMvQualifiedFieldLineage,
     sides: &JoinSideQualifiers,
-) -> Result<SqlMvJoinPredicateLineage, String> {
+) -> Result<SqlMvJoinPredicateLineage, AnalyzeError> {
     let left_side = join_side_for_qualifier(&left_ref.qualifier_at_create, sides)?;
     let right_side = join_side_for_qualifier(&right_ref.qualifier_at_create, sides)?;
     match (left_side, right_side) {
@@ -466,29 +499,28 @@ fn normalize_join_predicate(
             left: right_ref,
             right: left_ref,
         }),
-        _ => Err(
-            "incremental join MV join predicate must reference one column from each join side"
-                .to_string(),
-        ),
+        _ => Err(lineage_internal(
+            "incremental join MV join predicate must reference one column from each join side",
+        )),
     }
 }
 
 fn join_side_for_qualifier(
     qualifier: &str,
     sides: &JoinSideQualifiers,
-) -> Result<JoinSide, String> {
+) -> Result<JoinSide, AnalyzeError> {
     let key = qualifier.to_ascii_lowercase();
     let on_left = sides.left.contains(&key);
     let on_right = sides.right.contains(&key);
     match (on_left, on_right) {
         (true, false) => Ok(JoinSide::Left),
         (false, true) => Ok(JoinSide::Right),
-        (true, true) => Err(format!(
+        (true, true) => Err(lineage_internal(format!(
             "join MV qualifier `{qualifier}` is ambiguous across join sides"
-        )),
-        (false, false) => Err(format!(
+        ))),
+        (false, false) => Err(lineage_internal(format!(
             "join MV qualifier `{qualifier}` does not match either join side"
-        )),
+        ))),
     }
 }
 
@@ -547,28 +579,30 @@ fn typed_expr_children(expr: &TypedExpr) -> Vec<&TypedExpr> {
     }
 }
 
-fn single_scan_or_err(select: &ResolvedSelect) -> Result<(), String> {
+fn single_scan_or_err(select: &ResolvedSelect) -> Result<(), AnalyzeError> {
     match select.from.as_ref() {
         Some(Relation::Scan(_)) => Ok(()),
-        Some(_) => Err(
-            "A11 lineage builder requires a single-base SCAN, not a join or subquery".to_string(),
-        ),
-        None => Err("A11 lineage builder requires a FROM clause".to_string()),
+        Some(_) => Err(lineage_internal(
+            "A11 lineage builder requires a single-base SCAN, not a join or subquery",
+        )),
+        None => Err(lineage_internal(
+            "A11 lineage builder requires a FROM clause",
+        )),
     }
 }
 
 fn resolve_field<'a>(
     schema: &'a SqlMvLineageSchema,
     column_name: &str,
-) -> Result<&'a SqlMvLineageField, String> {
+) -> Result<&'a SqlMvLineageField, AnalyzeError> {
     schema
         .fields
         .iter()
         .find(|field| field.name_at_create.eq_ignore_ascii_case(column_name))
         .ok_or_else(|| {
-            format!(
+            lineage_internal(format!(
                 "base iceberg schema does not contain column {column_name}; cannot build A11 lineage"
-            )
+            ))
         })
 }
 
@@ -965,7 +999,7 @@ mod tests {
     mod join_lineage {
         use super::*;
 
-        fn lineage_for_on(on_expr: &str) -> Result<SqlMvJoinLineageResult, String> {
+        fn lineage_for_on(on_expr: &str) -> Result<SqlMvJoinLineageResult, AnalyzeError> {
             let sql = format!(
                 "select l.id as left_id, r.id as right_id \
                  from ns.left_tbl l join ns.right_tbl r on {on_expr} \
@@ -1051,9 +1085,10 @@ mod tests {
                 Err(err) => err,
             };
             assert!(
-                err.contains("one column from each join side"),
+                err.message().contains("one column from each join side"),
                 "unexpected error: {err}"
             );
+            assert_eq!(err.span(), None, "lineage has no parser span to report");
         }
 
         #[test]
@@ -1142,6 +1177,7 @@ mod tests {
     fn resolve_field_errors_on_missing_column() {
         let s = base_schema();
         let err = resolve_field(&s, "nope").unwrap_err();
-        assert!(err.contains("nope"), "{err}");
+        assert!(err.message().contains("nope"), "{err}");
+        assert_eq!(err.span(), None, "lineage has no parser span to report");
     }
 }

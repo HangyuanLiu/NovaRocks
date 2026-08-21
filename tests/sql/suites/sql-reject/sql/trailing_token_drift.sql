@@ -15,10 +15,9 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- The current parser rejects residual tokens after a complete statement.
--- This is a drift assertion until SQLP-1 registers a parser-domain code and
--- the engine reports locations against original SQL text.
+-- The current parser rejects a residual token after a complete statement.
+-- This remains a drift assertion until SQLP-1 registers a parser-domain code
+-- and the engine reports locations against original SQL text.
 -- @expect_error_tier=drift
--- @expect_error=ERROR 1064 (42000): sql parser error: syntax error
-SELECT * FROM reject_placeholder_left JOIN reject_placeholder_right
-    ON reject_placeholder_left.id => reject_placeholder_right.id;
+-- @expect_error=[sql.parse.unexpected_token] expected ';' or end of input
+SELECT 1 );

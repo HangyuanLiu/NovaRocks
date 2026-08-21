@@ -74,6 +74,9 @@ struct FoundationDbShutdownCommand {
     response: oneshot::Sender<Result<(), StateStoreError>>,
 }
 
+type OpenedFoundationDbProvider =
+    Result<(Arc<dyn StateStore>, FoundationDbRuntimeOwner), StateStoreError>;
+
 impl FoundationDbRuntimeOwner {
     async fn shutdown(&mut self, deadline: Instant) -> Result<(), StateStoreError> {
         let Some(commands) = self.commands.as_ref() else {
@@ -142,9 +145,7 @@ async fn run_foundationdb_runtime_owner<R: FoundationDbProviderRuntime>(
     cluster_file: PathBuf,
     keyspace_id: Uuid,
     request: StateStoreOpenRequest,
-    opened: oneshot::Sender<
-        Result<(Arc<dyn StateStore>, FoundationDbRuntimeOwner), StateStoreError>,
-    >,
+    opened: oneshot::Sender<OpenedFoundationDbProvider>,
 ) {
     let deadline = request.deadline;
     let open = tokio::time::timeout_at(
@@ -428,55 +429,37 @@ mod tests {
     use novarocks_spi::state_store::{
         ChangePage, ChangePollRequest, CommitResolution, FeDeploymentView, ReadTransaction,
         StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits,
-        StateStoreMetricsSnapshot, StateStoreOpenRequest, StateStoreProviderInstance,
-        StoreIdentity, TransactionId, WriteTransaction,
+        StateStoreMetricsSnapshot, StateStoreOpenRequest, StateStoreProviderFactory,
+        StateStoreProviderInstance, StoreIdentity, TransactionId, WriteTransaction,
     };
 
-    use crate::state_store::{
-        FOUNDATIONDB_STATE_STORE_PROVIDER_ID, FoundationDbClientConfig, StateStoreAppConfig,
-        StateStoreConfig, StateStoreHostConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
-        builtin_state_store_provider_registry,
+    use crate::{
+        FOUNDATIONDB_STATE_STORE_PROVIDER_ID, FoundationDbClientConfig, FoundationDbProviderConfig,
     };
 
-    fn foundationdb_host_config(cluster_file: std::path::PathBuf) -> StateStoreHostConfig {
-        StateStoreHostConfig {
-            state_store: StateStoreAppConfig {
-                store: StateStoreConfig {
-                    cluster_id: "cluster-a".to_owned(),
-                    limits: StateStoreLimitOverrides::default(),
-                    provider: StateStoreProviderConfig::Foundationdb {
-                        cluster_file,
-                        keyspace_id: Uuid::nil(),
-                    },
-                },
-                mysql_client: None,
+    #[test]
+    fn foundationdb_factory_binds_the_typed_descriptor_without_network_start() {
+        let temp = TempDir::new().expect("FoundationDB bind temp dir");
+        let cluster_file = temp.path().join("fdb.cluster");
+        std::fs::write(&cluster_file, b"test:test@127.0.0.1:4500")
+            .expect("write FoundationDB cluster file");
+        let factory = super::FoundationDbStateStoreProviderFactory::new(
+            FoundationDbProviderConfig {
+                cluster_file,
+                keyspace_id: Uuid::nil(),
             },
-            foundationdb_client: Some(FoundationDbClientConfig {
+            FoundationDbClientConfig {
                 disable_multi_version_client: true,
                 tls_cert_path: None,
                 tls_key_path: None,
                 tls_ca_path: None,
                 tls_verify_peers: None,
                 tls_password_env: None,
-            }),
-        }
-    }
-
-    #[test]
-    fn foundationdb_registration_binds_the_typed_factory_without_network_start() {
-        let temp = TempDir::new().expect("FoundationDB bind temp dir");
-        let cluster_file = temp.path().join("fdb.cluster");
-        std::fs::write(&cluster_file, b"test:test@127.0.0.1:4500")
-            .expect("write FoundationDB cluster file");
-        let registry = builtin_state_store_provider_registry().unwrap();
-        let bound = registry
-            .bind(
-                FOUNDATIONDB_STATE_STORE_PROVIDER_ID,
-                &foundationdb_host_config(cluster_file),
-            )
-            .unwrap();
+            },
+        )
+        .expect("FoundationDB factory");
         assert_eq!(
-            bound.factory.descriptor().id,
+            factory.descriptor().id,
             FOUNDATIONDB_STATE_STORE_PROVIDER_ID
         );
         assert_foundationdb_instance_contract::<super::FoundationDbStateStoreProviderInstance>();

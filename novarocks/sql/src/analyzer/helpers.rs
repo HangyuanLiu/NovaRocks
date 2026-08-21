@@ -20,6 +20,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Fields};
 use novarocks_parser::{ast, printer};
 
+use crate::analyze_error::AnalyzeError;
 use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
 // ---------------------------------------------------------------------------
@@ -32,7 +33,7 @@ fn nested_field_with_logical_type(
     name: &str,
     sql_type: &novarocks_parser::ast::TypeName,
     nullable: bool,
-) -> Result<Field, String> {
+) -> Result<Field, AnalyzeError> {
     let arrow = sql_type_to_arrow(sql_type)?;
     let mut field = Field::new(name, arrow, nullable);
     if is_json_sql_type(sql_type) {
@@ -51,13 +52,15 @@ fn is_json_sql_type(sql_type: &novarocks_parser::ast::TypeName) -> bool {
 
 pub(super) fn sql_type_to_arrow(
     sql_type: &novarocks_parser::ast::TypeName,
-) -> Result<DataType, String> {
+) -> Result<DataType, AnalyzeError> {
     let type_name = sql_type
         .name
         .parts
         .last()
         .map(|part| part.value.to_ascii_lowercase())
-        .ok_or_else(|| "CAST target type has no name".to_string())?;
+        .ok_or_else(|| {
+            AnalyzeError::invalid_query_shape("CAST target type has no name", sql_type.span)
+        })?;
     let type_args = &sql_type.arguments;
     match type_name.as_str() {
         "tinyint" => Ok(DataType::Int8),
@@ -90,14 +93,14 @@ pub(super) fn sql_type_to_arrow(
             Ok(DataType::Decimal128(precision, scale))
         }
         "array" => {
-            let element = type_type_argument(type_args, 0, "ARRAY")?;
+            let element = type_type_argument(type_args, 0, "ARRAY", sql_type.span)?;
             Ok(DataType::List(Arc::new(nested_field_with_logical_type(
                 "item", element, true,
             )?)))
         }
         "map" => {
-            let key = type_type_argument(type_args, 0, "MAP")?;
-            let value = type_type_argument(type_args, 1, "MAP")?;
+            let key = type_type_argument(type_args, 0, "MAP", sql_type.span)?;
+            let value = type_type_argument(type_args, 1, "MAP", sql_type.span)?;
             let key = nested_field_with_logical_type("key", key, true)?;
             let value = nested_field_with_logical_type("value", value, true)?;
             Ok(DataType::Map(
@@ -125,45 +128,76 @@ pub(super) fn sql_type_to_arrow(
                         )?))
                     }
                     novarocks_parser::ast::TypeNameArgument::Literal(_) => {
-                        Err("STRUCT type field must include a type name".to_string())
+                        Err(AnalyzeError::invalid_argument(
+                            "STRUCT type field must include a type name",
+                            type_name_argument_span(argument),
+                        ))
                     }
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<Result<Vec<_>, AnalyzeError>>()?;
             Ok(DataType::Struct(Fields::from(fields)))
         }
-        _ => Err(format!("unsupported SQL type: {type_name}")),
+        _ => Err(AnalyzeError::unsupported_query_shape(
+            format!("unsupported SQL type: {type_name}"),
+            sql_type.span,
+        )),
     }
 }
 
 fn type_numeric_argument(
     arguments: &[novarocks_parser::ast::TypeNameArgument],
     index: usize,
-) -> Result<Option<u64>, String> {
+) -> Result<Option<u64>, AnalyzeError> {
     let Some(argument) = arguments.get(index) else {
         return Ok(None);
     };
     let novarocks_parser::ast::TypeNameArgument::Literal(literal) = argument else {
-        return Err("numeric type parameter must be a literal".to_string());
+        return Err(AnalyzeError::invalid_literal(
+            "numeric type parameter must be a literal",
+            type_name_argument_span(argument),
+        ));
     };
     let novarocks_parser::ast::LiteralKind::Number(value) = &literal.kind else {
-        return Err("numeric type parameter must be an integer literal".to_string());
+        return Err(AnalyzeError::invalid_literal(
+            "numeric type parameter must be an integer literal",
+            literal.span,
+        ));
     };
-    value
-        .parse::<u64>()
-        .map(Some)
-        .map_err(|error| format!("invalid numeric type parameter `{value}`: {error}"))
+    value.parse::<u64>().map(Some).map_err(|error| {
+        AnalyzeError::invalid_literal(
+            format!("invalid numeric type parameter `{value}`: {error}"),
+            literal.span,
+        )
+    })
 }
 
 fn type_type_argument<'a>(
     arguments: &'a [novarocks_parser::ast::TypeNameArgument],
     index: usize,
     kind: &str,
-) -> Result<&'a novarocks_parser::ast::TypeName, String> {
+    type_span: novarocks_parser::Span,
+) -> Result<&'a novarocks_parser::ast::TypeName, AnalyzeError> {
     let Some(novarocks_parser::ast::TypeNameArgument::Type(data_type)) = arguments.get(index)
     else {
-        return Err(format!("{kind} type requires a type parameter"));
+        return Err(AnalyzeError::invalid_argument(
+            format!("{kind} type requires a type parameter"),
+            arguments
+                .get(index)
+                .map(type_name_argument_span)
+                .unwrap_or(type_span),
+        ));
     };
     Ok(data_type)
+}
+
+fn type_name_argument_span(
+    argument: &novarocks_parser::ast::TypeNameArgument,
+) -> novarocks_parser::Span {
+    match argument {
+        novarocks_parser::ast::TypeNameArgument::Type(type_name) => type_name.span,
+        novarocks_parser::ast::TypeNameArgument::Literal(literal) => literal.span,
+        novarocks_parser::ast::TypeNameArgument::Field(field) => field.span,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -940,41 +974,47 @@ fn lowercase_leading_keyword(display: &str) -> String {
 // LIMIT / OFFSET extraction
 // ---------------------------------------------------------------------------
 
-pub(super) fn extract_limit(query: &ast::Query) -> Result<Option<i64>, String> {
+pub(super) fn extract_limit(query: &ast::Query) -> Result<Option<i64>, AnalyzeError> {
     match &query.limit {
         Some(limit) => eval_limit_or_offset(limit, "LIMIT").map(Some),
         None => Ok(None),
     }
 }
 
-pub(super) fn extract_offset(query: &ast::Query) -> Result<Option<i64>, String> {
+pub(super) fn extract_offset(query: &ast::Query) -> Result<Option<i64>, AnalyzeError> {
     match &query.offset {
         Some(offset) => eval_limit_or_offset(&offset.value, "OFFSET").map(Some),
         None => Ok(None),
     }
 }
 
-fn eval_limit_or_offset(expr: &ast::Expr, keyword: &str) -> Result<i64, String> {
+fn eval_limit_or_offset(expr: &ast::Expr, keyword: &str) -> Result<i64, AnalyzeError> {
     match expr {
         ast::Expr::Literal(ast::Literal {
             kind: ast::LiteralKind::Number(value),
             ..
-        }) => value
-            .parse::<i64>()
-            .map_err(|error| format!("invalid {keyword} value: {error}")),
-        _ => Err(format!("only constant {keyword} is supported")),
+        }) => value.parse::<i64>().map_err(|error| {
+            AnalyzeError::invalid_literal(format!("invalid {keyword} value: {error}"), expr.span())
+        }),
+        _ => Err(AnalyzeError::invalid_argument(
+            format!("only constant {keyword} is supported"),
+            expr.span(),
+        )),
     }
 }
 
 /// Evaluate a constant integer expression (literals and simple arithmetic).
-pub(super) fn eval_const_i64(expr: &ast::Expr) -> Result<i64, String> {
+pub(super) fn eval_const_i64(expr: &ast::Expr) -> Result<i64, AnalyzeError> {
     match expr {
         ast::Expr::Literal(ast::Literal {
             kind: ast::LiteralKind::Number(value),
             ..
-        }) => value
-            .parse::<i64>()
-            .map_err(|error| format!("cannot parse integer literal '{value}': {error}")),
+        }) => value.parse::<i64>().map_err(|error| {
+            AnalyzeError::invalid_literal(
+                format!("cannot parse integer literal '{value}': {error}"),
+                expr.span(),
+            )
+        }),
         ast::Expr::Unary(unary) if unary.operator == ast::UnaryOperator::Minus => {
             Ok(-eval_const_i64(&unary.expression)?)
         }
@@ -987,16 +1027,22 @@ pub(super) fn eval_const_i64(expr: &ast::Expr) -> Result<i64, String> {
                 ast::BinaryOperator::Multiply => Ok(left * right),
                 ast::BinaryOperator::Divide if right != 0 => Ok(left / right),
                 ast::BinaryOperator::Modulo if right != 0 => Ok(left % right),
-                _ => Err(format!(
-                    "unsupported operator in constant expression: {}",
-                    binary_operator_display(binary.operator)
+                _ => Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "unsupported operator in constant expression: {}",
+                        binary_operator_display(binary.operator)
+                    ),
+                    expr.span(),
                 )),
             }
         }
         ast::Expr::Nested(nested) => eval_const_i64(&nested.expression),
-        _ => Err(format!(
-            "expected constant integer expression, got: {}",
-            printer::print_expr(expr)
+        _ => Err(AnalyzeError::invalid_literal(
+            format!(
+                "expected constant integer expression, got: {}",
+                printer::print_expr(expr)
+            ),
+            expr.span(),
         )),
     }
 }

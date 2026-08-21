@@ -567,7 +567,7 @@ mod tests {
         fn run_coordinated_write(
             &self,
             _spec: &WriteTransactionSpec,
-        ) -> Result<CoordinatedWriteReport<()>, String> {
+        ) -> Result<CoordinatedWriteReport<()>, crate::dml::error::DmlError> {
             Ok(CoordinatedWriteReport::CommitRequired(()))
         }
 

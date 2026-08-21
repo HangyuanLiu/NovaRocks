@@ -15,21 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
+
+use novarocks_server::app_config::NovaRocksConfig;
+use novarocks_server::state_store_config::{MySqlTlsMode, StateStoreProviderConfig};
+use uuid::Uuid;
+
+#[cfg(not(feature = "foundationdb-provider"))]
+use std::num::NonZeroUsize;
+#[cfg(not(feature = "foundationdb-provider"))]
 use std::time::{Duration, Instant};
 
+#[cfg(not(feature = "foundationdb-provider"))]
 use bytes::Bytes;
+#[cfg(not(feature = "foundationdb-provider"))]
 use novarocks_frontend::state_store::{
     StateStoreHost, StateStoreHostErrorKind, StateStoreHostInput,
 };
-use novarocks_server::app_config::NovaRocksConfig;
+#[cfg(not(feature = "foundationdb-provider"))]
 use novarocks_server::composition::state_store_provider_registry;
-use novarocks_server::state_store_config::{
-    FOUNDATIONDB_STATE_STORE_PROVIDER_ID, MySqlTlsMode, StateStoreProviderConfig,
-};
+#[cfg(not(feature = "foundationdb-provider"))]
+use novarocks_server::state_store_config::FOUNDATIONDB_STATE_STORE_PROVIDER_ID;
+#[cfg(not(feature = "foundationdb-provider"))]
 use novarocks_spi::state_store::{FeDeploymentView, StateStoreLimits};
-use uuid::Uuid;
 
 #[test]
 fn mysql_config_parses_exact_nested_client_shape() -> anyhow::Result<()> {

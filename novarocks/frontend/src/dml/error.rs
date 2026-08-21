@@ -19,6 +19,7 @@ use std::fmt;
 
 use novarocks_parser::Span;
 use novarocks_spi::connector::ConnectorWriteReceipt;
+use novarocks_sql::analyze_error::AnalyzeError;
 use novarocks_user_error::{
     ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserError,
 };
@@ -131,6 +132,71 @@ pub struct DmlError {
     committed_receipt: Option<Box<ConnectorWriteReceipt>>,
     user_error: Option<UserError>,
 }
+
+/// DML-local carrier for a SQL analysis error before the frontend client
+/// boundary renders it as a [`UserError`].
+///
+/// The carrier intentionally keeps non-analysis failures as opaque engine
+/// text. It must not infer a user-facing code from that text.
+#[derive(Debug)]
+pub enum DmlExecutionError {
+    Engine(String),
+    Analyze(AnalyzeError),
+}
+
+impl DmlExecutionError {
+    pub(crate) fn from_compile(error: novarocks_sql::compiler::SqlCompileError) -> Self {
+        match error {
+            novarocks_sql::compiler::SqlCompileError::Analyze(error) => Self::Analyze(error),
+            error => Self::Engine(error.to_string()),
+        }
+    }
+
+    pub(crate) fn into_dml_error(self, source: Option<&str>) -> DmlError {
+        match self {
+            Self::Engine(error) => DmlError::executor(error),
+            Self::Analyze(error) => DmlError::admit(error.to_user_error(source)),
+        }
+    }
+}
+
+impl From<String> for DmlExecutionError {
+    fn from(error: String) -> Self {
+        Self::Engine(error)
+    }
+}
+
+impl From<&str> for DmlExecutionError {
+    fn from(error: &str) -> Self {
+        Self::Engine(error.to_string())
+    }
+}
+
+impl From<crate::query_execution::planning::time_travel::TimeTravelRewriteError>
+    for DmlExecutionError
+{
+    fn from(error: crate::query_execution::planning::time_travel::TimeTravelRewriteError) -> Self {
+        match error {
+            crate::query_execution::planning::time_travel::TimeTravelRewriteError::Engine(
+                error,
+            ) => Self::Engine(error),
+            crate::query_execution::planning::time_travel::TimeTravelRewriteError::Analyze(
+                error,
+            ) => Self::Analyze(error),
+        }
+    }
+}
+
+impl std::fmt::Display for DmlExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Engine(error) => formatter.write_str(error),
+            Self::Analyze(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for DmlExecutionError {}
 
 impl DmlError {
     pub(crate) fn new(kind: DmlErrorKind, error: impl fmt::Display) -> Self {
