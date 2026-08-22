@@ -36,6 +36,12 @@ pub struct MysqlClientConnectionRegistry {
     state: Arc<Mutex<RegistryState>>,
 }
 
+impl Default for MysqlClientConnectionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct RegistryState {
     next_connection_id: u32,
     next_generation: u64,
