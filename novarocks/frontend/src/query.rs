@@ -852,10 +852,10 @@ impl FrontendQuerySession {
                 .as_ref()
                 .is_some_and(|statement| match statement {
                     ParsedStatement::Query(query) => {
-                        novarocks_sql::syntax::extract_allow_throw_exception_hint(query)
+                        novarocks_sql::admission::query_allows_throw_exception_hint(query)
                     }
                     ParsedStatement::ExplainQuery(explain) => {
-                        novarocks_sql::syntax::extract_allow_throw_exception_hint(&explain.query)
+                        novarocks_sql::admission::query_allows_throw_exception_hint(&explain.query)
                     }
                     _ => false,
                 }),

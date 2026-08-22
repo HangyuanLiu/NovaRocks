@@ -31,6 +31,7 @@ use novarocks_parser::ast::{
     DmlStatement, MergeClause, MergeMatchedAction, MutationSource, ObjectName as ParsedObjectName,
 };
 use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_sql::semantic::ObjectName;
 
 const PREPARED: u8 = 0;
 const STAGED: u8 = 1;
@@ -245,8 +246,8 @@ fn source_slice<'a>(source: &'a str, span: Span, context: &str) -> Result<&'a st
         .ok_or_else(|| format!("{context} span is outside the admitted SQL source"))
 }
 
-fn lower_object_name(name: &ParsedObjectName) -> novarocks_sql::syntax::ObjectName {
-    novarocks_sql::syntax::ObjectName {
+fn lower_object_name(name: &ParsedObjectName) -> ObjectName {
+    ObjectName {
         parts: name.parts.iter().map(|part| part.value.clone()).collect(),
     }
 }

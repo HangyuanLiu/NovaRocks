@@ -20,6 +20,10 @@
 use std::sync::Arc;
 
 use crate::mv::domain::application::MvApplicationService;
+use crate::mv::domain::application::{
+    MvAlterAction, MvAlterStatement, MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement,
+    MvShowStatement,
+};
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest};
@@ -31,17 +35,13 @@ use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target
 use crate::mv::domain::repository::MvRepository;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_parser::ast::Visit;
-use novarocks_sql::syntax::{
-    AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
-    DropMaterializedViewStmt, MaterializedViewRefreshPolicy, ShowMaterializedViewsStmt,
-};
 use novarocks_types::naming::normalize_identifier;
 
 fn default_mv_storage_engine() -> &'static str {
     "iceberg"
 }
 
-fn storage_engine_for_create(stmt: &CreateMaterializedViewStmt) -> Result<MvStorageEngine, String> {
+fn storage_engine_for_create(stmt: &MvCreateStatement) -> Result<MvStorageEngine, String> {
     let configured = stmt
         .properties
         .iter()
@@ -80,15 +80,11 @@ fn existing_mv_storage_engine_by_target(
     MvStorageEngine::from_sql_str(&definition.storage_engine).map(Some)
 }
 
-fn stored_refresh_policy(
-    policy: &MaterializedViewRefreshPolicy,
-) -> (StoredMvRefreshPolicy, Option<i64>) {
+fn stored_refresh_policy(policy: &MvCreateRefreshPolicy) -> (StoredMvRefreshPolicy, Option<i64>) {
     match policy {
-        MaterializedViewRefreshPolicy::Manual => (StoredMvRefreshPolicy::Manual, None),
-        MaterializedViewRefreshPolicy::AsyncOnChange => {
-            (StoredMvRefreshPolicy::AsyncOnChange, None)
-        }
-        MaterializedViewRefreshPolicy::AsyncInterval { interval_ms } => {
+        MvCreateRefreshPolicy::Manual => (StoredMvRefreshPolicy::Manual, None),
+        MvCreateRefreshPolicy::AsyncOnChange => (StoredMvRefreshPolicy::AsyncOnChange, None),
+        MvCreateRefreshPolicy::AsyncInterval { interval_ms } => {
             (StoredMvRefreshPolicy::AsyncInterval, Some(*interval_ms))
         }
     }
@@ -99,7 +95,7 @@ fn stored_refresh_policy(
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 pub(crate) fn initial_refresh_configuration_for_create(
-    policy: &MaterializedViewRefreshPolicy,
+    policy: &MvCreateRefreshPolicy,
 ) -> crate::mv::domain::repository::InitialMvRefreshConfiguration {
     let (policy, interval_ms) = stored_refresh_policy(policy);
     crate::mv::domain::repository::InitialMvRefreshConfiguration {
@@ -117,7 +113,7 @@ pub(crate) fn initial_refresh_configuration_for_create(
 )]
 pub(crate) fn refresh_metadata_request_for_create(
     mv_id: i64,
-    policy: &MaterializedViewRefreshPolicy,
+    policy: &MvCreateRefreshPolicy,
 ) -> UpdateMvRefreshMetadataRequest {
     let initial = initial_refresh_configuration_for_create(policy);
     UpdateMvRefreshMetadataRequest {
@@ -133,7 +129,7 @@ pub(crate) fn refresh_metadata_request_for_create(
 
 fn refresh_metadata_request_for_policy(
     definition: &StoredMvDefinition,
-    policy: &MaterializedViewRefreshPolicy,
+    policy: &MvCreateRefreshPolicy,
     refresh_paused: bool,
 ) -> UpdateMvRefreshMetadataRequest {
     let (refresh_policy, refresh_interval_ms) = stored_refresh_policy(policy);
@@ -152,9 +148,9 @@ fn load_definition_for_alter(
     repository: &dyn MvRepository,
     current_catalog: Option<&str>,
     db: &str,
-    name: &novarocks_parser::ast::ObjectName,
+    name_parts: &[String],
 ) -> Result<StoredMvDefinition, String> {
-    let target = resolve_refresh_target(current_catalog, db, name)?;
+    let target = resolve_refresh_target(current_catalog, db, name_parts)?;
     let Some(definition) = repository
         .find_by_target(&MvTarget {
             catalog: Some(target.catalog.clone()),
@@ -187,7 +183,7 @@ pub fn create_mv_with_ports(
     mv_backend: &IcebergMvBackend,
     current_catalog: Option<&str>,
     db: &str,
-    stmt: &CreateMaterializedViewStmt,
+    stmt: &MvCreateStatement,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
@@ -198,9 +194,8 @@ pub fn create_mv_with_ports(
         ports.clone(),
         connector_context.clone(),
     );
-    let application_statement = crate::mv::domain::application::MvApplicationStatement::Create(
-        crate::mv::domain::application::MvCreateStatement::from(stmt),
-    );
+    let application_statement =
+        crate::mv::domain::application::MvApplicationStatement::Create(stmt.clone());
     match application.try_handle_statement(
         &engine,
         &application_statement,
@@ -233,11 +228,11 @@ pub fn drop_mv_with_ports(
     mv_backend: &IcebergMvBackend,
     current_catalog: Option<&str>,
     db: &str,
-    stmt: &DropMaterializedViewStmt,
+    stmt: &MvDropStatement,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
-    let target = resolve_refresh_target(current_catalog, db, &stmt.name)?;
+    let target = resolve_refresh_target(current_catalog, db, &stmt.name_parts)?;
     if let Some(engine) = existing_mv_storage_engine_by_target(repository, &target)?
         && engine != MvStorageEngine::Iceberg
     {
@@ -263,21 +258,21 @@ pub fn alter_mv_with_ports(
     ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     db: &str,
-    stmt: &AlterMaterializedViewStmt,
+    stmt: &MvAlterStatement,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
-    if matches!(stmt.action, AlterMaterializedViewAction::Repartition(_)) {
+    if matches!(stmt.action, MvAlterAction::Repartition(_)) {
         return Err(
             "ALTER MATERIALIZED VIEW ... REPARTITION requires the frontend MV lifecycle"
                 .to_string(),
         );
     }
-    if matches!(stmt.action, AlterMaterializedViewAction::SetProperties(_)) {
+    if matches!(stmt.action, MvAlterAction::SetProperties(_)) {
         let current_catalog = current_catalog.ok_or_else(|| {
             "ALTER MATERIALIZED VIEW requires current Iceberg catalog".to_string()
         })?;
-        let target = resolve_refresh_target(Some(current_catalog), db, &stmt.name)?;
+        let target = resolve_refresh_target(Some(current_catalog), db, &stmt.name_parts)?;
         let engine = existing_mv_storage_engine_by_target(ports.repository().as_ref(), &target)?
             .ok_or_else(|| {
                 format!(
@@ -291,7 +286,7 @@ pub fn alter_mv_with_ports(
                     .to_string(),
             );
         }
-        let AlterMaterializedViewAction::SetProperties(entries) = &stmt.action else {
+        let MvAlterAction::SetProperties(entries) = &stmt.action else {
             unreachable!("properties branch was checked above")
         };
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
@@ -321,13 +316,17 @@ pub fn alter_mv_with_ports(
         )?;
         return Ok(StatementResult::Ok);
     }
-    let definition =
-        load_definition_for_alter(ports.repository().as_ref(), current_catalog, db, &stmt.name)?;
+    let definition = load_definition_for_alter(
+        ports.repository().as_ref(),
+        current_catalog,
+        db,
+        &stmt.name_parts,
+    )?;
     let req = match &stmt.action {
-        AlterMaterializedViewAction::SetRefresh(policy) => {
+        MvAlterAction::SetRefresh(policy) => {
             refresh_metadata_request_for_policy(&definition, policy, definition.refresh_paused)
         }
-        AlterMaterializedViewAction::PauseRefresh => UpdateMvRefreshMetadataRequest {
+        MvAlterAction::PauseRefresh => UpdateMvRefreshMetadataRequest {
             mv_id: definition.mv_id,
             refresh_policy: definition.refresh_policy.clone(),
             refresh_paused: true,
@@ -336,7 +335,7 @@ pub fn alter_mv_with_ports(
             last_scheduler_error: definition.last_scheduler_error.clone(),
             next_refresh_after_ms: definition.next_refresh_after_ms,
         },
-        AlterMaterializedViewAction::ResumeRefresh => UpdateMvRefreshMetadataRequest {
+        MvAlterAction::ResumeRefresh => UpdateMvRefreshMetadataRequest {
             mv_id: definition.mv_id,
             refresh_policy: definition.refresh_policy.clone(),
             refresh_paused: false,
@@ -345,8 +344,7 @@ pub fn alter_mv_with_ports(
             last_scheduler_error: definition.last_scheduler_error.clone(),
             next_refresh_after_ms: definition.next_refresh_after_ms,
         },
-        AlterMaterializedViewAction::Repartition(_)
-        | AlterMaterializedViewAction::SetProperties(_) => {
+        MvAlterAction::Repartition(_) | MvAlterAction::SetProperties(_) => {
             unreachable!("repartition and properties returned before metadata update")
         }
     };
@@ -376,7 +374,7 @@ pub fn alter_mv_with_ports(
 pub fn list_mvs_with_backend(
     mv_backend: &IcebergMvBackend,
     current_catalog: Option<&str>,
-    stmt: &ShowMaterializedViewsStmt,
+    stmt: &MvShowStatement,
 ) -> Result<StatementResult, String> {
     let req = ListMvsRequest {
         stmt: stmt.clone(),

@@ -1302,7 +1302,7 @@ fn test_request_context_with_role(
     reason = "Retained for the view compilation compatibility path exercised by integration tests."
 )]
 fn resolve_default_view_database(
-    name: &novarocks_sql::syntax::ObjectName,
+    name: &novarocks_sql::semantic::ObjectName,
     current_catalog: Option<&str>,
 ) -> Result<Option<String>, String> {
     let database = match name.parts.as_slice() {

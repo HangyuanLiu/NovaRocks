@@ -39,8 +39,9 @@ use crate::mv::domain::analysis_adapter::{
     BaseColumnDescriptor, BaseTableDescriptor, now_ms, validate_ivm_primary_key,
 };
 use crate::mv::domain::application::{
-    CreatedMvTarget, MvCreateStatement, MvEngine, MvEngineError, MvEngineErrorKind,
-    PrepareMvCreateRequest, PreparedMvCreate, PreparedMvDefinition,
+    CreatedMvTarget, MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement, MvEngine,
+    MvEngineError, MvEngineErrorKind, MvRefreshRequest, PrepareMvCreateRequest, PreparedMvCreate,
+    PreparedMvDefinition,
 };
 #[cfg(test)]
 use crate::mv::domain::application::{MvIncrementalJoinMode, MvIncrementalWriteMode};
@@ -125,10 +126,7 @@ use novarocks_sql::planning::mv::{
     SqlMvObservedSchemaFacts, SqlMvOutputColumnFacts, SqlMvPersistedApplyKeySourceFacts,
     extract_join_aliases, extract_single_scan_table_fqn, mv_apply_key_source_from_column_name,
 };
-use novarocks_sql::syntax::{
-    CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr,
-    MaterializedViewRefreshPolicy, ObjectName, RefreshMaterializedViewStmt, TableColumnDef,
-};
+use novarocks_sql::semantic::{IcebergPartitionFieldExpr, ObjectName, TableColumnDef};
 use novarocks_types::naming::{TableIdentity, normalize_identifier};
 
 /// The explicit Core ports a refresh preparation may read while deriving its
@@ -1086,11 +1084,11 @@ pub(crate) fn create_iceberg_mv_with_ports(
     ports: IcebergMvCorePorts,
     current_catalog: Option<&str>,
     current_database: &str,
-    stmt: &CreateMaterializedViewStmt,
+    stmt: &MvCreateStatement,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
-    let statement = MvCreateStatement::from(stmt);
+    let statement = stmt.clone();
     let engine = StandaloneMvEngine::new_with_ports(ports.clone(), connector_context.clone());
     let plan = engine
         .prepare_create(
@@ -1674,23 +1672,23 @@ fn descriptor_dependency_from_request(request: &CreateMvDependencyRequest) -> De
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
 fn refresh_policy_descriptor_json(
-    policy: &MaterializedViewRefreshPolicy,
+    policy: &MvCreateRefreshPolicy,
     paused: bool,
 ) -> serde_json::Value {
     match policy {
-        MaterializedViewRefreshPolicy::Manual => serde_json::json!({
+        MvCreateRefreshPolicy::Manual => serde_json::json!({
             "policy": "DEFERRED_MANUAL",
             "interval_ms": null,
             "paused": paused,
         }),
-        MaterializedViewRefreshPolicy::AsyncOnChange => {
+        MvCreateRefreshPolicy::AsyncOnChange => {
             serde_json::json!({
                 "policy": "ASYNC_ON_CHANGE",
                 "interval_ms": null,
                 "paused": paused,
             })
         }
-        MaterializedViewRefreshPolicy::AsyncInterval { interval_ms } => {
+        MvCreateRefreshPolicy::AsyncInterval { interval_ms } => {
             serde_json::json!({
                 "policy": "ASYNC_INTERVAL",
                 "interval_ms": interval_ms,
@@ -3814,12 +3812,13 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
     source: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     current_database: &str,
-    stmt: &RefreshMaterializedViewStmt,
+    stmt: &MvRefreshRequest,
     target: MvTarget,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<RefreshPlan, RefreshError> {
-    let iceberg_target = resolve_refresh_target(current_catalog, current_database, &stmt.name)
-        .map_err(RefreshError::user)?;
+    let iceberg_target =
+        resolve_refresh_target(current_catalog, current_database, &stmt.name_parts)
+            .map_err(RefreshError::user)?;
     if stmt.full {
         return Err(RefreshError::user(FULL_REFRESH_DISABLED_MESSAGE));
     }
@@ -4264,7 +4263,7 @@ fn plan_iceberg_union_projection_mv_refresh(
     source: &dyn IcebergMvRefreshSource,
     iceberg_target: &IcebergMvTarget,
     target: MvTarget,
-    stmt: &RefreshMaterializedViewStmt,
+    stmt: &MvRefreshRequest,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
@@ -4460,7 +4459,7 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
     source: &dyn IcebergMvRefreshSource,
     iceberg_target: &IcebergMvTarget,
     target: MvTarget,
-    stmt: &RefreshMaterializedViewStmt,
+    stmt: &MvRefreshRequest,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
@@ -4630,7 +4629,7 @@ fn plan_iceberg_aggregate_mv_refresh(
     source: &dyn IcebergMvRefreshSource,
     iceberg_target: &IcebergMvTarget,
     target: MvTarget,
-    stmt: &RefreshMaterializedViewStmt,
+    stmt: &MvRefreshRequest,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
@@ -4920,7 +4919,7 @@ fn plan_iceberg_aggregate_mv_refresh(
 fn build_iceberg_refresh_plan(
     mv_definition: &StoredMvDefinition,
     target: MvTarget,
-    stmt: &RefreshMaterializedViewStmt,
+    stmt: &MvRefreshRequest,
     current_catalog: Option<&str>,
     current_database: &str,
     base_refs: &[TableIdentity],
@@ -5735,7 +5734,7 @@ pub(crate) fn drop_iceberg_mv_with_ports(
     ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     current_database: &str,
-    stmt: &DropMaterializedViewStmt,
+    stmt: &MvDropStatement,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
@@ -5744,12 +5743,7 @@ pub(crate) fn drop_iceberg_mv_with_ports(
         current_catalog,
         current_database,
         &ObjectName {
-            parts: stmt
-                .name
-                .parts
-                .iter()
-                .map(|part| part.value.clone())
-                .collect(),
+            parts: stmt.name_parts.clone(),
         },
     )?;
     if !preflight_iceberg_mv_drop_with_repository(

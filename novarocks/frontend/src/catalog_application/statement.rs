@@ -23,6 +23,7 @@
 
 use std::sync::Arc;
 
+use crate::catalog_application::model::{CatalogCreateTableKind, CatalogCreateTableRequest};
 use crate::catalog_application::query_catalog::drop_local_table_registration_if_exists;
 use crate::runtime::statement_result::StatementResult;
 use bytes::Bytes;
@@ -35,7 +36,11 @@ use novarocks_spi::connector::{
     ConnectorTableKey, ConnectorTableKeyKind, ConnectorViewIdentity, ConnectorViewRequest,
     CreatePolicy, DropPolicy,
 };
-use novarocks_sql::syntax::{CreateTableKind, DefaultLiteral, ObjectName};
+use novarocks_sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
+use novarocks_sql::semantic::{
+    ColumnAggregation, DefaultLiteral, IcebergPartitionFieldExpr, ObjectName, TableColumnDef,
+    TableKeyDesc, TableKeyKind,
+};
 use novarocks_types::naming::{normalize_identifier, resolve_local_table_name};
 use novarocks_types::schema::SqlType;
 
@@ -105,13 +110,13 @@ pub(crate) fn execute_create_database_statement(
 
 pub(crate) fn execute_create_table_statement(
     context: &impl CatalogMutationContext,
-    stmt: novarocks_sql::syntax::CreateTableStmt,
+    stmt: CatalogCreateTableRequest,
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     match stmt.kind {
-        CreateTableKind::Iceberg {
+        CatalogCreateTableKind::Iceberg {
             columns,
             key_desc,
             bucket_count,
@@ -146,16 +151,14 @@ pub(crate) fn execute_create_table_statement(
             // error independent of catalog state.
             for partition_field in &partition_fields {
                 let source_column = match partition_field {
-                    novarocks_sql::syntax::IcebergPartitionFieldExpr::Identity { column }
-                    | novarocks_sql::syntax::IcebergPartitionFieldExpr::Year { column }
-                    | novarocks_sql::syntax::IcebergPartitionFieldExpr::Month { column }
-                    | novarocks_sql::syntax::IcebergPartitionFieldExpr::Day { column }
-                    | novarocks_sql::syntax::IcebergPartitionFieldExpr::Hour { column }
-                    | novarocks_sql::syntax::IcebergPartitionFieldExpr::Bucket { column, .. }
-                    | novarocks_sql::syntax::IcebergPartitionFieldExpr::Truncate {
-                        column, ..
-                    }
-                    | novarocks_sql::syntax::IcebergPartitionFieldExpr::Void { column } => column,
+                    IcebergPartitionFieldExpr::Identity { column }
+                    | IcebergPartitionFieldExpr::Year { column }
+                    | IcebergPartitionFieldExpr::Month { column }
+                    | IcebergPartitionFieldExpr::Day { column }
+                    | IcebergPartitionFieldExpr::Hour { column }
+                    | IcebergPartitionFieldExpr::Bucket { column, .. }
+                    | IcebergPartitionFieldExpr::Truncate { column, .. }
+                    | IcebergPartitionFieldExpr::Void { column } => column,
                 };
                 if let Some(column) = columns
                     .iter()
@@ -214,7 +217,7 @@ pub(crate) fn execute_create_table_statement(
 
 /// Execute parser-owned `CREATE TABLE` syntax without a source-text round trip.
 ///
-/// SQLP-5 keeps the legacy catalog DTO only as the connector request carrier;
+/// SQLP-8 lowers parser-owned syntax into the Frontend catalog request;
 /// statement-family recognition and all source locations remain parser-owned.
 pub(crate) fn execute_typed_create_table_statement(
     context: &impl CatalogMutationContext,
@@ -256,8 +259,8 @@ pub(crate) fn execute_typed_create_table_statement(
     let properties = lower_typed_table_properties(statement)?;
     execute_create_table_statement(
         context,
-        novarocks_sql::syntax::CreateTableStmt {
-            name: novarocks_sql::syntax::ObjectName {
+        CatalogCreateTableRequest {
+            name: ObjectName {
                 parts: statement
                     .name
                     .parts
@@ -265,7 +268,7 @@ pub(crate) fn execute_typed_create_table_statement(
                     .map(|part| part.value.clone())
                     .collect(),
             },
-            kind: CreateTableKind::Iceberg {
+            kind: CatalogCreateTableKind::Iceberg {
                 columns: statement
                     .columns
                     .iter()
@@ -307,26 +310,22 @@ pub(crate) fn execute_typed_create_table_statement(
     )
 }
 
-fn lower_typed_table_column(
-    column: &TypedColumnDefinition,
-) -> Result<novarocks_sql::syntax::TableColumnDef, String> {
+fn lower_typed_table_column(column: &TypedColumnDefinition) -> Result<TableColumnDef, String> {
     let data_type = lower_typed_sql_type(&column.data_type)?;
-    Ok(novarocks_sql::syntax::TableColumnDef {
+    Ok(TableColumnDef {
         name: column.name.value.clone(),
         nullable: column.nullable.unwrap_or(true),
         aggregation: column
             .aggregation
             .as_ref()
             .map(|value| match value.value.to_ascii_lowercase().as_str() {
-                "sum" => Ok(novarocks_sql::syntax::ColumnAggregation::Sum),
-                "min" => Ok(novarocks_sql::syntax::ColumnAggregation::Min),
-                "max" => Ok(novarocks_sql::syntax::ColumnAggregation::Max),
-                "replace" => Ok(novarocks_sql::syntax::ColumnAggregation::Replace),
-                "replace_if_not_null" => {
-                    Ok(novarocks_sql::syntax::ColumnAggregation::ReplaceIfNotNull)
-                }
-                "bitmap_union" => Ok(novarocks_sql::syntax::ColumnAggregation::BitmapUnion),
-                "hll_union" => Ok(novarocks_sql::syntax::ColumnAggregation::HllUnion),
+                "sum" => Ok(ColumnAggregation::Sum),
+                "min" => Ok(ColumnAggregation::Min),
+                "max" => Ok(ColumnAggregation::Max),
+                "replace" => Ok(ColumnAggregation::Replace),
+                "replace_if_not_null" => Ok(ColumnAggregation::ReplaceIfNotNull),
+                "bitmap_union" => Ok(ColumnAggregation::BitmapUnion),
+                "hll_union" => Ok(ColumnAggregation::HllUnion),
                 other => Err(format!("unsupported column aggregation `{other}`")),
             })
             .transpose()?,
@@ -339,15 +338,13 @@ fn lower_typed_table_column(
     })
 }
 
-fn lower_typed_table_key(
-    key: &TypedTableKey,
-) -> Result<novarocks_sql::syntax::TableKeyDesc, String> {
-    Ok(novarocks_sql::syntax::TableKeyDesc {
+fn lower_typed_table_key(key: &TypedTableKey) -> Result<TableKeyDesc, String> {
+    Ok(TableKeyDesc {
         kind: match key.kind {
-            TypedTableKeyKind::Duplicate => novarocks_sql::syntax::TableKeyKind::Duplicate,
-            TypedTableKeyKind::Unique => novarocks_sql::syntax::TableKeyKind::Unique,
-            TypedTableKeyKind::Aggregate => novarocks_sql::syntax::TableKeyKind::Aggregate,
-            TypedTableKeyKind::Primary => novarocks_sql::syntax::TableKeyKind::Primary,
+            TypedTableKeyKind::Duplicate => TableKeyKind::Duplicate,
+            TypedTableKeyKind::Unique => TableKeyKind::Unique,
+            TypedTableKeyKind::Aggregate => TableKeyKind::Aggregate,
+            TypedTableKeyKind::Primary => TableKeyKind::Primary,
         },
         columns: key
             .columns
@@ -359,8 +356,7 @@ fn lower_typed_table_key(
 
 fn lower_typed_table_partition_transform(
     transform: &TypedPartitionTransform,
-) -> Result<novarocks_sql::syntax::IcebergPartitionFieldExpr, String> {
-    use novarocks_sql::syntax::IcebergPartitionFieldExpr;
+) -> Result<IcebergPartitionFieldExpr, String> {
     let column = |value: &novarocks_parser::ast::Ident| value.value.clone();
     Ok(match transform {
         TypedPartitionTransform::Identity { column: value, .. } => {
@@ -437,9 +433,7 @@ fn mutation_instance_id(catalog: &str) -> Result<ConnectorInstanceId, String> {
     ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())
 }
 
-pub fn connector_column(
-    column: &novarocks_sql::syntax::TableColumnDef,
-) -> Result<ConnectorColumnDefinition, String> {
+pub fn connector_column(column: &TableColumnDef) -> Result<ConnectorColumnDefinition, String> {
     Ok(ConnectorColumnDefinition {
         name: Arc::from(column.name.as_str()),
         data_type: connector_data_type(&column.data_type)?,
@@ -515,31 +509,25 @@ fn connector_default(value: &DefaultLiteral) -> Result<ConnectorDefaultValue, St
     })
 }
 
-fn connector_column_aggregation(
-    aggregation: novarocks_sql::syntax::ColumnAggregation,
-) -> ConnectorColumnAggregation {
+fn connector_column_aggregation(aggregation: ColumnAggregation) -> ConnectorColumnAggregation {
     match aggregation {
-        novarocks_sql::syntax::ColumnAggregation::Sum => ConnectorColumnAggregation::Sum,
-        novarocks_sql::syntax::ColumnAggregation::Min => ConnectorColumnAggregation::Min,
-        novarocks_sql::syntax::ColumnAggregation::Max => ConnectorColumnAggregation::Max,
-        novarocks_sql::syntax::ColumnAggregation::Replace => ConnectorColumnAggregation::Replace,
-        novarocks_sql::syntax::ColumnAggregation::ReplaceIfNotNull => {
-            ConnectorColumnAggregation::ReplaceIfNotNull
-        }
-        novarocks_sql::syntax::ColumnAggregation::BitmapUnion => {
-            ConnectorColumnAggregation::BitmapUnion
-        }
-        novarocks_sql::syntax::ColumnAggregation::HllUnion => ConnectorColumnAggregation::HllUnion,
+        ColumnAggregation::Sum => ConnectorColumnAggregation::Sum,
+        ColumnAggregation::Min => ConnectorColumnAggregation::Min,
+        ColumnAggregation::Max => ConnectorColumnAggregation::Max,
+        ColumnAggregation::Replace => ConnectorColumnAggregation::Replace,
+        ColumnAggregation::ReplaceIfNotNull => ConnectorColumnAggregation::ReplaceIfNotNull,
+        ColumnAggregation::BitmapUnion => ConnectorColumnAggregation::BitmapUnion,
+        ColumnAggregation::HllUnion => ConnectorColumnAggregation::HllUnion,
     }
 }
 
-pub(crate) fn connector_table_key(key: &novarocks_sql::syntax::TableKeyDesc) -> ConnectorTableKey {
+pub(crate) fn connector_table_key(key: &TableKeyDesc) -> ConnectorTableKey {
     ConnectorTableKey {
         kind: match key.kind {
-            novarocks_sql::syntax::TableKeyKind::Duplicate => ConnectorTableKeyKind::Duplicate,
-            novarocks_sql::syntax::TableKeyKind::Unique => ConnectorTableKeyKind::Unique,
-            novarocks_sql::syntax::TableKeyKind::Aggregate => ConnectorTableKeyKind::Aggregate,
-            novarocks_sql::syntax::TableKeyKind::Primary => ConnectorTableKeyKind::Primary,
+            TableKeyKind::Duplicate => ConnectorTableKeyKind::Duplicate,
+            TableKeyKind::Unique => ConnectorTableKeyKind::Unique,
+            TableKeyKind::Aggregate => ConnectorTableKeyKind::Aggregate,
+            TableKeyKind::Primary => ConnectorTableKeyKind::Primary,
         },
         columns: key
             .columns
@@ -550,9 +538,8 @@ pub(crate) fn connector_table_key(key: &novarocks_sql::syntax::TableKeyDesc) -> 
 }
 
 pub fn connector_partition_transform(
-    field: &novarocks_sql::syntax::IcebergPartitionFieldExpr,
+    field: &IcebergPartitionFieldExpr,
 ) -> ConnectorPartitionTransform {
-    use novarocks_sql::syntax::IcebergPartitionFieldExpr;
     match field {
         IcebergPartitionFieldExpr::Identity { column } => ConnectorPartitionTransform::Identity {
             column: Arc::from(column.as_str()),
@@ -1646,12 +1633,10 @@ fn lower_typed_string_default(value: &str, data_type: &SqlType) -> Result<Defaul
                 .map_err(|error| format!("invalid JSON DEFAULT literal: {error}"))?;
             Ok(DefaultLiteral::String(value.to_string()))
         }
-        SqlType::Date => Ok(DefaultLiteral::Date(
-            novarocks_sql::syntax::parse_date_string_to_days(value)?,
-        )),
-        SqlType::DateTime => Ok(DefaultLiteral::DateTime(
-            novarocks_sql::syntax::parse_datetime_string_to_micros(value)?,
-        )),
+        SqlType::Date => Ok(DefaultLiteral::Date(parse_date_string_to_days(value)?)),
+        SqlType::DateTime => Ok(DefaultLiteral::DateTime(parse_datetime_string_to_micros(
+            value,
+        )?)),
         SqlType::DateTimeNs => Ok(DefaultLiteral::DateTime(typed_datetime_string_to_nanos(
             value,
         )?)),

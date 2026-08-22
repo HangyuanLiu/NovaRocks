@@ -172,7 +172,7 @@ under the License.
 | --- | --- | --- |
 | `FOR VERSION AS OF <snapshot_id>`（数字） | ✅ | PR #80 |
 | `FOR TIMESTAMP AS OF '<ts>'`（epoch-ms 或字符串字面量） | ✅ | 表达式形式仍 reject |
-| `FOR VERSION AS OF '<branch_or_tag>'` | ✅ | normalizer 重写绕开 sqlparser 限制 |
+| `FOR VERSION AS OF '<branch_or_tag>'` | ✅ | native typed parser 直接保留字符串 ref，由 analyzer 解析 |
 | 快照保留期读侧拒绝（拿过期 snapshot 报错） | ❌ | |
 
 ### 8.2 Branch / Tag DDL

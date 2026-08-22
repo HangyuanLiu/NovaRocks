@@ -19,7 +19,7 @@
 //!
 //! This module turns SQL's one-shot analyzed aggregate facts into the target
 //! table's physical columns and the execution-only runtime layout.  It keeps
-//! DDL spelling (`TableColumnDef`) and aggregate-function vocabulary in SQL;
+//! semantic table columns and aggregate-function vocabulary in SQL;
 //! the embedded [`MvAggregateRuntimeLayout`] contains only Arrow/runtime facts.
 
 use std::collections::HashSet;
@@ -34,7 +34,7 @@ use novarocks_types::schema::SqlType;
 
 use crate::mv_refresh::AggregateFunctionKind;
 use crate::planning::mv::SqlMvAggregateLayoutFacts;
-use crate::syntax::TableColumnDef;
+use crate::semantic::TableColumnDef;
 
 pub const MV_AGGREGATE_ROW_ID_COLUMN: &str = "__row_id__";
 pub const MV_AGGREGATE_STATE_PREFIX: &str = "__agg_state_";

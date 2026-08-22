@@ -34,13 +34,14 @@ use crate::query_execution::planning::write_sink::{
     admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use crate::runtime::query_result::QueryResult;
+use novarocks_sql::literal::literal_from_batch;
 use novarocks_sql::planning::dml::{
     DmlChangeStreamCompileRequest, DmlChangeStreamKind, DmlChangeStreamRoute,
     DmlChangeStreamRouteField, DmlPreExpandKeyedAssert, DmlWriteSinkMode, IcebergRefSuffix,
     dml_change_stream_optimizer_settings, split_ref_suffix,
 };
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
-use novarocks_sql::syntax::ObjectName;
+use novarocks_sql::semantic::ObjectName;
 
 fn write_commit_has_files(write_commit: &crate::query_execution::write::WriteCommitInput) -> bool {
     write_commit
@@ -2152,7 +2153,7 @@ fn selection_value_sql(
         .columns()
         .get(field_ordinal as usize)
         .ok_or_else(|| "COW selection field ordinal is out of bounds".to_string())?;
-    let literal = novarocks_sql::syntax::literal_from_batch(array, view.row_index())?;
+    let literal = literal_from_batch(array, view.row_index())?;
     let column = novarocks_types::schema::ColumnDef {
         name: field.name().to_string(),
         data_type: field.data_type().clone(),

@@ -53,7 +53,7 @@ use novarocks_spi::connector::ConnectorRowMutationStrategy;
 use novarocks_spi::connector::ConnectorWriteOperationId;
 use novarocks_sql::planning::dml::{DmlWriteSinkMode, IcebergRefSuffix, split_ref_suffix};
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
-use novarocks_sql::syntax::ObjectName as SqlObjectName;
+use novarocks_sql::semantic::ObjectName as SqlObjectName;
 use novarocks_types::schema::ColumnDef;
 
 pub(crate) fn prepare_delete_statement(

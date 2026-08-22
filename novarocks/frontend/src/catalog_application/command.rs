@@ -27,6 +27,7 @@ use novarocks_types::naming::normalize_identifier;
 use std::sync::Arc;
 
 use crate::catalog_application::create_table_ddl::build_iceberg_create_table_ddl;
+use crate::catalog_application::model::{CatalogCreateTableKind, CatalogCreateTableRequest};
 use crate::catalog_application::query_catalog::{CatalogServiceSource, QueryCatalogService};
 use crate::catalog_application::resolver::CatalogAdmission;
 use crate::catalog_application::statement::{
@@ -41,6 +42,8 @@ use crate::runtime::query_result::QueryResultColumn;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_parser::ast::{CatalogStatement, LiteralKind};
 use novarocks_spi::connector::MvStorageObservationPort;
+use novarocks_sql::literal::arrow_data_type_to_sql_type;
+use novarocks_sql::semantic::{ObjectName, TableColumnDef};
 
 /// Catalog DDL capability built from catalog-only leaf ports.
 ///
@@ -261,10 +264,8 @@ impl CatalogCommandExecutor {
     }
 }
 
-fn typed_object_name(
-    name: &novarocks_parser::ast::ObjectName,
-) -> novarocks_sql::syntax::ObjectName {
-    novarocks_sql::syntax::ObjectName {
+fn typed_object_name(name: &novarocks_parser::ast::ObjectName) -> ObjectName {
+    ObjectName {
         parts: name.parts.iter().map(|part| part.value.clone()).collect(),
     }
 }
@@ -402,7 +403,7 @@ fn execute_alter_iceberg_schema(
             default,
             position,
         } => {
-            let column = novarocks_sql::syntax::TableColumnDef {
+            let column = TableColumnDef {
                 name,
                 data_type,
                 nullable: true,
@@ -484,7 +485,7 @@ fn execute_alter_iceberg_schema(
 
 fn execute_alter_partition_spec(
     executor: &CatalogCommandExecutor,
-    table_name: novarocks_sql::syntax::ObjectName,
+    table_name: ObjectName,
     statement: crate::catalog_application::statement::IcebergPartitionSpecChange,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -542,8 +543,8 @@ fn execute_alter_partition_spec(
 
 fn execute_create_table_like(
     executor: &CatalogCommandExecutor,
-    target: novarocks_sql::syntax::ObjectName,
-    source: novarocks_sql::syntax::ObjectName,
+    target: ObjectName,
+    source: ObjectName,
     if_not_exists: bool,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -568,9 +569,9 @@ fn execute_create_table_like(
         .columns
         .iter()
         .map(|column| {
-            Ok(novarocks_sql::syntax::TableColumnDef {
+            Ok(TableColumnDef {
                 name: column.name.clone(),
-                data_type: novarocks_sql::syntax::arrow_data_type_to_sql_type(&column.data_type)?,
+                data_type: arrow_data_type_to_sql_type(&column.data_type)?,
                 nullable: column.nullable,
                 aggregation: None,
                 default: None,
@@ -579,9 +580,9 @@ fn execute_create_table_like(
         .collect::<Result<Vec<_>, String>>()?;
     execute_create_table_statement(
         executor,
-        novarocks_sql::syntax::CreateTableStmt {
+        CatalogCreateTableRequest {
             name: target,
-            kind: novarocks_sql::syntax::CreateTableKind::Iceberg {
+            kind: CatalogCreateTableKind::Iceberg {
                 columns,
                 key_desc: None,
                 bucket_count: None,
@@ -599,7 +600,7 @@ fn execute_create_table_like(
 
 fn execute_show_create_table(
     executor: &CatalogCommandExecutor,
-    table_name: novarocks_sql::syntax::ObjectName,
+    table_name: ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,

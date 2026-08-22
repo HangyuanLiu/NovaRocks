@@ -35,7 +35,7 @@ use novarocks_sql::planning::catalog::{
     SqlTimeTravelReferenceMetadataFacts, SqlTimeTravelSnapshotLogFacts,
     resolve_time_travel_snapshot_binding,
 };
-use novarocks_sql::syntax::ObjectName;
+use novarocks_sql::semantic::ObjectName;
 use novarocks_types::schema::ColumnDef;
 
 /// Keeps SQL analysis facts distinct from catalog and connector failures until

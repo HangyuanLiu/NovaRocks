@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::mv::domain::analysis::canonicalize_iceberg_mv_select_query;
+use crate::mv::domain::application::MvRefreshRequest;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::refresh::capabilities::RefreshCapabilities;
 use crate::mv::domain::refresh::definition::parse_iceberg_table_refs;
@@ -22,7 +23,6 @@ use crate::query_execution::mv_assembly::query_local_bindings::{
     bind_imv_target_query_table_in_store_from_rewrite,
     freeze_imv_base_query_local_overlays_from_captured_inputs,
 };
-use novarocks_sql::syntax::RefreshMaterializedViewStmt;
 
 /// Compiles an EXPLAIN refresh plan from the exact frozen MV ports and
 /// query-local bindings used by refresh preparation.
@@ -30,13 +30,13 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
     ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     current_database: &str,
-    stmt: &RefreshMaterializedViewStmt,
+    stmt: &MvRefreshRequest,
     level: novarocks_sql::compiler::ExplainLevel,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Vec<String>, String> {
     explain_refresh_full_guard(stmt.full)?;
 
-    let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
+    let target = resolve_refresh_target(current_catalog, current_database, &stmt.name_parts)?;
     let mv_definition = load_iceberg_mv_definition_by_target(ports.repository().as_ref(), &target)?;
     let target_binding = load_iceberg_mv_target_binding(
         ports.connector_control(),

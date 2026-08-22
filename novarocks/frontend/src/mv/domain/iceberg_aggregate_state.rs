@@ -312,7 +312,7 @@ fn validate_physical_aggregate_schema(
                 actual.name()
             ));
         }
-        let expected_type = novarocks_sql::syntax::sql_type_to_arrow_type(
+        let expected_type = novarocks_sql::literal::sql_type_to_arrow_type(
             &expected_column.column().data_type,
         )
                 .map_err(|e| {
@@ -328,7 +328,7 @@ fn validate_physical_aggregate_schema(
         // `sql_type_to_arrow_type`-derived expected uses nullable inner key
         // fields. Both are semantically the same shape. Top-level column
         // nullability is still enforced by the `is_nullable` check below.
-        let type_matches = novarocks_sql::syntax::arrow_type_equals_ignoring_metadata(
+        let type_matches = novarocks_sql::literal::arrow_type_equals_ignoring_metadata(
             actual.data_type(),
             &expected_type,
         ) || matches!(

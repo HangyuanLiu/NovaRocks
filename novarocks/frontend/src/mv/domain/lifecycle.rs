@@ -21,16 +21,15 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
+use crate::mv::domain::application::{
+    MvCreateStatement, MvDropStatement, MvRefreshRequest, MvShowStatement,
+};
 use crate::mv::domain::model::MvTarget;
 use crate::mv::domain::refresh::planning::RefreshPlanContract;
-use novarocks_sql::syntax::{
-    CreateMaterializedViewStmt, DropMaterializedViewStmt, RefreshMaterializedViewStmt,
-    ShowMaterializedViewsStmt,
-};
 
 #[derive(Clone)]
 pub struct CreateMvRequest {
-    pub stmt: CreateMaterializedViewStmt,
+    pub stmt: MvCreateStatement,
     pub current_catalog: Option<String>,
     pub current_database: String,
     pub connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -38,7 +37,7 @@ pub struct CreateMvRequest {
 
 #[derive(Clone)]
 pub struct DropMvRequest {
-    pub stmt: DropMaterializedViewStmt,
+    pub stmt: MvDropStatement,
     pub current_catalog: Option<String>,
     pub current_database: String,
     pub connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -46,7 +45,7 @@ pub struct DropMvRequest {
 
 #[derive(Clone, Debug)]
 pub struct ListMvsRequest {
-    pub stmt: ShowMaterializedViewsStmt,
+    pub stmt: MvShowStatement,
     pub current_catalog: Option<String>,
 }
 
@@ -59,7 +58,7 @@ pub struct RefreshRequest {
     pub target: MvTarget,
     pub current_catalog: Option<String>,
     pub current_database: String,
-    pub statement: RefreshMaterializedViewStmt,
+    pub statement: MvRefreshRequest,
 }
 
 #[derive(Clone, Debug)]
@@ -76,14 +75,14 @@ pub enum BackendRefreshPlan {
 
 #[derive(Clone, Debug)]
 pub struct StarRocksTableRefreshPlan {
-    pub stmt: RefreshMaterializedViewStmt,
+    pub stmt: MvRefreshRequest,
     pub current_catalog: Option<String>,
     pub current_database: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct IcebergRefreshPlan {
-    pub stmt: RefreshMaterializedViewStmt,
+    pub stmt: MvRefreshRequest,
     pub current_catalog: Option<String>,
     pub current_database: String,
 }

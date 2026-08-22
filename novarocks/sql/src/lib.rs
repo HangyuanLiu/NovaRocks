@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod admission;
 pub(crate) mod agg_mergeability;
 pub mod analyze_error;
 pub(crate) mod common;
@@ -25,13 +26,12 @@ pub(crate) mod catalog;
 pub(crate) mod column_id;
 pub mod compiler;
 pub(crate) mod functions;
-pub(crate) mod legacy_mv_ast;
-pub(crate) mod literal;
+pub mod literal;
 pub(crate) mod mv_refresh;
 pub(crate) mod parser;
 pub mod plan_read;
 pub mod planning;
-pub mod syntax;
+pub mod semantic;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -41,7 +41,6 @@ pub(crate) mod optimizer;
 pub(crate) mod analyzer;
 pub(crate) mod explain;
 pub(crate) mod planner;
-mod syntax_ast;
 
 #[cfg(test)]
 mod common_tests {

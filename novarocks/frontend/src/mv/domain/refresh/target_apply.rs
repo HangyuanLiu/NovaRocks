@@ -18,7 +18,7 @@
 //! Provider-neutral materialized-view target schema helpers.
 
 use novarocks_sql::planning::mv::{SqlMvInternalTargetColumn, mv_internal_target_column};
-use novarocks_sql::syntax::TableColumnDef;
+use novarocks_sql::semantic::TableColumnDef;
 
 pub(crate) use novarocks_sql::planning::mv::{
     iceberg_mv_physical_select_sql, validate_reserved_projection_output_names,

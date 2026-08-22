@@ -40,6 +40,8 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
     ConnectorViewRequest, ConnectorViewSourceFormat, CreateOrReplacePolicy, DropPolicy,
 };
+use novarocks_sql::literal::arrow_data_type_to_sql_type;
+use novarocks_sql::semantic::TableColumnDef;
 
 #[derive(Clone, Copy)]
 pub struct ViewRequestContext<'a> {
@@ -268,7 +270,7 @@ where
             .columns
             .into_iter()
             .map(|column| {
-                let column = novarocks_sql::syntax::TableColumnDef {
+                let column = TableColumnDef {
                     name: column.name,
                     data_type: crate::catalog_application::statement::lower_typed_sql_type(
                         &column.data_type,
@@ -574,9 +576,7 @@ fn view_type_name(data_type: &arrow::datatypes::DataType) -> Result<TypeName, St
         }
     }
 
-    Ok(convert(novarocks_sql::syntax::arrow_data_type_to_sql_type(
-        data_type,
-    )?))
+    Ok(convert(arrow_data_type_to_sql_type(data_type)?))
 }
 
 #[cfg(test)]

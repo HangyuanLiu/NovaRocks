@@ -34,10 +34,6 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
     PreparedMvRefresh,
 };
-use novarocks_parser::{
-    Span,
-    ast::{Ident, ObjectName},
-};
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
@@ -170,15 +166,15 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
             name_parts: vec![step.target.name.clone()],
             full: false,
         };
-        let ast_statement = novarocks_sql::syntax::RefreshMaterializedViewStmt {
-            name: generated_object_name([step.target.name.clone()]),
+        let request = crate::mv::domain::application::MvRefreshRequest {
+            name_parts: vec![step.target.name.clone()],
             full: false,
         };
         let service = crate::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_with_ports(
             &self.ports,
             step.target.catalog.as_deref(),
             &step.target.database,
-            &ast_statement,
+            &request,
             connector_context,
         );
         service
@@ -262,22 +258,6 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
             expire_min_snapshots_to_keep: stats.expire_min_snapshots_to_keep,
             target_file_size_bytes: stats.target_file_size_bytes,
         })
-    }
-}
-
-fn generated_object_name(parts: impl IntoIterator<Item = String>) -> ObjectName {
-    let span = Span::new(0, 0);
-    ObjectName {
-        parts: parts
-            .into_iter()
-            .map(|value| Ident {
-                value,
-                quoted: false,
-                quote_style: None,
-                span,
-            })
-            .collect(),
-        span,
     }
 }
 

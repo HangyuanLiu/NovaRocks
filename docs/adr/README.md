@@ -167,6 +167,7 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 语言或durable authority。
 
 - ADR-0090 — MV/View定义为何持久化用户有效SQL原文与解析上下文，而不是AST Display（active）
+- ADR-0101 — native SQL language authority 为何分离 parser、SQL semantic value 与 Frontend application request（active）
 
 ### runtime-role
 
