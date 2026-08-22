@@ -378,12 +378,20 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
         if !authenticated {
             return false;
         }
+        let connection = match crate::ClientConnectionToken::new(self.connection_id, 1) {
+            Ok(connection) => connection,
+            Err(error) => {
+                warn!(
+                    "reject frontend query session for invalid connection_id={}: {}",
+                    self.connection_id, error
+                );
+                return false;
+            }
+        };
         let session = match self
             .session_factory
-            .open_session(QuerySessionOpenRequest::new(
-                self.connection_id,
-                self.user.clone(),
-            )) {
+            .open_session(QuerySessionOpenRequest::new(connection, self.user.clone()))
+        {
             Ok(session) => session,
             Err(error) => {
                 warn!(

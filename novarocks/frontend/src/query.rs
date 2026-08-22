@@ -511,7 +511,7 @@ impl QuerySessionFactory for FrontendQueryService {
         let lease = self
             .query_control
             .register_session(SessionIdentity::new(
-                request.connection_id(),
+                request.connection_token(),
                 request.principal().to_string(),
             ))
             .map_err(|error| {
@@ -1704,6 +1704,10 @@ fn cancellation_error(reason: QueryCancellationReason) -> QueryServiceError {
             QueryServiceErrorKind::Interrupted,
             "Query execution was interrupted".to_string(),
         ),
+        QueryCancellationReason::ExplicitKillConnection { .. } => (
+            QueryServiceErrorKind::Interrupted,
+            "Query execution was interrupted because the connection was killed".to_string(),
+        ),
         QueryCancellationReason::ClientDisconnected => (
             QueryServiceErrorKind::Interrupted,
             "Query execution was interrupted because the client disconnected".to_string(),
@@ -2221,6 +2225,13 @@ mod tests {
         );
         assert_eq!(
             cancellation_error(QueryCancellationReason::ClientDisconnected).kind(),
+            QueryServiceErrorKind::Interrupted
+        );
+        assert_eq!(
+            cancellation_error(QueryCancellationReason::ExplicitKillConnection {
+                requester_connection_id: 8
+            })
+            .kind(),
             QueryServiceErrorKind::Interrupted
         );
     }

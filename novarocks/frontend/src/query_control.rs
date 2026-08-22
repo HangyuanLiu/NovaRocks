@@ -20,10 +20,12 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::ClientConnectionToken;
 use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
 use crate::query_execution::control::{
-    QueryCancelOutcome, QueryControlError, QueryControlPort, QueryControlService, SessionIdentity,
-    SessionToken, StatementFinishOutcome, StatementRegistration, StatementToken,
+    ConnectionKillAuthorization, QueryCancelOutcome, QueryControlError, QueryControlPort,
+    QueryControlService, SessionIdentity, SessionToken, StatementFinishOutcome,
+    StatementRegistration, StatementToken,
 };
 
 #[derive(Default)]
@@ -39,6 +41,7 @@ struct QueryControlState {
 
 struct SessionEntry {
     session_epoch: u64,
+    connection: ClientConnectionToken,
     principal: Arc<str>,
     next_statement_generation: u64,
     active: Option<ActiveStatement>,
@@ -79,6 +82,7 @@ impl QueryControlPort for FrontendQueryControl {
             token.connection_id(),
             SessionEntry {
                 session_epoch: token.session_epoch(),
+                connection: identity.connection_token(),
                 principal: Arc::from(identity.principal()),
                 next_statement_generation: 0,
                 active: None,
@@ -208,6 +212,27 @@ impl QueryControlPort for FrontendQueryControl {
         }
     }
 
+    fn authorize_connection_kill(
+        &self,
+        requester: SessionToken,
+        target_connection_id: u32,
+    ) -> ConnectionKillAuthorization {
+        let state = self.lock();
+        let Some(requester_entry) = state.sessions.get(&requester.connection_id()) else {
+            return ConnectionKillAuthorization::UnknownSession;
+        };
+        if requester_entry.session_epoch != requester.session_epoch() {
+            return ConnectionKillAuthorization::UnknownSession;
+        }
+        let Some(target_entry) = state.sessions.get(&target_connection_id) else {
+            return ConnectionKillAuthorization::UnknownSession;
+        };
+        if target_entry.principal != requester_entry.principal {
+            return ConnectionKillAuthorization::PermissionDenied;
+        }
+        ConnectionKillAuthorization::Authorized(target_entry.connection)
+    }
+
     fn cancel_all(&self, reason: QueryCancellationReason) {
         let state = self.lock();
         for entry in state.sessions.values() {
@@ -223,19 +248,27 @@ mod tests {
     use super::*;
     use crate::query_execution::control::QueryControlPort;
 
-    fn register(control: &FrontendQueryControl, id: u32, principal: &str) -> SessionToken {
+    fn register(
+        control: &FrontendQueryControl,
+        id: u32,
+        generation: u64,
+        principal: &str,
+    ) -> SessionToken {
         control
-            .register_session(SessionIdentity::new(id, principal))
+            .register_session(SessionIdentity::new(
+                ClientConnectionToken::new(id, generation).expect("valid connection token"),
+                principal,
+            ))
             .expect("register session")
     }
 
     #[test]
     fn stale_session_and_statement_cannot_remove_successor() {
         let control = FrontendQueryControl::default();
-        let first = register(&control, 7, "root");
+        let first = register(&control, 7, 1, "root");
         let old = control.begin_statement(first).expect("begin old");
         control.unregister_session(first);
-        let second = register(&control, 7, "root");
+        let second = register(&control, 7, 2, "root");
         let current = control.begin_statement(second).expect("begin current");
         assert_eq!(
             control.finish_statement(old.token()),
@@ -251,8 +284,8 @@ mod tests {
     #[test]
     fn repeated_kill_preserves_first_reason() {
         let control = FrontendQueryControl::default();
-        let target = register(&control, 7, "root");
-        let requester = register(&control, 8, "root");
+        let target = register(&control, 7, 1, "root");
+        let requester = register(&control, 8, 1, "root");
         let active = control.begin_statement(target).expect("begin target");
         assert_eq!(
             control.kill_query(requester, 7),
@@ -275,9 +308,9 @@ mod tests {
     #[test]
     fn permission_and_idle_do_not_change_target() {
         let control = FrontendQueryControl::default();
-        let target = register(&control, 7, "root");
-        let foreign = register(&control, 8, "other");
-        let own = register(&control, 9, "root");
+        let target = register(&control, 7, 1, "root");
+        let foreign = register(&control, 8, 1, "other");
+        let own = register(&control, 9, 1, "root");
         assert_eq!(
             control.kill_query(own, 99),
             QueryCancelOutcome::UnknownSession
@@ -297,8 +330,8 @@ mod tests {
     #[test]
     fn finish_and_cancel_are_linearized_and_busy_session_rejects_successor() {
         let control = FrontendQueryControl::default();
-        let target = register(&control, 7, "root");
-        let requester = register(&control, 8, "root");
+        let target = register(&control, 7, 1, "root");
+        let requester = register(&control, 8, 1, "root");
         let active = control.begin_statement(target).expect("begin target");
 
         assert!(matches!(
@@ -323,5 +356,38 @@ mod tests {
             control.begin_statement(target).is_ok(),
             "only the matching active generation is released"
         );
+    }
+
+    #[test]
+    fn connection_kill_authorization_returns_only_the_exact_target_token() {
+        let control = FrontendQueryControl::default();
+        let target = register(&control, 7, 3, "root");
+        let requester = register(&control, 8, 4, "root");
+        let foreign = register(&control, 9, 5, "other");
+
+        assert_eq!(
+            control.authorize_connection_kill(requester, 7),
+            ConnectionKillAuthorization::Authorized(
+                ClientConnectionToken::new(7, 3).expect("valid token")
+            )
+        );
+        assert_eq!(
+            control.authorize_connection_kill(requester, 99),
+            ConnectionKillAuthorization::UnknownSession
+        );
+        assert_eq!(
+            control.authorize_connection_kill(foreign, 7),
+            ConnectionKillAuthorization::PermissionDenied
+        );
+
+        control.unregister_session(target);
+        let successor = register(&control, 7, 6, "root");
+        assert_eq!(
+            control.authorize_connection_kill(requester, 7),
+            ConnectionKillAuthorization::Authorized(
+                ClientConnectionToken::new(7, 6).expect("valid token")
+            )
+        );
+        control.unregister_session(successor);
     }
 }

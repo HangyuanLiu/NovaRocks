@@ -765,7 +765,10 @@ mod tests {
         )
         .expect("build ready frontend session factory");
         let session = session_factory
-            .open_session(QuerySessionOpenRequest::new(1, "cp2-cutover"))
+            .open_session(QuerySessionOpenRequest::new(
+                crate::ClientConnectionToken::new(1, 1).expect("valid connection token"),
+                "cp2-cutover",
+            ))
             .expect("open frontend query session");
         let instance_id =
             novarocks_spi::connector::ConnectorInstanceId::parse("warehouse").expect("instance ID");
@@ -882,7 +885,10 @@ mod tests {
         )
         .expect("build ready frontend session factory");
         let session = session_factory
-            .open_session(QuerySessionOpenRequest::new(2, "statistics-binding"))
+            .open_session(QuerySessionOpenRequest::new(
+                crate::ClientConnectionToken::new(2, 1).expect("valid connection token"),
+                "statistics-binding",
+            ))
             .expect("open frontend query session");
         let error = session
             .execute_batch("SHOW ANALYZE JOBS")

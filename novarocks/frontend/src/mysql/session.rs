@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::client_connection::ClientConnectionToken;
 use crate::common::query_cancellation::QueryCancellationReason;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_protocol::{lifecycle::QueryOptions, novarocks};
@@ -34,7 +35,7 @@ use novarocks_user_error::UserError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuerySessionOpenRequest {
-    connection_id: u32,
+    connection: ClientConnectionToken,
     principal: Arc<str>,
 }
 
@@ -136,15 +137,19 @@ impl SessionExecutionSettings {
 }
 
 impl QuerySessionOpenRequest {
-    pub fn new(connection_id: u32, principal: impl Into<Arc<str>>) -> Self {
+    pub fn new(connection: ClientConnectionToken, principal: impl Into<Arc<str>>) -> Self {
         Self {
-            connection_id,
+            connection,
             principal: principal.into(),
         }
     }
 
     pub const fn connection_id(&self) -> u32 {
-        self.connection_id
+        self.connection.connection_id()
+    }
+
+    pub const fn connection_token(&self) -> ClientConnectionToken {
+        self.connection
     }
 
     pub fn principal(&self) -> &str {
@@ -238,8 +243,12 @@ mod tests {
 
     #[test]
     fn open_request_keeps_connection_identity_private_but_readable() {
-        let request = QuerySessionOpenRequest::new(42, "alice");
+        let request = QuerySessionOpenRequest::new(
+            ClientConnectionToken::new(42, 7).expect("valid connection token"),
+            "alice",
+        );
         assert_eq!(request.connection_id(), 42);
+        assert_eq!(request.connection_token().generation(), 7);
         assert_eq!(request.principal(), "alice");
     }
 
