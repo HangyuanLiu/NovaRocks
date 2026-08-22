@@ -949,7 +949,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
     ) -> Result<MaintenanceTarget, String> {
         let target = crate::catalog_application::resolver::resolve_existing_table_target(
             &self.kernel,
-            &novarocks_sql::syntax::ObjectName {
+            &novarocks_sql::semantic::ObjectName {
                 parts: name_parts.to_vec(),
             },
             context.current_catalog,

@@ -25,9 +25,10 @@ use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
 
-use novarocks_sql::syntax::{
+use novarocks_sql::literal::{compare_literals, literal_from_batch};
+use novarocks_sql::semantic::{
     AggregateLiteralKey, ColumnAggregation, Literal, TableKeyDesc, TableKeyKind,
-    aggregate_literal_key, compare_aggregate_literals, literal_from_batch,
+    aggregate_literal_key,
 };
 use novarocks_types::naming::normalize_identifier;
 use novarocks_types::schema::ColumnDef;
@@ -163,7 +164,7 @@ fn merge_aggregate_table_value(
                 return Ok(());
             }
             if matches!(existing, Literal::Null)
-                || compare_aggregate_literals(incoming, existing)? == std::cmp::Ordering::Less
+                || compare_literals(incoming, existing)? == std::cmp::Ordering::Less
             {
                 *existing = incoming.clone();
             }
@@ -174,7 +175,7 @@ fn merge_aggregate_table_value(
                 return Ok(());
             }
             if matches!(existing, Literal::Null)
-                || compare_aggregate_literals(incoming, existing)? == std::cmp::Ordering::Greater
+                || compare_literals(incoming, existing)? == std::cmp::Ordering::Greater
             {
                 *existing = incoming.clone();
             }

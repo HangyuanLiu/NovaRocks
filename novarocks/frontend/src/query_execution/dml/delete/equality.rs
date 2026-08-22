@@ -36,12 +36,10 @@ use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
     ConnectorWriteIntent, ConnectorWriteOperationId,
 };
+use novarocks_sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
-use novarocks_sql::syntax::{
-    Literal as SqlLiteral, ObjectName as SqlObjectName, parse_date_string_to_days,
-    parse_datetime_string_to_micros,
-};
+use novarocks_sql::semantic::{Literal as SqlLiteral, ObjectName as SqlObjectName};
 use novarocks_types::schema::ColumnDef;
 
 type Literal = SqlLiteral;
@@ -804,7 +802,7 @@ mod tests {
         ConnectorTableMetadata, ConnectorTablePlanningFacts,
     };
 
-    use novarocks_sql::syntax::Literal;
+    use novarocks_sql::semantic::Literal;
 
     struct NeverCancelled;
 

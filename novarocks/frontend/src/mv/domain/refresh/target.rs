@@ -23,9 +23,9 @@ use crate::mv::domain::refresh::target_binding::{
     MvTargetBinding, load_mv_target_binding_with_ports,
 };
 use crate::mv::domain::repository::MvTarget;
-use novarocks_parser::ast::ObjectName;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
+use novarocks_sql::semantic::ObjectName;
 use novarocks_types::naming::{TableIdentity, normalize_identifier};
 
 /// A normalized Iceberg MV target identity.  Refresh planning and the domain
@@ -51,16 +51,18 @@ impl From<&TableIdentity> for IcebergMvTarget {
 pub fn resolve_refresh_target(
     current_catalog: Option<&str>,
     current_database: &str,
-    name: &ObjectName,
+    name_parts: &[String],
 ) -> Result<IcebergMvTarget, String> {
     let catalog = current_catalog.ok_or_else(|| {
         "REFRESH MATERIALIZED VIEW for an Iceberg MV requires current Iceberg catalog context"
             .to_string()
     })?;
-    let semantic_name = novarocks_sql::syntax::ObjectName {
-        parts: name.parts.iter().map(|part| part.value.clone()).collect(),
-    };
-    let (namespace, table) = resolve_mv_name(&semantic_name, current_database)?;
+    let (namespace, table) = resolve_mv_name(
+        &ObjectName {
+            parts: name_parts.to_vec(),
+        },
+        current_database,
+    )?;
     Ok(IcebergMvTarget {
         catalog: normalize_identifier(catalog)?,
         namespace,
@@ -74,9 +76,9 @@ pub fn resolve_refresh_target(
 pub fn resolve_refresh_mv_target(
     current_catalog: Option<&str>,
     current_database: &str,
-    name: &ObjectName,
+    name_parts: &[String],
 ) -> Result<MvTarget, String> {
-    let target = resolve_refresh_target(current_catalog, current_database, name)?;
+    let target = resolve_refresh_target(current_catalog, current_database, name_parts)?;
     Ok(MvTarget {
         catalog: Some(target.catalog),
         database: target.namespace,

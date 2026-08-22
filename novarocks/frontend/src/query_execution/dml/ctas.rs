@@ -53,6 +53,7 @@ use novarocks_parser::ast::{
 };
 use novarocks_parser::printer;
 use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_sql::semantic::ObjectName;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CtasCommand {
@@ -1556,7 +1557,7 @@ impl CtasEngine for DmlExecutionKernel {
     ) -> Result<CtasTargetPreflightOutcome, CtasFailure> {
         let target = crate::catalog_application::resolver::resolve_table_target(
             self,
-            &novarocks_sql::syntax::ObjectName {
+            &ObjectName {
                 parts: command.target_parts.clone(),
             },
             current_catalog,
@@ -1624,7 +1625,7 @@ impl CtasEngine for DmlExecutionKernel {
         let preflight = downcast_preflight(preflight)?;
         let target = crate::catalog_application::resolver::resolve_table_target(
             self,
-            &novarocks_sql::syntax::ObjectName {
+            &ObjectName {
                 parts: request.command.target_parts.clone(),
             },
             request.current_catalog.as_deref(),

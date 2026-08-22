@@ -28,7 +28,7 @@ use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
     ConnectorTableResolution, ConnectorWriteLease,
 };
-use novarocks_sql::syntax::ObjectName;
+use novarocks_sql::semantic::ObjectName;
 use novarocks_types::naming::{resolve_catalog_namespace_name, resolve_catalog_table_name};
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -37,7 +37,7 @@ use crate::query_execution::dml::iceberg_writer;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_parser::ast::{Insert, Query};
 use novarocks_protocol::lifecycle::QueryOptions;
-use novarocks_sql::syntax::{Literal, ObjectName};
+use novarocks_sql::semantic::{Literal, ObjectName};
 
 pub use crate::query_execution::dml::iceberg_writer::PreparedIcebergWriteNativeEncoding;
 

@@ -29,6 +29,7 @@ use crate::mv::domain::analysis::refresh_property::derive_fragment_property;
 use crate::mv::domain::analysis::{
     canonicalize_iceberg_mv_select_query, validate_mv_partition_columns,
 };
+use crate::mv::domain::application::MvRefreshRequest;
 use crate::mv::domain::application::{
     MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
 };
@@ -78,12 +79,12 @@ use novarocks_spi::connector::{
 };
 use novarocks_sql::planning::mv::MvRefreshFinalizeFacts;
 use novarocks_sql::planning::mv::{SqlMvAggregateLayoutScope, extract_aggregate_sql_calls};
-use novarocks_sql::syntax::{IcebergPartitionFieldExpr, RefreshMaterializedViewStmt};
+use novarocks_sql::semantic::IcebergPartitionFieldExpr;
 pub struct StandaloneMvRefreshPreparationService<'a> {
     source: &'a IcebergMvCorePorts,
     current_catalog: Option<&'a str>,
     current_database: &'a str,
-    statement: &'a RefreshMaterializedViewStmt,
+    statement: &'a MvRefreshRequest,
     connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
     repartition_fields: Option<&'a [IcebergPartitionFieldExpr]>,
 }
@@ -93,7 +94,7 @@ impl<'a> StandaloneMvRefreshPreparationService<'a> {
         ports: &'a IcebergMvCorePorts,
         current_catalog: Option<&'a str>,
         current_database: &'a str,
-        statement: &'a RefreshMaterializedViewStmt,
+        statement: &'a MvRefreshRequest,
         connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
     ) -> Self {
         Self {
@@ -110,7 +111,7 @@ impl<'a> StandaloneMvRefreshPreparationService<'a> {
         ports: &'a IcebergMvCorePorts,
         current_catalog: Option<&'a str>,
         current_database: &'a str,
-        statement: &'a RefreshMaterializedViewStmt,
+        statement: &'a MvRefreshRequest,
         repartition_fields: &'a [IcebergPartitionFieldExpr],
         connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
     ) -> Self {
@@ -159,9 +160,7 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
         request: MvRefreshPreparationRequest,
     ) -> Result<PreparedMvRefresh, String> {
         request.validate()?;
-        if request.statement
-            != novarocks_sql::planning::mv::MvRefreshStatement::from(self.statement)
-        {
+        if request.statement != self.statement.sql_refresh_statement() {
             return Err(
                 "MV refresh preparation statement does not match the admitted SQL request"
                     .to_string(),

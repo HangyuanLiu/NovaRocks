@@ -26,7 +26,7 @@ use novarocks_sql::planning::mv::{
     SqlMvOutputColumnFacts, SqlResolvedMvRefreshInput, SqlResolvedMvRefreshInputSource,
     strip_catalog_from_three_part_names,
 };
-use novarocks_sql::syntax::{IcebergPartitionFieldExpr, ObjectName, TableColumnDef};
+use novarocks_sql::semantic::{IcebergPartitionFieldExpr, ObjectName, TableColumnDef};
 use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -616,7 +616,7 @@ pub(crate) fn output_column_to_table_column(
 ) -> Result<TableColumnDef, String> {
     Ok(TableColumnDef {
         name: column.name.clone(),
-        data_type: novarocks_sql::syntax::arrow_data_type_to_sql_type(&column.data_type)?,
+        data_type: novarocks_sql::literal::arrow_data_type_to_sql_type(&column.data_type)?,
         nullable: column.nullable,
         aggregation: None,
         default: None,
@@ -699,7 +699,7 @@ mod tests {
     fn resolve_mv_name_accepts_supported_forms_and_rejects_non_default_catalog() {
         assert_eq!(
             resolve_mv_name(
-                &novarocks_sql::syntax::ObjectName {
+                &novarocks_sql::semantic::ObjectName {
                     parts: vec!["Orders".to_string()],
                 },
                 "Sales",
@@ -708,7 +708,7 @@ mod tests {
         );
         assert_eq!(
             resolve_mv_name(
-                &novarocks_sql::syntax::ObjectName {
+                &novarocks_sql::semantic::ObjectName {
                     parts: vec!["Marketing".to_string(), "Orders".to_string()],
                 },
                 "Sales",
@@ -717,7 +717,7 @@ mod tests {
         );
         assert_eq!(
             resolve_mv_name(
-                &novarocks_sql::syntax::ObjectName {
+                &novarocks_sql::semantic::ObjectName {
                     parts: vec![
                         "default_catalog".to_string(),
                         "Marketing".to_string(),
@@ -730,7 +730,7 @@ mod tests {
         );
         assert_eq!(
             resolve_mv_name(
-                &novarocks_sql::syntax::ObjectName {
+                &novarocks_sql::semantic::ObjectName {
                     parts: vec![
                         "ice".to_string(),
                         "Marketing".to_string(),

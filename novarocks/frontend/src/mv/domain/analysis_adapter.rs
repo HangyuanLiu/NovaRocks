@@ -25,13 +25,13 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::mv::domain::analysis::{MvAnalysis, prepare_mv_select_for_catalog_provider};
+use crate::mv::domain::application::MvShowStatement;
 use crate::mv::domain::lifecycle::MvListRow;
 use crate::mv::domain::model::MvStorageEngine;
 use crate::mv::domain::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::mv::domain::persistence::refresh::MvRefreshState;
 use crate::mv::domain::repository::MvRepository;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
-use novarocks_sql::syntax::ShowMaterializedViewsStmt;
 
 /// Lightweight projection of the iceberg base table that
 /// `validate_ivm_primary_key` needs. Built once at the top of `create_mv`
@@ -133,7 +133,7 @@ fn is_hashable_pk_type(sql_type: &str) -> bool {
 pub(crate) fn list_mv_rows_with_ports(
     repository: &dyn MvRepository,
     current_catalog: Option<&str>,
-    stmt: &ShowMaterializedViewsStmt,
+    stmt: &MvShowStatement,
     storage_filter: Option<MvStorageEngine>,
 ) -> Result<Vec<MvListRow>, String> {
     let definitions = repository

@@ -32,7 +32,7 @@ under the License.
 
 实现入口：
 - `src/sql/analyzer/iceberg_ref.rs`（IcebergRefBinding 解析与校验）
-- `src/sql/parser/dialect/mod.rs`（`FOR VERSION AS OF '<string>'` 的 normalizer 重写）
+- `novarocks/parser/src/parser/query.rs`（typed grammar 保留 `FOR VERSION AS OF '<string>'`）
 - `src/connector/iceberg/read.rs`（`build_read_snapshot_at` 按 snapshot_id 加载历史 schema）
 
 ---
@@ -83,7 +83,7 @@ SELECT * FROM t FOR VERSION AS OF 'dev';        -- 一个 branch
 SELECT * FROM t FOR VERSION AS OF 'release_v1'; -- 一个 tag
 ```
 
-> sqlparser 0.61 的 `FOR VERSION AS OF` 子句默认要求数字字面量，NovaRocks 通过 dialect normalizer 把 `FOR VERSION AS OF '<ref>'` 重写成 `FOR SYSTEM_TIME AS OF '__nr_ref:<ref>'`，再在 analyzer 阶段还原。
+> native typed parser 直接保留 `FOR VERSION AS OF '<ref>'` 的字符串字面量；analyzer 随后将它解析为 Iceberg branch 或 tag，而不经过文本重写。
 
 ## ✅ 跨 ref 自连接（多版本对比）
 

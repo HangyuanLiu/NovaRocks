@@ -44,11 +44,12 @@ use novarocks_spi::connector::{
     ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
     ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
 };
+#[cfg(test)]
+use novarocks_sql::literal::bytes_to_latin1_string;
+use novarocks_sql::literal::{column_default_to_ast_literal, latin1_string_to_bytes};
 use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
-#[cfg(test)]
-use novarocks_sql::syntax::bytes_to_latin1_string;
-use novarocks_sql::syntax::{Literal, column_default_to_literal, latin1_string_to_bytes};
+use novarocks_sql::semantic::Literal;
 use novarocks_types::schema::{ColumnDef, ColumnDefault, SqlType};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -927,7 +928,7 @@ fn omitted_column_expr_sql(column: &ColumnDef) -> Result<String, String> {
         return Ok("NULL".to_string());
     };
     let sql_type = arrow_data_type_to_sql_type(&column.data_type)?;
-    let literal = column_default_to_literal(write_default, &sql_type)?;
+    let literal = column_default_to_ast_literal(write_default, &sql_type)?;
     literal_to_sql_for_arrow_type(&literal, &column.data_type)
 }
 

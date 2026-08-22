@@ -952,13 +952,12 @@ impl<'a> super::AnalyzerContext<'a> {
                 kind: ast::LiteralKind::String(s),
                 ..
             } => {
-                // sqlparser already applied MySQL-style backslash escapes when
-                // tokenising the literal (our dialect enables
-                // `supports_string_literal_backslash_escape`). Don't unescape
+                // The native typed parser already applied MySQL-style backslash
+                // escapes when it admitted the literal. Don't unescape
                 // again — that double-processed `'e\\f'` from 3 bytes (`e\f`)
                 // down to 2 (`ef`) and is the cause of `join_large_in_predicate`
                 // step 59 silently dropping the backslash row from the IN
-                // result. INSERT VALUES already trusts sqlparser's output
+                // result. INSERT VALUES already trusts the parser-admitted value
                 // (`sql::literal` clones the string as-is); SELECT now matches.
                 Ok(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::String(s.clone())),
@@ -1196,7 +1195,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 // pass. This lets mixed-type equi-joins (e.g. int32 = int64) carry
                 // matching key types so the RF gate (rf_key_types_match) passes.
                 // Non-numeric pairs return None and are left to literal coercion /
-                // the execution-time normalizer (normalize_comparison_types).
+                // execution-time comparison coercion.
                 match comparison_common_type(&left_coerced.data_type, &right_coerced.data_type)
                     .map_err(|message| AnalyzeError::type_mismatch(message, left.span()))?
                 {
@@ -2717,8 +2716,8 @@ impl<'a> super::AnalyzerContext<'a> {
     /// Analyse `map_apply((k, v) -> body, m)` / `transform_keys((k, v) -> nk, m)` /
     /// `transform_values((k, v) -> nv, m)`. The 2-parameter lambda binds
     /// `k` to the map's key Arrow type and `v` to the value type. For
-    /// `map_apply` the body must be a `(new_key, new_value)` tuple (sqlparser
-    /// surfaces it as `Expr::Tuple`); we rewrite it as a `row(...)` call so
+    /// `map_apply` the body must be a `(new_key, new_value)` tuple (the native
+    /// parser represents it as `Expr::Tuple`); we rewrite it as a `row(...)` call so
     /// downstream codegen sees a 2-field Struct.
     fn analyze_map_higher_order_lambda_arguments(
         &self,
@@ -4217,8 +4216,8 @@ fn is_lead_lag_default_arg_acceptable(default_arg: &TypedExpr, value_type: &Data
     }
     let stripped = strip_casts(default_arg);
     // Plain (signed) literal — `1`, `-1`, `(1)`, etc. — is always accepted.
-    // sqlparser surfaces `-1` as `UnaryOp::Minus(Literal(1))`, so peel the
-    // unary minus before deciding.
+    // The native parser represents `-1` as a unary minus around `Literal(1)`,
+    // so peel the unary minus before deciding.
     if is_signed_literal(stripped) {
         return true;
     }

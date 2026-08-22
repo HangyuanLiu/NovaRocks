@@ -22,8 +22,6 @@
 
 use std::collections::BTreeMap;
 
-use crate::legacy_mv_ast::RefreshMaterializedViewStmt;
-
 pub(crate) mod aggregate_shape;
 pub mod first_refresh;
 
@@ -85,20 +83,6 @@ pub const FULL_REFRESH_DISABLED_MESSAGE: &str = "REFRESH MATERIALIZED VIEW ... F
 pub struct MvRefreshStatement {
     pub name_parts: Vec<String>,
     pub full: bool,
-}
-
-impl From<&RefreshMaterializedViewStmt> for MvRefreshStatement {
-    fn from(statement: &RefreshMaterializedViewStmt) -> Self {
-        Self {
-            name_parts: statement
-                .name
-                .parts
-                .iter()
-                .map(|part| part.value.clone())
-                .collect(),
-            full: statement.full,
-        }
-    }
 }
 
 impl MvRefreshStatement {

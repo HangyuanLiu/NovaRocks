@@ -17,9 +17,8 @@
 
 //! Narrow catalog and view-analysis handoffs.
 //!
-//! SQL syntax is exposed only through [`crate::syntax`]. This module carries
-//! catalog materialization and typed view-analysis facts; it does not expose a
-//! parser or planner implementation tree.
+//! This module carries catalog materialization and typed view-analysis facts;
+//! it does not expose a parser or planner implementation tree.
 
 use std::collections::{BTreeMap, BTreeSet};
 

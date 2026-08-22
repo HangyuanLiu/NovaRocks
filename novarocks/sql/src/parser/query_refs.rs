@@ -17,42 +17,7 @@
 
 //! Native typed-query table-reference extraction and catalog stripping.
 
-use novarocks_parser::ast::{self as ast, Fold, TableFactor, Visit};
-
-#[derive(Default)]
-struct QueryRefVisitor {
-    three_part: Vec<(String, String, String)>,
-}
-
-impl Visit for QueryRefVisitor {
-    fn visit_table_factor(&mut self, factor: &TableFactor) {
-        if let TableFactor::Table { name, metadata, .. } = factor {
-            let parts = name
-                .parts
-                .iter()
-                .map(|part| part.value.to_ascii_lowercase())
-                .collect::<Vec<_>>();
-            if let (_, [catalog, namespace, table]) = (metadata.is_some(), parts.as_slice()) {
-                self.three_part
-                    .push((catalog.clone(), namespace.clone(), table.clone()));
-            }
-        }
-        ast::walk_table_factor(self, factor);
-    }
-}
-
-fn collect(query: &ast::Query) -> QueryRefVisitor {
-    let mut visitor = QueryRefVisitor::default();
-    visitor.visit_query(query);
-    visitor
-}
-
-/// Extract every catalog-qualified reference, preserving occurrences.
-pub(crate) fn extract_three_part_table_ref_occurrences(
-    query: &ast::Query,
-) -> Vec<(String, String, String)> {
-    collect(query).three_part
-}
+use novarocks_parser::ast::{self as ast, Fold, TableFactor};
 
 struct CatalogStripper;
 
@@ -105,23 +70,6 @@ mod tests {
             panic!("expected query");
         };
         query.clone()
-    }
-
-    #[test]
-    fn collects_catalog_qualified_table_references_across_nested_native_queries() {
-        let query = parse_query(
-            "WITH x AS (SELECT * FROM ns.seed) \
-             SELECT * FROM cat.db.t1 JOIN (SELECT * FROM cat.db.t2) d \
-             ON id IN (SELECT id FROM cat.db.t3)",
-        );
-        assert_eq!(
-            extract_three_part_table_ref_occurrences(&query),
-            vec![
-                ("cat".to_string(), "db".to_string(), "t1".to_string()),
-                ("cat".to_string(), "db".to_string(), "t2".to_string()),
-                ("cat".to_string(), "db".to_string(), "t3".to_string()),
-            ]
-        );
     }
 
     #[test]

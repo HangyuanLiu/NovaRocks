@@ -18,9 +18,10 @@
 //! CTAS schema derivation: turn a produced Arrow schema into declared table
 //! columns. Frontend DML owns CTAS routing and the durable staged-publication
 //! saga. The per-type Arrow -> SqlType mapping itself is owned by
-//! `novarocks_sql::syntax`, next to its `sql_type_to_arrow_type` inverse.
+//! `novarocks_sql::literal`, next to its `sql_type_to_arrow_type` inverse.
 
-use novarocks_sql::syntax::TableColumnDef;
+use novarocks_sql::literal::arrow_data_type_to_sql_type;
+use novarocks_sql::semantic::TableColumnDef;
 
 pub(crate) fn arrow_schema_to_table_column_defs(
     schema: &arrow::datatypes::Schema,
@@ -29,7 +30,7 @@ pub(crate) fn arrow_schema_to_table_column_defs(
         .fields()
         .iter()
         .map(|field| {
-            let data_type = novarocks_sql::syntax::arrow_data_type_to_sql_type(field.data_type())?;
+            let data_type = arrow_data_type_to_sql_type(field.data_type())?;
             Ok(TableColumnDef {
                 name: field.name().clone(),
                 data_type,

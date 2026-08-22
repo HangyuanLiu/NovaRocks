@@ -28,9 +28,7 @@ use crate::runtime::query_result::QueryResult;
 use novarocks_parser::ast::{
     LiteralKind, MaterializedViewPartitionArgument, MaterializedViewPartitionField, Query,
 };
-use novarocks_sql::syntax::{
-    CreateMaterializedViewStmt, IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy,
-};
+use novarocks_sql::semantic::IcebergPartitionFieldExpr;
 
 /// Join refresh shape retained until query assembly admits exact connector
 /// bindings for the corresponding write.
@@ -135,6 +133,42 @@ impl From<&MaterializedViewPartitionField> for MvCreatePartitionField {
     }
 }
 
+impl From<&MvCreatePartitionField> for IcebergPartitionFieldExpr {
+    fn from(value: &MvCreatePartitionField) -> Self {
+        match value {
+            MvCreatePartitionField::Identity { column } => Self::Identity {
+                column: column.clone(),
+            },
+            MvCreatePartitionField::Year { column } => Self::Year {
+                column: column.clone(),
+            },
+            MvCreatePartitionField::Month { column } => Self::Month {
+                column: column.clone(),
+            },
+            MvCreatePartitionField::Day { column } => Self::Day {
+                column: column.clone(),
+            },
+            MvCreatePartitionField::Hour { column } => Self::Hour {
+                column: column.clone(),
+            },
+            MvCreatePartitionField::Bucket {
+                column,
+                num_buckets,
+            } => Self::Bucket {
+                column: column.clone(),
+                num_buckets: *num_buckets,
+            },
+            MvCreatePartitionField::Truncate { column, width } => Self::Truncate {
+                column: column.clone(),
+                width: *width,
+            },
+            MvCreatePartitionField::Void { column } => Self::Void {
+                column: column.clone(),
+            },
+        }
+    }
+}
+
 fn normalized_partition_identifier(value: &str) -> String {
     novarocks_types::naming::normalize_identifier(value)
         .expect("MV partition identifier was validated during SQL admission")
@@ -183,16 +217,52 @@ pub enum MvCreateRefreshPolicy {
     },
 }
 
-impl From<&MaterializedViewRefreshPolicy> for MvCreateRefreshPolicy {
-    fn from(value: &MaterializedViewRefreshPolicy) -> Self {
-        match value {
-            MaterializedViewRefreshPolicy::Manual => Self::Manual,
-            MaterializedViewRefreshPolicy::AsyncOnChange => Self::AsyncOnChange,
-            MaterializedViewRefreshPolicy::AsyncInterval { interval_ms } => Self::AsyncInterval {
-                interval_ms: *interval_ms,
-            },
+/// Frontend-owned request for dropping one admitted materialized view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MvDropStatement {
+    pub name_parts: Vec<String>,
+    pub if_exists: bool,
+}
+
+/// Frontend-owned admitted materialized-view alteration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MvAlterAction {
+    SetRefresh(MvCreateRefreshPolicy),
+    SetProperties(Vec<(String, String)>),
+    PauseRefresh,
+    ResumeRefresh,
+    Repartition(Vec<MvCreatePartitionField>),
+}
+
+/// Frontend-owned request for altering one admitted materialized view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MvAlterStatement {
+    pub name_parts: Vec<String>,
+    pub action: MvAlterAction,
+}
+
+// Design: ADR-0101 (docs/adr/ADR-0101-native-sql-language-authority-and-owner-boundaries.md)
+/// Frontend-owned refresh request. The request keeps the admitted target name
+/// distinct from SQL planning's immutable refresh semantic value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MvRefreshRequest {
+    pub name_parts: Vec<String>,
+    pub full: bool,
+}
+
+impl MvRefreshRequest {
+    pub fn sql_refresh_statement(&self) -> novarocks_sql::planning::mv::MvRefreshStatement {
+        novarocks_sql::planning::mv::MvRefreshStatement {
+            name_parts: self.name_parts.clone(),
+            full: self.full,
         }
     }
+}
+
+/// Frontend-owned request for listing materialized views.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MvShowStatement {
+    pub database: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -206,36 +276,6 @@ pub struct MvCreateStatement {
     pub select_query: Query,
     pub properties: Vec<(String, String)>,
     pub primary_key: Option<Vec<String>>,
-}
-
-impl From<&CreateMaterializedViewStmt> for MvCreateStatement {
-    fn from(value: &CreateMaterializedViewStmt) -> Self {
-        Self {
-            name_parts: value
-                .name
-                .parts
-                .iter()
-                .map(|part| part.value.clone())
-                .collect(),
-            if_not_exists: value.if_not_exists,
-            partition_by: value
-                .partition_by
-                .as_ref()
-                .map(|fields| fields.iter().map(MvCreatePartitionField::from).collect()),
-            distribution: value
-                .distribution
-                .as_ref()
-                .map(|distribution| MvCreateDistribution {
-                    hash_columns: distribution.hash_columns.clone(),
-                    bucket_count: distribution.bucket_count,
-                }),
-            refresh_policy: MvCreateRefreshPolicy::from(&value.refresh_policy),
-            select_sql: value.select_sql.clone(),
-            select_query: value.select_query.clone(),
-            properties: value.properties.clone(),
-            primary_key: value.primary_key.clone(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

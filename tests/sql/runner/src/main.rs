@@ -994,8 +994,8 @@ fn run_imv_equivalence_check(
         }
     };
 
-    // SelectText is the canonical re-parseable CREATE-MV query body (sqlparser
-    // Display round-trip, re-parsed on every refresh), so it is safe to re-run.
+    // SelectText is the canonical persisted, re-parseable CREATE-MV query body.
+    // The native parser re-admits it on every refresh, so it is safe to re-run.
     let (ok, full, msg) = session.execute_query(query_timeout, &select_sql, None);
     if !ok {
         return Err(format!(
