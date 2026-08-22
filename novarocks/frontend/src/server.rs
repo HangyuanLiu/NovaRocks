@@ -23,7 +23,10 @@ use tokio::runtime::Handle;
 
 use crate::capabilities as core_capabilities;
 use crate::state_store::{StateStoreHostInput, StateStoreProviderRegistry};
-use crate::{QuerySessionFactory, ResolvedMysqlListenerSettings};
+use crate::{
+    ClientConnectionControlPort, MysqlClientConnectionRegistry, QuerySessionFactory,
+    ResolvedMysqlListenerSettings,
+};
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::connector::MvStorageObservationPort;
 
@@ -98,6 +101,7 @@ pub fn build_frontend_query_session_factory(
     system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog>,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    client_connection_control: Arc<dyn ClientConnectionControlPort>,
 ) -> Result<Arc<dyn QuerySessionFactory>, FrontendApplicationError> {
     let catalog_service =
         Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
@@ -322,6 +326,7 @@ pub fn build_frontend_query_session_factory(
             maintenance_command_executor,
             maintenance_read_command_executor,
             host.query_control_service(),
+            client_connection_control,
             query_execution,
             role,
             topology,
@@ -419,11 +424,15 @@ where
         .set_bound_port(exchange_port);
     let system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog> =
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
+    let client_connections = Arc::new(MysqlClientConnectionRegistry::new());
+    let client_connection_control: Arc<dyn ClientConnectionControlPort> =
+        client_connections.clone();
     let session_factory = match build_frontend_query_session_factory(
         host,
         system_catalog,
         exchange_port,
         mv_storage_observation,
+        client_connection_control,
     ) {
         Ok(factory) => factory,
         Err(error) => {
@@ -439,10 +448,14 @@ where
             );
         }
     };
-    let server_result =
-        crate::run_mysql_server_until_shutdown(config.mysql_listener, session_factory, shutdown)
-            .await
-            .map_err(FrontendApplicationError::server);
+    let server_result = crate::run_mysql_server_until_shutdown(
+        config.mysql_listener,
+        session_factory,
+        client_connections,
+        shutdown,
+    )
+    .await
+    .map_err(FrontendApplicationError::server);
     let stop_result = report_server
         .stop()
         .map_err(FrontendApplicationError::server);
@@ -642,7 +655,7 @@ mod tests {
     };
     use crate::{
         ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
-        FrontendApplicationHost, FrontendExecutionConfig,
+        FrontendApplicationHost, FrontendExecutionConfig, MysqlClientConnectionRegistry,
     };
     use crate::{QueryServiceErrorKind, QuerySessionOpenRequest, ResolvedMysqlListenerSettings};
 
@@ -762,6 +775,7 @@ mod tests {
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             0,
             Arc::new(UnavailableMvStorageObservationPort),
+            Arc::new(MysqlClientConnectionRegistry::new()),
         )
         .expect("build ready frontend session factory");
         let session = session_factory
@@ -882,6 +896,7 @@ mod tests {
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             0,
             Arc::new(UnavailableMvStorageObservationPort),
+            Arc::new(MysqlClientConnectionRegistry::new()),
         )
         .expect("build ready frontend session factory");
         let session = session_factory

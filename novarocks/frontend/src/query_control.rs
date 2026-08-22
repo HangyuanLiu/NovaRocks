@@ -28,6 +28,7 @@ use crate::query_execution::control::{
     StatementRegistration, StatementToken,
 };
 
+// Design: ADR-0102 (docs/adr/ADR-0102-mysql-kill-connection-lifecycle-ownership.md)
 #[derive(Default)]
 pub struct FrontendQueryControl {
     state: Mutex<QueryControlState>,

@@ -69,7 +69,8 @@ pub use mysql::session::{
     QuerySessionOpenRequest, SessionExecutionSettings,
 };
 pub use mysql::{
-    ResolvedMysqlListenerSettings, resolve_mysql_listener_settings, run_mysql_server_until_shutdown,
+    MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
+    run_mysql_server_until_shutdown,
 };
 pub use native::report_server::FrontendReportServerHandle;
 pub use query::FrontendQueryService;

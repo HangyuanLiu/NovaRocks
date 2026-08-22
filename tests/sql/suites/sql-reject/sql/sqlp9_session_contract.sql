@@ -47,15 +47,3 @@ USE db extra;
 -- @expect_sql_phase=Admit
 -- @expect_error_at=1:5
 SET GLOBAL query_timeout = 1;
-
--- @expect_error_tier=target
--- @expect_sql_code=sql.admit.kill_connection_unsupported
--- @expect_sql_phase=Admit
--- @expect_error_at=1:1
-KILL 1;
-
--- @expect_error_tier=target
--- @expect_sql_code=sql.admit.kill_connection_unsupported
--- @expect_sql_phase=Admit
--- @expect_error_at=1:1
-KILL CONNECTION 1;

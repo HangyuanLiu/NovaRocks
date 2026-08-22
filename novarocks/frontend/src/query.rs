@@ -32,8 +32,8 @@ use crate::common::query_cancellation::QueryCancellationReason;
 use crate::mv::command::MvCommandExecutor;
 use crate::query_execution::backend_command::BackendCommandExecutor;
 use crate::query_execution::control::{
-    QueryCancelOutcome, QueryControlService, QuerySessionLease, SessionIdentity, SessionToken,
-    StatementFinishOutcome,
+    ConnectionKillAuthorization, QueryCancelOutcome, QueryControlService, QuerySessionLease,
+    SessionIdentity, SessionToken, StatementFinishOutcome,
 };
 use crate::query_execution::dml::add_files::AddFilesEngine;
 use crate::query_execution::dml::ctas::CtasEngine;
@@ -49,8 +49,9 @@ use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::{PreparedQueryOperation, StatementResult};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::{
-    QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
-    QuerySessionOpenRequest, SessionExecutionSettings,
+    ClientConnectionControlPort, ClientConnectionTerminateOutcome,
+    ClientConnectionTerminationReason, QueryServiceError, QueryServiceErrorKind, QuerySession,
+    QuerySessionFactory, QuerySessionOpenRequest, SessionExecutionSettings,
 };
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -433,6 +434,7 @@ pub struct FrontendQueryService {
     query_compiler: FrontendQueryCompiler,
     command_executor: Arc<dyn CoreCommandRoute>,
     query_control: QueryControlService,
+    client_connection_control: Arc<dyn ClientConnectionControlPort>,
     query_execution: QueryExecutionService,
     role: ClusterRole,
     topology: BackendTopologyService,
@@ -462,6 +464,7 @@ impl FrontendQueryService {
         maintenance_command_executor: MaintenanceCommandExecutor,
         maintenance_read_command_executor: MaintenanceReadCommandExecutor,
         query_control: QueryControlService,
+        client_connection_control: Arc<dyn ClientConnectionControlPort>,
         query_execution: QueryExecutionService,
         role: ClusterRole,
         topology: BackendTopologyService,
@@ -488,6 +491,7 @@ impl FrontendQueryService {
                 maintenance_read_command_executor,
             )),
             query_control,
+            client_connection_control,
             query_execution,
             role,
             topology,
@@ -821,49 +825,14 @@ impl FrontendQuerySession {
         source: &str,
         statement: &ast::KillStatement,
     ) -> Result<StatementResult, QueryServiceError> {
-        if !matches!(statement.kind, ast::KillKind::Query) {
-            return Err(QueryServiceError::from_user_error(
-                crate::session_error::SessionAdmitError::KillConnectionUnsupported.to_user_error(
-                    source,
-                    statement.span,
-                    "KILL CONNECTION is not supported; use KILL QUERY",
-                ),
-            ));
-        }
-        let ast::LiteralKind::Number(connection_id) = &statement.connection_id.kind else {
-            return Err(QueryServiceError::new(
-                QueryServiceErrorKind::Parse,
-                "KILL QUERY requires an integer connection id",
-            ));
-        };
-        let connection_id = connection_id.parse::<u32>().map_err(|_| {
-            QueryServiceError::new(
-                QueryServiceErrorKind::Parse,
-                "KILL QUERY requires an integer connection id",
-            )
-        })?;
         let requester = self.token()?;
-        match self
-            .service
-            .query_control
-            .kill_query(requester, connection_id)
-        {
-            QueryCancelOutcome::Requested | QueryCancelOutcome::AlreadyRequested(_) => {
-                Ok(StatementResult::Ok)
-            }
-            QueryCancelOutcome::NoActiveStatement => Err(QueryServiceError::new(
-                QueryServiceErrorKind::NoSuchSession,
-                format!("connection {connection_id} has no active query"),
-            )),
-            QueryCancelOutcome::UnknownSession => Err(QueryServiceError::new(
-                QueryServiceErrorKind::NoSuchSession,
-                format!("unknown connection {connection_id}"),
-            )),
-            QueryCancelOutcome::PermissionDenied => Err(QueryServiceError::new(
-                QueryServiceErrorKind::PermissionDenied,
-                "permission denied to kill query owned by another principal",
-            )),
-        }
+        execute_kill_statement(
+            source,
+            statement,
+            requester,
+            &self.service.query_control,
+            Some(self.service.client_connection_control.as_ref()),
+        )
     }
 
     async fn execute_typed_statement(
@@ -1301,6 +1270,92 @@ struct DatabaseContext {
     database: String,
 }
 
+/// Resolves the frontend-owned KILL semantics after the protocol owner has
+/// supplied its transport-neutral connection-control capability.
+///
+/// Connection lifecycle composition is intentionally outside this helper: the
+/// MySQL protocol owner supplies the port only once its registry and runner
+/// share the same instance. Until then, a connection KILL cannot be admitted.
+fn execute_kill_statement(
+    source: &str,
+    statement: &ast::KillStatement,
+    requester: SessionToken,
+    query_control: &QueryControlService,
+    connection_control: Option<&dyn ClientConnectionControlPort>,
+) -> Result<StatementResult, QueryServiceError> {
+    let connection_id = kill_connection_id(statement)?;
+    match statement.kind {
+        ast::KillKind::Query => match query_control.kill_query(requester, connection_id) {
+            QueryCancelOutcome::Requested
+            | QueryCancelOutcome::AlreadyRequested(_)
+            | QueryCancelOutcome::NoActiveStatement => Ok(StatementResult::Ok),
+            QueryCancelOutcome::UnknownSession => Err(no_such_connection_error(connection_id)),
+            QueryCancelOutcome::PermissionDenied => Err(kill_denied_error(source, statement)),
+        },
+        ast::KillKind::Default | ast::KillKind::Connection => {
+            let target = match query_control.authorize_connection_kill(requester, connection_id) {
+                ConnectionKillAuthorization::Authorized(target) => target,
+                ConnectionKillAuthorization::UnknownSession => {
+                    return Err(no_such_connection_error(connection_id));
+                }
+                ConnectionKillAuthorization::PermissionDenied => {
+                    return Err(kill_denied_error(source, statement));
+                }
+            };
+            let connection_control = connection_control.ok_or_else(|| {
+                QueryServiceError::new(
+                    QueryServiceErrorKind::Unavailable,
+                    "client connection control is not composed",
+                )
+            })?;
+            match connection_control.terminate(
+                target,
+                ClientConnectionTerminationReason::ExplicitKillConnection {
+                    requester_connection_id: requester.connection_id(),
+                },
+            ) {
+                ClientConnectionTerminateOutcome::Requested
+                | ClientConnectionTerminateOutcome::AlreadyTerminating => Ok(StatementResult::Ok),
+                ClientConnectionTerminateOutcome::Stale => {
+                    Err(no_such_connection_error(connection_id))
+                }
+            }
+        }
+    }
+}
+
+fn kill_connection_id(statement: &ast::KillStatement) -> Result<u32, QueryServiceError> {
+    let ast::LiteralKind::Number(connection_id) = &statement.connection_id.kind else {
+        return Err(QueryServiceError::new(
+            QueryServiceErrorKind::Parse,
+            "KILL requires an integer connection id",
+        ));
+    };
+    connection_id.parse::<u32>().map_err(|_| {
+        QueryServiceError::new(
+            QueryServiceErrorKind::Parse,
+            "KILL requires an integer connection id",
+        )
+    })
+}
+
+fn no_such_connection_error(connection_id: u32) -> QueryServiceError {
+    QueryServiceError::new(
+        QueryServiceErrorKind::NoSuchSession,
+        format!("unknown connection {connection_id}"),
+    )
+}
+
+fn kill_denied_error(source: &str, statement: &ast::KillStatement) -> QueryServiceError {
+    QueryServiceError::from_user_error(
+        crate::session_error::SessionAdmitError::KillDenied.to_user_error(
+            source,
+            statement.span,
+            "permission denied to kill connection owned by another principal",
+        ),
+    )
+}
+
 fn resolve_catalog_name(
     resolver: &SessionCatalogResolver,
     catalog: &str,
@@ -1723,6 +1778,7 @@ fn cancellation_error(reason: QueryCancellationReason) -> QueryServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::common::admitted_query_context::QueryExecutionContext;
@@ -1745,6 +1801,180 @@ mod tests {
     fn default_query_options() -> QueryOptions {
         QueryOptions::parse(novarocks_protocol::novarocks::QueryOptions::default())
             .expect("default wire query options are valid")
+    }
+
+    fn parsed_kill(source: &str) -> ast::KillStatement {
+        let statements = novarocks_parser::parse(source).expect("KILL statement must parse");
+        let [ParsedStatement::Session(ast::SessionStatement::Kill(statement))] =
+            statements.as_slice()
+        else {
+            panic!("expected one KILL session statement");
+        };
+        statement.clone()
+    }
+
+    fn register_kill_session(
+        control: &QueryControlService,
+        connection_id: u32,
+        generation: u64,
+        principal: &str,
+    ) -> QuerySessionLease {
+        control
+            .register_session(SessionIdentity::new(
+                crate::ClientConnectionToken::new(connection_id, generation)
+                    .expect("valid test connection token"),
+                principal,
+            ))
+            .expect("register test session")
+    }
+
+    struct FixedConnectionControl {
+        outcome: ClientConnectionTerminateOutcome,
+        calls: Mutex<
+            Vec<(
+                crate::ClientConnectionToken,
+                ClientConnectionTerminationReason,
+            )>,
+        >,
+    }
+
+    impl FixedConnectionControl {
+        fn new(outcome: ClientConnectionTerminateOutcome) -> Self {
+            Self {
+                outcome,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ClientConnectionControlPort for FixedConnectionControl {
+        fn terminate(
+            &self,
+            target: crate::ClientConnectionToken,
+            reason: ClientConnectionTerminationReason,
+        ) -> ClientConnectionTerminateOutcome {
+            self.calls
+                .lock()
+                .expect("connection control calls lock")
+                .push((target, reason));
+            self.outcome
+        }
+    }
+
+    #[test]
+    fn kill_query_treats_an_idle_authorized_target_as_ok() {
+        let control = crate::query_control::FrontendQueryControl::service();
+        let requester = register_kill_session(&control, 8, 1, "alice");
+        let _target = register_kill_session(&control, 7, 1, "alice");
+        let source = "KILL QUERY 7";
+
+        let result = execute_kill_statement(
+            source,
+            &parsed_kill(source),
+            requester.token(),
+            &control,
+            None,
+        );
+
+        assert!(matches!(result, Ok(StatementResult::Ok)));
+    }
+
+    #[test]
+    fn kill_connection_forms_accept_requested_and_already_terminating() {
+        for outcome in [
+            ClientConnectionTerminateOutcome::Requested,
+            ClientConnectionTerminateOutcome::AlreadyTerminating,
+        ] {
+            for source in ["KILL 7", "KILL CONNECTION 7"] {
+                let control = crate::query_control::FrontendQueryControl::service();
+                let requester = register_kill_session(&control, 8, 1, "alice");
+                let _target = register_kill_session(&control, 7, 11, "alice");
+                let connection_control = FixedConnectionControl::new(outcome);
+
+                let result = execute_kill_statement(
+                    source,
+                    &parsed_kill(source),
+                    requester.token(),
+                    &control,
+                    Some(&connection_control),
+                );
+
+                assert!(
+                    matches!(result, Ok(StatementResult::Ok)),
+                    "{source}: {outcome:?}"
+                );
+                assert_eq!(
+                    connection_control
+                        .calls
+                        .lock()
+                        .expect("connection control calls lock")
+                        .as_slice(),
+                    &[(
+                        crate::ClientConnectionToken::new(7, 11)
+                            .expect("valid test connection token"),
+                        ClientConnectionTerminationReason::ExplicitKillConnection {
+                            requester_connection_id: 8,
+                        },
+                    )]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kill_connection_stale_target_maps_to_no_such_session() {
+        let control = crate::query_control::FrontendQueryControl::service();
+        let requester = register_kill_session(&control, 8, 1, "alice");
+        let _target = register_kill_session(&control, 7, 1, "alice");
+        let connection_control =
+            FixedConnectionControl::new(ClientConnectionTerminateOutcome::Stale);
+        let source = "KILL CONNECTION 7";
+
+        let error = execute_kill_statement(
+            source,
+            &parsed_kill(source),
+            requester.token(),
+            &control,
+            Some(&connection_control),
+        )
+        .expect_err("stale protocol target must be rejected");
+
+        assert_eq!(error.kind(), QueryServiceErrorKind::NoSuchSession);
+    }
+
+    #[test]
+    fn kill_denial_is_a_typed_admit_error_for_query_and_connection() {
+        for source in ["KILL QUERY 7", "KILL CONNECTION 7"] {
+            let control = crate::query_control::FrontendQueryControl::service();
+            let requester = register_kill_session(&control, 8, 1, "alice");
+            let _target = register_kill_session(&control, 7, 1, "bob");
+            let connection_control =
+                FixedConnectionControl::new(ClientConnectionTerminateOutcome::Requested);
+
+            let error = execute_kill_statement(
+                source,
+                &parsed_kill(source),
+                requester.token(),
+                &control,
+                Some(&connection_control),
+            )
+            .expect_err("cross-principal KILL must be denied");
+            let user_error = error.user_error().expect("typed KILL error");
+
+            assert_eq!(user_error.code().as_str(), "sql.admit.kill_denied");
+            assert_eq!(user_error.phase(), novarocks_user_error::ErrorPhase::Admit);
+            assert_eq!(
+                user_error.location().map(|location| location.column()),
+                Some(1)
+            );
+            assert!(
+                connection_control
+                    .calls
+                    .lock()
+                    .expect("connection control calls lock")
+                    .is_empty()
+            );
+        }
     }
 
     #[derive(Default)]

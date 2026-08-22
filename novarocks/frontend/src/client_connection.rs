@@ -91,6 +91,7 @@ pub enum ClientConnectionTerminateOutcome {
 }
 
 /// A protocol-owned capability for terminating one exact client connection.
+// Design: ADR-0102 (docs/adr/ADR-0102-mysql-kill-connection-lifecycle-ownership.md)
 pub trait ClientConnectionControlPort: Send + Sync + 'static {
     fn terminate(
         &self,
