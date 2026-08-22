@@ -65,6 +65,10 @@ pub trait Visit {
         walk_dml_statement(self, statement);
     }
 
+    fn visit_session_statement(&mut self, statement: &SessionStatement) {
+        walk_session_statement(self, statement);
+    }
+
     fn visit_query(&mut self, query: &Query) {
         walk_query(self, query);
     }
@@ -131,6 +135,7 @@ pub fn walk_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Statement)
         Statement::View(statement) => visitor.visit_view_statement(statement),
         Statement::Table(statement) => visitor.visit_table_statement(statement),
         Statement::Dml(statement) => visitor.visit_dml_statement(statement),
+        Statement::Session(statement) => visitor.visit_session_statement(statement),
         Statement::Query(query) => visitor.visit_query(query),
         Statement::ExplainQuery(query) => visitor.visit_explain_query(query),
     }
@@ -683,6 +688,10 @@ pub trait Fold {
         fold_dml_statement(self, statement)
     }
 
+    fn fold_session_statement(&mut self, statement: SessionStatement) -> SessionStatement {
+        fold_session_statement(self, statement)
+    }
+
     fn fold_query(&mut self, query: Query) -> Query {
         fold_query(self, query)
     }
@@ -759,6 +768,9 @@ pub fn fold_statement<F: Fold + ?Sized>(folder: &mut F, statement: Statement) ->
         Statement::View(statement) => Statement::View(folder.fold_view_statement(statement)),
         Statement::Table(statement) => Statement::Table(folder.fold_table_statement(statement)),
         Statement::Dml(statement) => Statement::Dml(folder.fold_dml_statement(statement)),
+        Statement::Session(statement) => {
+            Statement::Session(folder.fold_session_statement(statement))
+        }
         Statement::Query(query) => Statement::Query(folder.fold_query(query)),
         Statement::ExplainQuery(query) => Statement::ExplainQuery(folder.fold_explain_query(query)),
     }
@@ -829,6 +841,83 @@ pub fn fold_dml_statement<F: Fold + ?Sized>(
     statement: DmlStatement,
 ) -> DmlStatement {
     super::dml::fold(folder, statement)
+}
+
+pub fn walk_session_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &SessionStatement) {
+    match statement {
+        SessionStatement::Set(statement) => {
+            for assignment in &statement.assignments {
+                match &assignment.target {
+                    SetTarget::UserVariable(variable) => visitor.visit_user_variable(variable),
+                    SetTarget::SystemVariable(variable) => visitor.visit_ident(variable),
+                    SetTarget::Names { .. }
+                    | SetTarget::Transaction { .. }
+                    | SetTarget::Catalog { .. } => {}
+                }
+                match &assignment.value {
+                    SetValue::Expression(value) => visitor.visit_expr(value),
+                    SetValue::Query(value) => visitor.visit_query(value),
+                    SetValue::Words(words) => {
+                        for word in words {
+                            match word {
+                                SetWord::Ident(word) => visitor.visit_ident(word),
+                                SetWord::Literal(word) => visitor.visit_literal(word),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        SessionStatement::Use(statement) => visitor.visit_ident(&statement.database),
+        SessionStatement::Kill(statement) => visitor.visit_literal(&statement.connection_id),
+    }
+}
+
+pub fn fold_session_statement<F: Fold + ?Sized>(
+    folder: &mut F,
+    statement: SessionStatement,
+) -> SessionStatement {
+    match statement {
+        SessionStatement::Set(mut statement) => {
+            for assignment in &mut statement.assignments {
+                assignment.target = match assignment.target.clone() {
+                    SetTarget::UserVariable(variable) => {
+                        SetTarget::UserVariable(folder.fold_user_variable(variable))
+                    }
+                    SetTarget::SystemVariable(variable) => {
+                        SetTarget::SystemVariable(folder.fold_ident(variable))
+                    }
+                    target @ (SetTarget::Names { .. }
+                    | SetTarget::Transaction { .. }
+                    | SetTarget::Catalog { .. }) => target,
+                };
+                assignment.value = match assignment.value.clone() {
+                    SetValue::Expression(value) => SetValue::Expression(folder.fold_expr(value)),
+                    SetValue::Query(value) => SetValue::Query(Box::new(folder.fold_query(*value))),
+                    SetValue::Words(words) => SetValue::Words(
+                        words
+                            .into_iter()
+                            .map(|word| match word {
+                                SetWord::Ident(word) => SetWord::Ident(folder.fold_ident(word)),
+                                SetWord::Literal(word) => {
+                                    SetWord::Literal(folder.fold_literal(word))
+                                }
+                            })
+                            .collect(),
+                    ),
+                };
+            }
+            SessionStatement::Set(statement)
+        }
+        SessionStatement::Use(mut statement) => {
+            statement.database = folder.fold_ident(statement.database);
+            SessionStatement::Use(statement)
+        }
+        SessionStatement::Kill(mut statement) => {
+            statement.connection_id = folder.fold_literal(statement.connection_id);
+            SessionStatement::Kill(statement)
+        }
+    }
 }
 
 pub fn fold_ident<F: Fold + ?Sized>(_: &mut F, ident: Ident) -> Ident {

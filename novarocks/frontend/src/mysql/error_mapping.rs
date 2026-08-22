@@ -68,6 +68,14 @@ const ERROR_KIND_MAPPINGS: &[(&str, ErrorKind)] = &[
         ErrorKind::ER_NOT_SUPPORTED_YET,
     ),
     (
+        "sql.admit.session_global_scope_unsupported",
+        ErrorKind::ER_NOT_SUPPORTED_YET,
+    ),
+    (
+        "sql.admit.kill_connection_unsupported",
+        ErrorKind::ER_NOT_SUPPORTED_YET,
+    ),
+    (
         "sql.analyze.unsupported_expression",
         ErrorKind::ER_NOT_SUPPORTED_YET,
     ),
@@ -106,7 +114,7 @@ mod tests {
     use novarocks_user_error::ErrorCodeStatus;
 
     use super::*;
-    use crate::DML_ERROR_CODE_DESCRIPTORS;
+    use crate::{DML_ERROR_CODE_DESCRIPTORS, SESSION_ERROR_CODE_DESCRIPTORS};
 
     #[test]
     fn every_active_manifest_descriptor_has_exactly_one_wire_mapping() {
@@ -115,6 +123,7 @@ mod tests {
             .iter()
             .chain(ANALYZE_ERROR_CODE_DESCRIPTORS)
             .chain(DML_ERROR_CODE_DESCRIPTORS)
+            .chain(SESSION_ERROR_CODE_DESCRIPTORS)
             .filter(|descriptor| descriptor.status == ErrorCodeStatus::Active)
         {
             assert!(descriptor_codes.insert(descriptor.code.as_str()));
@@ -124,7 +133,7 @@ mod tests {
             .iter()
             .map(|(code, _)| *code)
             .collect::<BTreeSet<_>>();
-        assert_eq!(descriptor_codes.len(), 26);
+        assert_eq!(descriptor_codes.len(), 28);
         assert_eq!(mapping_codes.len(), ERROR_KIND_MAPPINGS.len());
         assert_eq!(mapping_codes, descriptor_codes);
         assert!(error_kind_for_code(ErrorCodeId::new("sql.analyze.unregistered")).is_none());
@@ -172,5 +181,18 @@ mod tests {
             error_kind_for_code(ErrorCodeId::new("sql.analyze.internal")),
             Some(ErrorKind::ER_UNKNOWN_ERROR)
         );
+    }
+
+    #[test]
+    fn session_admit_codes_use_not_supported_yet() {
+        for code in [
+            "sql.admit.session_global_scope_unsupported",
+            "sql.admit.kill_connection_unsupported",
+        ] {
+            assert_eq!(
+                error_kind_for_code(ErrorCodeId::new(code)),
+                Some(ErrorKind::ER_NOT_SUPPORTED_YET)
+            );
+        }
     }
 }

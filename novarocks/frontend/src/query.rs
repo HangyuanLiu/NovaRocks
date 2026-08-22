@@ -56,7 +56,10 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use novarocks_parser::ast::{self, Fold, Statement as ParsedStatement};
+use novarocks_parser::{
+    ast::{self, Fold, Statement as ParsedStatement},
+    printer::{print_expr, print_statement},
+};
 use novarocks_protocol::lifecycle::QueryOptions;
 use novarocks_types::naming::{DEFAULT_DATABASE, normalize_identifier};
 use novarocks_types::{ClusterRole, EngineErrorCode};
@@ -274,6 +277,9 @@ impl CoreCommandRoute for TypedCommandRoute {
             ParsedStatement::Dml(_) => Err(
                 "typed DDL/DML admission is enabled, but execution routing remains intentionally unconnected until SQLP-5 T10"
                     .to_string(),
+            ),
+            ParsedStatement::Session(_) => unreachable!(
+                "session statements are applied before typed command routing"
             ),
             ParsedStatement::Query(_) | ParsedStatement::ExplainQuery(_) => {
                 Err("typed query execution is owned by the query compiler".to_string())
@@ -581,106 +587,140 @@ impl FrontendQuerySession {
         if trimmed.is_empty() {
             return Ok(StatementResult::Ok);
         }
-        if let Some(schema) = parse_use_database(trimmed) {
-            self.init_database(schema).await?;
-            return Ok(StatementResult::Ok);
-        }
-        if let Some(connection_id) = parse_kill_query(trimmed)? {
-            let requester = self.token()?;
-            return match self
-                .service
-                .query_control
-                .kill_query(requester, connection_id)
-            {
-                QueryCancelOutcome::Requested | QueryCancelOutcome::AlreadyRequested(_) => {
-                    Ok(StatementResult::Ok)
-                }
-                QueryCancelOutcome::NoActiveStatement => Err(QueryServiceError::new(
-                    QueryServiceErrorKind::NoSuchSession,
-                    format!("connection {connection_id} has no active query"),
-                )),
-                QueryCancelOutcome::UnknownSession => Err(QueryServiceError::new(
-                    QueryServiceErrorKind::NoSuchSession,
-                    format!("unknown connection {connection_id}"),
-                )),
-                QueryCancelOutcome::PermissionDenied => Err(QueryServiceError::new(
-                    QueryServiceErrorKind::PermissionDenied,
-                    "permission denied to kill query owned by another principal",
-                )),
-            };
-        }
-        if self.apply_session_set(trimmed).await? {
-            return Ok(StatementResult::Ok);
-        }
         if let Some(error) = admin_raise_engine_error(trimmed)? {
             return Err(error);
         }
-        self.execute_admitted(trimmed.to_string()).await
+        let statements = novarocks_parser::parse(trimmed)
+            .map_err(|error| QueryServiceError::from_user_error(error.to_user_error(trimmed)))?;
+        let [parsed_statement] = statements.as_slice() else {
+            return Err(QueryServiceError::new(
+                QueryServiceErrorKind::Parse,
+                "command admission requires exactly one statement",
+            ));
+        };
+        match parsed_statement {
+            ParsedStatement::Session(statement) => {
+                self.execute_session_statement(trimmed, statement).await
+            }
+            statement => {
+                self.execute_typed_statement(trimmed.to_string(), statement.clone())
+                    .await
+            }
+        }
     }
 
-    async fn apply_session_set(&self, sql: &str) -> Result<bool, QueryServiceError> {
-        let lower = sql.to_ascii_lowercase();
-        if !lower.starts_with("set ") {
-            return Ok(false);
+    async fn execute_session_statement(
+        &self,
+        source: &str,
+        statement: &ast::SessionStatement,
+    ) -> Result<StatementResult, QueryServiceError> {
+        match statement {
+            ast::SessionStatement::Set(statement) => {
+                for assignment in &statement.assignments {
+                    self.apply_session_set_assignment(source, assignment)
+                        .await?;
+                }
+                Ok(StatementResult::Ok)
+            }
+            ast::SessionStatement::Use(statement) => {
+                self.init_database(&statement.database.value).await?;
+                Ok(StatementResult::Ok)
+            }
+            ast::SessionStatement::Kill(statement) => self.execute_session_kill(source, statement),
         }
-        let assignment = sql[4..].trim();
-        if let Some(catalog) = strip_prefix_ignore_ascii_case(assignment, "CATALOG ") {
-            let catalog =
-                resolve_catalog_name(&self.service.session_catalog_resolver, catalog.trim())?;
-            let mut state = self.state.lock().map_err(poisoned_state)?;
-            state.current_catalog = catalog;
-            return Ok(true);
-        }
-        let Some((raw_name, raw_value)) = assignment.split_once('=') else {
-            return Ok(true);
-        };
-        if raw_name.trim().starts_with('@') && !raw_name.trim().starts_with("@@") {
-            let value = if let Some(inner_query) = parenthesized_query(raw_value) {
-                match self.execute_admitted(inner_query.to_string()).await? {
-                    StatementResult::Query(result) => {
-                        crate::user_variable::query_result_to_user_variable_literal(&result)
-                            .map_err(|message| {
-                                QueryServiceError::new(QueryServiceErrorKind::Internal, message)
-                            })?
+    }
+
+    async fn apply_session_set_assignment(
+        &self,
+        source: &str,
+        assignment: &ast::SetAssignment,
+    ) -> Result<(), QueryServiceError> {
+        match &assignment.target {
+            ast::SetTarget::UserVariable(variable) => {
+                let value = match &assignment.value {
+                    ast::SetValue::Expression(value) => print_expr(value),
+                    ast::SetValue::Query(query) => {
+                        let statement = ParsedStatement::Query((**query).clone());
+                        let query_source = print_statement(&statement);
+                        match self
+                            .execute_typed_statement(query_source, statement)
+                            .await?
+                        {
+                            StatementResult::Query(result) => {
+                                crate::user_variable::query_result_to_user_variable_literal(&result)
+                                    .map_err(|message| {
+                                        QueryServiceError::new(
+                                            QueryServiceErrorKind::Internal,
+                                            message,
+                                        )
+                                    })?
+                            }
+                            StatementResult::Ok => {
+                                return Err(QueryServiceError::new(
+                                    QueryServiceErrorKind::InvalidValue,
+                                    "user variable assignment query did not return a value",
+                                ));
+                            }
+                        }
                     }
-                    StatementResult::Ok => {
+                    ast::SetValue::Words(_) => {
                         return Err(QueryServiceError::new(
                             QueryServiceErrorKind::InvalidValue,
-                            "user variable assignment query did not return a value",
+                            "user variable assignment requires an expression",
                         ));
                     }
-                }
-            } else {
-                raw_value.trim().to_string()
-            };
-            let mut state = self.state.lock().map_err(poisoned_state)?;
-            state
-                .user_variables
-                .insert(raw_name.trim().to_ascii_lowercase(), value);
-            return Ok(true);
-        }
-        let name = raw_name
-            .trim()
-            .trim_start_matches("@@")
-            .to_ascii_lowercase();
-        let value = raw_value.trim().trim_matches('\'').trim_matches('"');
-        if name == "catalog" {
-            let catalog = resolve_catalog_name(&self.service.session_catalog_resolver, value)?;
-            let mut state = self.state.lock().map_err(poisoned_state)?;
-            state.current_catalog = catalog;
-            if state.current_catalog.is_none()
-                && !self
-                    .service
-                    .session_catalog_resolver
-                    .database_exists(&state.current_database)
-                    .map_err(internal_error)?
-            {
-                state.current_database = DEFAULT_DATABASE.to_string();
+                };
+                let mut state = self.state.lock().map_err(poisoned_state)?;
+                state
+                    .user_variables
+                    .insert(variable.value.to_ascii_lowercase(), value);
+                Ok(())
             }
-            return Ok(true);
+            ast::SetTarget::SystemVariable(variable) => {
+                let name = variable.value.to_ascii_lowercase();
+                if matches!(assignment.scope, ast::SetScope::Global)
+                    && is_known_session_setting(&name)
+                {
+                    return Err(QueryServiceError::from_user_error(
+                        crate::session_error::SessionAdmitError::GlobalScopeUnsupported
+                            .to_user_error(
+                                source,
+                                assignment.span,
+                                format!("SET GLOBAL {name} is not supported"),
+                            ),
+                    ));
+                }
+                let value = session_setting_value(&assignment.value)?;
+                self.apply_session_system_variable(&name, &value)
+            }
+            ast::SetTarget::Catalog { .. } => {
+                if matches!(assignment.scope, ast::SetScope::Global) {
+                    return Err(QueryServiceError::from_user_error(
+                        crate::session_error::SessionAdmitError::GlobalScopeUnsupported
+                            .to_user_error(
+                                source,
+                                assignment.span,
+                                "SET GLOBAL CATALOG is not supported",
+                            ),
+                    ));
+                }
+                let catalog = session_catalog_value(&assignment.value)?;
+                self.apply_session_catalog(&catalog)
+            }
+            ast::SetTarget::Names { .. } | ast::SetTarget::Transaction { .. } => Ok(()),
+        }
+    }
+
+    fn apply_session_system_variable(
+        &self,
+        name: &str,
+        value: &str,
+    ) -> Result<(), QueryServiceError> {
+        if name == "catalog" {
+            return self.apply_session_catalog(value);
         }
         let mut state = self.state.lock().map_err(poisoned_state)?;
-        match name.as_str() {
+        match name {
             "query_timeout" => {
                 let seconds = value.parse::<u64>().map_err(|_| {
                     QueryServiceError::new(
@@ -755,36 +795,90 @@ impl FrontendQuerySession {
                     .optimizer_settings
                     .set_enable_ukfk_opt(parse_bool(value)?);
             }
-            _ => apply_optimizer_session_set(&mut state.optimizer_settings, &name, value)?,
+            _ => apply_optimizer_session_set(&mut state.optimizer_settings, name, value)?,
         }
-        Ok(true)
+        Ok(())
     }
 
-    async fn execute_admitted(&self, sql: String) -> Result<StatementResult, QueryServiceError> {
+    fn apply_session_catalog(&self, catalog: &str) -> Result<(), QueryServiceError> {
+        let catalog = resolve_catalog_name(&self.service.session_catalog_resolver, catalog)?;
+        let mut state = self.state.lock().map_err(poisoned_state)?;
+        state.current_catalog = catalog;
+        if state.current_catalog.is_none()
+            && !self
+                .service
+                .session_catalog_resolver
+                .database_exists(&state.current_database)
+                .map_err(internal_error)?
+        {
+            state.current_database = DEFAULT_DATABASE.to_string();
+        }
+        Ok(())
+    }
+
+    fn execute_session_kill(
+        &self,
+        source: &str,
+        statement: &ast::KillStatement,
+    ) -> Result<StatementResult, QueryServiceError> {
+        if !matches!(statement.kind, ast::KillKind::Query) {
+            return Err(QueryServiceError::from_user_error(
+                crate::session_error::SessionAdmitError::KillConnectionUnsupported.to_user_error(
+                    source,
+                    statement.span,
+                    "KILL CONNECTION is not supported; use KILL QUERY",
+                ),
+            ));
+        }
+        let ast::LiteralKind::Number(connection_id) = &statement.connection_id.kind else {
+            return Err(QueryServiceError::new(
+                QueryServiceErrorKind::Parse,
+                "KILL QUERY requires an integer connection id",
+            ));
+        };
+        let connection_id = connection_id.parse::<u32>().map_err(|_| {
+            QueryServiceError::new(
+                QueryServiceErrorKind::Parse,
+                "KILL QUERY requires an integer connection id",
+            )
+        })?;
+        let requester = self.token()?;
+        match self
+            .service
+            .query_control
+            .kill_query(requester, connection_id)
+        {
+            QueryCancelOutcome::Requested | QueryCancelOutcome::AlreadyRequested(_) => {
+                Ok(StatementResult::Ok)
+            }
+            QueryCancelOutcome::NoActiveStatement => Err(QueryServiceError::new(
+                QueryServiceErrorKind::NoSuchSession,
+                format!("connection {connection_id} has no active query"),
+            )),
+            QueryCancelOutcome::UnknownSession => Err(QueryServiceError::new(
+                QueryServiceErrorKind::NoSuchSession,
+                format!("unknown connection {connection_id}"),
+            )),
+            QueryCancelOutcome::PermissionDenied => Err(QueryServiceError::new(
+                QueryServiceErrorKind::PermissionDenied,
+                "permission denied to kill query owned by another principal",
+            )),
+        }
+    }
+
+    async fn execute_typed_statement(
+        &self,
+        sql: String,
+        parsed_statement: ParsedStatement,
+    ) -> Result<StatementResult, QueryServiceError> {
         let state = self.state.lock().map_err(poisoned_state)?.clone();
         let assignments = state
             .user_variables
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
-        let (admission, parsed_statements) =
-            crate::query_execution::statement_admission::admit_statement(&sql)
-                .map_err(QueryServiceError::from_user_error)?;
-        let parsed_statement = match admission {
-            crate::query_execution::statement_admission::StatementAdmission::Parsed => {
-                let [statement] = parsed_statements.as_slice() else {
-                    return Err(QueryServiceError::new(
-                        QueryServiceErrorKind::Parse,
-                        "command admission requires exactly one statement",
-                    ));
-                };
-                Some(
-                    substitute_session_user_variables(statement.clone(), &assignments)
-                        .map_err(|error| internal_error(error.to_string()))?,
-                )
-            }
-            crate::query_execution::statement_admission::StatementAdmission::LegacyFrontier => None,
-        };
+        let parsed_statement = substitute_session_user_variables(parsed_statement, &assignments)
+            .map_err(|error| internal_error(error.to_string()))?;
         let token = self.token()?;
         let mut active = self
             .service
@@ -848,22 +942,19 @@ impl FrontendQuerySession {
         let truncate_engine = Arc::clone(&self.service.truncate_engine);
         let query_options = with_allow_throw_exception(
             state.execution_settings.query_options(),
-            parsed_statement
-                .as_ref()
-                .is_some_and(|statement| match statement {
-                    ParsedStatement::Query(query) => {
-                        novarocks_sql::admission::query_allows_throw_exception_hint(query)
-                    }
-                    ParsedStatement::ExplainQuery(explain) => {
-                        novarocks_sql::admission::query_allows_throw_exception_hint(&explain.query)
-                    }
-                    _ => false,
-                }),
+            match &parsed_statement {
+                ParsedStatement::Query(query) => {
+                    novarocks_sql::admission::query_allows_throw_exception_hint(query)
+                }
+                ParsedStatement::ExplainQuery(explain) => {
+                    novarocks_sql::admission::query_allows_throw_exception_hint(&explain.query)
+                }
+                _ => false,
+            },
         );
         let mut worker = task::spawn_blocking(move || {
-            let result: Result<StatementResult, RoutedExecutionError> = if let Some(statement) =
-                parsed_statement
-            {
+            let result: Result<StatementResult, RoutedExecutionError> = {
+                let statement = parsed_statement;
                 if matches!(
                     statement,
                     ParsedStatement::Query(_) | ParsedStatement::ExplainQuery(_)
@@ -945,10 +1036,6 @@ impl FrontendQuerySession {
                         .execute_typed(&statement, &context, query_options)
                         .map_err(RoutedExecutionError::Engine)
                 }
-            } else {
-                Err(RoutedExecutionError::Engine(
-                    "statement was admitted before its command-family owner cut".to_string(),
-                ))
             };
             let completion = active.finish();
             (result, completion)
@@ -989,6 +1076,78 @@ impl FrontendQuerySession {
             }
         }
     }
+}
+
+fn session_setting_value(value: &ast::SetValue) -> Result<String, QueryServiceError> {
+    match value {
+        ast::SetValue::Expression(value) => Ok(print_expr(value)
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string()),
+        ast::SetValue::Query(_) | ast::SetValue::Words(_) => Err(QueryServiceError::new(
+            QueryServiceErrorKind::InvalidValue,
+            "session variable assignment requires an expression",
+        )),
+    }
+}
+
+fn session_catalog_value(value: &ast::SetValue) -> Result<String, QueryServiceError> {
+    if let ast::SetValue::Expression(value) = value {
+        return Ok(print_expr(value)
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string());
+    }
+    let ast::SetValue::Words(words) = value else {
+        return Err(QueryServiceError::new(
+            QueryServiceErrorKind::InvalidValue,
+            "SET CATALOG requires a catalog name",
+        ));
+    };
+    let [ast::SetWord::Ident(catalog)] = words.as_slice() else {
+        return Err(QueryServiceError::new(
+            QueryServiceErrorKind::InvalidValue,
+            "SET CATALOG requires a catalog name",
+        ));
+    };
+    Ok(catalog.value.clone())
+}
+
+fn is_known_session_setting(name: &str) -> bool {
+    matches!(
+        name,
+        "catalog"
+            | "query_timeout"
+            | "group_concat_max_len"
+            | "pipeline_dop"
+            | "enable_parquet_reader_page_index"
+            | "runtime_filter_scan_wait_time"
+            | "global_runtime_filter_wait_timeout"
+            | "disable_optimizer_rules"
+            | "cbo_disabled_rules"
+            | "enable_eliminate_agg"
+            | "enable_ukfk_opt"
+            | "cbo_broadcast_backend_count"
+            | "cbo_broadcast_node_mem_budget_bytes"
+            | "global_runtime_filter_build_max_size"
+            | "global_runtime_filter_build_min_size"
+            | "global_runtime_filter_probe_min_size"
+            | "global_runtime_filter_probe_min_selectivity"
+            | "cbo_max_reorder_node_use_exhaustive"
+            | "cbo_max_reorder_node_use_dp"
+            | "cbo_max_reorder_node_use_greedy"
+            | "cbo_max_reorder_node"
+            | "enable_query_rewrite_table_prune"
+            | "enable_cbo_table_prune"
+            | "enable_table_prune_on_update"
+            | "enable_common_subexpr_reuse"
+            | "enable_global_runtime_filter"
+            | "enable_materialized_view_rewrite"
+            | "enable_connector_static_predicate_pushdown"
+            | "cbo_enable_dp_join_reorder"
+            | "cbo_enable_greedy_join_reorder"
+            | "enable_global_runtime_filter_cross_exchange"
+    )
 }
 
 fn substitute_session_user_variables(
@@ -1046,13 +1205,6 @@ fn with_allow_throw_exception(query_options: QueryOptions, enabled: bool) -> Que
     let mut raw = *query_options.as_proto();
     raw.allow_throw_exception = enabled;
     QueryOptions::parse(raw).expect("allow_throw_exception does not invalidate query options")
-}
-
-fn parenthesized_query(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?.trim();
-    let lower = inner.to_ascii_lowercase();
-    (lower.starts_with("select ") || lower.starts_with("with ")).then_some(inner)
 }
 
 fn execute_prepared_query(
@@ -1147,12 +1299,6 @@ impl Drop for FrontendQuerySession {
 struct DatabaseContext {
     catalog: Option<String>,
     database: String,
-}
-
-fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    let head = value.get(..prefix.len())?;
-    head.eq_ignore_ascii_case(prefix)
-        .then(|| &value[prefix.len()..])
 }
 
 fn resolve_catalog_name(
@@ -1349,41 +1495,6 @@ fn strip_leading_line_comments(sql: &str) -> &str {
         }
         return remaining;
     }
-}
-
-fn parse_use_database(sql: &str) -> Option<&str> {
-    sql.strip_prefix("USE ")
-        .or_else(|| sql.strip_prefix("use "))
-        .map(str::trim)
-        .filter(|schema| !schema.is_empty())
-}
-
-fn parse_kill_query(sql: &str) -> Result<Option<u32>, QueryServiceError> {
-    let mut words = sql.split_whitespace();
-    let Some(first) = words.next() else {
-        return Ok(None);
-    };
-    if !first.eq_ignore_ascii_case("kill") {
-        return Ok(None);
-    }
-    let second = words.next();
-    if second.is_some_and(|word| word.eq_ignore_ascii_case("analyze")) {
-        return Ok(None);
-    }
-    let target = match second {
-        Some(word) if word.eq_ignore_ascii_case("query") => words.next(),
-        Some(word) => Some(word),
-        None => None,
-    };
-    let target = target.ok_or_else(|| {
-        QueryServiceError::new(
-            QueryServiceErrorKind::Parse,
-            "KILL requires a connection id",
-        )
-    })?;
-    target.parse().map(Some).map_err(|_| {
-        QueryServiceError::new(QueryServiceErrorKind::Parse, "invalid KILL connection id")
-    })
 }
 
 fn parse_bool(value: &str) -> Result<bool, QueryServiceError> {
@@ -1784,7 +1895,7 @@ mod tests {
     }
 
     /// Test-only router fixture. Production routing is the typed branch in
-    /// `execute_admitted`; this helper keeps focused unit tests independent of
+    /// `execute_typed_statement`; this helper keeps focused unit tests independent of
     /// a running frontend session.
     #[allow(clippy::too_many_arguments)]
     fn execute_frontend_command<C>(
@@ -2103,29 +2214,6 @@ mod tests {
     }
 
     #[test]
-    fn kill_query_parser_accepts_explicit_and_short_forms() {
-        assert_eq!(parse_kill_query("KILL QUERY 17").unwrap(), Some(17));
-        assert_eq!(parse_kill_query("kill 18").unwrap(), Some(18));
-        assert_eq!(parse_kill_query("SELECT 1").unwrap(), None);
-    }
-
-    #[test]
-    fn session_catalog_keyword_is_case_insensitive() {
-        for sql in [
-            "SET CATALOG warehouse",
-            "SET catalog warehouse",
-            "SET Catalog warehouse",
-        ] {
-            let assignment = sql.strip_prefix("SET ").expect("SET statement");
-            assert_eq!(
-                strip_prefix_ignore_ascii_case(assignment, "CATALOG "),
-                Some("warehouse"),
-                "{sql} must select the catalog session branch"
-            );
-        }
-    }
-
-    #[test]
     fn cancellation_errors_keep_timeout_distinct_from_interrupts() {
         assert_eq!(
             cancellation_error(QueryCancellationReason::DeadlineExceeded { timeout_ms: 25 }).kind(),
@@ -2135,21 +2223,6 @@ mod tests {
             cancellation_error(QueryCancellationReason::ClientDisconnected).kind(),
             QueryServiceErrorKind::Interrupted
         );
-    }
-
-    #[test]
-    fn parenthesized_query_accepts_scalar_selects_and_ctes() {
-        assert_eq!(parenthesized_query("(SELECT 1)"), Some("SELECT 1"));
-        assert_eq!(
-            parenthesized_query(" (WITH values_cte AS (SELECT 1) SELECT * FROM values_cte) "),
-            Some("WITH values_cte AS (SELECT 1) SELECT * FROM values_cte")
-        );
-    }
-
-    #[test]
-    fn parenthesized_query_rejects_non_query_expressions() {
-        assert_eq!(parenthesized_query("(array[1, 2])"), None);
-        assert_eq!(parenthesized_query("SELECT 1"), None);
     }
 
     #[test]

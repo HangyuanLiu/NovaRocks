@@ -30,6 +30,7 @@ mod maintenance;
 mod materialized_view;
 mod pratt;
 mod query;
+mod session;
 mod show_backends;
 mod statistics;
 mod table;
@@ -99,6 +100,7 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
             view::parse as FamilyParser,
             backend::parse,
             statistics::parse,
+            session::parse,
             catalog::parse,
             table::parse,
             dml::parse,
@@ -557,6 +559,7 @@ mod tests {
                 Statement::View(_) => "VIEW",
                 Statement::Table(_) => "TABLE",
                 Statement::Dml(_) => "DML",
+                Statement::Session(_) => "SESSION",
                 Statement::Query(_) => "QUERY",
                 Statement::ExplainQuery(_) => "EXPLAIN QUERY",
             })

@@ -429,6 +429,30 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
         schema: &'a str,
         writer: InitWriter<'a, W>,
     ) -> io::Result<()> {
+        let source = format!("USE {schema}");
+        let parsed = match novarocks_parser::parse(&source) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let error = QueryServiceError::from_user_error(error.to_user_error(&source));
+                return writer
+                    .error(mysql_error_kind(&error), error.message().as_bytes())
+                    .await;
+            }
+        };
+        let [
+            novarocks_parser::ast::Statement::Session(
+                novarocks_parser::ast::SessionStatement::Use(statement),
+            ),
+        ] = parsed.as_slice()
+        else {
+            let error = QueryServiceError::new(
+                QueryServiceErrorKind::Parse,
+                "COM_INIT_DB requires one USE statement",
+            );
+            return writer
+                .error(mysql_error_kind(&error), error.message().as_bytes())
+                .await;
+        };
         let session = match self.session() {
             Ok(session) => session,
             Err(error) => {
@@ -437,7 +461,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
                     .await;
             }
         };
-        match session.init_database(schema).await {
+        match session.init_database(&statement.database.value).await {
             Ok(()) => writer.ok().await,
             Err(error) => {
                 writer

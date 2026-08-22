@@ -52,6 +52,7 @@ pub fn validate_statement(statement: &Statement) -> Result<(), ValidateError> {
         | Statement::MaterializedView(_)
         | Statement::View(_)
         | Statement::Dml(_) => Ok(()),
+        Statement::Session(_) => Ok(()),
     }
 }
 

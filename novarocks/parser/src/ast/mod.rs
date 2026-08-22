@@ -28,6 +28,7 @@ pub(crate) mod maintenance;
 pub(crate) mod materialized_view;
 mod query;
 mod relation;
+pub(crate) mod session;
 pub(crate) mod statistics;
 pub(crate) mod table;
 mod validate;
@@ -84,6 +85,10 @@ pub use relation::{
     Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableFunctionSyntax, TableHint,
     TableVersion, TableVersionKind, TableWithJoins,
 };
+pub use session::{
+    KillKind, KillStatement, SessionStatement, SetAssignment, SetScope, SetStatement, SetTarget,
+    SetValue, SetWord, UseStatement,
+};
 pub use statistics::{
     AnalyzeMode, AnalyzeTable, CancelAnalyze, DropHistogram, DropMultipleColumnsStats, DropStats,
     ShowAnalyzeJobs, ShowBasicStatsMeta, ShowHistogramStatsMeta, ShowTableStats,
@@ -122,6 +127,7 @@ pub enum Statement {
     View(ViewStatement),
     Table(TableStatement),
     Dml(DmlStatement),
+    Session(SessionStatement),
     Query(Query),
     ExplainQuery(ExplainQuery),
 }
@@ -138,6 +144,7 @@ impl Statement {
             Self::View(statement) => statement.span(),
             Self::Table(statement) => statement.span(),
             Self::Dml(statement) => statement.span(),
+            Self::Session(statement) => statement.span(),
             Self::Query(query) => query.span,
             Self::ExplainQuery(query) => query.span,
         }
