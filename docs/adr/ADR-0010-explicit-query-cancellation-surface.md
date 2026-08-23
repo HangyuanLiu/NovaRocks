@@ -2,9 +2,9 @@
 id: ADR-0010
 title: "Explicit query cancellation surface"
 domain: [distributed-query-lifecycle]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0102
 date: 2026-07-29
 provenance:
   - "PR: #759"

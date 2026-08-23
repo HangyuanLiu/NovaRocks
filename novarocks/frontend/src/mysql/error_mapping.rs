@@ -71,10 +71,7 @@ const ERROR_KIND_MAPPINGS: &[(&str, ErrorKind)] = &[
         "sql.admit.session_global_scope_unsupported",
         ErrorKind::ER_NOT_SUPPORTED_YET,
     ),
-    (
-        "sql.admit.kill_connection_unsupported",
-        ErrorKind::ER_NOT_SUPPORTED_YET,
-    ),
+    ("sql.admit.kill_denied", ErrorKind::ER_KILL_DENIED_ERROR),
     (
         "sql.analyze.unsupported_expression",
         ErrorKind::ER_NOT_SUPPORTED_YET,
@@ -184,15 +181,20 @@ mod tests {
     }
 
     #[test]
-    fn session_admit_codes_use_not_supported_yet() {
-        for code in [
-            "sql.admit.session_global_scope_unsupported",
-            "sql.admit.kill_connection_unsupported",
-        ] {
-            assert_eq!(
-                error_kind_for_code(ErrorCodeId::new(code)),
-                Some(ErrorKind::ER_NOT_SUPPORTED_YET)
-            );
-        }
+    fn session_admit_codes_use_frozen_mysql_kinds() {
+        assert_eq!(
+            error_kind_for_code(ErrorCodeId::new(
+                "sql.admit.session_global_scope_unsupported"
+            )),
+            Some(ErrorKind::ER_NOT_SUPPORTED_YET)
+        );
+        assert_eq!(
+            error_kind_for_code(ErrorCodeId::new("sql.admit.kill_denied")),
+            Some(ErrorKind::ER_KILL_DENIED_ERROR)
+        );
+        assert!(
+            error_kind_for_code(ErrorCodeId::new("sql.admit.kill_connection_unsupported"))
+                .is_none()
+        );
     }
 }

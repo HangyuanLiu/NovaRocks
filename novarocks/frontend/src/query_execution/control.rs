@@ -19,24 +19,29 @@
 
 use std::sync::Arc;
 
+use crate::client_connection::ClientConnectionToken;
 use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationView};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionIdentity {
-    connection_id: u32,
+    connection: ClientConnectionToken,
     principal: Arc<str>,
 }
 
 impl SessionIdentity {
-    pub fn new(connection_id: u32, principal: impl Into<Arc<str>>) -> Self {
+    pub fn new(connection: ClientConnectionToken, principal: impl Into<Arc<str>>) -> Self {
         Self {
-            connection_id,
+            connection,
             principal: principal.into(),
         }
     }
 
     pub const fn connection_id(&self) -> u32 {
-        self.connection_id
+        self.connection.connection_id()
+    }
+
+    pub const fn connection_token(&self) -> ClientConnectionToken {
+        self.connection
     }
 
     pub fn principal(&self) -> &str {
@@ -130,6 +135,13 @@ pub enum QueryCancelOutcome {
     PermissionDenied,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionKillAuthorization {
+    Authorized(ClientConnectionToken),
+    UnknownSession,
+    PermissionDenied,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatementFinishOutcome {
     Completed,
@@ -155,6 +167,11 @@ pub trait QueryControlPort: Send + Sync + 'static {
         reason: QueryCancellationReason,
     ) -> QueryCancelOutcome;
     fn kill_query(&self, requester: SessionToken, target_connection_id: u32) -> QueryCancelOutcome;
+    fn authorize_connection_kill(
+        &self,
+        requester: SessionToken,
+        target_connection_id: u32,
+    ) -> ConnectionKillAuthorization;
     fn cancel_all(&self, reason: QueryCancellationReason);
 }
 
@@ -206,6 +223,15 @@ impl QueryControlService {
         target_connection_id: u32,
     ) -> QueryCancelOutcome {
         self.port.kill_query(requester, target_connection_id)
+    }
+
+    pub fn authorize_connection_kill(
+        &self,
+        requester: SessionToken,
+        target_connection_id: u32,
+    ) -> ConnectionKillAuthorization {
+        self.port
+            .authorize_connection_kill(requester, target_connection_id)
     }
 
     pub fn cancel_all(&self, reason: QueryCancellationReason) {
@@ -326,6 +352,14 @@ impl QueryControlPort for TestQueryControlPort {
         _target_connection_id: u32,
     ) -> QueryCancelOutcome {
         QueryCancelOutcome::UnknownSession
+    }
+
+    fn authorize_connection_kill(
+        &self,
+        _requester: SessionToken,
+        _target_connection_id: u32,
+    ) -> ConnectionKillAuthorization {
+        ConnectionKillAuthorization::UnknownSession
     }
 
     fn cancel_all(&self, _reason: QueryCancellationReason) {}

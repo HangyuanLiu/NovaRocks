@@ -21,6 +21,7 @@ pub mod catalog_application;
 pub mod catalog_attachment;
 pub mod catalog_controller;
 mod catalog_projection_metrics;
+pub mod client_connection;
 pub mod common;
 pub mod connector;
 #[doc(hidden)]
@@ -55,6 +56,10 @@ pub use application::{
     FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
     FrontendExecutionConfig, FrontendQueryControlTimeouts,
 };
+pub use client_connection::{
+    ClientConnectionControlPort, ClientConnectionTerminateOutcome,
+    ClientConnectionTerminationReason, ClientConnectionToken, ClientConnectionTokenError,
+};
 pub use dml::error::ERROR_CODE_DESCRIPTORS as DML_ERROR_CODE_DESCRIPTORS;
 pub use mv::FrontendMvService;
 pub use mv::maintenance::MaintenanceCoordinatorConfig;
@@ -64,7 +69,8 @@ pub use mysql::session::{
     QuerySessionOpenRequest, SessionExecutionSettings,
 };
 pub use mysql::{
-    ResolvedMysqlListenerSettings, resolve_mysql_listener_settings, run_mysql_server_until_shutdown,
+    MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
+    run_mysql_server_until_shutdown,
 };
 pub use native::report_server::FrontendReportServerHandle;
 pub use query::FrontendQueryService;

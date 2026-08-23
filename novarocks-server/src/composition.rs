@@ -923,11 +923,17 @@ where
             frontend_cleanup.err()
         ));
     }
+    let client_connections =
+        std::sync::Arc::new(novarocks_frontend::MysqlClientConnectionRegistry::new());
+    let client_connection_control: std::sync::Arc<
+        dyn novarocks_frontend::ClientConnectionControlPort,
+    > = client_connections.clone();
     let session_factory = match novarocks_frontend::build_frontend_query_session_factory(
         &frontend,
         std::sync::Arc::new(novarocks_frontend::SystemCatalogService::with_defaults()),
         report_port,
         std::sync::Arc::clone(&frontend_config.mv_storage_observation),
+        client_connection_control,
     ) {
         Ok(session_factory) => session_factory,
         Err(error) => {
@@ -959,6 +965,7 @@ where
     let server = novarocks_frontend::run_mysql_server_until_shutdown(
         listener,
         session_factory,
+        client_connections,
         async move {
             let _ = server_shutdown_rx.await;
         },

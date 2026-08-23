@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod connection_registry;
 mod encoding;
 mod error_mapping;
 pub mod session;
+
+pub use connection_registry::MysqlClientConnectionRegistry;
 
 use std::future::Future;
 use std::io;
@@ -25,8 +28,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(test)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -56,7 +58,6 @@ use novarocks_types::naming::DEFAULT_DATABASE;
 const DEFAULT_MYSQL_PORT: u16 = 9030;
 const ROOT_USER: &str = "root";
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
 
 struct ClientDisconnectWatcher {
     join_handle: Option<tokio::task::JoinHandle<()>>,
@@ -131,9 +132,11 @@ pub fn resolve_mysql_listener_settings(
 /// contract.  On shutdown it first asks the session factory to cancel all
 /// sessions, stops accepting new connections, then waits for active protocol
 /// tasks to drain (or aborts them after the bounded drain timeout).
+// Design: ADR-0102 (docs/adr/ADR-0102-mysql-kill-connection-lifecycle-ownership.md)
 pub async fn run_mysql_server_until_shutdown<F>(
     settings: ResolvedMysqlListenerSettings,
     session_factory: Arc<dyn QuerySessionFactory>,
+    connections: Arc<MysqlClientConnectionRegistry>,
     shutdown: F,
 ) -> Result<(), String>
 where
@@ -142,16 +145,21 @@ where
     let ready_user = settings.user.clone();
     let session_user = settings.user;
     let shutdown_factory = Arc::clone(&session_factory);
+    let shutdown_connections = Arc::clone(&connections);
+    let connection_registry = Arc::clone(&connections);
     serve_until_shutdown(
         settings.bind_addr,
         async move {
             shutdown.await;
             shutdown_factory.cancel_all(QueryCancellationReason::ServerShutdown);
+            shutdown_connections
+                .terminate_all(crate::ClientConnectionTerminationReason::ServerShutdown);
         },
         move |stream, peer_addr| {
             serve_frontend_mysql_connection(
                 session_user.clone(),
                 Arc::clone(&session_factory),
+                Arc::clone(&connection_registry),
                 stream,
                 peer_addr,
             )
@@ -280,32 +288,90 @@ async fn drain_session_tasks(sessions: &mut JoinSet<()>, drain_timeout: Duration
 async fn serve_frontend_mysql_connection(
     user: String,
     session_factory: Arc<dyn QuerySessionFactory>,
+    connections: Arc<MysqlClientConnectionRegistry>,
     stream: TcpStream,
     peer_addr: SocketAddr,
 ) {
-    let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    let mut registration = match connections.register() {
+        Ok(registration) => registration,
+        Err(error) => {
+            warn!(
+                "reject standalone mysql connection because the connection registry is exhausted: peer={}, error={:?}",
+                peer_addr, error
+            );
+            return;
+        }
+    };
+    let connection = registration.token();
     let session = Arc::new(OnceLock::new());
     let disconnect_watcher = spawn_frontend_disconnect_watcher(&stream, Arc::clone(&session));
     let shim = FrontendMysqlShim::new(
         user,
-        connection_id,
+        connection,
         session_factory,
-        session,
+        Arc::clone(&session),
         disconnect_watcher,
     );
     let (reader, writer) = stream.into_split();
-    let result = AsyncMysqlIntermediary::run_on(shim, reader, writer).await;
-    if let Err(err) = result {
+    let result = {
+        let intermediary = AsyncMysqlIntermediary::run_on(shim, reader, writer);
+        tokio::pin!(intermediary);
+        tokio::select! {
+            termination = registration.termination_receiver() => {
+                match termination {
+                    Ok(reason) => {
+                        if let Some(session) = session.get() {
+                            session.cancel_current(query_cancellation_reason_for_connection_termination(&reason));
+                        }
+                        info!(
+                            "terminate standalone mysql connection: peer={}, connection_id={}, reason={:?}",
+                            peer_addr,
+                            connection.connection_id(),
+                            reason
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            "standalone mysql connection termination signal closed unexpectedly: peer={}, connection_id={}, error={}",
+                            peer_addr,
+                            connection.connection_id(),
+                            error
+                        );
+                    }
+                }
+                None
+            }
+            result = &mut intermediary => Some(result),
+        }
+    };
+    if let Some(Err(err)) = result {
         warn!(
             "standalone mysql connection failed: peer={}, connection_id={}, err={}",
-            peer_addr, connection_id, err
+            peer_addr,
+            connection.connection_id(),
+            err
         );
+    }
+}
+
+fn query_cancellation_reason_for_connection_termination(
+    reason: &crate::ClientConnectionTerminationReason,
+) -> QueryCancellationReason {
+    match reason {
+        crate::ClientConnectionTerminationReason::ExplicitKillConnection {
+            requester_connection_id,
+        } => QueryCancellationReason::ExplicitKillConnection {
+            requester_connection_id: *requester_connection_id,
+        },
+        crate::ClientConnectionTerminationReason::ServerShutdown => {
+            QueryCancellationReason::ServerShutdown
+        }
     }
 }
 
 struct FrontendMysqlShim {
     user: String,
-    connection_id: u32,
+    connection: crate::ClientConnectionToken,
     session_factory: Arc<dyn QuerySessionFactory>,
     session: Arc<OnceLock<Arc<dyn QuerySession>>>,
     _disconnect_watcher: ClientDisconnectWatcher,
@@ -314,14 +380,14 @@ struct FrontendMysqlShim {
 impl FrontendMysqlShim {
     fn new(
         user: String,
-        connection_id: u32,
+        connection: crate::ClientConnectionToken,
         session_factory: Arc<dyn QuerySessionFactory>,
         session: Arc<OnceLock<Arc<dyn QuerySession>>>,
         disconnect_watcher: ClientDisconnectWatcher,
     ) -> Self {
         Self {
             user,
-            connection_id,
+            connection,
             session_factory,
             session,
             _disconnect_watcher: disconnect_watcher,
@@ -355,7 +421,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
     }
 
     fn connect_id(&self) -> u32 {
-        self.connection_id
+        self.connection.connection_id()
     }
 
     async fn authenticate(
@@ -381,14 +447,15 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
         let session = match self
             .session_factory
             .open_session(QuerySessionOpenRequest::new(
-                self.connection_id,
+                self.connection,
                 self.user.clone(),
             )) {
             Ok(session) => session,
             Err(error) => {
                 warn!(
                     "failed to open frontend query session for connection_id={}: {}",
-                    self.connection_id, error
+                    self.connection.connection_id(),
+                    error
                 );
                 return false;
             }
@@ -648,11 +715,45 @@ mod protocol_api_tests {
             user: ROOT_USER.to_string(),
         };
 
-        run_mysql_server_until_shutdown(settings, factory, async {})
+        run_mysql_server_until_shutdown(
+            settings,
+            factory,
+            Arc::new(MysqlClientConnectionRegistry::new()),
+            async {},
+        )
+        .await
+        .expect("ready protocol server should shut down cleanly");
+
+        assert!(cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn shutdown_broadcasts_the_same_protocol_connection_registry() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let factory: Arc<dyn QuerySessionFactory> = Arc::new(CancellationProbeFactory {
+            cancelled: Arc::clone(&cancelled),
+        });
+        let connections = Arc::new(MysqlClientConnectionRegistry::new());
+        let mut registration = connections
+            .register()
+            .expect("register protocol connection");
+        let settings = ResolvedMysqlListenerSettings {
+            bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            user: ROOT_USER.to_string(),
+        };
+
+        run_mysql_server_until_shutdown(settings, factory, Arc::clone(&connections), async {})
             .await
             .expect("ready protocol server should shut down cleanly");
 
         assert!(cancelled.load(Ordering::SeqCst));
+        assert_eq!(
+            registration
+                .termination_receiver()
+                .try_recv()
+                .expect("shutdown must reach the registered connection"),
+            crate::ClientConnectionTerminationReason::ServerShutdown
+        );
     }
 
     /// A shim whose session factory must never be reached. Every assertion below
@@ -660,7 +761,7 @@ mod protocol_api_tests {
     fn rejecting_shim() -> FrontendMysqlShim {
         FrontendMysqlShim::new(
             ROOT_USER.to_string(),
-            1,
+            crate::ClientConnectionToken::new(1, 1).expect("valid connection token"),
             Arc::new(CancellationProbeFactory {
                 cancelled: Arc::new(AtomicBool::new(false)),
             }),

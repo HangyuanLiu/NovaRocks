@@ -23,6 +23,7 @@ use std::sync::{Arc, OnceLock};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryCancellationReason {
     ExplicitKill { requester_connection_id: u32 },
+    ExplicitKillConnection { requester_connection_id: u32 },
     ClientDisconnected,
     DeadlineExceeded { timeout_ms: u64 },
     ServerShutdown,
@@ -102,7 +103,9 @@ mod tests {
             QueryCancellationRequestResult::Requested
         );
         assert_eq!(
-            source.request(QueryCancellationReason::ClientDisconnected),
+            source.request(QueryCancellationReason::ExplicitKillConnection {
+                requester_connection_id: 9,
+            }),
             QueryCancellationRequestResult::AlreadyRequested(
                 QueryCancellationReason::DeadlineExceeded { timeout_ms: 10 }
             )

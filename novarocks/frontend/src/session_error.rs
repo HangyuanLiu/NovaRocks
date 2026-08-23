@@ -30,6 +30,11 @@ const ADMIT_SESSION_GLOBAL_SCOPE_UNSUPPORTED: ErrorCodeDescriptor = ErrorCodeDes
 const ADMIT_KILL_CONNECTION_UNSUPPORTED: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.admit.kill_connection_unsupported"),
     phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Deprecated,
+};
+const ADMIT_KILL_DENIED: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.kill_denied"),
+    phase: ErrorPhase::Admit,
     status: ErrorCodeStatus::Active,
 };
 
@@ -37,20 +42,21 @@ const ADMIT_KILL_CONNECTION_UNSUPPORTED: ErrorCodeDescriptor = ErrorCodeDescript
 pub const SESSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     ADMIT_SESSION_GLOBAL_SCOPE_UNSUPPORTED,
     ADMIT_KILL_CONNECTION_UNSUPPORTED,
+    ADMIT_KILL_DENIED,
 ];
 
 /// Capability failures owned by the frontend session-statement application.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionAdmitError {
     GlobalScopeUnsupported,
-    KillConnectionUnsupported,
+    KillDenied,
 }
 
 impl SessionAdmitError {
     const fn descriptor(self) -> ErrorCodeDescriptor {
         match self {
             Self::GlobalScopeUnsupported => ADMIT_SESSION_GLOBAL_SCOPE_UNSUPPORTED,
-            Self::KillConnectionUnsupported => ADMIT_KILL_CONNECTION_UNSUPPORTED,
+            Self::KillDenied => ADMIT_KILL_DENIED,
         }
     }
 
@@ -76,16 +82,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_admit_descriptor_registry_is_unique_and_active() {
+    fn session_admit_descriptor_registry_is_unique_and_preserves_tombstones() {
         let codes = SESSION_ERROR_CODE_DESCRIPTORS
             .iter()
             .map(|descriptor| descriptor.code)
             .collect::<HashSet<_>>();
 
         assert_eq!(codes.len(), SESSION_ERROR_CODE_DESCRIPTORS.len());
-        assert!(SESSION_ERROR_CODE_DESCRIPTORS.iter().all(|descriptor| {
-            descriptor.phase == ErrorPhase::Admit && descriptor.status == ErrorCodeStatus::Active
-        }));
+        assert!(
+            SESSION_ERROR_CODE_DESCRIPTORS
+                .iter()
+                .all(|descriptor| descriptor.phase == ErrorPhase::Admit)
+        );
+        assert_eq!(
+            SESSION_ERROR_CODE_DESCRIPTORS
+                .iter()
+                .find(|descriptor| descriptor.code.as_str()
+                    == "sql.admit.kill_connection_unsupported")
+                .expect("published tombstone")
+                .status,
+            ErrorCodeStatus::Deprecated
+        );
+        assert_eq!(
+            SESSION_ERROR_CODE_DESCRIPTORS
+                .iter()
+                .find(|descriptor| descriptor.code.as_str() == "sql.admit.kill_denied")
+                .expect("active KILL denial")
+                .status,
+            ErrorCodeStatus::Active
+        );
     }
 
     #[test]
@@ -95,10 +120,7 @@ mod tests {
                 SessionAdmitError::GlobalScopeUnsupported,
                 "sql.admit.session_global_scope_unsupported",
             ),
-            (
-                SessionAdmitError::KillConnectionUnsupported,
-                "sql.admit.kill_connection_unsupported",
-            ),
+            (SessionAdmitError::KillDenied, "sql.admit.kill_denied"),
         ] {
             let error = kind.to_user_error(
                 "SET GLOBAL query_timeout = 1",

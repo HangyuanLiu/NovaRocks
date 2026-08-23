@@ -16,6 +16,7 @@ const CONNECTOR_READER_CLOSE: &str = "NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE";
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(DistributedReaderCancel),
+        Box::new(DistributedReaderKillConnection),
         Box::new(GenerationReplacement),
         Box::new(PredicatePageIndexPruning),
     ]
@@ -89,6 +90,10 @@ impl Scenario for DistributedReaderCancel {
             &target.done,
             context.remaining("await connector read cancellation")?,
         )?;
+        assert_target_connection_remains_usable(
+            &target,
+            context.remaining("verify KILL QUERY target connection remains usable")?,
+        )?;
         assert_idle_query(&mut control, connection_id)?;
         release_connector_read(&target)?;
         target
@@ -109,6 +114,116 @@ impl Scenario for DistributedReaderCancel {
             .context("run post-cancellation distributed query")?;
         if rows != [1, 2] {
             bail!("post-cancellation distributed query returned {rows:?}, expected [1, 2]");
+        }
+        Ok(())
+    }
+}
+
+struct DistributedReaderKillConnection;
+
+impl Scenario for DistributedReaderKillConnection {
+    fn name(&self) -> &'static str {
+        "connector/distributed-reader-kill-connection"
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        Ok(connector_launch_config())
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect connector KILL CONNECTION control session")?,
+        )?;
+
+        let warehouse = create_warehouse(context, "distributed-reader-kill-connection")?;
+        context.action("create Hadoop Iceberg catalog and three independent data files");
+        create_catalog_table_and_data(
+            &mut control,
+            "connector_kill_connection_catalog",
+            "connector_kill_connection_db",
+            "connector_kill_connection_data",
+            &warehouse,
+        )?;
+
+        context.action("start a public-MySQL distributed read that retains connector readers");
+        let target = start_connector_read(
+            &user,
+            port,
+            "connector_kill_connection_catalog",
+            "connector_kill_connection_db",
+            "connector_kill_connection_data",
+        )?;
+        let connection_id = target
+            .ready
+            .recv_timeout(context.remaining("receive KILL CONNECTION target id")?)
+            .context("KILL CONNECTION target terminated before publishing its connection id")?;
+        let reader_logs = wait_for_open_reader_on_every_backend(
+            context,
+            "connector_kill_connection_catalog",
+            "wait for every BE to open a KILL CONNECTION target reader",
+        )?;
+        assert_readers_are_in_flight(&reader_logs, "before KILL CONNECTION")?;
+
+        context.action(format!(
+            "terminate the active public-MySQL reader through KILL CONNECTION {connection_id}"
+        ));
+        control
+            .query_drop(format!("KILL CONNECTION {connection_id}"))
+            .context("issue public MySQL KILL CONNECTION for connector read")?;
+        assert_connection_killed_query(
+            &target.done,
+            context.remaining("await KILL CONNECTION target query termination")?,
+        )?;
+        assert_target_connection_is_closed(
+            &target,
+            context.remaining("verify KILL CONNECTION closes the target socket")?,
+        )?;
+        release_connector_read(&target)?;
+        target
+            .thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("KILL CONNECTION target thread panicked"))??;
+
+        let reader_logs = wait_for_balanced_reader_lifecycle(
+            context,
+            "wait for connector reader close after KILL CONNECTION",
+        )?;
+        assert_no_reader_open_after_abort(&reader_logs)?;
+        await_resource_convergence(context, &baseline, "KILL CONNECTION connector read")?;
+
+        context.action("verify bare KILL closes an idle public-MySQL target socket");
+        let idle_target = start_idle_mysql_connection(&user, port)?;
+        let idle_connection_id = idle_target
+            .ready
+            .recv_timeout(context.remaining("receive bare KILL target id")?)
+            .context("bare KILL target terminated before publishing its connection id")?;
+        control
+            .query_drop(format!("KILL {idle_connection_id}"))
+            .context("issue bare public MySQL KILL for idle target")?;
+        assert_idle_target_connection_is_closed(
+            &idle_target,
+            context.remaining("verify bare KILL closes the idle target socket")?,
+        )?;
+        idle_target
+            .thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("bare KILL target thread panicked"))??;
+
+        context.action("verify the KILL requester remains usable after both target terminations");
+        let rows: Vec<i64> = control
+            .query("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
+            .context("run requester query after KILL CONNECTION and bare KILL")?;
+        if rows != [1, 2] {
+            bail!("post-KILL requester query returned {rows:?}, expected [1, 2]");
         }
         Ok(())
     }
@@ -275,6 +390,10 @@ impl Scenario for GenerationReplacement {
             &target.done,
             context.remaining("await old-generation reader cancellation")?,
         )?;
+        assert_target_connection_remains_usable(
+            &target,
+            context.remaining("verify old-generation KILL QUERY target remains usable")?,
+        )?;
         assert_idle_query(&mut control, connection_id)?;
         release_connector_read(&target)?;
         target
@@ -295,7 +414,16 @@ impl Scenario for GenerationReplacement {
 struct ConnectorRead {
     ready: mpsc::Receiver<u32>,
     done: mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
+    probe: mpsc::SyncSender<()>,
+    probe_result: mpsc::Receiver<std::result::Result<Option<i64>, mysql::Error>>,
     release: mpsc::Sender<()>,
+    thread: thread::JoinHandle<Result<()>>,
+}
+
+struct IdleMysqlConnection {
+    ready: mpsc::Receiver<u32>,
+    probe: mpsc::SyncSender<()>,
+    probe_result: mpsc::Receiver<std::result::Result<Option<i64>, mysql::Error>>,
     thread: thread::JoinHandle<Result<()>>,
 }
 
@@ -480,6 +608,8 @@ fn start_connector_read(
 ) -> Result<ConnectorRead> {
     let (ready_tx, ready) = mpsc::sync_channel(1);
     let (done_tx, done) = mpsc::sync_channel(1);
+    let (probe, probe_rx) = mpsc::sync_channel(1);
+    let (probe_result_tx, probe_result) = mpsc::sync_channel(1);
     let (release, release_rx) = mpsc::channel();
     let user = user.to_string();
     // Keep every file reader in flight long enough to observe and cancel it,
@@ -499,6 +629,12 @@ fn start_connector_read(
         done_tx
             .send(result)
             .context("publish connector reader MySQL result")?;
+        probe_rx
+            .recv()
+            .context("receive connector reader connection probe")?;
+        probe_result_tx
+            .send(connection.query_first::<i64, _>("SELECT 1"))
+            .context("publish connector reader connection probe result")?;
         release_rx
             .recv()
             .context("release connector reader MySQL session")?;
@@ -507,18 +643,95 @@ fn start_connector_read(
     Ok(ConnectorRead {
         ready,
         done,
+        probe,
+        probe_result,
         release,
         thread,
     })
 }
 
+fn start_idle_mysql_connection(user: &str, port: u16) -> Result<IdleMysqlConnection> {
+    let (ready_tx, ready) = mpsc::sync_channel(1);
+    let (probe, probe_rx) = mpsc::sync_channel(1);
+    let (probe_result_tx, probe_result) = mpsc::sync_channel(1);
+    let user = user.to_string();
+    let thread = thread::spawn(move || -> Result<()> {
+        let mut connection = mysql_actor::connect(&user, port, Duration::from_secs(10))
+            .context("connect idle MySQL target")?;
+        ready_tx
+            .send(connection.connection_id())
+            .context("publish idle MySQL target connection id")?;
+        probe_rx
+            .recv()
+            .context("receive idle MySQL target connection probe")?;
+        probe_result_tx
+            .send(connection.query_first::<i64, _>("SELECT 1"))
+            .context("publish idle MySQL target connection probe result")?;
+        Ok(())
+    });
+    Ok(IdleMysqlConnection {
+        ready,
+        probe,
+        probe_result,
+        thread,
+    })
+}
+
 fn assert_idle_query(control: &mut mysql::Conn, connection_id: u32) -> Result<()> {
-    let error = control
+    control
         .query_drop(format!("KILL QUERY {connection_id}"))
-        .expect_err("a cancelled connector session must have no active query");
-    match error {
-        mysql::Error::MySqlError(error) if error.code == 1094 => Ok(()),
-        other => bail!("expected idle KILL QUERY error 1094, received {other}"),
+        .context("idle KILL QUERY must succeed for a live target connection")
+}
+
+fn assert_target_connection_remains_usable(
+    target: &ConnectorRead,
+    timeout: Duration,
+) -> Result<()> {
+    target
+        .probe
+        .send(())
+        .context("request KILL QUERY target connection probe")?;
+    match target
+        .probe_result
+        .recv_timeout(timeout)
+        .context("KILL QUERY target did not answer the connection probe")?
+    {
+        Ok(Some(1)) => Ok(()),
+        Ok(result) => bail!("KILL QUERY target probe returned {result:?}, expected Some(1)"),
+        Err(error) => bail!("KILL QUERY unexpectedly closed target connection: {error}"),
+    }
+}
+
+fn assert_target_connection_is_closed(target: &ConnectorRead, timeout: Duration) -> Result<()> {
+    target
+        .probe
+        .send(())
+        .context("request KILL CONNECTION target connection probe")?;
+    match target
+        .probe_result
+        .recv_timeout(timeout)
+        .context("KILL CONNECTION target did not answer the connection probe")?
+    {
+        Err(_) => Ok(()),
+        Ok(result) => bail!("KILL CONNECTION left the target connection usable: {result:?}"),
+    }
+}
+
+fn assert_idle_target_connection_is_closed(
+    target: &IdleMysqlConnection,
+    timeout: Duration,
+) -> Result<()> {
+    target
+        .probe
+        .send(())
+        .context("request bare KILL target connection probe")?;
+    match target
+        .probe_result
+        .recv_timeout(timeout)
+        .context("bare KILL target did not answer the connection probe")?
+    {
+        Err(_) => Ok(()),
+        Ok(result) => bail!("bare KILL left the idle target connection usable: {result:?}"),
     }
 }
 
@@ -543,6 +756,19 @@ fn assert_cancelled_query(
     match error {
         mysql::Error::MySqlError(error) if error.code == 1317 => Ok(()),
         other => bail!("expected MySQL cancellation error 1317, received {other}"),
+    }
+}
+
+fn assert_connection_killed_query(
+    done: &mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
+    timeout: Duration,
+) -> Result<()> {
+    match done
+        .recv_timeout(timeout)
+        .context("KILL CONNECTION target query did not terminate before the scenario deadline")?
+    {
+        Ok(rows) => bail!("KILL CONNECTION target query unexpectedly succeeded: {rows:?}"),
+        Err(_) => Ok(()),
     }
 }
 
