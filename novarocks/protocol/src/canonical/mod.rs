@@ -233,11 +233,17 @@ fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::novarocks;
+    use crate::{common, novarocks};
 
     use super::digest_message;
 
     const DOMAIN: &[u8] = b"novarocks.protocol.canonical.test.v1\0";
+    const LITERAL_VALUE_DIGEST_GOLDEN_HEX: &str =
+        "11fbceccc45ee0bf45e6acc5fcdefe220a95838183c3cedf95e7db5e9e142078";
+
+    fn digest_hex(digest: [u8; 32]) -> String {
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
 
     #[test]
     fn sorts_maps_but_preserves_repeated_order() {
@@ -288,5 +294,72 @@ mod tests {
         let error = digest_message(DOMAIN, "novarocks.SpillOptions", &non_finite)
             .expect_err("NaN cannot enter a canonical digest");
         assert!(error.detail().contains("non-finite"));
+    }
+
+    #[test]
+    fn literal_value_oneof_variants_change_digest_and_are_stable() {
+        use common::literal_value::Value;
+
+        let binary = common::LiteralValue {
+            value: Some(Value::BinaryValue(vec![0x00, 0xff, 0x2a])),
+        };
+        let same_binary = binary.clone();
+        let string = common::LiteralValue {
+            value: Some(Value::StringValue("\0\u{fffd}*".into())),
+        };
+
+        let binary_digest = digest_message(DOMAIN, "novarocks.common.LiteralValue", &binary)
+            .expect("binary literal digest");
+        assert_eq!(
+            binary_digest,
+            digest_message(DOMAIN, "novarocks.common.LiteralValue", &same_binary,)
+                .expect("same binary literal digest")
+        );
+        assert_ne!(
+            binary_digest,
+            digest_message(DOMAIN, "novarocks.common.LiteralValue", &string)
+                .expect("string literal digest")
+        );
+    }
+
+    #[test]
+    fn literal_value_bytes_and_empty_oneof_presence_change_digest() {
+        use common::literal_value::Value;
+
+        let first = common::LiteralValue {
+            value: Some(Value::BinaryValue(vec![0x00, 0xff, 0x2a])),
+        };
+        let changed = common::LiteralValue {
+            value: Some(Value::BinaryValue(vec![0x00, 0xfe, 0x2a])),
+        };
+        let absent = common::LiteralValue::default();
+        let present_empty = common::LiteralValue {
+            value: Some(Value::BinaryValue(Vec::new())),
+        };
+
+        assert_ne!(
+            digest_message(DOMAIN, "novarocks.common.LiteralValue", &first).expect("digest"),
+            digest_message(DOMAIN, "novarocks.common.LiteralValue", &changed)
+                .expect("changed bytes digest")
+        );
+        assert_ne!(
+            digest_message(DOMAIN, "novarocks.common.LiteralValue", &absent)
+                .expect("absent oneof digest"),
+            digest_message(DOMAIN, "novarocks.common.LiteralValue", &present_empty,)
+                .expect("present empty bytes digest")
+        );
+    }
+
+    #[test]
+    fn literal_value_digest_matches_known_hex_golden() {
+        use common::literal_value::Value;
+
+        let literal = common::LiteralValue {
+            value: Some(Value::BinaryValue(vec![0x00, 0xff, 0x2a])),
+        };
+        let digest = digest_message(DOMAIN, "novarocks.common.LiteralValue", &literal)
+            .expect("literal digest");
+
+        assert_eq!(digest_hex(digest), LITERAL_VALUE_DIGEST_GOLDEN_HEX);
     }
 }
