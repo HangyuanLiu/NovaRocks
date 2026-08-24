@@ -124,9 +124,10 @@ impl SetValue {
     }
 }
 
-/// `USE <database>`.
+/// `USE <database>` or `USE <catalog>.<database>`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UseStatement {
+    pub catalog: Option<Ident>,
     pub database: Ident,
     pub span: Span,
 }

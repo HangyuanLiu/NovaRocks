@@ -627,7 +627,11 @@ impl FrontendQuerySession {
                 Ok(StatementResult::Ok)
             }
             ast::SessionStatement::Use(statement) => {
-                self.init_database(&statement.database.value).await?;
+                let schema = statement.catalog.as_ref().map_or_else(
+                    || statement.database.value.clone(),
+                    |catalog| format!("{}.{}", catalog.value, statement.database.value),
+                );
+                self.init_database(&schema).await?;
                 Ok(StatementResult::Ok)
             }
             ast::SessionStatement::Kill(statement) => self.execute_session_kill(source, statement),
@@ -1053,7 +1057,23 @@ fn session_setting_value(value: &ast::SetValue) -> Result<String, QueryServiceEr
             .trim_matches('\'')
             .trim_matches('"')
             .to_string()),
-        ast::SetValue::Query(_) | ast::SetValue::Words(_) => Err(QueryServiceError::new(
+        ast::SetValue::Words(words) => {
+            let [ast::SetWord::Ident(value)] = words.as_slice() else {
+                return Err(QueryServiceError::new(
+                    QueryServiceErrorKind::InvalidValue,
+                    "session variable assignment requires an expression",
+                ));
+            };
+            if matches!(value.value.to_ascii_lowercase().as_str(), "on" | "off") {
+                Ok(value.value.to_ascii_lowercase())
+            } else {
+                Err(QueryServiceError::new(
+                    QueryServiceErrorKind::InvalidValue,
+                    "session variable assignment requires an expression",
+                ))
+            }
+        }
+        ast::SetValue::Query(_) => Err(QueryServiceError::new(
             QueryServiceErrorKind::InvalidValue,
             "session variable assignment requires an expression",
         )),
@@ -2420,6 +2440,21 @@ mod tests {
                 "SELECT ';'".to_string(),
                 "SELECT 3".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn session_setting_value_accepts_parser_owned_boolean_words() {
+        let statements = novarocks_parser::parse("SET enable_eliminate_agg = on")
+            .expect("SET boolean value must parse");
+        let [ParsedStatement::Session(ast::SessionStatement::Set(statement))] =
+            statements.as_slice()
+        else {
+            panic!("expected one SET statement");
+        };
+        assert_eq!(
+            session_setting_value(&statement.assignments[0].value).expect("boolean value"),
+            "on"
         );
     }
 
