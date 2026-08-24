@@ -40,6 +40,7 @@ use novarocks_spi::state_store::{
     CommitResolution, Key, Precondition, StateRecord, StateStore, Value,
 };
 use novarocks_types::ClusterRole;
+use novarocks_version::native_build_identity;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use uuid::Uuid;
@@ -432,6 +433,7 @@ enum MembershipStorage {
 enum RuntimeBackendState {
     Registering,
     Live,
+    Incompatible,
     Lost,
     Decommissioning,
 }
@@ -441,9 +443,44 @@ impl RuntimeBackendState {
         match self {
             Self::Registering => "Registering",
             Self::Live => "Live",
+            Self::Incompatible => "Incompatible",
             Self::Lost => "Lost",
             Self::Decommissioning => "Decommissioning",
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BackendAdmissionFailure {
+    BuildIdentityMismatch { expected: String, observed: String },
+}
+
+impl BackendAdmissionFailure {
+    fn build_identity_mismatch(observed: impl Into<String>) -> Self {
+        Self::BuildIdentityMismatch {
+            expected: native_build_identity().to_string(),
+            observed: observed.into(),
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::BuildIdentityMismatch { expected, observed } => format!(
+                "native build identity mismatch (expected {}, observed {})",
+                safe_native_build_identity(expected),
+                safe_native_build_identity(observed),
+            ),
+        }
+    }
+}
+
+fn safe_native_build_identity(identity: &str) -> &str {
+    let valid_character =
+        |character: char| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-');
+    if (1..=128).contains(&identity.len()) && identity.chars().all(valid_character) {
+        identity
+    } else {
+        "<invalid>"
     }
 }
 
@@ -458,6 +495,7 @@ struct FrontendBackendEntry {
     missed_heartbeats: u32,
     scheduled_fragments: u64,
     last_err: Option<String>,
+    admission_failure: Option<BackendAdmissionFailure>,
     decommission_started: Option<Instant>,
     decommission_timeout_event_sent: bool,
 }
@@ -626,12 +664,13 @@ impl ClusterBackendService {
                         endpoint: target.endpoint(),
                         state: RuntimeBackendState::Live,
                         start_epoch: target.start_epoch(),
-                        version: String::new(),
+                        version: native_build_identity().to_string(),
                         num_cores: 0,
                         last_heartbeat_ms: 0,
                         missed_heartbeats: 0,
                         scheduled_fragments: 0,
                         last_err: None,
+                        admission_failure: None,
                         decommission_started: None,
                         decommission_timeout_event_sent: false,
                     },
@@ -670,6 +709,7 @@ impl ClusterBackendService {
                     missed_heartbeats: 0,
                     scheduled_fragments: 0,
                     last_err: None,
+                    admission_failure: None,
                     decommission_started: (entry.desired_state
                         == DesiredBackendState::Decommissioning)
                         .then(Instant::now),
@@ -852,27 +892,56 @@ impl ClusterBackendService {
         }
         let old_state = entry.state;
         let old_epoch = entry.start_epoch;
-        entry.state = RuntimeBackendState::Live;
+        let version = version.into();
+        let admission_failure = (version != native_build_identity())
+            .then(|| BackendAdmissionFailure::build_identity_mismatch(version.clone()));
+        let matching_identity = admission_failure.is_none();
+        let state_changed = if matching_identity {
+            old_state != RuntimeBackendState::Live || old_epoch != start_epoch
+        } else {
+            old_state != RuntimeBackendState::Incompatible
+                || old_epoch != start_epoch
+                || entry.admission_failure != admission_failure
+        };
+        entry.state = if matching_identity {
+            RuntimeBackendState::Live
+        } else {
+            RuntimeBackendState::Incompatible
+        };
         entry.start_epoch = start_epoch;
-        entry.version = version.into();
+        entry.version = version;
         entry.num_cores = num_cores;
         entry.last_heartbeat_ms = now_ms;
         entry.missed_heartbeats = 0;
         entry.last_err = None;
-        let restarted = (old_epoch != 0 && start_epoch != 0 && old_epoch != start_epoch).then_some(
-            BackendQueryEvent::Restarted {
-                backend_idx,
-                old_epoch,
-                new_epoch: start_epoch,
-            },
-        );
-        if (old_state != RuntimeBackendState::Live || old_epoch != start_epoch)
-            && advance_topology_revision(&mut state).is_err()
-        {
+        entry.admission_failure = admission_failure;
+        let restarted =
+            (matching_identity && old_epoch != 0 && start_epoch != 0 && old_epoch != start_epoch)
+                .then_some(BackendQueryEvent::Restarted {
+                    backend_idx,
+                    old_epoch,
+                    new_epoch: start_epoch,
+                });
+        let unavailable =
+            (!matching_identity && old_state == RuntimeBackendState::Live).then(|| {
+                let detail = entry
+                    .admission_failure
+                    .as_ref()
+                    .expect("incompatible state has an admission failure")
+                    .detail();
+                BackendQueryEvent::Unavailable {
+                    backend_idx,
+                    reason: format!("backend {backend_idx} rejected: {detail}"),
+                }
+            });
+        if state_changed && advance_topology_revision(&mut state).is_err() {
             return;
         }
         drop(state);
         if let Some(event) = restarted {
+            self.dispatch_event(event);
+        }
+        if let Some(event) = unavailable {
             self.dispatch_event(event);
         }
         self.publish_snapshot();
@@ -1140,6 +1209,7 @@ impl ClusterBackendService {
                 match entry.state {
                     RuntimeBackendState::Registering => metrics.registering += 1,
                     RuntimeBackendState::Live => metrics.live += 1,
+                    RuntimeBackendState::Incompatible => {}
                     RuntimeBackendState::Lost => metrics.lost += 1,
                     RuntimeBackendState::Decommissioning => metrics.decommissioning += 1,
                 }
@@ -1410,6 +1480,7 @@ fn registering_entry(endpoint: SocketAddr) -> FrontendBackendEntry {
         missed_heartbeats: 0,
         scheduled_fragments: 0,
         last_err: None,
+        admission_failure: None,
         decommission_started: None,
         decommission_timeout_event_sent: false,
     }
@@ -1555,20 +1626,41 @@ fn invalid_state_store_request(
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
 
-    use crate::common::backend_topology::{BackendTopologyPort, LiveBackendTarget};
+    use crate::common::backend_topology::{
+        BackendQueryEvent, BackendQueryEventSink, BackendTopologyPort, LiveBackendTarget,
+    };
+    use novarocks_version::native_build_identity;
 
     use super::{
-        ClusterBackendOpenConfig, ClusterBackendService, DesiredBackendState,
+        ClusterBackendOpenConfig, ClusterBackendService, DesiredBackendState, RuntimeBackendState,
         StoredClusterBackendEntryV1, StoredClusterBackendsV1, validate_stored_cluster_backends,
     };
+
+    #[derive(Default)]
+    struct RecordingBackendQueryEvents {
+        events: Mutex<Vec<BackendQueryEvent>>,
+    }
+
+    impl BackendQueryEventSink for RecordingBackendQueryEvents {
+        fn on_backend_event(&self, event: BackendQueryEvent) {
+            self.events.lock().expect("record event").push(event);
+        }
+
+        fn backend_has_active_queries(&self, _backend_idx: usize) -> bool {
+            false
+        }
+
+        fn replace_live_backends(&self, _revision: u64, _backends: Vec<LiveBackendTarget>) {}
+    }
 
     #[test]
     fn snapshot_and_management_are_frontend_owned() {
         let service = ClusterBackendService::new_transient_for_test(1);
         let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
         service.add_backend(endpoint).unwrap();
-        service.record_heartbeat_success(0, 17, "test", 2, 100);
+        service.record_heartbeat_success(0, 17, native_build_identity(), 2, 100);
         assert_eq!(
             service.live_backends(),
             [LiveBackendTarget::new(0, endpoint, 17)]
@@ -1582,7 +1674,7 @@ mod tests {
         let service = ClusterBackendService::new_transient_for_test(1);
         let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
         service.add_backend(endpoint).unwrap();
-        service.record_heartbeat_success(0, 17, "test", 2, 100);
+        service.record_heartbeat_success(0, 17, native_build_identity(), 2, 100);
 
         let result = service.show_backends().unwrap();
         assert_eq!(
@@ -1599,6 +1691,131 @@ mod tests {
                 "ScheduledFragments",
                 "StartEpoch",
             ]
+        );
+    }
+
+    #[test]
+    fn mismatched_native_build_identity_is_not_schedulable_and_can_recover() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
+        service.add_backend(endpoint).unwrap();
+
+        service.record_heartbeat_success(0, 17, "incompatible-build", 2, 100);
+        assert!(service.live_backends().is_empty());
+        {
+            let state = service.state.lock().expect("frontend topology lock");
+            let entry = state.entries.get(&0).expect("registered backend");
+            assert_eq!(entry.state, RuntimeBackendState::Incompatible);
+            assert_eq!(entry.version, "incompatible-build");
+            assert!(entry.admission_failure.is_some());
+            assert_eq!(entry.last_err, None);
+        }
+
+        service.record_heartbeat_success(0, 17, native_build_identity(), 2, 101);
+        assert_eq!(
+            service.live_backends(),
+            [LiveBackendTarget::new(0, endpoint, 17)]
+        );
+        let state = service.state.lock().expect("frontend topology lock");
+        let entry = state.entries.get(&0).expect("registered backend");
+        assert_eq!(entry.state, RuntimeBackendState::Live);
+        assert_eq!(entry.admission_failure, None);
+    }
+
+    #[test]
+    fn repeated_mismatch_does_not_advance_revision_or_repeat_unavailable() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
+        service.add_backend(endpoint).unwrap();
+        service.record_heartbeat_success(0, 17, native_build_identity(), 2, 100);
+        let events = Arc::new(RecordingBackendQueryEvents::default());
+        service.attach_query_events(events.clone());
+
+        service.record_heartbeat_success(0, 17, "incompatible-build", 2, 101);
+        let revision_after_first_mismatch = service
+            .state
+            .lock()
+            .expect("frontend topology lock")
+            .topology_revision;
+        service.record_heartbeat_success(0, 17, "incompatible-build", 4, 102);
+
+        assert_eq!(
+            service
+                .state
+                .lock()
+                .expect("frontend topology lock")
+                .topology_revision,
+            revision_after_first_mismatch
+        );
+        assert_eq!(
+            events.events.lock().expect("recorded events").as_slice(),
+            [BackendQueryEvent::Unavailable {
+                backend_idx: 0,
+                reason: format!(
+                    "backend 0 rejected: native build identity mismatch (expected {}, observed incompatible-build)",
+                    native_build_identity()
+                ),
+            }]
+        );
+    }
+
+    #[test]
+    fn incompatible_heartbeat_timeout_becomes_lost_but_keeps_admission_history() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
+        service.add_backend(endpoint).unwrap();
+        service.record_heartbeat_success(0, 17, "incompatible-build", 2, 100);
+
+        assert!(service.record_heartbeat_failure(0));
+        let state = service.state.lock().expect("frontend topology lock");
+        let entry = state.entries.get(&0).expect("registered backend");
+        assert_eq!(entry.state, RuntimeBackendState::Lost);
+        assert!(entry.admission_failure.is_some());
+        assert_eq!(entry.last_err.as_deref(), Some("heartbeat failed"));
+    }
+
+    #[test]
+    fn live_backend_restart_with_mismatch_is_unavailable_not_restarted() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
+        service.add_backend(endpoint).unwrap();
+        service.record_heartbeat_success(0, 17, native_build_identity(), 2, 100);
+        let events = Arc::new(RecordingBackendQueryEvents::default());
+        service.attach_query_events(events.clone());
+
+        service.record_heartbeat_success(0, 18, "incompatible-build", 2, 101);
+        let events = events.events.lock().expect("recorded events");
+        assert!(matches!(
+            events.as_slice(),
+            [BackendQueryEvent::Unavailable { backend_idx: 0, .. }]
+        ));
+    }
+
+    #[test]
+    fn decommissioning_backend_ignores_identity_admission() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
+        service.add_backend(endpoint).unwrap();
+        service.mark_decommissioning_runtime(0, endpoint).unwrap();
+
+        service.record_heartbeat_success(0, 17, "incompatible-build", 2, 100);
+        let state = service.state.lock().expect("frontend topology lock");
+        let entry = state.entries.get(&0).expect("registered backend");
+        assert_eq!(entry.state, RuntimeBackendState::Decommissioning);
+        assert_eq!(entry.admission_failure, None);
+    }
+
+    #[test]
+    fn captured_targets_use_the_current_native_build_identity() {
+        let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
+        let service =
+            ClusterBackendService::from_captured_targets_for_test(&[LiveBackendTarget::new(
+                0, endpoint, 17,
+            )]);
+        let state = service.state.lock().expect("frontend topology lock");
+        assert_eq!(
+            state.entries.get(&0).expect("captured backend").version,
+            native_build_identity()
         );
     }
 

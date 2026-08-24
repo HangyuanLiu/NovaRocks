@@ -28,12 +28,9 @@ fn git_output(args: &[&str]) -> Option<String> {
 }
 
 fn is_valid_native_build_identity(identity: &str) -> bool {
-    let valid_char = |character: char| {
-        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
-    };
-    (1..=128).contains(&identity.len())
-        && identity != "unknown"
-        && identity.chars().all(valid_char)
+    let valid_char =
+        |character: char| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-');
+    (1..=128).contains(&identity.len()) && identity != "unknown" && identity.chars().all(valid_char)
 }
 
 fn is_full_git_commit(commit: &str) -> bool {
@@ -52,8 +49,8 @@ fn main() {
     }
 
     let explicit_identity = std::env::var(NATIVE_BUILD_IDENTITY_ENV).ok();
-    let full_commit = git_output(&["rev-parse", "--verify", "HEAD"])
-        .filter(|commit| is_full_git_commit(commit));
+    let full_commit =
+        git_output(&["rev-parse", "--verify", "HEAD"]).filter(|commit| is_full_git_commit(commit));
     let native_build_identity = explicit_identity
         .or_else(|| full_commit.clone())
         .expect("novarocks-version requires NOVAROCKS_NATIVE_BUILD_IDENTITY or a full Git commit");
