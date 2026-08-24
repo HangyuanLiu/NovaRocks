@@ -17,6 +17,15 @@
 
 const GIT_HASH: &str = env!("NOVAROCKS_GIT_HASH");
 const GIT_TIME: &str = env!("NOVAROCKS_GIT_TIME");
+const NATIVE_BUILD_IDENTITY: &str = env!("NOVAROCKS_NATIVE_BUILD_IDENTITY");
+
+/// Immutable release identity used to admit native Backend processes.
+///
+/// It is supplied explicitly at build time or derived from the full Git commit.
+/// It is intentionally distinct from the shorter human-facing version strings.
+pub const fn native_build_identity() -> &'static str {
+    NATIVE_BUILD_IDENTITY
+}
 
 /// Short version string reported via heartbeat, e.g. "novarocks-1b9f054a".
 /// Matches StarRocks BE convention of "version-commit".
@@ -29,4 +38,20 @@ pub fn short_version() -> &'static str {
 pub fn full_version() -> &'static str {
     static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     VERSION.get_or_init(|| format!("novarocks-{GIT_HASH} ({GIT_TIME})"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::native_build_identity;
+
+    #[test]
+    fn native_build_identity_is_present_and_not_unknown() {
+        let identity = native_build_identity();
+        assert!(!identity.is_empty());
+        assert_ne!(identity, "unknown");
+        assert!(identity.len() <= 128);
+        assert!(identity.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        }));
+    }
 }
