@@ -39,6 +39,7 @@ use novarocks_execution::runtime::query_options::{
     QueryCacheOptions, QueryOptions as RuntimeQueryOptions,
 };
 use novarocks_protocol::lifecycle::QueryOptions;
+use novarocks_protocol::provider::EnsureConnectorExecutionBindingRejection;
 use novarocks_spi::connector::{
     ConnectorActivatedWriteCohort, ConnectorError, ConnectorExecutionBindingKey,
     ConnectorRequestContext, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
@@ -818,6 +819,7 @@ pub enum DistributedQueryErrorKind {
 pub struct DistributedQueryError {
     kind: DistributedQueryErrorKind,
     message: String,
+    connector_binding_rejection: Option<EnsureConnectorExecutionBindingRejection>,
 }
 
 impl DistributedQueryError {
@@ -825,6 +827,31 @@ impl DistributedQueryError {
         Self {
             kind,
             message: message.into(),
+            connector_binding_rejection: None,
+        }
+    }
+
+    /// Preserves a BE-provided, Protocol-validated binding rejection without
+    /// reducing its reason or retry semantics to display text.
+    pub fn connector_binding_rejected(
+        context: impl Into<String>,
+        rejection: EnsureConnectorExecutionBindingRejection,
+    ) -> Self {
+        let context = context.into();
+        let field_path = rejection
+            .safe_field_path()
+            .map(|value| format!(" field_path={value}"))
+            .unwrap_or_default();
+        Self {
+            kind: DistributedQueryErrorKind::Rejected,
+            message: format!(
+                "{context}: connector execution binding rejected: reason={:?} retryable_before_progress={} detail={}{}",
+                rejection.reason(),
+                rejection.retryable_before_progress(),
+                rejection.safe_detail(),
+                field_path,
+            ),
+            connector_binding_rejection: Some(rejection),
         }
     }
 
@@ -834,6 +861,10 @@ impl DistributedQueryError {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub fn connector_binding_rejection(&self) -> Option<&EnsureConnectorExecutionBindingRejection> {
+        self.connector_binding_rejection.as_ref()
     }
 }
 

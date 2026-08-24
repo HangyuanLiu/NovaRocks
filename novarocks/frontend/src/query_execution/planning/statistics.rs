@@ -429,6 +429,10 @@ mod unified_tests {
     }
 
     impl ConnectorExecutionDistribution for ContextObservingProvider {
+        fn provider_kind(&self) -> novarocks_spi::connector::ConnectorExecutionProviderKind {
+            novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg
+        }
+
         fn declaration(
             &self,
             _context: &ConnectorRequestContext,

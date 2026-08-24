@@ -860,16 +860,16 @@ mod tests {
     use novarocks_spi::connector::{
         CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorClusterIdentity,
         ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-        ConnectorExecutionDistribution, ConnectorExternalFenceFailure,
-        ConnectorExternalFenceGeneration, ConnectorExternalFenceReceipt,
-        ConnectorExternalFenceRequest, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorProviderId, ConnectorRequestContext,
-        ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorTableHandle,
-        ConnectorTableIdentity, ConnectorWriteBaseVersion, ConnectorWriteControl,
-        ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
-        ConnectorWriteIntent, ConnectorWritePlan, ConnectorWritePlanningRequest,
-        ConnectorWritePreparation, ConnectorWriteTargetRef, ConnectorWriterHandle,
-        ConnectorWriterIdentity, ConnectorWriterTerminalState, ExternalMutationFinalization,
+        ConnectorExecutionDistribution, ConnectorExecutionProviderKind,
+        ConnectorExternalFenceFailure, ConnectorExternalFenceGeneration,
+        ConnectorExternalFenceReceipt, ConnectorExternalFenceRequest, ConnectorInstanceId,
+        ConnectorInstanceIncarnation, ConnectorRequestContext, ConnectorStagedReport,
+        ConnectorStagedReportSummary, ConnectorTableHandle, ConnectorTableIdentity,
+        ConnectorWriteBaseVersion, ConnectorWriteControl, ConnectorWriteFieldBinding,
+        ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
+        ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparation,
+        ConnectorWriteTargetRef, ConnectorWriterHandle, ConnectorWriterIdentity,
+        ConnectorWriterTerminalState, ExternalMutationFinalization,
     };
 
     use super::*;
@@ -895,18 +895,22 @@ mod tests {
     }
 
     impl ConnectorExecutionDistribution for TestDistribution {
+        fn provider_kind(&self) -> ConnectorExecutionProviderKind {
+            ConnectorExecutionProviderKind::Iceberg
+        }
+
         fn declaration(
             &self,
             _context: &ConnectorRequestContext,
         ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-            ConnectorExecutionDeclaration::try_new(
-                ConnectorInstanceDescriptor {
-                    provider_id: ConnectorProviderId::parse("session-test")?,
-                    instance_id: self.key.instance_id.clone(),
-                },
-                self.key.incarnation,
-                Bytes::from_static(b"session-test-binding"),
+            ConnectorExecutionDeclaration::iceberg(
+                self.key.instance_id.as_str(),
+                self.key.incarnation.to_bytes(),
+                "session-test-binding",
             )
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+            })
         }
     }
 

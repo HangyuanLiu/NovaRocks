@@ -99,6 +99,7 @@ code-anchors:
 - ADR-0034 — cluster composite split 与 Backend local scan unit 为何采用冻结、认证、再调度的两级生命周期（active）
 - ADR-0039 — scan unit为何以immutable、bounded的physical domain facts服务后续执行侧（active）
 - ADR-0103 — 中央 Provider wire authority 与同构 Native build admission 为何统一由 Protocol 和 Frontend topology 拥有（active）
+- ADR-0104 — Connector execution binding 为何使用 Protocol typed declaration、sealed Host 与可重放失败状态机（active）
 - ADR-0049 — row mutation 的 strategy、identity、route 与 cohort 为何由 Provider 签发并拥有（active）
 - ADR-0051 — distributed write 为何在 preparation 与 planning 之间强制 exact-generation Provider activation（active）
 - ADR-0052 — SHOW CREATE 为何以 exact lease 的有界 table-definition facts 取代 concrete table decode（active）

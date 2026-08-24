@@ -212,31 +212,22 @@ impl NovaRocksGrpc for BackendRpcService {
     ) -> Result<tonic::Response<proto::EnsureConnectorExecutionBindingResponse>, tonic::Status>
     {
         let ingress = Arc::clone(&self.native_fragment_ingress);
-        let result = tokio::task::spawn_blocking(move || {
-            let (execution_id, declaration) =
-                binding_decode::decode_ensure_request(request.into_inner())
-                    .map_err(|error| error.to_string())?;
-            let context =
-                binding_decode::install_request_context().map_err(|error| error.to_string())?;
-            ingress
-                .ensure_connector_execution_binding(execution_id, declaration, context)
-                .map_err(|error| error.to_string())
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!(
-                "ensure_connector_execution_binding handler panicked: {error}"
-            ))
-        })?;
-        let (status_code, message) = result
-            .map(|()| (0, String::new()))
-            .unwrap_or_else(|error| (1, error));
-        Ok(tonic::Response::new(
-            proto::EnsureConnectorExecutionBindingResponse {
-                status_code,
-                message,
-            },
-        ))
+        let result =
+            tokio::task::spawn_blocking(move || {
+                match binding_decode::decode_ensure_request(request.into_inner()) {
+                    Ok((execution_id, declaration)) => {
+                        ingress.ensure_connector_execution_binding(execution_id, declaration)
+                    }
+                    Err(rejection) => rejection,
+                }
+            })
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!(
+                    "ensure_connector_execution_binding handler panicked: {error}"
+                ))
+            })?;
+        Ok(tonic::Response::new(result.to_proto()))
     }
 
     async fn retire_connector_execution_binding(
@@ -245,28 +236,20 @@ impl NovaRocksGrpc for BackendRpcService {
     ) -> Result<tonic::Response<proto::RetireConnectorExecutionBindingResponse>, tonic::Status>
     {
         let ingress = Arc::clone(&self.native_fragment_ingress);
-        let result = tokio::task::spawn_blocking(move || {
-            let key = binding_decode::decode_retire_request(request.into_inner())
-                .map_err(|error| error.to_string())?;
-            ingress
-                .retire_connector_execution_binding(key)
-                .map_err(|error| error.to_string())
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!(
-                "retire_connector_execution_binding handler panicked: {error}"
-            ))
-        })?;
-        let (status_code, message) = result
-            .map(|()| (0, String::new()))
-            .unwrap_or_else(|error| (1, error));
-        Ok(tonic::Response::new(
-            proto::RetireConnectorExecutionBindingResponse {
-                status_code,
-                message,
-            },
-        ))
+        let result =
+            tokio::task::spawn_blocking(move || {
+                match binding_decode::decode_retire_request(request.into_inner()) {
+                    Ok(key) => ingress.retire_connector_execution_binding(key),
+                    Err(outcome) => outcome,
+                }
+            })
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!(
+                    "retire_connector_execution_binding handler panicked: {error}"
+                ))
+            })?;
+        Ok(tonic::Response::new(result.to_proto()))
     }
 
     async fn heartbeat(

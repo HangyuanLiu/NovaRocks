@@ -738,15 +738,22 @@ mod tests {
         key: ConnectorExecutionBindingKey,
     }
     impl ConnectorExecutionDistribution for TestDistribution {
+        fn provider_kind(&self) -> novarocks_spi::connector::ConnectorExecutionProviderKind {
+            novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg
+        }
+
         fn declaration(
             &self,
             _context: &ConnectorRequestContext,
         ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-            ConnectorExecutionDeclaration::try_new(
-                self.descriptor.clone(),
-                self.key.incarnation,
-                Bytes::from_static(b"test"),
+            ConnectorExecutionDeclaration::iceberg(
+                self.descriptor.instance_id.as_str(),
+                self.key.incarnation.to_bytes(),
+                "test",
             )
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+            })
         }
     }
 

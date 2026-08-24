@@ -39,8 +39,7 @@ use novarocks_execution::runtime::fragment::{
 use novarocks_execution::runtime::profile::Profiler;
 use novarocks_protocol::lifecycle::{QueryExecutionId, StageFragment};
 use novarocks_spi::connector::{
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorRequestContext,
-    WriteCommitEvidenceLimits,
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, WriteCommitEvidenceLimits,
 };
 use tracing::error;
 
@@ -160,7 +159,7 @@ impl NativeFragmentService {
             Arc::new(FragmentControlRegistry::default()),
             lifecycle,
             connector_registry,
-            Arc::new(ConnectorExecutionHost::new()),
+            Arc::new(ConnectorExecutionHost::empty_for_tests()),
             test_execution_runtime(),
         )
     }
@@ -234,7 +233,7 @@ impl NativeFragmentService {
             controls,
             lifecycle,
             Arc::new(ConnectorRegistry::new()),
-            Arc::new(ConnectorExecutionHost::new()),
+            Arc::new(ConnectorExecutionHost::empty_for_tests()),
             test_execution_runtime(),
         );
         service.lifecycle_observer = Some(Arc::new(observer));
@@ -635,20 +634,15 @@ impl NativeFragmentIngress for NativeFragmentService {
         &self,
         execution_id: QueryExecutionId,
         declaration: ConnectorExecutionDeclaration,
-        context: ConnectorRequestContext,
-    ) -> Result<(), NativeFragmentIngressError> {
-        self.execution_host
-            .ensure(execution_id, &declaration, &context)
-            .map_err(NativeFragmentIngressError::new)
+    ) -> novarocks_protocol::provider::EnsureConnectorExecutionBindingResult {
+        self.execution_host.ensure(execution_id, &declaration)
     }
 
     fn retire_connector_execution_binding(
         &self,
         key: ConnectorExecutionBindingKey,
-    ) -> Result<(), NativeFragmentIngressError> {
-        self.execution_host
-            .retire(&key)
-            .map_err(NativeFragmentIngressError::new)
+    ) -> novarocks_protocol::provider::RetireConnectorExecutionBindingResult {
+        self.execution_host.retire(&key)
     }
 
     fn cancel(
@@ -772,7 +766,7 @@ fn test_lifecycle_registry(controls: Arc<FragmentControlRegistry>) -> Arc<QueryL
         Arc::new(
             crate::query_lifecycle::NativeQueryLifecycleLocalRuntime::new(
                 controls,
-                Arc::new(ConnectorExecutionHost::new()),
+                Arc::new(ConnectorExecutionHost::empty_for_tests()),
             ),
         ),
         crate::query_lifecycle::QueryLifecycleRegistryConfig::new(

@@ -70,6 +70,7 @@ impl ConnectorExecutionBindingProvider<'_> {
     }
 }
 
+// Design: ADR-0104 (docs/adr/ADR-0104-typed-connector-execution-binding-declaration.md)
 /// Validated generated declaration root. It intentionally keeps no duplicate
 /// domain model and computes its digest from the Protocol-owned DTO.
 #[derive(Clone, PartialEq)]

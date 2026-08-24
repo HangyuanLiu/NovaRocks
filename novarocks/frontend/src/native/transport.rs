@@ -17,6 +17,9 @@ use crate::native::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, decode_fetched_query_batch,
 };
 use crate::query_execution::artifact::ConnectorBindingDispatcher;
+use crate::query_execution::connector_binding::{
+    ConnectorBindingDispatchError, ConnectorBindingRetirementError,
+};
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 use novarocks_protocol::common::UniqueId as ProtoUniqueId;
 use novarocks_protocol::lifecycle::{
@@ -28,6 +31,10 @@ use novarocks_protocol::novarocks::{
     EnsureConnectorExecutionBindingRequest, FetchResultRequest,
     QueryExecutionId as ProtoQueryExecutionId, RetireConnectorExecutionBindingRequest,
     fetch_result_response::Status as FetchStatus,
+};
+use novarocks_protocol::provider::{
+    EnsureConnectorExecutionBindingOutcome, EnsureConnectorExecutionBindingResult,
+    RetireConnectorExecutionBindingOutcome, RetireConnectorExecutionBindingResult,
 };
 use novarocks_types::{UniqueId, format_host_for_url};
 
@@ -253,8 +260,10 @@ impl ConnectorBindingDispatcher for ConnectorBindingControl {
         backend_idx: usize,
         endpoint: SocketAddr,
         declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
-    ) -> Result<(), String> {
-        let client = self.client(backend_idx, endpoint)?;
+    ) -> Result<(), ConnectorBindingDispatchError> {
+        let client = self
+            .client(backend_idx, endpoint)
+            .map_err(ConnectorBindingDispatchError::Transport)?;
         let request = EnsureConnectorExecutionBindingRequest {
             execution_id: Some(ProtoQueryExecutionId {
                 query_id: Some(ProtoUniqueId {
@@ -263,51 +272,64 @@ impl ConnectorBindingDispatcher for ConnectorBindingControl {
                 }),
                 attempt_id: execution_id.attempt_id().get(),
             }),
-            provider_id: declaration.descriptor().provider_id.as_str().to_string(),
-            instance_id: declaration.descriptor().instance_id.as_str().to_string(),
-            incarnation: declaration.incarnation().to_bytes().to_vec(),
-            declaration_payload: declaration.payload().to_vec(),
+            declaration: Some(declaration.as_proto().clone()),
         };
-        let response = client.data_runtime.block_on(async {
-            let mut grpc = client.grpc().await?;
-            grpc.ensure_connector_execution_binding(request)
-                .await
-                .map(|value| value.into_inner())
-                .map_err(|error| format!("ensure_connector_execution_binding rpc failed: {error}"))
-        })??;
-        if response.status_code == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "connector execution binding ensure was rejected by BE[{backend_idx}] ({endpoint}): {}",
-                response.message
-            ))
+        let response = client
+            .data_runtime
+            .block_on(async {
+                let mut grpc = client.grpc().await?;
+                grpc.ensure_connector_execution_binding(request)
+                    .await
+                    .map(|value| value.into_inner())
+                    .map_err(|error| {
+                        format!("ensure_connector_execution_binding rpc failed: {error}")
+                    })
+            })
+            .map_err(ConnectorBindingDispatchError::Transport)?
+            .map_err(ConnectorBindingDispatchError::Transport)?;
+        match EnsureConnectorExecutionBindingResult::try_from_proto(response)
+            .map_err(|error| ConnectorBindingDispatchError::Transport(format!(
+                "BE[{backend_idx}] ({endpoint}) returned an invalid ensure connector execution binding outcome: {error}"
+            )))?
+            .outcome()
+        {
+            EnsureConnectorExecutionBindingOutcome::Ensured => Ok(()),
+            EnsureConnectorExecutionBindingOutcome::Rejected(rejection) => {
+                Err(ConnectorBindingDispatchError::Rejected(rejection.clone()))
+            }
         }
     }
     fn retire(
         &self,
         endpoint: SocketAddr,
         key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
-    ) -> Result<(), String> {
-        let client = self.endpoints.iter().find_map(|(id, configured)| (*configured == endpoint).then(|| self.clients.get(id))).flatten().ok_or_else(|| format!("connector retirement endpoint {endpoint} is absent from configured backend snapshot"))?;
+    ) -> Result<(), ConnectorBindingRetirementError> {
+        let client = self.endpoints.iter().find_map(|(id, configured)| (*configured == endpoint).then(|| self.clients.get(id))).flatten().ok_or_else(|| ConnectorBindingRetirementError::Transport(format!("connector retirement endpoint {endpoint} is absent from configured backend snapshot")))?;
         let request = RetireConnectorExecutionBindingRequest {
             instance_id: key.instance_id.as_str().to_string(),
             incarnation: key.incarnation.to_bytes().to_vec(),
         };
-        let response = client.data_runtime.block_on(async {
-            let mut grpc = client.grpc().await?;
-            grpc.retire_connector_execution_binding(request)
-                .await
-                .map(|value| value.into_inner())
-                .map_err(|error| format!("retire_connector_execution_binding rpc failed: {error}"))
-        })??;
-        if response.status_code == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "connector execution binding retirement was rejected by {endpoint}: {}",
-                response.message
-            ))
+        let response = client
+            .data_runtime
+            .block_on(async {
+                let mut grpc = client.grpc().await?;
+                grpc.retire_connector_execution_binding(request)
+                    .await
+                    .map(|value| value.into_inner())
+                    .map_err(|error| {
+                        format!("retire_connector_execution_binding rpc failed: {error}")
+                    })
+            })
+            .map_err(ConnectorBindingRetirementError::Transport)?
+            .map_err(ConnectorBindingRetirementError::Transport)?;
+        match RetireConnectorExecutionBindingResult::try_from_proto(response)
+            .map_err(|error| ConnectorBindingRetirementError::Transport(format!(
+                "{endpoint} returned an invalid retire connector execution binding outcome: {error}"
+            )))?
+            .outcome()
+        {
+            RetireConnectorExecutionBindingOutcome::Accepted => Ok(()),
+            outcome => Err(ConnectorBindingRetirementError::Outcome(outcome)),
         }
     }
 }

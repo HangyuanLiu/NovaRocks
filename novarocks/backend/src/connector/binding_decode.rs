@@ -15,86 +15,68 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use bytes::Bytes;
-use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorProviderId, ConnectorRequestContext,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-};
-
 use novarocks_protocol::lifecycle::QueryExecutionId;
 use novarocks_protocol::novarocks::{
     EnsureConnectorExecutionBindingRequest, RetireConnectorExecutionBindingRequest,
 };
+use novarocks_protocol::provider::{
+    ConnectorExecutionBindingKey as ProtocolBindingKey, EnsureConnectorExecutionBindingRejection,
+    EnsureConnectorExecutionBindingRejectionReason, EnsureConnectorExecutionBindingResult,
+    RetireConnectorExecutionBindingOutcome, RetireConnectorExecutionBindingResult,
+};
+use novarocks_spi::connector::{
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceId,
+    ConnectorInstanceIncarnation,
+};
 
 use crate::fragment::decode::request::decode_native_query_execution_id;
 
-const CONNECTOR_BINDING_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
-
 pub(crate) fn decode_ensure_request(
     request: EnsureConnectorExecutionBindingRequest,
-) -> Result<(QueryExecutionId, ConnectorExecutionDeclaration), ConnectorError> {
+) -> Result<(QueryExecutionId, ConnectorExecutionDeclaration), EnsureConnectorExecutionBindingResult>
+{
     let execution_id = request.execution_id.as_ref().ok_or_else(|| {
-        ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "connector execution binding request is missing execution_id",
-        )
+        invalid_declaration("connector execution binding request is missing execution_id")
     })?;
-    let execution_id = decode_native_query_execution_id(execution_id).map_err(|error| {
-        ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+    let execution_id = decode_native_query_execution_id(execution_id)
+        .map_err(|error| invalid_declaration(&error.to_string()))?;
+    let declaration = request.declaration.ok_or_else(|| {
+        invalid_declaration("connector execution binding request is missing declaration")
     })?;
-    let provider_id = ConnectorProviderId::parse(&request.provider_id)?;
-    let instance_id = ConnectorInstanceId::parse(&request.instance_id)?;
-    let incarnation = decode_incarnation(&request.incarnation)?;
-    let declaration = ConnectorExecutionDeclaration::try_new(
-        ConnectorInstanceDescriptor {
-            provider_id,
-            instance_id,
-        },
-        incarnation,
-        Bytes::from(request.declaration_payload),
-    )?;
+    let declaration = ConnectorExecutionDeclaration::try_from_proto(declaration)
+        .map_err(|error| invalid_declaration(&error.to_string()))?;
     Ok((execution_id, declaration))
 }
 
 pub(crate) fn decode_retire_request(
     request: RetireConnectorExecutionBindingRequest,
-) -> Result<ConnectorExecutionBindingKey, ConnectorError> {
+) -> Result<ConnectorExecutionBindingKey, RetireConnectorExecutionBindingResult> {
+    let key =
+        ProtocolBindingKey::try_new(request.instance_id, request.incarnation).map_err(|_| {
+            RetireConnectorExecutionBindingResult::new(
+                RetireConnectorExecutionBindingOutcome::InvalidKey,
+            )
+        })?;
     Ok(ConnectorExecutionBindingKey {
-        instance_id: ConnectorInstanceId::parse(&request.instance_id)?,
-        incarnation: decode_incarnation(&request.incarnation)?,
+        instance_id: ConnectorInstanceId::parse(key.instance_id())
+            .expect("Protocol validates canonical retire instance IDs"),
+        incarnation: ConnectorInstanceIncarnation::from_bytes(key.incarnation()),
     })
 }
 
-pub(crate) fn install_request_context() -> Result<ConnectorRequestContext, ConnectorError> {
-    ConnectorRequestContext::try_new(
-        Instant::now() + CONNECTOR_BINDING_CONTEXT_TIMEOUT,
-        Arc::new(NotCancelled),
-        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    )
-}
-
-fn decode_incarnation(bytes: &[u8]) -> Result<ConnectorInstanceIncarnation, ConnectorError> {
-    let bytes: [u8; 16] = bytes.try_into().map_err(|_| {
-        ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "connector instance incarnation must contain exactly 16 bytes",
-        )
-    })?;
-    Ok(ConnectorInstanceIncarnation::from_bytes(bytes))
-}
-
-struct NotCancelled;
-
-impl ConnectorCancellation for NotCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
+fn invalid_declaration(detail: &str) -> EnsureConnectorExecutionBindingResult {
+    let mut end = detail.len().min(512);
+    while end > 0 && !detail.is_char_boundary(end) {
+        end -= 1;
     }
+    let rejection = EnsureConnectorExecutionBindingRejection::try_new(
+        EnsureConnectorExecutionBindingRejectionReason::InvalidDeclaration,
+        false,
+        detail[..end].to_string(),
+        None,
+    )
+    .expect("fixed invalid declaration outcome is Protocol-valid");
+    EnsureConnectorExecutionBindingResult::rejected(rejection)
 }
 
 #[cfg(test)]
@@ -102,18 +84,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ensure_request_rejects_invalid_incarnation_length() {
-        let error = decode_ensure_request(EnsureConnectorExecutionBindingRequest {
+    fn ensure_request_rejects_missing_typed_declaration() {
+        let result = decode_ensure_request(EnsureConnectorExecutionBindingRequest {
             execution_id: Some(novarocks_protocol::novarocks::QueryExecutionId {
                 query_id: Some(novarocks_protocol::common::UniqueId { hi: 7, lo: 9 }),
                 attempt_id: 1,
             }),
-            provider_id: "iceberg".to_string(),
-            instance_id: "catalog.analytics".to_string(),
-            incarnation: vec![7; 15],
-            declaration_payload: Vec::new(),
-        })
-        .expect_err("short incarnation must be rejected");
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            declaration: None,
+        });
+        assert!(result.is_err());
     }
 }

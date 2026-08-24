@@ -1534,18 +1534,22 @@ pub(crate) mod tests {
     }
 
     impl ConnectorExecutionDistribution for TestControl {
+        fn provider_kind(&self) -> novarocks_spi::connector::ConnectorExecutionProviderKind {
+            novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg
+        }
+
         fn declaration(
             &self,
             _context: &novarocks_spi::connector::ConnectorRequestContext,
         ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-            ConnectorExecutionDeclaration::try_new(
-                ConnectorInstanceDescriptor {
-                    provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
-                    instance_id: self.instance_id.clone(),
-                },
-                self.incarnation,
-                Bytes::from_static(b"binding=default"),
+            ConnectorExecutionDeclaration::iceberg(
+                self.instance_id.as_str(),
+                self.incarnation.to_bytes(),
+                "default",
             )
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+            })
         }
     }
 
@@ -1694,7 +1698,10 @@ pub(crate) mod tests {
             .binding()
             .execution_declaration(&starrocks_context())
             .expect("declaration");
-        assert_eq!(declaration.binding_key().incarnation, first_incarnation);
+        assert_eq!(
+            declaration.binding_key().incarnation(),
+            first_incarnation.to_bytes()
+        );
 
         host.retire_current(&instance)
             .expect("retire first generation");
@@ -1737,7 +1744,10 @@ pub(crate) mod tests {
         host.retire_current(&instance)
             .expect("retire RPC generation");
         assert!(host.acquire_current(&instance).is_err());
-        assert_eq!(lease.binding().incarnation(), key.incarnation);
+        assert_eq!(
+            lease.binding().incarnation(),
+            ConnectorInstanceIncarnation::from_bytes(key.incarnation())
+        );
         drop(lease);
         assert_eq!(host.take_ready_retires().expect("ready retire").len(), 1);
     }

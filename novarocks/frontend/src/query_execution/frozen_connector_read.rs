@@ -167,7 +167,7 @@ fn validate_execution_declaration(
     declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
     expected_owner: &ConnectorExecutionBindingKey,
 ) -> Result<(), ConnectorError> {
-    if declaration.binding_key() != *expected_owner {
+    if ConnectorExecutionBindingKey::from(declaration) != *expected_owner {
         return Err(corrupt(
             "frozen connector execution declaration does not match the exact planning generation",
         ));
@@ -318,9 +318,9 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorControlPlanningLease, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
-        ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorProviderId, ConnectorSplit,
-        ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+        ConnectorControlPlanningLease, ConnectorExecutionDeclaration, ConnectorInstanceId,
+        ConnectorInstanceIncarnation, ConnectorSplit, ConnectorTableIdentity,
+        ConnectorTableRequest, ConnectorTableResolution,
     };
 
     use super::*;
@@ -396,7 +396,10 @@ mod tests {
 
         assert_eq!(read.scan.output_schema().as_ref(), metadata.schema.as_ref());
         assert_eq!(read.splits.len(), 1);
-        assert_eq!(read.declaration.binding_key(), read.scan.owner().clone());
+        assert_eq!(
+            ConnectorExecutionBindingKey::from(&read.declaration),
+            read.scan.owner().clone()
+        );
     }
 
     #[test]
@@ -505,13 +508,10 @@ mod tests {
             instance_id: instance_id.clone(),
             incarnation: ConnectorInstanceIncarnation::from_bytes([3; 16]),
         };
-        let declaration = ConnectorExecutionDeclaration::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("fixture").expect("provider ID"),
-                instance_id,
-            },
-            ConnectorInstanceIncarnation::from_bytes([4; 16]),
-            Bytes::new(),
+        let declaration = ConnectorExecutionDeclaration::iceberg(
+            instance_id.as_str(),
+            [4; 16],
+            "fixture-binding",
         )
         .expect("foreign generation declaration");
         let error = validate_execution_declaration(&declaration, &expected)

@@ -652,15 +652,20 @@ impl ConnectorScanPlanning for FakeProvider {
 }
 
 impl ConnectorExecutionDistribution for FakeProvider {
+    fn provider_kind(&self) -> novarocks_spi::connector::ConnectorExecutionProviderKind {
+        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg
+    }
+
     fn declaration(
         &self,
         _context: &ConnectorRequestContext,
     ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-        ConnectorExecutionDeclaration::try_new(
-            self.descriptor.clone(),
-            self.binding_key.incarnation,
-            Bytes::from_static(b"binding=fake"),
+        ConnectorExecutionDeclaration::iceberg(
+            self.descriptor.instance_id.as_str(),
+            self.binding_key.incarnation.to_bytes(),
+            "fake",
         )
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string()))
     }
 }
 
