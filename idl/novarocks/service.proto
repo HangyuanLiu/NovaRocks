@@ -794,7 +794,7 @@ message HeartbeatRequest {
 // BE heartbeat state returned to the FE poller.
 message HeartbeatResponse {
   uint64 start_epoch = 1;  // BE process start epoch (restart detection)
-  string version = 2;      // BE build version
+  string version = 2;      // Immutable Native build identity for FE/BE admission.
   uint32 num_cores = 3;    // available cores for scheduling
   int32 status_code = 4;   // 0 == healthy
 }

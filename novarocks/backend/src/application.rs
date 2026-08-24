@@ -632,6 +632,7 @@ mod tests {
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
     use novarocks_types::AdvertiseEndpoint;
     use novarocks_types::QueryId;
+    use novarocks_version::native_build_identity;
     use tokio_stream::wrappers::ReceiverStream;
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -880,6 +881,7 @@ mod tests {
             .await
             .expect("bind backend identity")
             .into_inner();
+        assert_eq!(heartbeat.version, native_build_identity());
         let init = live_query_init_request(heartbeat.start_epoch, 901);
         let protocol_init = protocol_init_request(&init);
         client

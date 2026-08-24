@@ -2,9 +2,9 @@
 id: ADR-0047
 title: "Provider-neutral native Connector read carrier"
 domain: [provider-spi, distributed-query-lifecycle]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0103
 date: 2026-08-08
 provenance:
   - "mechanism: exact-generation catalog and read admission; PR number to be backfilled after merge"

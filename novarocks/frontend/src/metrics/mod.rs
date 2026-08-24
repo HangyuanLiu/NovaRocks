@@ -117,6 +117,7 @@ pub fn observe_backend_heartbeat_rtt(duration: Duration) {
 pub(crate) fn publish_backend_topology_metrics(
     registering: usize,
     live: usize,
+    incompatible: usize,
     lost: usize,
     decommissioning: usize,
 ) {
@@ -124,6 +125,7 @@ pub(crate) fn publish_backend_topology_metrics(
     for (state_name, count) in [
         ("registering", registering),
         ("live", live),
+        ("incompatible", incompatible),
         ("lost", lost),
         ("decommissioning", decommissioning),
     ] {
@@ -357,7 +359,7 @@ mod tests {
 
     #[test]
     fn backend_topology_gauges_preserve_the_last_nonzero_frontend_snapshot() {
-        publish_backend_topology_metrics(1, 2, 3, 4);
+        publish_backend_topology_metrics(1, 2, 3, 4, 5);
 
         let first = render_metrics().expect("render first metrics snapshot");
         let second = render_metrics().expect("render second metrics snapshot");
@@ -373,11 +375,15 @@ mod tests {
                 "{body}"
             );
             assert!(
-                body.contains("novarocks_backends{state=\"lost\"} 3"),
+                body.contains("novarocks_backends{state=\"incompatible\"} 3"),
                 "{body}"
             );
             assert!(
-                body.contains("novarocks_backends{state=\"decommissioning\"} 4"),
+                body.contains("novarocks_backends{state=\"lost\"} 4"),
+                "{body}"
+            );
+            assert!(
+                body.contains("novarocks_backends{state=\"decommissioning\"} 5"),
                 "{body}"
             );
         }

@@ -98,7 +98,7 @@ code-anchors:
 - ADR-0029 — distributed rewrite 为何以 frozen groups、C1 cohorts 与 FE aggregate commit 实现单 snapshot（active）
 - ADR-0034 — cluster composite split 与 Backend local scan unit 为何采用冻结、认证、再调度的两级生命周期（active）
 - ADR-0039 — scan unit为何以immutable、bounded的physical domain facts服务后续执行侧（active）
-- ADR-0047 — catalog/read admission 为何以 exact Connector generation 与中立 native carrier 封存（active）
+- ADR-0103 — 中央 Provider wire authority 与同构 Native build admission 为何统一由 Protocol 和 Frontend topology 拥有（active）
 - ADR-0049 — row mutation 的 strategy、identity、route 与 cohort 为何由 Provider 签发并拥有（active）
 - ADR-0051 — distributed write 为何在 preparation 与 planning 之间强制 exact-generation Provider activation（active）
 - ADR-0052 — SHOW CREATE 为何以 exact lease 的有界 table-definition facts 取代 concrete table decode（active）
@@ -123,6 +123,7 @@ code-anchors:
 - ADR-0048 — distributed write为何以 Provider-signed preparation、exact lease 与中立 durable terminal fact 收敛 caller authority（superseded → ADR-0051）
 - ADR-0062 — Copy-on-Write row mutation 的读源为何由 Provider 按 cohort 冻结并以中立 recipe 签发（superseded → ADR-0063）
 - ADR-0060 — MV refresh base pin 为何必须从同一 exact metadata 投影 UUID 与 current snapshot（superseded → ADR-0086）
+- ADR-0047 — catalog/read admission 为何以 exact Connector generation 与中立 native carrier 封存（superseded → ADR-0103）
 
 ### distributed-query-lifecycle
 
@@ -136,7 +137,7 @@ code-anchors:
 - ADR-0011 — 请求执行为何使用 immutable context、一次 topology capture 并拒绝 ambient fallback（active）
 - ADR-0012 — Query session admission 与 router 为何由 frontend 拥有、core 只保留 wire/compiler kernel（active）
 - ADR-0102 — MySQL KILL 为何经 exact generation token 与 protocol-owned connection lifecycle 实现（active）
-- ADR-0047 — catalog/read admission 为何以 exact Connector generation 与中立 native carrier 封存（active）
+- ADR-0103 — 中央 Provider wire authority 与同构 Native build admission 为何统一由 Protocol 和 Frontend topology 拥有（active）
 - ADR-0078 — Runtime Filter terminal observation 为何只作观测，且以 P0/P1/P2 查询终止契约交付（active）
 - ADR-0079 — IDL/proto 为何是 FE/BE 中立 query lifecycle 契约的规范形式、Protocol 如何同时拥有 schema 与已验证值（active）
 - ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
@@ -146,6 +147,7 @@ code-anchors:
 
 - ADR-0010 — 显式 query cancellation surface 为何以 MySQL KILL QUERY 和 frontend session owner 实现（superseded → ADR-0102）
 - ADR-0076 — Runtime Filter terminal observation 为何由 Backend participant 有界聚合、并仅经 typed QLC contribution 出域（superseded → ADR-0078）
+- ADR-0047 — catalog/read admission 为何以 exact Connector generation 与中立 native carrier 封存（superseded → ADR-0103）
 
 ### sql-compiler
 
@@ -196,6 +198,7 @@ frontend 的 `ClusterBackendService` 通过 StateStore 成为唯一 membership a
 seeds，动态 ADD/DROP 的结果跨 FE 重启恢复；单 FE writer 与未来多 FE fencing/takeover 分阶段裁决。
 
 - ADR-0013 — backend membership 为何由 frontend StateStore 单独持久化（active）
+- ADR-0103 — 中央 Provider wire authority 与同构 Native build admission 为何统一由 Protocol 和 Frontend topology 拥有（active）
 
 ### catalog-attachment
 
