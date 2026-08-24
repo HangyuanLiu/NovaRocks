@@ -20,20 +20,21 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
+use novarocks_protocol::provider::ConnectorExecutionBindingProvider;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
-    ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
-    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderId,
-    ConnectorReadExecution, ConnectorRequestContext, ConnectorScanUnitDomainFacts,
-    ConnectorScanUnitFactsMissingReason, ConnectorSplit,
+    ConnectorExecutionProviderKind, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
+    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
+    ConnectorProviderId, ConnectorReadExecution, ConnectorRequestContext,
+    ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsMissingReason, ConnectorSplit,
 };
 
 use crate::STARROCKS_PROVIDER_ID;
 use crate::codec::{encode_schema_ipc, schema_digest};
 use crate::control::{
-    StrategyPayload, decode_declaration, decode_split, direct_outer_facts,
-    split_output_schema_digest, split_strategy, validate_split_generation,
+    StrategyPayload, decode_split, direct_outer_facts, split_output_schema_digest, split_strategy,
+    validate_split_generation,
 };
 use crate::direct::{StarRocksDirectSplit, decode_direct_split};
 use crate::domain::{
@@ -90,6 +91,13 @@ pub struct StarRocksExecutionInstaller {
     bindings: StarRocksExecutionBindings,
 }
 
+/// Validated, credential-free installation facts. Preparing these facts must
+/// not resolve a local client or touch a process-local execution binding.
+struct PreparedStarRocksExecutionBinding {
+    key: ConnectorExecutionBindingKey,
+    local_binding: StarRocksLocalBindingRef,
+}
+
 impl StarRocksExecutionInstaller {
     pub fn new(bindings: StarRocksExecutionBindings) -> Self {
         Self {
@@ -98,9 +106,50 @@ impl StarRocksExecutionInstaller {
             bindings,
         }
     }
+
+    fn prepare(
+        declaration: &ConnectorExecutionDeclaration,
+    ) -> Result<PreparedStarRocksExecutionBinding, ConnectorError> {
+        let local_binding = match declaration.provider() {
+            ConnectorExecutionBindingProvider::StarRocks { local_binding } => local_binding,
+            ConnectorExecutionBindingProvider::Iceberg { .. } => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "StarRocks installer received a declaration for another provider kind",
+                ));
+            }
+        };
+        Ok(PreparedStarRocksExecutionBinding {
+            key: ConnectorExecutionBindingKey::from(declaration),
+            local_binding: StarRocksLocalBindingRef::parse(local_binding)?,
+        })
+    }
+
+    fn activate(
+        &self,
+        prepared: PreparedStarRocksExecutionBinding,
+    ) -> Result<ConnectorExecutionBinding, ConnectorError> {
+        let binding = self
+            .bindings
+            .get(&prepared.local_binding)
+            .ok_or_else(|| unavailable("StarRocks local execution binding is unavailable"))?;
+        ConnectorExecutionBinding::try_new(
+            self.provider_id.clone(),
+            prepared.key.clone(),
+            Arc::new(CompositeReadExecution {
+                key: prepared.key,
+                rpc: binding.rpc.clone(),
+                direct: binding.direct.clone(),
+            }),
+        )
+    }
 }
 
 impl ConnectorExecutionInstaller for StarRocksExecutionInstaller {
+    fn provider_kind(&self) -> ConnectorExecutionProviderKind {
+        ConnectorExecutionProviderKind::StarRocks
+    }
+
     fn provider_id(&self) -> &ConnectorProviderId {
         &self.provider_id
     }
@@ -110,29 +159,9 @@ impl ConnectorExecutionInstaller for StarRocksExecutionInstaller {
         declaration: &ConnectorExecutionDeclaration,
         context: &ConnectorRequestContext,
     ) -> Result<ConnectorExecutionBinding, ConnectorError> {
+        let prepared = Self::prepare(declaration)?;
         ensure_active(context)?;
-        if declaration.descriptor().provider_id != self.provider_id {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "StarRocks installer received a declaration for another provider",
-            ));
-        }
-        let payload = decode_declaration(declaration.payload())?;
-        let local_binding = StarRocksLocalBindingRef::parse(payload.local_binding)?;
-        let binding = self
-            .bindings
-            .get(&local_binding)
-            .ok_or_else(|| unavailable("StarRocks local execution binding is unavailable"))?;
-        let key = declaration.binding_key();
-        ConnectorExecutionBinding::try_new(
-            self.provider_id.clone(),
-            key.clone(),
-            Arc::new(CompositeReadExecution {
-                key,
-                rpc: binding.rpc.clone(),
-                direct: binding.direct.clone(),
-            }),
-        )
+        self.activate(prepared)
     }
 }
 
@@ -612,6 +641,40 @@ mod tests {
                 ConnectorScanUnitFactsMissingReason::NoPinnedStatistics
             )
         ));
+    }
+
+    #[test]
+    fn foreign_typed_declaration_is_rejected_before_local_binding_activation() {
+        let installer = StarRocksExecutionInstaller::new(StarRocksExecutionBindings::new());
+        let declaration = ConnectorExecutionDeclaration::iceberg("catalog", [7; 16], "default")
+            .expect("valid foreign declaration");
+
+        let error = match installer.install(&declaration, &context()) {
+            Ok(_) => panic!("foreign declaration must not activate an empty local binding map"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(error.to_string().contains("another provider kind"));
+    }
+
+    #[test]
+    fn missing_typed_local_binding_is_an_unavailable_activation_failure() {
+        let installer = StarRocksExecutionInstaller::new(StarRocksExecutionBindings::new());
+        let declaration = ConnectorExecutionDeclaration::starrocks("catalog", [7; 16], "missing")
+            .expect("valid StarRocks declaration");
+
+        let error = match installer.install(&declaration, &context()) {
+            Ok(_) => panic!("missing local binding must fail activation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
+        assert!(
+            error
+                .to_string()
+                .contains("local execution binding is unavailable")
+        );
     }
 
     struct Reader {

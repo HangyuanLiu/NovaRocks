@@ -49,6 +49,7 @@ typetag = "0.2"
 url = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 novarocks-fs = { path = "../../fs" }
+novarocks-protocol = { path = "../../protocol" }
 novarocks-spi = { path = "../../spi" }
 novarocks-types = { path = "../../types" }
 

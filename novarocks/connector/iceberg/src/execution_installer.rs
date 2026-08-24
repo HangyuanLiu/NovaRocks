@@ -24,15 +24,15 @@ use std::time::Instant;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
-    ConnectorInstanceId, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
-    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
-    ConnectorProviderId, ConnectorReadExecution, ConnectorRequestContext,
-    ConnectorScanUnitDomainFacts, ConnectorSplit,
+    ConnectorExecutionProviderKind, ConnectorInstanceId, ConnectorOpenReaderRequest,
+    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
+    ConnectorPreparedScanUnitSet, ConnectorProviderId, ConnectorReadExecution,
+    ConnectorRequestContext, ConnectorScanUnitDomainFacts, ConnectorSplit,
 };
 
 use crate::access_binding::IcebergReadBinding;
 use crate::commit::write_execution::IcebergDataWriteExecution;
-use crate::execution_declaration::decode_access_binding;
+use crate::execution_declaration::prepare_iceberg_execution_binding;
 use crate::file_reader::batch_reader::IcebergBatchReader;
 use crate::file_reader::delta_reader::IcebergDeltaBatchReader;
 use crate::file_reader::distributed_rewrite_reader::IcebergRewritePositionBatchReader;
@@ -69,6 +69,10 @@ impl IcebergConnectorInstaller {
 }
 
 impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
+    fn provider_kind(&self) -> ConnectorExecutionProviderKind {
+        ConnectorExecutionProviderKind::Iceberg
+    }
+
     fn provider_id(&self) -> &ConnectorProviderId {
         &self.provider_id
     }
@@ -78,20 +82,14 @@ impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
         declaration: &ConnectorExecutionDeclaration,
         _context: &ConnectorRequestContext,
     ) -> Result<ConnectorExecutionBinding, ConnectorError> {
-        if declaration.descriptor().provider_id != self.provider_id {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg installer received a declaration for another provider",
-            ));
-        }
-        let access_binding = decode_access_binding(declaration)?;
-        if access_binding != self.resources.binding().access_binding() {
+        let prepared = prepare_iceberg_execution_binding(declaration)?;
+        if prepared.access_binding() != self.resources.binding().access_binding() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "Iceberg declaration access binding does not match BE startup binding",
             ));
         }
-        let key = declaration.binding_key();
+        let key = ConnectorExecutionBindingKey::from(declaration);
         ConnectorExecutionBinding::try_new_capabilities(
             self.provider_id.clone(),
             key.clone(),
