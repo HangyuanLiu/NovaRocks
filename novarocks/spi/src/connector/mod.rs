@@ -117,8 +117,7 @@ pub use distributed_rewrite::{
     REWRITE_POSITION_DELETES_KIND,
 };
 pub use distribution::{
-    ConnectorExecutionDeclaration, ConnectorInstanceIncarnation,
-    MAX_CONNECTOR_INSTANCE_DECLARATION_PAYLOAD_BYTES,
+    ConnectorExecutionDeclaration, ConnectorExecutionProviderKind, ConnectorInstanceIncarnation,
 };
 pub use domain_facts::{
     ConnectorAvailableScanUnitDomainFacts, ConnectorScanUnitColumn, ConnectorScanUnitColumnDomain,

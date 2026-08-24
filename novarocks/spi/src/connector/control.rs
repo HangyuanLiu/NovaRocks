@@ -23,7 +23,7 @@ use super::{
     ConnectorCtasStagedPublication, ConnectorCtasStagedPublicationLease, ConnectorDataMutation,
     ConnectorDataMutationResolver, ConnectorDistributedRewrite,
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionProviderKind,
     ConnectorHistoricalCtasStagedPublicationRecovery, ConnectorHistoricalDataMutationRecovery,
     ConnectorHistoricalMaintenanceRecovery, ConnectorHistoricalMaintenanceResolver,
     ConnectorHistoricalWriteRecovery, ConnectorInstanceDescriptor, ConnectorInstanceId,
@@ -54,9 +54,11 @@ pub trait ConnectorScanPlanning: Send + Sync {
     ) -> Result<ConnectorSplitPlanningResult, ConnectorError>;
 }
 
-/// FE-only capability that turns a logical control binding into the bounded,
-/// opaque declaration accepted by a BE execution installer.
+/// FE-only capability that turns a logical control binding into the typed
+/// Protocol declaration accepted by a BE execution installer.
 pub trait ConnectorExecutionDistribution: Send + Sync {
+    fn provider_kind(&self) -> ConnectorExecutionProviderKind;
+
     fn declaration(
         &self,
         context: &ConnectorRequestContext,
@@ -912,8 +914,10 @@ impl ConnectorControlBinding {
         context: &ConnectorRequestContext,
     ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
         let declaration = self.distribution.declaration(context)?;
-        if declaration.descriptor() != &self.descriptor
-            || declaration.incarnation() != self.incarnation
+        let key = ConnectorExecutionBindingKey::from(&declaration);
+        if declaration.provider_kind() != self.distribution.provider_kind()
+            || key.instance_id != self.descriptor.instance_id
+            || key.incarnation != self.incarnation
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,

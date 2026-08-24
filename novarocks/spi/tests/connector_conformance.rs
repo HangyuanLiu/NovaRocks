@@ -569,15 +569,20 @@ struct OwnerDistribution {
 }
 
 impl ConnectorExecutionDistribution for OwnerDistribution {
+    fn provider_kind(&self) -> novarocks_spi::connector::ConnectorExecutionProviderKind {
+        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg
+    }
+
     fn declaration(
         &self,
         _: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-        ConnectorExecutionDeclaration::try_new(
-            self.descriptor.clone(),
-            self.incarnation,
-            bytes::Bytes::new(),
+        ConnectorExecutionDeclaration::iceberg(
+            self.descriptor.instance_id.as_str(),
+            self.incarnation.to_bytes(),
+            "owner-fixture",
         )
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string()))
     }
 }
 

@@ -22,9 +22,10 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
-    ConnectorProviderId, ConnectorRequestContext, ConnectorScanUnitDomainFacts,
-    ConnectorScanUnitFactsSummary, ConnectorSplit, ConnectorWriteExecution,
+    ConnectorExecutionProviderKind, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRequestContext,
+    ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsSummary, ConnectorSplit,
+    ConnectorWriteExecution,
 };
 
 /// A hard bound on the independently schedulable physical leaves carried by
@@ -38,6 +39,17 @@ pub const MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT: usize = 4096;
 pub struct ConnectorExecutionBindingKey {
     pub instance_id: ConnectorInstanceId,
     pub incarnation: ConnectorInstanceIncarnation,
+}
+
+impl From<&ConnectorExecutionDeclaration> for ConnectorExecutionBindingKey {
+    fn from(declaration: &ConnectorExecutionDeclaration) -> Self {
+        let key = declaration.binding_key();
+        Self {
+            instance_id: ConnectorInstanceId::parse(key.instance_id())
+                .expect("Protocol validates canonical execution binding instance IDs"),
+            incarnation: ConnectorInstanceIncarnation::from_bytes(key.incarnation()),
+        }
+    }
 }
 
 /// Provider-private bytes for one leaf of a prepared local scan set.
@@ -506,10 +518,12 @@ impl ConnectorExecutionBinding {
     }
 }
 
-/// Startup-composed provider factory. Implementations use only local process
-/// bindings for credentials and clients; declaration payloads are opaque,
-/// bounded facts from the control plane.
+/// Startup-composed provider factory. Implementations receive a Protocol-
+/// validated, credential-free declaration and use only local process bindings
+/// for credentials and clients.
 pub trait ConnectorExecutionInstaller: Send + Sync {
+    fn provider_kind(&self) -> ConnectorExecutionProviderKind;
+
     fn provider_id(&self) -> &ConnectorProviderId;
 
     fn install(
