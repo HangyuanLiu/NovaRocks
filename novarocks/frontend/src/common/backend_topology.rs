@@ -149,6 +149,7 @@ impl std::error::Error for BackendTopologyValidationError {}
 pub struct BackendTopologyMetricsSnapshot {
     pub registering: usize,
     pub live: usize,
+    pub incompatible: usize,
     pub lost: usize,
     pub decommissioning: usize,
 }
@@ -164,6 +165,7 @@ pub fn publish_backend_topology_metrics(snapshot: BackendTopologyMetricsSnapshot
     crate::metrics::publish_backend_topology_metrics(
         snapshot.registering,
         snapshot.live,
+        snapshot.incompatible,
         snapshot.lost,
         snapshot.decommissioning,
     );

@@ -16,6 +16,7 @@
 // under the License.
 
 //! Frontend-owned durable backend membership and runtime topology.
+// Design: ADR-0103 (docs/adr/ADR-0103-central-provider-wire-and-homogeneous-native-build-admission.md)
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -460,6 +461,12 @@ impl BackendAdmissionFailure {
         Self::BuildIdentityMismatch {
             expected: native_build_identity().to_string(),
             observed: observed.into(),
+        }
+    }
+
+    fn observed_identity(&self) -> &str {
+        match self {
+            Self::BuildIdentityMismatch { observed, .. } => safe_native_build_identity(observed),
         }
     }
 
@@ -1209,7 +1216,7 @@ impl ClusterBackendService {
                 match entry.state {
                     RuntimeBackendState::Registering => metrics.registering += 1,
                     RuntimeBackendState::Live => metrics.live += 1,
-                    RuntimeBackendState::Incompatible => {}
+                    RuntimeBackendState::Incompatible => metrics.incompatible += 1,
                     RuntimeBackendState::Lost => metrics.lost += 1,
                     RuntimeBackendState::Decommissioning => metrics.decommissioning += 1,
                 }
@@ -1432,6 +1439,8 @@ impl BackendTopologyPort for ClusterBackendService {
             "State",
             "ScheduledFragments",
             "StartEpoch",
+            "BuildIdentity",
+            "StatusDetail",
         ];
         let mut columns = vec![Vec::<String>::new(); names.len()];
         for (backend_idx, entry) in self.rows() {
@@ -1441,6 +1450,25 @@ impl BackendTopologyPort for ClusterBackendService {
             columns[3].push(entry.state.as_str().to_string());
             columns[4].push(entry.scheduled_fragments.to_string());
             columns[5].push(entry.start_epoch.to_string());
+            columns[6].push(
+                entry
+                    .admission_failure
+                    .as_ref()
+                    .map(BackendAdmissionFailure::observed_identity)
+                    .unwrap_or_else(|| safe_native_build_identity(&entry.version))
+                    .to_string(),
+            );
+            columns[7].push(
+                entry
+                    .admission_failure
+                    .as_ref()
+                    .map(BackendAdmissionFailure::detail)
+                    .unwrap_or_else(|| {
+                        (entry.state == RuntimeBackendState::Lost)
+                            .then_some("heartbeat unavailable".to_string())
+                            .unwrap_or_default()
+                    }),
+            );
         }
         let arrays = columns
             .into_iter()
@@ -1690,6 +1718,8 @@ mod tests {
                 "State",
                 "ScheduledFragments",
                 "StartEpoch",
+                "BuildIdentity",
+                "StatusDetail",
             ]
         );
     }
