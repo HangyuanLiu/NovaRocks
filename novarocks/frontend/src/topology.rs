@@ -1464,9 +1464,11 @@ impl BackendTopologyPort for ClusterBackendService {
                     .as_ref()
                     .map(BackendAdmissionFailure::detail)
                     .unwrap_or_else(|| {
-                        (entry.state == RuntimeBackendState::Lost)
-                            .then_some("heartbeat unavailable".to_string())
-                            .unwrap_or_default()
+                        if entry.state == RuntimeBackendState::Lost {
+                            "heartbeat unavailable".to_string()
+                        } else {
+                            String::new()
+                        }
                     }),
             );
         }
