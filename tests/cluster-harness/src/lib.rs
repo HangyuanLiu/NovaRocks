@@ -1343,8 +1343,16 @@ fn wait_for_live_backend_topology(
         wait.be_config_paths,
         wait.runtime,
     )?;
+    let build_identities = rows
+        .iter()
+        .map(|row| row.build_identity.as_str())
+        .collect::<BTreeSet<_>>();
+    let status_details = rows
+        .iter()
+        .map(|row| row.status_detail.as_str())
+        .collect::<BTreeSet<_>>();
     println!(
-        "cross-process topology barrier PASS: SHOW BACKENDS {}/{} Live; {}",
+        "cross-process topology barrier PASS: SHOW BACKENDS {}/{} Live; build_identities={build_identities:?}; status_details={status_details:?}; {}",
         rows.len(),
         expected,
         diagnostics
