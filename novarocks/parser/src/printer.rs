@@ -143,6 +143,10 @@ impl Printer {
             }
             SessionStatement::Use(statement) => {
                 self.output.push_str("USE ");
+                if let Some(catalog) = &statement.catalog {
+                    self.write_ident(catalog);
+                    self.output.push('.');
+                }
                 self.write_ident(&statement.database);
             }
             SessionStatement::Kill(statement) => {

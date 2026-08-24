@@ -266,7 +266,7 @@ pub(super) fn expr_display_name(expr: &ast::Expr) -> String {
             format!(
                 "CAST({} AS {})",
                 expr_display_name_with_parens(&cast.expr),
-                format_cast_type(&cast.data_type)
+                format_cast_type_for_expression(&cast.data_type, &cast.expr)
             )
         }
         ast::Expr::Binary(binary) => format!(
@@ -523,8 +523,8 @@ fn format_cast_type(data_type: &ast::TypeName) -> String {
         }
         "tinyint" => "TINYINT".to_string(),
         "smallint" => "SMALLINT".to_string(),
-        "largeint" => "LARGEINT".to_string(),
         "bigint" => "BIGINT".to_string(),
+        "largeint" => "LARGEINT".to_string(),
         "string" => "VARCHAR(65533)".to_string(),
         "binary" | "varbinary" => "VARBINARY".to_string(),
         "int" | "integer" => "INT".to_string(),
@@ -560,6 +560,65 @@ fn format_cast_type(data_type: &ast::TypeName) -> String {
     }
 }
 
+fn format_cast_type_for_expression(data_type: &ast::TypeName, expression: &ast::Expr) -> String {
+    if is_parse_json_call(expression) {
+        format_json_cast_type(data_type)
+    } else {
+        format_cast_type(data_type)
+    }
+}
+
+fn is_parse_json_call(expression: &ast::Expr) -> bool {
+    let ast::Expr::FunctionCall(function) = expression else {
+        return false;
+    };
+    function
+        .name
+        .parts
+        .last()
+        .is_some_and(|part| part.value.eq_ignore_ascii_case("parse_json"))
+}
+
+fn format_json_cast_type(data_type: &ast::TypeName) -> String {
+    let name = data_type
+        .name
+        .parts
+        .last()
+        .map(|part| part.value.to_ascii_lowercase())
+        .unwrap_or_default();
+    match name.as_str() {
+        "array" => format!(
+            "ARRAY<{}>",
+            data_type
+                .arguments
+                .first()
+                .and_then(type_name_argument_as_type)
+                .map(format_json_cast_type)
+                .unwrap_or_default()
+        ),
+        "map" => format!(
+            "MAP<{}>",
+            data_type
+                .arguments
+                .iter()
+                .filter_map(type_name_argument_as_type)
+                .map(format_json_cast_type)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        "struct" => format!(
+            "struct<{}>",
+            data_type
+                .arguments
+                .iter()
+                .map(format_json_struct_type_argument)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => format_cast_type(data_type),
+    }
+}
+
 fn numeric_type_argument(data_type: &ast::TypeName, index: usize) -> Option<u64> {
     match data_type.arguments.get(index) {
         Some(ast::TypeNameArgument::Literal(ast::Literal {
@@ -583,19 +642,27 @@ fn format_struct_type_argument(argument: &ast::TypeNameArgument) -> String {
             format!(
                 "{} {}",
                 field.name.value,
-                format_struct_field_cast_type(&field.data_type)
+                format_cast_type(&field.data_type)
             )
         }
-        ast::TypeNameArgument::Type(data_type) => format_struct_field_cast_type(data_type),
+        ast::TypeNameArgument::Type(data_type) => format_cast_type(data_type),
         ast::TypeNameArgument::Literal(literal) => format_literal_display_name(literal),
     }
 }
 
-/// StarRocks keeps MySQL display widths for scalar types below a STRUCT
-/// field, unlike top-level CAST targets.  This must recurse through nested
-/// collection types so `struct<field array<int>>` does not inherit the
-/// top-level `ARRAY<INT>` spelling.
-fn format_struct_field_cast_type(data_type: &ast::TypeName) -> String {
+fn format_json_struct_type_argument(argument: &ast::TypeNameArgument) -> String {
+    match argument {
+        ast::TypeNameArgument::Field(field) => format!(
+            "{} {}",
+            field.name.value,
+            format_json_struct_field_cast_type(&field.data_type)
+        ),
+        ast::TypeNameArgument::Type(data_type) => format_json_struct_field_cast_type(data_type),
+        ast::TypeNameArgument::Literal(literal) => format_literal_display_name(literal),
+    }
+}
+
+fn format_json_struct_field_cast_type(data_type: &ast::TypeName) -> String {
     let name = data_type
         .name
         .parts
@@ -615,7 +682,7 @@ fn format_struct_field_cast_type(data_type: &ast::TypeName) -> String {
                 .arguments
                 .first()
                 .and_then(type_name_argument_as_type)
-                .map(format_struct_field_cast_type)
+                .map(format_json_struct_field_cast_type)
                 .unwrap_or_default()
         ),
         "map" => format!(
@@ -624,7 +691,7 @@ fn format_struct_field_cast_type(data_type: &ast::TypeName) -> String {
                 .arguments
                 .iter()
                 .filter_map(type_name_argument_as_type)
-                .map(format_struct_field_cast_type)
+                .map(format_json_struct_field_cast_type)
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -633,7 +700,7 @@ fn format_struct_field_cast_type(data_type: &ast::TypeName) -> String {
             data_type
                 .arguments
                 .iter()
-                .map(format_struct_type_argument)
+                .map(format_json_struct_type_argument)
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -781,7 +848,70 @@ fn format_function_display_name(function: &ast::FunctionCall) -> String {
         out.push_str(" OVER ");
         out.push_str(&format_window_display_name(over));
     }
-    out
+    if canonical_name == "typeof" {
+        restore_typeof_cast_spelling(out, function)
+    } else {
+        out
+    }
+}
+
+fn restore_typeof_cast_spelling(display: String, function: &ast::FunctionCall) -> String {
+    struct CastSpelling {
+        canonical: String,
+        display: String,
+    }
+
+    struct Collector {
+        casts: Vec<CastSpelling>,
+    }
+
+    impl ast::Visit for Collector {
+        fn visit_expr(&mut self, expression: &ast::Expr) {
+            if let ast::Expr::Cast(cast) = expression {
+                let source = cast
+                    .data_type
+                    .name
+                    .parts
+                    .last()
+                    .map(|part| part.value.as_str())
+                    .unwrap_or_default();
+                let canonical = format_cast_type(&cast.data_type);
+                let display = match source {
+                    // `typeof` has legacy result-header spellings for these
+                    // narrow integer casts. Keep that compatibility local to
+                    // typeof; ordinary CAST expressions use canonical names.
+                    "tinyint" | "smallint" | "bigint" => source.to_string(),
+                    _ => canonical.clone(),
+                };
+                self.casts.push(CastSpelling { canonical, display });
+            }
+            ast::walk_expr(self, expression);
+        }
+    }
+
+    let mut collector = Collector { casts: Vec::new() };
+    for argument in &function.arguments {
+        ast::Visit::visit_expr(&mut collector, argument);
+    }
+    if collector.casts.is_empty() {
+        return display;
+    }
+
+    let mut restored = String::with_capacity(display.len());
+    let mut remaining = display.as_str();
+    for cast in collector.casts {
+        let needle = format!(" AS {})", cast.canonical);
+        let Some(index) = remaining.find(&needle) else {
+            return display;
+        };
+        restored.push_str(&remaining[..index]);
+        restored.push_str(" AS ");
+        restored.push_str(&cast.display);
+        restored.push(')');
+        remaining = &remaining[index + needle.len()..];
+    }
+    restored.push_str(remaining);
+    restored
 }
 
 fn format_function_arguments(function: &ast::FunctionCall, canonical_name: &str) -> String {
@@ -1213,22 +1343,51 @@ mod tests {
     fn expr_display_name_canonicalizes_top_level_integer_cast_types() {
         let int_expr = parse_select_expr("SELECT CAST(NULL AS INT)");
         let tinyint_expr = parse_select_expr("SELECT CAST(NULL AS TINYINT)");
+        let bigint_expr = parse_select_expr("SELECT CAST(NULL AS bigint)");
 
         assert_eq!(expr_display_name(&int_expr), "CAST(NULL AS INT)");
         assert_eq!(expr_display_name(&tinyint_expr), "CAST(NULL AS TINYINT)");
+        assert_eq!(expr_display_name(&bigint_expr), "CAST(NULL AS BIGINT)");
     }
 
     #[test]
-    fn expr_display_name_preserves_struct_field_integer_widths_recursively() {
-        let expr = parse_select_expr(
+    fn expr_display_name_preserves_legacy_typeof_cast_spelling() {
+        let scalar_expr = parse_select_expr(
+            "SELECT typeof(CAST(1 AS tinyint), CAST(1 AS smallint), CAST(1 AS bigint))",
+        );
+        let nested_expr =
+            parse_select_expr("SELECT typeof(greatest(CAST(100 AS int), CAST(200 AS bigint)))");
+
+        assert_eq!(
+            expr_display_name(&scalar_expr),
+            "typeof(CAST(1 AS tinyint), CAST(1 AS smallint), CAST(1 AS bigint))"
+        );
+        assert_eq!(
+            expr_display_name(&nested_expr),
+            "typeof(greatest(CAST(100 AS INT), CAST(200 AS bigint)))"
+        );
+    }
+
+    #[test]
+    fn expr_display_name_keeps_json_struct_field_widths_but_canonicalizes_other_structs() {
+        let json_expr = parse_select_expr(
             "SELECT CAST(parse_json('[1,2,3]') AS \
+             STRUCT<col1 INT, col2 ARRAY<INT>, col3 STRUCT<nested TINYINT>>)",
+        );
+        let row_expr = parse_select_expr(
+            "SELECT CAST(row(1, 2, 3) AS \
              STRUCT<col1 INT, col2 ARRAY<INT>, col3 STRUCT<nested TINYINT>>)",
         );
 
         assert_eq!(
-            expr_display_name(&expr),
+            expr_display_name(&json_expr),
             "CAST((parse_json('[1,2,3]')) AS struct<col1 int(11), col2 array<int(11)>, \
              col3 struct<nested tinyint(4)>>)"
+        );
+        assert_eq!(
+            expr_display_name(&row_expr),
+            "CAST((row(1, 2, 3)) AS struct<col1 INT, col2 ARRAY<INT>, \
+             col3 struct<nested TINYINT>>)"
         );
     }
 }

@@ -196,6 +196,11 @@ fn parse_variable_target(
 }
 
 fn parse_assignment_value(parser: &mut StatementParser<'_, '_>) -> Result<SetValue, ParseError> {
+    if parser.current_is_word("ON") || parser.current_is_word("OFF") {
+        return parser
+            .parse_contextual_ident()
+            .map(|value| SetValue::Words(vec![SetWord::Ident(value)]));
+    }
     if parenthesized_query_follows(parser) {
         parser.consume_symbol(Symbol::LParen)?;
         let query = query::parse_query(parser)?;
@@ -291,9 +296,15 @@ fn parse_set_word(parser: &mut StatementParser<'_, '_>) -> Result<SetWord, Parse
 
 fn parse_use(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseError> {
     let start = parser.consume_word("USE")?.start();
-    let database = parser.parse_contextual_ident()?;
+    let first = parser.parse_contextual_ident()?;
+    let (catalog, database) = if parser.consume_if_symbol(Symbol::Dot) {
+        (Some(first), parser.parse_contextual_ident()?)
+    } else {
+        (None, first)
+    };
     let end = database.span.end();
     Ok(Statement::Session(SessionStatement::Use(UseStatement {
+        catalog,
         database,
         span: Span::new(start, end),
     })))
@@ -327,7 +338,7 @@ fn parse_kill(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseEr
 mod tests {
     use crate::{
         ast::{
-            KillKind, SessionStatement, SetScope, SetTarget, SetValue, Statement,
+            KillKind, SessionStatement, SetScope, SetTarget, SetValue, SetWord, Statement,
             StatisticsStatement,
         },
         parser,
@@ -387,17 +398,25 @@ mod tests {
     #[test]
     fn parses_set_user_variable_query_use_and_all_kill_forms() {
         let statements = parser::parse(
-            "SET @answer = (SELECT 42); USE analytics; KILL 1; KILL QUERY 2; KILL CONNECTION 3",
+            "SET @answer = (SELECT 42); USE `catalog`.`analytics`; KILL 1; KILL QUERY 2; KILL CONNECTION 3",
         )
         .expect("session statements should parse");
         let Statement::Session(SessionStatement::Set(set)) = &statements[0] else {
             panic!("expected SET statement");
         };
         assert!(matches!(&set.assignments[0].value, SetValue::Query(_)));
-        assert!(matches!(
-            &statements[1],
-            Statement::Session(SessionStatement::Use(_))
-        ));
+        let Statement::Session(SessionStatement::Use(use_statement)) = &statements[1] else {
+            panic!("expected USE statement");
+        };
+        assert_eq!(
+            use_statement
+                .catalog
+                .as_ref()
+                .map(|catalog| catalog.value.as_str()),
+            Some("catalog")
+        );
+        assert_eq!(use_statement.database.value, "analytics");
+        assert_eq!(print_statement(&statements[1]), "USE `catalog`.`analytics`");
         for (statement, kind) in
             statements[2..]
                 .iter()
@@ -421,13 +440,43 @@ mod tests {
 
     #[test]
     fn session_commands_reject_trailing_tokens_with_parser_errors() {
-        for source in ["USE default extra", "KILL QUERY 1 extra", "KILL QUERY '1'"] {
+        for source in [
+            "USE default extra",
+            "USE catalog.database.extra",
+            "KILL QUERY 1 extra",
+            "KILL QUERY '1'",
+        ] {
             let error = parser::parse(source).expect_err("trailing token must fail");
             assert_eq!(
                 error.to_user_error(source).code().as_str(),
                 "sql.parse.unexpected_token"
             );
         }
+    }
+
+    #[test]
+    fn parses_set_boolean_values_without_widening_expression_grammar() {
+        let statements =
+            parser::parse("SET disable_function_fold_constants = on, enable_eliminate_agg = off")
+                .expect("SET boolean assignments should parse");
+        let Statement::Session(SessionStatement::Set(set)) = &statements[0] else {
+            panic!("expected SET statement");
+        };
+        assert!(matches!(
+            set.assignments[0].value,
+            SetValue::Words(ref words)
+                if matches!(words.as_slice(), [SetWord::Ident(value)] if value.value.eq_ignore_ascii_case("on"))
+        ));
+        assert!(matches!(
+            set.assignments[1].value,
+            SetValue::Words(ref words)
+                if matches!(words.as_slice(), [SetWord::Ident(value)] if value.value.eq_ignore_ascii_case("off"))
+        ));
+        assert_eq!(
+            print_statement(&statements[0]),
+            "SET disable_function_fold_constants = on, enable_eliminate_agg = off"
+        );
+        assert!(parser::parse("SELECT on").is_err());
     }
 
     #[test]

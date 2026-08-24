@@ -496,30 +496,6 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
         schema: &'a str,
         writer: InitWriter<'a, W>,
     ) -> io::Result<()> {
-        let source = format!("USE {schema}");
-        let parsed = match novarocks_parser::parse(&source) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                let error = QueryServiceError::from_user_error(error.to_user_error(&source));
-                return writer
-                    .error(mysql_error_kind(&error), error.message().as_bytes())
-                    .await;
-            }
-        };
-        let [
-            novarocks_parser::ast::Statement::Session(
-                novarocks_parser::ast::SessionStatement::Use(statement),
-            ),
-        ] = parsed.as_slice()
-        else {
-            let error = QueryServiceError::new(
-                QueryServiceErrorKind::Parse,
-                "COM_INIT_DB requires one USE statement",
-            );
-            return writer
-                .error(mysql_error_kind(&error), error.message().as_bytes())
-                .await;
-        };
         let session = match self.session() {
             Ok(session) => session,
             Err(error) => {
@@ -528,7 +504,10 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
                     .await;
             }
         };
-        match session.init_database(&statement.database.value).await {
+        match session
+            .init_database(&normalize_init_database_schema(schema))
+            .await
+        {
             Ok(()) => writer.ok().await,
             Err(error) => {
                 writer
@@ -561,6 +540,14 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
             }
         }
     }
+}
+
+fn normalize_init_database_schema(schema: &str) -> String {
+    schema
+        .split('.')
+        .map(|part| part.trim_matches('`'))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn map_query_service_error(kind: QueryServiceErrorKind) -> ErrorKind {
@@ -844,6 +831,18 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    #[test]
+    fn com_init_db_normalizes_quoted_qualified_schema() {
+        assert_eq!(
+            normalize_init_database_schema("`iceberg_cat`.`ssb`"),
+            "iceberg_cat.ssb"
+        );
+        assert_eq!(
+            normalize_init_database_schema("iceberg_cat.ssb"),
+            "iceberg_cat.ssb"
+        );
+    }
 
     mod shutdown_lifecycle {
         use super::*;
