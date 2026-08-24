@@ -19,6 +19,9 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 /// Canonical descriptor-driven projection and digest utilities.
 pub mod canonical;
 
+/// Validated connector execution-binding declaration and result values.
+pub mod provider;
+
 /// Validated neutral values used by the native query lifecycle.
 pub mod lifecycle;
 

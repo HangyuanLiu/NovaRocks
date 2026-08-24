@@ -758,21 +758,61 @@ message FetchResultResponse {
   bool eos = 5;                  // end-of-stream marker
 }
 
-// Coordinator cancellation request for active fragment instances.
-// Control-plane-only declaration. `provider_id` selects a startup-composed
-// installer and never appears in a fragment carrier. `declaration_payload`
-// is provider-owned, bounded, opaque, and credential-free.
+// Control-plane-only typed declaration. The closed provider oneof is the only
+// wire selector; local credentials and runtime capabilities never appear here.
 message EnsureConnectorExecutionBindingRequest {
   QueryExecutionId execution_id = 1;
-  string provider_id = 2;
-  string instance_id = 3;
-  bytes incarnation = 4;          // exactly 16 UUID-v7 bytes
-  bytes declaration_payload = 5;  // <= 64 KiB
+  reserved 2, 3, 4, 5;
+  reserved "provider_id", "instance_id", "incarnation", "declaration_payload";
+  ConnectorExecutionBindingDeclaration declaration = 6;
 }
 
 message EnsureConnectorExecutionBindingResponse {
-  int32 status_code = 1;  // 0 == ensured and query leased
-  string message = 2;
+  reserved 1, 2;
+  reserved "status_code", "message";
+  oneof outcome {
+    EnsureConnectorExecutionBindingEnsured ensured = 3;
+    EnsureConnectorExecutionBindingRejection rejection = 4;
+  }
+}
+
+message ConnectorExecutionBindingDeclaration {
+  string instance_id = 1;
+  bytes incarnation = 2;  // exactly 16 UUID bytes
+  oneof provider {
+    IcebergExecutionBindingDeclaration iceberg = 10;
+    StarRocksExecutionBindingDeclaration starrocks = 11;
+  }
+}
+
+message IcebergExecutionBindingDeclaration {
+  string access_binding = 1;  // non-empty ASCII, <= 256 bytes
+}
+
+message StarRocksExecutionBindingDeclaration {
+  string local_binding = 1;  // non-empty ASCII, <= 256 bytes
+}
+
+message EnsureConnectorExecutionBindingEnsured {}
+
+enum EnsureConnectorExecutionBindingRejectionReason {
+  ENSURE_CONNECTOR_EXECUTION_BINDING_REJECTION_REASON_UNSPECIFIED = 0;
+  ENSURE_CONNECTOR_EXECUTION_BINDING_REJECTION_REASON_INVALID_DECLARATION = 1;
+  ENSURE_CONNECTOR_EXECUTION_BINDING_REJECTION_REASON_CONFLICTING_DECLARATION = 2;
+  ENSURE_CONNECTOR_EXECUTION_BINDING_REJECTION_REASON_QUERY_INCARNATION_CONFLICT = 3;
+  ENSURE_CONNECTOR_EXECUTION_BINDING_REJECTION_REASON_RETIRING = 4;
+  ENSURE_CONNECTOR_EXECUTION_BINDING_REJECTION_REASON_HOST_UNAVAILABLE = 5;
+  ENSURE_CONNECTOR_EXECUTION_BINDING_REJECTION_REASON_ACTIVATION_UNAVAILABLE = 6;
+  ENSURE_CONNECTOR_EXECUTION_BINDING_REJECTION_REASON_DEADLINE_EXCEEDED = 7;
+  ENSURE_CONNECTOR_EXECUTION_BINDING_REJECTION_REASON_RESOURCE_EXHAUSTED = 8;
+  ENSURE_CONNECTOR_EXECUTION_BINDING_REJECTION_REASON_INTERNAL_FAILURE = 9;
+}
+
+message EnsureConnectorExecutionBindingRejection {
+  EnsureConnectorExecutionBindingRejectionReason reason = 1;
+  bool retryable_before_progress = 2;
+  string safe_detail = 3;  // <= 512 bytes, redacted by the producing owner
+  optional string safe_field_path = 4;  // <= 256 bytes when present
 }
 
 message RetireConnectorExecutionBindingRequest {
@@ -781,9 +821,22 @@ message RetireConnectorExecutionBindingRequest {
 }
 
 message RetireConnectorExecutionBindingResponse {
-  int32 status_code = 1;  // 0 == retirement accepted
-  string message = 2;
+  reserved 1, 2;
+  reserved "status_code", "message";
+  oneof outcome {
+    RetireConnectorExecutionBindingAccepted accepted = 3;
+    RetireConnectorExecutionBindingNotFound not_found = 4;
+    RetireConnectorExecutionBindingUnavailable unavailable = 5;
+    RetireConnectorExecutionBindingInvalidKey invalid_key = 6;
+    RetireConnectorExecutionBindingInternal internal = 7;
+  }
 }
+
+message RetireConnectorExecutionBindingAccepted {}
+message RetireConnectorExecutionBindingNotFound {}
+message RetireConnectorExecutionBindingUnavailable {}
+message RetireConnectorExecutionBindingInvalidKey {}
+message RetireConnectorExecutionBindingInternal {}
 
 // FE-pull heartbeat request. Consumer: src/runtime/heartbeat_mgr.rs.
 message HeartbeatRequest {
