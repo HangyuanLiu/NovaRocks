@@ -773,7 +773,6 @@ impl IcebergStagedCreateAdapter {
             },
         }
     }
-
 }
 
 impl ConnectorStagedCreate for IcebergStagedCreateAdapter {

@@ -173,12 +173,6 @@ impl ConnectorControlFactory for IcebergControlFactory {
         } else {
             None
         };
-        // One owner implements both MV control facets: fencing and attempt
-        // discovery share the provider, the stable resource vocabulary, and the
-        // same freshness requirement.
-        let mv_fencing = Arc::new(
-            crate::mv_publication_fencing::IcebergMvPublicationFencing::new(provider.clone()),
-        );
         let binding = ConnectorControlBinding::try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
                 descriptor.clone(),
                 incarnation,
@@ -204,8 +198,6 @@ impl ConnectorControlFactory for IcebergControlFactory {
                     Arc::clone(&unpublished.runtime),
                 )?,
             )))?
-            .try_with_mv_publication_fencing(Some(mv_fencing.clone()))?
-            .try_with_mv_attempt_discovery(Some(mv_fencing))?
             .try_with_view_metadata(Some(provider))?;
         ConnectorControlCreation::try_new(&request, binding, unpublished.durable_properties)
     }
@@ -265,10 +257,7 @@ fn unavailable(error: String) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
     use std::sync::Arc;
-    use std::thread;
 
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::ConnectorInstanceId;
@@ -289,39 +278,6 @@ mod tests {
             timeout_ms: None,
             io_timeout_ms: None,
         }
-    }
-
-    fn config_server(server_properties: serde_json::Value) -> (String, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind config server");
-        let address = listener.local_addr().expect("config server address");
-        let body = serde_json::json!({
-            "defaults": server_properties,
-            "overrides": {},
-        })
-        .to_string();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept config request");
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .expect("config request timeout");
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 1024];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let read = stream.read(&mut chunk).expect("read config request");
-                assert_ne!(read, 0, "config request ended before headers");
-                request.extend_from_slice(&chunk[..read]);
-            }
-            let request = String::from_utf8(request).expect("UTF-8 config request");
-            assert!(request.starts_with("GET /v1/config "));
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .expect("write config response");
-        });
-        (format!("http://{address}"), server)
     }
 
     fn rest_factory_request(
@@ -634,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn rest_factory_does_not_install_retired_fenced_ctas_capabilities() {
+    fn rest_factory_exposes_standard_staged_create() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let binding = crate::access_binding::IcebergReadBinding::new(
             None,
@@ -646,56 +602,21 @@ mod tests {
             binding,
             runtime.handle().clone(),
         ));
-        let (uri, server) = config_server(serde_json::json!({
-            crate::iceberg_catalog_rest::CTAS_FENCED_PUBLICATION_CAPABILITY:
-                crate::iceberg_catalog_rest::CTAS_FENCED_PUBLICATION_VERSION,
-        }));
-
         let creation = factory
-            .create_control(rest_factory_request(&factory, uri, Vec::new()))
-            .expect("advertised REST control");
-        server.join().expect("config server");
+            .create_control(rest_factory_request(
+                &factory,
+                "http://127.0.0.1:1".to_string(),
+                Vec::new(),
+            ))
+            .expect("standard REST control");
         assert!(
             creation.binding().staged_create().is_some(),
-            "standard REST staged create must not depend on a retired private capability"
+            "standard REST staged create must not depend on a private capability"
         );
     }
 
     #[test]
-    fn rest_factory_does_not_trust_user_fenced_ctas_property() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let binding = crate::access_binding::IcebergReadBinding::new(
-            None,
-            FsAccessResolver::new(),
-            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
-        );
-        let factory = IcebergControlFactory::new(IcebergControlResources::new(
-            binding,
-            runtime.handle().clone(),
-        ));
-        let (uri, server) = config_server(serde_json::json!({}));
-        let request = rest_factory_request(
-            &factory,
-            uri,
-            vec![(
-                crate::iceberg_catalog_rest::CTAS_FENCED_PUBLICATION_CAPABILITY.to_string(),
-                crate::iceberg_catalog_rest::CTAS_FENCED_PUBLICATION_VERSION.to_string(),
-            )],
-        );
-
-        let creation = factory
-            .create_control(request)
-            .expect("vanilla REST control");
-        server.join().expect("config server");
-        assert!(
-            creation.binding().staged_create().is_some(),
-            "a user-supplied retired capability property cannot alter the standard path"
-        );
-    }
-
-    #[test]
-    fn hive_factory_never_installs_fenced_ctas_capabilities() {
+    fn hive_factory_does_not_expose_rest_staged_create() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
         let binding = crate::access_binding::IcebergReadBinding::new(

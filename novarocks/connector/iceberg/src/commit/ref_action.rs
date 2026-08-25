@@ -217,6 +217,31 @@ pub enum ExactBranchDropOutcome {
     Abandoned,
 }
 
+fn build_exact_branch_drop_commit(
+    ident: TableIdent,
+    expected_table_uuid: Uuid,
+    name: &str,
+    expected_head_snapshot_id: i64,
+) -> TableCommit {
+    TableCommit::builder()
+        .ident(ident)
+        .updates(vec![TableUpdate::RemoveSnapshotRef {
+            ref_name: name.to_string(),
+        }])
+        .requirements(vec![
+            // The pre-read is only candidate discovery. Keep the incarnation
+            // proof in the destructive commit so DROP/recreate abandons GC.
+            TableRequirement::UuidMatch {
+                uuid: expected_table_uuid,
+            },
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: name.to_string(),
+                snapshot_id: Some(expected_head_snapshot_id),
+            },
+        ])
+        .build()
+}
+
 /// Drop one provider-owned branch only if its table incarnation and observed
 /// head are unchanged. This is intentionally separate from SQL `DROP BRANCH`:
 /// it has no `IF EXISTS` mode and never converts a missing or changed ref into
@@ -248,16 +273,8 @@ pub async fn drop_branch_if_exact(
     {
         return Ok(ExactBranchDropOutcome::Abandoned);
     }
-    let commit = TableCommit::builder()
-        .ident(ident)
-        .updates(vec![TableUpdate::RemoveSnapshotRef {
-            ref_name: name.to_string(),
-        }])
-        .requirements(vec![TableRequirement::RefSnapshotIdMatch {
-            r#ref: name.to_string(),
-            snapshot_id: Some(expected_head_snapshot_id),
-        }])
-        .build();
+    let commit =
+        build_exact_branch_drop_commit(ident, metadata.uuid(), name, expected_head_snapshot_id);
     match catalog.update_table(commit).await {
         Ok(_) => Ok(ExactBranchDropOutcome::Retired),
         // A concurrently moved/deleted ref is a failed compare-and-swap proof,
@@ -460,4 +477,31 @@ pub async fn execute_ref_action(
         .map_err(|e| format!("iceberg ref: commit failed: {e}"))?;
 
     Ok(RefActionOutcome::Committed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_branch_drop_commit_pins_table_incarnation_and_branch_head() {
+        let table_uuid = Uuid::new_v4();
+        let mut commit = build_exact_branch_drop_commit(
+            TableIdent::from_strs(["db", "orders"]).expect("valid table identifier"),
+            table_uuid,
+            "__novarocks_mv_refresh",
+            42,
+        );
+
+        assert_eq!(
+            commit.take_requirements(),
+            vec![
+                TableRequirement::UuidMatch { uuid: table_uuid },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "__novarocks_mv_refresh".to_string(),
+                    snapshot_id: Some(42),
+                },
+            ]
+        );
+    }
 }

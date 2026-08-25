@@ -26,13 +26,12 @@ use super::{
     ConnectorHistoricalMaintenanceRecovery, ConnectorHistoricalMaintenanceResolver,
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
     ConnectorMetadata, ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver,
-    ConnectorMvAttemptDiscovery, ConnectorMvPublicationFencing, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
-    ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsLease,
-    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorUnanchoredCtasCleanup,
-    ConnectorUnanchoredCtasCleanupLease, ConnectorViewMetadata, ConnectorWriteControl,
-    ConnectorWriteLease,
+    ConnectorProviderId, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStagedCreate,
+    ConnectorStagedCreateLease, ConnectorStagedPublicationRecovery, ConnectorStatistics,
+    ConnectorStatisticsLease, ConnectorStatisticsResolver, ConnectorTableHandle,
+    ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease, ConnectorViewMetadata,
+    ConnectorWriteControl, ConnectorWriteLease,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -240,8 +239,6 @@ pub struct ConnectorControlBinding {
     statistics: Option<Arc<dyn ConnectorStatistics>>,
     staged_publication_recovery: Option<Arc<dyn ConnectorStagedPublicationRecovery>>,
     historical_maintenance_recovery: Option<Arc<dyn ConnectorHistoricalMaintenanceRecovery>>,
-    mv_publication_fencing: Option<Arc<dyn ConnectorMvPublicationFencing>>,
-    mv_attempt_discovery: Option<Arc<dyn ConnectorMvAttemptDiscovery>>,
     view_metadata: Option<Arc<dyn ConnectorViewMetadata>>,
 }
 
@@ -428,8 +425,6 @@ impl ConnectorControlBinding {
             statistics,
             staged_publication_recovery: None,
             historical_maintenance_recovery: None,
-            mv_publication_fencing: None,
-            mv_attempt_discovery: None,
             view_metadata: None,
         })
     }
@@ -772,55 +767,6 @@ impl ConnectorControlBinding {
         &self,
     ) -> Option<&Arc<dyn ConnectorHistoricalMaintenanceRecovery>> {
         self.historical_maintenance_recovery.as_ref()
-    }
-
-    /// Installs the provider-owned external MV publication fence.
-    ///
-    /// It is a builder for the same reason staged-publication recovery is: it
-    /// keeps the existing control-binding constructors intact. Establishing a
-    /// fence and publishing under it are control-plane external mutations, so
-    /// this facet deliberately never reaches a BE execution binding.
-    pub fn try_with_mv_publication_fencing(
-        mut self,
-        fencing: Option<Arc<dyn ConnectorMvPublicationFencing>>,
-    ) -> Result<Self, ConnectorError> {
-        if let Some(fencing) = &fencing {
-            super::mv_publication_fencing::validate_mv_publication_fencing_owner(
-                &self.descriptor,
-                self.incarnation,
-                fencing.as_ref(),
-            )?;
-        }
-        self.mv_publication_fencing = fencing;
-        Ok(self)
-    }
-
-    pub fn mv_publication_fencing(&self) -> Option<&Arc<dyn ConnectorMvPublicationFencing>> {
-        self.mv_publication_fencing.as_ref()
-    }
-
-    /// Installs the provider-owned, target-scoped attempt discovery.
-    ///
-    /// It is FE-only for the same reason fencing is: enumerating a target's
-    /// attempts is a recovery/control decision, never something a BE execution
-    /// binding needs.
-    pub fn try_with_mv_attempt_discovery(
-        mut self,
-        discovery: Option<Arc<dyn ConnectorMvAttemptDiscovery>>,
-    ) -> Result<Self, ConnectorError> {
-        if let Some(discovery) = &discovery {
-            super::mv_attempt_discovery::validate_mv_attempt_discovery_owner(
-                &self.descriptor,
-                self.incarnation,
-                discovery.as_ref(),
-            )?;
-        }
-        self.mv_attempt_discovery = discovery;
-        Ok(self)
-    }
-
-    pub fn mv_attempt_discovery(&self) -> Option<&Arc<dyn ConnectorMvAttemptDiscovery>> {
-        self.mv_attempt_discovery.as_ref()
     }
 
     pub fn execution_declaration(

@@ -20,9 +20,8 @@ use arrow::record_batch::RecordBatch;
 
 use super::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorError, ConnectorErrorKind,
-    ConnectorMetadata, ConnectorTableObjectBinding,
-    ConnectorTableObjectBindingFailure, ConnectorTableObjectCaptureRequest,
-    ConnectorTableObjectRebindRequest,
+    ConnectorMetadata, ConnectorTableObjectBinding, ConnectorTableObjectBindingFailure,
+    ConnectorTableObjectCaptureRequest, ConnectorTableObjectRebindRequest,
 };
 
 pub fn assert_batch_reader_contract(
@@ -186,11 +185,11 @@ mod tests {
     use super::*;
     use crate::connector::{
         ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorRequestContext,
-        ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
-        ConnectorTableDefinitionFacts, ConnectorTableHandle, ConnectorTableIdentity,
-        ConnectorTableMetadata, ConnectorTableObjectId, ConnectorTableObjectSelector,
-        ConnectorTablePlanningFacts, ConnectorTableRequest, ConnectorTableResolution,
+        ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
+        ConnectorNamespaceRequest, ConnectorRequestContext, ConnectorTableDefinitionFacts,
+        ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
+        ConnectorTableObjectId, ConnectorTableObjectSelector, ConnectorTablePlanningFacts,
+        ConnectorTableRequest, ConnectorTableResolution,
     };
 
     struct NeverCancelled;

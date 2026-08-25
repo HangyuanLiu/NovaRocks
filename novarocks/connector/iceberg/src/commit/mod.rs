@@ -29,7 +29,6 @@ pub mod equality_delete_writer;
 mod fast_append;
 pub mod frozen_write;
 pub(crate) mod helpers;
-pub mod mv_attempt_scan;
 pub mod mv_provenance;
 pub mod mv_publication_fence;
 pub mod mv_refresh_ref;
@@ -66,27 +65,18 @@ mod write_shared;
 
 pub use abort::{AbortLog, CleanupError};
 pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
-pub use mv_attempt_scan::{
-    AttemptScanPage, ObservedAttemptRef, ScannedAttempt, UnclaimableAttemptRef, UnclaimableReason,
-    is_candidate_attempt_ref, observe_attempt_refs, scan_attempt_page,
-};
 pub use mv_provenance::{
-    MV_PROVENANCE_V1_PROP, MV_PROVENANCE_V2_PROP, MV_PROVENANCE_V2_VERSION, MV_PROVENANCE_VERSION,
-    MV_REFRESH_ROW_COUNT_PROP, MvProvenanceV1, MvProvenanceV2, MvPublicationV2Identity,
+    MV_PROVENANCE_V1_PROP, MV_PROVENANCE_VERSION, MV_REFRESH_ROW_COUNT_PROP, MvProvenanceV1,
     ProvenanceBase, RefreshTechnique, waterline_hash_for,
 };
 pub use mv_publication_fence::{
-    MV_PUBLICATION_FENCE_MARKER_PROP, MV_PUBLICATION_FENCE_REF, MV_PUBLICATION_FENCE_VERSION,
-    MvPublicationError, MvPublicationFenceDecision, MvPublicationFenceMarker,
-    MvPublicationFenceOutcome, MvPublicationFencePlan, MvPublicationOperationStatus, ObservedFence,
-    build_fence_commit, classify_fence_operation, decide_fence_establishment,
-    establish_publication_fence, observe_fence,
+    LegacyMvPublicationFenceObservation, MV_PUBLICATION_FENCE_MARKER_PROP,
+    MV_PUBLICATION_FENCE_REF, MV_PUBLICATION_FENCE_VERSION, MvPublicationFenceMarker,
+    is_legacy_mv_publication_fence_ref, observe_legacy_mv_publication_fence,
 };
 pub use mv_refresh_ref::{
     MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP, MvRefreshPublishOutcome,
-    MvRefreshPublishPlan, MvRefreshPublishV2Plan, MvRefreshSnapshotMarker,
-    ObservedPublicationState, decide_v2_publication, observe_publication_state,
-    publish_staging_branch_to_main, publish_staging_branch_to_main_v2,
+    MvRefreshPublishPlan, MvRefreshSnapshotMarker, publish_staging_branch_to_main,
     snapshot_matches_refresh_marker,
 };
 pub use position_delete_writer::{PositionDeleteGroup, write_position_delete_files};
