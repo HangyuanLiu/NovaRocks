@@ -454,6 +454,7 @@ pub struct NovaRocksConfig {
 }
 
 impl NovaRocksConfig {
+    // Design: ADR-0107 (docs/adr/ADR-0107-static-startup-secret-resolution.md)
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let s = std::fs::read_to_string(path)
             .with_context(|| format!("read config file: {}", path.display()))?;
