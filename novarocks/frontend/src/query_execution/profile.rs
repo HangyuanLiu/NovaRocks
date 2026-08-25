@@ -1111,7 +1111,7 @@ mod tests {
         let execution_id =
             QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
                 .expect("execution id");
-        QueryTerminalSnapshot::seal(novarocks::QueryTerminalSnapshot {
+        QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
             execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(execution_id)),
             backend: Some(novarocks::ParticipantBackendIdentity {
@@ -1171,7 +1171,6 @@ mod tests {
                     ),
                 ),
             }),
-            ..Default::default()
         })
         .expect("terminal snapshot")
     }
@@ -1232,7 +1231,7 @@ mod tests {
 
     #[test]
     fn profile_terminal_builder_ignores_canonical_empty_contribution() {
-        let snapshot = QueryTerminalSnapshot::seal(novarocks::QueryTerminalSnapshot {
+        let snapshot = QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
             execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
                 QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))

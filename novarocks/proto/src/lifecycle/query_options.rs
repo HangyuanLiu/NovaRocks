@@ -1,6 +1,6 @@
 //! Validated wire query options shared by lifecycle participants.
 
-use crate::ProtocolError;
+use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::novarocks;
 
 /// A parsed `novarocks.QueryOptions` contract value.
@@ -34,25 +34,40 @@ fn validate_spill_options(raw: &novarocks::QueryOptions) -> Result<(), ProtocolE
         return Ok(());
     }
 
-    let spill = raw
-        .spill_options
-        .as_ref()
-        .ok_or_else(|| ProtocolError::invalid_value("enable_spill=true requires spill_options"))?;
+    let spill = raw.spill_options.as_ref().ok_or_else(|| {
+        ProtocolError::new(
+            FieldPath::root("query_options").field("spill_options"),
+            ProtocolErrorKind::InvalidValue,
+            "enable_spill=true requires spill_options",
+        )
+    })?;
     match spill.spill_mode {
         0..=2 => {}
         3 => {
-            return Err(ProtocolError::invalid_value(
+            return Err(ProtocolError::new(
+                FieldPath::root("query_options")
+                    .field("spill_options")
+                    .field("spill_mode"),
+                ProtocolErrorKind::InvalidValue,
                 "spill_mode RANDOM is not supported yet",
             ));
         }
         value => {
-            return Err(ProtocolError::invalid_value(format!(
-                "unknown spill_mode value {value}"
-            )));
+            return Err(ProtocolError::new(
+                FieldPath::root("query_options")
+                    .field("spill_options")
+                    .field("spill_mode"),
+                ProtocolErrorKind::InvalidValue,
+                format!("unknown spill_mode value {value}"),
+            ));
         }
     }
     if !spill.spill_mem_limit_threshold.is_finite() {
-        return Err(ProtocolError::invalid_value(
+        return Err(ProtocolError::new(
+            FieldPath::root("query_options")
+                .field("spill_options")
+                .field("spill_mem_limit_threshold"),
+            ProtocolErrorKind::InvalidValue,
             "spill_mem_limit_threshold must be finite",
         ));
     }
@@ -94,6 +109,7 @@ mod tests {
         .expect_err("spill options are required when spilling is enabled");
 
         assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(error.path().to_string(), "query_options.spill_options");
         assert_eq!(error.detail(), "enable_spill=true requires spill_options");
     }
 
@@ -113,6 +129,10 @@ mod tests {
             })
             .expect_err("invalid spill mode");
             assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+            assert_eq!(
+                error.path().to_string(),
+                "query_options.spill_options.spill_mode"
+            );
             assert_eq!(error.detail(), expected);
         }
     }
@@ -130,6 +150,10 @@ mod tests {
         .expect_err("non-finite values cannot enter a canonical contract");
 
         assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(
+            error.path().to_string(),
+            "query_options.spill_options.spill_mem_limit_threshold"
+        );
         assert_eq!(error.detail(), "spill_mem_limit_threshold must be finite");
     }
 

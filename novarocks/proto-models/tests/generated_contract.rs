@@ -103,3 +103,37 @@ fn retired_starrocks_native_scan_wire_fields_fail_closed() {
         .expect("retired range field remains decodable as an unknown field");
     assert!(range.kind.is_none());
 }
+
+#[test]
+fn retired_terminal_self_attestation_fields_remain_reserved() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+
+    for (message_name, field_number) in [
+        ("novarocks.QueryTerminalSnapshot", 5),
+        ("novarocks.TerminalizationProof", 5),
+        ("novarocks.NegativeAttestation", 7),
+    ] {
+        let message = pool
+            .get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("{message_name} descriptor"));
+        assert!(
+            message
+                .reserved_ranges()
+                .any(|range| range.contains(&field_number)),
+            "{message_name} field {field_number} must remain reserved"
+        );
+        assert!(
+            message.reserved_names().any(|name| name == "digest"),
+            "{message_name} digest name must remain reserved"
+        );
+        assert!(
+            message.fields().all(|field| field.number() != field_number),
+            "{message_name} must not reuse retired digest tag {field_number}"
+        );
+        assert!(
+            message.fields().all(|field| field.name() != "digest"),
+            "{message_name} must not reuse retired digest name"
+        );
+    }
+}

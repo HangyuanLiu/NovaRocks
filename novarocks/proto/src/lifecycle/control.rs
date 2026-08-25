@@ -7,7 +7,7 @@
 use super::identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id};
 use super::manifest::{ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest};
 use super::terminal::ParticipantTerminalOutcome;
-use crate::ProtocolError;
+use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, novarocks};
 
 /// The generated enum is the sole init-outcome representation.
@@ -41,7 +41,9 @@ impl QueryInitRequest {
         let manifest = required_manifest(&raw.manifest)?;
         let digest = manifest_digest(&raw.init_digest)?;
         if manifest.digest()? != digest {
-            return Err(ProtocolError::invalid_value(
+            return Err(ProtocolError::new(
+                FieldPath::root("init_query_request").field("init_digest"),
+                ProtocolErrorKind::InvalidValue,
                 "participant manifest digest does not match canonical projection",
             ));
         }
@@ -128,7 +130,8 @@ impl QueryControlAttach {
         required_execution_id(&raw.execution_id, "query execution id is required")?;
         manifest_digest(&raw.init_digest)?;
         if raw.frontend_owner_epoch == 0 {
-            return Err(ProtocolError::invalid_value(
+            return Err(invalid(
+                FieldPath::root("query_control_attach").field("frontend_owner_epoch"),
                 "frontend owner epoch must be nonzero",
             ));
         }
@@ -170,17 +173,24 @@ impl QueryControlCommand {
                 QueryTerminalAck::parse(ack.clone())?;
             }
             Some(Command::Abort(_)) => {
-                return Err(ProtocolError::invalid_value(
+                return Err(invalid(
+                    FieldPath::root("query_control_request")
+                        .field("command")
+                        .field("abort")
+                        .field("reason"),
                     "query control abort reason must not be empty",
                 ));
             }
             Some(Command::Attach(_)) => {
-                return Err(ProtocolError::invalid_value(
+                return Err(ProtocolError::new(
+                    FieldPath::root("query_control_request").field("command"),
+                    ProtocolErrorKind::InvalidValue,
                     "attach is not a query control command",
                 ));
             }
             None => {
-                return Err(ProtocolError::invalid_value(
+                return Err(missing(
+                    FieldPath::root("query_control_request").field("command"),
                     "query control command is required",
                 ));
             }
@@ -220,12 +230,16 @@ impl QueryControlEvent {
                 FragmentLiveObservation::parse(observation.clone())?;
             }
             Some(Event::LocalFailure(_)) => {
-                return Err(ProtocolError::invalid_value(
+                return Err(invalid(
+                    FieldPath::root("query_control_response")
+                        .field("event")
+                        .field("local_failure"),
                     "local failure code and detail must not be empty",
                 ));
             }
             None => {
-                return Err(ProtocolError::invalid_value(
+                return Err(missing(
+                    FieldPath::root("query_control_response").field("event"),
                     "query control event is required",
                 ));
             }
@@ -261,7 +275,8 @@ impl QueryAbortRequest {
         required_execution_id(&raw.execution_id, "query execution id is required")?;
         manifest_digest(&raw.init_digest)?;
         if raw.reason.trim().is_empty() {
-            return Err(ProtocolError::invalid_value(
+            return Err(invalid(
+                FieldPath::root("abort_query_request").field("reason"),
                 "abort reason must not be empty",
             ));
         }
@@ -411,15 +426,20 @@ impl FragmentLiveObservation {
             "fragment observation backend identity is required",
         )?;
         let fragment_id = raw.fragment_instance_id.ok_or_else(|| {
-            ProtocolError::invalid_value("fragment observation instance id is required")
+            missing(
+                FieldPath::root("fragment_live_observation").field("fragment_instance_id"),
+                "fragment observation instance id is required",
+            )
         })?;
         if is_missing_unique_id(fragment_id) {
-            return Err(ProtocolError::invalid_value(
+            return Err(invalid(
+                FieldPath::root("fragment_live_observation").field("fragment_instance_id"),
                 "fragment observation instance id must be nonzero",
             ));
         }
         if raw.sequence == 0 {
-            return Err(ProtocolError::invalid_value(
+            return Err(invalid(
+                FieldPath::root("fragment_live_observation").field("sequence"),
                 "fragment observation sequence must be nonzero",
             ));
         }
@@ -447,7 +467,10 @@ impl FragmentLiveObservation {
 
     pub fn fragment_instance_id(&self) -> Result<common::UniqueId, ProtocolError> {
         self.raw.fragment_instance_id.ok_or_else(|| {
-            ProtocolError::invalid_value("fragment observation instance id is required")
+            missing(
+                FieldPath::root("fragment_live_observation").field("fragment_instance_id"),
+                "fragment observation instance id is required",
+            )
         })
     }
 
@@ -475,9 +498,12 @@ impl FragmentLiveObservation {
 fn required_manifest(
     raw: &Option<novarocks::ParticipantManifest>,
 ) -> Result<ParticipantManifest, ProtocolError> {
-    let raw = raw
-        .clone()
-        .ok_or_else(|| ProtocolError::invalid_value("participant manifest is required"))?;
+    let raw = raw.clone().ok_or_else(|| {
+        missing(
+            FieldPath::root("init_query_request").field("manifest"),
+            "participant manifest is required",
+        )
+    })?;
     ParticipantManifest::parse(raw)
 }
 
@@ -487,7 +513,7 @@ fn required_execution_id(
 ) -> Result<QueryExecutionId, ProtocolError> {
     let raw = raw
         .as_ref()
-        .ok_or_else(|| ProtocolError::invalid_value(missing_detail))?;
+        .ok_or_else(|| missing(FieldPath::root("query_execution_id"), missing_detail))?;
     decode_query_execution_id(raw)
 }
 
@@ -495,9 +521,12 @@ fn required_backend(
     raw: &Option<novarocks::ParticipantBackendIdentity>,
     missing_detail: &'static str,
 ) -> Result<ParticipantBackendIdentity, ProtocolError> {
-    let raw = raw
-        .clone()
-        .ok_or_else(|| ProtocolError::invalid_value(missing_detail))?;
+    let raw = raw.clone().ok_or_else(|| {
+        missing(
+            FieldPath::root("participant_backend_identity"),
+            missing_detail,
+        )
+    })?;
     ParticipantBackendIdentity::parse(raw)
 }
 
@@ -507,7 +536,7 @@ fn manifest_digest(raw: &[u8]) -> Result<ParticipantManifestDigest, ProtocolErro
 
 fn digest_array(raw: &[u8], detail: &'static str) -> Result<[u8; 32], ProtocolError> {
     raw.try_into()
-        .map_err(|_| ProtocolError::invalid_value(detail))
+        .map_err(|_| invalid(FieldPath::root("snapshot_digest"), detail))
 }
 
 fn parse_init_outcome(raw: i32) -> Result<QueryInitOutcome, ProtocolError> {
@@ -521,9 +550,11 @@ fn parse_init_outcome(raw: i32) -> Result<QueryInitOutcome, ProtocolError> {
             | QueryInitOutcome::QueryInitRejectedInvalidManifest
             | QueryInitOutcome::QueryInitRejectedTerminated),
         ) => Ok(outcome),
-        Ok(QueryInitOutcome::Unspecified) | Err(_) => Err(ProtocolError::invalid_value(format!(
-            "unknown query init outcome {raw}"
-        ))),
+        Ok(QueryInitOutcome::Unspecified) | Err(_) => Err(ProtocolError::new(
+            FieldPath::root("init_query_response").field("outcome"),
+            ProtocolErrorKind::InvalidValue,
+            format!("unknown query init outcome {raw}"),
+        )),
     }
 }
 
@@ -537,7 +568,9 @@ fn parse_termination_reason(raw: i32) -> Result<QueryTerminationReason, Protocol
             | QueryTerminationReason::QueryTerminationLocalFailure
             | QueryTerminationReason::QueryTerminationPreStartTimeout),
         ) => Ok(reason),
-        Ok(QueryTerminationReason::Unspecified) | Err(_) => Err(ProtocolError::invalid_value(
+        Ok(QueryTerminationReason::Unspecified) | Err(_) => Err(ProtocolError::new(
+            FieldPath::root("abort_query_response").field("accepted_reason"),
+            ProtocolErrorKind::InvalidValue,
             format!("unknown query termination reason {raw}"),
         )),
     }
@@ -551,10 +584,20 @@ fn parse_terminal_report_outcome(raw: i32) -> Result<QueryTerminalReportOutcome,
             | QueryTerminalReportOutcome::RejectedConflict
             | QueryTerminalReportOutcome::RejectedGone),
         ) => Ok(outcome),
-        Ok(QueryTerminalReportOutcome::Unspecified) | Err(_) => Err(ProtocolError::invalid_value(
+        Ok(QueryTerminalReportOutcome::Unspecified) | Err(_) => Err(ProtocolError::new(
+            FieldPath::root("report_query_terminal_response").field("outcome"),
+            ProtocolErrorKind::InvalidValue,
             format!("unknown query terminal report outcome {raw}"),
         )),
     }
+}
+
+fn invalid(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
+    ProtocolError::new(path, ProtocolErrorKind::InvalidValue, detail)
+}
+
+fn missing(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
+    ProtocolError::new(path, ProtocolErrorKind::InvalidValue, detail)
 }
 
 const fn is_missing_unique_id(id: common::UniqueId) -> bool {

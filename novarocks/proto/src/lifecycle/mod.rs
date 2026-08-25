@@ -32,6 +32,6 @@ pub use stage::{
 pub use terminal::{
     FragmentTerminalOutcome, FragmentTerminalProfileTelemetry, FragmentTerminalSnapshot,
     NegativeAttestation, ParticipantTerminalOutcome, QueryTerminalProfileContributionTelemetry,
-    QueryTerminalProfileContributionV1, QueryTerminalSnapshot, TerminalTelemetryUnavailable,
-    TerminalizationProof,
+    QueryTerminalProfileContributionV1, QueryTerminalSnapshot, TerminalOutcomeContentId,
+    TerminalTelemetryUnavailable, TerminalizationProof,
 };

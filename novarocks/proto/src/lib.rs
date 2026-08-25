@@ -4,9 +4,7 @@
 //! `novarocks-proto-models`. This crate owns the codec and validation layer
 //! derived from those artifacts. Transport, role-local state machines, and
 //! FE/BE execution conversion remain outside this package.
-// Design: ADR-0105 (docs/adr/ADR-0105-wire-authority-and-domain-carrier-separation.md)
-
-// Design: ADR-0098 (docs/adr/ADR-0098-native-protocol-error-contract.md)
+// Design: ADR-0106 (docs/adr/ADR-0106-native-wire-layering-and-terminal-content-identity.md)
 pub mod error;
 pub use error::{FieldPath, FieldPathSegment, ProtocolError, ProtocolErrorKind};
 

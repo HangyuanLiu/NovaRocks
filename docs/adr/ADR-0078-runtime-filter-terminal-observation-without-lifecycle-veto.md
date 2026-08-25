@@ -2,9 +2,9 @@
 id: ADR-0078
 title: "Runtime filter terminal observation has no lifecycle veto"
 domain: [runtime-filter, distributed-query-lifecycle]
-status: active
+status: superseded
 supersedes: [ADR-0076]
-superseded-by: null
+superseded-by: ADR-0106
 date: 2026-08-15
 provenance:
   - "mechanism: terminal proof, negative attestation, and frontend liveness convergence"

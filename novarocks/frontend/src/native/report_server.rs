@@ -913,7 +913,7 @@ mod tests {
             start_epoch: 11,
         })
         .expect("backend identity");
-        let attestation = NegativeAttestation::seal(proto::NegativeAttestation {
+        let attestation = NegativeAttestation::parse(proto::NegativeAttestation {
             execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
                 execution_id,
             )),
@@ -922,7 +922,6 @@ mod tests {
             reason: proto::NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted as i32,
             detail: "test terminal report".to_string(),
             detail_truncated: false,
-            digest: Vec::new(),
         })
         .expect("negative attestation");
         ParticipantTerminalOutcome::parse(proto::ParticipantTerminalOutcome {

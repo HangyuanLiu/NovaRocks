@@ -16,7 +16,7 @@
 // under the License.
 
 //! Frontend-owned durable backend membership and runtime topology.
-// Design: ADR-0105 (docs/adr/ADR-0105-wire-authority-and-domain-carrier-separation.md)
+// Design: ADR-0106 (docs/adr/ADR-0106-native-wire-layering-and-terminal-content-identity.md)
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;

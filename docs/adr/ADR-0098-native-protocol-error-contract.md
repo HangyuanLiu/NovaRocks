@@ -2,9 +2,9 @@
 id: ADR-0098
 title: "Native Protocol Error Contract Ownership"
 domain: [distributed-query-lifecycle, crate-boundary]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0106
 date: 2026-08-18
 provenance:
   - "discussion: 2026-08-18 native role data-plane ownership"

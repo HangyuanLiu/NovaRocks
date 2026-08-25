@@ -39,7 +39,7 @@ use sha2::Digest;
 use super::entry::QueryLifecyclePhase;
 use super::registry::{
     MonotonicClock, QueryLifecycleLocalRuntime, QueryLifecycleMetricsSink, QueryLifecycleRegistry,
-    QueryLifecycleRegistryConfig, StageBuildDecision,
+    QueryLifecycleRegistryConfig, StageBuildDecision, capture_terminal_profile_contribution,
 };
 use super::{
     QueryControlAttachment, QueryLifecycleError, QueryLifecycleErrorCode,
@@ -47,6 +47,7 @@ use super::{
 };
 use crate::rpc::runtime::test_backend_data_runtime;
 use crate::runtime_filter::install_decode::DecodedRuntimeFilterContribution;
+use crate::runtime_filter::observation::RuntimeFilterObservationSnapshot;
 use crate::runtime_filter::participant::{
     BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipantFactory,
 };
@@ -993,7 +994,11 @@ fn terminal_ack_from_outcome(
         )),
         init_digest: outcome.init_digest().as_bytes().to_vec(),
         snapshot_version: 1,
-        snapshot_digest: outcome.digest().to_vec(),
+        snapshot_digest: outcome
+            .content_id()
+            .expect("validated terminal outcome has a content ID")
+            .as_bytes()
+            .to_vec(),
     })
     .expect("terminal outcome forms a valid acknowledgement")
 }
@@ -2218,6 +2223,26 @@ fn injected_p2_faults_keep_terminal_proof_and_publish_typed_unavailability() {
         assert_eq!(unavailable.code, expected_code);
         assert_eq!(registry.metrics_snapshot().terminal_records_frozen, 1);
     }
+}
+
+#[test]
+fn runtime_filter_correctness_evidence_fails_terminal_capture_instead_of_becoming_p2_telemetry() {
+    let error = capture_terminal_profile_contribution(
+        Some(
+            RuntimeFilterObservationSnapshot::correctness_failure_for_test(
+                "test-only sticky observation failure",
+            ),
+        ),
+        true,
+    )
+    .expect_err("sticky Backend observation correctness evidence must fail terminal capture");
+
+    assert_eq!(error.code(), QueryLifecycleErrorCode::InvalidManifest);
+    assert!(
+        error
+            .detail()
+            .contains("runtime-filter observation correctness failure")
+    );
 }
 
 #[test]

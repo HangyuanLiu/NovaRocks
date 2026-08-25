@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use novarocks_types::UniqueId;
 
-use crate::{ProtocolError, canonical};
+use crate::{FieldPath, ProtocolError, ProtocolErrorKind, canonical};
 use novarocks_proto_models::{novarocks, plan};
 
 use super::{
@@ -34,9 +34,11 @@ impl StageDigestVersion {
     pub fn try_from_wire(value: u32) -> Result<Self, ProtocolError> {
         match value {
             1 => Ok(Self::V1),
-            _ => Err(ProtocolError::version_mismatch(format!(
-                "unsupported stage digest version {value}"
-            ))),
+            _ => Err(ProtocolError::new(
+                FieldPath::root("stage_digest_version"),
+                ProtocolErrorKind::VersionMismatch,
+                format!("unsupported stage digest version {value}"),
+            )),
         }
     }
 }
@@ -51,9 +53,13 @@ impl StageDigest {
     }
 
     pub fn try_from_slice(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| ProtocolError::invalid_value("stage digest must be 32 bytes"))?;
+        let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+            ProtocolError::new(
+                FieldPath::root("stage_digest"),
+                ProtocolErrorKind::InvalidValue,
+                "stage digest must be 32 bytes",
+            )
+        })?;
         Ok(Self(bytes))
     }
 
@@ -74,7 +80,9 @@ impl StageDigest {
         ordered.sort_by_key(|fragment| fragment.fragment_instance_id());
         for pair in ordered.windows(2) {
             if pair[0].fragment_instance_id() == pair[1].fragment_instance_id() {
-                return Err(ProtocolError::invalid_value(
+                return Err(ProtocolError::new(
+                    FieldPath::root("stage_fragments"),
+                    ProtocolErrorKind::InvalidValue,
                     "stage digest requires unique fragment instance ids",
                 ));
             }
@@ -112,9 +120,11 @@ fn hash_stage_message<M: Message>(
     message: &M,
 ) -> Result<(), ProtocolError> {
     canonical::hash_message(hasher, message_name, message).map_err(|error| {
-        ProtocolError::invalid_value(format!(
-            "cannot canonicalize {message_name} for Stage digest: {error}"
-        ))
+        ProtocolError::new(
+            FieldPath::root("stage_fragments"),
+            ProtocolErrorKind::InvalidValue,
+            format!("cannot canonicalize {message_name} for Stage digest: {error}"),
+        )
     })
 }
 
@@ -138,10 +148,16 @@ impl StageFragment {
 
     pub fn parse(wire: novarocks::StageFragment) -> Result<Self, ProtocolError> {
         let instance_params = wire.instance_params.as_ref().ok_or_else(|| {
-            ProtocolError::invalid_value("stage fragment instance params are required")
+            ProtocolError::new(
+                FieldPath::root("stage_fragment").field("instance_params"),
+                ProtocolErrorKind::InvalidValue,
+                "stage fragment instance params are required",
+            )
         })?;
         if wire.plan.is_none() {
-            return Err(ProtocolError::invalid_value(
+            return Err(ProtocolError::new(
+                FieldPath::root("stage_fragment").field("plan"),
+                ProtocolErrorKind::InvalidValue,
                 "stage fragment plan is required",
             ));
         }
@@ -209,15 +225,23 @@ impl QueryStageRequest {
 
     pub fn parse(wire: novarocks::StageFragmentsRequest) -> Result<Self, ProtocolError> {
         if wire.fragments.len() > DEFAULT_STAGE_MAX_FRAGMENTS {
-            return Err(ProtocolError::capacity(format!(
-                "stage request contains {} fragments; limit is {DEFAULT_STAGE_MAX_FRAGMENTS}",
-                wire.fragments.len()
-            )));
+            return Err(ProtocolError::new(
+                FieldPath::root("stage_fragments_request").field("fragments"),
+                ProtocolErrorKind::Capacity,
+                format!(
+                    "stage request contains {} fragments; limit is {DEFAULT_STAGE_MAX_FRAGMENTS}",
+                    wire.fragments.len()
+                ),
+            ));
         }
         if wire.encoded_len() > DEFAULT_STAGE_MAX_ENCODED_BYTES {
-            return Err(ProtocolError::capacity(format!(
-                "stage request encoded bytes exceed {DEFAULT_STAGE_MAX_ENCODED_BYTES} byte limit"
-            )));
+            return Err(ProtocolError::new(
+                FieldPath::root("stage_fragments_request"),
+                ProtocolErrorKind::Capacity,
+                format!(
+                    "stage request encoded bytes exceed {DEFAULT_STAGE_MAX_ENCODED_BYTES} byte limit"
+                ),
+            ));
         }
 
         let execution_id = required_execution_id(wire.execution_id.as_ref())?;
@@ -236,7 +260,9 @@ impl QueryStageRequest {
         // versioned without leaving an unchecked fallback for future values.
         let recomputed = StageDigest::compute_v1(execution_id, init_digest, &fragments)?;
         if recomputed != digest {
-            return Err(ProtocolError::digest_mismatch(
+            return Err(ProtocolError::new(
+                FieldPath::root("stage_fragments_request").field("stage_digest"),
+                ProtocolErrorKind::DigestMismatch,
                 "stage digest does not match decoded stage fragment batch",
             ));
         }
@@ -502,8 +528,13 @@ impl QueryStartAck {
 fn required_execution_id(
     execution_id: Option<&novarocks::QueryExecutionId>,
 ) -> Result<QueryExecutionId, ProtocolError> {
-    let execution_id = execution_id
-        .ok_or_else(|| ProtocolError::invalid_value("query execution id is required"))?;
+    let execution_id = execution_id.ok_or_else(|| {
+        ProtocolError::new(
+            FieldPath::root("query_execution_id"),
+            ProtocolErrorKind::InvalidValue,
+            "query execution id is required",
+        )
+    })?;
     decode_query_execution_id(execution_id)
 }
 
@@ -514,12 +545,20 @@ fn fragment_instance_id(
         .fragment_instance_id
         .as_ref()
         .ok_or_else(|| {
-            ProtocolError::invalid_value(
+            ProtocolError::new(
+                FieldPath::root("stage_fragment")
+                    .field("instance_params")
+                    .field("fragment_instance_id"),
+                ProtocolErrorKind::InvalidValue,
                 "stage fragment instance params require fragment instance id",
             )
         })?;
     if fragment_instance_id.hi == 0 && fragment_instance_id.lo == 0 {
-        return Err(ProtocolError::invalid_value(
+        return Err(ProtocolError::new(
+            FieldPath::root("stage_fragment")
+                .field("instance_params")
+                .field("fragment_instance_id"),
+            ProtocolErrorKind::InvalidValue,
             "stage fragment instance id must be nonzero",
         ));
     }
@@ -536,7 +575,9 @@ fn validate_stage_fragment_ids(fragments: &[StageFragment]) -> Result<(), Protoc
         .collect::<Vec<_>>();
     instance_ids.sort_unstable();
     if instance_ids.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(ProtocolError::invalid_value(
+        return Err(ProtocolError::new(
+            FieldPath::root("stage_fragments_request").field("fragments"),
+            ProtocolErrorKind::InvalidValue,
             "stage fragment instance ids must be unique",
         ));
     }
@@ -577,9 +618,11 @@ fn decode_stage_outcome(value: i32) -> Result<QueryStageOutcome, ProtocolError> 
         Some(Wire::StageFragmentsRejectedLocalFailure) => {
             Ok(QueryStageOutcome::RejectedLocalFailure)
         }
-        Some(Wire::Unspecified) | None => Err(ProtocolError::invalid_value(format!(
-            "unknown stage fragments outcome {value}"
-        ))),
+        Some(Wire::Unspecified) | None => Err(ProtocolError::new(
+            FieldPath::root("stage_fragments_response").field("outcome"),
+            ProtocolErrorKind::InvalidValue,
+            format!("unknown stage fragments outcome {value}"),
+        )),
     }
 }
 
@@ -607,9 +650,11 @@ fn decode_start_outcome(value: i32) -> Result<QueryStartOutcome, ProtocolError> 
         Some(Wire::StartPreparedQueryRejectedTerminated) => {
             Ok(QueryStartOutcome::RejectedTerminated)
         }
-        Some(Wire::Unspecified) | None => Err(ProtocolError::invalid_value(format!(
-            "unknown start prepared query outcome {value}"
-        ))),
+        Some(Wire::Unspecified) | None => Err(ProtocolError::new(
+            FieldPath::root("start_prepared_query_response").field("outcome"),
+            ProtocolErrorKind::InvalidValue,
+            format!("unknown start prepared query outcome {value}"),
+        )),
     }
 }
 
@@ -715,6 +760,11 @@ mod tests {
         };
         let error = QueryStageRequest::parse(raw).expect_err("duplicate ids cannot be staged");
         assert_eq!(error.detail(), "stage fragment instance ids must be unique");
+        assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(
+            error.path().to_string(),
+            "stage_fragments_request.fragments"
+        );
         assert!(StageDigestVersion::try_from_wire(2).is_err());
     }
 

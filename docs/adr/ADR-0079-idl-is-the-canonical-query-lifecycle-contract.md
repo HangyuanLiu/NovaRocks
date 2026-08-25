@@ -2,9 +2,9 @@
 id: ADR-0079
 title: "IDL is the canonical FE/BE query lifecycle contract"
 domain: [distributed-query-lifecycle, crate-boundary]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0106
 date: 2026-08-16
 provenance:
   - "discussion: 2026-08-15 native query lifecycle canonical contract and Protocol ownership"

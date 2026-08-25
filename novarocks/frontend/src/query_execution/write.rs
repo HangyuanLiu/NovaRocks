@@ -966,7 +966,7 @@ mod tests {
     fn terminal_snapshot_with_p2(
         profile_contribution: novarocks::QueryTerminalProfileContributionTelemetry,
     ) -> QueryTerminalSnapshot {
-        QueryTerminalSnapshot::seal(novarocks::QueryTerminalSnapshot {
+        QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
             execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
                 execution_id(),
@@ -982,7 +982,6 @@ mod tests {
             init_digest: vec![9; 32],
             fragments: vec![writer_terminal_fragment()],
             profile_contribution: Some(profile_contribution),
-            ..Default::default()
         })
         .expect("terminal snapshot")
     }

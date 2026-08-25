@@ -497,7 +497,8 @@ message QueryTerminalSnapshot {
   QueryExecutionId execution_id = 2;
   ParticipantBackendIdentity backend = 3;
   bytes init_digest = 4;
-  bytes digest = 5;
+  reserved 5;
+  reserved "digest";
   repeated QueryTerminalFragmentSnapshot fragments = 6;
   QueryTerminalProfileContributionTelemetry profile_contribution = 7;
 }
@@ -518,7 +519,8 @@ message TerminalizationProof {
   QueryExecutionId execution_id = 2;
   ParticipantBackendIdentity backend = 3;
   bytes init_digest = 4;
-  bytes digest = 5;
+  reserved 5;
+  reserved "digest";
   repeated TerminalizationProofFragment fragments = 6;
 }
 
@@ -538,7 +540,8 @@ message NegativeAttestation {
   NegativeAttestationReason reason = 4;
   string detail = 5;
   bool detail_truncated = 6;
-  bytes digest = 7;
+  reserved 7;
+  reserved "digest";
 }
 
 message ParticipantTerminalOutcome {

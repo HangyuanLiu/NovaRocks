@@ -30,7 +30,7 @@ use crate::query_execution::terminal_set::QueryTerminalSet;
 use novarocks_proto::lifecycle::{
     FragmentLiveObservation, ParticipantManifestDigest, ParticipantTerminalOutcome,
     QueryAbortRequest, QueryControlCommand, QueryControlEvent, QueryExecutionId, QueryTerminalAck,
-    QueryTerminationReason,
+    QueryTerminationReason, TerminalOutcomeContentId,
 };
 
 use super::barrier::FrontendQueryLifecycleConfig;
@@ -138,9 +138,18 @@ struct TerminalState {
     backend_stream_closed: BTreeSet<usize>,
     locally_drained: BTreeSet<usize>,
     termination_accepted: BTreeMap<usize, QueryTerminationReason>,
-    outcomes: BTreeMap<usize, ParticipantTerminalOutcome>,
+    outcomes: BTreeMap<usize, RetainedTerminalOutcome>,
     reader_failure: Option<String>,
     stop_readers: bool,
+}
+
+/// FE-local retained terminal payload. The content ID is computed exactly when
+/// the immutable outcome is admitted, then reused for idempotency, conflict
+/// checks, and the delivery acknowledgement.
+#[derive(Clone)]
+struct RetainedTerminalOutcome {
+    outcome: ParticipantTerminalOutcome,
+    content_id: TerminalOutcomeContentId,
 }
 
 /// Bounded, best-effort live state received on the participant's control
@@ -181,8 +190,20 @@ pub(super) struct FragmentObservationSnapshot {
 /// first one contributes to the terminal set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TerminalOutcomeStoreOutcome {
-    Accepted,
-    AlreadyAccepted,
+    Accepted(TerminalOutcomeContentId),
+    AlreadyAccepted(TerminalOutcomeContentId),
+}
+
+impl TerminalOutcomeStoreOutcome {
+    pub(crate) const fn content_id(self) -> TerminalOutcomeContentId {
+        match self {
+            Self::Accepted(content_id) | Self::AlreadyAccepted(content_id) => content_id,
+        }
+    }
+
+    const fn is_accepted(self) -> bool {
+        matches!(self, Self::Accepted(_))
+    }
 }
 
 impl ActiveSession {
@@ -287,8 +308,8 @@ impl FrontendLifecycleMetrics {
 
     pub fn terminal_snapshot_stored(&self, outcome: TerminalOutcomeStoreOutcome) {
         self.update(|snapshot| match outcome {
-            TerminalOutcomeStoreOutcome::Accepted => snapshot.terminal_snapshots_accepted += 1,
-            TerminalOutcomeStoreOutcome::AlreadyAccepted => {
+            TerminalOutcomeStoreOutcome::Accepted(_) => snapshot.terminal_snapshots_accepted += 1,
+            TerminalOutcomeStoreOutcome::AlreadyAccepted(_) => {
                 snapshot.terminal_snapshots_idempotent += 1
             }
         });
@@ -699,8 +720,8 @@ impl AttemptControl {
             )));
         }
         let store_outcome = match terminal.outcomes.get(&backend_idx) {
-            Some(existing) if existing.digest() == outcome.digest() => {
-                TerminalOutcomeStoreOutcome::AlreadyAccepted
+            Some(existing) if existing.outcome == outcome => {
+                TerminalOutcomeStoreOutcome::AlreadyAccepted(existing.content_id)
             }
             Some(_) => {
                 drop(terminal);
@@ -710,12 +731,23 @@ impl AttemptControl {
                 ));
             }
             None => {
-                terminal.outcomes.insert(backend_idx, outcome);
-                TerminalOutcomeStoreOutcome::Accepted
+                let content_id = outcome.content_id().map_err(|error| {
+                    contract_violation(format!(
+                        "cannot compute participant terminal outcome content id: {error}"
+                    ))
+                })?;
+                terminal.outcomes.insert(
+                    backend_idx,
+                    RetainedTerminalOutcome {
+                        outcome,
+                        content_id,
+                    },
+                );
+                TerminalOutcomeStoreOutcome::Accepted(content_id)
             }
         };
         drop(terminal);
-        if store_outcome == TerminalOutcomeStoreOutcome::Accepted {
+        if store_outcome.is_accepted() {
             super::barrier::record_lifecycle_phase_marker_for_execution(
                 "terminal-retained",
                 marker_execution_id(self.execution_id)?,
@@ -738,9 +770,15 @@ impl AttemptControl {
                 "injected query terminal conflict changed the participant identity",
             ));
         }
-        if outcome.digest() == conflict.digest() {
+        let content_id = outcome
+            .content_id()
+            .map_err(|error| contract_violation(error.to_string()))?;
+        let conflict_content_id = conflict
+            .content_id()
+            .map_err(|error| contract_violation(error.to_string()))?;
+        if content_id == conflict_content_id {
             return Err(contract_violation(
-                "injected query terminal conflict did not change the outcome digest",
+                "injected query terminal conflict did not change the outcome content id",
             ));
         }
         let mut terminal = self.terminal.0.lock().expect("query terminal store");
@@ -752,13 +790,19 @@ impl AttemptControl {
         // Store the primary immutable value and the conflicting value while
         // holding the same lock.  No finalizer can observe an apparently
         // complete terminal set between the two admissions.
-        terminal.outcomes.insert(backend_idx, outcome);
+        terminal.outcomes.insert(
+            backend_idx,
+            RetainedTerminalOutcome {
+                outcome,
+                content_id,
+            },
+        );
         let reason = "query terminal outcome conflicts with an already stored participant outcome";
         terminal.reader_failure = Some(reason.to_string());
         drop(terminal);
         self.terminal.1.notify_all();
         self.metrics
-            .terminal_snapshot_stored(TerminalOutcomeStoreOutcome::Accepted);
+            .terminal_snapshot_stored(TerminalOutcomeStoreOutcome::Accepted(content_id));
         self.metrics.terminal_snapshot_conflict();
         Err(contract_violation(reason))
     }
@@ -775,11 +819,12 @@ impl AttemptControl {
         let snapshots = terminal
             .outcomes
             .values()
-            .map(|outcome| match outcome.snapshot() {
+            .map(|retained| match retained.outcome.snapshot() {
                 Some(snapshot) => Ok(snapshot),
                 None => Err(failed(format!(
                     "query lifecycle participant returned negative attestation: {:?}",
-                    outcome
+                    retained
+                        .outcome
                         .negative_attestation()
                         .expect("validated terminal outcome is proof or attestation")
                         .reason()
@@ -798,7 +843,7 @@ impl AttemptControl {
             .expect("query terminal store")
             .outcomes
             .values()
-            .cloned()
+            .map(|retained| retained.outcome.clone())
             .collect()
     }
 
@@ -1165,11 +1210,12 @@ impl AttemptControl {
             let snapshots = terminal
                 .outcomes
                 .values()
-                .map(|outcome| match outcome.snapshot() {
+                .map(|retained| match retained.outcome.snapshot() {
                     Some(snapshot) => Ok(snapshot),
                     None => Err(TerminalConvergenceFailure::BackendAttestation(format!(
                         "query lifecycle participant returned negative attestation: {:?}",
-                        outcome
+                        retained
+                            .outcome
                             .negative_attestation()
                             .expect("validated terminal outcome is proof or attestation")
                             .reason()
@@ -1522,7 +1568,7 @@ fn control_event_reader(control: Weak<AttemptControl>, session: ActiveSession) {
 }
 
 impl AttemptControl {
-    fn handle_control_event(
+    pub(super) fn handle_control_event(
         &self,
         session: &ActiveSession,
         event: QueryControlEvent,
@@ -1601,14 +1647,15 @@ impl AttemptControl {
                         .store_terminal_outcome_conflict(outcome, conflict)
                         .map_err(|error| error.to_string());
                 }
-                self.store_terminal_outcome(outcome.clone())
+                let stored = self
+                    .store_terminal_outcome(outcome.clone())
                     .map_err(|error| error.to_string())?;
                 if claim_terminal_ack_drop(session, &outcome)? {
                     return Ok(());
                 }
                 session
                     .session
-                    .send(terminal_ack_command(&outcome)?)
+                    .send(terminal_ack_command(&outcome, stored.content_id())?)
                     .map_err(|error| {
                         format!(
                             "query lifecycle terminal ACK failed for backend {}: {error}",
@@ -1763,7 +1810,7 @@ fn claim_terminal_snapshot_conflict(
 fn conflicting_terminal_outcome(
     outcome: &ParticipantTerminalOutcome,
 ) -> Result<ParticipantTerminalOutcome, String> {
-    let attestation = novarocks_proto::lifecycle::NegativeAttestation::seal(
+    let attestation = novarocks_proto::lifecycle::NegativeAttestation::parse(
         novarocks_proto_models::novarocks::NegativeAttestation {
             execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
                 outcome.execution_id(),
@@ -1775,7 +1822,6 @@ fn conflicting_terminal_outcome(
                     as i32,
             detail: "same participant produced a conflicting terminal outcome".to_string(),
             detail_truncated: false,
-            digest: Vec::new(),
         },
     )
     .map_err(|error| error.to_string())?;
@@ -1822,7 +1868,7 @@ impl ActiveQueryAttemptControl for AttemptControl {
         outcome: ParticipantTerminalOutcome,
     ) -> Result<bool, DistributedQueryError> {
         self.store_terminal_outcome(outcome)
-            .map(|outcome| outcome == TerminalOutcomeStoreOutcome::Accepted)
+            .map(|outcome| outcome.is_accepted())
     }
 
     fn retain_terminal_ingress(&self) -> bool {
@@ -1837,7 +1883,7 @@ impl ActiveQueryAttemptControl for AttemptControl {
             .expect("query terminal state")
             .outcomes
             .values()
-            .cloned()
+            .map(|retained| retained.outcome.clone())
             .collect::<Vec<_>>();
         let decision = self
             .terminal_decision
@@ -2102,17 +2148,20 @@ fn control_command(
 
 fn terminal_ack_command(
     outcome: &ParticipantTerminalOutcome,
+    content_id: TerminalOutcomeContentId,
 ) -> Result<QueryControlCommand, String> {
     let snapshot = outcome.snapshot().ok_or_else(|| {
         "negative terminal attestation cannot be acknowledged as a snapshot".to_string()
     })?;
+    // `snapshot_digest` is the established ACK/release field name. Its value
+    // is the immutable terminal outcome content ID retained at FE admission.
     let ack = QueryTerminalAck::parse(novarocks_proto_models::novarocks::QueryControlTerminalAck {
         execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
             outcome.execution_id(),
         )),
         init_digest: outcome.init_digest().as_bytes().to_vec(),
         snapshot_version: snapshot.version(),
-        snapshot_digest: outcome.digest().to_vec(),
+        snapshot_digest: content_id.as_bytes().to_vec(),
     })
     .map_err(|error| error.to_string())?;
     control_command(

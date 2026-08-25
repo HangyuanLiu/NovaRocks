@@ -893,7 +893,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let snapshot = QueryTerminalSnapshot::seal(proto::QueryTerminalSnapshot {
+        let snapshot = QueryTerminalSnapshot::parse(proto::QueryTerminalSnapshot {
             version: 1,
             execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
                 execution_id,
@@ -911,10 +911,9 @@ mod tests {
                     ),
                 ),
             }),
-            ..Default::default()
         })
         .expect("terminal snapshot");
-        let proof = TerminalizationProof::seal(proto::TerminalizationProof {
+        let proof = TerminalizationProof::parse(proto::TerminalizationProof {
             version: 1,
             execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
                 execution_id,
@@ -927,7 +926,6 @@ mod tests {
                 outcome: proto::QueryTerminalFragmentOutcome::Succeeded as i32,
                 ..Default::default()
             }],
-            ..Default::default()
         })
         .expect("terminal proof");
         ParticipantTerminalOutcome::parse(proto::ParticipantTerminalOutcome {

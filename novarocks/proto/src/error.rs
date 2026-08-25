@@ -33,19 +33,22 @@ impl FieldPath {
         Self(vec![FieldPathSegment::Field(name)])
     }
 
-    pub fn field(mut self, name: &'static str) -> Self {
-        self.0.push(FieldPathSegment::Field(name));
-        self
+    pub fn field(&self, name: &'static str) -> Self {
+        let mut path = self.clone();
+        path.0.push(FieldPathSegment::Field(name));
+        path
     }
 
-    pub fn index(mut self, index: usize) -> Self {
-        self.0.push(FieldPathSegment::Index(index));
-        self
+    pub fn index(&self, index: usize) -> Self {
+        let mut path = self.clone();
+        path.0.push(FieldPathSegment::Index(index));
+        path
     }
 
-    pub fn map_key(mut self, key: impl Into<String>) -> Self {
-        self.0.push(FieldPathSegment::MapKey(key.into()));
-        self
+    pub fn map_key(&self, key: impl Into<String>) -> Self {
+        let mut path = self.clone();
+        path.0.push(FieldPathSegment::MapKey(key.into()));
+        path
     }
 
     pub fn segments(&self) -> &[FieldPathSegment] {
@@ -131,46 +134,6 @@ impl ProtocolError {
 
     pub fn detail(&self) -> &str {
         &self.detail
-    }
-
-    pub(crate) fn invalid_value(detail: impl Into<String>) -> Self {
-        Self::new(
-            FieldPath::root("native_query_lifecycle"),
-            ProtocolErrorKind::InvalidValue,
-            detail,
-        )
-    }
-
-    pub(crate) fn conflict(detail: impl Into<String>) -> Self {
-        Self::new(
-            FieldPath::root("native_query_lifecycle"),
-            ProtocolErrorKind::Conflict,
-            detail,
-        )
-    }
-
-    pub(crate) fn capacity(detail: impl Into<String>) -> Self {
-        Self::new(
-            FieldPath::root("native_query_lifecycle"),
-            ProtocolErrorKind::Capacity,
-            detail,
-        )
-    }
-
-    pub(crate) fn version_mismatch(detail: impl Into<String>) -> Self {
-        Self::new(
-            FieldPath::root("native_query_lifecycle"),
-            ProtocolErrorKind::VersionMismatch,
-            detail,
-        )
-    }
-
-    pub(crate) fn digest_mismatch(detail: impl Into<String>) -> Self {
-        Self::new(
-            FieldPath::root("native_query_lifecycle"),
-            ProtocolErrorKind::DigestMismatch,
-            detail,
-        )
     }
 }
 
