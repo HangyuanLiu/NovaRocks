@@ -172,11 +172,11 @@ fn execute_add_files_operation(
             payload: OperationPayload::AddFilesLifecycle(planned.clone()),
         },
         artifacts: vec![plan_artifact],
-        source_action: Some(AddFilesSourceAction::Reserve {
-            provider_id: prepared.facts.provider_id.clone(),
-            scope_digest: scope_digest(&prepared.facts),
-            ownership: SourceScopeOwnership::ReservedImmutable,
-        }),
+        // Source-scope ledger entries are only a legacy anti-waste hint. The
+        // lake commit's refreshed-base duplicate validation is the ownership
+        // correctness authority, so a lost local reservation cannot change
+        // publication classification.
+        source_action: None,
     };
     active
         .journal
@@ -184,8 +184,9 @@ fn execute_add_files_operation(
         .map_err(|error| journal_error(error, stored.operation_id))?;
     stored = apply(active, reserve)?;
 
-    // This second durable write is deliberately distinct from reservation:
-    // the plan and ownership are visible before execution is admitted.
+    // This second durable write is deliberately distinct from planning: the
+    // frozen manifest facts are visible before execution is admitted. Source
+    // ownership remains with its original GC domain until the catalog commit.
     let executing = AddFilesLifecycleRecord {
         phase: AddFilesLifecyclePhase::Executing,
         ..planned
@@ -337,7 +338,7 @@ fn persist_unknown_then_reconcile(
             .unwrap_or_else(|| evidence_artifact.descriptor.clone()),
     );
     record.dispatch_certainty = AddFilesDispatchCertainty::PossiblyDispatched;
-    record.source_ownership = SourceScopeOwnership::Frozen;
+    record.source_ownership = SourceScopeOwnership::Unclaimed;
     record.next_action = StatementNextAction::ManualInspect;
     record.outcome = Some(DurableExternalFact {
         outcome: ExternalFactOutcome::CommitUnknown,
@@ -346,16 +347,7 @@ fn persist_unknown_then_reconcile(
         finalization_failure: None,
         failure: Some(encode_failure(&failure)),
     });
-    let source_action = match first_evidence {
-        Some(_) => None,
-        None => Some(AddFilesSourceAction::Transition {
-            provider_id: prepared.facts.provider_id.clone(),
-            scope_digest: scope_digest(&prepared.facts),
-            expected: SourceScopeOwnership::ReservedImmutable,
-            ownership: SourceScopeOwnership::Frozen,
-        }),
-    };
-    let artifacts = if source_action.is_some() {
+    let artifacts = if first_evidence.is_none() {
         vec![evidence_artifact]
     } else {
         Vec::new()
@@ -367,7 +359,7 @@ fn persist_unknown_then_reconcile(
             OperationState::CommitUnknown,
             record,
             artifacts,
-            source_action,
+            None,
         ),
     )?;
     Err(operation_error(
@@ -407,7 +399,7 @@ fn persist_known_committed(
     record.phase = AddFilesLifecyclePhase::Committed;
     record.receipt_artifact = Some(receipt_artifact.descriptor.clone());
     record.dispatch_certainty = AddFilesDispatchCertainty::PossiblyDispatched;
-    record.source_ownership = SourceScopeOwnership::TableOwned;
+    record.source_ownership = SourceScopeOwnership::Unclaimed;
     record.next_action = match finalization {
         AddFilesFinalization::Complete => StatementNextAction::None,
         AddFilesFinalization::Failed(_) => StatementNextAction::RetryFinalize,
@@ -422,7 +414,6 @@ fn persist_known_committed(
         },
         failure: None,
     });
-    let expected_ownership = source_ownership(&stored)?;
     let stored = apply(
         journal,
         mutation(
@@ -430,12 +421,7 @@ fn persist_known_committed(
             OperationState::Committed,
             record,
             vec![receipt_artifact],
-            Some(AddFilesSourceAction::Transition {
-                provider_id: facts.provider_id.clone(),
-                scope_digest: scope_digest(facts),
-                expected: expected_ownership,
-                ownership: SourceScopeOwnership::TableOwned,
-            }),
+            None,
         ),
     )?;
     match finalization {
@@ -474,9 +460,9 @@ fn persist_known_committed(
     }
 }
 
-/// A confirmed provider commit transfers the scope to the table even if the
-/// frontend cannot retain its receipt.  Record that ownership truth and stop
-/// at manual inspection; releasing or freezing this source would be false.
+/// A confirmed provider commit is lake truth even if the frontend cannot
+/// retain its receipt. Keep the local source-scope ledger unclaimed and stop
+/// at manual inspection; it is not an ownership correctness authority.
 #[allow(
     clippy::result_large_err,
     reason = "Preserves the frozen DML error contract without a broad ABI migration."
@@ -484,13 +470,12 @@ fn persist_known_committed(
 fn persist_committed_manual(
     journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
-    facts: &AddFilesPlanFacts,
+    _facts: &AddFilesPlanFacts,
     message: String,
 ) -> Result<u32, DmlError> {
-    let expected_ownership = source_ownership(&stored)?;
     let mut record = add_files_record(&stored)?;
     record.phase = AddFilesLifecyclePhase::Committed;
-    record.source_ownership = SourceScopeOwnership::TableOwned;
+    record.source_ownership = SourceScopeOwnership::Unclaimed;
     record.dispatch_certainty = AddFilesDispatchCertainty::PossiblyDispatched;
     record.next_action = StatementNextAction::ManualInspect;
     record.outcome = Some(DurableExternalFact {
@@ -502,18 +487,7 @@ fn persist_committed_manual(
     });
     let stored = apply(
         journal,
-        mutation(
-            stored,
-            OperationState::Committed,
-            record,
-            Vec::new(),
-            Some(AddFilesSourceAction::Transition {
-                provider_id: facts.provider_id.clone(),
-                scope_digest: scope_digest(facts),
-                expected: expected_ownership,
-                ownership: SourceScopeOwnership::TableOwned,
-            }),
-        ),
+        mutation(stored, OperationState::Committed, record, Vec::new(), None),
     )?;
     let record = add_files_record(&stored)?;
     let stored = apply(
@@ -549,23 +523,7 @@ fn persist_known_uncommitted(
     failure: AddFilesFailure,
 ) -> Result<u32, DmlError> {
     let mut record = add_files_record(&stored)?;
-    let source_action = if record.source_ownership == SourceScopeOwnership::ReservedImmutable {
-        let provider_id = record
-            .provider_id
-            .clone()
-            .ok_or_else(|| wrong_record(&stored))?;
-        let scope_digest = record
-            .source_scope_digest
-            .clone()
-            .ok_or_else(|| wrong_record(&stored))?;
-        record.source_ownership = SourceScopeOwnership::Unclaimed;
-        Some(AddFilesSourceAction::Release {
-            provider_id,
-            scope_digest,
-        })
-    } else {
-        None
-    };
+    record.source_ownership = SourceScopeOwnership::Unclaimed;
     record.phase = AddFilesLifecyclePhase::Failed;
     record.next_action = StatementNextAction::None;
     record.outcome = Some(DurableExternalFact {
@@ -582,7 +540,7 @@ fn persist_known_uncommitted(
             OperationState::FailedKnownUncommitted,
             record,
             Vec::new(),
-            source_action,
+            None,
         ),
     )?;
     Err(operation_error(
@@ -624,26 +582,7 @@ fn persist_frozen_manual(
     evidence: Option<AddFilesArtifact>,
 ) -> Result<u32, DmlError> {
     let mut record = add_files_record(&stored)?;
-    let has_scope = record.source_scope_digest.is_some();
-    let source_action =
-        if has_scope && record.source_ownership == SourceScopeOwnership::ReservedImmutable {
-            record.source_ownership = SourceScopeOwnership::Frozen;
-            Some(AddFilesSourceAction::Transition {
-                provider_id: record
-                    .provider_id
-                    .clone()
-                    .ok_or_else(|| wrong_record(&stored))?,
-                scope_digest: record
-                    .source_scope_digest
-                    .clone()
-                    .ok_or_else(|| wrong_record(&stored))?,
-                expected: SourceScopeOwnership::ReservedImmutable,
-                ownership: SourceScopeOwnership::Frozen,
-            })
-        } else {
-            record.source_ownership = SourceScopeOwnership::Frozen;
-            None
-        };
+    record.source_ownership = SourceScopeOwnership::Unclaimed;
     if let Some(evidence) = evidence.as_ref() {
         record.evidence_artifact = Some(evidence.descriptor.clone());
     }
@@ -664,7 +603,7 @@ fn persist_frozen_manual(
             OperationState::CommitUnknown,
             record,
             evidence.into_iter().collect(),
-            source_action,
+            None,
         ),
     )?;
     Err(operation_error(
@@ -739,7 +678,7 @@ fn planned_record(
         receipt_artifact: None,
         evidence_artifact: None,
         dispatch_certainty: AddFilesDispatchCertainty::ConfirmedNotDispatched,
-        source_ownership: SourceScopeOwnership::ReservedImmutable,
+        source_ownership: SourceScopeOwnership::Unclaimed,
         outcome: None,
         next_action: StatementNextAction::None,
     }
@@ -874,10 +813,6 @@ fn add_files_record(stored: &StoredOperation) -> Result<AddFilesLifecycleRecord,
     clippy::result_large_err,
     reason = "Preserves the frozen DML error contract without a broad ABI migration."
 )]
-fn source_ownership(stored: &StoredOperation) -> Result<SourceScopeOwnership, DmlError> {
-    Ok(add_files_record(stored)?.source_ownership)
-}
-
 fn scope_digest(facts: &AddFilesPlanFacts) -> String {
     hex::encode(facts.source_scope.digest())
 }
@@ -1085,7 +1020,7 @@ mod tests {
         fn execute_add_files(&self, _prepared: &dyn AddFilesPrepared) -> AddFilesOutcome {
             assert!(
                 self.plan_is_durable.load(Ordering::SeqCst),
-                "execute must not happen before the public plan and reservation are durable"
+                "execute must not happen before the public plan is durable"
             );
             self.execute_calls.fetch_add(1, Ordering::SeqCst);
             behavior_outcome(
@@ -1425,14 +1360,10 @@ mod tests {
             }
             let stored = operation.clone();
             if let OperationPayload::AddFilesLifecycle(record) = &stored.payload {
-                if record.plan_artifact.is_some()
-                    && record.source_ownership == SourceScopeOwnership::ReservedImmutable
-                {
+                if record.plan_artifact.is_some() {
                     self.plan_is_durable.store(true, Ordering::SeqCst);
                 }
-                if record.evidence_artifact.is_some()
-                    && record.source_ownership == SourceScopeOwnership::Frozen
-                {
+                if record.evidence_artifact.is_some() {
                     self.evidence_is_durable.store(true, Ordering::SeqCst);
                 }
             }
@@ -1575,7 +1506,7 @@ mod tests {
             record.connector_operation_id,
             *operation.operation_id.as_uuid()
         );
-        assert_eq!(record.source_ownership, SourceScopeOwnership::TableOwned);
+        assert_eq!(record.source_ownership, SourceScopeOwnership::Unclaimed);
         assert!(record.plan_artifact.is_some());
         assert!(record.receipt_artifact.is_some());
 
@@ -1603,11 +1534,11 @@ mod tests {
         };
         assert_eq!(operation.state, OperationState::CommitUnknown);
         assert!(record.evidence_artifact.is_some());
-        assert_eq!(record.source_ownership, SourceScopeOwnership::Frozen);
+        assert_eq!(record.source_ownership, SourceScopeOwnership::Unclaimed);
     }
 
     #[test]
-    fn a_second_unknown_stays_frozen_and_never_retries_execution_or_reconcile() {
+    fn unknown_stays_manual_and_never_retries_execution_or_reconcile() {
         let mut engine = FakeEngine::new(Behavior::Unknown, Behavior::Unknown);
         let (service, journal) = harness(&mut engine);
         let error = service
@@ -1623,12 +1554,12 @@ mod tests {
             panic!("ADD FILES payload")
         };
         assert_eq!(operation.state, OperationState::CommitUnknown);
-        assert_eq!(record.source_ownership, SourceScopeOwnership::Frozen);
+        assert_eq!(record.source_ownership, SourceScopeOwnership::Unclaimed);
         assert_eq!(record.next_action, StatementNextAction::ManualInspect);
     }
 
     #[test]
-    fn possibly_dispatched_failure_freezes_and_does_not_fallback() {
+    fn possibly_dispatched_failure_stays_manual_and_does_not_fallback() {
         let mut engine = FakeEngine::new(Behavior::PossiblyDispatched, Behavior::Committed);
         let (service, journal) = harness(&mut engine);
         let error = service
@@ -1643,12 +1574,12 @@ mod tests {
         let OperationPayload::AddFilesLifecycle(record) = operation.payload else {
             panic!("ADD FILES payload")
         };
-        assert_eq!(record.source_ownership, SourceScopeOwnership::Frozen);
+        assert_eq!(record.source_ownership, SourceScopeOwnership::Unclaimed);
         assert_eq!(record.next_action, StatementNextAction::ManualInspect);
     }
 
     #[test]
-    fn known_uncommitted_releases_reserved_scope() {
+    fn known_uncommitted_never_claims_source_scope() {
         let mut engine = FakeEngine::new(Behavior::KnownUncommitted, Behavior::Committed);
         let (service, journal) = harness(&mut engine);
         let error = service
