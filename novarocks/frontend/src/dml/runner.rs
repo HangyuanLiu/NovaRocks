@@ -23,13 +23,18 @@
 
 use std::convert::Infallible;
 
+#[cfg(test)]
 use novarocks_spi::connector::{
     ConnectorError, ConnectorEstablishedWriteFence, ConnectorExternalFenceFailure,
+};
+use novarocks_spi::connector::{
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorWriteAbortOutcome,
     ConnectorWriteReceipt, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
-use crate::dml::coordination::{ActiveDmlOperation, DmlExternalFenceProposal};
+use crate::dml::coordination::ActiveDmlOperation;
+#[cfg(test)]
+use crate::dml::coordination::DmlExternalFenceProposal;
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
@@ -50,43 +55,6 @@ pub enum CoordinatedWriteReport<H, A = Infallible> {
 pub trait WriteExecutor {
     type CommitHandle;
     type AbortHandle;
-
-    /// Establish this coordination attempt's external operation fence on the
-    /// exact connector write authority that will later commit, abort or
-    /// reconcile this operation (CP-3B spec D2).
-    ///
-    /// The runner calls this after the durable intent reaches `Writing` and
-    /// before any writer or commit dispatch, because a control-plane owner
-    /// cannot withdraw a Connector commit it has already dispatched. The
-    /// implementation completes the supplied proposal with the connector-owned
-    /// write operation and resource identity, hands it to the write
-    /// operation's establish entry, and returns exactly what the provider
-    /// acknowledged.
-    ///
-    /// The fence must land on the exact `ConnectorWriteLease` between
-    /// `activate_write` and `begin_write_operation`: every terminal provider
-    /// call reads it back through that lease, including the pre-registration
-    /// aborts that hold only the lease and never obtain an operation session.
-    /// An implementation whose lease is not created until the coordinated
-    /// write runs cannot satisfy that ordering and must fail closed here
-    /// instead of dispatching unfenced.
-    ///
-    /// There is deliberately no unfenced dispatch path. The default fails
-    /// closed: an executor that cannot fence its write must not reach a writer
-    /// or a commit, and its operation is left to historical write recovery.
-    /// A fence conflict must keep its typed `ConnectorExternalFenceFailure`
-    /// classification and must never be widened into an unknown outcome.
-    fn establish_external_fence(
-        &self,
-        spec: &WriteTransactionSpec,
-        proposal: &DmlExternalFenceProposal,
-    ) -> Result<ConnectorEstablishedWriteFence, ConnectorError> {
-        let _ = (spec, proposal);
-        Err(ConnectorError::external_fence(
-            ConnectorExternalFenceFailure::NotEstablished,
-            "connector write executor does not expose an external operation fence authority",
-        ))
-    }
 
     #[allow(
         clippy::result_large_err,
@@ -1055,47 +1023,6 @@ mod tests {
         type CommitHandle = Infallible;
         type AbortHandle = Infallible;
 
-        fn establish_external_fence(
-            &self,
-            _spec: &WriteTransactionSpec,
-            proposal: &DmlExternalFenceProposal,
-        ) -> Result<ConnectorEstablishedWriteFence, ConnectorError> {
-            self.push("establish-fence");
-            if let Some(failure) = self.establish_failure {
-                return Err(ConnectorError::external_fence(
-                    failure,
-                    "test provider refused the external operation fence",
-                ));
-            }
-            let fence = if self.foreign_attempt_id {
-                // A fence that is internally well formed but belongs to
-                // another coordination attempt. The lease cannot detect this;
-                // the frontend double check must.
-                ConnectorExternalOperationFence::try_new(
-                    novarocks_spi::connector::ConnectorClusterIdentity::derive(
-                        "runner-test-cluster",
-                    )?,
-                    novarocks_spi::connector::ConnectorExternalFenceGeneration::try_new(
-                        proposal.generation().control_plane_incarnation,
-                        proposal.generation().resource_epoch,
-                        proposal.generation().fence_generation,
-                    )?,
-                    connector_write_operation_id(),
-                    [0xAB; 16],
-                    connector_table(),
-                    ConnectorWriteTargetRef::main(),
-                )?
-            } else {
-                proposal.seal(
-                    connector_write_operation_id(),
-                    connector_table(),
-                    ConnectorWriteTargetRef::main(),
-                )?
-            };
-            self.lease
-                .establish_external_fence(fence, connector_context())
-        }
-
         fn run_coordinated_write(
             &self,
             _spec: &WriteTransactionSpec,
@@ -1135,14 +1062,6 @@ mod tests {
         type CommitHandle = ();
         type AbortHandle = Infallible;
 
-        fn establish_external_fence(
-            &self,
-            _spec: &WriteTransactionSpec,
-            proposal: &DmlExternalFenceProposal,
-        ) -> Result<ConnectorEstablishedWriteFence, ConnectorError> {
-            establish_test_fence(proposal)
-        }
-
         fn run_coordinated_write(
             &self,
             _spec: &WriteTransactionSpec,
@@ -1177,14 +1096,6 @@ mod tests {
     impl WriteExecutor for AbortEnvelopeFailureExecutor {
         type CommitHandle = Infallible;
         type AbortHandle = ();
-
-        fn establish_external_fence(
-            &self,
-            _spec: &WriteTransactionSpec,
-            proposal: &DmlExternalFenceProposal,
-        ) -> Result<ConnectorEstablishedWriteFence, ConnectorError> {
-            establish_test_fence(proposal)
-        }
 
         fn run_coordinated_write(
             &self,
@@ -1221,14 +1132,6 @@ mod tests {
     impl WriteExecutor for KnownUncommittedAbortExecutor {
         type CommitHandle = Infallible;
         type AbortHandle = ();
-
-        fn establish_external_fence(
-            &self,
-            _spec: &WriteTransactionSpec,
-            proposal: &DmlExternalFenceProposal,
-        ) -> Result<ConnectorEstablishedWriteFence, ConnectorError> {
-            establish_test_fence(proposal)
-        }
 
         fn run_coordinated_write(
             &self,
