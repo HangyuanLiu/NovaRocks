@@ -938,9 +938,11 @@ impl FrontendDistributedQueryCoordinator {
         request: DistributedQueryRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         let statement_deadline = statement_deadline_for_request(&request)?;
+        let intent = request.intent();
         let query_id = self.query_ids.next_query_id()?;
         let execution_id = execution_id_for_round(query_id, 1)?;
         self.execute_round(query_id, execution_id, statement_deadline, request)
+            .map_err(|error| fail_closed_one_shot_topology_retry(intent, error))
     }
 
     /// Execute exactly one move-only distributed round. A future statement
@@ -1424,6 +1426,28 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
     }
 }
 
+fn fail_closed_one_shot_topology_retry(
+    intent: DistributedQueryIntent,
+    error: DistributedQueryError,
+) -> DistributedQueryError {
+    if intent == DistributedQueryIntent::Write
+        && let Some(outcome) = error.pre_ready_topology_outcome()
+    {
+        // A write request is one-shot. Until its DML owner can preserve the
+        // exact target/base/publication binding and rebuild the complete write
+        // layout under a positive zero-effect permit, it must not reuse this
+        // request or silently enter the read-query replan controller.
+        return DistributedQueryError::topology_retry_unsupported(
+            outcome,
+            format!(
+                "distributed write cannot retry pre-ready topology change without a whole-round semantic binding and effect-free permit: {}",
+                error.message()
+            ),
+        );
+    }
+    error
+}
+
 /// Establish one absolute execution deadline before the first distributed
 /// round.  Every retry consumes this same monotonic budget; it must never
 /// inherit a fresh `query_timeout` window merely because the layout changed.
@@ -1526,7 +1550,8 @@ mod tests {
         QueryIdSource, QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryLifecycleTarget,
         QueryLifecycleTransport, QueryLifecycleTransportError, QueryStageAck, QueryStageRequest,
         QueryStartAck, QueryStartRequest, QueryTerminationAck, ReadyLifecycleTransportForTest,
-        UniqueQueryIdSource, pre_ready_topology_validation_error,
+        UniqueQueryIdSource, fail_closed_one_shot_topology_retry,
+        pre_ready_topology_validation_error,
     };
     use crate::common::backend_topology::CoordinatorReportEndpointSink;
     use crate::common::backend_topology::{
@@ -1575,6 +1600,28 @@ mod tests {
                 process_id,
             })
         );
+    }
+
+    #[test]
+    fn one_shot_write_rejects_pre_ready_topology_without_a_replan_owner() {
+        let process_id = BackendProcessId::new_v7();
+        let original = DistributedQueryError::pre_ready_topology(
+            PreReadyTopologyOutcome::BackendDraining {
+                backend_idx: 1,
+                process_id,
+            },
+            "backend is draining",
+        );
+        let outcome = original
+            .pre_ready_topology_outcome()
+            .expect("typed outcome is retained");
+        let error = fail_closed_one_shot_topology_retry(DistributedQueryIntent::Write, original);
+
+        assert_eq!(
+            error.kind(),
+            DistributedQueryErrorKind::TopologyRetryUnsupported
+        );
+        assert_eq!(error.pre_ready_topology_outcome(), Some(outcome));
     }
 
     #[test]

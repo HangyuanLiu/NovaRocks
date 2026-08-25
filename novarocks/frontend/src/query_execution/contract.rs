@@ -811,6 +811,10 @@ pub(crate) fn with_connector_write_operation(
 pub enum DistributedQueryErrorKind {
     ContractViolation,
     Rejected,
+    /// The statement observed a pre-ControlReady topology disposition, but
+    /// its owner cannot prove the stable semantic binding and zero-effect
+    /// conditions required to construct a replacement round.
+    TopologyRetryUnsupported,
     Failed,
 }
 
@@ -887,6 +891,22 @@ impl DistributedQueryError {
     ) -> Self {
         Self {
             kind: DistributedQueryErrorKind::Rejected,
+            message: message.into(),
+            connector_binding_rejection: None,
+            pre_ready_topology_outcome: Some(outcome),
+        }
+    }
+
+    /// Turns typed pre-ready topology evidence into a fail-closed statement
+    /// result when the operation has no whole-round replanning owner. The
+    /// original outcome remains available to observability and callers; it is
+    /// not reduced to transport/display text.
+    pub(crate) fn topology_retry_unsupported(
+        outcome: PreReadyTopologyOutcome,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: DistributedQueryErrorKind::TopologyRetryUnsupported,
             message: message.into(),
             connector_binding_rejection: None,
             pre_ready_topology_outcome: Some(outcome),
