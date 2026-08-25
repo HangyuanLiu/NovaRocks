@@ -26,14 +26,13 @@ use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
     CreatePreparingRequest, CreateStatementOperationRequest, DmlOperationId, DmlRecoveryCandidate,
-    OperationPayload, OperationState, StatementNextAction, StoredOperation,
+    OperationKind, OperationPayload, OperationState, StatementNextAction, StoredOperation,
     WriteTransactionOutcome, WriteTransactionSpec,
 };
 use crate::dml::runner::{
     ActiveWriteTransactionRunner, AlwaysAdmit, WriteAdmission, WriteExecutor,
     WriteTransactionRunner, preparing_request,
 };
-use crate::dml::statement_recovery::direct_mutation_kind;
 use crate::statistics::{FrontendStatisticsService, StatisticsColumn};
 
 /// The frontend DML application owner. Composes the narrow ports (journal +
@@ -245,7 +244,10 @@ impl DmlService {
             == crate::dml::model::OperationKind::CreateTableAsSelect
         {
             quarantine_legacy_ctas(&mut active).map(|()| None)
-        } else if direct_mutation_kind(active.stored.operation_kind).is_some() {
+        } else if matches!(
+            active.stored.operation_kind,
+            OperationKind::Truncate | OperationKind::AddFiles
+        ) {
             quarantine_legacy_direct_mutation(&mut active).map(|()| None)
         } else {
             active
