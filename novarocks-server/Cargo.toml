@@ -43,5 +43,6 @@ mv-first-refresh-staging-test-support = []
 # scenarios — not to this package.
 bytes = "1"
 mysql = "25"
+novarocks-protocol = { path = "../novarocks/protocol" }
 novarocks-test-support = { path = "../tests/test-support" }
 tempfile = "3"

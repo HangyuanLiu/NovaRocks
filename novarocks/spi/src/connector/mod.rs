@@ -25,6 +25,7 @@ mod distribution;
 mod domain_facts;
 mod error;
 mod execution;
+mod execution_declaration;
 mod external_write_fence;
 mod handle;
 mod historical_data_mutation_recovery;
@@ -116,9 +117,7 @@ pub use distributed_rewrite::{
     MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES, REWRITE_DATA_FILES_KIND,
     REWRITE_POSITION_DELETES_KIND,
 };
-pub use distribution::{
-    ConnectorExecutionDeclaration, ConnectorExecutionProviderKind, ConnectorInstanceIncarnation,
-};
+pub use distribution::ConnectorInstanceIncarnation;
 pub use domain_facts::{
     ConnectorAvailableScanUnitDomainFacts, ConnectorScanUnitColumn, ConnectorScanUnitColumnDomain,
     ConnectorScanUnitColumnFacts, ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsEvidence,
@@ -131,10 +130,13 @@ pub use error::{
     ConnectorTableObjectBindingFailure,
 };
 pub use execution::{
-    ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionInstaller,
-    ConnectorExecutionResolver, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
-    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorReadExecution,
+    ConnectorExecutionBinding, ConnectorExecutionInstaller, ConnectorExecutionResolver,
+    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
+    ConnectorPreparedScanUnitSet, ConnectorReadExecution,
     MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT,
+};
+pub use execution_declaration::{
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionProviderKind,
 };
 pub use external_write_fence::{
     ConnectorClusterIdentity, ConnectorExternalFenceGeneration, ConnectorExternalFenceReceipt,

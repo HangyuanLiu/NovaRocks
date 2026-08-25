@@ -1724,10 +1724,10 @@ pub(crate) mod tests {
         let host = ConnectorControlHost::new();
         let binding = starrocks_binding();
         let instance = binding.descriptor().instance_id.clone();
-        let key = binding
+        let declaration = binding
             .execution_declaration(&starrocks_context())
-            .expect("declaration")
-            .binding_key();
+            .expect("declaration");
+        let key = declaration.binding_key().clone();
         host.register(binding).expect("register RPC generation");
         let lease = host
             .acquire_current(&instance)
@@ -1738,7 +1738,7 @@ pub(crate) mod tests {
                 .execution_declaration(&starrocks_context())
                 .expect("lease declaration")
                 .binding_key(),
-            key
+            &key
         );
 
         host.retire_current(&instance)

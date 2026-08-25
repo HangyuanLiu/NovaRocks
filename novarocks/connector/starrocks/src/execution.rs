@@ -20,14 +20,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
-use novarocks_protocol::provider::ConnectorExecutionBindingProvider;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
-    ConnectorExecutionProviderKind, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
-    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
-    ConnectorProviderId, ConnectorReadExecution, ConnectorRequestContext,
-    ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsMissingReason, ConnectorSplit,
+    ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
+    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderId,
+    ConnectorReadExecution, ConnectorRequestContext, ConnectorScanUnitDomainFacts,
+    ConnectorScanUnitFactsMissingReason, ConnectorSplit,
 };
 
 use crate::STARROCKS_PROVIDER_ID;
@@ -110,17 +109,14 @@ impl StarRocksExecutionInstaller {
     fn prepare(
         declaration: &ConnectorExecutionDeclaration,
     ) -> Result<PreparedStarRocksExecutionBinding, ConnectorError> {
-        let local_binding = match declaration.provider() {
-            ConnectorExecutionBindingProvider::StarRocks { local_binding } => local_binding,
-            ConnectorExecutionBindingProvider::Iceberg { .. } => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "StarRocks installer received a declaration for another provider kind",
-                ));
-            }
-        };
+        let local_binding = declaration.starrocks_local_binding().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "StarRocks installer received a declaration for another provider kind",
+            )
+        })?;
         Ok(PreparedStarRocksExecutionBinding {
-            key: ConnectorExecutionBindingKey::from(declaration),
+            key: declaration.binding_key().clone(),
             local_binding: StarRocksLocalBindingRef::parse(local_binding)?,
         })
     }
@@ -146,10 +142,6 @@ impl StarRocksExecutionInstaller {
 }
 
 impl ConnectorExecutionInstaller for StarRocksExecutionInstaller {
-    fn provider_kind(&self) -> ConnectorExecutionProviderKind {
-        ConnectorExecutionProviderKind::StarRocks
-    }
-
     fn provider_id(&self) -> &ConnectorProviderId {
         &self.provider_id
     }

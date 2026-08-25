@@ -23,7 +23,6 @@
 
 use std::time::Instant;
 
-use novarocks_protocol::provider::ConnectorExecutionBindingProvider;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
     ConnectorExecutionDistribution, ConnectorExecutionProviderKind, ConnectorInstanceDescriptor,
@@ -32,7 +31,7 @@ use novarocks_spi::connector::{
 
 const DEFAULT_ACCESS_BINDING: &str = "default";
 
-/// Iceberg-only facts parsed from a Protocol-validated declaration.
+/// Iceberg-only facts parsed from an SPI-validated domain declaration.
 ///
 /// This is deliberately resource-free. Installation performs this preparation
 /// before it reaches any BE-local credential, object-store, or runtime state.
@@ -105,17 +104,17 @@ impl ConnectorExecutionDistribution for IcebergInstanceDistribution {
 pub(crate) fn prepare_iceberg_execution_binding(
     declaration: &ConnectorExecutionDeclaration,
 ) -> Result<PreparedIcebergExecutionBinding, ConnectorError> {
-    match declaration.provider() {
-        ConnectorExecutionBindingProvider::Iceberg { access_binding } => {
-            Ok(PreparedIcebergExecutionBinding {
-                access_binding: access_binding.to_string(),
-            })
-        }
-        ConnectorExecutionBindingProvider::StarRocks { .. } => Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "Iceberg installer received a declaration for another provider",
-        )),
-    }
+    declaration
+        .iceberg_access_binding()
+        .map(|access_binding| PreparedIcebergExecutionBinding {
+            access_binding: access_binding.to_string(),
+        })
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg installer received a declaration for another provider",
+            )
+        })
 }
 
 #[cfg(test)]
@@ -139,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn declaration_carries_the_default_access_binding_in_the_protocol_variant() {
+    fn declaration_carries_the_default_access_binding_in_the_domain_variant() {
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse("iceberg").expect("valid provider ID"),
             instance_id: ConnectorInstanceId::parse("catalog").expect("valid instance ID"),

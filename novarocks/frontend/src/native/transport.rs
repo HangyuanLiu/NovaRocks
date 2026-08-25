@@ -28,8 +28,11 @@ use novarocks_protocol::lifecycle::{
     QueryTerminationAck, QueryTerminationReason,
 };
 use novarocks_protocol::novarocks::{
-    EnsureConnectorExecutionBindingRequest, FetchResultRequest,
+    ConnectorExecutionBindingDeclaration, EnsureConnectorExecutionBindingRequest,
+    FetchResultRequest, IcebergExecutionBindingDeclaration,
     QueryExecutionId as ProtoQueryExecutionId, RetireConnectorExecutionBindingRequest,
+    StarRocksExecutionBindingDeclaration,
+    connector_execution_binding_declaration::Provider as ConnectorExecutionBindingProvider,
     fetch_result_response::Status as FetchStatus,
 };
 use novarocks_protocol::provider::{
@@ -47,6 +50,41 @@ use super::query_lifecycle::{
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const QUERY_CONTROL_CHANNEL_CAPACITY: usize = 32;
+
+/// Encodes a validated SPI declaration at the FE-owned Protocol boundary.
+///
+// Design: ADR-0105 (docs/adr/ADR-0105-wire-authority-and-domain-carrier-separation.md)
+/// This is deliberately the only frontend mapping from the transport-neutral
+/// declaration into the generated wire DTO. The declaration's closed variant
+/// selects the wire oneof; canonical digesting remains Protocol-owned and is
+/// performed by the BE over this generated DTO.
+#[doc(hidden)]
+pub fn encode_connector_execution_declaration(
+    declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
+) -> ConnectorExecutionBindingDeclaration {
+    let binding_key = declaration.binding_key();
+    let provider = match (
+        declaration.iceberg_access_binding(),
+        declaration.starrocks_local_binding(),
+    ) {
+        (Some(access_binding), None) => {
+            ConnectorExecutionBindingProvider::Iceberg(IcebergExecutionBindingDeclaration {
+                access_binding: access_binding.to_string(),
+            })
+        }
+        (None, Some(local_binding)) => {
+            ConnectorExecutionBindingProvider::Starrocks(StarRocksExecutionBindingDeclaration {
+                local_binding: local_binding.to_string(),
+            })
+        }
+        _ => unreachable!("validated connector execution declaration has an invalid provider"),
+    };
+    ConnectorExecutionBindingDeclaration {
+        instance_id: binding_key.instance_id.as_str().to_string(),
+        incarnation: binding_key.incarnation.to_bytes().to_vec(),
+        provider: Some(provider),
+    }
+}
 
 #[derive(Clone)]
 struct Client {
@@ -272,7 +310,7 @@ impl ConnectorBindingDispatcher for ConnectorBindingControl {
                 }),
                 attempt_id: execution_id.attempt_id().get(),
             }),
-            declaration: Some(declaration.as_proto().clone()),
+            declaration: Some(encode_connector_execution_declaration(declaration)),
         };
         let response = client
             .data_runtime
@@ -973,5 +1011,51 @@ fn stream_status_error(status: tonic::Status) -> QueryLifecycleTransportError {
             status.code(),
             status.message()
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use novarocks_protocol::novarocks::{
+        IcebergExecutionBindingDeclaration, StarRocksExecutionBindingDeclaration,
+        connector_execution_binding_declaration::Provider,
+    };
+    use novarocks_spi::connector::ConnectorExecutionDeclaration;
+
+    use super::encode_connector_execution_declaration;
+
+    #[test]
+    fn encodes_iceberg_declaration_from_the_closed_spi_variant() {
+        let declaration =
+            ConnectorExecutionDeclaration::iceberg("catalog", [7; 16], "warehouse-binding")
+                .unwrap();
+
+        assert_eq!(
+            encode_connector_execution_declaration(&declaration),
+            novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
+                instance_id: "catalog".to_string(),
+                incarnation: vec![7; 16],
+                provider: Some(Provider::Iceberg(IcebergExecutionBindingDeclaration {
+                    access_binding: "warehouse-binding".to_string(),
+                })),
+            }
+        );
+    }
+
+    #[test]
+    fn encodes_starrocks_declaration_from_the_closed_spi_variant() {
+        let declaration =
+            ConnectorExecutionDeclaration::starrocks("catalog", [9; 16], "local-binding").unwrap();
+
+        assert_eq!(
+            encode_connector_execution_declaration(&declaration),
+            novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
+                instance_id: "catalog".to_string(),
+                incarnation: vec![9; 16],
+                provider: Some(Provider::Starrocks(StarRocksExecutionBindingDeclaration {
+                    local_binding: "local-binding".to_string(),
+                })),
+            }
+        );
     }
 }

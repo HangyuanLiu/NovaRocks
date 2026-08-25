@@ -964,12 +964,7 @@ mod tests {
             declaration.provider_kind(),
             ConnectorExecutionProviderKind::StarRocks
         );
-        match declaration.provider() {
-            novarocks_protocol::provider::ConnectorExecutionBindingProvider::StarRocks {
-                local_binding,
-            } => assert_eq!(local_binding, "default"),
-            provider => panic!("unexpected typed execution provider: {provider:?}"),
-        }
+        assert_eq!(declaration.starrocks_local_binding(), Some("default"));
     }
 
     #[test]

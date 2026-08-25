@@ -28,9 +28,11 @@ use novarocks_protocol::provider::{
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
-    ConnectorExecutionProviderKind, ConnectorExecutionResolver, ConnectorRequestContext,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorExecutionResolver, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
+
+use super::binding_decode::AdmittedConnectorExecutionDeclaration;
 
 const CONNECTOR_BINDING_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -215,21 +217,16 @@ impl ConnectorExecutionHost {
         installers: impl IntoIterator<Item = Arc<dyn ConnectorExecutionInstaller>>,
     ) -> Result<Self, ConnectorError> {
         let installers: Vec<_> = installers.into_iter().collect();
-        for expected in [
-            ConnectorExecutionProviderKind::Iceberg,
-            ConnectorExecutionProviderKind::StarRocks,
-        ] {
+        for expected in ["iceberg", "starrocks"] {
             if installers
                 .iter()
-                .filter(|installer| installer.provider_kind() == expected)
+                .filter(|installer| installer.provider_id().as_str() == expected)
                 .count()
                 != 1
             {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
-                    format!(
-                        "startup installer set must contain exactly one {expected:?} installer"
-                    ),
+                    format!("startup installer set must contain exactly one {expected} installer"),
                 ));
             }
         }
@@ -287,13 +284,11 @@ impl ConnectorExecutionHost {
     pub fn ensure(
         &self,
         query: QueryExecutionId,
-        declaration: &ConnectorExecutionDeclaration,
+        admitted: &AdmittedConnectorExecutionDeclaration,
     ) -> EnsureConnectorExecutionBindingResult {
-        let key = ConnectorExecutionBindingKey::from(declaration);
-        let digest = match declaration.digest() {
-            Ok(digest) => digest,
-            Err(error) => return rejected(internal_text(&error.to_string())),
-        };
+        let declaration = admitted.declaration();
+        let key = declaration.binding_key().clone();
+        let digest = admitted.digest();
         let (installer, cell, first_activation) = match self.state.lock() {
             Ok(mut state) => {
                 if let Err(rejection) = ensure_admissible(&state, query, &key) {
@@ -302,7 +297,7 @@ impl ConnectorExecutionHost {
                 let Some(installer) = state
                     .installers
                     .iter()
-                    .find(|installer| installer.provider_kind() == declaration.provider_kind())
+                    .find(|installer| installer.provider_id().as_str() == declaration.provider_id())
                     .cloned()
                 else {
                     return rejected(host_unavailable(
@@ -768,16 +763,12 @@ mod tests {
     }
 
     struct TestInstaller {
-        kind: ConnectorExecutionProviderKind,
         provider_id: ConnectorProviderId,
         installs: Arc<AtomicUsize>,
         error: Option<ConnectorError>,
     }
 
     impl ConnectorExecutionInstaller for TestInstaller {
-        fn provider_kind(&self) -> ConnectorExecutionProviderKind {
-            self.kind
-        }
         fn provider_id(&self) -> &ConnectorProviderId {
             &self.provider_id
         }
@@ -800,17 +791,12 @@ mod tests {
     }
 
     fn installer(
-        kind: ConnectorExecutionProviderKind,
+        provider: &str,
         installs: Arc<AtomicUsize>,
         error: Option<ConnectorError>,
     ) -> Arc<dyn ConnectorExecutionInstaller> {
         Arc::new(TestInstaller {
-            kind,
-            provider_id: ConnectorProviderId::parse(match kind {
-                ConnectorExecutionProviderKind::Iceberg => "iceberg",
-                ConnectorExecutionProviderKind::StarRocks => "starrocks",
-            })
-            .expect("provider ID"),
+            provider_id: ConnectorProviderId::parse(provider).expect("provider ID"),
             installs,
             error,
         })
@@ -818,12 +804,8 @@ mod tests {
 
     fn host(installs: Arc<AtomicUsize>, error: Option<ConnectorError>) -> ConnectorExecutionHost {
         ConnectorExecutionHost::try_new([
-            installer(ConnectorExecutionProviderKind::Iceberg, installs, error),
-            installer(
-                ConnectorExecutionProviderKind::StarRocks,
-                Arc::new(AtomicUsize::new(0)),
-                None,
-            ),
+            installer("iceberg", installs, error),
+            installer("starrocks", Arc::new(AtomicUsize::new(0)), None),
         ])
         .expect("complete installer set")
     }
@@ -831,6 +813,18 @@ mod tests {
     fn declaration(incarnation: u8, binding: &str) -> ConnectorExecutionDeclaration {
         ConnectorExecutionDeclaration::iceberg("catalog.analytics", [incarnation; 16], binding)
             .expect("declaration")
+    }
+    fn admitted(
+        declaration: ConnectorExecutionDeclaration,
+    ) -> AdmittedConnectorExecutionDeclaration {
+        let mut digest = [0; 32];
+        digest[0] = declaration.binding_key().incarnation.to_bytes()[0];
+        digest[1] = declaration
+            .iceberg_access_binding()
+            .unwrap_or_default()
+            .bytes()
+            .fold(0, u8::wrapping_add);
+        super::super::binding_decode::admitted_for_tests(declaration, digest)
     }
     fn query(value: i64) -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(1, value), AttemptId::new(1).expect("attempt"))
@@ -849,21 +843,13 @@ mod tests {
     fn sealed_set_rejects_missing_and_duplicate_installers() {
         let installs = Arc::new(AtomicUsize::new(0));
         assert!(
-            ConnectorExecutionHost::try_new([installer(
-                ConnectorExecutionProviderKind::Iceberg,
-                Arc::clone(&installs),
-                None,
-            )])
-            .is_err()
+            ConnectorExecutionHost::try_new([installer("iceberg", Arc::clone(&installs), None,)])
+                .is_err()
         );
         assert!(
             ConnectorExecutionHost::try_new([
-                installer(
-                    ConnectorExecutionProviderKind::Iceberg,
-                    Arc::clone(&installs),
-                    None
-                ),
-                installer(ConnectorExecutionProviderKind::Iceberg, installs, None),
+                installer("iceberg", Arc::clone(&installs), None),
+                installer("iceberg", installs, None),
             ])
             .is_err()
         );
@@ -876,19 +862,19 @@ mod tests {
         let first_declaration = declaration(7, "default");
         assert!(matches!(
             execution_host
-                .ensure(query(1), &first_declaration)
+                .ensure(query(1), &admitted(first_declaration.clone()))
                 .outcome(),
             EnsureConnectorExecutionBindingOutcome::Ensured
         ));
         assert!(matches!(
             execution_host
-                .ensure(query(2), &first_declaration)
+                .ensure(query(2), &admitted(first_declaration.clone()))
                 .outcome(),
             EnsureConnectorExecutionBindingOutcome::Ensured
         ));
         assert_eq!(installs.load(Ordering::SeqCst), 1);
         assert_eq!(
-            rejection(execution_host.ensure(query(3), &declaration(7, "other"))).reason(),
+            rejection(execution_host.ensure(query(3), &admitted(declaration(7, "other")))).reason(),
             EnsureConnectorExecutionBindingRejectionReason::ConflictingDeclaration,
         );
 
@@ -902,11 +888,13 @@ mod tests {
         );
         let terminal_declaration = declaration(8, "default");
         assert_eq!(
-            rejection(terminal_host.ensure(query(4), &terminal_declaration)).reason(),
+            rejection(terminal_host.ensure(query(4), &admitted(terminal_declaration.clone())))
+                .reason(),
             EnsureConnectorExecutionBindingRejectionReason::InvalidDeclaration
         );
         assert_eq!(
-            rejection(terminal_host.ensure(query(5), &terminal_declaration)).reason(),
+            rejection(terminal_host.ensure(query(5), &admitted(terminal_declaration.clone())))
+                .reason(),
             EnsureConnectorExecutionBindingRejectionReason::InvalidDeclaration
         );
         assert_eq!(installs.load(Ordering::SeqCst), 1);
@@ -924,7 +912,7 @@ mod tests {
         );
         let declaration = declaration(7, "default");
         for value in [1, 2] {
-            let error = rejection(retry_host.ensure(query(value), &declaration));
+            let error = rejection(retry_host.ensure(query(value), &admitted(declaration.clone())));
             assert_eq!(
                 error.reason(),
                 EnsureConnectorExecutionBindingRejectionReason::ActivationUnavailable
@@ -936,7 +924,9 @@ mod tests {
         let ready_host = host(Arc::new(AtomicUsize::new(0)), None);
         let first = query(3);
         assert!(matches!(
-            ready_host.ensure(first, &declaration).outcome(),
+            ready_host
+                .ensure(first, &admitted(declaration.clone()))
+                .outcome(),
             EnsureConnectorExecutionBindingOutcome::Ensured
         ));
         let key = ConnectorExecutionBindingKey::from(&declaration);
@@ -946,7 +936,7 @@ mod tests {
         );
         assert!(ready_host.resolver_for(first).resolve(&key).is_ok());
         assert_eq!(
-            rejection(ready_host.ensure(query(4), &declaration)).reason(),
+            rejection(ready_host.ensure(query(4), &admitted(declaration))).reason(),
             EnsureConnectorExecutionBindingRejectionReason::Retiring
         );
     }

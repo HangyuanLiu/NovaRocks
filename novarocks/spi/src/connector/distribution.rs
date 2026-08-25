@@ -15,13 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Execution-binding wire facts are owned by `novarocks-protocol`; SPI only
-//! exposes the validated value at its frontend-to-backend port.
-
-pub use novarocks_protocol::provider::{
-    ConnectorExecutionBindingDeclaration as ConnectorExecutionDeclaration,
-    ConnectorExecutionProviderKind,
-};
 use uuid::Uuid;
 
 /// A monotonically generated identity for one logical connector instance

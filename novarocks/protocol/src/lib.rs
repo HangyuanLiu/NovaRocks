@@ -4,7 +4,7 @@
 //! lifecycle contract derived from the canonical repository-level IDL.
 //! Transport, role-local state machines, and FE/BE execution conversion remain
 //! outside this package.
-// Design: ADR-0103 (docs/adr/ADR-0103-central-provider-wire-and-homogeneous-native-build-admission.md)
+// Design: ADR-0105 (docs/adr/ADR-0105-wire-authority-and-domain-carrier-separation.md)
 
 pub const SCHEMA_LEDGER_VERSION: u32 = 1;
 

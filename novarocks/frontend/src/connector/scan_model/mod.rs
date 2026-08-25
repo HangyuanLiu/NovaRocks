@@ -70,7 +70,9 @@ use serde::{Deserialize, Serialize};
 
 /// Neutral provider identity for the fixture. It intentionally names no real
 /// provider so a Core assertion can never accidentally depend on one.
-const FIXTURE_PROVIDER_ID: &str = "fixture";
+// The fixture emits the closed Iceberg declaration variant, so its descriptor
+// must carry the same derived provider identity.
+const FIXTURE_PROVIDER_ID: &str = "iceberg";
 const FIXTURE_SPLIT_PAYLOAD_V1: u16 = 1;
 /// Wildcard key in a table -> files map: it answers for every table name that
 /// has no explicit entry.

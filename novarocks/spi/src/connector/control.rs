@@ -914,8 +914,9 @@ impl ConnectorControlBinding {
         context: &ConnectorRequestContext,
     ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
         let declaration = self.distribution.declaration(context)?;
-        let key = ConnectorExecutionBindingKey::from(&declaration);
+        let key = declaration.binding_key();
         if declaration.provider_kind() != self.distribution.provider_kind()
+            || declaration.provider_id() != self.descriptor.provider_id.as_str()
             || key.instance_id != self.descriptor.instance_id
             || key.incarnation != self.incarnation
         {

@@ -23,9 +23,11 @@ use novarocks_protocol::lifecycle::QueryExecutionId;
 use novarocks_protocol::provider::{
     EnsureConnectorExecutionBindingResult, RetireConnectorExecutionBindingResult,
 };
-use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorExecutionDeclaration};
+use novarocks_spi::connector::ConnectorExecutionBindingKey;
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
+
+use crate::connector::binding_decode::AdmittedConnectorExecutionDeclaration;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(
@@ -92,7 +94,7 @@ pub(crate) trait NativeFragmentIngress: Send + Sync + 'static {
     fn ensure_connector_execution_binding(
         &self,
         execution_id: QueryExecutionId,
-        declaration: ConnectorExecutionDeclaration,
+        declaration: AdmittedConnectorExecutionDeclaration,
     ) -> EnsureConnectorExecutionBindingResult;
     fn retire_connector_execution_binding(
         &self,

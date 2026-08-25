@@ -3,9 +3,8 @@
 mod execution_binding;
 
 pub use execution_binding::{
-    ConnectorExecutionBindingDeclaration, ConnectorExecutionBindingKey,
-    ConnectorExecutionBindingProvider, ConnectorExecutionProviderKind,
     EnsureConnectorExecutionBindingOutcome, EnsureConnectorExecutionBindingRejection,
     EnsureConnectorExecutionBindingRejectionReason, EnsureConnectorExecutionBindingResult,
     RetireConnectorExecutionBindingOutcome, RetireConnectorExecutionBindingResult,
+    connector_execution_binding_declaration_digest,
 };

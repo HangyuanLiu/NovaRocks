@@ -1,201 +1,32 @@
-//! Central execution-binding declaration and typed control-plane outcomes.
-
-use std::fmt;
+//! Wire-level execution-binding helpers and typed control-plane outcomes.
 
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind, canonical, novarocks};
 
 const DECLARATION_DIGEST_DOMAIN: &[u8] = b"novarocks.connector.execution-binding-declaration.v1\0";
 const DECLARATION_MESSAGE_NAME: &str = "novarocks.ConnectorExecutionBindingDeclaration";
-const MAX_INSTANCE_ID_BYTES: usize = 128;
-const MAX_LOCAL_BINDING_BYTES: usize = 256;
 const MAX_SAFE_DETAIL_BYTES: usize = 512;
 const MAX_SAFE_FIELD_PATH_BYTES: usize = 256;
 
-/// Exact process-local generation key carried by an execution declaration.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ConnectorExecutionBindingKey {
-    instance_id: String,
-    incarnation: [u8; 16],
-}
-
-impl ConnectorExecutionBindingKey {
-    pub fn try_new(
-        instance_id: impl Into<String>,
-        incarnation: impl AsRef<[u8]>,
-    ) -> Result<Self, ProtocolError> {
-        let instance_id = instance_id.into();
-        validate_instance_id(
-            &instance_id,
-            FieldPath::root("connector_execution_binding").field("instance_id"),
-        )?;
-        let incarnation = parse_incarnation(
-            incarnation.as_ref(),
-            FieldPath::root("connector_execution_binding").field("incarnation"),
-        )?;
-        Ok(Self {
-            instance_id,
-            incarnation,
-        })
-    }
-
-    pub fn instance_id(&self) -> &str {
-        &self.instance_id
-    }
-
-    pub const fn incarnation(&self) -> [u8; 16] {
-        self.incarnation
-    }
-}
-
-/// Closed provider kind derived only from the declaration oneof.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ConnectorExecutionProviderKind {
-    Iceberg,
-    StarRocks,
-}
-
-/// Borrowed provider-specific declaration facts.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorExecutionBindingProvider<'a> {
-    Iceberg { access_binding: &'a str },
-    StarRocks { local_binding: &'a str },
-}
-
-impl ConnectorExecutionBindingProvider<'_> {
-    pub const fn kind(self) -> ConnectorExecutionProviderKind {
-        match self {
-            Self::Iceberg { .. } => ConnectorExecutionProviderKind::Iceberg,
-            Self::StarRocks { .. } => ConnectorExecutionProviderKind::StarRocks,
-        }
-    }
-}
-
-// Design: ADR-0104 (docs/adr/ADR-0104-typed-connector-execution-binding-declaration.md)
-/// Validated generated declaration root. It intentionally keeps no duplicate
-/// domain model and computes its digest from the Protocol-owned DTO.
-#[derive(Clone, PartialEq)]
-pub struct ConnectorExecutionBindingDeclaration {
-    raw: novarocks::ConnectorExecutionBindingDeclaration,
-}
-
-impl Eq for ConnectorExecutionBindingDeclaration {}
-
-impl ConnectorExecutionBindingDeclaration {
-    pub fn try_from_proto(
-        raw: novarocks::ConnectorExecutionBindingDeclaration,
-    ) -> Result<Self, ProtocolError> {
-        let root = FieldPath::root("connector_execution_binding");
-        validate_instance_id(&raw.instance_id, root.clone().field("instance_id"))?;
-        parse_incarnation(&raw.incarnation, root.clone().field("incarnation"))?;
-        validate_provider(raw.provider.as_ref(), root.field("provider"))?;
-        Ok(Self { raw })
-    }
-
-    pub fn iceberg(
-        instance_id: impl Into<String>,
-        incarnation: [u8; 16],
-        access_binding: impl Into<String>,
-    ) -> Result<Self, ProtocolError> {
-        Self::try_from_proto(novarocks::ConnectorExecutionBindingDeclaration {
-            instance_id: instance_id.into(),
-            incarnation: incarnation.to_vec(),
-            provider: Some(
-                novarocks::connector_execution_binding_declaration::Provider::Iceberg(
-                    novarocks::IcebergExecutionBindingDeclaration {
-                        access_binding: access_binding.into(),
-                    },
-                ),
-            ),
-        })
-    }
-
-    pub fn starrocks(
-        instance_id: impl Into<String>,
-        incarnation: [u8; 16],
-        local_binding: impl Into<String>,
-    ) -> Result<Self, ProtocolError> {
-        Self::try_from_proto(novarocks::ConnectorExecutionBindingDeclaration {
-            instance_id: instance_id.into(),
-            incarnation: incarnation.to_vec(),
-            provider: Some(
-                novarocks::connector_execution_binding_declaration::Provider::Starrocks(
-                    novarocks::StarRocksExecutionBindingDeclaration {
-                        local_binding: local_binding.into(),
-                    },
-                ),
-            ),
-        })
-    }
-
-    pub fn as_proto(&self) -> &novarocks::ConnectorExecutionBindingDeclaration {
-        &self.raw
-    }
-
-    pub fn into_proto(self) -> novarocks::ConnectorExecutionBindingDeclaration {
-        self.raw
-    }
-
-    pub fn binding_key(&self) -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
-            instance_id: self.raw.instance_id.clone(),
-            incarnation: self
-                .raw
-                .incarnation
-                .as_slice()
-                .try_into()
-                .expect("validated declaration has a 16-byte incarnation"),
-        }
-    }
-
-    pub fn provider_kind(&self) -> ConnectorExecutionProviderKind {
-        self.provider().kind()
-    }
-
-    pub fn provider(&self) -> ConnectorExecutionBindingProvider<'_> {
-        match self
-            .raw
-            .provider
-            .as_ref()
-            .expect("validated declaration has a provider variant")
-        {
-            novarocks::connector_execution_binding_declaration::Provider::Iceberg(value) => {
-                ConnectorExecutionBindingProvider::Iceberg {
-                    access_binding: &value.access_binding,
-                }
-            }
-            novarocks::connector_execution_binding_declaration::Provider::Starrocks(value) => {
-                ConnectorExecutionBindingProvider::StarRocks {
-                    local_binding: &value.local_binding,
-                }
-            }
-        }
-    }
-
-    pub fn digest(&self) -> Result<[u8; 32], ProtocolError> {
-        canonical::digest_message(
-            DECLARATION_DIGEST_DOMAIN,
-            DECLARATION_MESSAGE_NAME,
-            &self.raw,
+/// Computes the domain-separated canonical digest for the generated wire DTO.
+///
+/// The caller owns structural and domain validation. This helper deliberately
+/// accepts the generated message directly so Protocol does not become a second
+/// declaration-domain authority.
+pub fn connector_execution_binding_declaration_digest(
+    declaration: &novarocks::ConnectorExecutionBindingDeclaration,
+) -> Result<[u8; 32], ProtocolError> {
+    canonical::digest_message(
+        DECLARATION_DIGEST_DOMAIN,
+        DECLARATION_MESSAGE_NAME,
+        declaration,
+    )
+    .map_err(|error| {
+        ProtocolError::new(
+            FieldPath::root("connector_execution_binding"),
+            ProtocolErrorKind::InvalidValue,
+            format!("cannot canonicalize execution binding declaration: {error}"),
         )
-        .map_err(|error| {
-            ProtocolError::new(
-                FieldPath::root("connector_execution_binding"),
-                ProtocolErrorKind::InvalidValue,
-                format!("cannot canonicalize execution binding declaration: {error}"),
-            )
-        })
-    }
-}
-
-impl fmt::Debug for ConnectorExecutionBindingDeclaration {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ConnectorExecutionBindingDeclaration")
-            .field("instance_id", &self.raw.instance_id)
-            .field("incarnation", &"<16-byte-id>")
-            .field("provider_kind", &self.provider_kind())
-            .finish()
-    }
+    })
 }
 
 /// Closed Ensure rejection reason set validated at the Protocol boundary.
@@ -499,73 +330,6 @@ impl RetireConnectorExecutionBindingResult {
     }
 }
 
-fn validate_instance_id(value: &str, path: FieldPath) -> Result<(), ProtocolError> {
-    let bytes = value.as_bytes();
-    let valid = !bytes.is_empty()
-        && bytes.len() <= MAX_INSTANCE_ID_BYTES
-        && (bytes[0].is_ascii_lowercase() || bytes[0] == b'_')
-        && bytes[1..].iter().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
-        });
-    if valid {
-        Ok(())
-    } else {
-        Err(ProtocolError::new(
-            path,
-            ProtocolErrorKind::InvalidValue,
-            "instance ID must already be canonical lowercase ASCII",
-        ))
-    }
-}
-
-fn parse_incarnation(value: &[u8], path: FieldPath) -> Result<[u8; 16], ProtocolError> {
-    value.try_into().map_err(|_| {
-        ProtocolError::new(
-            path,
-            ProtocolErrorKind::OutOfRange,
-            "connector execution binding incarnation must be exactly 16 bytes",
-        )
-    })
-}
-
-fn validate_provider(
-    provider: Option<&novarocks::connector_execution_binding_declaration::Provider>,
-    path: FieldPath,
-) -> Result<(), ProtocolError> {
-    match provider {
-        Some(novarocks::connector_execution_binding_declaration::Provider::Iceberg(value)) => {
-            validate_local_binding(
-                &value.access_binding,
-                path.field("iceberg").field("access_binding"),
-                "Iceberg access binding",
-            )
-        }
-        Some(novarocks::connector_execution_binding_declaration::Provider::Starrocks(value)) => {
-            validate_local_binding(
-                &value.local_binding,
-                path.field("starrocks").field("local_binding"),
-                "StarRocks local binding",
-            )
-        }
-        None => Err(ProtocolError::new(
-            path,
-            ProtocolErrorKind::MissingField,
-            "connector execution binding provider is required",
-        )),
-    }
-}
-
-fn validate_local_binding(value: &str, path: FieldPath, label: &str) -> Result<(), ProtocolError> {
-    if value.is_empty() || value.len() > MAX_LOCAL_BINDING_BYTES || !value.is_ascii() {
-        return Err(ProtocolError::new(
-            path,
-            ProtocolErrorKind::InvalidValue,
-            format!("{label} must be non-empty ASCII and at most {MAX_LOCAL_BINDING_BYTES} bytes"),
-        ));
-    }
-    Ok(())
-}
-
 fn validate_bounded_text(
     value: &str,
     max_bytes: usize,
@@ -592,132 +356,79 @@ mod tests {
 
     use super::*;
 
-    fn declaration() -> ConnectorExecutionBindingDeclaration {
-        ConnectorExecutionBindingDeclaration::iceberg("catalog.analytics", [7; 16], "local-iceberg")
-            .expect("valid declaration")
-    }
-
-    #[test]
-    fn validates_a_typed_declaration_without_normalizing_the_wire_identity() {
-        let declaration = declaration();
-        assert_eq!(declaration.binding_key().instance_id(), "catalog.analytics");
-        assert_eq!(declaration.binding_key().incarnation(), [7; 16]);
-        assert_eq!(
-            declaration.provider_kind(),
-            ConnectorExecutionProviderKind::Iceberg
-        );
-        assert_eq!(
-            declaration.provider(),
-            ConnectorExecutionBindingProvider::Iceberg {
-                access_binding: "local-iceberg"
-            }
-        );
-
-        let error = ConnectorExecutionBindingDeclaration::iceberg("MyCatalog", [7; 16], "local")
-            .expect_err("wire identity must not be normalized");
-        assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
-        assert_eq!(
-            error.path().to_string(),
-            "connector_execution_binding.instance_id"
-        );
-    }
-
-    #[test]
-    fn rejects_missing_variant_bad_incarnation_and_invalid_binding_before_host_admission() {
-        let missing_provider = ConnectorExecutionBindingDeclaration::try_from_proto(
-            novarocks::ConnectorExecutionBindingDeclaration {
-                instance_id: "catalog".into(),
-                incarnation: vec![1; 16],
-                provider: None,
-            },
-        )
-        .expect_err("provider is required");
-        assert_eq!(missing_provider.kind(), ProtocolErrorKind::MissingField);
-
-        let short_incarnation = ConnectorExecutionBindingDeclaration::try_from_proto(
-            novarocks::ConnectorExecutionBindingDeclaration {
-                instance_id: "catalog".into(),
-                incarnation: vec![1; 15],
-                provider: Some(
-                    novarocks::connector_execution_binding_declaration::Provider::Iceberg(
-                        novarocks::IcebergExecutionBindingDeclaration {
-                            access_binding: "local".into(),
-                        },
-                    ),
+    fn declaration() -> novarocks::ConnectorExecutionBindingDeclaration {
+        novarocks::ConnectorExecutionBindingDeclaration {
+            instance_id: "catalog.analytics".into(),
+            incarnation: vec![7; 16],
+            provider: Some(
+                novarocks::connector_execution_binding_declaration::Provider::Iceberg(
+                    novarocks::IcebergExecutionBindingDeclaration {
+                        access_binding: "local-iceberg".into(),
+                    },
                 ),
-            },
-        )
-        .expect_err("incarnation length is structural");
-        assert_eq!(short_incarnation.kind(), ProtocolErrorKind::OutOfRange);
-
-        let empty_binding = ConnectorExecutionBindingDeclaration::iceberg("catalog", [1; 16], "")
-            .expect_err("empty binding is invalid");
-        assert_eq!(empty_binding.kind(), ProtocolErrorKind::InvalidValue);
-
-        let oversized_binding = ConnectorExecutionBindingDeclaration::starrocks(
-            "catalog",
-            [1; 16],
-            "x".repeat(MAX_LOCAL_BINDING_BYTES + 1),
-        )
-        .expect_err("binding bound is structural");
-        assert_eq!(oversized_binding.kind(), ProtocolErrorKind::InvalidValue);
+            ),
+        }
     }
 
     #[test]
-    fn declaration_digest_is_domain_separated_and_covers_presence_and_variant() {
+    fn wire_declaration_digest_is_domain_separated_and_covers_presence_and_variant() {
         const ICEBERG_DECLARATION_DIGEST_GOLDEN_HEX: &str =
             "c443163cfd63a77ca3c489f407fee2e4ad08e97cd5d9d6ffdc7bd3ca596c5ee3";
 
         let iceberg = declaration();
         let same = declaration();
-        let starrocks = ConnectorExecutionBindingDeclaration::starrocks(
-            "catalog.analytics",
-            [7; 16],
-            "local-starrocks",
-        )
-        .expect("valid starrocks declaration");
-        let changed_binding = ConnectorExecutionBindingDeclaration::iceberg(
-            "catalog.analytics",
-            [7; 16],
-            "different-binding",
-        )
-        .expect("valid declaration");
-        let changed_instance = ConnectorExecutionBindingDeclaration::iceberg(
-            "catalog.replacement",
-            [7; 16],
-            "local-iceberg",
-        )
-        .expect("valid declaration");
-        let changed_incarnation = ConnectorExecutionBindingDeclaration::iceberg(
-            "catalog.analytics",
-            [8; 16],
-            "local-iceberg",
-        )
-        .expect("valid declaration");
+        let starrocks = novarocks::ConnectorExecutionBindingDeclaration {
+            instance_id: "catalog.analytics".into(),
+            incarnation: vec![7; 16],
+            provider: Some(
+                novarocks::connector_execution_binding_declaration::Provider::Starrocks(
+                    novarocks::StarRocksExecutionBindingDeclaration {
+                        local_binding: "local-starrocks".into(),
+                    },
+                ),
+            ),
+        };
+        let changed_binding = novarocks::ConnectorExecutionBindingDeclaration {
+            provider: Some(
+                novarocks::connector_execution_binding_declaration::Provider::Iceberg(
+                    novarocks::IcebergExecutionBindingDeclaration {
+                        access_binding: "different-binding".into(),
+                    },
+                ),
+            ),
+            ..declaration()
+        };
+        let changed_instance = novarocks::ConnectorExecutionBindingDeclaration {
+            instance_id: "catalog.replacement".into(),
+            ..declaration()
+        };
+        let changed_incarnation = novarocks::ConnectorExecutionBindingDeclaration {
+            incarnation: vec![8; 16],
+            ..declaration()
+        };
 
         assert_eq!(
-            iceberg.digest().expect("digest"),
-            same.digest().expect("digest")
+            connector_execution_binding_declaration_digest(&iceberg).expect("digest"),
+            connector_execution_binding_declaration_digest(&same).expect("digest")
         );
         assert_ne!(
-            iceberg.digest().expect("digest"),
-            starrocks.digest().expect("digest")
+            connector_execution_binding_declaration_digest(&iceberg).expect("digest"),
+            connector_execution_binding_declaration_digest(&starrocks).expect("digest")
         );
         assert_ne!(
-            iceberg.digest().expect("digest"),
-            changed_binding.digest().expect("digest")
+            connector_execution_binding_declaration_digest(&iceberg).expect("digest"),
+            connector_execution_binding_declaration_digest(&changed_binding).expect("digest")
         );
         assert_ne!(
-            iceberg.digest().expect("digest"),
-            changed_instance.digest().expect("digest")
+            connector_execution_binding_declaration_digest(&iceberg).expect("digest"),
+            connector_execution_binding_declaration_digest(&changed_instance).expect("digest")
         );
         assert_ne!(
-            iceberg.digest().expect("digest"),
-            changed_incarnation.digest().expect("digest")
+            connector_execution_binding_declaration_digest(&iceberg).expect("digest"),
+            connector_execution_binding_declaration_digest(&changed_incarnation).expect("digest")
         );
         assert_eq!(
-            iceberg
-                .digest()
+            connector_execution_binding_declaration_digest(&iceberg)
                 .expect("digest")
                 .iter()
                 .map(|byte| format!("{byte:02x}"))

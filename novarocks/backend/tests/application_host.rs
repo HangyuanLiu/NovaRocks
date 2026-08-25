@@ -3,7 +3,8 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 use novarocks_backend::{
-    BackendApplicationHost, BackendDataRuntime, BackendServerConfig, QueryLifecycleRegistryConfig,
+    BackendApplicationErrorKind, BackendApplicationHost, BackendDataRuntime, BackendServerConfig,
+    QueryLifecycleRegistryConfig,
 };
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
@@ -81,26 +82,17 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
 }
 
 #[test]
-fn host_preserves_native_backend_ready_marker() {
+fn host_rejects_an_unsealed_connector_installer_set() {
     let grpc_port = unused_port();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(1)
         .build()
         .expect("build Backend application host runtime");
-    let host = BackendApplicationHost::open(
+    let error = BackendApplicationHost::open(
         backend_config(grpc_port, grpc_port),
         BackendDataRuntime::new(runtime.handle().clone()),
     )
-    .expect("open native backend host");
-
-    assert_eq!(
-        host.ready_marker(),
-        format!(
-            "NOVAROCKS_READY role=be grpc_port={grpc_port} advertise_host=127.0.0.1 pid={}",
-            std::process::id()
-        )
-    );
-
-    host.shutdown().expect("shutdown native backend host");
+    .expect_err("unsealed connector installer set must fail startup");
+    assert_eq!(error.kind(), BackendApplicationErrorKind::Configuration);
 }

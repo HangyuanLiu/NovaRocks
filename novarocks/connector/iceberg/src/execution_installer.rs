@@ -24,10 +24,10 @@ use std::time::Instant;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
-    ConnectorExecutionProviderKind, ConnectorInstanceId, ConnectorOpenReaderRequest,
-    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
-    ConnectorPreparedScanUnitSet, ConnectorProviderId, ConnectorReadExecution,
-    ConnectorRequestContext, ConnectorScanUnitDomainFacts, ConnectorSplit,
+    ConnectorInstanceId, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
+    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
+    ConnectorProviderId, ConnectorReadExecution, ConnectorRequestContext,
+    ConnectorScanUnitDomainFacts, ConnectorSplit,
 };
 
 use crate::access_binding::IcebergReadBinding;
@@ -69,10 +69,6 @@ impl IcebergConnectorInstaller {
 }
 
 impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
-    fn provider_kind(&self) -> ConnectorExecutionProviderKind {
-        ConnectorExecutionProviderKind::Iceberg
-    }
-
     fn provider_id(&self) -> &ConnectorProviderId {
         &self.provider_id
     }
@@ -89,7 +85,7 @@ impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
                 "Iceberg declaration access binding does not match BE startup binding",
             ));
         }
-        let key = ConnectorExecutionBindingKey::from(declaration);
+        let key = declaration.binding_key().clone();
         ConnectorExecutionBinding::try_new_capabilities(
             self.provider_id.clone(),
             key.clone(),

@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use crate::connector::ConnectorRegistry;
+use crate::connector::{ConnectorRegistry, binding_decode::AdmittedConnectorExecutionDeclaration};
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use crate::runtime::sink_commit::{BackendSinkCommitPort, ConfiguredBackendSinkCommitPort};
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntime;
@@ -38,9 +38,7 @@ use novarocks_execution::runtime::fragment::{
 };
 use novarocks_execution::runtime::profile::Profiler;
 use novarocks_protocol::lifecycle::{QueryExecutionId, StageFragment};
-use novarocks_spi::connector::{
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, WriteCommitEvidenceLimits,
-};
+use novarocks_spi::connector::{ConnectorExecutionBindingKey, WriteCommitEvidenceLimits};
 use tracing::error;
 
 use super::control::{FragmentControlHandle, FragmentControlRegistry};
@@ -633,7 +631,7 @@ impl NativeFragmentIngress for NativeFragmentService {
     fn ensure_connector_execution_binding(
         &self,
         execution_id: QueryExecutionId,
-        declaration: ConnectorExecutionDeclaration,
+        declaration: AdmittedConnectorExecutionDeclaration,
     ) -> novarocks_protocol::provider::EnsureConnectorExecutionBindingResult {
         self.execution_host.ensure(execution_id, &declaration)
     }
