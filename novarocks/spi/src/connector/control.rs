@@ -32,7 +32,8 @@ use super::{
     ConnectorScanHandle, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
     ConnectorStagedCreate, ConnectorStagedCreateLease, ConnectorStagedPublicationRecovery,
     ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
-    ConnectorTableHandle, ConnectorViewMetadata, ConnectorWriteControl, ConnectorWriteLease,
+    ConnectorTableHandle, ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease,
+    ConnectorViewMetadata, ConnectorWriteControl, ConnectorWriteLease,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -235,6 +236,7 @@ pub struct ConnectorControlBinding {
     distributed_rewrite: Option<Arc<dyn ConnectorDistributedRewrite>>,
     cleanup_maintenance: Option<Arc<dyn ConnectorCleanupMaintenance>>,
     staged_create: Option<Arc<dyn ConnectorStagedCreate>>,
+    unanchored_ctas_cleanup: Option<Arc<dyn ConnectorUnanchoredCtasCleanup>>,
     ctas_staged_publication: Option<Arc<dyn ConnectorCtasStagedPublication>>,
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
@@ -425,6 +427,7 @@ impl ConnectorControlBinding {
             distributed_rewrite: None,
             cleanup_maintenance: None,
             staged_create: None,
+            unanchored_ctas_cleanup: None,
             ctas_staged_publication: None,
             write,
             statistics,
@@ -666,6 +669,10 @@ impl ConnectorControlBinding {
         self.staged_create.as_ref()
     }
 
+    pub fn unanchored_ctas_cleanup(&self) -> Option<&Arc<dyn ConnectorUnanchoredCtasCleanup>> {
+        self.unanchored_ctas_cleanup.as_ref()
+    }
+
     pub fn ctas_staged_publication(&self) -> Option<&Arc<dyn ConnectorCtasStagedPublication>> {
         self.ctas_staged_publication.as_ref()
     }
@@ -718,6 +725,27 @@ impl ConnectorControlBinding {
             )?;
         }
         self.staged_publication_recovery = recovery;
+        Ok(self)
+    }
+
+    /// Attaches the catalog-wide CTAS staging-root collector to this exact
+    /// generation. The capability is independent from table-owned cleanup:
+    /// before a CREATE publishes its target, no table location can anchor the
+    /// staged root.
+    pub fn try_with_unanchored_ctas_cleanup(
+        mut self,
+        capability: Option<Arc<dyn ConnectorUnanchoredCtasCleanup>>,
+    ) -> Result<Self, ConnectorError> {
+        if let Some(capability) = &capability
+            && (capability.descriptor() != &self.descriptor
+                || capability.incarnation() != self.incarnation)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "unanchored CTAS cleanup capability owner does not match its control binding generation",
+            ));
+        }
+        self.unanchored_ctas_cleanup = capability;
         Ok(self)
     }
 
@@ -1019,6 +1047,32 @@ impl ConnectorControlPlanningLease {
         };
         let retained_planning_lease = self.clone();
         ConnectorStagedCreateLease::new(owner, capability, move || drop(retained_planning_lease))
+    }
+
+    /// Derive the catalog-wide unanchored CTAS cleanup capability from this
+    /// planning generation. It is retained alongside staged-create so a
+    /// retired connector generation cannot use a newer catalog's warehouse.
+    pub fn derive_unanchored_ctas_cleanup_lease(
+        &self,
+    ) -> Result<ConnectorUnanchoredCtasCleanupLease, ConnectorError> {
+        let capability = self
+            .binding
+            .unanchored_ctas_cleanup()
+            .cloned()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "connector control generation has no unanchored CTAS cleanup capability",
+                )
+            })?;
+        let owner = ConnectorExecutionBindingKey {
+            instance_id: self.binding.descriptor().instance_id.clone(),
+            incarnation: self.binding.incarnation(),
+        };
+        let retained_planning_lease = self.clone();
+        ConnectorUnanchoredCtasCleanupLease::new(owner, capability, move || {
+            drop(retained_planning_lease)
+        })
     }
 
     /// Derive the exact-generation fenced CTAS publication lease. This is the

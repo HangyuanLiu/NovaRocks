@@ -53,6 +53,8 @@ pub mod staged_create;
 pub mod statistics;
 #[path = "catalog_control/type_mapping.rs"]
 pub(crate) mod type_mapping;
+#[path = "catalog_control/unanchored_ctas_cleanup.rs"]
+pub(crate) mod unanchored_ctas_cleanup;
 #[path = "catalog_control/views.rs"]
 pub(crate) mod views;
 

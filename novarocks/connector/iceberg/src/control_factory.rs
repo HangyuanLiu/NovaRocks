@@ -29,6 +29,7 @@ use crate::catalog_control::cleanup_maintenance::IcebergCleanupMaintenanceAdapte
 use crate::catalog_control::data_mutation::IcebergDataMutationAdapter;
 use crate::catalog_control::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
 use crate::catalog_control::staged_create::IcebergStagedCreateAdapter;
+use crate::catalog_control::unanchored_ctas_cleanup::IcebergUnanchoredCtasCleanupAdapter;
 use crate::commit::IcebergWriteControl;
 use crate::control_provider::IcebergControlProvider;
 use crate::control_runtime::IcebergControlRuntime;
@@ -163,6 +164,15 @@ impl ConnectorControlFactory for IcebergControlFactory {
         } else {
             None
         };
+        let unanchored_ctas_cleanup = if unpublished.runtime.rest_catalog().is_some() {
+            Some(Arc::new(IcebergUnanchoredCtasCleanupAdapter::try_new(
+                descriptor.clone(),
+                incarnation,
+                Arc::clone(&unpublished.runtime),
+            )?))
+        } else {
+            None
+        };
         // One owner implements both MV control facets: fencing and attempt
         // discovery share the provider, the stable resource vocabulary, and the
         // same freshness requirement.
@@ -184,6 +194,9 @@ impl ConnectorControlFactory for IcebergControlFactory {
                 Some(write_control),
                 Some(provider.clone()),
             )?
+            .try_with_unanchored_ctas_cleanup(unanchored_ctas_cleanup.map(|capability| {
+                capability as Arc<dyn novarocks_spi::connector::ConnectorUnanchoredCtasCleanup>
+            }))?
             .try_with_staged_publication_recovery(Some(provider.clone()))?
             .try_with_historical_maintenance_recovery(Some(Arc::new(
                 crate::catalog_control::historical_maintenance_recovery::IcebergHistoricalMaintenanceRecovery::new(

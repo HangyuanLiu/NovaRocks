@@ -516,6 +516,35 @@ pub struct ConnectorCtasUnanchoredCleanupRequest {
     pub provenance: ConnectorCtasUnanchoredProvenance,
 }
 
+/// Catalog-wide discovery input for the deterministic CTAS staging namespace.
+/// It carries the same age boundary as exact deletion, so a provider cannot
+/// list young roots and leave filtering to a later, potentially skewed owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorCtasUnanchoredDiscoveryRequest {
+    pub owner: ConnectorExecutionBindingKey,
+    pub warehouse_root: Arc<str>,
+    pub cutoff_ms: i64,
+}
+
+impl ConnectorCtasUnanchoredDiscoveryRequest {
+    pub fn try_new(
+        owner: ConnectorExecutionBindingKey,
+        warehouse_root: Arc<str>,
+        cutoff_ms: i64,
+    ) -> Result<Self, ConnectorError> {
+        if warehouse_root.trim_end_matches('/').is_empty() || cutoff_ms <= 0 {
+            return Err(invalid(
+                "unanchored CTAS discovery requires an explicit warehouse root and positive cutoff",
+            ));
+        }
+        Ok(Self {
+            owner,
+            warehouse_root,
+            cutoff_ms,
+        })
+    }
+}
+
 impl ConnectorCtasUnanchoredCleanupRequest {
     pub fn try_new(
         owner: ConnectorExecutionBindingKey,
@@ -556,12 +585,91 @@ pub enum ConnectorCtasUnanchoredCleanupOutcome {
 pub trait ConnectorUnanchoredCtasCleanup: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn incarnation(&self) -> ConnectorInstanceIncarnation;
+    fn warehouse_root(&self) -> Result<Arc<str>, ConnectorError>;
+
+    /// Enumerate only provenance sidecars under the fixed warehouse prefix.
+    /// Missing, malformed, young, or unverifiable roots are deliberately not
+    /// candidates; the caller has no durable recovery index to compensate.
+    fn discover_unanchored_ctas(
+        &self,
+        request: ConnectorCtasUnanchoredDiscoveryRequest,
+        context: ConnectorRequestContext,
+    ) -> Result<Vec<ConnectorCtasUnanchoredProvenance>, ConnectorError>;
 
     fn inspect_then_delete_unanchored_ctas(
         &self,
         request: ConnectorCtasUnanchoredCleanupRequest,
         context: ConnectorRequestContext,
     ) -> Result<ConnectorCtasUnanchoredCleanupOutcome, ConnectorError>;
+}
+
+/// Lease for the catalog-wide CTAS staging namespace. Unlike a staged-create
+/// lease it has no statement-local operation registry: the caller supplies a
+/// fully frozen provenance record and the provider must independently re-read
+/// both the target and sidecar before deleting one exact root.
+#[derive(Clone)]
+pub struct ConnectorUnanchoredCtasCleanupLease {
+    owner: ConnectorExecutionBindingKey,
+    capability: Arc<dyn ConnectorUnanchoredCtasCleanup>,
+    _release: Arc<StagedCreateLeaseRelease>,
+}
+
+impl ConnectorUnanchoredCtasCleanupLease {
+    pub fn new(
+        owner: ConnectorExecutionBindingKey,
+        capability: Arc<dyn ConnectorUnanchoredCtasCleanup>,
+        release: impl FnOnce() + Send + Sync + 'static,
+    ) -> Result<Self, ConnectorError> {
+        if capability.descriptor().instance_id != owner.instance_id
+            || capability.incarnation() != owner.incarnation
+        {
+            return Err(invalid(
+                "unanchored CTAS cleanup capability does not match its lease generation",
+            ));
+        }
+        Ok(Self {
+            owner,
+            capability,
+            _release: Arc::new(StagedCreateLeaseRelease {
+                release: Mutex::new(Some(Box::new(release))),
+            }),
+        })
+    }
+
+    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+        &self.owner
+    }
+
+    pub fn warehouse_root(&self) -> Result<Arc<str>, ConnectorError> {
+        self.capability.warehouse_root()
+    }
+
+    pub fn inspect_then_delete_unanchored_ctas(
+        &self,
+        request: ConnectorCtasUnanchoredCleanupRequest,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorCtasUnanchoredCleanupOutcome, ConnectorError> {
+        if request.owner != self.owner {
+            return Err(invalid(
+                "unanchored CTAS cleanup request has a foreign owner",
+            ));
+        }
+        self.capability
+            .inspect_then_delete_unanchored_ctas(request, context)
+    }
+
+    pub fn discover_unanchored_ctas(
+        &self,
+        request: ConnectorCtasUnanchoredDiscoveryRequest,
+        context: ConnectorRequestContext,
+    ) -> Result<Vec<ConnectorCtasUnanchoredProvenance>, ConnectorError> {
+        if request.owner != self.owner {
+            return Err(invalid(
+                "unanchored CTAS discovery request has a foreign owner",
+            ));
+        }
+        self.capability.discover_unanchored_ctas(request, context)
+    }
 }
 
 #[derive(Clone)]

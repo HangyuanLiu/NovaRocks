@@ -26,6 +26,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
@@ -34,17 +35,18 @@ use novarocks_spi::connector::{
     ConnectorCtasOperationId, ConnectorCtasPublicationFence, ConnectorCtasPublicationFenceReceipt,
     ConnectorCtasPublicationProof, ConnectorCtasPublishRequest, ConnectorCtasPublishResult,
     ConnectorCtasStageRequest, ConnectorCtasStagedLocator, ConnectorCtasStagedPublicationLease,
-    ConnectorCtasStagedTableDefinition, ConnectorHistoricalCtasCleanupReceipt,
+    ConnectorCtasStagedTableDefinition, ConnectorCtasUnanchoredCleanupRequest,
+    ConnectorCtasUnanchoredDiscoveryRequest, ConnectorHistoricalCtasCleanupReceipt,
     ConnectorHistoricalCtasCleanupRequest, ConnectorHistoricalCtasDescriptor,
     ConnectorHistoricalCtasObservation, ConnectorMutationFailure, ConnectorPartitionTransform,
     ConnectorStagedCreateLease, ConnectorStagedCreatePrepareOutcome,
     ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublishOutcome,
     ConnectorStagedCreatePublishRequest, ConnectorStagedTableHandle,
-    ConnectorStagedWritePlanningRequest, ConnectorWriteAdmissionPurpose,
-    ConnectorWriteFieldRequest, ConnectorWriteInputRequest, ConnectorWriteIntent,
-    ConnectorWriteLease, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
-    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, CreatePolicy,
-    ExternalMutationEvidence, LakePublicationId,
+    ConnectorStagedWritePlanningRequest, ConnectorUnanchoredCtasCleanupLease,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
+    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationCompletion,
+    ConnectorWriteOperationId, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+    CreatePolicy, ExternalMutationEvidence, LakePublicationId,
 };
 use novarocks_user_error::UserError;
 
@@ -518,14 +520,6 @@ pub enum CtasWriteOutcome {
 /// One-to-one core capability consumed by the frontend CTAS application
 /// owner. It is intentionally not a generic connector DML facade.
 pub trait CtasEngine: Send + Sync {
-    /// Standard CTAS is admissible only when its control generation can
-    /// enumerate and exactly retire warehouse-owned roots for absent targets.
-    /// The default is deliberately closed until that catalog capability is
-    /// wired end-to-end.
-    fn supports_unanchored_ctas_cleanup(&self) -> bool {
-        false
-    }
-
     /// Crash-only standard staged-create preflight.  The standard path is
     /// intentionally separate from the legacy fenced surface while T50 still
     /// compiles the historical recovery implementation.
@@ -991,6 +985,7 @@ pub(crate) struct CoreCtasTargetSession {
 struct CoreStandardCtasTargetPreflight {
     target: crate::catalog_application::resolver::TargetBackend,
     lease: ConnectorStagedCreateLease,
+    _unanchored_ctas_cleanup_lease: novarocks_spi::connector::ConnectorUnanchoredCtasCleanupLease,
     write_lease: ConnectorWriteLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
 }
@@ -1762,6 +1757,55 @@ fn downcast_standard_preflight(
         })
 }
 
+fn sweep_unanchored_ctas_roots(
+    kernel: &DmlExecutionKernel,
+    lease: &ConnectorUnanchoredCtasCleanupLease,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), CtasFailure> {
+    let policy = kernel.lake_publication_runtime_policy().ok_or_else(|| CtasFailure {
+        kind: CtasFailureKind::Unsupported,
+        message: "standard CTAS is unsupported until the shared lake publication GC policy is installed"
+            .to_string(),
+        user_error: None,
+    })?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| internal_failure("system clock is before Unix epoch"))?;
+    let now_ms = i64::try_from(now.as_millis())
+        .map_err(|_| internal_failure("system clock exceeds i64 milliseconds"))?;
+    let safe_age_ms = i64::try_from(policy.safe_gc_age().as_millis())
+        .map_err(|_| internal_failure("lake publication safe GC age exceeds i64 milliseconds"))?;
+    let cutoff_ms = now_ms
+        .checked_sub(safe_age_ms)
+        .ok_or_else(|| internal_failure("lake publication safe GC cutoff underflows"))?;
+    let warehouse_root = lease.warehouse_root().map_err(connector_failure)?;
+    let discovery = ConnectorCtasUnanchoredDiscoveryRequest::try_new(
+        lease.owner().clone(),
+        warehouse_root.clone(),
+        cutoff_ms,
+    )
+    .map_err(connector_failure)?;
+    let candidates = lease
+        .discover_unanchored_ctas(discovery, context.clone())
+        .map_err(connector_failure)?;
+    for provenance in candidates {
+        let cleanup = ConnectorCtasUnanchoredCleanupRequest::try_new(
+            lease.owner().clone(),
+            warehouse_root.clone(),
+            cutoff_ms,
+            provenance,
+        )
+        .map_err(connector_failure)?;
+        // An exact delete whose acknowledgement is uncertain stays an aged
+        // residue for a later GC pass. It never grants this new CTAS attempt
+        // authority to reconcile, retry, or infer the old publication.
+        let _ = lease
+            .inspect_then_delete_unanchored_ctas(cleanup, context.clone())
+            .map_err(connector_failure)?;
+    }
+    Ok(())
+}
+
 fn downcast_catalog_action(
     action: &dyn CtasPreparedCatalogAction,
 ) -> Result<&CoreCtasCatalogAction, CtasFailure> {
@@ -2084,22 +2128,6 @@ impl CtasEngine for DmlExecutionKernel {
             current_database,
         )
         .map_err(internal_failure)?;
-        // A standard staged-create commit can publish a table atomically, but
-        // an absent target leaves its staging root outside every table-owned
-        // cleanup domain. Until the control generation proves a catalog-wide
-        // unanchored-root enumerator and exact cleanup capability, admitting a
-        // CTAS would create crash residue that no correct GC can discover.
-        // Reject before source planning, writer reservation, or stage-create.
-        if !self.supports_unanchored_ctas_cleanup() {
-            return Err(CtasFailure {
-                kind: CtasFailureKind::Unsupported,
-                message: format!(
-                    "standard CTAS for {}.{} is unsupported until unanchored staging-root GC is available",
-                    target.namespace, target.table
-                ),
-                user_error: None,
-            });
-        }
         let context =
             crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))
                 .map_err(internal_failure)?;
@@ -2115,12 +2143,18 @@ impl CtasEngine for DmlExecutionKernel {
         let lease = planning
             .derive_staged_create_lease()
             .map_err(connector_failure)?;
+        let unanchored_ctas_cleanup_lease = planning
+            .derive_unanchored_ctas_cleanup_lease()
+            .map_err(connector_failure)?;
         let write_lease = planning.derive_write_lease().map_err(connector_failure)?;
-        if lease.owner() != write_lease.binding_key() {
+        if lease.owner() != write_lease.binding_key()
+            || lease.owner() != unanchored_ctas_cleanup_lease.owner()
+        {
             return Err(internal_failure(
-                "standard CTAS staged-create and writer leases do not share one exact generation",
+                "standard CTAS staged-create, cleanup, and writer leases do not share one exact generation",
             ));
         }
+        sweep_unanchored_ctas_roots(self, &unanchored_ctas_cleanup_lease, context.clone())?;
         let exists = crate::connector::metadata_table_exists_with_planning_lease(
             planning.clone(),
             context.clone(),
@@ -2151,6 +2185,7 @@ impl CtasEngine for DmlExecutionKernel {
                         handle: Arc::new(CoreStandardCtasTargetPreflight {
                             target,
                             lease,
+                            _unanchored_ctas_cleanup_lease: unanchored_ctas_cleanup_lease,
                             write_lease,
                             context,
                         }),

@@ -168,6 +168,8 @@ pub struct DmlExecutionKernel {
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
+    lake_publication_runtime_policy:
+        Option<crate::common::admitted_query_context::LakePublicationRuntimePolicy>,
 }
 
 impl DmlExecutionKernel {
@@ -186,7 +188,16 @@ impl DmlExecutionKernel {
             unified_statistics,
             mv_storage_observation,
             query_execution,
+            lake_publication_runtime_policy: None,
         }
+    }
+
+    pub fn with_lake_publication_runtime_policy(
+        mut self,
+        policy: crate::common::admitted_query_context::LakePublicationRuntimePolicy,
+    ) -> Self {
+        self.lake_publication_runtime_policy = Some(policy);
+        self
     }
 
     pub(crate) fn catalog_service(&self) -> &Arc<QueryCatalogService> {
@@ -211,6 +222,12 @@ impl DmlExecutionKernel {
 
     pub(crate) fn query_execution(&self) -> &QueryExecutionService {
         &self.query_execution
+    }
+
+    pub(crate) fn lake_publication_runtime_policy(
+        &self,
+    ) -> Option<crate::common::admitted_query_context::LakePublicationRuntimePolicy> {
+        self.lake_publication_runtime_policy
     }
 }
 

@@ -310,6 +310,7 @@ pub fn build_frontend_query_session_factory(
         unified_statistics,
         mv_storage_observation,
         query_execution.clone(),
+        host.lake_publication_runtime_policy(),
     ));
     host.dml_service()
         .install_local_catalog(Arc::clone(&catalog_service));

@@ -149,6 +149,8 @@ pub struct DmlEnginePorts {
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
+    lake_publication_runtime_policy:
+        crate::common::admitted_query_context::LakePublicationRuntimePolicy,
 }
 
 impl DmlEnginePorts {
@@ -160,6 +162,7 @@ impl DmlEnginePorts {
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
+        lake_publication_runtime_policy: crate::common::admitted_query_context::LakePublicationRuntimePolicy,
     ) -> Self {
         Self {
             catalog_service,
@@ -168,6 +171,7 @@ impl DmlEnginePorts {
             unified_statistics,
             mv_storage_observation,
             query_execution,
+            lake_publication_runtime_policy,
         }
     }
 
@@ -180,6 +184,7 @@ impl DmlEnginePorts {
             Arc::clone(&self.mv_storage_observation),
             self.query_execution.clone(),
         )
+        .with_lake_publication_runtime_policy(self.lake_publication_runtime_policy)
     }
 }
 

@@ -23,14 +23,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorColumnDefinition, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorInstanceDescriptor, ConnectorInstanceIncarnation, ConnectorMutationFailure,
-    ConnectorMutationFailureKind, ConnectorPartitionTransform, ConnectorRequestContext,
-    ConnectorStagedCreate, ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,
+    ConnectorColumnDefinition, ConnectorCtasUnanchoredProvenance, ConnectorError,
+    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
+    ConnectorInstanceIncarnation, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorPartitionTransform, ConnectorRequestContext, ConnectorStagedCreate,
+    ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,
     ConnectorStagedCreateOperationId, ConnectorStagedCreatePrepareOutcome,
     ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublishOutcome,
     ConnectorStagedCreatePublishRequest, ConnectorStagedCreateReceipt,
@@ -59,6 +60,22 @@ const CTAS_PROVENANCE_TARGET: &str = "novarocks.ctas.target";
 const CTAS_PROVENANCE_EXPECTED_ABSENT: &str = "novarocks.ctas.expected-absent";
 const CTAS_PROVENANCE_TABLE_UUID: &str = "novarocks.ctas.table-uuid";
 const CTAS_STAGING_NAMESPACE: &str = "_novarocks/ctas-staging/v1";
+const CTAS_UNANCHORED_PROVENANCE_FILE: &str = "_novarocks.ctas.provenance.v1.json";
+const CTAS_UNANCHORED_PROVENANCE_VERSION: u16 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UnanchoredCtasProvenanceFileV1 {
+    version: u16,
+    publication_id: String,
+    catalog: String,
+    namespace: String,
+    table: String,
+    expected_absent: bool,
+    staged_table_uuid: String,
+    created_at_ms: i64,
+    digest: [u8; 32],
+}
 
 #[derive(Clone)]
 pub(crate) struct RestStagedTableCreate {
@@ -239,6 +256,96 @@ pub(crate) fn prepare_rest_staged_table(
         table,
         initialization_updates,
     })
+}
+
+fn now_ms() -> Result<i64, ConnectorError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| unavailable("system clock is before Unix epoch"))?;
+    i64::try_from(now.as_millis()).map_err(|_| unavailable("system clock exceeds i64 milliseconds"))
+}
+
+pub(crate) fn unanchored_ctas_provenance_location(
+    table_location: &str,
+) -> Result<String, ConnectorError> {
+    let root = table_location
+        .strip_suffix("/table")
+        .ok_or_else(|| invalid("CTAS staging location does not end in /table"))?;
+    Ok(format!("{root}/{CTAS_UNANCHORED_PROVENANCE_FILE}"))
+}
+
+pub(crate) fn decode_unanchored_ctas_provenance(
+    bytes: &[u8],
+) -> Result<ConnectorCtasUnanchoredProvenance, ConnectorError> {
+    let file: UnanchoredCtasProvenanceFileV1 = serde_json::from_slice(bytes)
+        .map_err(|error| corrupt(format!("decode CTAS unanchored provenance: {error}")))?;
+    if file.version != CTAS_UNANCHORED_PROVENANCE_VERSION {
+        return Err(corrupt(
+            "CTAS unanchored provenance has an unsupported version",
+        ));
+    }
+    let publication_uuid = uuid::Uuid::parse_str(&file.publication_id)
+        .map_err(|error| corrupt(format!("parse CTAS publication ID: {error}")))?;
+    let publication_id =
+        novarocks_spi::connector::LakePublicationId::try_from_uuid(publication_uuid)?;
+    let target = novarocks_spi::connector::ConnectorTableIdentity {
+        instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(&file.catalog)?,
+        namespace: Arc::from(file.namespace),
+        table: Arc::from(file.table),
+    };
+    let staged_table_uuid = uuid::Uuid::parse_str(&file.staged_table_uuid)
+        .map_err(|error| corrupt(format!("parse CTAS staged table UUID: {error}")))?;
+    let provenance = ConnectorCtasUnanchoredProvenance::try_new(
+        publication_id,
+        target,
+        file.expected_absent,
+        Some(*staged_table_uuid.as_bytes()),
+        file.created_at_ms,
+    )?;
+    if provenance.digest != file.digest {
+        return Err(corrupt("CTAS unanchored provenance digest is invalid"));
+    }
+    Ok(provenance)
+}
+
+fn write_unanchored_ctas_provenance(
+    runtime: &IcebergControlRuntime,
+    table_location: &str,
+    provenance: &ConnectorCtasUnanchoredProvenance,
+) -> Result<(), ConnectorError> {
+    provenance.validate()?;
+    let staged_table_uuid = provenance.staged_table_uuid.ok_or_else(|| {
+        invalid(
+            "unanchored CTAS provenance must retain the staged table UUID before it is persisted",
+        )
+    })?;
+    let payload = serde_json::to_vec(&UnanchoredCtasProvenanceFileV1 {
+        version: CTAS_UNANCHORED_PROVENANCE_VERSION,
+        publication_id: provenance.publication_id.to_string(),
+        catalog: provenance.target.instance_id.as_str().to_string(),
+        namespace: provenance.target.namespace.to_string(),
+        table: provenance.target.table.to_string(),
+        expected_absent: provenance.expected_absent,
+        staged_table_uuid: uuid::Uuid::from_bytes(staged_table_uuid).to_string(),
+        created_at_ms: provenance.created_at_ms,
+        digest: provenance.digest,
+    })
+    .map(Bytes::from)
+    .map_err(|error| internal(format!("encode CTAS unanchored provenance: {error}")))?;
+    let location = unanchored_ctas_provenance_location(table_location)?;
+    let file_io = crate::fs_io::build_file_io_for_location(
+        table_location,
+        runtime.control_state().object_store_config(),
+    );
+    let output = file_io
+        .new_output(&location)
+        .map_err(|error| unavailable(error.to_string()))?;
+    runtime
+        .resources()
+        .catalog_runtime()
+        .block_on(async move { output.write(payload).await })
+        .map_err(unavailable)?
+        .map_err(|error| unavailable(error.to_string()))
 }
 
 /// Exact-generation REST staged-create capability.
@@ -983,6 +1090,38 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         );
         match result {
             Ok(staged) => {
+                let table_location = staged.table.metadata().location().to_string();
+                let provenance = ConnectorCtasUnanchoredProvenance::try_new(
+                    request.publication_id,
+                    request.table.clone(),
+                    true,
+                    Some(*staged.table.metadata().uuid().as_bytes()),
+                    now_ms()?,
+                )?;
+                if let Err(error) =
+                    write_unanchored_ctas_provenance(&self.runtime, &table_location, &provenance)
+                {
+                    let evidence = self.evidence(
+                        request.operation_id,
+                        ConnectorStagedCreateReconcilePhase::Prepare,
+                        Bytes::copy_from_slice(&request.operation_id.to_bytes()),
+                    )?;
+                    self.set_unknown(
+                        request.operation_id,
+                        ConnectorStagedCreateReconcilePhase::Prepare,
+                        &evidence,
+                        None,
+                    );
+                    return Ok(ConnectorStagedCreatePrepareOutcome::CommitUnknown {
+                        failure: ConnectorMutationFailure::new(
+                            ConnectorMutationFailureKind::Unavailable,
+                            format!(
+                                "persist CTAS unanchored provenance after staged create: {error}"
+                            ),
+                        ),
+                        evidence,
+                    });
+                }
                 let payload = Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes());
                 let handle = ConnectorStagedTableHandle::try_new(
                     self.owner(),
@@ -1700,6 +1839,10 @@ fn internal(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Internal, message.into())
 }
 
+fn unavailable(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::Unavailable, message.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1789,6 +1932,52 @@ mod tests {
         assert_eq!(
             operation_marker(operation_id),
             uuid::Uuid::from_bytes(operation_id.to_bytes()).to_string()
+        );
+    }
+
+    #[test]
+    fn unanchored_provenance_sidecar_is_exact_and_tamper_evident() {
+        let publication_id = novarocks_spi::connector::LakePublicationId::new_v7();
+        let target = novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+            namespace: Arc::from("analytics"),
+            table: Arc::from("orders"),
+        };
+        let staged_uuid = *uuid::Uuid::now_v7().as_bytes();
+        let provenance = ConnectorCtasUnanchoredProvenance::try_new(
+            publication_id,
+            target,
+            true,
+            Some(staged_uuid),
+            1_234,
+        )
+        .expect("provenance");
+        let bytes = serde_json::to_vec(&UnanchoredCtasProvenanceFileV1 {
+            version: CTAS_UNANCHORED_PROVENANCE_VERSION,
+            publication_id: publication_id.to_string(),
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "orders".to_string(),
+            expected_absent: true,
+            staged_table_uuid: uuid::Uuid::from_bytes(staged_uuid).to_string(),
+            created_at_ms: 1_234,
+            digest: provenance.digest,
+        })
+        .expect("encode");
+        assert_eq!(
+            decode_unanchored_ctas_provenance(&bytes).expect("decode"),
+            provenance
+        );
+
+        let mut tampered: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        tampered["table"] = serde_json::Value::String("other".to_string());
+        assert_eq!(
+            decode_unanchored_ctas_provenance(
+                &serde_json::to_vec(&tampered).expect("encode tampered")
+            )
+            .expect_err("digest mismatch")
+            .kind(),
+            ConnectorErrorKind::CorruptData
         );
     }
 
